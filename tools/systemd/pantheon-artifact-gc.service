@@ -1,0 +1,17 @@
+[Unit]
+Description=Pantheon artifact-GC — sweep stale ticket-scoped evidence dirs (T-1360)
+Documentation=file:///home/%u/pantheon-config/tools/artifact_gc.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
+# --apply is required for the tool to actually remove+commit; a bare invocation
+# is report-only by design. Conservative 30d grace + scope-guarded commit.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/artifact_gc.py --apply
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

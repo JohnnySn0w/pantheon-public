@@ -1,0 +1,14 @@
+[Unit]
+Description=Pantheon knowledge-sweep driver (ORG-012 Phase C, T-0781) — due-detector that files an in-session sweep-dispatch ticket when the corpus changes
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/knowledge_sweep.py --file-sweep-ticket
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

@@ -1,0 +1,15 @@
+[Unit]
+Description=Pantheon weekly ticket-summary generator — produces reports/<YYYY>-W<NN>.md
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+Documentation=file:///home/%u/pantheon-config/sop/standard/weekly-ticket-summary-generation.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.npm-global/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/weekly_ticket_summary.py --file-request
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=15min

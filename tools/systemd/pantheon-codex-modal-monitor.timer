@@ -1,0 +1,12 @@
+[Unit]
+Description=Pantheon codex modal monitor — poll every 5 min for the rate-limit model-switch wedge (T-1366)
+Documentation=file:///home/%u/pantheon-config/tools/codex_modal_monitor.py
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+Persistent=true
+Unit=pantheon-codex-modal-monitor.service
+
+[Install]
+WantedBy=timers.target

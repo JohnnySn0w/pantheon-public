@@ -1,0 +1,11 @@
+[Unit]
+Description=ORG-038 S3* audit pilot scheduler — daily due-check (08:30 UTC)
+Documentation=file:///home/%u/pantheon-config/adr/ORG-038-codex-system3star-assurance-auditor.md
+
+[Timer]
+OnCalendar=*-*-* 08:30:00 UTC
+Persistent=true
+Unit=pantheon-s3star-audit.service
+
+[Install]
+WantedBy=timers.target

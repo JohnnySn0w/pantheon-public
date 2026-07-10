@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon cross-repo spine grooming — daily 13:00 UTC (after pantheon-config groom 12:30 + policy-outflow 12:45) (T-0666)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 13:00:00 UTC
+Persistent=true
+Unit=pantheon-spine-cross-repo.service
+
+[Install]
+WantedBy=timers.target

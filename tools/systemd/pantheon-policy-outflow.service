@@ -1,0 +1,16 @@
+[Unit]
+Description=Pantheon policy-outflow sync — refresh the recent-policy-changes digest (T-0834, ORG-012 outflow)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.npm-global/bin
+# Default-safe: regenerates the notes/recent-policy-changes.md digest from git log
+# over rulebook/+adr/+sop/; commits+pushes ONLY when the digest content changed.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/policy_outflow_sync.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

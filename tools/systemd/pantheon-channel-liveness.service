@@ -1,0 +1,20 @@
+[Unit]
+Description=Pantheon channel-liveness monitor — detect a comms-dark-but-session-healthy agent (T-0894)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Probes every configured agent's inbound Telegram poller (bot.pid -> live bun
+# server.ts). Detect+alert via route_failure_alert (others->Recovery, recovery-self->the operator)
+# on the 409-death signature. Runs on recovery; cross-account reads via Recovery's sudo.
+# ARMED 2026-06-15 (T-1140-arming, supervised first-fire — the operator msg 3287 "sure shoot"):
+# auto-remediation now LIVE — a CONFIRMED bridge-down fires the graceful-restart path
+# (tombstone for recovery, fire_restart for orchestrator/specialist). Bounded by a 30min per-agent
+# cooldown + consecutive-tracking + escalation (no restart-loop); healthy bridges no-op.
+Environment=PANTHEON_CHANNEL_REMEDIATE_ENABLED=1
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/channel_liveness_monitor.py --all
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2min

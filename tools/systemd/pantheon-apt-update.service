@@ -1,0 +1,24 @@
+[Unit]
+Description=Pantheon — non-security apt updates (weekly)
+Documentation=file:///root/pantheon-config/tools/systemd/README.md
+After=network-online.target apt-daily.service apt-daily-upgrade.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# apt-get -y --without-new-pkgs upgrade installs available updates for
+# already-installed packages but refuses to add new ones — safer than
+# `dist-upgrade` for unattended use. The daily auto-security path
+# (apt-daily-upgrade.service + 50unattended-upgrades) already covers
+# security updates; this service is the non-security counterpart.
+ExecStart=/usr/bin/apt-get update
+ExecStart=/usr/bin/apt-get -y --without-new-pkgs upgrade
+
+# Non-zero exit from apt-get (e.g., transient mirror issue) should NOT
+# kill the timer cadence; systemd will fire again next week. Log the
+# failure to journal and move on.
+SuccessExitStatus=0 100
+
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2h

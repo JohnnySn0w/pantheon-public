@@ -1,0 +1,104 @@
+# ============================================================================
+# ⚠️ REFERENCE-INSTANCE EXAMPLE — REPLACE FOR YOUR INSTANCE.
+# The repo registry + grants below are the reference instance's. Replace with
+# your own repos. Structure/schema is framework; the entries are instance data.
+# ============================================================================
+# repos.yaml — canonical Pantheon repo registry + per-agent access grants.
+#
+# T-0761 (clone-on-demand structural enforcement; the operator msg 2319). This is the
+# STRUCTURAL GATE for per-agent repo access:
+#   - ticket_lint validates a ticket's `repos:` field against this registry —
+#     an unknown repo, or `rw` to an agent not granted it here, FAILS lint.
+#   - the provisioning helper clones/pulls a ticket's declared repos on claim
+#     (rw → push access); every repo an agent holds traces to a ticket that
+#     declared it.
+#   - context_fill_monitor's per-agent audit flags repos PRESENT on an account
+#     but NOT declared in any active ticket (can't hard-block `git clone`, so:
+#     mandatory declaration + loud off-path audit).
+#
+# This same registry is intended to carry the "domain restrictions" surface IF
+# the operator lands the orchestrator-tier-with-domains reclass: an agent's domain =
+# the set of repos (+ later, targets) it may act on. Until that decision lands,
+# the `grants` below are DESCRIPTIVE of current access reality, not a new policy
+# — widen them only via ticket + the operator's call, never silently.
+#
+# Grants are keyed on instance role-keys (ORG-030 Q4): orchestrator,
+# specialist, recovery. The role→persona binding is in instance.yaml.
+# Access levels: ro (clone/read for cross-reference), rw (clone + push).
+
+schema_version: 1
+
+# Every agent always has pantheon-config (the orchestration hub) rw — it is the
+# default and need not be declared in a ticket's `repos:` field.
+always_available:
+  - repo: pantheon-config
+    access: rw
+    agents: [orchestrator, specialist, recovery]
+
+repos:
+  - name: pantheon-config
+    description: orchestration hub (principles, directives, ADRs, ledger, tickets, tooling)
+    grants: { orchestrator: rw, specialist: rw, recovery: rw }
+
+  - name: pantheon-bridge
+    description: "RETIRED (dead) — the ORG-004 shared getUpdates poller + SSE fanout is no longer running anywhere; every agent self-polls via the per-agent telegram plugin (T-0719/T-0759 failure class). Repo kept for history; do not revive without a design pass."
+    grants: { orchestrator: ro, recovery: ro }
+
+  - name: echo-prismatic
+    description: Echo voice-agent stack (project-tier ADR-201+)
+    grants: { orchestrator: rw }
+
+  - name: echo-recorder
+    description: echo audio-capture web app
+    grants: { orchestrator: rw }
+
+  - name: echo_vault
+    description: echo architecture vault
+    grants: { orchestrator: rw }
+
+  - name: pantheon-pwa
+    description: operator-facing PWA (kino)
+    grants: { orchestrator: rw }
+
+  - name: revenue-project
+    description: revenue-project project
+    grants: { orchestrator: rw }
+
+  - name: personal-site-astro
+    description: the operator's personal site (example.com rebuild)
+    grants: { orchestrator: rw }
+
+  - name: vibecamp-scheduler
+    description: the operator's vibecamp scheduler site (personal; push direct to main → GH Pages)
+    grants: { orchestrator: rw }
+
+  - name: claude-config
+    description: claude config (ORG-030 Phase 3 rename to claude-code-config pending — T-0915)
+    grants: { orchestrator: rw }
+
+  # Added 2026-07-07 (T-1621, descriptive-of-current-reality per this file's own
+  # grants policy — access below predates this entry and traces to tickets):
+  - name: codex-config
+    description: codex agent config + telegram bridge (poller/daemon, MAILBOX.md runbook); LIVE repo
+    grants: { peer-daemon-codex: rw, recovery: rw }   # recovery deploy key codex_config_deploy (T-1044/T-1046 arcs); canonical recovery clone ~/work/codex-config
+  - name: codex-config-template
+    description: genericized codex-config release template (T-1472); private mirror example-org/codex-config-template published by HO (T-1501); public flip operator-gated
+    grants: { orchestrator: rw }
+
+# Repos PRESENT on an agent's box but intentionally NOT sanctioned project repos
+# (the operator ruling msg 3848, T-0761): the present-but-undeclared audit (T-0761
+# component 5, when built) must SKIP these rather than flag them. Not granted,
+# not cloned-on-demand — just present-and-tolerated. ticket_lint ignores this key
+# (loader reads only `repos:`).
+ignored:
+  - repo: excalidraw-diagram-skill
+    reason: "document-implementation tool, not a Pantheon/the operator project (the operator msg 3848)"
+  - repo: toys
+    reason: "catchall/experiments, not to be truly committed (the operator msg 3848)"
+
+# NOTE (grants policy, pending reclass): today orchestrator holds all
+# project repos; specialist/recovery hold only pantheon-config. Specialist
+# research that needs cross-reference (ro) or repo-specific output (rw) should
+# DECLARE it via a ticket `repos:` field + get the grant added here (the operator's
+# call, or per the domain definition once the orchestrator-tier-with-domains
+# reclass lands).

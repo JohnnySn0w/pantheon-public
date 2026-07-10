@@ -1,0 +1,24 @@
+[Unit]
+Description=Pantheon mailbox wake — kick %i on new inter-agent mail (ORG-026)
+Documentation=file:///home/%u/pantheon-config/adr/ORG-026-inter-agent-message-passing-substrate.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+# Wake-only: peek inbox/new and inject a kick into %i's own pane. Does NOT consume
+# or ack — the agent drains+acks in-session, so a dropped kick never loses a message
+# (it stays in new/ for the next wake). See tools/mailbox_wake.py.
+#
+# `sg veneration -c` is REQUIRED (T-1015, 2026-06-09): the Path-A hub
+# (/home/the-ancestor/mailbox/%i/new) is mode-2770 group veneration, but a
+# user-mode systemd service runs with ONLY the account's primary group — user
+# systemd cannot grant supplementary groups (SupplementaryGroups= fails 216 on
+# --user units). Without the wrap the waker dies with `PermissionError: ... hub/new`
+# and never injects. `sg` re-execs with veneration as the effective group (the agent
+# is already a member, so no password prompt). cwd stays %h/pantheon-config (set by
+# WorkingDirectory before ExecStart).
+ExecStart=/usr/bin/sg veneration -c "/usr/bin/python3 %h/pantheon-config/tools/mailbox_wake.py --agent %i"
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=90s

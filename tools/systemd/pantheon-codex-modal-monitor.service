@@ -1,0 +1,16 @@
+[Unit]
+Description=Pantheon codex modal monitor — detect codex wedged on the rate-limit model-switch modal (T-1366)
+Documentation=file:///home/%u/pantheon-config/tools/codex_modal_monitor.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
+# Alert-only: captures codex-session (sudo -nu codex) and, on the model-switch
+# modal, routes a failure alert to Recovery (route_failure_alert). NEVER sends keys
+# into codex — Recovery does the Esc-dismiss (keeping the current model). Cooldown-gated.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/codex_modal_monitor.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2min

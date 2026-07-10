@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon spine-index groom — daily fire (12:30 UTC, offset from 12:00 UTC ticket grooming)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 12:30:00 UTC
+Persistent=true
+Unit=pantheon-spine-index-groom.service
+
+[Install]
+WantedBy=timers.target

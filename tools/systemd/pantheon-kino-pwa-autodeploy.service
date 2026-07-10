@@ -1,0 +1,22 @@
+[Unit]
+Description=Pantheon kino-pwa auto-redeploy — detect pantheon-pwa origin/main advance and redeploy
+Documentation=file:///home/%u/pantheon-config/sop/standard/redeploy-pantheon-pwa.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+# bun is at /home/claude/.bun/bin but is invoked inside the sudo'd claude shell
+# (which exports it explicitly); this PATH is for the poller process itself.
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# DEFAULT-OFF kill-switch. The poller is a no-op (exit 0, one log line) unless this
+# is "1". Intentionally NOT set here — installed default is disabled. To enable,
+# add a drop-in (systemctl edit) setting PANTHEON_PWA_AUTODEPLOY_ENABLED=1. The
+# in-script check (not a ConditionEnvironment=) keeps the disabled state auditable
+# in the journal. Do NOT ship an enable drop-in alongside this template.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/kino_pwa_autodeploy.py
+StandardOutput=journal
+StandardError=journal
+# Long pole is the bun build (bun install + build:web); allow generous headroom.
+TimeoutStartSec=15min

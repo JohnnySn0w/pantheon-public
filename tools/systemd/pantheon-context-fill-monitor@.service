@@ -1,0 +1,13 @@
+[Unit]
+Description=Pantheon context-fill monitor for %i — poll session jsonl, fire graceful restart at min(500k absolute, 0.70×window) tokens (T-1497)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/context_fill_monitor.py --agent %i
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=15min

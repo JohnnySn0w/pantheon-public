@@ -1,0 +1,14 @@
+[Unit]
+Description=ORG-038 S3* audit pilot scheduler — files a supervised Codex-dispatch ticket for any due audit slot
+Documentation=file:///home/%u/pantheon-config/adr/ORG-038-codex-system3star-assurance-auditor.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/s3star_audit_runner.py --file-dispatch-ticket
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10m

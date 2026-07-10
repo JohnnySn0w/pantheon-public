@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon HO auto-resumer — poll every 5 minutes for cap-hit state file
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+Unit=pantheon-ho-resumer.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon suite-health soak filer — monthly (1st, 06:00 UTC) per-account soak fan-out
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-01 06:00:00 UTC
+Persistent=true
+Unit=pantheon-soak-filer.service
+
+[Install]
+WantedBy=timers.target

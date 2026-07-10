@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon ticket-grooming — daily fire (12:00 UTC, interleaved with watch loop's 08:00 UTC)
+Documentation=file:///home/%u/pantheon-config/tickets/README.md
+
+[Timer]
+OnCalendar=*-*-* 12:00:00 UTC
+Persistent=true
+Unit=pantheon-grooming.service
+
+[Install]
+WantedBy=timers.target

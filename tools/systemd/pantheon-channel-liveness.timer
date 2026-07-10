@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon channel-liveness monitor — every 5 min inbound-poller liveness probe (T-0894)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=false
+Unit=pantheon-channel-liveness.service
+
+[Install]
+WantedBy=timers.target

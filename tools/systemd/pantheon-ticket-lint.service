@@ -1,0 +1,15 @@
+[Unit]
+Description=Pantheon ticket-lint — hourly frontmatter format scan + auto-fix
+Documentation=file:///home/%u/pantheon-config/tickets/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/ticket_lint.py --commit-prod --no-digest
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

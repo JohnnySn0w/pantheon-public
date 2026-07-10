@@ -1,0 +1,13 @@
+[Unit]
+Description=Pantheon session-reset reconcile — sweep session_reset_log jsonl into structured ledger entries (T-0257)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/session_reset_reconcile.py --commit-prod
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

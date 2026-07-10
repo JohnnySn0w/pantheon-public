@@ -1,0 +1,7 @@
+[Unit]
+Description=Pantheon cross-repo spine grooming — owner-run (orchestrator) grooming of pantheon-pwa + revenue-project doc indexes (T-0666)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/spine_groom_cross_repo.py --apply

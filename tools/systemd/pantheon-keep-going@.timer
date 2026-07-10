@@ -1,0 +1,14 @@
+[Unit]
+Description=Pantheon keep-going nudge — every 15 min for %i (anti-idle heartbeat)
+Documentation=file:///home/%u/pantheon-config/tools/keep_going.py
+
+[Timer]
+# Cadence is a tunable; 15 min is frequent enough to catch a park quickly without
+# churn. The idle-gate (keep_going.py) is the throttle — a busy agent is skipped, so
+# this never spams active work regardless of cadence.
+OnUnitActiveSec=15min
+OnBootSec=5min
+Unit=pantheon-keep-going@%i.service
+
+[Install]
+WantedBy=timers.target

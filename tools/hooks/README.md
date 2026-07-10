@@ -1,0 +1,48 @@
+# tools/hooks/
+
+Claude Code session hooks owned by pantheon-config. Symlinked into `~/.claude/hooks/` at HO setup; the symlink pattern mirrors `claude-config/agents/` ↔ `~/.claude/agents/`.
+
+## Install
+
+For each script here, the user-scope runtime symlink is:
+
+```bash
+ln -sfn ~/pantheon-config/tools/hooks/<script>.sh ~/.claude/hooks/<script>.sh
+```
+
+Hook entries in `~/.claude/settings.json` reference the symlink path (`/home/claude/.claude/hooks/<script>.sh`), so future runs resolve through the symlink to the version-controlled source.
+
+## Hooks
+
+| Hook | Event | Purpose | Status |
+|---|---|---|---|
+| [`handoff-auto-read.sh`](handoff-auto-read.sh) | `SessionStart` | Auto-injects "Read /home/claude/HANDOFF.md and follow it" on fresh sessions when the handoff was modified within the last hour. No-op otherwise. Part of T-0008 deliverable 1. | shipped 2026-05-02 |
+| [`backlog-surface.sh`](backlog-surface.sh) | `SessionStart` | Surfaces open BACKLOG.md items (B-ids) into the new session's `additionalContext` so fresh-HO sees the queue without grepping. Part of T-0011 / T-0023 (Tier-1 synthesis item 2). | shipped 2026-05-02 |
+| [`recall-feedback.py`](recall-feedback.py) | `PreToolUse` (Edit/Write/MultiEdit/NotebookEdit/Bash) | Narrow high-precision footgun guard (T-1090, Dei recall narrowing): surfaces ONLY `feedback`/`project` memories whose **description** names an EXACT token in the tool args (file path, `T-NNNN`, `ORG-NNN`, or a multi-word command signature like `git stash`/`tailscale serve`). Read-only Bash commands skipped; per-session dedup; cap 2/call; fail-open. Injects a model-only "recalled feedback (verify it still applies)" `additionalContext` nudge. | **built + tested 2026-06-12; NOT yet wired** (the live settings.json + HOOK_ALLOWLIST step is interactive) |
+
+## Why version-control hooks
+
+A hook script is load-bearing infrastructure: if it disappears or drifts, fresh sessions silently regress. Storing the canonical copy in `pantheon-config/tools/hooks/` gives audit trail (git history), durability (lost VPS state recoverable from clone), and consistency across the three VPS users (claude / claude-fallback / claude-research) — each can install the same hook by checkout + symlink.
+
+Failure modes the symlink pattern handles:
+- HO's local `~/.claude/hooks/` was nuked: `git checkout` recreates the source, `ln -sfn` recreates the symlink.
+- Drift between machines: `git pull` + smoke-test gates updates.
+- Settings watcher caveat: the `~/.claude/settings.json` reference points to the symlink path; the watcher follows it.
+
+## Git hooks (pantheon-config repo)
+
+Distinct from the Claude Code session hooks above. These live in `.githooks/` (not `~/.claude/hooks/`) and activate via `tools/install_hooks.sh` setting `core.hooksPath = .githooks` per-clone. Each clone (Orchestrator's, Recovery's, Specialist's) needs the install run once.
+
+| Hook | Event | Purpose | Status |
+|---|---|---|---|
+| `pre-commit` | `git commit` (pre) | Refuses commits whose staged blobs contain the unescaped HERMES byte sequence. Per `~/CLAUDE.md` §HERMES discipline. | shipped 2026-05-03 |
+| `commit-msg` | `git commit` (msg) | Same HERMES guard applied to the commit message body. | shipped 2026-05-03 |
+| `pre-push` | `git push` (pre) | Fetches remote + rebases local onto tip before push. Prevents the ID-collision class on auto-numbered files (tickets, ledger entries) when parallel writers (Orchestrator + Recovery + Specialist) push without first pulling. Skips on detached HEAD; fails-open on fetch failure. Per T-0147 / the operator msg_1121+1124. | shipped 2026-05-09 |
+
+Install (idempotent):
+
+```bash
+bash ~/pantheon-config/tools/install_hooks.sh
+```
+
+Cross-account: each of `claude` / `claude-fallback` / `claude-research` runs the install on their own clone. Hook discipline travels with the repo, not with the user.

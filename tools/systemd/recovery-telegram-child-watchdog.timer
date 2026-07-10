@@ -1,0 +1,15 @@
+[Unit]
+Description=Recovery telegram bun-child watchdog — poll every 90s for a mid-session inner-child death (T-1456)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# 90s cadence: with DEBOUNCE=2 a genuine death auto-recovers in ~3min, while the
+# debounce + BOOT_GRACE ride out the transient child-absence of a legitimate
+# restart. Cheap (a pgrep) so the tight cadence costs nothing.
+OnBootSec=2min
+OnUnitActiveSec=90s
+Persistent=false
+Unit=recovery-telegram-child-watchdog.service
+
+[Install]
+WantedBy=timers.target

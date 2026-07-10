@@ -1,0 +1,12 @@
+[Unit]
+Description=Pantheon ticket-lint — hourly fire (*:20 UTC, offset from :00 boundary and :30 spine-index slot)
+Documentation=file:///home/%u/pantheon-config/tickets/README.md
+
+[Timer]
+OnCalendar=*-*-* *:20:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=pantheon-ticket-lint.service
+
+[Install]
+WantedBy=timers.target

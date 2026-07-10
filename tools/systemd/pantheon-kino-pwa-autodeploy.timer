@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon kino-pwa auto-redeploy — poll every ~5 minutes for pantheon-pwa origin/main advance
+Documentation=file:///home/%u/pantheon-config/sop/standard/redeploy-pantheon-pwa.md
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+Unit=pantheon-kino-pwa-autodeploy.service
+
+[Install]
+WantedBy=timers.target

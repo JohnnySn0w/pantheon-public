@@ -1,0 +1,23 @@
+[Unit]
+Description=Pantheon inbox auto-consumer — every 10 min for %i
+Documentation=file:///home/%u/pantheon-config/notes/autonomy.md
+
+[Timer]
+OnUnitActiveSec=10min
+# OnBootSec anchors the timer to (user-)manager start so it re-fires after a
+# manager restart. Without it, OnUnitActiveSec has no anchor post-restart and the
+# timer stalls (Trigger: n/a) → ticket auto-delivery silently stops (T-1020,
+# observed on specialist after its T-1016 manager restart). Mirrors the unaffected
+# pantheon-keep-going@.timer (OnUnitActiveSec + OnBootSec) and mailbox-wake (OnBootSec).
+OnBootSec=5min
+# OnActiveSec re-arms relative to TIMER activation, so a daemon-reload / timer
+# restart ALWAYS schedules a finite next-fire — even when the timer is reloaded
+# >OnBootSec after manager start (e.g. when a drop-in override is added) and the
+# service has never run, which OnBootSec alone leaves stalled at NextElapse=
+# infinity. T-1096 (Recovery's timer hit exactly this after its 5-min override was
+# added; ticket auto-delivery was silently down until the service was kicked).
+OnActiveSec=5min
+Unit=pantheon-inbox-consumer@%i.service
+
+[Install]
+WantedBy=timers.target

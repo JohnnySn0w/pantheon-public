@@ -1,0 +1,20 @@
+# systemctl --user unit for Recovery — weekly lessons→hooks promotion fire (T-0649 inc 4).
+# Install to /home/claude-fallback/.config/systemd/user/promote-lessons.service
+#
+# Files new high-confidence promotion candidates to promotion-candidates/,
+# auto-commits + pushes the SURFACE only (HERMES-guarded, scoped — never a hook;
+# the review gate is recovery via --land/--decline), and sends a proof-of-life digest
+# to the operator. Recovery-only (not templated). Mirrors ticket_grooming's posture.
+
+[Unit]
+Description=Lessons→hooks promotion pipeline — weekly fire (T-0649 inc 4)
+Documentation=file:///home/%u/pantheon-config/notes/2026-06-09-lessons-to-hooks-promotion-pipeline.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/promote_lessons_cron.py --commit-prod
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=180s

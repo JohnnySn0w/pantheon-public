@@ -1,0 +1,16 @@
+[Unit]
+Description=Pantheon adaptive-finish weekly digest — Telegram summary of narrate-then-exit hits (T-0907)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.npm-global/bin
+# Skip-on-empty by default (no send when the week had zero hits); reads the
+# detector's audit log read-only. See tools/adaptive_finish_digest.py.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/adaptive_finish_digest.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

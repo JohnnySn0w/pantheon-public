@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon context-fill monitor for %i — poll every 5 minutes for session fill state
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+Unit=pantheon-context-fill-monitor@%i.service
+
+[Install]
+WantedBy=timers.target

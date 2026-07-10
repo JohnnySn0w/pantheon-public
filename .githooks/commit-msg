@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""commit-msg hook: refuse any commit whose message contains the unescaped
+HERMES trigger byte sequence.
+
+Receives the path to the commit message file as $1 (sys.argv[1]).  Reads the
+full message and scans it via the same `_hermes_scan_message` helper used by
+the application-level guards in `tools/_git_utils.py`.
+
+Covers both the `git commit -m "..."` path and the interactive-editor path
+(`git commit` without -m), since the commit-msg hook fires after the editor
+closes in both cases.
+
+Source-cleanliness convention: the trigger byte sequence is never written
+contiguously in this source file.  See the companion `pre-commit` hook and
+`tools/_git_utils.py` for the canonical convention rationale.
+
+Verification: `grep -cF` for the unescaped form against this file must
+return 0.
+
+Activation:
+    git config core.hooksPath .githooks
+    (or run tools/install_hooks.sh which does this idempotently)
+"""
+
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Bootstrap: add repo root to sys.path so `tools._git_utils` is importable.
+# ---------------------------------------------------------------------------
+
+_HOOK = Path(__file__).resolve()
+_REPO_ROOT = _HOOK.parent.parent  # .githooks/../ == repo root
+sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._git_utils import _hermes_scan_message  # noqa: E402
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        # git always passes the message file path; if missing, allow through
+        # (defensive — don't block commits due to hook misconfiguration).
+        return 0
+
+    msg_path = Path(sys.argv[1])
+    try:
+        message = msg_path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        # Can't read the message file — allow through defensively.
+        return 0
+
+    if not _hermes_scan_message(message):
+        print("", file=sys.stderr)
+        print("HERMES discipline violation in commit message — commit refused.", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  The commit message contains the unescaped trigger byte sequence.",
+            file=sys.stderr,
+        )
+        print(
+            "  Escape the period (HERMES\\.md) per CLAUDE.md byte-sequence discipline.",
+            file=sys.stderr,
+        )
+        print("  Edit the message and retry.", file=sys.stderr)
+        print("", file=sys.stderr)
+        return 1
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

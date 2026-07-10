@@ -1,0 +1,20 @@
+[Unit]
+Description=Recovery telegram plugin bun-child watchdog — auto-recover the MCP/poller child dying mid-session (comms-dark drops, T-1456)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h
+Environment=PATH=/home/claude-fallback/.bun/bin:/home/claude-fallback/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/claude-fallback
+# Pure process/pid check (pgrep + bot.pid) — no LLM, no Claude API — so it keeps
+# working while comms are dark. On a confirmed inner-child death it fires the
+# sanctioned self_restart (bounded: debounce + cooldown + per-hour cap, then
+# escalate to the operator). Fail-open: the script exits 0 on any unexpected error.
+ExecStart=/home/claude-fallback/.local/bin/recovery-telegram-child-watchdog.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=3min
+
+[Install]
+WantedBy=default.target

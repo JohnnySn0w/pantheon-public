@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon activity-monitor for %i — 15-min cadence per ORG-011 Phase B
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* *:0/15:00
+Persistent=true
+Unit=pantheon-activity-monitor@%i.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon policy-outflow sync — daily 12:45 UTC refresh of the recent-policy-changes digest
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 12:45:00 UTC
+Persistent=true
+Unit=pantheon-policy-outflow.service
+
+[Install]
+WantedBy=timers.target

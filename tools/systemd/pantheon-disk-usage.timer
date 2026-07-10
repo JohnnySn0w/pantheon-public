@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon disk-usage monitor — hourly root-FS capacity probe (fleet-wedge-on-full prevention)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* *:50:00
+Persistent=true
+Unit=pantheon-disk-usage.service
+
+[Install]
+WantedBy=timers.target

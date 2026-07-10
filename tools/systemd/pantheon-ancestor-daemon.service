@@ -1,0 +1,19 @@
+[Unit]
+Description=Pantheon the-ancestor daemon — channel-less Veneration substrate + mailbox node (T-0765)
+Documentation=file:///home/the-ancestor/pantheon-config/tickets/inbox/T-0765.md
+After=network.target
+
+[Service]
+# Supervised wrapper (NOT Type=oneshot): the wrapper stays alive as MainPID for as long
+# as the tmux session lives, so a dead session => wrapper exits => Restart=always respawns
+# it. (Type=oneshot + RemainAfterExit was the ~14h inert-daemon outage on Recovery, 2026-05-21.)
+Type=simple
+ExecStart=%h/pantheon-config/tools/ancestor-bot-supervise.sh
+Restart=always
+RestartSec=5
+# Thin/idle by design; no channels, no bot token (the channel-less safety invariant).
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

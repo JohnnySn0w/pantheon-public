@@ -1,0 +1,18 @@
+[Unit]
+Description=Pantheon Telegram bridge — single owner of getUpdates, multi-client SSE
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/pantheon-bridge
+EnvironmentFile=%h/.claude/channels/telegram-bridge/.env
+ExecStart=%h/pantheon-bridge/.venv/bin/telegram-bridge serve
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

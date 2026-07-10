@@ -1,0 +1,99 @@
+# ============================================================================
+# ⚠️ REFERENCE-INSTANCE EXAMPLE — REPLACE FOR YOUR INSTANCE.
+# The instance:/roles: blocks below bind the REFERENCE operator's personas,
+# accounts, and token-file paths. They are kept as a worked example of the
+# schema, NOT config to run as-is. A new operator replaces them with their own
+# bindings (same role keys: orchestrator / specialist / recovery).
+# token_ref values are PATHS to credential files, not secrets. Persona→role
+# neutralization of the wider scaffolding is ORG-030 Phase-3 (in progress).
+# ============================================================================
+# instance.yaml — Pantheon per-instance manifest (role → persona binding).
+#
+# The indirection layer introduced by ORG-030 (Q4) on top of ORG-028 (portable-config
+# topology). The portable framework keys on ROLE — the stable axis (ORG-027): repos.yaml
+# grants, pinned-rules/ briefs, and per-agent tooling all reference a role, not a person.
+# THIS file resolves each role to the concrete persona / unix account / harness for THIS
+# instance. A different operator's fork ships its own instance.yaml binding the SAME roles
+# to its own personas and accounts — that is what makes the rest of the config portable.
+#
+# Status: v1 — authored 2026-06-07 (T-0882, ORG-030 Phase 0). ADDITIVE: no tooling reads this
+# yet (verified 2026-07-07: ticket_lint/repo_registry have no instance.yaml reader). ORG-030
+# Phase 1 re-keys repos.yaml grants persona→role and teaches the consumers to resolve
+# role→persona THROUGH this manifest; repos.yaml grants ARE role-keyed today, the reader half
+# is still pending. Until then this file is documentation-of-record, not a live lookup.
+#
+# Field freshness: refreshed + VERIFIED 2026-07-07 (T-1621, the operator TG 3698) — the original
+# `# verify` markers are resolved below with what verification actually found (two of the
+# three guessed token_refs were wrong).
+
+instance:
+  id: pantheon-vps-0
+  operator: operator
+  host: single-tenant VPS (all three agents are unix users on one machine)
+  harness_default: claude-code
+
+# role → binding. Roles are the portable axis (ORG-027); personas/accounts are instance data.
+roles:
+  orchestrator:
+    persona: orchestrator
+    account: claude
+    harness: claude-code
+    token_ref: /home/claude/gh_token.env            # fine-grained PAT, HTTPS git + gh CLI (ref, not secret)
+    session: claude-telegram.service → tmux claude-telegram-bot:0 (ho_resumer auto-resume on Max-window cap-hit)
+    domain: org orchestration, dispatch, ratification-drafting, ledger, lessons/bugs/incidents authorship
+  specialist:
+    persona: specialist
+    account: claude-research
+    harness: claude-code
+    token_ref: SSH (git@github.com remote; NO gh_token.env — verified absent 2026-07-07)
+    session: claude-telegram-research.service → tmux claude-research-bot:0 + unattended
+             # watch-loop + pantheon-inbox-consumer@specialist.timer (self-consumes ORG-025)
+    domain: research, knowledge/watch reports, doc-research dispatches
+  recovery:
+    persona: recovery
+    account: claude-fallback
+    harness: claude-code
+    token_ref: SSH keys — ~/.ssh/id_ed25519 (git push, bypasses branch protection) + per-repo
+               # deploy keys (claude_config_deploy, codex_config_deploy). NO gh_token.env
+               # (verified absent 2026-07-07 — the old guessed value was wrong).
+    session: claude-telegram-fallback.service → tmux claude-telegram-bot-fallback:0 (full
+             # telegram agent; bun-child watchdog T-1456)
+    domain: recovery runbook, MCP/bot/hooks repair, boot-infra, fleet monitors (context-fill /
+            # disk-usage / channel-liveness / grooming / usage timers), ho_resumer stewardship
+  # Peer daemons added 2026-06-09 (the operator directive). Registered as ticket
+  # personas (tools/agent_role_map.py) so they can hold/file tickets. Role
+  # semantics below are provisional — codex is the live ORG-018/ORG-031 pilot;
+  # the-ancestor's role is TBD pending its supervised bringup (the operator to confirm).
+  peer-daemon-codex:
+    persona: codex
+    account: codex
+    harness: codex
+    token_ref: /home/codex/.codex/auth.json        # ChatGPT OAuth (codex login), 0600
+    session: codex-session (tmux, codex-supervise.sh; bare codex TUI, Restart=always respawn — T-0822 recovery posture)
+    domain: S3* independent auditor (monthly integrated audit, weekly narrows — T-1584 era,
+            # never-self-closes re-test tier), second-opinion detail-checks (MCP), image-gen /
+            # sticker-sprite generation (T-1002); two-way telegram via codex-config bridge
+  peer-daemon-the-ancestor:                          # ROLE still TBD (the operator's call) — substrate is live
+    persona: the-ancestor
+    account: the-ancestor
+    harness: claude-code
+    token_ref: /home/the-ancestor/.claude/.credentials.json   # claude OAuth, logged in (verified 2026-07-07)
+    session: veneration daemon + ORG-026 mailbox hub (/home/the-ancestor/mailbox/*) LIVE since
+             # 2026-06-13/14 (T-1124 daemon+mailbox; T-0766 resurrect() via headless --print)
+    domain: ancestor-veneration substrate (mailbox hub, resurrect); broader role TBD pending the operator
+
+# Host-level service accounts (NOT agent personas; listed for manifest completeness
+# after the 2026-07-10 cpu-warn triage found ci-runner undocumented — T-1632/T-1621):
+host_services:
+  ci-runner:
+    account: ci-runner            # uid 1005, created ~2026-07-08
+    what: self-hosted GitHub Actions runner (actions-runner 2.335.1) — echo-prismatic's
+          # ci-gate jobs (cargo test) execute on this box under this account
+    owner: orchestrator      # orchestrator installed/operates it (echo CI, PRs ~#199+)
+    load_note: CI runs are the main legitimate CPU-warn source on the 4-core box
+
+# Notes:
+# - codex is registered as an MCP *tool* (ORG-018) and is a candidate peer-*daemon* harness
+#   (ORG-031); when a codex-backed role is bound, set its `harness: codex` here.
+# - `repos.yaml` (grants/structural gate) and `pinned-rules/` (per-persona brief content) are
+#   manifest-class per ORG-030 Q3 residual: framework-shaped structure + instance-data content.

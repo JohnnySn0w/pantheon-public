@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon watch-loop driver — daily fire (08:00 UTC)
+Documentation=file:///home/%u/pantheon-config/knowledge/watch/README.md
+
+[Timer]
+OnCalendar=*-*-* 08:00:00 UTC
+Persistent=true
+Unit=pantheon-watch.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,15 @@
+[Unit]
+Description=Pantheon activity digest — 5hr system-pulse signal to the operator's Telegram
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/activity_digest.py --agent recovery
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

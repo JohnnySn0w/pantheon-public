@@ -1,0 +1,19 @@
+# systemctl --user timer for Recovery — weekly promotion cadence (T-0649 inc 4).
+# Install to /home/claude-fallback/.config/systemd/user/promote-lessons.timer
+# Enable with: systemctl --user enable --now promote-lessons.timer
+#
+# Weekly is enough — promotion is not urgent (design note §inc 4). Persistent=true
+# so a fire missed while the machine was off runs at next boot. The proof-of-life
+# digest sends every fire regardless of candidate count, so a silent week is still
+# visible (same contract as ticket_grooming's digest).
+
+[Unit]
+Description=Lessons→hooks promotion — weekly (T-0649 inc 4)
+
+[Timer]
+OnCalendar=Mon 12:00
+Persistent=true
+Unit=promote-lessons.service
+
+[Install]
+WantedBy=timers.target

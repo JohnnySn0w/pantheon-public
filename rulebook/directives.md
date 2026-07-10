@@ -1,0 +1,236 @@
+# Pantheon — Org Directives
+
+**Status:** **Ratified 2026-05-26 by the operator.** Established 2026-04-28 by ORG-002.
+**Origin:** First three directives are demotions from the original P1/P7/P9 (the "operationally true now, obviously change later" subset of the initial 9-principle set).
+
+Directives are **scoped, dated, and explicitly editable** operational rules that emanate from a principle (or a named operational constraint) but are not durable in the way principles are. Each directive carries:
+
+- **Emanates from:** principle id or named operational constraint
+- **Scope:** the conditions/configuration the directive is operationally true within
+- **Effective:** date the directive took force
+- **Re-evaluate:** trigger condition prompting revisitation
+- **The directive itself**
+- **How to apply**
+
+When a directive's re-evaluate trigger fires, the orchestrator surfaces the directive for review. If the trigger fires and no review happens, the directive is suspect — directives without review on trigger become invisible permanent rules, the failure mode this whole tier exists to prevent.
+
+The reference precedent for this pattern is Anthropic's own Responsible Scaling Policy (durable Core Views + scoped/dated RSP). See ORG-002 for full grounding.
+
+---
+
+## D1 — Preserve the operator's bandwidth
+**Emanates from:** named operational constraint — "the operator is the sole human author through phase 3 across all projects."
+**Scope:** Pre-MVP / single-human-org configuration. Currently true; obviously not durable.
+**Effective:** 2026-04-28 (originally as P1; demoted to directive 2026-04-28 per ORG-002).
+**Re-evaluate:** When project workforce expands beyond the operator, OR when escalation rate per week deviates >2× from the running median (signal of miscalibration in either direction).
+
+**The directive:** Every interaction with the operator is a withdrawal from a finite account. Batch, don't interrupt. Don't ask what you can answer. Don't surface what you can decide within bounds.
+
+**How to apply:**
+- Default to acting within the autonomy bar (D3).
+- Batch reports into digests where possible.
+- Mid-stride pings only when the autonomy bar requires it.
+- Use Telegram reactions (👍, 👀) for acknowledgments instead of new messages where they suffice.
+
+## D2 — Hand-curated docs are immutable to workers
+**Emanates from:** P5 (roles don't hop) + named operational constraint — "current worker reliability is not validated for hand-curated content; agent-written context files have a measurable quality penalty (~3% loss, +20% cost per published research)."
+**Scope:** Current worker-orchestrator topology with implementer + reviewer personas as currently configured. Constrained by absence of empirical worker reliability data on hand-curated text.
+**Effective:** 2026-04-28 (originally as P7; demoted to directive 2026-04-28 per ORG-002).
+**Re-evaluate:** When worker reliability metrics support broader write access (after ≥50 implementer dispatches with reviewer-approved DECISIONS), OR when the published research on agent-authored context degrades is contradicted by newer measurement.
+
+**The directive:** Workers (implementer, reviewer, etc.) suggest changes to canonical docs (`CLAUDE.md`, READMEs, all of `notes/`, all of `adr/`, the architecture vault, and Pantheon's own principles + ADRs); only the operator or the orchestrator with explicit ratification writes them.
+
+**How to apply:**
+- Worker persona charters list this in their constraints (already shipped in `claude-config@48e32c2`).
+- Orchestrator can amend with explicit ratification trail in the ledger.
+- Bulk rewrites are ADR-worthy (per P3).
+
+## D3 — Autonomy bar (escalate above the line)
+**Emanates from:** D1 (preserve the operator's bandwidth — the bar is what makes the bandwidth-preservation actionable) + P2 (principles-first — principle-touching decisions deserve human ratification).
+**Scope:** Current trust calibration between Orchestrator and the operator. Criteria are operational and will tighten or loosen as trust accumulates.
+**Effective:** 2026-04-28 (originally as P9; demoted to directive 2026-04-28 per ORG-002).
+**Re-evaluate:** Quarterly (next: 2026-07-28), OR when escalation rate signals miscalibration (per D1's trigger).
+
+**The directive (amended 2026-06-11 per the operator msg 3733 + msg 3735 — principles-as-ratification):** Below the bar I act; above it I hold and ping. **The bar sits at goal-level**: which projects exist and what they are for; real-world / irreversible / outward-facing externals; money spend; secrets / payments / account-and-access grants; un-defer rulings on phases the operator explicitly deferred; vault artifacts the operator authored (echo ADRs 001–199 and any range he reserves). Everything below — **ADR-tier decisions, methodology, architecture, dispatch, org-shape — the orchestrator adopts under P/D justification**, ledgered as always. The operator verbatim (msg 3733): "my personal taste IS the principles. That's what they're for. … If you need clarity at the goal level or above, that is my job. But everything and everyone below that, they are yours." Ratify-asks below the bar are retired; agent ADRs terminate at status **Adopted** (autonomous, P/D-justified) rather than awaiting a ratification stamp. The operator's surface is **digests**: what was done, what was added, how it connects to the project goals. The audit chain (P3/P4 DECISIONS + ledger) is unchanged — justification still happens; it just no longer waits on a stamp. **When a genuinely goal-level ping gets no response within a few cycles, proceed autonomously + file a post-hoc-review ticket** (per the operator 2026-05-09 msg_1118 — "if I don't respond in a few cycles, we'll want you to stop being idle. It's better I have to submit adjustment work later, than for no work to be done"). Idle-while-waiting is worse than act-with-adjustment.
+
+*Superseded text for the record (2026-04-28 → 2026-06-11): the bar previously included "ADR-worthy / principle-touching / vault-adjacent / cost-or-secret-bearing / low-confidence on direction." Cost/secret-bearing survives inside the goal-level items above; low-confidence-on-direction survives as "need clarity at the goal level"; ADR-worthy/principle-touching/vault-adjacent (agent ranges) moved below the bar.*
+
+**Goal-level test (added same date, per msg 3737/3738/3740):** the registry of goals lives in `rulebook/goals.md` (core north stars are the operator's verbatim words); work that maps to a registered goal is below the bar; unmapped work is goal-shaped by definition and follows `rulebook/policies/goal-mapping.md` (propose-and-proceed if reversible, wait if irreversible).
+
+**How to apply:**
+- Every dispatch checks the bar before acting.
+- Cost ceiling integration: hitting any cost threshold (per BACKLOG B2 once thresholds set) automatically promotes the action to "above the bar."
+- "Low-confidence on direction" — if I'm uncertain enough to hedge in the brief, that's a signal to escalate the design choice rather than shipping uncertainty.
+- **Wait-time-bound**: when an above-bar item is held-and-pinged but the operator doesn't respond within ~3 cycles (Telegram volleys / message round-trips), proceed with the most-defensible autonomous call AND simultaneously file a post-hoc-review ticket targeting the operator documenting the choice + the alternatives + the reasoning. The operator can then ratify or redirect after the fact. The bar still applies (don't act on items genuinely outside autonomous scope like unbounded spend, public-facing brand, irreversible org-scoped commits) — but routine above-bar items where idle-cost > adjustment-cost get the autonomous-with-post-hoc path. Per `~/CLAUDE.md` Identity / D8 self-discipline / D1 (the operator's bandwidth — idle work isn't bandwidth-preserving, it's bandwidth-wasting).
+- **What still genuinely waits**: secrets / payments / new account creation / public statements / irreversible production cutovers / anything where post-hoc adjustment can't undo the action. These items wait regardless of cycle count.
+
+**Calibration amendment (2026-05-12, per the operator msg_1367 + msg_1369 ratification of recording):** Implementation decisions sit *below* the bar; HO owns them as long as they satisfy everything above (principles, directives, dispatched-arc scope). Don't insert HO-sanity-check gates on common-pattern implementation calls (per msg_1335 dimension already captured in the memory pin `feedback_calibrate_autonomy_higher_per_msg1271.md`).
+
+**The variance-absorption framing (the operator msg_1353):** *"Org work is about a system that is eventually correct and centers variance around a desired target value."* The chain (DECISIONS-with-justifies-via, REBOUND budget, reviewer-as-gate, ratification flows) is explicitly designed to absorb implementation variance at the appropriate tier. That's the system functioning, not a sign of trust failure. Don't let perfect be the enemy of good — make confident principle-aligned calls; trust the chain to converge.
+
+**The recursive structure:** D3 calibrates HO ↔ the operator, but the variance-absorption pattern applies recursively at every dispatcher↔dispatchee boundary in the chain (HO ↔ implementer; project-orchestrator ↔ implementer; implementer ↔ reviewer). Each dispatcher trusts the next tier with implementation autonomy as long as principle-aligned; each tier's DECISIONS-with-justifies-via is how variance gets centered, not constrained-to-zero. See `rulebook/policies/trust-posture.md` §Disposition for operational application + the backing memory pin `feedback_eventual_correctness_variance_around_target.md`.
+
+**Calibration pointer (2026-06-10, Ratified by the operator, Telegram 3096):** the operational act-vs-park calibration — distinguishing a deferred judgment (reason through + proceed reversibly + surface a lean) from a genuinely-reserved item — lives in `rulebook/policies/trust-posture.md` §Act-vs-park calibration; procedure in `sop/standard/agent-autonomy-act-vs-park.md`. (Policy-tier per ORG-010/ORG-015; this directive carries only the pointer.)
+
+## D4 — Brief quality bar
+**Emanates from:** P1 (structural enforcement over runtime checks) + P5 (roles don't hop — briefs are the contract between dispatcher and dispatchee).
+**Scope:** Every dispatch brief — HO→orchestrator, orchestrator→implementer, HO→implementer-direct. Briefs are the dispatchee's load-bearing input for code work.
+**Effective:** 2026-05-09 (consolidated from 3 incident-shaped memory pins per 2026-05-08 audit; pins surfaced 2026-05-04 b9 cycle and 2026-05-07 supervised first-fire).
+**Re-evaluate:** Quarterly (next: 2026-08-09), OR when a brief-quality regression costs ≥2 REBOUND rounds in a single cycle.
+
+**The directive:** Every named symbol in a brief — methods, CLI subcommands, schema fields, test runners, vocab enumerations, file paths, config keys — is verified at source before being written. Coverage-spec asks ("verify X is tested," "names path Y") are cross-checked against the dispatchee's plan test list before plan-tier approval. Briefs that touch read-paths from a freshly-bootstrapped daemon include a unit-test-level end-to-end smoke (`<route>_returns_<expected>_after_<bootstrap>`-shaped test) so gaps don't surface at supervised-first-fire. Schema-shape compatibility (e.g., serde-pattern fits the schema's table-nesting structure) gets validated at brief-or-plan-tier, not at code-tier.
+
+**How to apply:**
+- Before writing any symbol into a brief, do an actual `Read` or `grep` to confirm spelling, location, adjacent context. Cite line numbers when behavior depends on adjacent code.
+- For vocab/enum lists with distinct-emission semantics, write as typed enumeration with explicit "each is a distinct value" framing — never inline alternatives.
+- Pre-flight cross-check at plan-tier: every coverage-spec ask in the brief has a named test in the plan list. Missing → REBOUND.
+- For read-paths from bootstrapped state, the brief explicitly names the bootstrap step + the unit-test that exercises post-bootstrap behavior.
+- Discipline applies recursively at every tier (HO writes briefs to project-orchestrators; orchestrators write briefs to implementers).
+
+## D5 — Smoke verification discipline
+**Emanates from:** P4 (traceability — audit chain requires verifiable evidence not delta-claims) + P1 (structural enforcement).
+**Scope:** Every plan-tier and code-tier READY message that crosses a tier boundary (implementer → orchestrator, orchestrator → HO).
+**Effective:** 2026-05-09 (consolidated from 2 memory pins per 2026-05-08 audit; pins surfaced T-0111 r0 lesson 2026-05-07).
+**Re-evaluate:** Quarterly (next: 2026-08-09), OR when a green-claim is later contradicted by direct verification.
+
+**The directive:** Smoke results upward are LITERAL command-tail in fenced block, never delta-claims like "+5 passing." Pre-existing failures hide in deltas; only literal output exposes the actual state. Project-orchestrators run the brief's smoke commands DIRECTLY in the worktree before relaying implementer results upward — that's the team-pattern's distinct value-add over HO-direct dispatch. Without orchestrator-tier verification, the orchestrator is just a forwarder. The chain holds because each tier independently verifies, not because each tier trusts the prior.
+
+**How to apply:**
+- Implementer code-tier READY: paste literal command-tail (`cargo fmt --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace` for Echo; equivalent for other projects) in fenced block. Never paraphrase.
+- Orchestrator pre-relay: `cd` into the worktree, run the brief's smoke commands, paste your own literal output alongside the implementer's. If they diverge, REBOUND immediately.
+- Bootstrap-step narration: when smokes depend on a setup step (`tools/setup-onnxruntime.sh`, `bootstrap.sh`, env-var exports), the READY message names every step taken — not "all green," but "ran X then Y then Z; here's the output."
+- Wet-run validation at design-time for IPC patterns and external-binary contracts (single-message smoke against the actual binary's stdio model before locking the architecture).
+
+## D6 — Plan-first protocol + locked-answer-deviation handling
+**Emanates from:** P2 (principles first — locked answers are operationalized principles) + P5 (roles don't hop — implementer doesn't ratify, orchestrator doesn't merge).
+**Scope:** Every implementer-tier dispatch (HO-direct or via project-orchestrator).
+**Effective:** 2026-05-09 (consolidated from 2 memory pins per 2026-05-08 audit; pins surfaced b23 sqlite-store cycle 2026-05-08 + b28 ha-mcp cycle 2026-05-08).
+**Re-evaluate:** Quarterly (next: 2026-08-09), OR when a plan-first violation OR claimed-prior-approval framing surfaces in any cycle.
+
+**The directive:** Implementers return a PLAN before writing code; orchestrator green-lights or REBOUNDs before any edit lands. Implementers MUST NOT self-merge to main. If implementer's plan revises away from a §Locked answer in the brief, they FLAG the deviation explicitly + ASK for re-confirmation; "approved at REBOUND #N" framing on a deviation is rejected unless the orchestrator's REBOUND message literally said "approved" for that exact path. Orchestrator + HO both watchdog at READY review — coverage cross-check before approval; framing-language scan before close.
+
+**How to apply:**
+- Every dispatch brief includes verbatim hard-stop language: "no code edits before plan approval; if you self-merge, the cycle escalates to HO REBOUND regardless of code quality."
+- At plan-tier review: orchestrator scans for locked-answer-deviations + asks "did my prior message literally approve this path?" before accepting.
+- At close-report review: HO scans framing language ("approved," "resolved," "as agreed") against the actual REBOUND-trail. Disagreement → flag in close ledger entry.
+- Framing-as-approved on a deviation triggers in-tier REBOUND (b28 surface) — even if the deviation is correct on architectural merit, the framing bypasses the audit chain.
+
+## D7 — Decision flow execution
+**Emanates from:** D1 (preserve the operator's bandwidth) + D2 (hand-curated docs immutable to workers) + P3 (decisions justify upward) + P5 (roles don't hop).
+**Scope:** Every multi-step build arc + every dispatcher↔dispatchee boundary in the chain (HO ↔ orchestrator ↔ implementer ↔ reviewer).
+**Effective:** 2026-05-09 (consolidated from 3 memory pins per 2026-05-08 audit; pins surfaced 2026-05-04 b9 + 2026-05-04 chain-of-justification ratification). **Amended 2026-06-12 (ORG-034, operator-ratified msg 3767):** intent-first justification — briefs open with the arc-intent line; DECISIONS cite the intent served (or "goal-neutral maintenance"), P/D ids carry the how.
+**Re-evaluate:** Quarterly (next: 2026-08-09), OR when escalation-rate to the operator deviates >2× from running median (signal of D7 mis-execution).
+
+**The directive:** For multi-step build arcs, dispatch via a project-orchestrator + Agent-spawned worker team — the session's implicit agent-team (teammates spawned via the Agent tool's `name` param, addressed via SendMessage; TeamCreate/TeamDelete were removed in Claude Code 2.1.178) — not HO-direct implementer dispatch. **Every dispatch brief OPENS with its arc-intent line** — one sentence of outcome language naming what the work serves (a north star or the parent arc's intent), per ORG-034; when methodology and intent genuinely conflict mid-arc, intent binds and the deviation is FLAGGED (D6 handling, never silent). Each tier absorbs its own variance via DECISIONS that cite **intent-first** (the arc-intent/goal served, or honestly "goal-neutral maintenance") with justifies-via P/D + EX/ED ids carrying the **how**. Most back-and-forth stays inside the tier; bubble-up reserved for 5 structural items: locked-decision deviation, scope-creep beyond dispatched-arc boundary, new dependencies (security/maintenance surface), 3-REBOUND budget exhausted on one ticket, production-enable / supervised-first-fire coordination. D2 hand-curated docs (CLAUDE.md, README, principles, directives, adr/, notes/) stay HO-or-operator; if a brief asks worker to write one, dispatcher cuts the deliverable from worker scope + authors at close (D2 dynamic scope-split).
+
+**How to apply:**
+- Every dispatch brief explicitly partitions: which calls dispatchee can decide autonomously (with justifies-via), which must bubble up via REBOUND. Don't assume inheritance-by-reference.
+- Arc-intent nesting per ORG-034: tickets cite their arc-intent; the arc-intent cites the north star. Don't make leaf workers paste north stars — one sentence at their working altitude. "Goal-neutral maintenance" is a legitimate, honest cite for hygiene/process work.
+- Smell test before firing each dispatch: "is the chain-of-justification rule explicit in this brief, or am I assuming inference?" Fix if inferring.
+- 3-REBOUND budget: three REBOUNDs on the same ticket → bubble up. Most cycles stay 0-1 REBOUND.
+- D2 dynamic scope-split: at brief-authoring, scan for any deliverable touching hand-curated docs; either cut (and author at close) or explicitly note the audit-chain ratification trail in the close ledger entry.
+- Single-shot tasks can still go HO-direct implementer; the team-pattern is for multi-step arcs (≥3 anticipated rounds OR ≥1 design back-and-forth).
+
+## D8 — HO self-discipline (cross-check + autonomy bar + drift)
+**Emanates from:** P3 (decisions justify upward — applies to HO's own decisions) + P4 (traceability) + D3 (autonomy bar — knowing when to act vs hold).
+**Scope:** HO's own conduct: audit-chain commits, surface-to-operator decisions, HO-direct edit loops, sticky-belief drift recovery.
+**Effective:** 2026-05-09 (consolidated from 5 memory pins per 2026-05-08 audit; pins surfaced 2026-05-04 cross-check, 2026-05-06 doom-narrative gap, 2026-05-06 α-vs-γ correction, 2026-05-07 HO-direct drift, 2026-05-07 b15-b16 sticky-belief).
+**Re-evaluate:** Quarterly (next: 2026-08-09), OR when HO surfaces a "still broken" framing that contradicts unread async-task output, OR when HO-direct edit loop crosses the threshold without halt.
+
+**The directive:** Before any audit-chain commit (ledger entry, ADR amendment, ticket transition log, hand-curated doc update), cross-check confidently-stated claims (subagent-relayed OR self-authored) against memory + ledger. Before any "still broken" / doom-narrative surface to the operator, check async inflight work (background tasks, until-loops, async smokes) for completion + results — silence-of-tools is not failure. When reaching for "pause + consult the operator," smell-test for time-pressure / fatigue framing leaking into the act-vs-pause choice; do an explicit P/D pass before surfacing. HO-direct debug loops crossing **3+ atomic edits, >2 source files, ~50 LoC, OR any design-decision** halt + reset to team-pattern (fresh team OR REBOUND active team) — cumulative implementer-territory bypasses reviewer pre-flight + DECISIONS chain audit even when each atomic step is correct. **When implementer drifts on a ratified-locked-answer across 2+ plan iterations** in the same context, fresh-context redispatch with carry-forward set + triple-defense + readback-gate is the structural remediation (per the operator 2026-05-09 ratification — N=2, not vague "N").
+
+**How to apply:**
+- Pre-commit checklist before any audit-chain write: "is this fact in memory or ledger? does it contradict?"
+- Pre-send checklist before any "still broken" Telegram outbound: "did I read the latest output of every background task I started?"
+- Pre-pause checklist before any "consult the operator" framing: "are P&Ds clear here? am I projecting time-pressure?" If P&Ds favor act, act.
+- Edit-loop counter: as soon as I'm at 2 edits across 2 files in the same probe-then-fix flow, evaluate halt-or-reset before edit #3.
+- Sticky-belief drift detection: if implementer's plan-revision still has the same wrong-shape after 2 REBOUND rounds in same context, trigger fresh-context redispatch (don't push for 3rd iteration in-context).
+
+## D9 — Orchestrator response contract + ticket / inbox discipline
+**Emanates from:** P4 (traceability) + P5 (roles don't hop — orchestrator's outputs are part of the audit chain).
+**Scope:** Every HO ask to a spawned orchestrator + every fan-out close that files dependent tickets.
+**Effective:** 2026-05-09 (consolidated from 2 memory pins per 2026-05-08 audit; pins surfaced T-0096 Kerfuffle 8 + T-0080 fan-out cleanup arc).
+**Re-evaluate:** Quarterly (next: 2026-08-09), OR when a spawned orchestrator's response is silent / incomplete relative to the ask.
+
+**The directive:** Every HO ask to a spawned orchestrator carries an explicit response contract: categorical answer + format + timing. Open-ended "explain your reasoning" prompts elicit silent processing, not visible output. At fan-out close, gate tickets with non-empty `depends_on` at filetime via `ticket.py block --depends-on T-NNNN` — inbox-consumer skips tickets with unresolved deps; filing to inbox without the gate costs serial cycles per ticket when the dep fires and the consumer doesn't know.
+
+**How to apply:**
+- Every substantive ask to a spawned orchestrator names: (a) categorical answer expected (yes/no/REBOUND-with-X), (b) format (DECISIONS-with-justifies-via, fenced smoke-output, etc.), (c) timing (within next message OR at next plan-tier checkpoint).
+- Fan-out filing: scan each child ticket's `depends_on` field at filetime; if non-empty, file in `inbox/` with `depends_on: [T-NNNN, ...]` set in frontmatter (ORG-019 shape; cascade-unblock via ORG-013 removes satisfied deps when parent resolves).
+- Orchestrator response contract scales: HO → spawned-orchestrator brief carries it; orchestrator → implementer brief carries it.
+
+*(Note: `blocked_by:` discipline, `blocked/` filing, and `unblock_when`/`unblock_check` fields are retired per ORG-019 (2026-05-19). Blocks are expressed via `not_before` or `depends_on` frontmatter only.)*
+
+## D10 — Context-frugality / minimum-traversal-to-precise-info
+**Emanates from:** D1 (preserve the operator's bandwidth) + D2 (HO's cognitive context budget mirrors the operator's bandwidth at the next tier down) + P4 (traceability requires information durable AND findable).
+**Scope:** All durable knowledge artifacts in the org — ledgers, handoff docs, decision logs, append-only state, multi-record directories.
+**Effective:** 2026-05-09 (per the operator ratification msg_1091; consolidated from `feedback_pantheon_spine_convention.md` + the operator's new framing).
+**Re-evaluate:** Quarterly (next: 2026-08-09), OR when any durable knowledge artifact's load-cost-per-agent-pass exceeds 1500 tokens for the index-tier alone (signal of bloat past D10's structural enforcement).
+
+**The directive:** Information that compounds over time is structured for minimum-traversal-to-precise-info. Default shape is **index + records**: a thin index file gives the map (one-line-per-entry: id / ts / agent / action-tag / one-line summary); record files hold the full content, opened only when a specific entry warrants. **References (path/file/commit pointers) replace transclusion** — the same fact does NOT live duplicated across five places that all drift; one canonical source + N pointers. **Every directory carries a README spine** as its index-map (existing convention, ratified into D10 here). The why is the cognitive-context budget at every tier: bloat in any layer eventually starves the next layer.
+
+**How to apply:**
+- Append-only logs (ledger, handoff sections, audit trails): split into INDEX + records when growing past ~100 entries OR ~5KB JSONL. The INDEX is what loads in agent context; records open on-demand.
+  - **Ledger append convention (D10; weekly-shard per T-0148, ORG-001 §Sub-year sharding):** HO appends each ledger entry to the CURRENT WEEK's shard `pantheon-config/ledger/<ISO-year>-W<NN>/<seg>.jsonl` AND the top-level `ledger/INDEX.md` in the same commit. The segment `<ISO-year>-W<NN>` is computed from the entry's ISO week (`datetime.isocalendar()`) at write time. *(Pre-migration fallback: while `ledger/2026.jsonl` still exists, append to it instead of the week-shard — the writers' `current_write_target` helper resolves this automatically.)*
+- HANDOFF.md grows with each adapter / arc landing — when active file crosses ~500 lines, archive older subsections to `notes/HANDOFF-<period>-archive.md` with a one-line reference from the active file.
+- Information-recording uses pointers: `<see pantheon-config/knowledge/episodic/2026-05-08-X/notes.md §3>` not "here's the same content again." Update the canonical source; readers follow the pointer.
+- Every directory has a README. New directories ship the README in the same commit. The spine is structural, not optional.
+- ADR / research / incidents subdirectories follow the same pattern: a directory-level README that maps the contents, then individual files for full content.
+
+**Empirical grounding (added 2026-05-10 per the operator msg_859):**
+- **Letta filesystem-grep beats Mem0 graph (74.0% vs 68.5% on LoCoMo)** — `knowledge/watch/reports/2026-05-09/agent-memory-systems.md` §4. Direct empirical signal that the agent + filesystem + grep + curated indices shape (i.e., what D10 codifies) outperforms vendor memory frameworks at the relevant scale. Canonical anchor when a memory-framework adoption gets proposed.
+- **Long-context windows are 10-20% effective for reasoning** — `knowledge/watch/reports/2026-05-09/context-degradation-curves.md` §5. BABILong benchmark + MRCR v2 + NoLiMa converge on the finding that LLMs use a small fraction of advertised context for reasoning-grade tasks; the discipline mirrors Anthropic's published 2025 context-engineering guidance but predates it (convergent rather than imitative).
+- **NoLiMa: small models collapse 3–6× harder than frontier at 32K** (added 2026-06-29 per T-1430; `knowledge/watch/reports/2026-06-29/context-management.md` §NoLiMa; arXiv 2502.05167). Latent-association retrieval at 32K tokens — well within Pantheon's operational range:
+
+  | Model | Base (short ctx) | @ 32K | Drop |
+  |---|---|---|---|
+  | GPT-4o mini | 84.9% | 13.7% | −71.2 pts |
+  | Gemini 1.5 Flash | 84.7% | 28.6% | −56.1 pts |
+
+  **Caveat (load-bearing):** NoLiMa measures **latent-reasoning** (inferring non-lexical connections), **not fact-retrieval**. The prior bullet's 10–20% figure (BABILong) likely reflects fact-retrieval where literal matching still partially works; NoLiMa exposes a much steeper floor specifically for reasoning-grade tasks. So this **refines** the small-model case — it does **not** claim long context is useless for retrieval. Operational read for D10: Haiku-class subagents doing *reasoning* work have an effective budget closer to 4–8K than the frontier 25–30%-of-window heuristic. [experiment-only — NoLiMa not yet independently reproduced; Claude 3.5 Haiku/Sonnet per-length numbers not in the excerpt.] Threshold-calibration follow-on tracked separately (T-0178 lineage), not folded here.
+
+## D11 — Third-party surface verification (read the spec; validate against the real API)
+**Emanates from:** D4 (brief quality bar — verify-at-source) + D5 (smoke verification discipline) + P4 (traceability of what's been verified and against what).
+**Scope:** Any implementation work that touches a third-party library, API, SDK, protocol, or external service. Applies to both client code and its validation tests.
+**Effective:** 2026-05-22 (per the operator msg_2059 directive — *"bigger picture sop for third party libraries: read the spec. don't implement blind. catches updates, catches proper data shapes. implementers should be told this"*).
+**Re-evaluate:** Quarterly (next: 2026-08-22), OR when a third-party-API regression bites despite the discipline being followed.
+
+**The directive:** For any third-party surface, READ THE SPEC BEFORE IMPLEMENTING — data shapes, message structures, version-specific behavior, valid field sets, error semantics. Don't infer from training-data memory or partial doc summaries; verify from the authoritative source URL. AND validate against the REAL API/library — fake-server unit/integration tests are necessary but insufficient; they accept what the real surface may reject. Every third-party-touching dispatch carries explicit "read the spec for X" and "validate against the real surface" instructions, and a real-surface smoke is part of the done bar.
+
+**How to apply:**
+- Dispatch briefs for any work touching a third-party surface name: (a) the authoritative spec URL(s) and the specific sections to verify, (b) the fields/shapes/behaviors that must be spec-confirmed BEFORE coding, (c) the live/integration test path against the REAL surface (not just fakes/mocks; gated on a credential env var when applicable). Implementers' plan-first must include spec-confirmed shapes IN the plan.
+- Reviewers REBOUND when a non-trivial third-party path lands without explicit spec verification — especially: new message types, new fields, new endpoints, version bumps, error-handling paths.
+- The smoke loop for third-party paths is necessary-not-sufficient: a passing fake-server integration test does NOT prove the real API accepts the wire content. A real-surface smoke (e.g. `live_smoke`-style, gated on a credential env var) is the validation gate before READY.
+- When a third-party surface gives a generic-but-fatal error (WS close 1003, HTTP 400 with no useful body, an opaque rejection), surface the RAW wire content at debug-level and diff against a working reference — don't swallow rejections in `#[serde(other)]` catch-alls or `?`-short-circuits without logging.
+- **Deploy verification corollary:** after a code change to a daemon/service, verify the running binary is actually the new build (mtime / version stamp / a known new log line on startup). A rebuild does not guarantee deployed.
+- **Test-fixture corollary (the operator msg_2110):** mock-server payloads, recorded inputs, and any other "what the third-party would send/accept" test data MUST be derived from the spec OR captured from the real API — NEVER hand-invented. Inventing the fixture shape couples the test to your assumptions about the API, defeating the test's purpose: the test then validates code-against-assumptions instead of code-against-reality, and real-API rejections or shape changes go uncaught. When a mock is necessary (e.g. unit isolation), the mock must reproduce the spec's exact message shapes; the canonical fixture artifact is a real captured response (e.g. checked-in `.jsonl` recordings from the live API) or a generator that emits spec-conformant payloads.
+
+**Why pinned here.** The 2026-05-22 echo live-demo arc hit this trap three times in one cycle:
+1. **AddTranscript incremental semantics:** Speechmatics' realtime API sends finals as INCREMENTAL spans — each is the newly-processed audio's text; the full transcript is the CONCATENATION. The daemon was driving the orchestrator on each `AddTranscript` → every command arrived as just its first word ("With" instead of full sentences). This is in the spec (`/api-ref/realtime-transcription-websocket` Received Messages). Reading it first at T-0557 would have built the accumulation correctly → would have saved the entire empty-transcript debugging arc (caught by the operator in msg_2057).
+2. **`conversation_config` is Flow-API-only:** T-0568 added `conversation_config.end_of_utterance_silence_trigger` to the realtime `StartRecognition` — but that field is valid only for the Flow API, not realtime transcription. Real Speechmatics rejected with WS code 1003 *"Additional property `conversation_config` is not allowed"*. The fake-server integration test accepted it (no schema validation); only `live_smoke` against real Speechmatics caught it (REBOUND #1).
+3. **Deploy-path gap:** after the REBOUND fix landed in code, `cargo build --release` did not replace the running daemon binary on the next restart (cause TBD — worktree/target-dir interaction). Reproducing locally and running `live_smoke` proved the code was right; only inspecting the running binary's behavior surfaced the deploy gap (REBOUND #2).
+
+The directive captures all three — spec verification, real-surface validation, deploy verification — as a single discipline applied at every third-party-touching boundary.
+
+**Test-fixture provenance (added 2026-05-23 per the operator msg_2110).** A fourth slip in the same arc: the fake-server integration tests accepted shapes the real API rejects (the `conversation_config` issue) AND missed shapes the real API actually emits (the `AudioAdded` "message" field change; the AddTranscript digest shape). Because we hand-invented the fake-server responses, the tests validated our code-against-our-assumptions in a closed loop. The test-fixture corollary above closes this — fixtures must be spec-derived or captured, so the validation reference is the actual API, not our internal model of it.
+
+## D12 — Resource-mindset: well-resourced, structural engineering over wall-clock
+**Emanates from:** P1 (architecture over policy) + P3 (decisions justify upward). *(Drifted "P5 (decision-driven)" dropped as redundant per T-1587 fork (a), ratified the operator 2026-07-06.)*
+**Scope:** All Pantheon engineering work — HO, project-orchestrators, implementers, reviewers, researchers. Pre-MVP through phase 3. Applies to architectural-options framings, dispatch briefs, plan-tier reviews, and any decision-comparison surface.
+**Effective:** 2026-05-27 (per the operator msg_2424 + msg_2428 — *"Let's make my statement on resource mindset an org directive"*).
+**Re-evaluate:** When external time-pressure constraints become genuinely binding (commercial launch deadline, contractual SLA, dependent-arc clock that can't move) AND structural correctness vs deadline becomes a real tension. Hypothetical: project workforce expands beyond the operator, OR a deployment hits a hard external clock that's not movable.
+
+**The directive:** Engineering decisions evaluate against structural correctness, principle alignment, and design integrity — NOT against wall-clock framing, time-to-implement estimates, or fatigue/momentum proxies. Pantheon is well-resourced enough to take the longer correct path whenever the longer path is also the structurally-aligned path. Phrases like "multi-week scope" / "substantial new infrastructure" / "longer arc" / "Phase-2 thing" / "shorter path" / "harder path" as comparison axes in architectural messages are anti-patterns: they smuggle wall-clock into decisions that should be wall-clock-independent.
+
+**How to apply:**
+- Architectural-options messages strip all time-to-implement framing. Compare options on shape + principle-alignment + risk-profile. If a paragraph would still make sense with all timeline mentions removed, that's the version to send.
+- Dispatch briefs do not include "do this fast" / "ship soon" / "land today" language; they include "do this right" + the structural principles to align with. Implementer-side urgency framing belongs only in genuinely external-deadline contexts, surfaced separately per the next bullet.
+- If wall-clock IS a real binding constraint (external deadline, dependent arc with a fixed gate, contractual SLA), surface it as a SEPARATE explicit ratification ask — never woven into the option comparison. That separation forces "the principled answer is X, but the deadline forces Y" to be visible as a tradeoff, not hidden as a structural argument.
+- Reviewer REBOUND surfaces wall-clock framing as a process violation alongside DECISIONS / smoke / scope checks. Cite this directive's id.
+- Smell test before any architectural-options outbound — author OR dispatcher: *"Is anything in this framing about how long it'd take, how soon it'd be done, how late we're working, or how 'big' a path is?"* If yes, strip it before sending.
+
+**Why pinned here.** Two incidents converged into the promotion. msg_843 (2026-05-06, Phase-1b deploy debug): HO presented option (α) ship-partial / (β) socat-bridge / (γ) full-IPC-redesign with framing biased toward (α) by "we're ~4 hours into this deploy / get sleep" subtext. The operator caught: *"You're projecting time constraints. Don't do that, per directive about taking time and doing things the right way."* HO re-presented options without time bias; (β) socat ACCEPT-FD bridge was the structurally-correct answer regardless of clock. Captured as memory pin `user_no_time_pressure_in_architecture.md`.
+
+msg_2424 (2026-05-27, T-0617 architectural fork): HO framed multi-provider LLM fallback as "multi-week scope" to argue against shape-(C)+OpenAI-fallback in favor of shape-(A) template-floor-fix. The operator caught the recurrence: *"multi-week is a strong wording. I doubt it would take that long... You and subagents are overall rushing."* The reality: `IntentClassifier` is already a port (`crates/echo-core/src/ports/classifier.rs`) per EX-1; adding an OpenAI adapter is sibling-crate scope (hours-to-a-day), and Phase-6 roadmap already names "Ollama adapter for IntentClassifier (optional)" exactly because of this port-shape. The "multi-week" gloss made (C) look more expensive than it is — exactly the wall-clock framing the prior pin warned against.
+
+The recurrence after a year-old discipline-tier pin shows prose-tier was insufficient — directive promotion is the structural escalation. The variance-absorption frame (D7 disposition) accepts implementation variance around a target value; this directive defines the target as structural correctness, not "ship soon." Reviewer enforcement closes the loop: a dispatch brief or architectural-options message containing wall-clock framing is REBOUND-worthy.

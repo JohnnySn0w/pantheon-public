@@ -1,0 +1,349 @@
+# Pantheon — systemd unit templates
+
+These are templates for the systemd-user-timer that fires the watch-loop driver and end-of-day digest. They live in the repo as **canonical templates**; the actual installed units live at `~/.config/systemd/user/` on each machine and are not version-controlled.
+
+**Convention amendment (2026-05-09 per T-0102 ratification)**: Telegram bot units were originally per-host / not version-controlled (Orchestrator's + Recovery's both live ONLY at `~/.config/systemd/user/` on their respective accounts; no canonical template here). With T-0102 Phase 1 landing, `claude-telegram-research.service` (Specialist's interactive bot unit) IS version-controlled in this directory as a canonical template. Future-normalization-ticket tracked separately if Orchestrator's + Recovery's units should be lifted to canonical templates too; for now, asymmetry stands (research-side templated, prime + fallback per-host).
+
+## Files
+
+### Watch loop (runs on `claude-research`, the specialist user)
+- [`pantheon-watch.service`](pantheon-watch.service) — runs the driver script once.
+- [`pantheon-watch.timer`](pantheon-watch.timer) — fires the service on schedule (08:00 UTC daily).
+- [`pantheon-watch-digest.service`](pantheon-watch-digest.service) — runs the digest once.
+- [`pantheon-watch-digest.timer`](pantheon-watch-digest.timer) — fires the digest at end of day.
+
+### Knowledge sweep (runs on `claude-research`, the specialist user) — ORG-012 Phase C, T-0781
+- [`pantheon-knowledge-sweep.service`](pantheon-knowledge-sweep.service) — runs `tools/knowledge_sweep.py --file-sweep-ticket` once. Due-detector: content-fingerprints the corpus (`lessons/ bugs/ incidents/ notes/ sop/ rulebook/ adr/ knowledge/` + accessible `feedback_*.md` pins); if it changed since the last *completed* sweep (and no sweep dispatch is already pending), files ONE `target=specialist` sweep-dispatch ticket carrying the team-SOP review recipe. Fires NO subagent itself — the in-session review fan-out (team-pattern per `team-orchestrator-dispatch-checklist.md`) + VERIFY-against-repo + SOP-shaped filing (`throughline-sweep-result-filing.md`) happen when Specialist actions the ticket; `--land-sweep` then records the new baseline. Default-safe (T-0261); idempotent. Quiet days = no-op.
+- [`pantheon-knowledge-sweep.timer`](pantheon-knowledge-sweep.timer) — fires the service daily at 13:00 UTC, offset from `pantheon-spine-index-groom.timer` (12:30) and `pantheon-watch-digest.timer` (18:00) to avoid push contention.
+
+### Ticket grooming (runs on `claude-fallback`, the Recovery user)
+- [`pantheon-grooming.service`](pantheon-grooming.service) — runs the staleness scanner once. Per fire: scans `tickets/active/` (only; `tickets/blocked/` retired per ORG-019 2026-05-19), flags stale tickets idempotently in their transition logs, auto-commits via the shared `_git_utils` discipline, and sends a plain-text Telegram digest as proof-of-life.
+- [`pantheon-grooming.timer`](pantheon-grooming.timer) — fires the service daily at 12:00 UTC (interleaved with the watch loop's 08:00 UTC fire to avoid dispatch contention).
+
+### Suite-health soak filer (runs on `claude-fallback`, the Recovery user)
+- [`pantheon-soak-filer.service`](pantheon-soak-filer.service) — runs `tools/soak_filer.py --file-soak-tickets` once. Files ONE per-account suite-health soak ticket to specialist/orchestrator/recovery (T-0991 option b / T-0992), idempotently (skips any account whose prior leg is still unresolved — scans `tickets/inbox/` + `active/`, matched on the `suite-health-soak-auto` label). Each receiving agent runs its own leg in-session with the guarded invocation `PANTHEON_DISABLE_LIVE_TELEGRAM=1 python3 -m unittest discover -s tools -t .` and resolves with the green count. Central trigger (recovery only); decentralized execution removes the cross-account-sudo dependency. Fires NO suite itself. Default-safe (T-0261).
+- [`pantheon-soak-filer.timer`](pantheon-soak-filer.timer) — fires the service monthly on the 1st at 06:00 UTC (`Persistent=true` so a missed fire while the VPS was down runs on next boot).
+
+### Channel-liveness monitor (runs on `claude-fallback`, the Recovery user)
+- [`pantheon-channel-liveness.service`](pantheon-channel-liveness.service) — runs `tools/channel_liveness_monitor.py --all` once. Probes every configured agent's INBOUND Telegram poller (`bot.pid` → live `bun server.ts`; the single-poller-409 death signature is bot.pid present but its PID dead) — distinct from session-liveness, which reads green while an agent is comms-dark (T-0893/T-0894 gap). Alert-only via `route_failure_alert` (others→Recovery, recovery-self→the operator), 30-min per-agent cooldown. Cross-account reads via Recovery's sudo. Auto-remediation + the `mcp list` guard + restart-path hardening are separate gated prongs (T-0894 children).
+- [`pantheon-channel-liveness.timer`](pantheon-channel-liveness.timer) — fires the service every 5 minutes (`OnCalendar=*-*-* *:0/5:00`).
+- [`pantheon-ancestor-liveness.service`](pantheon-ancestor-liveness.service) — runs `tools/ancestor_liveness_monitor.py` once (T-1134). Detects an alive-but-WEDGED the-ancestor daemon (process up via `Restart=always`, but its `ancestor-daemon` tmux session stuck) — the T-0510-class gap that `Restart=always` can't see. Read-only pane probe (Recovery → sudo): ALIVE iff the live bottom shows the idle (`? for shortcuts`) or mid-turn (`esc to interrupt`) sentinel. DETECT+ALERT live (a confirmed wedge — N=3 consecutive not-alive — routes via `route_failure_alert` → Recovery; the-ancestor is channel-less); auto-RESTART (kill-session → `Restart=always` respawns) is ship-dark behind `PANTHEON_ANCESTOR_REMEDIATE_ENABLED` (default off) pending a supervised first-fire. Cooldown + consecutive-N guard against loops/transients.
+- [`pantheon-ancestor-liveness.timer`](pantheon-ancestor-liveness.timer) — fires the service every 10 minutes (`OnCalendar=*-*-* *:0/10:00`); lighter cadence than channel-liveness since the-ancestor is thin/idle.
+- [`pantheon-credential-expiry.service`](pantheon-credential-expiry.service) — runs `tools/credential_expiry_monitor.py --all` once. Pure file-read of every agent's `~/.claude/.credentials.json` (no LLM/API) — so it keeps working during a full auth outage and alerts the operator **directly** via the Telegram bot token (independent of Claude OAuth). Flags `NO_REFRESH` (empty/missing refresh token — the exact 2026-06-20→22 Specialist failure: cannot auto-renew → hard 401 at access-token expiry) and `MALFORMED` creds; access-token near/post expiry **with** a valid refresh token is normal auto-renew and is NOT alerted (no nightly false alarms). Per-`(agent,class)` 6h alert cooldown. The complementary present-but-revoked-refresh / actively-401ing case (not file-readable) is covered by the auth-outage detector inside `context_fill_monitor` (`_maybe_fire_auth_outage`, T-1223 — sustained recent 401 run in the session JSONL → direct-operator alert, never restart; ships ON). Re-login runbook: `sop/remediation/agent-oauth-relogin.md`.
+- [`pantheon-credential-expiry.timer`](pantheon-credential-expiry.timer) — fires the service hourly (`OnCalendar=*-*-* *:35:00`, `Persistent=true`).
+- [`pantheon-disk-usage.service`](pantheon-disk-usage.service) — runs `tools/disk_usage_monitor.py --check` once. Pure `df` read of the root FS (no LLM/API) — alerts the operator **directly** via the Telegram bot token when used% crosses `WARN` (85) / `URGENT` (92), throttled per class (6h cooldown) so the hourly timer nags without spamming. On breach it appends a best-effort per-home size breakdown (cross-account `du` via sudo) so the alert is actionable. Built 2026-06-26 after build/venv caches (a 51G Rust `target/`, a 5.2G `.venv`) pushed the FS to 82% with nothing watching it — a full root FS wedges every agent (can't write session logs/handoffs/commits). Thresholds + watch path are env-overridable (`PANTHEON_DISK_WARN_PCT`, `PANTHEON_DISK_URGENT_PCT`, `PANTHEON_DISK_WATCH_PATH`).
+- [`pantheon-disk-usage.timer`](pantheon-disk-usage.timer) — fires the service hourly (`OnCalendar=*-*-* *:50:00`, `Persistent=true`; offset from the `:35` credential timer to spread load).
+- [`pantheon-worktree-sweeper.service`](pantheon-worktree-sweeper.service) — runs `tools/stale_worktree_sweeper.py --clean`. The *cause* side of the 2026-06-25 disk-full (the disk-usage monitor is the symptom side): agents spawn throwaway build worktrees (e.g. `/tmp/echo-T-1312`), each carrying a 10-20G Rust `target/`; post-merge stragglers accumulate until the FS fills. Removes a worktree ONLY when every guard passes — not the main checkout, path under `/tmp`, tracked tree clean, and HEAD an **ancestor of origin/main** (fully merged) — so it can never drop unmerged/in-progress work (mid-arc worktrees are kept). Cross-account via sudo (operates as each repo's owner). Tool defaults to dry-run; the unit passes `--clean`. T-1324b.
+- [`pantheon-worktree-sweeper.timer`](pantheon-worktree-sweeper.timer) — fires the sweeper 6-hourly (`OnCalendar=*-*-* 00,06,12,18:40:00`, `Persistent=true`).
+
+### Telegram bun-child watchdog (runs on `claude-fallback`, the Recovery user) — T-1456
+- [`recovery-telegram-child-watchdog.service`](recovery-telegram-child-watchdog.service) — runs `~/.local/bin/recovery-telegram-child-watchdog.sh` once (repo source: [`recovery-telegram-child-watchdog.sh`](recovery-telegram-child-watchdog.sh)). Auto-**recovers** the telegram plugin's `bun server.ts` child (== `bot.pid`) dying MID-SESSION — the "comms-dark drop" that only Recovery hits in practice (Recovery runs 12h+ sessions; orchestrator/specialist context-fill-restart every ~1.5-3h so their child rarely lives long enough to hit the transient that kills it). That child is a **combined** MCP-stdio-server + grammy-poller; when it exits, Claude does NOT re-spawn the stdio child in-session, so BOTH directions stay dark until a full session self_restart. `recovery-bot-supervise.sh` only watches the tmux **session** (which stays alive here), so it cannot catch this. Pure pgrep/`bot.pid` check (no LLM/API — works while comms are dark); on a confirmed death it fires the sanctioned `self_restart.sh`, **bounded**: `DEBOUNCE=2` fires (rides out a legitimate restart's transient child-absence) + `BOOT_GRACE=150s` + `COOLDOWN=600s` (one restart per effectiveness window) + a per-hour `CAP=3`, past which it **stops** and alerts the operator directly (bot token, independent of Claude OAuth). Every detection/action is appended to `~/.claude/logs/recovery-telegram-watchdog.log` (the observability half of T-1456). Fail-open (exits 0 on any unexpected error). Complements the fleet-wide, alert-only, cross-account `pantheon-channel-liveness` **detector** above — this is the Recovery-**self** auto-remediation prong (tighter 90s cadence for fast comms recovery; the T-0894 "auto-remediation" idea, Recovery-scoped). Smoke: [`test_recovery_telegram_child_watchdog.sh`](test_recovery_telegram_child_watchdog.sh) (sandbox-`$HOME`, `--simulate-absent --dry-run`; expect `N passed, 0 failed`). **Recovery-per-host** (like `recovery-bot-supervise.sh`): script installed under `~/.local/bin`, units under `~/.config/systemd/user/`; the repo copies are canonical source.
+- [`recovery-telegram-child-watchdog.timer`](recovery-telegram-child-watchdog.timer) — fires the service every 90s (`OnUnitActiveSec=90s`, `OnBootSec=2min`); cheap (a pgrep) so a genuine death auto-recovers in ~3min (DEBOUNCE×cadence).
+
+### Spine-index grooming (runs on `claude-fallback`, the Recovery user)
+- [`pantheon-spine-index-groom.service`](pantheon-spine-index-groom.service) — runs `tools/spine_index_groom.py` once. Per fire: walks each spine dir (`knowledge/episodic/`, `tools/`, `notes/`, `bugs/`, `incidents/`, `knowledge/watch/reports/`, `adr/`, `ledger/`), reads `<dir>/README.md` for the existing `<!-- AUTOGEN-START spine-index --> ... <!-- AUTOGEN-END spine-index -->` sentinel region, regenerates table rows from disk state, writes back only if rows changed. Mtime-cached to skip unchanged dirs (`~/.local/state/pantheon/index_groom_cache.json`, `CACHE_SCHEMA_VERSION=1`). Auto-commits + pushes via the shared `_git_utils` discipline (HERMES-guarded). Generalizes the now-retired `tools/ledger_index_groom.py` per T-0141. Idempotent: re-runs are no-op when all spine indexes are current. **Production-README sentinel-region migration is gated behind T-0143** (handler tune-up to match production-README curated shape) — until that lands, the script grooms the legacy `ledger/INDEX.md` only.
+- [`pantheon-spine-index-groom.timer`](pantheon-spine-index-groom.timer) — fires the service daily at 12:30 UTC, offset from `pantheon-grooming.timer` at 12:00 UTC to avoid simultaneous-push contention.
+
+### Activity digest (runs on `claude-fallback`, the Recovery user)
+- [`pantheon-activity-digest.service`](pantheon-activity-digest.service) — runs `tools/activity_digest.py` once. Per fire: gathers tickets resolved in the last 5hr window from `tickets/done/`, classifies by BACKLOG arc + project, posts a short Telegram-Markdown digest to the operator, appends a ledger entry on non-empty windows. Quiet windows post a one-line "no notable activity" message; no ledger write.
+- [`pantheon-activity-digest.timer`](pantheon-activity-digest.timer) — fires the service every 5 hours at 00/05/10/15/20 UTC (B10 system-pulse signal per T-0057 / T-0063 / T-0064).
+
+### Non-security apt updates (system-level, runs as root)
+- [`pantheon-apt-update.service`](pantheon-apt-update.service) — runs `apt-get update && apt-get -y --without-new-pkgs upgrade`. Daily auto-security path (`apt-daily-upgrade.service` + `50unattended-upgrades`) already covers security updates; this service is the non-security counterpart.
+- [`pantheon-apt-update.timer`](pantheon-apt-update.timer) — fires the service weekly Mon 04:00 UTC ± 30min jitter. **System timer**, not user timer (apt requires root).
+
+### HO auto-resumer (runs on `claude`, the prime user)
+- [`pantheon-ho-resumer.service`](pantheon-ho-resumer.service) — polls `~/.local/state/pantheon/ho_limit_hit.json` once per fire; if `resets_at + 90s` has arrived and HO isn't already running a `--resume`, fires `claude --resume <session_id> -p "<locked-prompt>"` and rotates the state file. Bail-and-poll design: scripts terminates fast if it's not yet time. See `tools/ho_resumer.py` and the upstream StopFailure hook at `tools/hooks/ho_stop_failure.py`.
+- [`pantheon-ho-resumer.timer`](pantheon-ho-resumer.timer) — fires the service every 5 minutes (`OnCalendar=*-*-* *:0/5:00`). Worst-case latency between window-refresh and resume is ~5min; acceptable for the use case (cap-hits are infrequent; Max plan windows are 5h).
+
+### Adaptive-finish digest (runs on `claude`, the prime user — T-0907)
+- [`pantheon-adaptive-finish-digest.service`](pantheon-adaptive-finish-digest.service) — runs `tools/adaptive_finish_digest.py` once. Reads the detector's audit log (`~/.local/state/pantheon/adaptive_finish_log.jsonl`) read-only, summarizes the last 7d of narrate-then-exit hits (count, by-agent, by-phrase, samples), and sends a plain-text Telegram digest via the shared `watch_digest` Bot-API helper. **Skip-on-empty by default** (no send on a zero-hit week; the operator is noise-averse per msg_1934) — `--always` to force. Cadence locked by HO in the T-0220 brief (decision #1). Read-only over the detector; the detector code is untouched.
+- [`pantheon-adaptive-finish-digest.timer`](pantheon-adaptive-finish-digest.timer) — fires the service weekly (`OnCalendar=Mon *-*-* 09:15:00 UTC`, `Persistent=true`), offset 15min from the weekly ticket-summary (Mon 09:00).
+
+### Policy outflow (runs on `claude`, the prime user — T-0834, ORG-012 application half)
+- [`pantheon-policy-outflow.service`](pantheon-policy-outflow.service) — runs `tools/policy_outflow_sync.py` once. Regenerates `notes/recent-policy-changes.md` — a generated, pointer-only digest of P&Ds/ADRs/SOPs (rulebook/+adr/+sop/) changed in the last 30d, from `git log`. The ORG-012 OUTFLOW half (T-0781 is inflow): persona briefs point at this digest for the recency signal so newly-ratified knowledge gets applied. **Default-safe** (commits+pushes only when the digest content changed; README/index files excluded; digest lives in notes/ so it never self-triggers).
+- [`pantheon-policy-outflow.timer`](pantheon-policy-outflow.timer) — fires the service daily (`OnCalendar=*-*-* 12:45:00 UTC`, `Persistent=true`), offset from spine-index-groom (12:30) so the digest reflects the day's grooming. Folder-change-trigger upgrade (ORG-013-shaped) is a deferred follow-up.
+
+### Telegram bridge (runs on `claude`, the prime user — ORG-004 Phase 1)
+- [`pantheon-bridge.service`](pantheon-bridge.service) — persistent foreground service (`Type=simple`, `Restart=always`, `RestartSec=5`). Runs `~/pantheon-bridge/.venv/bin/telegram-bridge serve`, the single owner of Telegram's `getUpdates` poll lock. Multi-client SSE/HTTP exposed on loopback for Orchestrator/Specialist/Recovery to consume. Replaces the in-process Telegram MCP plugin's polling, which contends with subagent dispatches inside the `claude` user account (Issue #46617). EnvironmentFile at `~/.claude/channels/telegram-bridge/.env` (mode 0600; contains `BOT_TOKEN`, per-instance `BRIDGE_TOKEN_*`, `BRIDGE_PORT`). Routing config at `~/.claude/channels/telegram-bridge/routing.yaml` (operator-staged, validated by `telegram-bridge --validate-config <path>` before deploy). State persisted in `~/.claude/channels/telegram-bridge/state.db` (SQLite). **No timer**: the bridge is a long-running daemon, not a cron-style oneshot.
+
+### Specialist long-lived TUI (runs on `claude-research`, the specialist user — T-0102 Phase 1)
+- [`claude-telegram-research.service`](claude-telegram-research.service) — one-shot user-systemd unit that bootstraps a long-lived tmux session running Claude Code (bare invocation; **no `--channels` plugin** per the operator msg_784/785 scope-tightening 2026-05-09). Specialist does NOT have an interactive Telegram surface; this unit exists solely so the inbox-consumer cron's `tmux send-keys` injection has a Claude Code session to land on. Outbound Specialist messaging stays on the existing direct-curl POST path (`activity_digest.py` + watch-loop digest); no inbound DM surface. Mirrors the Recovery-side `claude-telegram-fallback.service` shape (Type=oneshot + RemainAfterExit=yes); differs on account name (`claude-research`), tmux session name (`claude-research-bot`), and description. Unit name retained for stability — `claude-telegram-research.service` is a slight misnomer post-scope-tightening (no telegram bridge); future-rename to `claude-tui-research.service` is a follow-up cleanup, not blocking. **Unlike Orchestrator's + Recovery's telegram-bot units which are per-host, this unit IS version-controlled per T-0102 ratification** — see §Files convention amendment above.
+
+## Install
+
+### Watch loop (run as `claude-research`)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/pantheon-config/tools/systemd/pantheon-watch.service ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-watch.timer ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-watch-digest.service ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-watch-digest.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now pantheon-watch.timer
+systemctl --user enable --now pantheon-watch-digest.timer
+loginctl enable-linger claude-research  # ensure timers run when the user isn't logged in
+```
+
+### Ticket grooming (run as `claude-fallback`, i.e. Recovery)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/pantheon-config/tools/systemd/pantheon-grooming.service ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-grooming.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now pantheon-grooming.timer
+loginctl enable-linger claude-fallback  # ensure timers run when the user isn't logged in
+```
+
+### Spine-index grooming (run as `claude-fallback`, i.e. Recovery)
+
+```bash
+mkdir -p ~/.config/systemd/user
+# Migration from the old pantheon-ledger-index-groom (renamed 2026-05-09 per T-0141):
+systemctl --user disable --now pantheon-ledger-index-groom.timer 2>/dev/null || true
+rm -f ~/.config/systemd/user/pantheon-ledger-index-groom.{service,timer}
+# Install the new spine-index-groom units:
+cp ~/pantheon-config/tools/systemd/pantheon-spine-index-groom.service ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-spine-index-groom.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now pantheon-spine-index-groom.timer
+# linger already enabled for ticket-grooming; no separate enable-linger needed.
+```
+
+### Activity digest (run as `claude-fallback`, i.e. Recovery)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/pantheon-config/tools/systemd/pantheon-activity-digest.service ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-activity-digest.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now pantheon-activity-digest.timer
+# linger already enabled for ticket-grooming; no separate enable-linger needed.
+```
+
+### HO auto-resumer (run as `claude`)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/pantheon-config/tools/systemd/pantheon-ho-resumer.service ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-ho-resumer.timer ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now pantheon-ho-resumer.timer
+loginctl enable-linger claude  # ensure timer runs when the user isn't logged in
+```
+
+### Restart drain — the self-heal core (run as EACH agent: `claude`, `claude-research`, `claude-fallback`) (T-0783)
+
+Processes restart tombstones → graceful agent restarts. Runs per-account (each account drains its OWN tombstones — same-account self-restart). Ships **default-OFF**; the `enable.conf` drop-in arms it (it bails clean unless `PANTHEON_RESTART_DRAIN_ENABLED=1`), so the first arming should follow a supervised first-fire.
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/pantheon-config/tools/systemd/pantheon-restart-drain.service ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-restart-drain.timer   ~/.config/systemd/user/
+# feature-flag drop-in (arms the drain; omit to leave it installed-but-inert):
+mkdir -p ~/.config/systemd/user/pantheon-restart-drain.service.d
+printf '[Service]\nEnvironment=PANTHEON_RESTART_DRAIN_ENABLED=1\n' \
+  > ~/.config/systemd/user/pantheon-restart-drain.service.d/enable.conf
+systemctl --user daemon-reload
+systemctl --user enable --now pantheon-restart-drain.timer   # ~30s cadence
+loginctl enable-linger "$USER"
+```
+
+### Context-fill + activity monitors + ticket-lint (run as `claude-fallback`, i.e. Recovery) (T-0783)
+
+Recovery runs the system-wide self-heal monitors (it holds the cross-account sudo to watch the others). The context-fill monitor is parametric (`@<agent>`) — enable one timer instance per agent watched.
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/pantheon-config/tools/systemd/pantheon-context-fill-monitor@.service ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-context-fill-monitor@.timer   ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-activity-monitor@.service     ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-activity-monitor@.timer       ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-ticket-lint.service           ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-ticket-lint.timer             ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-credential-expiry.service     ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-credential-expiry.timer       ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-disk-usage.service            ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-disk-usage.timer              ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-worktree-sweeper.service      ~/.config/systemd/user/
+cp ~/pantheon-config/tools/systemd/pantheon-worktree-sweeper.timer        ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# context-fill monitor: one @-instance per agent watched (every 5 min):
+systemctl --user enable --now pantheon-context-fill-monitor@orchestrator.timer
+systemctl --user enable --now pantheon-context-fill-monitor@specialist.timer
+systemctl --user enable --now pantheon-context-fill-monitor@recovery.timer
+# activity monitor (ORG-011 HO-absent queue-poke) — currently watches orchestrator:
+systemctl --user enable --now pantheon-activity-monitor@orchestrator.timer
+# ticket-lint (hourly :20 frontmatter scan + auto-fix):
+systemctl --user enable --now pantheon-ticket-lint.timer
+# credential-expiry monitor (hourly :35 — OAuth-credential health; Jun-2026 outage prevention):
+systemctl --user enable --now pantheon-credential-expiry.timer
+# disk-usage monitor (hourly :50 — root-FS capacity; fleet-wedge-on-full prevention):
+systemctl --user enable --now pantheon-disk-usage.timer
+# stale-worktree sweeper (6-hourly :40 — auto-remove merged throwaway build worktrees; T-1324b):
+systemctl --user enable --now pantheon-worktree-sweeper.timer
+loginctl enable-linger claude-fallback
+```
+
+The context-fill monitor's per-agent detector legs — **api-health force-restart** (`PANTHEON_API_HEALTH_ENABLED`), **wedge/staleness** (`PANTHEON_STALENESS_ENABLED`), and **model-outage alert** (`PANTHEON_MODEL_OUTAGE_ENABLED`) — are each armed by a one-line drop-in on `pantheon-context-fill-monitor@<agent>.service.d/`. These drop-ins live only in Recovery's `~/.config` (not in the unit templates here), so they are **reproducible via `tools/provision_context_fill_monitor_dropins.py`** (T-1214) rather than hand-created:
+
+```bash
+# After (re)installing the @-instances above, re-arm the detector legs:
+python3 ~/pantheon-config/tools/provision_context_fill_monitor_dropins.py --provision
+# Confirm every leg is armed (exits non-zero on any missing):
+python3 ~/pantheon-config/tools/provision_context_fill_monitor_dropins.py --verify
+```
+
+The tool IS the canonical manifest (agents × detectors); a re-provision that skips it leaves the legs disarmed, which `verify_startup.sh` surfaces as a SOFT WARN at the next boot (C9 guard) instead of letting detection go silently dark. The api-health/staleness/model-outage cutover history (each leg was first-fired supervised before fleet-wide) lives in the ticket trail (T-0857 / T-1126) and the ledger — see also the `context_fill_monitor.py` module docstring. Each leg is removable (delete the `.conf` + `systemctl --user daemon-reload`) to disarm.
+
+### Specialist interactive bot (run as `claude-research`)
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp ~/pantheon-config/tools/systemd/claude-telegram-research.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now claude-telegram-research.service
+
+# Then enable the inbox-consumer timer for specialist (uses the parametric pantheon-inbox-consumer@.{service,timer} template; no per-instance file needed):
+systemctl --user enable --now pantheon-inbox-consumer@specialist.timer
+
+# linger for the user (idempotent; required for user-units to survive logout):
+loginctl enable-linger claude-research
+```
+
+**Plugin install + Claude Code auth** in `claude-research`'s `~/.claude/` (using existing botfather identity per the operator 2026-05-09 msg_1108) is operator-tier work — Phase 2 of T-0102; tracked at T-0145 (Recovery-target follow-up ticket) since Recovery has the asymmetric-repair-sudo for cross-account install.
+
+### Telegram bridge (run as `claude` — ORG-004 Phase 1, T-0026 install)
+
+**CRITICAL — do NOT auto-start or auto-enable on T-0026 install.** The bridge acquires Telegram's `getUpdates` lock when it starts; doing so while the official Telegram MCP plugin is still active (default state today) evicts the plugin's lock and breaks Orchestrator's MCP inbound. T-0027 owns the live cutover in tight sequence with the per-instance MCP-config flip; T-0026 stops at "unit installed, recognized, inactive."
+
+```bash
+# Pre-reqs: ~/pantheon-bridge already cloned + venv built (T-0025);
+# ~/.claude/channels/telegram-bridge/{.env,routing.yaml} already staged + 0600.
+mkdir -p ~/.config/systemd/user
+cp ~/pantheon-config/tools/systemd/pantheon-bridge.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+
+# Verify ONLY — do not start, do not enable:
+systemctl --user status pantheon-bridge.service --no-pager   # expect: loaded; inactive (dead)
+systemctl --user is-enabled pantheon-bridge.service          # expect: disabled
+systemd-analyze --user verify pantheon-bridge.service        # expect: clean
+```
+
+If you accidentally start it: `systemctl --user stop pantheon-bridge.service` and the official plugin reclaims the `getUpdates` lock on its next poll (~30s). No message loss; brief inbound gap.
+
+### Non-security apt updates (run as `root` — the operator's hands)
+
+This is a **system** timer, not a user timer. Bot accounts (`claude`, `claude-fallback`, `claude-research`) lack root sudo per VPS topology; root operations land via the operator over tailscale SSH.
+
+```bash
+# As root:
+cp /home/claude/pantheon-config/tools/systemd/pantheon-apt-update.service /etc/systemd/system/
+cp /home/claude/pantheon-config/tools/systemd/pantheon-apt-update.timer   /etc/systemd/system/
+systemctl daemon-reload
+systemctl enable --now pantheon-apt-update.timer
+```
+
+The unit fires Monday 04:00 UTC (low-traffic window, well after `apt-daily-upgrade.service`'s daily fire) with 30min randomized jitter. Output goes to journal; no Telegram digest in v0 (operator polls journal weekly, or wires a `needrestart`-driven notify hook later if drift becomes a real problem). Reboot policy: **skip auto-reboot, surface in journal** — kernel-required-reboot is rare and the operator decides timing.
+
+## Verify
+
+```bash
+# Watch loop (claude-research)
+systemctl --user list-timers pantheon-watch*
+journalctl --user -u pantheon-watch.service -n 50 --no-pager
+journalctl --user -u pantheon-watch-digest.service -n 50 --no-pager
+
+# Grooming (claude-fallback)
+systemctl --user list-timers pantheon-grooming*
+journalctl --user -u pantheon-grooming.service -n 50 --no-pager
+
+# Spine-index grooming (claude-fallback)
+systemctl --user list-timers pantheon-spine-index-groom*
+journalctl --user -u pantheon-spine-index-groom.service -n 50 --no-pager
+
+# Activity digest (claude-fallback)
+systemctl --user list-timers pantheon-activity-digest*
+journalctl --user -u pantheon-activity-digest.service -n 50 --no-pager
+
+# Apt updates (system, run as root)
+systemctl list-timers pantheon-apt-update*
+journalctl -u pantheon-apt-update.service -n 50 --no-pager
+
+# HO auto-resumer (claude)
+systemctl --user list-timers pantheon-ho-resumer*
+journalctl --user -u pantheon-ho-resumer.service -n 50 --no-pager
+
+# Telegram bridge (claude) — only after T-0027 cutover starts the service
+systemctl --user status pantheon-bridge.service --no-pager
+journalctl --user -u pantheon-bridge.service -n 50 --no-pager
+```
+
+## Manual fire
+
+```bash
+# Watch loop (run as claude-research):
+systemctl --user start pantheon-watch.service
+python3 ~/pantheon-config/tools/watch_runner.py --dry-run    # see what would fire
+python3 ~/pantheon-config/tools/watch_runner.py              # fire all due topics
+python3 ~/pantheon-config/tools/watch_runner.py --topic anthropic-claude-code-changelog
+
+# Grooming (run as claude-fallback / Recovery):
+systemctl --user start pantheon-grooming.service
+python3 ~/pantheon-config/tools/ticket_grooming.py --dry-run --no-digest    # passive sanity-check
+python3 ~/pantheon-config/tools/ticket_grooming.py --no-digest              # real scan + auto-commit, no Telegram send
+python3 ~/pantheon-config/tools/ticket_grooming.py                          # full fire (scan + commit + push + digest)
+
+# Spine-index grooming (run as claude-fallback / Recovery):
+systemctl --user start pantheon-spine-index-groom.service
+python3 ~/pantheon-config/tools/spine_index_groom.py --dry-run              # scan + print rows-to-append, no write
+python3 ~/pantheon-config/tools/spine_index_groom.py --no-push              # write + commit, skip push
+python3 ~/pantheon-config/tools/spine_index_groom.py                        # full fire (write + commit + push)
+
+# Activity digest (run as claude-fallback / Recovery):
+systemctl --user start pantheon-activity-digest.service
+python3 ~/pantheon-config/tools/activity_digest.py --agent recovery --dry-run   # gather + render, no Telegram send
+python3 ~/pantheon-config/tools/activity_digest.py --agent recovery             # full fire (gather + render + Telegram + ledger)
+
+# HO auto-resumer (run as claude):
+systemctl --user start pantheon-ho-resumer.service
+python3 ~/pantheon-config/tools/ho_resumer.py    # manual poll (bails clean if no state file or not-yet-time)
+```
+
+## State + log locations
+
+### Watch loop
+- State (last-fire dates per topic): `~/.local/state/pantheon/watch/state.json`
+- Driver per-fire stdout/stderr capture: `~/.local/log/pantheon/watch/<date>-<slug>.log`
+- systemd journal for the units: `journalctl --user -u pantheon-watch.service`
+
+### Grooming
+- No state file (the staleness data lives entirely in each ticket's transition log; the grooming agent re-derives it every fire).
+- systemd journal for the unit: `journalctl --user -u pantheon-grooming.service`
+- Telegram digest history: visible in the chat itself; no local mirror at v0.
+
+### HO auto-resumer
+- State file (written by the StopFailure hook): `~/.local/state/pantheon/ho_limit_hit.json`
+- Consumed (post-fire archive): `~/.local/state/pantheon/ho_limit_hit.json.consumed.<epoch>`
+- systemd journal: `journalctl --user -u pantheon-ho-resumer.service`
+
+**Troubleshooting checklist (post-incident):**
+1. State file present? `ls -lh ~/.local/state/pantheon/ho_limit_hit.json`
+2. mtime fresh (< 24h)? `stat ~/.local/state/pantheon/ho_limit_hit.json`
+3. `resets_at` parseable? `python3 -c "import json,pathlib; print(json.loads(pathlib.Path('~/.local/state/pantheon/ho_limit_hit.json').expanduser().read_text())['resets_at'])"`
+4. Timer firing? `systemctl --user list-timers pantheon-ho-resumer*`
+5. Journal shows recent fires? `journalctl --user -u pantheon-ho-resumer.service -n 20 --no-pager`
+6. claude binary reachable? `which claude` or check `PANTHEON_CLAUDE_BIN` in the service unit.
+
+## Notes
+
+- The `claude` binary path is set via the `PANTHEON_CLAUDE_BIN` env var in the service unit (default: `~/.npm-global/bin/claude`). Adjust if your install layout differs.
+- The digest timer runs after the driver (offset ≥ 1h to give last fires time to land). See the `OnCalendar` lines in the timer files.
+- Both timers persist `Persistent=true` so missed fires (laptop closed / VPS reboot during fire window) re-run on next boot.
+
+## S3* audit dispatch (ORG-038 pilot)
+
+`pantheon-s3star-audit.timer` → `pantheon-s3star-audit.service` (oneshot, daily 08:30 UTC tick, runs as `claude`/Orchestrator): invokes `tools/s3star_audit_runner.py --file-dispatch-ticket`, which checks both pilot cadences (weekly-narrow / monthly-integrated) and, for any due slot, composes the audit brief from the ORG-038 proposal verbatim and files a SUPERVISED dispatch ticket to orchestrator (no unattended Codex dispatch exists — `--auto-dispatch` deliberately raises; see T-1583). Findings return via `--land-findings`, which files one ticket per finding to domain owners (never to codex). Enable at supervised-first-fire only: `systemctl --user enable --now pantheon-s3star-audit.timer`. State: `~/.local/state/pantheon/s3star_audit/`; log: `~/.local/log/pantheon/s3star_audit_runner.log`.

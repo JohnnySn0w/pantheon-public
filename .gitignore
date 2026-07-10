@@ -1,0 +1,26 @@
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+__pycache__/
+*.pyc
+.claude/worktrees/
+
+# Secrets — never commit credentials (guard for the multi-writer shared repo).
+# Verified 2026-06-24 (pre-share secrets scan): tree + full history clean.
+.env
+*.env
+.env.*
+!.env.example
+*.pem
+*.key
+id_rsa
+id_ed25519
+*.p12
+*.pfx
+*_token.txt
+secrets.yaml
+secrets.yml
+credentials.json

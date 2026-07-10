@@ -1,0 +1,18 @@
+[Unit]
+Description=Pantheon stale-worktree sweeper — auto-remove merged+clean throwaway build worktrees (T-1324b; each carries a 10-20G Rust target/ that filled the VPS to 100% on 2026-06-25)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Scans each repo's `git worktree list` (cross-account via sudo) and removes a
+# worktree ONLY when every guard passes: not the main checkout, path under /tmp,
+# tracked tree clean, and HEAD is an ANCESTOR of origin/main (fully merged) — so it
+# can never drop unmerged or in-progress work. Mid-arc (unmerged) worktrees are
+# kept; only post-merge stragglers are swept. --clean actually removes; the tool
+# defaults to dry-run for safe manual runs.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/stale_worktree_sweeper.py --clean
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

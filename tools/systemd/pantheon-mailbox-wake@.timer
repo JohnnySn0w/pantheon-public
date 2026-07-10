@@ -1,0 +1,17 @@
+[Unit]
+Description=Pantheon mailbox wake safety-sweep — periodic %i waker (ORG-026 backstop)
+Documentation=file:///home/%u/pantheon-config/adr/ORG-026-inter-agent-message-passing-substrate.md
+
+[Timer]
+# Belt-and-suspenders for the daemonless .path watch (T-1015, 2026-06-09). The
+# systemd .path is edge-triggered (fires only on the new/ EMPTY->NONEMPTY
+# transition; won't re-fire while new/ stays non-empty) and was observed to miss a
+# real delivery on a restart-fired-empty race. This periodic sweep runs the SAME
+# waker (pantheon-mailbox-wake@%i.service, same instance) — which is idempotent and
+# marker-debounced, so it NEVER re-kicks already-kicked mail; it only catches
+# deliveries the .path missed. An empty inbox is a clean no-op.
+OnBootSec=2min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target

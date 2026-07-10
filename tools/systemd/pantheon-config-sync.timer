@@ -1,0 +1,12 @@
+[Unit]
+Description=Pantheon-config bidirectional sync — fire every 60s (T-0211 Phase B; supersedes T-0208's pantheon-config-pull)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*:*:00
+Persistent=true
+AccuracySec=10s
+Unit=pantheon-config-sync.service
+
+[Install]
+WantedBy=timers.target

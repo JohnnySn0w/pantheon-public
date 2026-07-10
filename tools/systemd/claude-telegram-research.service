@@ -1,0 +1,39 @@
+# CANONICAL bot-service reference shape (T-0783, fixes the prior broken oneshot).
+#
+# This is the version-controlled reference for an agent's Telegram-bot service.
+# THE CORRECT SHAPE IS: Type=simple + Restart=always + a supervise-wrapper as
+# ExecStart (NOT Type=oneshot + RemainAfterExit + a bare `tmux new-session`,
+# which returns 0 immediately so systemd reports "active (exited)" forever even
+# after the tmux session + the inner `claude` die — nothing respawns it; the
+# dead-daemon outage that bit Recovery 2026-05-21 and Specialist pre-T-0755).
+#
+# The wrapper (here specialist-bot-supervise.sh) keeps the SAME detached tmux session
+# but stays alive as systemd's MainPID for the session's lifetime; when the
+# session dies it exits and Restart=always respawns it. The wrapper's CLAUDE_ARGS
+# MUST carry `--channels plugin:telegram@claude-plugins-official` for a bidirectional
+# bot (and enabledPlugins[telegram]=true in settings.json — the keystone).
+#
+# TO ADAPT FOR ANOTHER AGENT: change Description, the account in the three paths
+# (WorkingDirectory / Environment / ExecStart wrapper), and the kill-session
+# target to that agent's session name. Wrapper variants: recovery-bot-supervise.sh
+# (recovery) + specialist-bot-supervise.sh (specialist) operate on their OWN clones, so
+# NO sg-wrap; claude-bot-supervise.sh is the ORCHESTRATOR variant, sg-wrapped for
+# `pantheon-shared` because its clone is the canonical one written by multiple
+# group accounts (T-0783).
+[Unit]
+Description=Claude Code Telegram bot bridge (research — Specialist, @c_specialist_bot bidirectional; supervisor wrapper per T-0755)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/claude-research
+Environment=PATH=/home/claude-research/.bun/bin:/home/claude-research/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/claude-research
+ExecStart=/home/claude-research/.local/bin/specialist-bot-supervise.sh
+ExecStop=/usr/bin/tmux kill-session -t claude-research-bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

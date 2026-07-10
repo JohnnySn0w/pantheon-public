@@ -1,0 +1,173 @@
+#!/usr/bin/env python3
+"""pre-commit hook: refuse any commit whose staged file content contains the
+unescaped HERMES trigger byte sequence.
+
+Scans the FULL blob of every staged file (not just the diff lines) so that
+pasting contaminated content into an otherwise-unchanged file is also caught.
+Binary files are scanned at the byte level — no decode step, no exclusions.
+
+Source-cleanliness convention: the trigger byte sequence is never written
+contiguously in this source file.  The compiled pattern in `tools._git_utils`
+uses `rb"HERMES\\.md"` (backslash escapes the dot in the regex, but the
+source bytes H-E-R-M-E-S-backslash-.-m-d contain a backslash between S and
+the dot — so the contiguous 9-byte trigger never appears in this file's
+source).  Verification: `grep -cF` for the unescaped form against this file
+must return 0.
+
+Activation:
+    git config core.hooksPath .githooks
+    (or run tools/install_hooks.sh which does this idempotently)
+"""
+
+from __future__ import annotations
+
+import subprocess
+import sys
+from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Bootstrap: add repo root to sys.path so `tools._git_utils` is importable
+# regardless of cwd.
+# ---------------------------------------------------------------------------
+
+_HOOK = Path(__file__).resolve()
+_REPO_ROOT = _HOOK.parent.parent  # .githooks/../ == repo root
+sys.path.insert(0, str(_REPO_ROOT))
+
+from tools._git_utils import _HERMES_PATTERN  # noqa: E402
+
+
+def _staged_files() -> list[str]:
+    """Return list of staged file paths (added/modified, not deleted)."""
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    return [line for line in result.stdout.splitlines() if line]
+
+
+def _read_staged_blob(path: str) -> bytes | None:
+    """Read the staged (index) blob for `path` via `git show :<path>`.
+
+    Returns None if the path is not in the index (should not happen after
+    --diff-filter=ACM, but defensive).
+    """
+    result = subprocess.run(
+        ["git", "show", f":{path}"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _scan_blob(blob: bytes, label: str) -> tuple[bool, str | None]:
+    """Return (ok, detail).  detail is '<label>:<lineno>' on match."""
+    m = _HERMES_PATTERN.search(blob)
+    if m:
+        lineno = blob[: m.start()].count(b"\n") + 1
+        return False, f"{label}:{lineno}"
+    return True, None
+
+
+def _warn_directive_drift(staged: list[str]) -> None:
+    """Non-blocking drift tripwire (T-0796).
+
+    When rulebook/directives.md is staged, run the directive<->skill drift guard
+    and surface any drift as a WARNING. The canonical pantheon-org-discipline
+    skill lives cross-repo (claude-config), so a pantheon-config commit usually
+    can't fix the drift in the same change — hence warn, not block. The blocking
+    gate is claude-config CI; this local hook just makes the staleness loud at
+    the moment directives.md moves.
+    """
+    if "rulebook/directives.md" not in staged:
+        return
+    script = _REPO_ROOT / "tools" / "directive_skill_drift_check.py"
+    if not script.exists():
+        return
+    result = subprocess.run(
+        [sys.executable, str(script)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        print("", file=sys.stderr)
+        print("directive<->skill drift WARNING (non-blocking):", file=sys.stderr)
+        for line in result.stdout.splitlines() + result.stderr.splitlines():
+            if line.strip():
+                print(f"  {line}", file=sys.stderr)
+        print(
+            "  -> update the pantheon-org-discipline skill in your harness-config repo "
+            "(e.g. claude-code-config) before workers rely on the new D-id. Commit is allowed. "
+            "(A fork without a harness-config repo gets a clean SKIP, not this warning — ORG-039 §4.)",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+
+
+def _hook_allowlist_drift() -> tuple[str, list[str]] | None:
+    """Blocking hook<->allowlist pairing guard (T-1102).
+
+    Returns (agent, deviations) when the committing agent has hook(s) wired in its
+    own settings.json that are not in HOOK_ALLOWLIST — else None. Fail-OPEN on any
+    error (a lint bug must never brick commits, like the rest of this hook).
+    """
+    try:
+        from tools.hook_allowlist_lint import lint, local_agent
+
+        agent = local_agent()
+        if agent is None:
+            return None
+        deviations = lint(agent)
+        return (agent, deviations) if deviations else None
+    except Exception:
+        return None
+
+
+def main() -> int:
+    failures: list[str] = []
+
+    staged = _staged_files()
+    for path in staged:
+        blob = _read_staged_blob(path)
+        if blob is None:
+            continue
+        ok, detail = _scan_blob(blob, path)
+        if not ok:
+            failures.append(detail)
+
+    _warn_directive_drift(staged)
+
+    drift = _hook_allowlist_drift()
+    if drift is not None:
+        from tools.hook_allowlist_lint import format_failure
+
+        print(format_failure(drift[0], drift[1]), file=sys.stderr)
+
+    if failures:
+        print("", file=sys.stderr)
+        print("HERMES discipline violation — commit refused.", file=sys.stderr)
+        print("", file=sys.stderr)
+        for detail in failures:
+            print(f"  {detail}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  Escape the period (HERMES\\.md) per CLAUDE.md byte-sequence discipline.",
+            file=sys.stderr,
+        )
+        print("  Fix the file(s), re-stage, and retry.", file=sys.stderr)
+        print("", file=sys.stderr)
+        return 1
+
+    # Hook-allowlist pairing drift blocks the commit even with no HERMES failure.
+    return 1 if drift is not None else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

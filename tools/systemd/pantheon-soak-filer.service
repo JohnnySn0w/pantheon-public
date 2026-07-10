@@ -1,0 +1,18 @@
+[Unit]
+Description=Pantheon suite-health soak filer — monthly per-account soak ticket fan-out (T-0992)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Files one per-account suite-health soak ticket (specialist/orchestrator/recovery), idempotently
+# (skips any account whose prior leg is unresolved). Runs NO test suite itself;
+# each receiving agent runs its own leg in-session (T-0991 option b). Central
+# trigger on recovery only; decentralized execution removes the cross-account sudo dep.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/soak_filer.py --file-soak-tickets
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

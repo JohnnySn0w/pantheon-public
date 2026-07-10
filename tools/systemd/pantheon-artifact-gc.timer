@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon artifact-GC — weekly fire (Sun 13:00 UTC, after grooming's 12:00)
+Documentation=file:///home/%u/pantheon-config/tools/artifact_gc.py
+
+[Timer]
+OnCalendar=Sun *-*-* 13:00:00 UTC
+Persistent=true
+Unit=pantheon-artifact-gc.service
+
+[Install]
+WantedBy=timers.target

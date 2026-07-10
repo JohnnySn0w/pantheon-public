@@ -1,0 +1,14 @@
+[Unit]
+Description=Pantheon HO auto-resumer — poll and fire claude --resume on cap-hit
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PANTHEON_CLAUDE_BIN=%h/.npm-global/bin/claude
+Environment=PATH=%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/ho_resumer.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

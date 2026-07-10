@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon activity digest — 5hr cycle (00/05/10/15/20 UTC)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 00,05,10,15,20:00:00 UTC
+Persistent=true
+Unit=pantheon-activity-digest.service
+
+[Install]
+WantedBy=timers.target

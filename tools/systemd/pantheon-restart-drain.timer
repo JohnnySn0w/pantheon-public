@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon restart drain — poll every 30 seconds for restart tombstones
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* *:*:0/30
+Persistent=true
+Unit=pantheon-restart-drain.service
+
+[Install]
+WantedBy=timers.target

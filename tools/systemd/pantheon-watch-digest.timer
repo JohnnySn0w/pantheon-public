@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon watch-loop digest — daily summary (18:00 UTC, after watch fires)
+Documentation=file:///home/%u/pantheon-config/knowledge/watch/README.md
+
+[Timer]
+OnCalendar=*-*-* 18:00:00 UTC
+Persistent=true
+Unit=pantheon-watch-digest.service
+
+[Install]
+WantedBy=timers.target

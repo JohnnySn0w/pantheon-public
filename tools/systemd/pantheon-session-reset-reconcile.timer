@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon session-reset reconcile — daily 00:30 UTC (after grooming at 00:00)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 00:30:00
+Persistent=true
+Unit=pantheon-session-reset-reconcile.service
+
+[Install]
+WantedBy=timers.target

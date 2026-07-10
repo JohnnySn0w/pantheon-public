@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon knowledge-sweep — daily fire (13:00 UTC, offset from 12:30 UTC spine-groom + 18:00 UTC watch-digest)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 13:00:00 UTC
+Persistent=true
+Unit=pantheon-knowledge-sweep.service
+
+[Install]
+WantedBy=timers.target

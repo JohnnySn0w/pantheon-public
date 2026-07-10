@@ -1,0 +1,15 @@
+[Unit]
+Description=Pantheon keep-going nudge — anti-idle heartbeat for %i (parallel to mailbox wake)
+Documentation=file:///home/%u/pantheon-config/tools/keep_going.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+# Idle-gated: captures %i's own pane and injects a "keep going" nudge ONLY when it is
+# parked at the idle prompt — never into active generation or a modal. A separate
+# mechanism from the mailbox inbox-push wake (the operator's directive: parallel, not merged).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/keep_going.py --agent %i
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=90s

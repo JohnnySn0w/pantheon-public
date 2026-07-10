@@ -1,0 +1,17 @@
+[Unit]
+Description=Pantheon — weekly non-security apt updates (Mon 04:00 UTC)
+Documentation=file:///root/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# Monday 04:00 UTC: low-traffic window globally; well after the daily
+# apt-daily-upgrade.service fire (which runs at random offset within
+# its own 24h window). RandomizedDelaySec adds 0-30min jitter to avoid
+# a thundering herd against package mirrors when many hosts share the
+# same calendar trigger.
+OnCalendar=Mon *-*-* 04:00:00 UTC
+RandomizedDelaySec=30min
+Persistent=true
+Unit=pantheon-apt-update.service
+
+[Install]
+WantedBy=timers.target

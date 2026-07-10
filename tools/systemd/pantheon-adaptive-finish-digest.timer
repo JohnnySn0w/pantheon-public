@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon adaptive-finish weekly digest — Monday 09:15 UTC fire (prior 7d)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=Mon *-*-* 09:15:00 UTC
+Persistent=true
+Unit=pantheon-adaptive-finish-digest.service
+
+[Install]
+WantedBy=timers.target

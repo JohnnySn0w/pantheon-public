@@ -1,0 +1,17 @@
+[Unit]
+Description=Pantheon disk-usage monitor — alert BEFORE the root FS fills and wedges the fleet (2026-06-26 the operator ask; build/venv caches ballooned to 82%)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Pure `df` read of the root FS (no LLM, no Claude API) — alerts the operator DIRECTLY
+# via the Telegram bot token (independent of Claude OAuth) when used% crosses the
+# WARN (85) / URGENT (92) thresholds, throttled per class so the hourly timer nags
+# without spamming. On breach it appends a best-effort per-home size breakdown so
+# the alert is actionable. Runs on recovery; cross-account du via sudo (best-effort).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/disk_usage_monitor.py --check
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2min

@@ -1,0 +1,13 @@
+[Unit]
+Description=Pantheon restart drain — process tombstone files and fire graceful agent restarts
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/restart_drain.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=12min

@@ -1,0 +1,13 @@
+[Unit]
+Description=Pantheon activity-monitor for %i — ORG-011 Phase B / T-0223
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/activity_monitor.py --agent %i
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

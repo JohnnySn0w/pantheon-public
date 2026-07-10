@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# pre-push hook: ensure local is up-to-date with origin before push.
+# Prevents ID-collision class on auto-numbered files (tickets, ledger entries)
+# when parallel writers (Recovery, Specialist, Orchestrator) push without first pulling.
+#
+# Behavior:
+#   - Fetch remote; warn + allow if fetch fails (fail-open — don't block on
+#     transient network errors).
+#   - On detached HEAD: skip check and allow push.
+#   - If local is behind remote tip: rebase onto tip via
+#     `git pull --rebase --autostash`.
+#   - If rebase succeeds: allow push (exit 0).
+#   - If rebase fails (conflict): block push (exit 1) with resolve hint.
+#
+# Activation:
+#   git config core.hooksPath .githooks
+#   (or run tools/install_hooks.sh which does this idempotently)
+set -euo pipefail
+
+REMOTE="$1"
+URL="$2"
+
+# Detect current branch first. On detached HEAD, symbolic-ref returns empty.
+# Check before fetch so detached-HEAD pushes are never delayed by a network call.
+CURRENT_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo "")"
+if [[ -z "${CURRENT_BRANCH}" ]]; then
+    # Detached HEAD — skip freshness check.
+    exit 0
+fi
+
+# Fetch latest state from remote; fail-open on network/config errors.
+git fetch --quiet "${REMOTE}" 2>/dev/null || {
+    echo "pre-push: WARNING — could not fetch ${REMOTE} (${URL}); allowing push without freshness check" >&2
+    exit 0
+}
+
+UPSTREAM="${REMOTE}/${CURRENT_BRANCH}"
+BEHIND_COUNT="$(git rev-list --count "HEAD..${UPSTREAM}" 2>/dev/null || echo "0")"
+
+if [[ "${BEHIND_COUNT}" -gt 0 ]]; then
+    echo "pre-push: local is ${BEHIND_COUNT} commit(s) behind ${UPSTREAM}." >&2
+    echo "pre-push: rebasing local onto ${UPSTREAM} before push..." >&2
+    # Run rebase; capture exit code explicitly before pipefail can interfere.
+    git pull --rebase --autostash "${REMOTE}" "${CURRENT_BRANCH}" 2>&1 | sed 's/^/pre-push: /' >&2 || {
+        echo "pre-push: rebase FAILED — resolve conflicts, then retry push." >&2
+        exit 1
+    }
+fi
+
+# --- auto-commit-cron contract gate (T-1084) ---------------------------------
+# Block a push whose repo state contains a bare-unit auto-commit cron (a cron
+# that authors+pushes commits with no default-safe mode flag). The linter is
+# repo-content-based (scans tools/*.py + tools/systemd/*.service), so this is
+# deterministic per checkout — it lints exactly what would be pushed.
+#
+# Fail posture: fail-OPEN on any linter execution/parse anomaly (a broken linter
+# must NEVER brick the fleet's ability to push); fail-CLOSED only on a cleanly
+# reported VIOLATION. ADVISORY findings never block. Fleet is green at adoption
+# (0 VIOLATIONs), so this gate blocks nothing on day one.
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || echo "")"
+LINTER="${REPO_ROOT}/tools/auto_commit_contract_lint.py"
+if [[ -n "${REPO_ROOT}" && -f "${LINTER}" ]]; then
+    # Capture JSON regardless of the linter's exit code (exit 1 == VIOLATION;
+    # we must NOT confuse that with a crash). A crash prints a traceback to
+    # stderr (suppressed) and nothing parseable to stdout -> empty -> fail-open.
+    LINT_JSON="$(python3 "${LINTER}" --json 2>/dev/null)" || true
+    if [[ -z "${LINT_JSON}" ]]; then
+        echo "pre-push: WARNING — auto-commit contract linter produced no output; allowing push (fail-open)" >&2
+    elif printf '%s' "${LINT_JSON}" | grep -qE '"severity":[[:space:]]*"VIOLATION"'; then
+        echo "pre-push: BLOCKED — auto-commit-cron contract VIOLATION(s) present:" >&2
+        python3 "${LINTER}" >&2 2>/dev/null || true
+        echo "pre-push: an auto-commit cron unit ExecStart is bare (no default-safe mode flag)," >&2
+        echo "pre-push: so the cron would author+push to a prod ref unguarded. Fix per" >&2
+        echo "pre-push: sop/standard/auto-commit-cron-default-safe-contract.md, then retry the push." >&2
+        exit 1
+    fi
+fi
+# --- end contract gate -------------------------------------------------------
+
+exit 0

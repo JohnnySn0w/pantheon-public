@@ -1,0 +1,12 @@
+[Unit]
+Description=Pantheon-config bidirectional sync — fetch + push-or-pull (T-0211 Phase B; supersedes T-0208)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/pantheon_config_sync.py --commit-prod
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=30s

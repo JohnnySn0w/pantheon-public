@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon stale-worktree sweeper — 6-hourly sweep of merged throwaway build worktrees (VPS disk-full prevention, pairs with pantheon-disk-usage)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 00,06,12,18:40:00
+Persistent=true
+Unit=pantheon-worktree-sweeper.service
+
+[Install]
+WantedBy=timers.target
