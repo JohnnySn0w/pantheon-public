@@ -80,7 +80,7 @@ repos:
   # grants policy — access below predates this entry and traces to tickets):
   - name: codex-config
     description: codex agent config + telegram bridge (poller/daemon, MAILBOX.md runbook); LIVE repo
-    grants: { peer-daemon-codex: rw, recovery: rw }   # recovery deploy key codex_config_deploy (T-1044/T-1046 arcs); canonical recovery clone ~/work/codex-config
+    grants: { third-party-auditor: rw, recovery: rw }   # recovery deploy key codex_config_deploy (T-1044/T-1046 arcs); canonical recovery clone ~/work/codex-config
   - name: codex-config-template
     description: genericized codex-config release template (T-1472); private mirror example-org/codex-config-template published by HO (T-1501); public flip operator-gated
     grants: { orchestrator: rw }

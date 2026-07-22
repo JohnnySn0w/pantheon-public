@@ -3,7 +3,10 @@
 # The instance:/roles: blocks below bind the REFERENCE operator's personas,
 # accounts, and token-file paths. They are kept as a worked example of the
 # schema, NOT config to run as-is. A new operator replaces them with their own
-# bindings (same role keys: orchestrator / specialist / recovery).
+# bindings (same role keys: orchestrator / specialist / recovery, plus the
+# optional sub-orchestrator N+ tier and the two opt-in extras — memory-hub,
+# third-party-auditor — described inline below and framed as a Viable System
+# Model instantiation in knowledge/vsm-instantiation.md).
 # token_ref values are PATHS to credential files, not secrets. Persona→role
 # neutralization of the wider scaffolding is ORG-030 Phase-3 (in progress).
 # ============================================================================
@@ -41,6 +44,24 @@ roles:
     token_ref: /home/claude/gh_token.env            # fine-grained PAT, HTTPS git + gh CLI (ref, not secret)
     session: claude-telegram.service → tmux claude-telegram-bot:0 (ho_resumer auto-resume on Max-window cap-hit)
     domain: org orchestration, dispatch, ratification-drafting, ledger, lessons/bugs/incidents authorship
+  # sub-orchestrator — N+ TIER, horizontally scalable. N is a per-deployment choice, INCLUDING
+  # N=0 (the base config: one `orchestrator` persona above, no sub-orchestrator seats — a
+  # legitimate starting state, not a gap to fill by default). Add a seat by copying this block
+  # and incrementing the suffix (sub-orchestrator-2, sub-orchestrator-3, ...); there's no list
+  # construct here because no tooling reads instance.yaml yet (see the Status note above) — a
+  # seat is just another role-keyed block, same shape as orchestrator/specialist/recovery.
+  # Per the VSM framing (knowledge/vsm-instantiation.md §0/§1), each seat is a FULL viable
+  # system one recursion level down: its own workers, its own worktree/branch conventions, its
+  # own plan-approval + review discipline, its own read of the repo/ticket environment, its own
+  # persona identity — not a diluted copy of the orchestrator's dispatch discipline.
+  sub-orchestrator-1:                                  # ILLUSTRATIVE first seat — omit entirely for N=0
+    persona: sub-orchestrator-1
+    account: <per-deployment unix account>
+    harness: claude-code
+    token_ref: <per-deployment credential path — same shape as orchestrator's token_ref>
+    session: <per-deployment session/service — same shape as orchestrator's session>
+    domain: drives one project arc end-to-end (dispatches + reviews its own implementers),
+            # scoped by the operator per seat; see knowledge/vsm-instantiation.md
   specialist:
     persona: specialist
     account: claude-research
@@ -60,27 +81,35 @@ roles:
              # telegram agent; bun-child watchdog T-1456)
     domain: recovery runbook, MCP/bot/hooks repair, boot-infra, fleet monitors (context-fill /
             # disk-usage / channel-liveness / grooming / usage timers), ho_resumer stewardship
-  # Peer daemons added 2026-06-09 (the operator directive). Registered as ticket
-  # personas (tools/agent_role_map.py) so they can hold/file tickets. Role
-  # semantics below are provisional — codex is the live ORG-018/ORG-031 pilot;
-  # the-ancestor's role is TBD pending its supervised bringup (the operator to confirm).
-  peer-daemon-codex:
-    persona: codex
-    account: codex
-    harness: codex
-    token_ref: /home/codex/.codex/auth.json        # ChatGPT OAuth (codex login), 0600
-    session: codex-session (tmux, codex-supervise.sh; bare codex TUI, Restart=always respawn — T-0822 recovery posture)
-    domain: S3* independent auditor (monthly integrated audit, weekly narrows — T-1584 era,
-            # never-self-closes re-test tier), second-opinion detail-checks (MCP), image-gen /
-            # sticker-sprite generation (T-1002); two-way telegram via codex-config bridge
-  peer-daemon-the-ancestor:                          # ROLE still TBD (the operator's call) — substrate is live
-    persona: the-ancestor
-    account: the-ancestor
+  # Two OPT-IN extras, both OFF BY DEFAULT — omit either block entirely if you don't want it.
+  # Per the VSM framing (knowledge/vsm-instantiation.md §3), each has a documented viability
+  # gap if you skip it; the point of shipping them as extras rather than base roles is that
+  # the gap is a legitimate, named trade-off, not a silent omission.
+  third-party-auditor:                                 # OPT-IN, off by default — S3* sporadic audit
+    persona: third-party-auditor
+    account: <per-deployment unix account>
+    harness: <a different-vendor CLI harness than your orchestrator's — e.g. if orchestrator
+             # runs claude-code, this seat runs something else entirely; the heterogeneity is
+             # the point (see the S3*-extension honesty note in knowledge/vsm-instantiation.md
+             # — Beer's S3* requires independence from the audited channel, not vendor
+             # heterogeneity specifically; a different-vendor harness is our documented
+             # EXTENSION of that requirement, not Beer's own specification)>
+    token_ref: <per-deployment credential path — whatever auth mechanism that harness uses>
+    session: <per-deployment session/service>
+    domain: S3* independent audit (sporadic, aperiodic checks against what the routine
+            # S1→S2→S3 reporting channel claims), second-opinion detail-checks; see
+            # knowledge/vsm-instantiation.md and knowledge/vsm-deployment-self-check.md
+  memory-hub:                                          # OPT-IN, off by default — channel/memory substrate
+    persona: memory-hub
+    account: <per-deployment unix account>
     harness: claude-code
-    token_ref: /home/the-ancestor/.claude/.credentials.json   # claude OAuth, logged in (verified 2026-07-07)
-    session: veneration daemon + ORG-026 mailbox hub (/home/the-ancestor/mailbox/*) LIVE since
-             # 2026-06-13/14 (T-1124 daemon+mailbox; T-0766 resurrect() via headless --print)
-    domain: ancestor-veneration substrate (mailbox hub, resurrect); broader role TBD pending the operator
+    token_ref: <per-deployment credential path>
+    session: <per-deployment session/service — a mailbox/message-passing daemon>
+    domain: channel infrastructure the org's coordination and escalation signals traverse,
+            # plus organizational memory continuity across sessions; exercises no autonomy
+            # and holds no resource bargain (it is substrate, not a sixth VSM system, and not
+            # an S1 unit — see knowledge/vsm-instantiation.md §2 for the rebalance trigger if
+            # that ever changes)
 
 # Host-level service accounts (NOT agent personas; listed for manifest completeness
 # after the 2026-07-10 cpu-warn triage found ci-runner undocumented — T-1632/T-1621):
@@ -93,7 +122,8 @@ host_services:
     load_note: CI runs are the main legitimate CPU-warn source on the 4-core box
 
 # Notes:
-# - codex is registered as an MCP *tool* (ORG-018) and is a candidate peer-*daemon* harness
-#   (ORG-031); when a codex-backed role is bound, set its `harness: codex` here.
+# - a third-party-auditor seat may ALSO be registered as an MCP *tool* on the orchestrator
+#   (for second-opinion detail-checks) in addition to running as its own daemon; that's a
+#   separate wiring decision from the role binding above.
 # - `repos.yaml` (grants/structural gate) and `pinned-rules/` (per-persona brief content) are
 #   manifest-class per ORG-030 Q3 residual: framework-shaped structure + instance-data content.

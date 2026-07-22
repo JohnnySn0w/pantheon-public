@@ -12,6 +12,8 @@ Env-knowledge artifacts: everything Specialist and Orchestrator have learned abo
 
 - [`pantheon-glossary.md`](pantheon-glossary.md) — the named things in Pantheon (personas, daemon session names, account paths, historical vocabulary, stability-naming quirks). The index a fresh agent or operator can grep when a name in the repo doesn't make sense. Authored 2026-06-03 by Specialist per the T-0751 bringup-doc revise pass.
 - [`infra-abstractions/`](infra-abstractions/) — the **infra-abstractions reference map**: a descriptive catalogue of the recurring infrastructure *component families* across all three agents (Monitors, Pollers/Wakers, Due-detectors+Filers, Runners, Remediators, Guards, Digesters) + the cross-cutting patterns they share. Answers "where does a new tool fit / what pattern should it follow." Glossary = terms; this map = components and shapes. Drafted 2026-06-09 by Recovery (T-0999).
+- [`vsm-instantiation.md`](vsm-instantiation.md) — the role set (`orchestrator`, the optional `sub-orchestrator` N+ tier, `specialist`, `recovery`, and the `memory-hub`/`third-party-auditor` opt-in extras) presented explicitly as a Viable System Model instantiation, with per-role/extra viability-gap notes.
+- [`vsm-deployment-self-check.md`](vsm-deployment-self-check.md) — Beer's four diagnostic questions (verbatim, 1984), as a standing "is your deployment still viable" checklist to re-run when the role/extra set changes.
 
 ## When to look where
 
