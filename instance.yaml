@@ -82,6 +82,11 @@ roles:
     domain: recovery runbook, MCP/bot/hooks repair, boot-infra, fleet monitors (context-fill /
             # disk-usage / channel-liveness / grooming / usage timers), ho_resumer stewardship
   # Two OPT-IN extras, both OFF BY DEFAULT — omit either block entirely if you don't want it.
+  # NOTE (audit 2026-07-22): these blocks are present ONLY as schema worked-examples, like
+  # everything in this file (see the ⚠️ banner) — their presence here does not mean they are
+  # deployed. A tool or reader consuming this manifest literally should treat a role as
+  # configured only once its placeholder values are replaced with real bindings; DELETE the
+  # block to opt out explicitly.
   # Per the VSM framing (knowledge/vsm-instantiation.md §3), each has a documented viability
   # gap if you skip it; the point of shipping them as extras rather than base roles is that
   # the gap is a legitimate, named trade-off, not a silent omission.
