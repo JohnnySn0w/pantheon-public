@@ -34,12 +34,23 @@ each case," Beer 1984). This seed nominates:
 
 ## 1. The mapping (level 0)
 
+**How to read this table — the load-bearing correction.** Map **functions to systems, not personas
+to systems.** The five systems (plus the channels) are *roles the org performs*; a persona or
+artifact **occupies whichever functions it is performing**, and most occupy **several, across
+different systems**. Persona→system 1:1 is the wrong shape — it cannot come out cleanly, because
+actors are cross-system by nature.
+
+So the rows below read as *what serves each function*, not *who is assigned to which box*. The
+recurring cross-system actors are collected in §1a, and that section is not a list of exceptions to
+the table: **the spanning IS the structure.** A deployment that reads only the table and skips §1a
+will re-derive the persona→system 1:1 error this frame exists to prevent.
+
 | VSM function | Realization in this org |
 |---|---|
-| **S1 — Operations** | Conditional on N (third-party-audit correction, 2026-07-22): at **N=0** (the base config), S1 is the **orchestrator's own operational work** — S1 must exist in any viable system, so the base is one persona wearing S1 and S3 at once (see §3's "cell-sized" gap note). When **sub-orchestrator seats are deployed**, they become the S1 units: each drives a project arc end-to-end and is itself a full viable system (level −1, see §0), and the orchestrator sheds direct operations to hold S3. N is a per-deployment choice. |
+| **S1 — Operations** | Up to three things serve S1, each a value-producing unit. (a) The **N+ sub-orchestrator seat tier** — each seat drives a project arc end-to-end and is itself a full viable system (level −1, see §0); N is a per-deployment choice, **including N=0**. (b) The **orchestrator's own operational acts** — the orchestrator *when producing*: authorship, decision-log entries, dispatch execution. **These acts are S1 even though the same persona's orchestration is S3** — that is not an N=0 special case, it stays true at every N (see §1a). (c) Optionally, a **privacy-partitioned specialized unit** — an integral level-0 S1 unit **on par with the seats**, separated for concern reasons (implementation, not topology): its own account, its own private-data domain, its own operator-facing channel. "On par" means on par in VSM level and S1 status — **not** identical in channels or accountability routing (see §1a). *At N=0 with no specialized unit, (b) is the whole of S1 — one persona wearing S1 and S3 at once, which is viable but cell-sized; see §3.* |
 | **S2 — Coordination / anti-oscillation** | Deliberately **structural, not a persona**: the ticket system + WIP cap (serializes claims, prevents resource fights), agent-branch + single-push-actor merge flow (serializes writes to main), the mailbox protocol, the lint/guard suite, shared SOPs. Beer: without S2, S1 units "fight for resources and against entropy" — S2 here is the convention-and-tooling layer that makes that structurally hard. **What you install for S2 is the conventions and tooling, not another agent** — this is the answer a deploying operator needs, and it is load-bearing: S2 is a design property of the system, not a seat you staff. |
-| **S3 — Internal regulation / resource bargain** | **The orchestrator** (one persona, always exactly one — see §3 and §4). Dispatch briefs ARE the resource bargain: scoped autonomy + worktree/branch resources in exchange for decisions-with-justification accountability. The intervention channel is direct messaging/status-checks; the synergy function is the cross-arc knowledge lift (`bugs/`, `lessons/`, the ledger). |
-| **S3\* — Sporadic audit** | Two realizations. (a) The **third-party-auditor extra** — a different-vendor harness auditing the org's claims (opt-in, off by default — see §3). (b) The orchestrator's own read-the-defining-surface discipline (verifying claims in durable artifacts; direct inspection of worker output bypassing routine reports). Both bypass the routine reporting channel, which is Beer's actual independence requirement. **Documented extension, not Beer's specification:** Beer's S3\* is internal-but-channel-independent — the literature is silent on vendor-heterogeneity. Reading S3\* as "a different-vendor harness" is a defensible extension (tooling heterogeneity guarantees the auditor doesn't share the audited channel's blind spots), and this seed presents it as an extension, not as something Beer stated. |
+| **S3 — Internal regulation / resource bargain** | Two things serve S3. (a) The **written governing documents** — the principles, directives, policies, and **ratified architecture decisions functioning as governance**: the standing control surface of what the org has decided must hold. This half is easy to miss and load-bearing; without it S3 collapses into "whoever is orchestrating today". (b) The **orchestrator's regulation function** — the orchestrator *when orchestrating*: dispatch, resource bargains, priority ordering, merge/push authority, accountability for the S1 collective. Dispatch briefs ARE the resource bargain: scoped autonomy + worktree/branch resources in exchange for decisions-with-justification accountability. The intervention channel is direct messaging/status-checks; the synergy function is the cross-arc knowledge lift (`bugs/`, `lessons/`, the decision log). **This is only the orchestrator's S3 arm** — the same persona's producing acts are S1 (§1a). One orchestrator per instance remains the invariant (§3, §4), but that is a claim about *dispatch authority*, not about S3 being one persona. |
+| **S3\* — Sporadic audit** | **A channel/class, not a single tool** — direct inspection of S1's output that bypasses normal S3 reporting. Reading S3\* as "the auditor persona" is the same 1:1 error the frame warns about; it has several instances at once: the **reviewer role** (adversarial review of an implementer's diff), a **standing audit worker** filing severity-ranked findings, the **guard / lint / leak-scan hooks** (structural audit with no persona at all), the orchestrator's own **read-the-defining-surface discipline** (verifying claims in durable artifacts; inspecting worker output directly rather than trusting its report), and the **third-party-auditor extra** — a different-vendor harness auditing the org's claims (opt-in, off by default — see §3). What unites them is bypassing the routine reporting channel, which is Beer's actual independence requirement. **Documented extension, not Beer's specification:** Beer's S3\* is internal-but-channel-independent — the literature is silent on vendor-heterogeneity. Reading S3\* as "a different-vendor harness" is a defensible extension (tooling heterogeneity guarantees the auditor doesn't share the audited channel's blind spots), and this seed presents it as an extension, not as something Beer stated. |
 | **S4 — Intelligence (outside-and-future)** | The **specialist** role: watch topics = environmental scanning (vendor policy, billing, harness landscape); research dispatches = directed sensing. The orchestrator's own design/ADR work is the S3–S4 homeostat in action (operational reality ↔ what's coming). |
 | **S5 — Identity / policy / closure** | **The operator.** Ultimate authority, ethos, closure; the operator holds goal-level ratification and externals. Nobody sits outside the model: **the operator is IN the system** as S5 (and as the level-+1 metasystem), not an external user of it. **Where the rulebook and the orchestrator sit (corrected 2026-08-02, superseding the prior "operator + rulebook + orchestrator, jointly"):** the rulebook is the artifact S5's closure is *inscribed in*, but as a standing control surface it **serves S3**, and it is cross-system *by lifecycle* — S1 as authored → S3 as governance. The orchestrator **drafts** policy (an authoring act, S1) and holds S3 regulation, but does **not** hold S5 closure. Seating all three in S5 jointly is the persona→system 1:1 error this model exists to prevent. |
 | **Memory/continuity substrate** | The **memory-hub extra** — see §2; deliberately mapped as substrate, not as a sixth system. |
@@ -56,6 +67,46 @@ algedonic-response **+ S2-construction** (building the substrate itself) **+ S3\
 index audits). Read "recovery is not S3\*" as a persona-level claim and you have reproduced exactly
 the persona→system 1:1 error §1 exists to prevent — it is *because* an actor is not a box that the
 same seat's repair work can be autonomic while its grooming audits are S3\*.
+
+## 1a. Cross-system occupancy (this spanning IS the structure)
+
+Per §1's central rule, actors routinely occupy several systems at once. **This section is not a list
+of exceptions to the table — it is the table's actual shape.** A deployment that omits it will
+re-derive the persona→system 1:1 error the frame exists to prevent. The load-bearing cases:
+
+- **The orchestrator:** **S1** (authorship, decision-log entries, dispatch execution) **+ S3**
+  (orchestration, resource allocation, merge authority).
+- **The operator:** **S5** (policy, closure) **+ bounded S3** for the specialized private-domain
+  unit's resource/accountability channel (guardrails below).
+- **The third-party auditor:** **S1** (dispatched worker) **+ S3\*** (spec-review auditor).
+- **The recovery seat:** **recovery / algedonic response** (restoring wedged units; the operator arm
+  of the alarm channel) **+ S2-construction** (building the substrate itself: hosts, git server,
+  container layout) **+ S3\*** (grooming / index audits).
+- **Governing documents:** **S1 as authored** (the act of writing) **→ S3 as governance** (once
+  ratified and binding) — cross-system *by lifecycle*. The same artifact, different system,
+  depending on where it is in its life.
+- **The specialized unit's knowledge base:** **S1** (that unit's operational domain) **+
+  S2-adjacent** (organizational-memory store).
+
+**Accountability can partition between two holders.** The seats' accountability channel (resource
+bargain, dispatch briefs, merge review) attaches to the orchestrator's S3; a privacy-partitioned
+unit's attaches **directly to the operator**, by privacy design — routing personal-domain
+accountability through the orchestrator would defeat the separation that unit exists for. So
+level-0 S1 units can partition between two accountability holders.
+
+**Guardrails on the operator's S3-attachment.** For that one unit the operator deliberately wears
+S3-attachment and S5 at once. To keep this distinct from the "S5 collapsed into S3" pathology (§3),
+the collapse is **BOUNDED**: (a) it applies ONLY to that unit's private-domain
+resource/accountability channel; (b) it does NOT generalize to the technical seats; (c) it does NOT
+replace the orchestrator's S3 for any org operation; (d) it MUST be re-evaluated if that unit ever
+gains dispatch, merge, or decision-log-curation authority. Any breach of (a)–(c) observed in
+practice is a **pathology signal to surface, not a precedent**.
+
+**The one-orchestrator invariant survives, precisely stated:** one *orchestrator / one dispatch
+authority per instance* — **not** "one accountability holder", and not "S3 is one persona". A
+privacy-partitioned unit is not an orchestrator (no dispatch, merge, or curation role), which is
+exactly what places it as S1 rather than a second S2/S3/S5. One instance, one orchestrator, N+
+seats, plus optionally one privacy-partitioned specialized unit.
 
 ## 2. memory-hub: substrate beneath the model
 
@@ -111,18 +162,34 @@ Beer's own pathology narratives, applied per deployable piece:
   workflow), and require design/ADR work to cite operational evidence (S3 reality lands in
   S4/S5 deliberation). The mechanism should be a shared ticket+ledger loop, not goodwill.
 
-## 4. Second head — reconciled via recursion, not via a second orchestrator
+## 4. A "second head" — two different shapes, and they resolve differently
 
-A deployment that wants a second "head" (a separate personal/creative or otherwise
-differently-scoped hemisphere alongside this org) does NOT put two orchestrators inside one
-viable system. The correct frame is level +1: **the operator's operation contains multiple
-viable systems as S1 units** — this org (one hemisphere) and any other hemisphere (its own,
-separately-instantiated head) — with the operator as the shared S5 and an explicit hand-over
-protocol as level-+1 S2 (anti-oscillation between hemispheres: clean ownership transfer, no
-double-driving). Each hemisphere is base-one-orchestrator internally. **Seed consequence:** ship
-exactly one orchestrator persona per instantiated system; "multiple heads" is multiple seed
-*instances* under one operator's S5, coordinated by an explicit hand-over convention — never
-two orchestrators in one instance.
+Neither shape puts two orchestrators inside one viable system. But they are **not the same
+deployment**, and collapsing them is how the persona→system 1:1 error gets back in through the
+side door. Decide which one you are building.
+
+**Shape A — a separately-instantiated head (level +1).** Two differently-scoped hemispheres, each
+its own full deployment. The frame is level +1: **the operator's operation contains multiple viable
+systems as S1 units**, with the operator as the shared S5 and an explicit hand-over protocol as
+level-+1 S2 (anti-oscillation: clean ownership transfer, no double-driving). Each hemisphere is
+base-one-orchestrator internally. "Multiple heads" here means multiple seed *instances* under one
+operator's S5 — never two orchestrators in one instance.
+
+**Shape B — a privacy-partitioned specialized unit inside ONE instance (level 0).** The far more
+common want, and the one the level-+1 reading gets wrong: a unit with its own account, its own
+private-data domain, and its own operator-facing channel, but sharing this instance. That is **not**
+a second head at all — it is an **integral level-0 S1 unit on par with the seats** (§1 row S1(c)),
+separated for *concern* reasons rather than topological ones, with the accountability partition and
+bounded S3+S5 guardrails in §1a. It is not an orchestrator because it holds no dispatch, merge, or
+curation authority — which is precisely what makes it S1 rather than a second S2/S3/S5.
+
+**The framing that gets retired:** for Shape B, "exception" / "outside the model" language is wrong
+and should not be carried into a deployment's own docs. Such a unit is integral, not a carve-out.
+If your deployment calls something a "second head", check which shape you actually have — the
+hemisphere/second-head vocabulary is useful **domain and comms-surface description**, and it is
+**not a VSM placement**.
+
+**Seed consequence, unchanged:** ship exactly one orchestrator persona per instantiated system.
 
 ## Sources
 
