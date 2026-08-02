@@ -41,14 +41,21 @@ each case," Beer 1984). This seed nominates:
 | **S3 — Internal regulation / resource bargain** | **The orchestrator** (one persona, always exactly one — see §3 and §4). Dispatch briefs ARE the resource bargain: scoped autonomy + worktree/branch resources in exchange for decisions-with-justification accountability. The intervention channel is direct messaging/status-checks; the synergy function is the cross-arc knowledge lift (`bugs/`, `lessons/`, the ledger). |
 | **S3\* — Sporadic audit** | Two realizations. (a) The **third-party-auditor extra** — a different-vendor harness auditing the org's claims (opt-in, off by default — see §3). (b) The orchestrator's own read-the-defining-surface discipline (verifying claims in durable artifacts; direct inspection of worker output bypassing routine reports). Both bypass the routine reporting channel, which is Beer's actual independence requirement. **Documented extension, not Beer's specification:** Beer's S3\* is internal-but-channel-independent — the literature is silent on vendor-heterogeneity. Reading S3\* as "a different-vendor harness" is a defensible extension (tooling heterogeneity guarantees the auditor doesn't share the audited channel's blind spots), and this seed presents it as an extension, not as something Beer stated. |
 | **S4 — Intelligence (outside-and-future)** | The **specialist** role: watch topics = environmental scanning (vendor policy, billing, harness landscape); research dispatches = directed sensing. The orchestrator's own design/ADR work is the S3–S4 homeostat in action (operational reality ↔ what's coming). |
-| **S5 — Identity / policy / closure** | **The operator + the rulebook + the orchestrator, jointly.** The rulebook (principles/directives, ADRs) is the closure artifact; the operator holds goal-level ratification and externals; the orchestrator embodies identity day-to-day and drafts policy but does not close goal-level questions. Nobody sits outside the model: **the operator is IN the system** as S5 (and as the level-+1 metasystem), not an external user of it. |
+| **S5 — Identity / policy / closure** | **The operator.** Ultimate authority, ethos, closure; the operator holds goal-level ratification and externals. Nobody sits outside the model: **the operator is IN the system** as S5 (and as the level-+1 metasystem), not an external user of it. **Where the rulebook and the orchestrator sit (corrected 2026-08-02, superseding the prior "operator + rulebook + orchestrator, jointly"):** the rulebook is the artifact S5's closure is *inscribed in*, but as a standing control surface it **serves S3**, and it is cross-system *by lifecycle* — S1 as authored → S3 as governance. The orchestrator **drafts** policy (an authoring act, S1) and holds S3 regulation, but does **not** hold S5 closure. Seating all three in S5 jointly is the persona→system 1:1 error this model exists to prevent. |
 | **Memory/continuity substrate** | The **memory-hub extra** — see §2; deliberately mapped as substrate, not as a sixth system. |
 | **Algedonic channels** | Escalation rules that BYPASS normal reporting: failure-triggered alerts, "urgent enough to skip the queue" escalation, cap-hit/recovery chains, a sibling instance's poke into a drifted orchestrator. Beer's two design features hold: they fire after the normal channel had its chance (timeout-gated), and they are not restricted to negative signals — a seat surfacing an unexpected win routes the same way. |
 
-**Recovery — autonomic, not a numbered system.** The recovery role is not a sixth system and
-not S3\*: it is the org's *autonomic loop* — the machinery that keeps the plant alive (restarts,
-repair, drift-pokes) without engaging planning or identity. This is distinct from the audit
-function (which inspects claims, not liveness).
+**Recovery — the recovery FUNCTION is autonomic, not a numbered system.** The recovery function is
+not a sixth system and not S3\*: it is the org's *autonomic loop* — the machinery that keeps the
+plant alive (restarts, repair, drift-pokes) without engaging planning or identity. This is distinct
+from the audit function (which inspects claims, not liveness).
+
+**Scope note (corrected 2026-08-02).** That is a claim about the *function*, **not** about whoever
+performs it. In this org's own deployment the recovery seat is cross-system: recovery /
+algedonic-response **+ S2-construction** (building the substrate itself) **+ S3\*** (grooming and
+index audits). Read "recovery is not S3\*" as a persona-level claim and you have reproduced exactly
+the persona→system 1:1 error §1 exists to prevent — it is *because* an actor is not a box that the
+same seat's repair work can be autonomic while its grooming audits are S3\*.
 
 ## 2. memory-hub: substrate beneath the model
 
