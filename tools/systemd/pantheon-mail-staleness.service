@@ -1,0 +1,33 @@
+[Unit]
+Description=Pantheon mail-staleness detector — per-inbox liveness for the ORG-026 hub (T-2157/T-2200)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-2200.md
+After=network.target
+
+# Silent-failure guard (T-1868). Load-bearing rather than conventional here: this
+# unit exists because a mail-layer failure presents as SILENCE, so a silent
+# failure OF THE DETECTOR reproduces the exact defect it was built to catch.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# NOT a templated @-unit despite the ticket's shorthand: the monitor scans EVERY
+# inbox on the hub in one pass (discover_inboxes by maildir shape), so there is no
+# per-agent instance to parameterise. One unit, whole hub — templating it would
+# run the same full scan N times and multiply the alerts.
+#
+# `sg pantheon-mailbox` for the same reason mailbox-wake and unit-failure-alert use it:
+# the hub is mode 2770 group pantheon-mailbox, and systemd user units cannot grant
+# supplementary groups (SupplementaryGroups= fails 216 on --user).
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/mail_staleness_monitor.py"
+
+StandardOutput=journal
+StandardError=journal
+# Read-only: stats 9 maildirs and captures panes. Seconds in practice; the
+# ceiling exists so a hung pane-capture cannot wedge the timer.
+TimeoutStartSec=4min
+
+[Install]
+WantedBy=default.target

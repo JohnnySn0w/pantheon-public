@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vault link check — verify every [[wikilink]] in the repo resolves for Obsidian (T-1597).
+"""Vault link check — verify every `[[wikilink]]` in the repo resolves for Obsidian (T-1597).
 
 Obsidian resolves ``[[target]]`` against (a) any markdown file's basename
 (sans ``.md``) anywhere in the vault and (b) any name listed in a file's YAML
@@ -52,6 +52,13 @@ MEMORY_PREFIXES = (
 # Sibling-repo namespaces (echo ADRs et al.) — resolvable only in the
 # parent-folder multi-repo vault, once that repo adopts the convention.
 CROSS_REPO_RE = re.compile(r"^(ADR-\d+$|adr/ADR-|Supplementary Material/)")
+
+# Code-identifier shape (T-1597 follow-up 2026-07-12): `[[tool_executor.source]]`,
+# `[[hooks.<Event>]]` etc. are code refs written in prose, not vault links — a
+# dotted identifier (a.b) with no path separator and not a real note filename.
+# No markdown note is named this way, so treating them as a distinct class stops
+# the recurring false-positive without editing every author's prose.
+CODE_REF_RE = re.compile(r"^[A-Za-z_][\w<>]*\.[\w<>.]+$")
 
 # Historical record dirs: never rewritten, so dead links there WARN not FAIL.
 HISTORICAL_PREFIXES = ("tickets/done/", "knowledge/watch/reports/", "incidents/", "ledger/")
@@ -133,7 +140,7 @@ def run(repo_root: Path, list_memory_pointers: bool = False) -> int:
     dead_fail: list[tuple[str, str]] = []
     dead_warn: list[tuple[str, str]] = []
     memory_ptrs: list[tuple[str, str]] = []
-    counts = {"resolved": 0, "cross-repo": 0, "citation": 0, "annotation": 0}
+    counts = {"resolved": 0, "cross-repo": 0, "citation": 0, "annotation": 0, "code-ref": 0}
     n_links = 0
     for p, text in texts.items():
         rel = str(p.relative_to(repo_root))
@@ -149,6 +156,8 @@ def run(repo_root: Path, list_memory_pointers: bool = False) -> int:
                 counts["citation"] += 1
             elif ": " in target:
                 counts["annotation"] += 1
+            elif "/" not in target and CODE_REF_RE.match(target):
+                counts["code-ref"] += 1
             elif rel.startswith(HISTORICAL_PREFIXES):
                 dead_warn.append((rel, target))
             else:
@@ -158,7 +167,8 @@ def run(repo_root: Path, list_memory_pointers: bool = False) -> int:
         f"[vault-link-check] {n_links} wikilinks in {len(files)} files: "
         f"{counts['resolved']} resolved, {len(memory_ptrs)} agent-memory pointers, "
         f"{counts['cross-repo']} cross-repo, {counts['citation']} citation, "
-        f"{counts['annotation']} annotation, {len(dead_warn)} dead-historical (warn), "
+        f"{counts['annotation']} annotation, {counts['code-ref']} code-ref, "
+        f"{len(dead_warn)} dead-historical (warn), "
         f"{len(dead_fail)} dead-curated (FAIL)"
     )
     if list_memory_pointers:

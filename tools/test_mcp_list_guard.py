@@ -95,5 +95,65 @@ class DecideTest(unittest.TestCase):
         self.assertIsNone(guard.decide({}, poller_live=True))
 
 
+class TestCommandSubstitutionFalsePositive(unittest.TestCase):
+    """T-2251: `$(cd /home/claude && …)` was denied as a `claude` invocation.
+
+    Two independent defects had to line up, and the fix needs both halves — each
+    test below is paired against the half it exercises, so reverting either one
+    fails this class rather than passing quietly:
+
+      1. `$(`, `)` and backtick were not segment boundaries. `)` in particular
+         meant `FOO=$(date) claude -p x` had no command position before `claude`.
+      2. the env-assignment VALUE was `\\S*`, which swallowed `$(cd ` (and then
+         the `;` the normalisation inserts) as one value — leaving the PATH token
+         `/home/claude` parsed as the command.
+
+    The account is literally named `claude`, so `$(cd /home/claude && …)` is an
+    everyday shape on the most-used path on the box. A safety guard that
+    false-positives on ordinary commands is one that gets routed around, and a
+    routed-around guard protects nothing.
+    """
+
+    # Reported by bisection on T-2251; command substitution AROUND a cd whose
+    # target ends in /claude. Either element alone was already fine.
+    def test_allows_substitution_around_cd_into_claude_home(self):
+        for cmd in (
+            "out=$(cd /home/claude && echo '{}' | bash .claude/hooks/handoff-auto-read.sh 2>&1)",
+            "out=$(cd /home/claude && echo '{}' | bash x.sh 2>&1)",
+            "sz=$(cd /home/claude && stat -c %s HANDOFF.md)",
+            "d=$(cd /home/claude/pantheon-config && git rev-parse HEAD)",
+            "n=$(cd /home/claude-fallback && wc -l < HANDOFF.md)",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(guard.command_targets_mcp_list(cmd))
+
+    def test_still_blocks_real_invocation_after_a_substitution(self):
+        """Guards defect 1. A false ALLOW here reintroduces the 409 bridge-death,
+        so this is the case that must never regress: the `)` has to close a
+        segment or `claude` is not seen to be in command position at all."""
+        self.assertTrue(guard.command_targets_mcp_list("FOO=$(date) claude -p hi"))
+
+    def test_still_blocks_claude_as_the_substitution_command(self):
+        for cmd in ("out=$(claude -p q)", "out=$(cd /tmp && claude -p q)", "`claude -p q`"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(guard.command_targets_mcp_list(cmd))
+
+    def test_still_blocks_env_assigned_invocation(self):
+        """Guards defect 2's fix from over-tightening: a legitimate `VAR=value
+        claude …` prefix must still parse as an env assignment and block."""
+        self.assertTrue(guard.command_targets_mcp_list("FOO=bar claude -p x"))
+
+    def test_path_mention_is_never_an_invocation(self):
+        """The general property behind T-2251: a path COMPONENT named claude is
+        not a command, in or out of a substitution."""
+        for cmd in (
+            "cd /home/claude && bash x.sh",
+            "ls /home/claude/pantheon-config",
+            "rsync -a /home/claude/ /backup/claude/",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertFalse(guard.command_targets_mcp_list(cmd))
+
+
 if __name__ == "__main__":
     unittest.main()

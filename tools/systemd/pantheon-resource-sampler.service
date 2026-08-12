@@ -1,0 +1,25 @@
+[Unit]
+Description=Pantheon resource sampler — per-process memory attribution for post-mortems (T-2213)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-2213.md
+After=network.target
+
+# NO OnFailure= here, deliberately. This is an evidence recorder, not a monitor.
+# Routing its failures into the mailbox would put an alerting dependency on the
+# one thing that must keep writing while the box is in trouble — and the sampler
+# already swallows every error and exits 0 by design.
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/resource_sampler.py
+StandardOutput=null
+StandardError=journal
+# Reads /proc and appends one line. Sub-second in practice; the ceiling only
+# exists so a pathological /proc scan cannot pile up instances.
+TimeoutStartSec=60s
+Nice=10
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

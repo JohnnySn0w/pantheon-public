@@ -1,3 +1,8 @@
+---
+symptom: "Inbox auto-deliveries stop silently for hours; inbox_consumer logs skip:dispatch_locked every 10-min cycle and exits 0"
+fix: "A blocked ticket keeps its auto_delivered stamp and holds the T-0717 mutex - clear auto_delivered and auto_delivered_at from the blocked ticket; the structural fix is T-0864"
+domain: pantheon, tickets, inbox-consumer, mutex, silent-failure
+---
 # Inbox pings stop / `skip:dispatch_locked` forever — a blocked ticket still holds the auto_delivered mutex
 
 **Symptom(s)**

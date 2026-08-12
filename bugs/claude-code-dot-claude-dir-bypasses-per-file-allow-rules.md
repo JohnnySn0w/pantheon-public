@@ -1,3 +1,8 @@
+---
+symptom: "Explicit per-file Edit/Write allow rules in settings.json are ignored for files under ~/.claude/ - the edit still prompts"
+fix: "Relocate the target file out of ~/.claude/; the CLI special-cases that directory ahead of per-file allow rules"
+domain: claude-code-harness, permissions, settings
+---
 # Claude Code: files under `~/.claude/` bypass per-file Edit/Write allow rules
 
 **Surfaced:** 2026-05-13 (Recovery investigation during HO HANDOFF.md prompt loop)

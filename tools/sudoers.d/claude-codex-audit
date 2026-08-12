@@ -1,0 +1,55 @@
+# tools/sudoers.d/claude-codex-audit — T-1884
+#
+# SOURCE COPY for review; the operator installs to /etc/sudoers.d/claude-codex-audit.
+# Grants claude exactly one NOPASSWD command as codex: the INSTALLED wrapper
+# at /usr/local/bin/pantheon-s3star-tmux (root:root, mode 0755) — see the
+# paired tools/sudoers.d/pantheon-s3star-tmux for what it validates/execs.
+#
+# Why one fixed-PATH line instead of tmux-command Cmnd_Aliases: an earlier
+# draft tried scoping this directly to the three tmux command shapes
+# (`bash -lc "tmux new-session ..."` etc.) via wildcard Cmnd_Aliases. That
+# shape has no way to verify pre-install (sudoers' fnmatch-over-a-quoted-
+# string matching semantics can only be confirmed against a live install),
+# and a wildcard mismatch discovered post-install would put us right back
+# at password prompts. Pointing the grant at a single fixed, root-owned
+# executable instead means every real constraint (verb, session-name shape,
+# workspace-path prefix) lives in that script's bash validation, which is
+# plain-unittest-testable pre-install — see
+# tools/test_s3star_audit_runner.py's WrapperScriptTests. This is P1
+# (architecture over policy): the sudoers line itself needs no runtime
+# verification beyond "does it match this one path."
+#
+# THREAT MODEL: this grants claude -> codex COMMAND EXECUTION via the
+# wrapper only — NOT root, and NOT arbitrary commands as codex. It does
+# NOT grant `sudo -u codex bash` or `sudo -u codex <anything else>` — only
+# this one fixed path, which itself only execs `tmux new-session|send-keys|
+# kill-session` against sessions shaped like the runner's own
+# `codex_audit_session_name()` output (see the wrapper's SESSION_RE).
+#
+# The wrapper also carries test-only env overrides (S3STAR_WORKSPACE_ROOT,
+# S3STAR_TMUX_BIN) for its own pre-install unit tests. Their inertness
+# under this grant is CODE-ENFORCED in the wrapper (it unsets both whenever
+# SUDO_USER is set — sudo always sets that on the process it execs), not
+# merely a side effect of this grant omitting SETENV/env_keep for them —
+# see the wrapper's header for the full reasoning (T-1884 REBOUND).
+#
+# CRITICAL: the Cmnd path below MUST stay /usr/local/bin/pantheon-s3star-tmux
+# (the installed, root-owned copy) — NEVER a path under this repo.
+# pantheon-config is claude-writable; a NOPASSWD grant pointing at a
+# claude-writable path would let a compromised claude session rewrite the
+# target and run arbitrary code as codex, defeating the wrapper entirely.
+#
+# INSTALL (the operator):
+#   visudo -cf tools/sudoers.d/claude-codex-audit
+#   sudo install -o root -g root -m 0755 tools/sudoers.d/pantheon-s3star-tmux /usr/local/bin/pantheon-s3star-tmux
+#   sudo install -o root -g root -m 0440 tools/sudoers.d/claude-codex-audit /etc/sudoers.d/claude-codex-audit
+#
+# VERIFY (the operator, post-install — this is the real proof; visudo -c only
+# checks syntax, not runtime matching):
+#   sudo -n -l -U claude
+#     # confirm the grant is listed
+#   sudo -n -u codex /usr/local/bin/pantheon-s3star-tmux kill codex-audit-weekly-narrow-1900-01-01
+#     # expect a clean tmux "can't find session" failure (exit nonzero, NOT
+#     # a password prompt / hang) — proves the grant actually matches.
+
+claude ALL=(codex) NOPASSWD: /usr/local/bin/pantheon-s3star-tmux

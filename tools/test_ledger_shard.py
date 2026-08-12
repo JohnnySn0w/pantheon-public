@@ -5,6 +5,7 @@ Covers the three backward-compat primitives:
   - current_segment_shard: pure-path subfolder shard (no mkdir).
   - iter_ledger_entry_files: the reader union (legacy-only / shards-only /
     both during transition / archive-exclusion / sort order).
+  - entry_ts: ts-field-or-derive-from-id fallback (T-1879).
 
 Run from repo root:
     python3 -m unittest tools.test_ledger_shard -v
@@ -213,6 +214,148 @@ class TestIterLedgerEntryFiles(unittest.TestCase):
             legacy = d / "2026.jsonl"
             legacy.write_text("{}\n")
             self.assertEqual(ls.iter_ledger_entry_files(d), [legacy])
+
+
+class TestEntryTs(unittest.TestCase):
+    def test_ts_field_present_returned_as_is(self):
+        entry = {"id": "2026-04-30T00:00:00Z-001", "ts": "2026-04-30T12:34:56Z"}
+        self.assertEqual(ls.entry_ts(entry), "2026-04-30T12:34:56Z")
+
+    def test_ts_field_wins_over_garbage_id(self):
+        # A str ts field takes priority even when the id would not parse.
+        entry = {"id": "not-a-timestamp-suffix", "ts": "2026-04-30T12:34:56Z"}
+        self.assertEqual(ls.entry_ts(entry), "2026-04-30T12:34:56Z")
+
+    def test_ts_absent_derives_from_valid_id_prefix(self):
+        entry = {"id": "2026-07-20T00:10:23Z-ho-t1818-exocortex-phase1"}
+        self.assertEqual(ls.entry_ts(entry), "2026-07-20T00:10:23Z")
+
+    def test_non_str_ts_falls_back_to_id_derivation(self):
+        entry = {"id": "2026-07-20T00:10:23Z-suffix", "ts": 12345}
+        self.assertEqual(ls.entry_ts(entry), "2026-07-20T00:10:23Z")
+
+    def test_garbage_id_returns_none(self):
+        entry = {"id": "not-a-timestamp-suffix"}
+        self.assertIsNone(ls.entry_ts(entry))
+
+    def test_missing_id_and_ts_returns_none(self):
+        self.assertIsNone(ls.entry_ts({"action": "x"}))
+
+    def test_non_str_id_returns_none(self):
+        entry = {"id": 12345}
+        self.assertIsNone(ls.entry_ts(entry))
+
+    def test_id_shorter_than_prefix_returns_none(self):
+        entry = {"id": "2026-07-20"}
+        self.assertIsNone(ls.entry_ts(entry))
+
+
+class TestAppendRefusesDuplicateIds(unittest.TestCase):
+    """T-2407: an append-only chain whose ids are not unique cannot address its
+    own records — lookup by id returns two rows and a `supersedes` naming that
+    id corrects both or neither.
+
+    Nine such pairs exist historically (2026-05-14..05-20 sync-alerts). They are
+    frozen rather than repaired: rewriting an append-only chain to fix an
+    addressing defect forfeits the property the addressing exists to serve.
+    """
+
+    def _ledger(self, tmp: str) -> Path:
+        d = Path(tmp) / "ledger"
+        d.mkdir()
+        return d
+
+    def _entry(self, eid: str) -> dict:
+        return {"id": eid, "ts": "2026-08-02T00:00:00Z", "agent": "orchestrator"}
+
+    def test_duplicate_id_is_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._ledger(tmp)
+            ls.append_entry(d, self._entry("20260802T000000Z-orchestrator-x"))
+            with self.assertRaises(ValueError) as ctx:
+                ls.append_entry(d, self._entry("20260802T000000Z-orchestrator-x"))
+            self.assertIn("already exists", str(ctx.exception))
+
+    def test_refusal_leaves_the_ledger_byte_identical(self) -> None:
+        """The re-test criterion states this exactly: rejected WITHOUT modifying
+        the ledger. A guard that refuses after opening the file in append mode
+        would still touch it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._ledger(tmp)
+            target = ls.append_entry(d, self._entry("20260802T000000Z-orchestrator-x"))
+            before = target.read_bytes()
+            with self.assertRaises(ValueError):
+                ls.append_entry(d, self._entry("20260802T000000Z-orchestrator-x"))
+            self.assertEqual(target.read_bytes(), before)
+
+    def test_a_distinct_id_still_appends(self) -> None:
+        """The guard must not be the kind that also blocks the legitimate case."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._ledger(tmp)
+            ls.append_entry(d, self._entry("20260802T000000Z-orchestrator-x"))
+            target = ls.append_entry(d, self._entry("20260802T000001Z-orchestrator-y"))
+            self.assertEqual(len(target.read_text().strip().splitlines()), 2)
+
+    def test_collision_is_caught_across_shards_not_just_within_one(self) -> None:
+        """A duplicate must not be able to hide by living in a different shard
+        from its twin."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._ledger(tmp)
+            early = {"id": "dup", "ts": "2026-05-14T21:44:52Z"}
+            late = {"id": "dup", "ts": "2026-08-02T00:00:00Z"}
+            first = ls.append_entry(d, early)
+            with self.assertRaises(ValueError):
+                ls.append_entry(d, late)
+            # ...and they really would have been different shards.
+            self.assertNotEqual(
+                ls.segment_for_ts(ls.entry_ts(early)), ls.segment_for_ts(ls.entry_ts(late))
+            )
+            self.assertEqual(len(first.read_text().strip().splitlines()), 1)
+
+    def test_a_malformed_existing_line_does_not_break_appends(self) -> None:
+        """Fail-open on unparseable history: a guard that crashes on a
+        pre-existing bad line turns an unrelated defect into a total append
+        outage, and a line that will not parse cannot collide anyway."""
+        with tempfile.TemporaryDirectory() as tmp:
+            d = self._ledger(tmp)
+            target = ls.append_entry(d, self._entry("20260802T000000Z-orchestrator-x"))
+            with target.open("a") as fh:
+                fh.write("{not json at all\n")
+            ls.append_entry(d, self._entry("20260802T000002Z-orchestrator-z"))
+            self.assertIn("20260802T000002Z-orchestrator-z", target.read_text())
+
+    def test_live_ledger_has_exactly_the_nine_known_pairs(self) -> None:
+        """The frozen historical set, pinned so it cannot GROW unnoticed.
+
+        Deliberately an equality assertion, not a ceiling: a tenth duplicate
+        means the writer-side guard was bypassed (raw-git hand-append), which is
+        the one path this refusal cannot cover and the thing worth hearing about.
+        """
+        import collections
+        import json as _json
+
+        repo_ledger = Path(__file__).resolve().parent.parent / "ledger"
+        counts: collections.Counter = collections.Counter()
+        for path in ls.iter_ledger_entry_files(repo_ledger):
+            for line in path.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    eid = _json.loads(line).get("id")
+                except _json.JSONDecodeError:
+                    continue
+                if isinstance(eid, str):
+                    counts[eid] += 1
+        dupes = sorted(k for k, n in counts.items() if n > 1)
+        self.assertEqual(
+            len(dupes), 9,
+            f"expected the 9 frozen 2026-05 sync-alert pairs, found {len(dupes)}: {dupes}",
+        )
+        self.assertTrue(
+            all(k.startswith("2026-05-1") or k.startswith("2026-05-2") for k in dupes),
+            f"a duplicate outside the frozen 2026-05 window: {dupes}",
+        )
 
 
 if __name__ == "__main__":

@@ -196,6 +196,94 @@ class TestGitCommitMessageNotMatchSurface(unittest.TestCase):
         ))
 
 
+class TestLedgerBareTokenAnchored(unittest.TestCase):
+    """T-2655: the bare `ledger/<year>` alternative in _HO_RECORDS is anchored to
+    require the token be the START of a path (start-of-string / whitespace /
+    quote), not merely present anywhere in the command string. An unrelated
+    absolute /tmp scratch path that nests a `ledger/<year>` segment partway
+    through must not false-positive (the T-2650 implementer's hook-wet-run
+    case); a real cwd-relative pantheon-config write (bare `ledger/<year>`
+    preceded by whitespace, e.g. after `git add `) must still block, and an
+    explicit `pantheon-config-<ticket>/ledger/...` worktree operand must still
+    block via the (now worktree-suffix-aware) explicit alternative.
+    """
+
+    def test_tmp_scratch_nested_ledger_path_redirect_allowed(self):
+        self.assertFalse(_blocked(
+            "echo x > /tmp/scratch/ledger/2026-W30/x.jsonl",
+            agent_type="implementer",
+        ))
+
+    def test_tmp_scratch_nested_ledger_path_cp_allowed(self):
+        self.assertFalse(_blocked(
+            "cp file.txt /tmp/scratch/ledger/2026-W30/x.jsonl",
+            agent_type="implementer",
+        ))
+
+    def test_worktree_ledger_write_still_blocked(self):
+        self.assertTrue(_blocked(
+            "echo x > pantheon-config-T-9999/ledger/2026-W28/x.jsonl",
+            agent_type="implementer",
+        ))
+
+    def test_bare_relative_ledger_add_still_blocked(self):
+        self.assertTrue(_blocked(
+            "git add ledger/2026-W26/2026-W26.jsonl",
+            agent_type="implementer",
+        ))
+
+
+class TestPushMessageTextNotMatchSurface(unittest.TestCase):
+    """T-2716: a git commit whose MESSAGE merely mentions push/PR/merge text
+    must not be treated as an actual push/PR/merge attempt — the -m/--message
+    value is not a command being run, mirroring the T-1600 discipline already
+    applied to _ho_records_match."""
+
+    def test_commit_message_mentioning_git_push_allowed(self):
+        # No `;` in the message text: a literal semicolon inside the quoted
+        # -m value trips `_COMPOUND_RE`'s raw-string scan (it runs before
+        # shlex, so it can't tell the `;` is inside quotes) and falls to the
+        # conservative raw-string fallback — that's the same pre-existing,
+        # intentional fail-closed behavior `_ho_records_match` already has for
+        # compound-looking shapes, not something this fix changes or is
+        # required to handle.
+        self.assertFalse(_blocked(
+            'git commit -m "feat: add --no-verify-push flag, so echo-merge '
+            'no longer runs git push after merge"',
+            agent_type="implementer",
+        ))
+
+    def test_commit_message_mentioning_gh_pr_merge_allowed(self):
+        self.assertFalse(_blocked(
+            'git commit -m "docs: describe gh pr merge --admin flow"',
+            agent_type="t2714-impl",
+        ))
+
+    def test_commit_dash_c_message_mentioning_push_allowed(self):
+        self.assertFalse(_blocked(
+            'git -C /tmp/pantheon-config-T-2714 commit -m '
+            '"note: gh pr create is HO-exclusive per this change"',
+            agent_type="implementer",
+        ))
+
+    def test_real_push_still_blocked(self):
+        self.assertTrue(_blocked("git push origin agent/T-2714", agent_type="implementer"))
+
+    def test_real_pr_create_still_blocked(self):
+        self.assertTrue(_blocked("gh pr create --fill", agent_type="implementer"))
+
+    def test_real_pr_merge_still_blocked(self):
+        self.assertTrue(_blocked("gh pr merge 200 --admin --squash", agent_type="implementer"))
+
+    def test_compound_commit_message_then_real_push_still_blocked(self):
+        # Ambiguous compound structure -> fail-closed (conservative fallback),
+        # even though the push half is a separate real invocation.
+        self.assertTrue(_blocked(
+            'git commit -m "mentions git push" && git push',
+            agent_type="implementer",
+        ))
+
+
 class TestQuoteSplitEvasionStillCaught(unittest.TestCase):
     """The NAMED off-limits evasion class (quote-splitting the guarded word to
     dodge the regex) must stay caught. Reconstructing the match surface via
@@ -418,6 +506,107 @@ class TestWorkerCodeEditsAllowed(unittest.TestCase):
 
     def test_edit_screenshots_evidence_allowed(self):
         self.assertFalse(_edit_blocked("/home/claude/pantheon-config/screenshots/T-1381/note.txt", agent_type="implementer"))
+
+
+class TestGitIdentityGuard(unittest.TestCase):
+    """T-1687: workers never touch git identity (after the 6-day --global
+    misattribution incident, bugs/subagent-git-config-global-identity-pollution.md)."""
+
+    @staticmethod
+    def _bash_cwd(command, agent_type=None, cwd=""):
+        d = {"tool_name": "Bash", "tool_input": {"command": command}}
+        if agent_type is not None:
+            d["agent_type"] = agent_type
+        if cwd:
+            d["cwd"] = cwd
+        return d
+
+    def _blocked_cwd(self, command, agent_type=None, cwd=""):
+        return worker_guard.decide(self._bash_cwd(command, agent_type, cwd)) is not None
+
+    # --- the incident command shape ---
+    def test_global_identity_write_blocked_for_subagent(self):
+        self.assertTrue(self._blocked_cwd(
+            'git config --global user.name reviewer', agent_type="reviewer"))
+
+    def test_global_any_write_blocked_for_subagent(self):
+        self.assertTrue(self._blocked_cwd(
+            'git config --global core.editor vim', agent_type="implementer"))
+
+    def test_system_config_blocked_for_subagent(self):
+        self.assertTrue(self._blocked_cwd(
+            'git config --system user.email x@y', agent_type="t1336-impl2"))
+
+    def test_ho_exempt_from_global_config(self):
+        self.assertFalse(self._blocked_cwd('git config --global user.name orchestrator'))
+
+    # --- shared-checkout identity (non-global) ---
+    def test_identity_in_shared_checkout_cwd_blocked(self):
+        self.assertTrue(self._blocked_cwd(
+            'git config user.email r@l', agent_type="reviewer",
+            cwd="/home/claude/pantheon-config"))
+
+    def test_identity_via_dash_C_shared_checkout_blocked(self):
+        self.assertTrue(self._blocked_cwd(
+            'git -C /home/claude/echo-prismatic config user.name w',
+            agent_type="implementer", cwd="/tmp/echo-T-9999"))
+
+    def test_worktree_local_identity_allowed(self):
+        self.assertFalse(self._blocked_cwd(
+            'git config user.name impl', agent_type="implementer",
+            cwd="/tmp/pantheon-config-T-9999"))
+
+    # --- non-identity, non-global config + read-only mentions stay allowed ---
+    def test_plain_config_read_allowed_in_shared_checkout(self):
+        self.assertFalse(self._blocked_cwd(
+            'git config --get remote.origin.url', agent_type="reviewer",
+            cwd="/home/claude/pantheon-config"))
+
+    def test_grep_mentioning_global_config_allowed(self):
+        self.assertFalse(self._blocked_cwd(
+            'grep -rn "git config --global" tools/', agent_type="reviewer",
+            cwd="/home/claude/pantheon-config"))
+
+    # --- T-2323: the denial must carry a route that actually works ---
+    #
+    # This guard's cwd test reads the SESSION's directory, not the command's
+    # effective target, so it fires even on a /tmp-targeted command when the
+    # worker's session sits in a shared checkout. That over-block is deliberate
+    # (parsing a leading `cd` is defeatable, and a false negative re-opens
+    # T-1687), which makes the DENIAL TEXT load-bearing: it is the only thing
+    # standing between a blocked worker and a dead end. Two workers hit this on
+    # 2026-07-29 doing Amendment H falsification in throwaway repos and both had
+    # to rediscover the alternative on their own.
+    #
+    # Asserted rather than argued, because the value of that fix is entirely in
+    # message CONTENT and nothing else would notice if an edit dropped it.
+    def test_identity_denial_names_a_route_that_actually_works(self):
+        reason = worker_guard._git_identity_match(
+            "git config user.email r@l", "/home/claude/pantheon-config")
+        self.assertIsNotNone(reason, "precondition: this shape must still block")
+        for token in ("git -c user.email", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
+            self.assertIn(token, reason,
+                          f"denial must name {token} — the worker's way through")
+
+    def test_identity_denial_does_not_promise_an_unreachable_tmp_exemption(self):
+        # The pre-T-2323 text said "worktree-local identity under /tmp is allowed",
+        # which is FALSE for the worker most likely to read it: one whose session
+        # cwd is a shared checkout. Promising an exemption that does not apply is
+        # worse than promising nothing.
+        reason = worker_guard._git_identity_match(
+            "git config user.email r@l", "/home/claude/pantheon-config")
+        self.assertNotIn("under /tmp is allowed", reason)
+
+    def test_named_alternatives_are_genuinely_unblocked(self):
+        # The routes the message recommends must pass the guard from the SAME cwd
+        # that triggered the denial — otherwise the advice sends the worker into a
+        # second wall. This is the assertion that makes the message trustworthy.
+        shared = "/home/claude/pantheon-config"
+        self.assertIsNone(worker_guard._git_identity_match(
+            "git -c user.email=w@example.com -c user.name=w commit -m x", shared))
+        self.assertIsNone(worker_guard._git_identity_match(
+            "GIT_AUTHOR_EMAIL=w@example.com GIT_COMMITTER_EMAIL=w@example.com "
+            "git commit -m x", shared))
 
 
 if __name__ == "__main__":

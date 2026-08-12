@@ -3,6 +3,17 @@ aliases: [ORG-001]
 title: Decision ledger format and storage
 status: Ratified 2026-04-28
 date: 2026-04-28
+# re_evaluate: machine-checkable mirror of this ADR's inline re-eval prose,
+# consumed by tools/adr_reeval_walk.py (T-2527) during the weekly-review walk.
+# type: calendar|metric|event ; fires: auto-ticket (deterministic only) | surface.
+# Backfilled per T-2530 (inline-only trigger was previously uncaught).
+re_evaluate:
+  - id: R1
+    type: event
+    when: "a second project comes online"
+    fires: surface
+    text: "v0 assumes a single shared ledger; revisit ledger-per-project vs periodic-merge when the second project comes online"
+build_disposition: built
 ---
 # ORG-001 — Decision ledger format and storage
 
@@ -85,6 +96,52 @@ Rationale: §Format's original year-rollover argument (b)/(c) under-shards at th
 | `parent_id` | optional | The entry id this one descends from (e.g. a worker's report entry references the dispatch entry that spawned it). `null` for root entries. |
 | `supersedes` | optional | The entry id this one corrects or replaces. Use sparingly — most decisions evolve via parent_id chains, not supersedure. |
 | `metrics` | optional (close-entries only) | Structured per-cycle metrics; see §Metrics field below. Ratified per T-0193. |
+| `executor` | optional | Free text naming **which executor of `agent` acted** — session id, pid, tmux/unit label, or a plain description. Recommended whenever a persona can have more than one live executor; mandatory nowhere. Documented 2026-08-02 per T-2276; see §Executor attribution. |
+
+### Executor attribution (T-2276, documented 2026-08-02)
+
+`agent` identifies a **persona**, not an executor. When one persona has two live
+executors, every reconstruction mechanism — ledger authorship, commit author,
+reflog, working copy, persona name — resolves to the same value for both, and
+the chain becomes **intact, append-only, and unable to answer the question it
+exists to answer.** P4 is not weakened by a missing entry here; it is weakened by
+an actor field that has stopped being a key.
+
+The worked case (mnemosyne, T-2274/T-2276): entry
+`20260729T002700Z-mnemosyne-manual-drain-29-operator-directed` (`be5c28b39`) is
+authored `mnemosyne`, sits in her clone's reflog as a local commit from her
+working copy, and records a Telegram-directed action — while the session that
+found it had received zero Telegram inbounds all night. Her sentence is the whole
+ticket: *"I cannot tell you whether I did it."* It resolved benignly, and the
+benign resolution demonstrates the finding rather than shrinking it: **it took
+three seats and a ledger grep to attribute one action.**
+
+**This field was not designed; it was already in use.** Measured 2026-08-02:
+45 of 1509 entries already carried `executor`, written independently by three
+different agents, two of them already using exactly the session-id and
+tmux-unit-label forms. Convergent invention under real need is stronger evidence
+that a field is required than any argument for adding one. This ADR documents
+what the ledger already does.
+
+**Additive by construction.** Consumers ignore unknown keys, and that claim was
+**run, not reasoned** (Amendment H2): `ledger_placement_lint --all`,
+`spine_index_groom --dry-run`, `cycle_stats session-resets`, and
+`activity_digest --agent <a> --dry-run` were each executed against an entry
+carrying the field, with a deliberately corrupt line first to prove the harness
+could see a consumer complain. None validates the key set. The field also
+survives a parse-and-reserialise round trip. And the strongest evidence is not
+the fixture: **45 entries carrying this field have already passed through every
+daily consumer run in production.**
+
+**Relation to T-2274's executor-mutex.** If one-executor-per-identity becomes
+structural, this field documents history rather than disambiguating the present —
+still worth having, because a mutex can fail and on the night in question it did
+not exist. The mutex lowers this field's urgency; it does not retire it.
+
+**Interim convention, effective without any schema change:** an entry written
+where a second executor could plausibly share the persona should name the
+executor **in the action or rationale text** if the field is not set. Costs
+nothing, breaks nothing, and makes tonight's question answerable tomorrow.
 
 ## Metrics field (close-entries)
 

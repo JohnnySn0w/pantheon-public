@@ -154,19 +154,48 @@ def read_doc(path: Path) -> _Doc:
 # Transition-log actors are MIXED: persona names (recovery/orchestrator/specialist/codex), Unix
 # account / role names (claude/claude-fallback/orchestrator/claude-research/
 # specialist), and special non-agent actors (grooming/auto-unblock/operator/…).
-# Per project_agent_account_mapping: Orchestrator=HO=`claude`; Specialist=`claude-research`;
-# Recovery=`claude-fallback`. `touched-by <agent>` expands a query to its whole group
-# so "recovery" finds `[recovery]` AND `[claude-fallback]` lines, etc. Unknown tokens
-# match only themselves (so `touched-by grooming` still works literally).
+# `touched-by <agent>` expands a query to its whole group so "recovery" finds
+# `[recovery]` AND `[claude-fallback]` lines, etc. Unknown tokens match only
+# themselves (so `touched-by grooming` still works literally).
+#
+# DERIVED (T-2256), and it was returning WRONG ANSWERS before it was. The list
+# was hand-carried and stopped at the pre-ORG-042 three, so the ORG-042/ORG-043
+# seats had no group at all — and alias_group() falls back to self, silently.
+# Measured 2026-07-29 on the live tree: `touched-by mnemosyne` matched only
+# `[mnemosyne]` lines and missed all 80 `[exocortex]` ones; `touched-by atlas`
+# missed 10 `[suborch2]` ones. Not a latent risk — wrong output, and the gap grew
+# with every transition log anyone wrote. Deriving from the persona registry plus
+# the instance.yaml account bindings means a new seat is grouped at registration.
 # ---------------------------------------------------------------------------
 
-_ALIAS_GROUPS: list[set[str]] = [
-    {"recovery", "claude-fallback"},
-    {"orchestrator", "orchestrator", "orchestrator", "claude"},
-    {"specialist", "claude-research", "specialist"},
-    {"codex"},
-    {"operator"},
-]
+# Actor strings that are NOT derivable from the registries: a legacy free-form
+# role word, and non-agent actors that appear as transition-log actors. These are
+# additions to the derived groups, never a substitute for them.
+_ALIAS_EXTRAS: dict[str, set[str]] = {"orchestrator": {"orchestrator"}}
+_NON_AGENT_ACTOR_GROUPS: list[set[str]] = [{"operator"}]
+
+
+def _build_alias_groups() -> list[set[str]]:
+    """One group per registered persona: {persona, audit role-id, OS account} plus
+    any non-derivable extras, then the non-agent actor groups. Identity entries
+    collapse naturally (`recovery`'s audit role-id IS "recovery"; codex's account IS
+    "codex"), so a singleton group is a correct answer, not a missing one."""
+    from tools.agent_role_map import AGENT_ROLE_MAP, account_persona_map, resolve_role
+
+    persona_accounts: dict[str, str] = {
+        persona: account for account, persona in account_persona_map().items()
+    }
+    groups: list[set[str]] = []
+    for persona in sorted(AGENT_ROLE_MAP):
+        group = {persona, resolve_role(persona)} | _ALIAS_EXTRAS.get(persona, set())
+        account = persona_accounts.get(persona)
+        if account:
+            group.add(account)
+        groups.append(group)
+    return groups + [set(g) for g in _NON_AGENT_ACTOR_GROUPS]
+
+
+_ALIAS_GROUPS: list[set[str]] = _build_alias_groups()
 
 
 def alias_group(agent: str) -> set[str]:

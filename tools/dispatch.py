@@ -59,7 +59,17 @@ try:
     from tools.agent_role_map import AGENT_ROLE_MAP  # noqa: E402
     _KNOWN_AGENTS = set(AGENT_ROLE_MAP.keys())
 except Exception:  # pragma: no cover - role map optional
-    _KNOWN_AGENTS = {"orchestrator", "specialist", "recovery", "codex", "the-ancestor"}
+    # SYNC MIRROR of AGENT_ROLE_MAP's keys, reached only when the role map cannot
+    # be imported at all — so it is the one list in this file that CANNOT derive
+    # from the canonical map, by construction. It therefore gets the repo's other
+    # answer to a hand-carried list: a check that fails. Held the pre-ORG-042/043
+    # five until T-2256 (orchestrator/specialist/recovery/codex/the-ancestor), a silent 5-of-8 that
+    # would have warned "unknown dispatchee" for every mnemosyne/metis/atlas
+    # dispatch in a degraded import. test_dispatch enforces the sync.
+    _KNOWN_AGENTS = {
+        "orchestrator", "specialist", "recovery", "codex", "the-ancestor",
+        "mnemosyne", "metis", "atlas",
+    }
 
 # Standard non-enumerable role names that are valid dispatch endpoints. Ephemeral
 # workers are spawned per-arc and are NOT exhaustively listable; this set just

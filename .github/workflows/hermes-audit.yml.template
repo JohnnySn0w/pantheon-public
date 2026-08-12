@@ -1,0 +1,59 @@
+# HERMES\.md byte-sequence discipline audit — OPT-IN server-side enforcement layer.
+#
+# ── HOW TO ENABLE ──────────────────────────────────────────────────────────
+# This file ships as `hermes-audit.yml.template` and does NOT run as-is: GitHub
+# Actions only runs `.yml`/`.yaml` files. To turn it on, rename it:
+#     git mv .github/workflows/hermes-audit.yml.template \
+#            .github/workflows/hermes-audit.yml
+# It then runs on GitHub-hosted CI (ubuntu-latest) on every push and PR — which
+# consumes YOUR account's Actions minutes/compute. Leaving it as `.template`
+# keeps the guard available but inert; enabling it is your call.
+#
+# ── WHAT IT IS ─────────────────────────────────────────────────────────────
+# The seed already ships the LOCAL half of this guard (`.githooks/pre-commit`,
+# activated by `tools/install-hooks.sh`). That half catches at author time but
+# is bypassable with `--no-verify` or a hookless clone. THIS file is the
+# server-side half: it catches at origin regardless. Together they make the rule
+# un-bypassable. Enabling it is recommended but optional — rolling your own CI
+# that runs `tools/hermes_diff_scan.py` on the push diff is equally fine.
+#
+# ── WHAT THE RULE IS ───────────────────────────────────────────────────────
+# It rejects an unescaped 9-byte trigger phrase that can route agent-harness git
+# activity through a hosting provider's anti-abuse classifier. The matching logic
+# lives in `tools/hermes_diff_scan.py` (shipped); this YAML never contains the
+# trigger bytes. In prose, always write it escaped as `HERMES\.md`.
+
+name: HERMES discipline audit
+
+on: [push, pull_request]
+
+jobs:
+  hermes-audit:
+    name: Scan added lines for byte-sequence violations
+    runs-on: ubuntu-latest    # GitHub-hosted; sufficient for most forks. Swap for
+                              # a self-hosted runner label to spend zero Actions minutes.
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compute diff base
+        id: diff-base
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            echo "diff_cmd=git diff ${BASE}...HEAD" >> "$GITHUB_OUTPUT"
+          else
+            BEFORE="${{ github.event.before }}"
+            if [ "${BEFORE}" = "0000000000000000000000000000000000000000" ]; then
+              BASE=$(git rev-list --max-parents=0 HEAD)
+              echo "diff_cmd=git diff ${BASE} HEAD" >> "$GITHUB_OUTPUT"
+            else
+              echo "diff_cmd=git diff ${BEFORE} HEAD" >> "$GITHUB_OUTPUT"
+            fi
+          fi
+      - name: Scan diff for byte-sequence violations
+        shell: bash
+        run: |
+          ${{ steps.diff-base.outputs.diff_cmd }} | python3 tools/hermes_diff_scan.py

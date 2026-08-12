@@ -3,6 +3,7 @@ aliases: [ORG-015]
 title: Ratifiable document class allow-list
 status: Ratified 2026-05-17 by the operator (T-0400 verdict 17:04Z).
 date: 2026-05-17
+build_disposition: no-build-needed
 ---
 # ORG-015 — Ratifiable document class allow-list
 

@@ -1,0 +1,18 @@
+[Unit]
+Description=Pantheon resource sampler — every 2 min (T-2213)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-2213.md
+
+[Timer]
+# 2 min. The 2026-07-28 spiral went from 38% to 95% memory between two 10-minute
+# sar samples, so the entire attributable window was invisible at that cadence.
+# Two minutes puts ~5 samples inside a climb of that shape while staying trivial:
+# one /proc scan and one appended line per fire.
+OnUnitActiveSec=2min
+OnBootSec=1min
+OnActiveSec=30s
+# NOT Persistent=true: a replayed sample taken at the wrong time is worse than a
+# gap, because it would be read as evidence of the state at its firing slot.
+Unit=pantheon-resource-sampler.service
+
+[Install]
+WantedBy=timers.target

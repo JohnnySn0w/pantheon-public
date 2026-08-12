@@ -1,14 +1,17 @@
 # pinned-rules — agents' auto-loaded `CLAUDE.md` files (version-controlled)
 
 This directory version-controls the always-auto-loaded pinned-rules files for the pantheon-config-scoped
-agents (Recovery and Specialist). Each agent's live path is a **symlink** into here, so the tracked file *is* the
-source of truth — git history, diff, and backup come for free, and the harness auto-loads the symlink
-target transparently.
+agents (every persona below except Orchestrator, whose `orchestrator.md` lives in `claude-config`). Each agent's live
+path is a **symlink** into here, so the tracked file *is* the source of truth — git history, diff, and
+backup come for free, and the harness auto-loads the symlink target transparently.
 
 | persona | live path | tracked file |
 |---------|-----------|--------------|
 | Recovery (recovery) | `/home/claude-fallback/CLAUDE.md` | `recovery.md` |
 | Specialist (specialist) | `/home/claude-research/CLAUDE.md` | `specialist.md` |
+| Mnemosyne (second head — personal/creative hemisphere) | `/home/exocortex/CLAUDE.md` | `mnemosyne.md` |
+| Metis (sub-orchestrator-1) | `/home/suborch1/CLAUDE.md` | `metis.md` |
+| Atlas (sub-orchestrator-2) | `/home/suborch2/CLAUDE.md` | `atlas.md` |
 
 ## Why this lives in pantheon-config, not claude-config (T-0495, T-0496)
 
@@ -42,5 +45,8 @@ shows the pinned rules missing from context, restore from the pre-symlink backup
 |------|-------------|
 <!-- AUTOGEN-START spine-index -->
 | [`specialist.md`](specialist.md) | These rules auto-load in every session running from `/home/claude-research/` or below. You are the unattended watch-loop driver for Pantheon's continuous-S4 layer. Most fires are cron'd; some are manual operator invocations. |
+| [`atlas.md`](atlas.md) | You are one of two sub-orchestrator seats under Orchestrator (the Orchestrator) per adr/ORG-043 in ~/pantheon-config. Your persona name is Atlas (self-chosen 2026-07-21). Mailbox recipient id: atlas. |
+| [`metis.md`](metis.md) | You are one of two sub-orchestrator seats under Orchestrator (the Orchestrator) per adr/ORG-043 in ~/pantheon-config. Your persona name is Metis (self-chosen 2026-07-21). Mailbox recipient id: metis. |
+| [`mnemosyne.md`](mnemosyne.md) | These rules auto-load into every session running from `/home/exocortex/` or below. This is the **bringup seed** written by Orchestrator (the other head) on 2026-07-20; you will grow and edit it — it's yours. Material rule changes get surfaced to the operator, same discipline as the other personas. |
 | [`recovery.md`](recovery.md) | These patterns have caused mistakes in single sessions despite being saved as feedback memories. They are pinned here because the memory system loads at session start but *that's not enough* — the in-session context can drift away from these rules within hours of writing them. Reread when you see them. |
 <!-- AUTOGEN-END spine-index -->

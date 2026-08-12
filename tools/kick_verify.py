@@ -98,8 +98,52 @@ def _build_inject(send_keys_submit_path: str):
     return inject
 
 
-def _capture(pane: str) -> str:
+def _pane_in_mode(pane: str) -> bool:
+    """True if the pane is sitting in a tmux mode (copy-mode et al). (T-2277)
+
+    Fail-SAFE: an unreadable answer counts as in-mode, because the only use of
+    this is deciding whether to TRUST a capture, and trusting one we cannot
+    vouch for is the failure being prevented.
+    """
     import subprocess
+    try:
+        r = subprocess.run(
+            ["tmux", "display-message", "-p", "-t", pane, "#{pane_in_mode}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            return True
+        return r.stdout.strip() != "0"
+    except (subprocess.TimeoutExpired, OSError):
+        return True
+
+
+def _capture(pane: str) -> str:
+    """Pane text, or "" when the surface cannot be trusted. (T-2268 shape, T-2277)
+
+    ⚠️ THE WRITE AND THE READ SHARE A FAILURE DOMAIN, which is what this ticket is
+    about. We inject into a pane and then confirm by capturing THE SAME PANE — and
+    a pane in copy-mode returns a FROZEN view: returncode 0, non-empty stdout, and
+    stale content. So during the one fault where the keystroke was most likely
+    eaten, capture-pane hands back a snapshot of a previously-working pane and the
+    verifier votes SUCCESS. A dropped kick then reports as delivered, which is
+    strictly worse than no verifier — a missing check is visibly missing, this one
+    emits positive confirmation while nothing happened.
+
+    A failed capture was already safe: "" matches nothing, so the caller retries.
+    It is the SUCCESSFUL-BUT-STALE read that had no defence.
+
+    send_keys_submit.sh clears copy-mode before delivering (T-2259), which removes
+    the common trigger but not the window — the pane can re-enter a mode between
+    injection and verification, and nothing here noticed.
+
+    Declining to answer is correct: the caller treats "" as not-yet-started and
+    polls again, so an untrustworthy surface costs a retry rather than a wrong
+    verdict.
+    """
+    import subprocess
+    if _pane_in_mode(pane):
+        return ""
     try:
         r = subprocess.run(
             ["tmux", "capture-pane", "-p", "-t", pane],

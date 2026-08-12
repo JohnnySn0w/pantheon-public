@@ -9,11 +9,16 @@ from unittest import mock
 from tools import fleet_health as fh
 
 
-def _runner(*, svc="active", session="yes", bwrap="ok", ran=True):
-    """Build a stub `run(user, inner)` that answers each check kind."""
+def _runner(*, svc="active", session="yes", bwrap="ok", enabled="enabled", ran=True):
+    """Build a stub `run(user, inner)` that answers each check kind.
+
+    `enabled` defaults to "enabled" (not paused) so every pre-T-2706 test that
+    doesn't care about pause-state keeps exercising the normal check path."""
     def _f(user, inner, timeout=15):
         if not ran:
             return (None, "", False)
+        if "is-enabled" in inner:
+            return (0, enabled, True)
         if "is-active" in inner:
             return (0, svc, True)
         if "has-session" in inner:
@@ -171,6 +176,237 @@ class RenderWithFailedUnits(unittest.TestCase):
     def test_render_without_failed_arg_is_backward_compatible(self):
         agents = [{"agent": "recovery", "status": fh.OK, "checks": []}]
         self.assertIn("all healthy", fh.render(agents))
+
+
+class ControlPlaneProbe(unittest.TestCase):
+    """T-2685: control-plane seats (recovery, specialist — T-2590/T-2633 cutover) must be
+    probed via the persistently-active consume TIMER, not the disabled bespoke
+    unit and not the oneshot consume SERVICE (never is-active after it exits)."""
+
+    def test_control_plane_services_derive_from_consume_timer(self):
+        self.assertEqual(fh.FLEET["recovery"]["services"],
+                         ["pantheon-persona-consume@recovery.timer"])
+        self.assertEqual(fh.FLEET["specialist"]["services"],
+                         ["pantheon-persona-consume@specialist.timer"])
+
+    def test_control_plane_healthy_when_timer_active(self):
+        r = fh.check_agent("recovery", fh.FLEET["recovery"], run=_runner())
+        self.assertEqual(r["status"], fh.OK)
+        r = fh.check_agent("specialist", fh.FLEET["specialist"], run=_runner())
+        self.assertEqual(r["status"], fh.OK)
+
+    def test_control_plane_fail_when_timer_inactive(self):
+        r = fh.check_agent("recovery", fh.FLEET["recovery"], run=_runner(svc="inactive"))
+        self.assertEqual(r["status"], fh.FAIL)
+        svc = [c for c in r["checks"] if c["name"].startswith("svc:")][0]
+        self.assertIn("pantheon-persona-consume@recovery.timer", svc["name"])
+
+    def test_orchestrator_and_codex_stay_bespoke(self):
+        self.assertEqual(fh.FLEET["orchestrator"]["services"], ["claude-telegram.service"])
+        self.assertEqual(fh.FLEET["codex"]["services"],
+                         ["codex-daemon.service", "codex-telegram-poller.service"])
+
+
+class SubOrchSeats(unittest.TestCase):
+    """T-2690: metis (suborch1) + atlas (suborch2) are consume control-plane
+    seats (T-2677) but their instance.yaml `roles:` binding does NOT yet carry
+    `supervisor: control-plane` (a manifest gap, distinct from T-2691 —
+    flagged separately), so `_liveness_services` cannot auto-derive their
+    timer the way it does for recovery/specialist. Their FLEET entries pass the
+    already-verified-live consume timer explicitly instead (bespoke list) —
+    the T-2677 resolve note confirms both timers armed + firing green.
+
+    Mailbox-first, NO telegram channel (T-2677): no telegram-poller or
+    mailbox-wake unit belongs in either seat's services."""
+
+    def test_metis_services_is_explicit_consume_timer(self):
+        self.assertEqual(fh.FLEET["metis"]["services"],
+                         ["pantheon-persona-consume@metis.timer"])
+
+    def test_atlas_services_is_explicit_consume_timer(self):
+        self.assertEqual(fh.FLEET["atlas"]["services"],
+                         ["pantheon-persona-consume@atlas.timer"])
+
+    def test_metis_and_atlas_carry_no_telegram_or_mailbox_wake_unit(self):
+        for persona in ("metis", "atlas"):
+            for svc in fh.FLEET[persona]["services"]:
+                self.assertNotIn("telegram", svc)
+                self.assertNotIn("mailbox-wake", svc)
+
+    def test_metis_and_atlas_user_and_session(self):
+        self.assertEqual(fh.FLEET["metis"]["user"], "suborch1")
+        self.assertEqual(fh.FLEET["metis"]["session"], "suborch1-main")
+        self.assertEqual(fh.FLEET["atlas"]["user"], "suborch2")
+        self.assertEqual(fh.FLEET["atlas"]["session"], "suborch2-main")
+
+    def test_metis_healthy_when_timer_active(self):
+        r = fh.check_agent("metis", fh.FLEET["metis"], run=_runner())
+        self.assertEqual(r["status"], fh.OK)
+
+    def test_atlas_healthy_when_timer_active(self):
+        r = fh.check_agent("atlas", fh.FLEET["atlas"], run=_runner())
+        self.assertEqual(r["status"], fh.OK)
+
+    def test_metis_fail_when_timer_inactive(self):
+        r = fh.check_agent("metis", fh.FLEET["metis"], run=_runner(svc="inactive"))
+        self.assertEqual(r["status"], fh.FAIL)
+        svc = [c for c in r["checks"] if c["name"].startswith("svc:")][0]
+        self.assertIn("pantheon-persona-consume@metis.timer", svc["name"])
+
+    def test_no_bwrap_check_for_suborch_seats(self):
+        for persona in ("metis", "atlas"):
+            r = fh.check_agent(persona, fh.FLEET[persona], run=_runner())
+            self.assertFalse(any(c["name"] == "bwrap-userns" for c in r["checks"]))
+
+
+class PausedSeat(unittest.TestCase):
+    """T-2706: a deliberately-paused seat (session-owning unit disabled) reads
+    PAUSED, not FAIL — mirrors channel_liveness_monitor's is-enabled
+    discriminator (disabled -> paused, NOT is-active/inactive)."""
+
+    def test_disabled_service_reads_paused_not_fail(self):
+        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"],
+                           run=_runner(enabled="disabled"))
+        self.assertEqual(r["status"], fh.PAUSED)
+        self.assertFalse(any(c["status"] == fh.FAIL for c in r["checks"]))
+        self.assertFalse(any(c["status"] == fh.WARN for c in r["checks"]))
+
+    def test_paused_short_circuits_before_normal_checks(self):
+        # Even though svc/session would read FAIL if judged normally, the
+        # disabled short-circuit means they're never probed at all — one check.
+        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"],
+                           run=_runner(enabled="disabled", svc="inactive", session="no"))
+        self.assertEqual(r["status"], fh.PAUSED)
+        self.assertEqual(len(r["checks"]), 1)
+
+    def test_masked_service_also_reads_paused(self):
+        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"],
+                           run=_runner(enabled="masked"))
+        self.assertEqual(r["status"], fh.PAUSED)
+
+    def test_enabled_but_inactive_service_still_fails(self):
+        # Crash != pause: an enabled unit that's merely not active is a real FAIL.
+        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"],
+                           run=_runner(enabled="enabled", svc="inactive"))
+        self.assertEqual(r["status"], fh.FAIL)
+
+    def test_control_plane_seat_not_misread_as_paused(self):
+        # recovery's session-owning unit is the consume TIMER; healthy == enabled+active.
+        # Must judge normally (OK), never PAUSED, on a healthy control-plane seat.
+        r = fh.check_agent("recovery", fh.FLEET["recovery"], run=_runner(enabled="enabled"))
+        self.assertEqual(r["status"], fh.OK)
+
+    def test_unqueryable_is_enabled_probe_judges_normally_not_paused(self):
+        # ran=False means EVERY probe (including is-enabled) is unqueryable ->
+        # _is_paused returns None -> falls through to the normal (WARN) path,
+        # never silently reads PAUSED for a seat we simply couldn't ask.
+        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"], run=_runner(ran=False))
+        self.assertEqual(r["status"], fh.WARN)
+
+
+class MnemosyneFleetEntry(unittest.TestCase):
+    def test_mnemosyne_user_session_services(self):
+        self.assertEqual(fh.FLEET["mnemosyne"]["user"], "exocortex")
+        self.assertEqual(fh.FLEET["mnemosyne"]["session"], "claude-telegram-bot-exocortex")
+        self.assertEqual(fh.FLEET["mnemosyne"]["services"],
+                         ["claude-telegram-exocortex.service"])
+
+    def test_mnemosyne_healthy_when_enabled_and_active(self):
+        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"], run=_runner())
+        self.assertEqual(r["status"], fh.OK)
+
+
+class RenderAndExitCodeWithPaused(unittest.TestCase):
+    def test_render_paused_does_not_degrade_fleet(self):
+        results = [
+            {"agent": "recovery", "status": fh.OK, "checks": []},
+            {"agent": "mnemosyne", "status": fh.PAUSED,
+             "checks": [{"name": "paused:x", "status": fh.PAUSED, "detail": "x disabled"}]},
+        ]
+        out = fh.render(results)
+        self.assertNotIn("DEGRADED", out)
+        self.assertIn("paused", out)
+        self.assertIn("mnemosyne", out)
+
+    def test_render_paused_alongside_warn_does_not_degrade(self):
+        results = [
+            {"agent": "orchestrator", "status": fh.WARN, "checks": []},
+            {"agent": "mnemosyne", "status": fh.PAUSED, "checks": []},
+        ]
+        out = fh.render(results)
+        self.assertNotIn("DEGRADED", out)
+        self.assertIn("healthy with warnings", out)
+        self.assertIn("mnemosyne", out)
+        self.assertIn("paused", out)
+
+    def test_main_exit_0_when_only_non_ok_is_paused(self):
+        with mock.patch.object(
+            fh, "sweep",
+            return_value=[
+                {"agent": "recovery", "status": fh.OK, "checks": []},
+                {"agent": "mnemosyne", "status": fh.PAUSED, "checks": []},
+            ],
+        ), mock.patch.object(
+            fh, "failed_units_sweep",
+            return_value=[{"scope": "system", "status": fh.OK, "units": [], "detail": ""}],
+        ):
+            self.assertEqual(fh.main([]), 0)
+
+
+class SudoDenial(unittest.TestCase):
+    """T-2718: a `sudo -n` auth/setup denial must classify as 'never ran' (WARN),
+    never as the inner command's verdict (FAIL). The dangerous direction — softening a
+    genuinely-dead seat's real FAIL to WARN — must NOT happen."""
+
+    def test_denial_markers_detected(self):
+        for stderr in (
+            "sudo: a password is required",
+            "sudo: a password is required\n",
+            "sudo: a terminal is required to read the password",
+            "sudo: no askpass program specified",
+            "sudo: unknown user: suborch9",
+            "sudo: nonexistent is not allowed to execute",
+        ):
+            self.assertTrue(fh._sudo_denied(1, stderr), stderr)
+
+    def test_rc_zero_is_never_denial(self):
+        self.assertFalse(fh._sudo_denied(0, "sudo: a password is required"))
+
+    def test_real_command_failure_is_not_denial(self):
+        # The inner command RAN and returned non-zero — a genuine FAIL, not a sudo
+        # denial. Must not be softened to WARN even though rc != 0.
+        self.assertFalse(fh._sudo_denied(3, "Failed to get properties: Unit not found"))
+        self.assertFalse(fh._sudo_denied(1, ""))
+        self.assertFalse(fh._sudo_denied(1, "inactive"))
+
+    def test_run_sudo_denied_returns_not_ran(self):
+        # End-to-end: a non-current user + a sudo-denial stderr => ran=False.
+        import getpass
+        other = "definitely-not-" + getpass.getuser()
+        fake = mock.Mock(returncode=1, stdout="", stderr="sudo: a password is required")
+        with mock.patch.object(fh.subprocess, "run", return_value=fake):
+            rc, out, ran = fh._run(other, "systemctl --user is-active foo.service")
+        self.assertFalse(ran)
+
+    def test_run_real_failure_still_ran(self):
+        # Same non-current user, but the inner command actually ran and failed
+        # (rc=3, non-sudo stderr) => ran=True so the seat's real FAIL is preserved.
+        import getpass
+        other = "definitely-not-" + getpass.getuser()
+        fake = mock.Mock(returncode=3, stdout="inactive", stderr="")
+        with mock.patch.object(fh.subprocess, "run", return_value=fake):
+            rc, out, ran = fh._run(other, "systemctl --user is-active foo.service")
+        self.assertTrue(ran)
+        self.assertEqual(out, "inactive")
+
+    def test_non_recovery_seat_denial_is_warn_not_fail(self):
+        # The full T-2718 repro at the check_agent level: every cross-account probe is
+        # sudo-denied => the seat is WARN (unqueryable), NOT FAIL — so no false DEGRADED.
+        def denied_run(user, inner, timeout=15):
+            return (1, "", False)  # what _run now returns for a sudo denial
+        r = fh.check_agent("orchestrator", fh.FLEET["orchestrator"], run=denied_run)
+        self.assertEqual(r["status"], fh.WARN)
+        self.assertTrue(all(c["status"] == fh.WARN for c in r["checks"]))
 
 
 if __name__ == "__main__":

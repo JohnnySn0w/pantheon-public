@@ -1,0 +1,112 @@
+#!/usr/bin/env bash
+# tools/sudoers.d/pantheon-s3star-tmux — T-1884
+#
+# SOURCE COPY for review. The operator installs the REAL copy to
+# /usr/local/bin/pantheon-s3star-tmux (root:root, mode 0755) — see
+# tools/sudoers.d/claude-codex-audit's header for exact install commands
+# and why the sudoers grant must point at that installed path, never here.
+#
+# Runs AS the codex unix account (invoked via `sudo -n -u codex
+# /usr/local/bin/pantheon-s3star-tmux <verb> <args...>`, see
+# tools/s3star_audit_runner.py's `_sudo_codex_argv`). A constrained
+# verb+arg wrapper around the three tmux operations the runner needs to
+# spawn/drive/tear down its dedicated codex-audit session — replaces the
+# earlier `sudo -u codex bash -lc "<free-form tmux string>"` shape, whose
+# only sudoers-side constraint would have been a wildcard match over a
+# whole quoted command string (unverifiable pre-install, brittle — see
+# T-1884's DECISIONS for why that shape was rejected). This script does
+# ALL validation in bash instead — plain, testable, and the sudoers grant
+# it pairs with becomes one line matching a fixed PATH (P1: prefer
+# structural enforcement to policy).
+#
+# THREAT MODEL: exit non-zero (and touch nothing) unless verb, session
+# name, AND (for `new`) the resolved run_dir all match the fixed shapes
+# below. This does not grant root, and does not grant arbitrary commands
+# as codex — only these three tmux operations, only against sessions named
+# like the runner's own `codex_audit_session_name()`, only under the
+# shared audit workspace root.
+#
+# Env/login-shell note: the prior `bash -lc` shape existed so `tmux` (and,
+# for `send`, the `codex` binary) resolved via codex's own profile/PATH,
+# not claude's — this script is exec'd directly (no login shell in the sudo
+# invocation), so that resolution moves in here: HOME is forced explicitly
+# (a plain `sudo -n -u` invocation is not guaranteed to reset HOME on every
+# sudoers config — `Defaults always_set_home` is the common default but
+# this script does not assume it) and codex's profile/rc files are sourced
+# if present.
+#
+# Test-only overrides (S3STAR_WORKSPACE_ROOT, S3STAR_TMUX_BIN): used by
+# tools/test_s3star_audit_runner.py's WrapperScriptTests to exercise this
+# script's validation logic directly (no sudo, no real tmux, no install
+# needed) by pointing it at a tempdir + a stub tmux. Inertness under the
+# real grant is CODE-ENFORCED (T-1884 REBOUND), not convention-dependent:
+# `sudo` always sets SUDO_USER on the process it execs, and its presence is
+# used below to unset both overrides before they're ever read, regardless
+# of what the sudo'd environment happens to carry. `Defaults env_reset`
+# (this repo doesn't modify that default) is a second, independent layer —
+# these overrides aren't in `claude-codex-audit`'s SETENV/env_keep, so they
+# shouldn't reach this process at all under a real `sudo -n -u codex`
+# invocation — but the SUDO_USER check means that no longer has to be the
+# ONLY thing standing between an attacker-controlled env and this script's
+# real security boundaries (P1: prefer structural enforcement to policy).
+set -euo pipefail
+
+if [ -n "${SUDO_USER:-}" ]; then
+    unset S3STAR_WORKSPACE_ROOT S3STAR_TMUX_BIN
+fi
+
+HOME=/home/codex
+export HOME
+# shellcheck disable=SC1091
+if [ -r "$HOME/.profile" ]; then . "$HOME/.profile"; fi
+# shellcheck disable=SC1091
+if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
+
+# Hardcoded to tools/s3star_audit_runner.py's AUDIT_SLOTS keys — if a slot
+# is added there, add it here too (deliberately not a generic [a-z-]+: the
+# tighter the session-name bound, the smaller the blast radius of a bug
+# elsewhere in the caller).
+SESSION_RE='^codex-audit-(weekly-narrow|monthly-integrated)-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
+WORKSPACE_ROOT="${S3STAR_WORKSPACE_ROOT:-/home/the-ancestor/s3star-workspace}"
+TMUX_BIN="${S3STAR_TMUX_BIN:-/usr/bin/tmux}"
+
+die() {
+    echo "pantheon-s3star-tmux: $*" >&2
+    exit 1
+}
+
+require_session() {
+    [[ "$1" =~ $SESSION_RE ]] || die "rejected session name: $1"
+}
+
+verb="${1:-}"
+case "$verb" in
+    new)
+        [ "$#" -eq 3 ] || die "new requires exactly 2 args: <session> <run_dir>"
+        session="$2"
+        run_dir="$3"
+        require_session "$session"
+        run_dir_abs="$(readlink -f -- "$run_dir")" || die "unresolvable run_dir: $run_dir"
+        case "$run_dir_abs" in
+            "$WORKSPACE_ROOT"/*) ;;
+            *) die "run_dir outside workspace root ($WORKSPACE_ROOT): $run_dir_abs" ;;
+        esac
+        exec "$TMUX_BIN" new-session -d -s "$session" -c "$run_dir_abs"
+        ;;
+    send)
+        [ "$#" -eq 3 ] || die "send requires exactly 2 args: <session> <command-string>"
+        session="$2"
+        command_string="$3"
+        require_session "$session"
+        exec "$TMUX_BIN" send-keys -t "$session" "$command_string" Enter
+        ;;
+    kill)
+        [ "$#" -eq 2 ] || die "kill requires exactly 1 arg: <session>"
+        session="$2"
+        require_session "$session"
+        exec "$TMUX_BIN" kill-session -t "$session"
+        ;;
+    *)
+        die "unknown verb: $verb (expected new|send|kill)"
+        ;;
+esac

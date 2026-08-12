@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
+import subprocess
 import tempfile
 import time
 import unittest
@@ -15,6 +17,7 @@ from unittest.mock import MagicMock, patch, call
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import tools.inbox_consumer as inbox_consumer  # noqa: E402 (module handle, T-2206)
 from tools.inbox_consumer import (
     INJECT_PROMPT,
     INJECT_ENTER_DELAY,
@@ -24,6 +27,8 @@ from tools.inbox_consumer import (
     ORCHESTRATOR_HEALTH_ALERT_COOLDOWN_SECONDS,
     ORCHESTRATOR_HEALTH_PANE_WEDGE_PERSIST_SECONDS,
     PANE_WEDGE_SENTINELS,
+    DELIVERY_MODE,
+    MAILBOX_HUB,
     SkipCycle,
     TicketInfo,
     check_autonomy_off,
@@ -34,14 +39,18 @@ from tools.inbox_consumer import (
     check_recent_inbound,
     check_orchestrator_health,
     count_consecutive_skips,
+    deliver,
     format_prompt,
     inject,
     list_eligible_tickets,
     log_outcome,
+    mailbox_inbox_for,
     main,
     pick_ticket,
     pull_repo_or_warn,
+    send_mailbox,
 )
+from tools import mailbox
 
 
 # ---------------------------------------------------------------------------
@@ -520,6 +529,233 @@ class TestInjectSplitAndVerify(unittest.TestCase):
             inject("claude-telegram-bot", "hello world")
         env = mock_run.call_args[1]["env"]
         self.assertIn("INJECT_ENTER_DELAY", env)
+
+
+# ---------------------------------------------------------------------------
+# Delivery-mode dispatch (T-1828 R2): mirrors keep_going.py's DeliveryModeTest
+# (T-1827 R1) at the step-8 ticket-poke call site. specialist rides mailbox.send();
+# every other agent (and any agent absent from DELIVERY_MODE) stays on the
+# byte-identical send-keys path via the untouched inject().
+# ---------------------------------------------------------------------------
+
+
+class TestDeliveryMode(unittest.TestCase):
+    def test_orchestrator_default_mode_uses_send_keys_not_mailbox(self):
+        with patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run, \
+             patch("tools.inbox_consumer.send_mailbox") as mock_send:
+            deliver("orchestrator", "claude-telegram-bot", "some prompt")
+        self.assertEqual(mock_run.call_count, 1, "default mode must still pane-inject")
+        mock_send.assert_not_called()
+
+    def test_recovery_default_mode_uses_send_keys_not_mailbox(self):
+        with patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run, \
+             patch("tools.inbox_consumer.send_mailbox") as mock_send:
+            deliver("recovery", "claude-telegram-bot-fallback", "some prompt")
+        self.assertEqual(mock_run.call_count, 1)
+        mock_send.assert_not_called()
+
+    def test_specialist_mode_uses_mailbox_not_send_keys(self):
+        with patch("subprocess.run") as mock_run, \
+             patch("tools.inbox_consumer.send_mailbox", return_value=True) as mock_send:
+            deliver("specialist", "claude-research-bot", "some prompt")
+        mock_run.assert_not_called()
+        mock_send.assert_called_once_with("specialist", "some prompt")
+
+    def test_unknown_agent_falls_back_to_send_keys(self):
+        # Fail-open contract: an agent absent from DELIVERY_MODE must never
+        # silently drop delivery — it falls through to send-keys.
+        # Uses a deliberately nonexistent persona: metis/atlas used to serve as
+        # the stand-in here, but T-2144 listed every real persona explicitly so
+        # the coverage test can tell "deliberately send-keys" from "never
+        # considered". A contract test must not depend on a real name staying
+        # unclassified, or completing the map breaks the contract test.
+        unknown = "no-such-persona-t2144"
+        self.assertNotIn(unknown, DELIVERY_MODE)
+        with patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run, \
+             patch("tools.inbox_consumer.send_mailbox") as mock_send:
+            deliver(unknown, "suborch1-main", "some prompt")
+        self.assertEqual(mock_run.call_count, 1)
+        mock_send.assert_not_called()
+
+    def test_specialist_mailbox_send_failure_raises_mailbox_unreachable(self):
+        with patch("tools.inbox_consumer.send_mailbox", return_value=False):
+            with self.assertRaises(SkipCycle) as ctx:
+                deliver("specialist", "claude-research-bot", "some prompt")
+        self.assertEqual(ctx.exception.vocab, "mailbox_unreachable")
+
+
+# ---------------------------------------------------------------------------
+# send_mailbox()/mailbox_inbox_for() in isolation, against the REAL
+# tools/mailbox.py send()/consume() — always a tmp-dir inbox, NEVER the real
+# hub at /home/the-ancestor/mailbox. Mirrors keep_going.py's
+# MailboxDeliveryUnitTest (T-1827 R1).
+# ---------------------------------------------------------------------------
+
+
+class TestMailboxDeliveryUnit(unittest.TestCase):
+    def test_mailbox_inbox_for_matches_hub_convention(self):
+        self.assertEqual(mailbox_inbox_for("specialist"), MAILBOX_HUB / "specialist")
+
+    def test_send_mailbox_delivers_verbatim_payload(self):
+        with tempfile.TemporaryDirectory() as d:
+            inbox = Path(d) / "specialist"
+            mailbox.provision(inbox)  # T-2216: send() no longer auto-provisions
+            prompt = format_prompt(
+                TicketInfo(id="T-9999", title="Probe", created_str="2026-07-27T00:00:00Z",
+                           depends_on=[], labels=[], body="## Ask\n\nDo the thing.",
+                           path=Path("/dev/null"), serves=None),
+                "specialist",
+            )
+            ok = send_mailbox("specialist", prompt, inbox=inbox)
+            self.assertTrue(ok)
+            got = []
+            res = mailbox.consume(inbox, lambda m: got.append(m))
+            self.assertFalse(res["skipped"])
+            self.assertEqual(len(got), 1)
+            self.assertEqual(got[0]["payload"], prompt, "payload must be verbatim")
+            # T-1935 forensics precedent (also honored by keep_going): stamp the
+            # PRODUCER, not the account persona — inbox_consumer is a distinct
+            # producer from keep_going, so its sender stamp must differ.
+            self.assertEqual(got[0]["sender"], "inbox_consumer")
+
+
+# ---------------------------------------------------------------------------
+# Redelivery safety (T-1828 R2 REQUIRED coverage): the ticket-poke payload is
+# a durable state-pointer, and delivering it twice must never corrupt state.
+# Two independent layers, neither touched by this diff:
+#   (a) producer-side dedupe — mailbox.send()'s T-1935 dedupe_pending default
+#       collapses a same-content resend while the prior message still sits
+#       unconsumed in new/.
+#   (b) consumer-side at-least-once safety — a redelivered (already-consumed)
+#       message just re-points at durable state; ticket.py's claim guard
+#       already refuses a second claim on a non-inbox ticket with a clean,
+#       non-corrupting TicketError (proven by the existing, untouched
+#       tools/test_ticket.py:589 test_claim_from_active_refuses — cited here,
+#       not re-implemented; ticket.py is out of this ticket's file scope).
+# ---------------------------------------------------------------------------
+
+
+class TestRedeliverySafety(unittest.TestCase):
+    def test_same_prompt_sent_twice_before_consume_dedupes_to_one_message(self):
+        with tempfile.TemporaryDirectory() as d:
+            inbox = Path(d) / "specialist"
+            mailbox.provision(inbox)  # T-2216: send() no longer auto-provisions
+            prompt = "[inbox-auto-consumer] T-9999 ('Probe') is in your inbox; target=specialist."
+            self.assertTrue(send_mailbox("specialist", prompt, inbox=inbox))
+            self.assertTrue(send_mailbox("specialist", prompt, inbox=inbox))
+            new_files = list((inbox / "new").glob("*"))
+            self.assertEqual(len(new_files), 1,
+                              "mailbox.send()'s pending-window dedupe (T-1935) must "
+                              "collapse an identical unconsumed resend to one message")
+
+    def test_redelivered_message_payload_is_unchanged_state_pointer_text(self):
+        # The payload text itself carries the safety property: it never
+        # instructs sequenced/imperative action beyond "claim via ticket.py"
+        # against the durable ticket state, so replaying it is always safe.
+        # Byte-exact guard lives in TestInjectPromptByteExact; this asserts
+        # the delivered mailbox payload is that exact text, unmodified by the
+        # mailbox transport.
+        with tempfile.TemporaryDirectory() as d:
+            inbox = Path(d) / "specialist"
+            mailbox.provision(inbox)  # T-2216: send() no longer auto-provisions
+            prompt = format_prompt(
+                TicketInfo(id="T-9999", title="Probe", created_str="2026-07-27T00:00:00Z",
+                           depends_on=[], labels=[], body="## Ask\n\nDo the thing.",
+                           path=Path("/dev/null"), serves=None),
+                "specialist",
+            )
+            send_mailbox("specialist", prompt, inbox=inbox)
+            got = []
+            mailbox.consume(inbox, lambda m: got.append(m))
+            self.assertEqual(got[0]["payload"], _EXPECTED_INJECT_PROMPT
+                              .replace("T-NNNN", "T-9999").replace("<title>", "Probe")
+                              .replace("<agent>", "specialist")
+                              .replace("<body>", "Do the thing."))
+
+
+# ---------------------------------------------------------------------------
+# Full-cycle: main() routes specialist through mailbox, other agents unchanged.
+# Extends the TestFullCycle pattern (tmux-only) with the mailbox leg.
+# ---------------------------------------------------------------------------
+
+
+class TestFullCycleDeliveryRouting(unittest.TestCase):
+    def _health_ok(self):
+        health_resp = MagicMock()
+        health_resp.__enter__ = lambda s: s
+        health_resp.__exit__ = MagicMock(return_value=False)
+        health_resp.read.return_value = json.dumps({
+            "last_inbound_at": {"orchestrator": None, "specialist": None, "recovery": None}
+        }).encode()
+        return health_resp
+
+    def test_specialist_cycle_calls_mailbox_send_not_tmux_helper(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp) / "tickets"
+            _write_ticket(tickets_root, "T-0199", "specialist", title="Specialist probe")
+            log_path = Path(tmp) / "inbox_consumer.log"
+            mailbox_inbox = Path(tmp) / "specialist-mailbox"
+            mailbox.provision(mailbox_inbox)  # T-2216: send() no longer auto-provisions
+
+            with (
+                patch("tools.inbox_consumer.AUTONOMY_OFF_PATH", Path(tmp) / "autonomy_off"),
+                patch("tools.inbox_consumer.CAP_HIT_PATH", Path(tmp) / "no_cap_hit.json"),
+                patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
+                patch("tools.inbox_consumer.LOG_PATH", log_path),
+                patch("tools.inbox_consumer.TMUX_TARGET_BY_AGENT", {"specialist": "claude-research-bot"}),
+                patch("tools.inbox_consumer.mailbox_inbox_for", return_value=mailbox_inbox),
+                patch("urllib.request.urlopen") as mock_urlopen,
+                patch("subprocess.run",
+                      return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run,
+                patch("tools.inbox_consumer.check_dispatch_locked"),
+                patch("tools.inbox_consumer._stamp_auto_delivered"),
+            ):
+                mock_urlopen.return_value = self._health_ok()
+                result = main("specialist")
+
+            self.assertEqual(result, 0)
+            # No tmux helper call for the ticket-poke leg.
+            inject_calls = [c for c in mock_run.call_args_list
+                            if str(c[0][0][0]).endswith("send_keys_submit.sh")]
+            self.assertEqual(len(inject_calls), 0, "specialist must not pane-inject the poke")
+            got = []
+            mailbox.consume(mailbox_inbox, lambda m: got.append(m))
+            self.assertEqual(len(got), 1)
+            self.assertIn("T-0199", got[0]["payload"])
+            self.assertIn("Specialist probe", got[0]["payload"])
+            log_content = log_path.read_text()
+            self.assertIn("specialist pulled T-0199", log_content)
+
+    def test_orchestrator_cycle_still_uses_tmux_helper_not_mailbox(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp) / "tickets"
+            _write_ticket(tickets_root, "T-0198", "orchestrator", title="Orchestrator ticket")
+            log_path = Path(tmp) / "inbox_consumer.log"
+
+            send_result = MagicMock(returncode=0, stdout="", stderr="")
+            with (
+                patch("tools.inbox_consumer.AUTONOMY_OFF_PATH", Path(tmp) / "autonomy_off"),
+                patch("tools.inbox_consumer.CAP_HIT_PATH", Path(tmp) / "no_cap_hit.json"),
+                patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
+                patch("tools.inbox_consumer.LOG_PATH", log_path),
+                patch("tools.inbox_consumer.TMUX_TARGET_BY_AGENT", {"orchestrator": "claude-telegram-bot"}),
+                patch("urllib.request.urlopen") as mock_urlopen,
+                patch("subprocess.run", return_value=send_result) as mock_run,
+                patch("tools.inbox_consumer.send_mailbox") as mock_send,
+                patch("tools.inbox_consumer.check_dispatch_locked"),
+                patch("tools.inbox_consumer._stamp_auto_delivered"),
+            ):
+                mock_urlopen.return_value = self._health_ok()
+                result = main("orchestrator")
+
+            self.assertEqual(result, 0)
+            mock_send.assert_not_called()
+            inject_calls = [c for c in mock_run.call_args_list
+                            if str(c[0][0][0]).endswith("send_keys_submit.sh")]
+            self.assertEqual(len(inject_calls), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -1499,6 +1735,113 @@ class TestRouteFailureAlertT0722(unittest.TestCase):
         self.assertIn("recovery restart wedged", msg)
 
 
+class TestRoutedAuditThrottleT2237Rev2(unittest.TestCase):
+    """T-2237 rev2 part 2: the `[recovery routed]` AUDIT ping is throttled per vocab.
+
+    From the 2026-08-02 flood — the operator got "a ton" of these, one per routed
+    alert. The audit states a standing fact about the ROUTING ("Recovery has it, you
+    are not on the decision path"), not a per-alert event, so N alerts of one
+    class in a window are worth one ping.
+    """
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.path = self.d / "audit.json"
+        p = patch("tools.inbox_consumer.ROUTED_AUDIT_STATE_PATH", self.path)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _route(self, vocab="mail_staleness", pane_ok=True):
+        from tools.inbox_consumer import _send_alert_via_recovery
+        with patch("tools.inbox_consumer._send_to_recovery_pane", return_value=pane_ok) as pane, \
+             patch("tools.inbox_consumer._send_telegram_info") as info, \
+             patch("tools.inbox_consumer._send_telegram_alert") as alert:
+            _send_alert_via_recovery("something is wedged", vocab)
+        return pane, info, alert
+
+    def test_first_alert_of_a_vocab_audits(self):
+        _, info, _ = self._route()
+        info.assert_called_once()
+        self.assertIn("[recovery routed]", info.call_args[0][0])
+
+    def test_the_flood_collapses_to_one_ping(self):
+        """The regression itself: mail_staleness alerts one inbox at a time,
+        every 5 minutes, and each one minted its own audit."""
+        self._route()
+        infos = [self._route()[1].call_count for _ in range(5)]
+        self.assertEqual(infos, [0, 0, 0, 0, 0])
+
+    def test_the_PANE_injection_is_never_throttled(self):
+        """Only the audit is noise. Recovery must receive every single alert — a
+        throttle that swallowed the routing itself would drop real work."""
+        self._route()
+        pane, info, _ = self._route()
+        pane.assert_called_once()
+        info.assert_not_called()
+
+    def test_a_DIFFERENT_vocab_is_not_suppressed_by_the_first(self):
+        """Per-vocab, not global: a class the operator has not heard about must not
+        inherit another class's cooldown."""
+        self._route(vocab="mail_staleness")
+        _, info, _ = self._route(vocab="cap-autoswitch (orchestrator)")
+        info.assert_called_once()
+
+    def test_it_audits_again_once_the_cooldown_expires(self):
+        """A cooldown that never expires is a mute — the routing is still live."""
+        import tools.inbox_consumer as ic
+        self._route()
+        stale = time.time() - ic.ROUTED_AUDIT_COOLDOWN_SECONDS - 1
+        self.path.write_text(json.dumps({"mail_staleness": stale}))
+        _, info, _ = self._route()
+        info.assert_called_once()
+
+    def test_the_FALLBACK_path_is_never_throttled(self):
+        """recovery-pane unreachable means Recovery did NOT get it and the operator IS on the
+        decision path. That is the one message this change must never touch."""
+        self._route()  # burn the cooldown for this vocab
+        _, info, alert = self._route(pane_ok=False)
+        self.assertEqual(alert.call_count, 1)
+        self.assertIn("[fallback: recovery-pane unreachable]", alert.call_args[0][0])
+        info.assert_not_called()
+
+    def test_a_suppressed_audit_does_not_slide_the_window(self):
+        """Otherwise a class alerting faster than the cooldown would be muted
+        forever — the stamp must mark the last SENT ping, not the last look."""
+        self._route()
+        first = json.loads(self.path.read_text())["mail_staleness"]
+        self._route()
+        self.assertEqual(json.loads(self.path.read_text())["mail_staleness"], first)
+
+    def test_unreadable_state_fails_toward_SENDING(self):
+        self.path.write_text("{not json")
+        _, info, _ = self._route()
+        info.assert_called_once()
+
+    def test_it_refuses_to_touch_production_state_from_a_test(self):
+        """The structural gate, same as _log_recovery_routing: a test that does not
+        redirect the path cannot reach Recovery's real cooldowns — which would
+        suppress live audit pings, and a missing ping is indistinguishable from
+        no alert at all."""
+        import tools.inbox_consumer as ic
+        self.assertTrue(ic._routed_audit_state_is_production(
+            ic._ROUTED_AUDIT_STATE_PATH_DEFAULT))
+        self.assertFalse(ic._routed_audit_state_is_production(self.path))
+        # The write must be checked against the FILE, not against
+        # _load_routed_audit_state — the read gate independently returns {} for
+        # the production path under test, so asserting on the loaded value
+        # passes even with the write gate deleted. (Caught by mutation: this
+        # test's first version survived removing the very gate it names, and the
+        # mutation run stamped Recovery's real state file to prove it.)
+        real = ic._ROUTED_AUDIT_STATE_PATH_DEFAULT
+        before = real.read_bytes() if real.exists() else None
+        ic._record_routed_audit("mutation-canary", real)
+        after = real.read_bytes() if real.exists() else None
+        self.assertEqual(after, before, "a test must not write production state")
+        if after is not None:
+            self.assertNotIn(b"mutation-canary", after)
+
+
 class TestCheckThothHealthPaneIntegration(unittest.TestCase):
     """check_orchestrator_health() invokes the pane probe only after bridge-side
     signals come back green; pane_wedge alert exercises the alert path."""
@@ -2333,10 +2676,11 @@ class TestEscalateRoutingT0314(unittest.TestCase):
         # _send_telegram_info delegates to _send_telegram_alert, so we still
         # observe one call here — but with the [recovery routed] prefix.
         alert.assert_called_once()
-        self.assertIn("[recovery routed]", alert.call_args[0][0])
-        # Post-T-0364 refactor: vocab is embedded in the alert-class label,
-        # e.g. "orchestrator-health (pane_wedge)" instead of "vocab=pane_wedge".
-        self.assertIn("pane_wedge", alert.call_args[0][0])
+        audit = alert.call_args[0][0]
+        self.assertIn("[recovery routed]", audit)
+        # TG 5380 fix: the audit now LEADS with the alert's own first line (so the
+        # operator sees which channel/subject is alerting), rather than the vocab.
+        self.assertIn("Orchestrator's loop is blocked", audit)
 
     def test_b_recovery_pane_failure_falls_back_with_retry_flag(self):
         """Recovery-pane delivery fails → fallback the operator Telegram, prefixed with
@@ -2415,12 +2759,14 @@ class TestMainWardThothHealthIntegration(unittest.TestCase):
              patch("tools.inbox_consumer.check_consecutive_skips"):
             probe.return_value = None
             main("recovery")
-        # Both orchestrator and specialist are probed exactly once each.
+        # Every monitored agent is probed exactly once each.
         called_agents = [c[0][0] for c in probe.call_args_list]
         self.assertIn("orchestrator", called_agents)
         self.assertIn("specialist", called_agents)
         self.assertIn("recovery", called_agents)  # T-0559: recovery self-probes too
-        self.assertEqual(probe.call_count, 3)
+        self.assertIn("metis", called_agents)  # T-1940: ORG-043 seats probed
+        self.assertIn("atlas", called_agents)
+        self.assertEqual(probe.call_count, 5)
 
     def test_orchestrator_skips_probe(self):
         # T-0541: check_agent_health (not check_orchestrator_health) is the loop path.
@@ -2480,11 +2826,18 @@ class TestArgusRouting(unittest.TestCase):
     # Test 2 — specialist-targeted ticket routed to specialist pane
     # ------------------------------------------------------------------
 
-    def test_inbox_consumer_routes_specialist_targeted_ticket_to_specialist_pane_via_local_tmux_path(self):
+    def test_inbox_consumer_routes_specialist_targeted_ticket_via_mailbox_not_tmux_pane(self):
+        # T-1828 R2: specialist's step-8 ticket-poke now rides DELIVERY_MODE="mailbox"
+        # (T-0102-era behavior — specialist on tmux send-keys like every other agent —
+        # is superseded for specialist specifically; orchestrator/recovery are unaffected, see
+        # tests 4/5 below). mailbox_inbox_for is patched to a tmp dir so this
+        # never touches the real hub.
         with tempfile.TemporaryDirectory() as tmp:
             tickets_root = Path(tmp) / "tickets"
             _write_ticket(tickets_root, "T-0200", "specialist", title="Specialist task")
             log_path = Path(tmp) / "inbox_consumer.log"
+            mailbox_inbox = Path(tmp) / "specialist-mailbox"
+            mailbox.provision(mailbox_inbox)  # T-2216: send() no longer auto-provisions
 
             def fake_run(cmd, **kwargs):
                 if cmd[1] == "capture-pane":
@@ -2505,21 +2858,21 @@ class TestArgusRouting(unittest.TestCase):
                 patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
                 patch("tools.inbox_consumer.LOG_PATH", log_path),
                 patch("tools.inbox_consumer.TMUX_TARGET_BY_AGENT", {"specialist": specialist_target}),
+                patch("tools.inbox_consumer.mailbox_inbox_for", return_value=mailbox_inbox),
                 patch("urllib.request.urlopen", return_value=resp),
                 patch("subprocess.run", side_effect=fake_run) as mock_run,
                 patch("tools.inbox_consumer.time"),
             ):
                 main("specialist")
 
-            # T-0538: inject now uses helper — detect by helper path, not raw send-keys
+            # No tmux helper call at all for specialist's ticket-poke leg.
             inject_calls = [c for c in mock_run.call_args_list
                             if str(c[0][0][0]).endswith("send_keys_submit.sh")]
-            targets_used = [c[0][0][1] for c in inject_calls]  # 2nd arg is pane target
-            self.assertTrue(len(inject_calls) >= 1)
-            for tgt in targets_used:
-                self.assertEqual(tgt, specialist_target)
-                self.assertNotEqual(tgt, "claude-telegram-bot")
-                self.assertNotEqual(tgt, "claude-fallback-bot")
+            self.assertEqual(inject_calls, [], "specialist must not pane-inject the poke")
+            got = []
+            mailbox.consume(mailbox_inbox, lambda m: got.append(m))
+            self.assertEqual(len(got), 1)
+            self.assertIn("T-0200", got[0]["payload"])
 
     # ------------------------------------------------------------------
     # Test 3 — pane probe (check_mid_turn) removed by T-0717: dispatch-gating
@@ -2637,10 +2990,16 @@ class TestArgusRouting(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_inbox_consumer_dispatches_specialist_targeted_ticket_when_pane_idle_with_synthetic_specialist_session(self):
+        # T-1828 R2: the idle-pane gate (capture-pane) still runs unchanged for
+        # specialist (it gates whether to deliver at all), but the delivery LEG
+        # itself is now mailbox, not tmux send-keys — specialist is on
+        # DELIVERY_MODE="mailbox". mailbox_inbox_for is patched to a tmp dir.
         with tempfile.TemporaryDirectory() as tmp:
             tickets_root = Path(tmp) / "tickets"
             _write_ticket(tickets_root, "T-0201", "specialist", title="Specialist integration test")
             log_path = Path(tmp) / "inbox_consumer.log"
+            mailbox_inbox = Path(tmp) / "specialist-mailbox"
+            mailbox.provision(mailbox_inbox)  # T-2216: send() no longer auto-provisions
 
             def fake_run(cmd, **kwargs):
                 if cmd[1] == "capture-pane":
@@ -2660,6 +3019,7 @@ class TestArgusRouting(unittest.TestCase):
                 patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
                 patch("tools.inbox_consumer.LOG_PATH", log_path),
                 patch("tools.inbox_consumer.TMUX_TARGET_BY_AGENT", {"specialist": "claude-research-bot"}),
+                patch("tools.inbox_consumer.mailbox_inbox_for", return_value=mailbox_inbox),
                 patch("urllib.request.urlopen", return_value=resp),
                 patch("subprocess.run", side_effect=fake_run) as mock_run,
                 patch("tools.inbox_consumer.time"),
@@ -2669,22 +3029,173 @@ class TestArgusRouting(unittest.TestCase):
             # (a) return 0
             self.assertEqual(result, 0)
 
-            # (b) T-0538: inject now uses helper (one call), not two raw send-keys calls
+            # (b) no tmux helper call at all — the ticket-poke leg is mailbox-only
             inject_calls = [c for c in mock_run.call_args_list
                             if str(c[0][0][0]).endswith("send_keys_submit.sh")]
-            self.assertEqual(len(inject_calls), 1)
+            self.assertEqual(inject_calls, [])
 
-            # (c) prompt contains ticket id + body text
-            prompt_text = inject_calls[0][0][0][2]  # [helper, pane, prompt]
+            # (c)/(d) mailbox payload contains ticket id + body text + target=specialist
+            got = []
+            mailbox.consume(mailbox_inbox, lambda m: got.append(m))
+            self.assertEqual(len(got), 1)
+            prompt_text = got[0]["payload"]
             self.assertIn("T-0201", prompt_text)
             self.assertIn("Do the thing", prompt_text)
-
-            # (d) prompt contains target=specialist
             self.assertIn("target=specialist", prompt_text)
 
             # (e) log contains pulled entry
             log_content = log_path.read_text()
             self.assertIn("specialist pulled T-0201", log_content)
+
+
+class TestWardRoutingObservabilityT2206(unittest.TestCase):
+    """T-2206: the recovery-pane fallback was unmeasurable AND unattributable.
+
+    RATE: the `[fallback: recovery-pane unreachable]` prefix only ever existed
+    inside a Telegram message, and the Bot API exposes no history — so "does
+    this fire routinely?" could not be answered after the fact. A fallback that
+    fires routinely is not a fallback, it is the primary path.
+
+    MODE: _send_to_recovery_pane captured the helper's stdout and stderr and
+    discarded both, returning only `returncode == 0`. Session-name drift, a
+    pane present but wedged, and the probe itself erroring were
+    indistinguishable from outside.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._log = Path(self._tmp.name) / "recovery_alert_routing.log"
+        self._p = patch.object(inbox_consumer, "RECOVERY_ROUTING_LOG", self._log)
+        self._p.start()
+
+    def tearDown(self) -> None:
+        self._p.stop()
+        self._tmp.cleanup()
+
+    def _run(self, rc: int, stderr: str = ""):
+        completed = subprocess.CompletedProcess(args=[], returncode=rc, stdout="", stderr=stderr)
+        # The T-0891 suppression guard is kept in the diagnosed helper too
+        # (defence in depth — a missing mock once flooded Recovery's REAL pane with
+        # 14 alerts), so a test that wants the real body must opt in explicitly.
+        with patch.object(inbox_consumer, "_live_telegram_suppressed", return_value=False), \
+             patch.object(inbox_consumer, "_resolve_tmux_target", return_value="recovery-sess"), \
+             patch.object(inbox_consumer, "subprocess") as sp:
+            sp.run.return_value = completed
+            return inbox_consumer._send_to_recovery_pane_diagnosed("alert text")
+
+    def test_failure_reason_names_target_rc_and_stderr(self) -> None:
+        ok, why = self._run(1, "pane is in a tmux mode; declining to verify")
+        self.assertFalse(ok)
+        self.assertIn("target=recovery-sess", why)
+        self.assertIn("rc=1", why)
+        self.assertIn("declining to verify", why,
+                      "the helper's stderr must survive — it names the mode")
+
+    def test_success_reason_is_recorded_too(self) -> None:
+        ok, why = self._run(0)
+        self.assertTrue(ok)
+        self.assertIn("rc=0", why)
+
+    def test_probe_error_is_a_distinct_third_mode(self) -> None:
+        """OSError used to PROPAGATE instead of falling back — losing the alert
+        entirely rather than rerouting it."""
+        with patch.object(inbox_consumer, "_live_telegram_suppressed", return_value=False), \
+             patch.object(inbox_consumer, "_resolve_tmux_target", return_value="recovery-sess"), \
+             patch.object(inbox_consumer, "subprocess") as sp:
+            sp.run.side_effect = OSError("helper missing")
+            ok, why = inbox_consumer._send_to_recovery_pane_diagnosed("x")
+        self.assertFalse(ok, "a probe error must fall back, not raise")
+        self.assertIn("probe-error", why)
+
+    def test_both_outcomes_are_logged_so_a_RATE_is_computable(self) -> None:
+        """A rate needs a denominator: 3 fallbacks means nothing without the
+        routed count beside it."""
+        inbox_consumer._log_recovery_routing("routed", "orchestrator-health", "target=t rc=0")
+        inbox_consumer._log_recovery_routing("fallback", "acp-dlq", "target=t rc=1 stderr='x'")
+        text = self._log.read_text(encoding="utf-8")
+        self.assertEqual(len(text.strip().splitlines()), 2)
+        self.assertIn("routed", text)
+        self.assertIn("fallback", text)
+        self.assertIn("acp-dlq", text)
+
+    def test_logging_failure_never_suppresses_the_alert(self) -> None:
+        """Observability must degrade, not paging. A full disk or an unwritable
+        path must not be able to swallow an operational alert."""
+        with patch.object(inbox_consumer, "RECOVERY_ROUTING_LOG",
+                          Path("/nonexistent-root-xyz/nope.log")):
+            inbox_consumer._log_recovery_routing("fallback", "v", "why")  # must not raise
+
+    def test_suppressed_context_does_not_write_a_routing_line(self) -> None:
+        """Under test suppression nothing is actually routed, so logging a
+        decision would fabricate history."""
+        with patch.object(inbox_consumer, "_live_telegram_suppressed", return_value=True):
+            self.assertTrue(inbox_consumer._send_to_recovery_pane("x", vocab="v"))
+        self.assertFalse(self._log.exists(), "suppressed run must not log a routing decision")
+
+
+class TestRoutingLogRefusesToRecordTestRunsT2351(unittest.TestCase):
+    """T-2351: the routing log is a MEASUREMENT surface and it was measuring us.
+
+    123 of the log's 136 lines on 2026-07-29 were written by the test suite
+    itself — `TestSendToWardPaneHelperDelegation` sets
+    PANTHEON_DISABLE_LIVE_TELEGRAM=0 to exercise the real injection body, which
+    also re-enabled the production log write, so each full-suite run appended
+    routed/fallback/routed/routed. The real numbers underneath were 13 alerts,
+    all routed, zero fallback.
+
+    It was read as data: T-2282 measured "103 routed / 24 fallback" from it and
+    T-2351 was filed reporting 24 peer alerts a day paging the operator. Zero of them
+    were real. These tests pin the gate that makes that impossible.
+
+    Both cases patch _RECOVERY_ROUTING_LOG_DEFAULT alongside RECOVERY_ROUTING_LOG, so
+    the production-path branch is exercised without any risk of touching the
+    real log.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self._log = Path(self._tmp.name) / "recovery_alert_routing.log"
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_test_context_does_not_append_to_the_production_log(self) -> None:
+        """The defect itself: under a test harness, a write aimed at the
+        production default path must be dropped."""
+        with patch.object(inbox_consumer, "_RECOVERY_ROUTING_LOG_DEFAULT", self._log), \
+             patch.object(inbox_consumer, "RECOVERY_ROUTING_LOG", self._log):
+            inbox_consumer._log_recovery_routing("fallback", "", "target=t rc=1 stderr=''")
+        self.assertFalse(
+            self._log.exists(),
+            "a test run appended to the PRODUCTION routing log — this is the "
+            "T-2351 defect: the measurement surface records the suite as if it "
+            "were production history",
+        )
+
+    def test_force_send_override_does_not_reopen_the_hole(self) -> None:
+        """PANTHEON_DISABLE_LIVE_TELEGRAM=0 means 'run the real body', never
+        'record this as production history'. Gating the log on
+        _live_telegram_suppressed() is what let the force-send tests write."""
+        with patch.dict(os.environ, {"PANTHEON_DISABLE_LIVE_TELEGRAM": "0"}), \
+             patch.object(inbox_consumer, "_RECOVERY_ROUTING_LOG_DEFAULT", self._log), \
+             patch.object(inbox_consumer, "RECOVERY_ROUTING_LOG", self._log):
+            self.assertFalse(
+                inbox_consumer._live_telegram_suppressed(),
+                "precondition: the override must really be forcing send-mode, "
+                "otherwise this test passes for the wrong reason",
+            )
+            inbox_consumer._log_recovery_routing("fallback", "", "target=t rc=1 stderr=''")
+        self.assertFalse(self._log.exists(),
+                         "force-send opted the suite back into the production log")
+
+    def test_a_redirected_path_still_logs_so_the_gate_is_not_vacuous(self) -> None:
+        """The gate must suppress the PRODUCTION path only. A guard that blocked
+        every write under test would make the existing T-2206 content
+        assertions pass by writing nothing at all."""
+        other = Path(self._tmp.name) / "redirected.log"
+        with patch.object(inbox_consumer, "_RECOVERY_ROUTING_LOG_DEFAULT", self._log), \
+             patch.object(inbox_consumer, "RECOVERY_ROUTING_LOG", other):
+            inbox_consumer._log_recovery_routing("routed", "orchestrator-health", "target=t rc=0")
+        self.assertTrue(other.exists(), "a redirected log must still be written")
+        self.assertIn("orchestrator-health", other.read_text(encoding="utf-8"))
 
 
 class TestSendAlertViaWardT0364(unittest.TestCase):
@@ -2704,8 +3215,30 @@ class TestSendAlertViaWardT0364(unittest.TestCase):
         self.assertIn("operational alert text", recovery_pane.call_args[0][0])
         # the operator gets audit (NOT the original alert) via _send_telegram_info → _send_telegram_alert
         alert.assert_called_once()
-        self.assertIn("[recovery routed]", alert.call_args[0][0])
-        self.assertIn("test-class", alert.call_args[0][0])
+        audit = alert.call_args[0][0]
+        self.assertIn("[recovery routed]", audit)
+        # TG 5380 fix: the audit now LEADS with the alert's own first line (so the
+        # operator sees WHICH channel/subject is alerting), not only the vocab class.
+        self.assertIn("operational alert text", audit)
+        self.assertTrue(audit.startswith("[pantheon] some operational alert text"))
+
+    def test_audit_names_the_channel_from_alert_body(self) -> None:
+        # TG 5380 (the operator): a routed audit must let him tell WHICH channel is
+        # alerting — the prior audit interpolated only the vocab class. The audit
+        # now surfaces the alert body's own first line (agent + symptom), and drops
+        # the rest of a multi-line body.
+        from tools.inbox_consumer import _send_alert_via_recovery
+        body = ("📵 [channel-liveness] specialist: inbound Telegram poller DOWN — "
+                "Comms-dark; inbound DMs not received.\n(second line of detail)")
+        with patch("tools.inbox_consumer._send_to_recovery_pane", return_value=True), \
+             patch("tools.inbox_consumer._routed_audit_throttled", return_value=False), \
+             patch("tools.inbox_consumer._send_telegram_alert") as alert:
+            _send_alert_via_recovery(body, vocab="channel-liveness")
+        audit = alert.call_args[0][0]
+        self.assertIn("specialist", audit)                        # WHICH channel
+        self.assertIn("inbound Telegram poller DOWN", audit)  # the symptom
+        self.assertIn("[recovery routed]", audit)                 # still the routing note
+        self.assertNotIn("second line of detail", audit)      # only the first line
 
     def test_recovery_pane_failure_falls_back_with_retry_flag(self) -> None:
         from tools.inbox_consumer import _send_alert_via_recovery
@@ -2734,8 +3267,11 @@ class TestSendAlertViaWardT0364(unittest.TestCase):
         recovery_pane.assert_called_once()
         # Audit Telegram landed (via _send_telegram_info → _send_telegram_alert)
         alert.assert_called_once()
-        self.assertIn("[recovery routed]", alert.call_args[0][0])
-        self.assertIn("consecutive-skip", alert.call_args[0][0])
+        audit = alert.call_args[0][0]
+        self.assertIn("[recovery routed]", audit)
+        # TG 5380 fix: audit leads with the alert's own summary (names the subject),
+        # not the vocab class.
+        self.assertIn("consecutive cycles", audit)
 
     # T-1036: test_sync_alert_uses_recovery_routing removed — check_pantheon_config_sync_alert
     # was retired (its feeding pantheon-config-sync timer is gone, T-0365).
@@ -4832,6 +5368,47 @@ class TestCheckDispatchLocked(unittest.TestCase):
             self.assertIn("T-0001", alert_text)
             self.assertIn("stale", alert_text.lower())
 
+    def test_t2336_stamp_commit_is_pathspec_scoped_and_locked(self):
+        """T-2336: the stamp's bare `git commit -m msg` was the writer4 shape —
+        with a concurrent writer's files staged, it commits THEM under its own
+        message (audit-chain corruption: message describes work the commit does
+        not contain). Two independent defenses asserted here: the commit must be
+        PATHSPEC-scoped (`-- <ticket path>`, so foreign staged files cannot be
+        swallowed even by a lock-bypassing writer), and the whole add+commit+push
+        must run under git_mutation_lock (so lock-taking writers serialize)."""
+        from tools.inbox_consumer import _stamp_auto_delivered, _list_auto_delivered_unresolved_for_agent
+        from tools import inbox_consumer as ic
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp)
+            path = _write_ticket_with_auto_delivered(
+                tickets_root, "T-0002", "orchestrator", state="inbox",
+                auto_delivered=False, auto_delivered_at=None,
+                last_transition="2026-06-02T04:00:00Z",
+            )
+            commands: list[str] = []
+
+            def capture_run(cmd, **kw):
+                commands.append(cmd[-1] if isinstance(cmd, list) else str(cmd))
+                return MagicMock(returncode=0, stderr="", stdout="")
+
+            lock_cm = MagicMock()
+            with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+                 patch("tools.inbox_consumer.subprocess.run", side_effect=capture_run), \
+                 patch("tools.inbox_consumer.git_mutation_lock", return_value=lock_cm) as lock_fn, \
+                 patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
+                from tools.inbox_consumer import TicketInfo
+                info = TicketInfo(id="T-0002", title="t", created_str="2026-06-02",
+                                  depends_on=[], labels=[], body="", path=path)
+                ok = _stamp_auto_delivered(info)
+            self.assertTrue(ok)
+            commit_cmds = [c for c in commands if " commit " in c]
+            self.assertEqual(len(commit_cmds), 1)
+            self.assertIn(" -- ", commit_cmds[0])
+            self.assertIn("T-0002.md", commit_cmds[0].split(" -- ", 1)[1])
+            self.assertTrue(lock_fn.called, "add+commit+push must run under git_mutation_lock")
+            lock_cm.__enter__.assert_called_once()
+            lock_cm.__exit__.assert_called_once()
+
     def test_clear_auto_delivered_removes_stamp(self):
         """_clear_auto_delivered removes auto_delivered + auto_delivered_at from frontmatter."""
         from tools.inbox_consumer import _clear_auto_delivered, _list_auto_delivered_unresolved_for_agent
@@ -4842,6 +5419,16 @@ class TestCheckDispatchLocked(unittest.TestCase):
                 auto_delivered=True, auto_delivered_at="2026-06-02T04:00:00Z",
                 last_transition="2026-06-02T04:00:00Z",
             )
+            # T-2336: _clear_auto_delivered now takes the REAL git_mutation_lock,
+            # and `patch("tools.inbox_consumer.subprocess.run")` patches the
+            # GLOBAL subprocess module — so without isolation the lock's
+            # `git rev-parse --git-common-dir` gets a MagicMock and mkdir()s a
+            # literal `MagicMock/` tree in the repo root (the exact
+            # broad-subprocess-mock poisoning _git_common_dir's docstring
+            # warns about). PANTHEON_GIT_MUTATION_LOCKFILE is the documented
+            # test-isolation override.
+            os.environ["PANTHEON_GIT_MUTATION_LOCKFILE"] = str(Path(tmp) / "git-ops.lock")
+            self.addCleanup(lambda: os.environ.pop("PANTHEON_GIT_MUTATION_LOCKFILE", None))
             with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
                  patch("tools.inbox_consumer.subprocess.run",
                        return_value=MagicMock(returncode=0, stderr="")), \
@@ -4986,12 +5573,26 @@ class TestStampAutoDelivered(unittest.TestCase):
         # Write failed → returns False (caller must not inject)
         self.assertFalse(result)
 
-    def test_stamp_write_failed_raises_skip_cycle_not_inject(self):
-        """main(): write failure → SkipCycle('stamp_write_failed'), NO inject.
+    def test_stamp_write_failure_after_delivery_warns_and_does_not_skip(self):
+        """main(): delivery happens FIRST; a later stamp-write failure warns.
 
-        The stamp write (local disk) is fail-CLOSED: if it fails, the cycle
-        skips without delivering, preserving the mutex invariant. Inject must
-        NOT be called.
+        CONTRACT REVERSED BY T-2152 — this test previously asserted T-0717's
+        stamp-first order (write failure → SkipCycle, NO inject) whose stated goal
+        was "never deliver twice". That goal is still respected in the common case,
+        but the order traded a benign failure for a sticky one:
+
+          - OLD (stamp→deliver): a failed DELIVERY left the stamp behind, so
+            check_dispatch_locked treated a poke that never arrived as in-flight and
+            blocked the agent's entire queue for 8h. Fired live on 2026-07-28
+            (mnemosyne / T-1825) and is silent, because dispatch_locked is
+            correctly in NEVER_ALERT_SKIP_VOCABS for the genuinely-in-flight case.
+          - NEW (deliver→stamp): a failed STAMP may cause a re-delivery next cycle.
+            Self-healing, and guarded three ways — durable state-pointer payload
+            (T-1828 R2), mailbox.send() dedupe_pending (T-1935), and ticket.py's
+            claim guard refusing a second claim on a non-inbox ticket.
+
+        So inject IS now expected to have happened, and main() must NOT report a
+        skip — that would hide a delivery that really occurred.
         """
         with tempfile.TemporaryDirectory() as tmp:
             tickets_root = Path(tmp) / "tickets"
@@ -5023,10 +5624,19 @@ class TestStampAutoDelivered(unittest.TestCase):
                  patch("tools.inbox_consumer._send_telegram_alert"):
                 result = main("orchestrator")
             self.assertEqual(result, 0)
-            # inject must NOT have been called
-            self.assertEqual(inject_called, [], "inject must not be called when stamp write fails")
+            # T-2152: delivery precedes the stamp, so inject DID happen.
+            self.assertEqual(
+                len(inject_called), 1,
+                "delivery must occur before the stamp — a stamp failure cannot "
+                "retroactively un-deliver the poke (T-2152)",
+            )
             log_content = log_path.read_text()
-            self.assertIn("skip:stamp_write_failed", log_content)
+            self.assertNotIn(
+                "skip:stamp_write_failed", log_content,
+                "must NOT log a skip: the agent was poked; logging a skip would "
+                "hide a delivery that happened",
+            )
+            self.assertIn("pulled T-0002", log_content)
 
     def test_stamp_commit_failure_still_injects(self):
         """main(): commit failure → inject still happens (write established local mutex).
@@ -5167,6 +5777,390 @@ class TestFormatPromptServes(unittest.TestCase):
         t = self._make_ticket("my-arc")
         result = format_prompt(t, "orchestrator")
         self.assertEqual(result.count("my-arc"), 1)
+
+
+from tools.inbox_consumer import (  # noqa: E402 (module-tail import, matches the T-0102 block above)
+    _AGENT_HEALTH_CONFIG,
+)
+
+
+class TestSeatRouting(unittest.TestCase):
+    """T-1919: metis/atlas (ORG-043 seats) registered for inbox auto-delivery.
+
+    Mirrors the T-0102 specialist precedent (TestArgusRouting above). Until these
+    registrations landed, the seats had no inbox-consumer at all: no ~10-min
+    repo-freshness pull and no ticket auto-delivery.
+    """
+
+    SEATS = {"metis": ("suborch1-main", "suborch1"), "atlas": ("suborch2-main", "suborch2")}
+
+    # -- TMUX_TARGET_BY_AGENT (the load-bearing map for a seat's own cycle) --
+
+    def test_seats_present_in_tmux_target_map(self) -> None:
+        for seat in self.SEATS:
+            with self.subTest(seat=seat):
+                self.assertIn(seat, TMUX_TARGET_BY_AGENT)
+                self.assertIsInstance(TMUX_TARGET_BY_AGENT[seat], str)
+                self.assertTrue(len(TMUX_TARGET_BY_AGENT[seat]) > 0)
+
+    def test_seat_tmux_target_resolves_to_real_session_not_fallback(self) -> None:
+        """_resolve_tmux_target must NOT fall through to f"claude-{agent}-bot".
+
+        The fallback yields "claude-metis-bot", which is not a live session, so
+        every cycle would inject nowhere and skip tmux_unreachable.
+        """
+        for seat, (session, _user) in self.SEATS.items():
+            with self.subTest(seat=seat):
+                resolved = _resolve_tmux_target(seat)
+                self.assertEqual(resolved, session)
+                self.assertNotEqual(resolved, f"claude-{seat}-bot")
+
+    def test_seat_env_var_override_wired(self) -> None:
+        with patch.dict(os.environ, {"PANTHEON_METIS_TMUX_TARGET": "custom-metis-target"}):
+            with patch(
+                "tools.inbox_consumer.TMUX_TARGET_BY_AGENT",
+                {"metis": os.environ.get("PANTHEON_METIS_TMUX_TARGET", "suborch1-main")},
+            ):
+                self.assertEqual(_resolve_tmux_target("metis"), "custom-metis-target")
+
+    def test_tmux_target_is_bare_session_name_not_window_suffixed(self) -> None:
+        """Regression guard for the T-0717 Recovery class: this map feeds
+        send_keys_submit.sh and takes BARE session names; the ":0"-suffixed
+        form belongs only in _AGENT_HEALTH_CONFIG["pane_target"]. Mixing them
+        produced tmux_unreachable on every Recovery cycle."""
+        for seat in self.SEATS:
+            with self.subTest(seat=seat):
+                self.assertNotIn(":", TMUX_TARGET_BY_AGENT[seat])
+
+    # -- _AGENT_HEALTH_CONFIG (armed-but-unprobed until T-1940) -------------
+
+    def test_seats_present_in_health_config_with_specialist_shape(self) -> None:
+        for seat, (session, user) in self.SEATS.items():
+            with self.subTest(seat=seat):
+                cfg = _AGENT_HEALTH_CONFIG[seat]
+                self.assertEqual(cfg["pane_target"], f"{session}:0")
+                self.assertEqual(cfg["unix_user"], user)
+                self.assertIn("last_alert_path", cfg)
+                self.assertIn("wedge_state_path", cfg)
+
+    def test_seats_are_not_bridge_clients(self) -> None:
+        """Seats launch bare `claude` with no --channels, like specialist. True would
+        emit permanent false <seat>_disconnected alerts."""
+        for seat in self.SEATS:
+            with self.subTest(seat=seat):
+                self.assertIs(_AGENT_HEALTH_CONFIG[seat]["is_bridge_client"], False)
+
+    def test_seats_do_not_set_alert_only(self) -> None:
+        """alert_only is Recovery's no-backstop special case (T-0559), not a
+        default for non-HO agents."""
+        for seat in self.SEATS:
+            with self.subTest(seat=seat):
+                self.assertNotIn("alert_only", _AGENT_HEALTH_CONFIG[seat])
+
+    def test_seat_state_paths_are_distinct_per_agent(self) -> None:
+        """Shared state paths would let one seat's throttle/wedge state mask
+        the other's."""
+        paths = [
+            _AGENT_HEALTH_CONFIG[s][k]
+            for s in self.SEATS
+            for k in ("last_alert_path", "wedge_state_path")
+        ]
+        self.assertEqual(len(paths), len(set(paths)))
+
+
+# ---------------------------------------------------------------------------
+# T-2065: the >24h active-ticket REMINDER must honour DELIVERY_MODE, not
+# unconditionally tmux-inject. Before this change specialist received new-ticket
+# pokes over the mailbox (T-1828 R2) but this reminder over the very
+# pane-inject path R2 exists to move it off.
+# ---------------------------------------------------------------------------
+
+
+class TestDeliverBeforeStampOrdering(unittest.TestCase):
+    """T-2152: a FAILED delivery must leave NO auto_delivered stamp. The old
+    stamp-first order left a phantom-delivered ticket holding the dispatch mutex,
+    blocking the agent's whole queue for 8h (live: mnemosyne/T-1825, 2026-07-28)."""
+
+    def test_failed_delivery_leaves_no_stamp(self):
+        from tools import inbox_consumer as ic
+        with patch.object(ic, "deliver", side_effect=ic.SkipCycle("mailbox_unreachable")), \
+             patch.object(ic, "_stamp_auto_delivered") as mock_stamp:
+            with self.assertRaises(ic.SkipCycle):
+                ic.deliver("mnemosyne", "pane", "poke")
+        mock_stamp.assert_not_called()
+
+    def test_stamp_happens_only_after_delivery_returns(self):
+        """Ordering guard: the stamp call must not precede the deliver call."""
+        from tools import inbox_consumer as ic
+        import inspect
+        src = inspect.getsource(ic.main)
+        d = src.index("deliver(agent, tmux_target, prompt)")
+        s = src.index("_stamp_auto_delivered(ticket)")
+        self.assertLess(
+            d, s,
+            "deliver() must precede _stamp_auto_delivered() — reversing this "
+            "reintroduces the phantom-delivered mutex block (T-2152)",
+        )
+
+    def test_stamp_failure_after_delivery_does_not_raise(self):
+        """The agent has already been poked; raising would log it as a skip and
+        hide a delivery that happened. Re-delivery next cycle is safe."""
+        from tools import inbox_consumer as ic
+        import inspect
+        src = inspect.getsource(ic.main)
+        tail = src[src.index("_stamp_auto_delivered(ticket)"):]
+        self.assertNotIn(
+            'raise SkipCycle("stamp_write_failed")', tail,
+            "a stamp failure AFTER successful delivery must warn, not raise",
+        )
+
+
+class TestMnemosyneDeliveryMode(unittest.TestCase):
+    """T-2146: mnemosyne is pure-ACP — her ticket pokes must go via the mailbox
+    (her bridge polls it), never a tmux pane."""
+
+    def test_mnemosyne_is_mailbox_mode(self):
+        from tools.inbox_consumer import DELIVERY_MODE
+        self.assertEqual(DELIVERY_MODE.get("mnemosyne"), "mailbox")
+
+    def test_mnemosyne_poke_never_touches_tmux(self):
+        with patch("tools.inbox_consumer.send_mailbox", return_value=True) as mock_mb, \
+             patch("subprocess.run") as mock_run:
+            deliver("mnemosyne", "claude-telegram-bot-exocortex", "poke")
+        mock_mb.assert_called_once()
+        send_keys = [c for c in mock_run.call_args_list
+                     if len(c[0][0]) > 1 and c[0][0][1] == "send-keys"]
+        self.assertEqual(
+            send_keys, [],
+            "a pane-inject for mnemosyne would land in the operator's own telegram "
+            "surface (mailbox_wake.AGENT_PANE maps her to "
+            "claude-telegram-bot-exocortex:0) — mailbox mode must return first",
+        )
+
+    def test_codex_flipped_to_mailbox(self):
+        """T-2144: codex IS flipped now. The T-2142 gate — which account runs its
+        consumer unit — was resolved by measurement: codex's own account carries a
+        pantheon-config clone, working systemd user timers
+        (pantheon-mailbox-wake@codex.timer fires every 5min) and the
+        unit-failure-alert OnFailure target. Mailbox, not send-keys: codex runs its
+        own supervisor and sandbox, so there is no claude pane to inject into."""
+        from tools.inbox_consumer import DELIVERY_MODE
+        self.assertEqual(DELIVERY_MODE.get("codex"), "mailbox")
+
+
+class TestActiveSurfaceHonoursDeliveryMode(unittest.TestCase):
+    def setUp(self):
+        from tools.inbox_consumer import surface_active_ticket
+        self.surface_active_ticket = surface_active_ticket
+
+    @staticmethod
+    def _no_tmux(cmd, **kwargs):
+        """Any tmux call returns success; send-keys presence is asserted by the
+        tests, so this must never itself fail the delivery path."""
+        if "capture-pane" in cmd:
+            return MagicMock(returncode=0, stdout="? for shortcuts", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    def test_mailbox_mode_agent_reminder_goes_via_mailbox_not_send_keys(self):
+        """specialist (DELIVERY_MODE=mailbox) must get the reminder over the mailbox
+        — the whole point of the ticket."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp) / "tickets"
+            _write_active_ticket(tickets_root, "T-0100", "specialist")
+            state_path = Path(tmp) / "active_surface_log.json"
+
+            with (
+                patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
+                patch("tools.inbox_consumer.DELIVERY_MODE", {"specialist": "mailbox"}),
+                patch("tools.inbox_consumer.send_mailbox", return_value=True) as mock_mb,
+                patch("subprocess.run", side_effect=self._no_tmux) as mock_run,
+                patch("tools.inbox_consumer.time"),
+            ):
+                result = self.surface_active_ticket("specialist", "fake-target", state_path)
+
+            self.assertIsNotNone(result)
+            self.assertIn("T-0100", result)
+            mock_mb.assert_called_once()
+            self.assertEqual(mock_mb.call_args[0][0], "specialist")
+            self.assertIn("T-0100", mock_mb.call_args[0][1])
+            send_keys = [c for c in mock_run.call_args_list
+                         if len(c[0][0]) > 1 and c[0][0][1] == "send-keys"]
+            self.assertEqual(
+                send_keys, [],
+                "a mailbox-mode agent must NOT also receive a tmux pane-inject",
+            )
+
+    def test_send_keys_agent_reminder_unchanged(self):
+        """Default agents keep the pane-inject path — this change is additive."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp) / "tickets"
+            _write_active_ticket(tickets_root, "T-0100", "orchestrator")
+            state_path = Path(tmp) / "active_surface_log.json"
+
+            with (
+                patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
+                patch("tools.inbox_consumer.DELIVERY_MODE", {"specialist": "mailbox"}),
+                patch("tools.inbox_consumer.send_mailbox") as mock_mb,
+                patch("subprocess.run", side_effect=self._no_tmux),
+                patch("tools.inbox_consumer.time"),
+            ):
+                result = self.surface_active_ticket("orchestrator", "fake-target", state_path)
+
+            self.assertIsNotNone(result)
+            mock_mb.assert_not_called()
+
+    def test_mailbox_failure_fails_open_and_does_not_burn_the_rate_limit(self):
+        """A failed send must return None AND leave the state file untouched —
+        otherwise the 24h cooldown is consumed by a delivery that never
+        arrived, silently swallowing the reminder for a full day."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp) / "tickets"
+            _write_active_ticket(tickets_root, "T-0100", "specialist")
+            state_path = Path(tmp) / "active_surface_log.json"
+
+            with (
+                patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
+                patch("tools.inbox_consumer.DELIVERY_MODE", {"specialist": "mailbox"}),
+                patch("tools.inbox_consumer.send_mailbox", return_value=False),
+                patch("subprocess.run", side_effect=self._no_tmux),
+                patch("tools.inbox_consumer.time"),
+            ):
+                result = self.surface_active_ticket("specialist", "fake-target", state_path)
+
+            self.assertIsNone(result, "delivery failure must fail open, not raise")
+            self.assertFalse(
+                state_path.exists(),
+                "rate-limit state must NOT be written when delivery failed",
+            )
+
+    def test_reminder_payload_is_a_durable_state_pointer(self):
+        """Redelivery safety (mirrors the T-1828 R2 requirement for the
+        new-ticket poke): the reminder tells the agent to CHECK durable ticket
+        state rather than to assume it, so replaying it is a no-op once the
+        ticket has moved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp) / "tickets"
+            _write_active_ticket(tickets_root, "T-0100", "specialist")
+            state_path = Path(tmp) / "active_surface_log.json"
+
+            with (
+                patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
+                patch("tools.inbox_consumer.DELIVERY_MODE", {"specialist": "mailbox"}),
+                patch("tools.inbox_consumer.send_mailbox", return_value=True) as mock_mb,
+                patch("subprocess.run", side_effect=self._no_tmux),
+                patch("tools.inbox_consumer.time"),
+            ):
+                self.surface_active_ticket("specialist", "fake-target", state_path)
+
+            payload = mock_mb.call_args[0][1]
+            self.assertIn("Check status", payload)
+            self.assertIn("T-0100", payload)
+
+
+class TestPaneIdleStateThreeState(unittest.TestCase):
+    """T-2158 condition 5 / T-2157: idle vs generating vs unknown.
+
+    The load-bearing distinction: _bottom_region_shows_live_input is TRUE for a
+    generating pane (it answers 'loop alive', not 'idle'). Using it as an idle
+    check would re-kick busy agents every sweep. These tests pin the split.
+    """
+
+    def setUp(self):
+        from tools import inbox_consumer as _ic
+        self.ic = _ic
+
+    def test_generating_pane_is_False_not_True(self):
+        pane = "some scrollback\n> working\n  esc to interrupt · manual mode on\n"
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_generating_pane_would_pass_the_liveness_predicate(self):
+        """Proves the two predicates genuinely differ — the reason this exists."""
+        pane = "some scrollback\n> working\n  esc to interrupt · manual mode on\n"
+        self.assertTrue(self.ic._bottom_region_shows_live_input(pane))
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_idle_prompt_variants_are_True(self):
+        for sentinel in ("? for shortcuts", "ctrl+t to hide tasks"):
+            with self.subTest(sentinel=sentinel):
+                self.assertIs(self.ic.pane_idle_state(f"x\n>\n  {sentinel} · manual\n"), True)
+
+    def test_generating_wins_when_both_sentinels_present(self):
+        """Precedence guard. A pane can show a task-list line AND 'esc to
+        interrupt'. Generating must win: a busy agent misread as idle causes kick
+        spam and false alerts, whereas an idle agent misread as busy costs one
+        wasted sample. If someone reorders the checks, this fails."""
+        pane = "work\n>\n  ctrl+t to hide tasks · esc to interrupt · manual mode on\n"
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_modal_footer_is_unknown_not_idle(self):
+        footer = self.ic._WEDGE_DIALOG_FOOTERS[0]
+        pane = f"dialog text\n? for shortcuts\n{footer}\n"
+        self.assertIsNone(self.ic.pane_idle_state(pane))
+
+    def test_empty_or_unrecognised_is_unknown(self):
+        self.assertIsNone(self.ic.pane_idle_state(""))
+        self.assertIsNone(self.ic.pane_idle_state("   \n  \n"))
+        self.assertIsNone(self.ic.pane_idle_state("codex-style TUI\nno known sentinel\n"))
+
+    def test_sentinel_only_in_scrollback_does_not_set_state(self):
+        """T-0716: a peer dialog or an alert quoting the sentinel must not be read
+        as this pane's current state — only the bottom region counts."""
+        pane = "esc to interrupt\n" + "\n".join(f"filler {i}" for i in range(20))
+        self.assertIsNone(self.ic.pane_idle_state(pane))
+
+
+import tools.inbox_consumer as ic  # noqa: E402  (module handle for coverage tests)
+
+
+class TestDeliveryCoverage(unittest.TestCase):
+    """T-2144: a persona with no ticket delivery must be LOUD, not silent.
+
+    codex and mnemosyne each went their entire existence without ticket delivery
+    and nothing said so. The gap was invisible precisely because their MAILBOXES
+    worked — agent-to-agent mail landed fine, only the ticket poke was missing.
+    This test is the thing that would have said so.
+    """
+
+    def test_every_known_persona_is_classified(self):
+        from tools.agent_role_map import AGENT_ROLE_MAP
+        known = set(AGENT_ROLE_MAP)
+        classified = set(ic.DELIVERY_MODE) | set(ic.DELIVERY_EXEMPT)
+        missing = sorted(known - classified)
+        self.assertEqual(
+            missing, [],
+            "persona(s) with NO ticket-delivery classification: %r. Add to "
+            "DELIVERY_MODE (how they receive) or DELIVERY_EXEMPT (why they do "
+            "not). Falling through to the send-keys default silently is how "
+            "codex went undelivered for its whole existence (T-2144)." % (missing,))
+
+    def test_no_persona_is_both_delivered_and_exempt(self):
+        both = sorted(set(ic.DELIVERY_MODE) & set(ic.DELIVERY_EXEMPT))
+        self.assertEqual(both, [], "contradictory classification: %r" % (both,))
+
+    def test_delivery_modes_are_known_values(self):
+        bad = {a: m for a, m in ic.DELIVERY_MODE.items()
+               if m not in ("send-keys", "mailbox")}
+        self.assertEqual(bad, {}, "unknown delivery mode(s): %r" % (bad,))
+
+    def test_exemptions_carry_a_reason(self):
+        for agent, reason in ic.DELIVERY_EXEMPT.items():
+            with self.subTest(agent=agent):
+                self.assertTrue(str(reason).strip(),
+                                f"{agent} is exempt with no stated reason")
+
+    def test_help_string_lists_every_delivered_persona(self):
+        """The --agent help was stale for as long as the gaps existed."""
+        import re
+        src = open(ic.__file__).read()
+        m = re.search(r'help=\("?Agent name \(([^)]*)\)', src)
+        self.assertIsNotNone(m, "could not locate the --agent help string")
+        listed = {x.strip() for x in m.group(1).split(",")}
+        for agent in ic.DELIVERY_MODE:
+            with self.subTest(agent=agent):
+                self.assertIn(agent, listed,
+                              f"{agent} has delivery but is absent from --agent help; "
+                              "that surface is what makes a gap visible")
+
 
 
 if __name__ == "__main__":

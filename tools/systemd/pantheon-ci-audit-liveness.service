@@ -1,0 +1,26 @@
+[Unit]
+Description=Pantheon CI-audit liveness — alert when the origin-side byte-sequence audit stops running (T-2440)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Reads the RUNNER's journal (ssh pve2 -> pct exec 202 -> journalctl) and origin/main's tip.
+# No GitHub auth needed and none held: recovery has none, and borrowing another account's
+# credential on every fire was the reason the GitHub-side signal was rejected (T-2440).
+#
+# DETECT + ALERT only — it holds no credential for pve2's API and takes no remediating
+# action. A stale audit wants a human decision about the runner, not an automatic restart of
+# somebody's home-lab host.
+#
+# TimeoutStartSec exceeds the two ssh probes plus a git fetch with room to spare; a monitor
+# killed by its own timeout would fire OnFailure and report the monitor rather than the fault
+# (the same-second-timeout trap).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/ci_audit_liveness.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

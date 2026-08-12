@@ -42,6 +42,26 @@ DEFAULT_TTL_SECS = 900  # 15 min — a resume + single HANDOFF write is minutes 
 _CONTENDED_ERRNOS = (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK)
 
 
+class _Unknown:
+    """Sentinel: the kernel's lock state could not be determined (T-2307).
+
+    Distinct from None ("definitively not held") because callers act on the
+    two oppositely — see Lease.flock_holder_pid.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return "UNKNOWN"
+
+    def __bool__(self) -> bool:
+        # Never let `if holder:` silently read as "not held".
+        raise TypeError("UNKNOWN lock state must be handled explicitly, not coerced to bool")
+
+
+UNKNOWN = _Unknown()
+
+
 class LeaseHeld(Exception):
     """Raised by acquire(raising=True) / __enter__ when held by a live, non-stale holder."""
 
@@ -71,7 +91,18 @@ class Lease:
         return obj if isinstance(obj, dict) else None
 
     def _write_record(self) -> None:
-        rec = {"pid": os.getpid(), "start": int(time.time()), "label": self.label}
+        # ttl_secs is RECORDED because staleness is a property of the HOLDER, not of
+        # whoever happens to ask (T-2236, mnemosyne). Without it, `_holder_is_stale`
+        # judges a long-lived holder against the ACQUIRER's TTL: an MCP consume
+        # (DEFAULT_TTL_SECS=900) declared a 7200s ACP bridge stale after 15 minutes
+        # and SIGKILLed it — same uid, so the kill was permitted. Measured live with
+        # both bridges past threshold: specialist 1365s, mnemosyne 2708s.
+        rec = {
+            "pid": os.getpid(),
+            "start": int(time.time()),
+            "label": self.label,
+            "ttl_secs": self.ttl_secs,
+        }
         os.ftruncate(self._fd, 0)
         os.lseek(self._fd, 0, os.SEEK_SET)
         os.write(self._fd, (json.dumps(rec) + "\n").encode("utf-8"))
@@ -97,23 +128,146 @@ class Lease:
         if not self._pid_alive(pid):
             return True  # dead holder, lockfile orphaned
         start = rec.get("start")
-        if isinstance(start, int) and (now - start) > self.ttl_secs:
-            return True  # wedged-but-alive past TTL
+        # Honour the HOLDER's recorded TTL; fall back to ours only when absent
+        # (a record written before T-2236, or by an older tool on this host).
+        # Reading self.ttl_secs here is what let a 900s acquirer reap a 7200s
+        # holder — the acquirer does not know what the holder was promised.
+        holder_ttl = rec.get("ttl_secs")
+        if not isinstance(holder_ttl, int) or isinstance(holder_ttl, bool) or holder_ttl <= 0:
+            holder_ttl = self.ttl_secs
+        if isinstance(start, int) and (now - start) > holder_ttl:
+            return True  # wedged-but-alive past the holder's OWN TTL
         return False
 
-    def _reap(self, rec: dict) -> None:
-        pid = rec.get("pid")
-        if isinstance(pid, int) and self._pid_alive(pid):
-            self._signal(pid, signal.SIGTERM)
-            deadline = time.time() + self.grace_secs
-            while time.time() < deadline and self._pid_alive(pid):
-                time.sleep(0.05)
-            if self._pid_alive(pid):
-                self._signal(pid, signal.SIGKILL)
+    def flock_holder_pid(self) -> int | None | object:
+        """PID actually holding the flock on this lockfile, per the KERNEL (T-2292).
+
+        THREE outcomes, and conflating two of them forked the lock (T-2307, specialist):
+            int        -> held by exactly that pid
+            None       -> definitively NOT held
+            UNKNOWN    -> we could not find out (procfs unreadable, stat failed)
+
+        The first version returned None for both "not held" and "cannot tell".
+        _reap acts on those OPPOSITELY: `holder is None` took the
+        clear-the-record branch, so an unreadable /proc/locks made a live
+        holder lose its lockfile, the retry O_CREATed a second inode, and the
+        lock forked — the exact outcome the T-2292 commit existed to remove,
+        reachable again through the error path. specialist reproduced it with two
+        real processes and a control: procfs up -> 1 live lease; procfs down
+        -> 2.
+
+        Keyed on MAJOR:MINOR:INODE —
+        all three, because an inode number is unique only within its filesystem
+        while /proc/locks spans every mounted one (T-2296, proven by a real
+        cross-tmpfs collision). major/minor are HEX there; the inode decimal.
+
+        This is the ONLY trustworthy answer to "who holds this lease". The
+        lockfile's own `pid` field is text somebody wrote down: it survives the
+        writer's death, and Linux recycles pids.
+        """
         try:
-            self.path.unlink()
-        except (FileNotFoundError, OSError):
-            pass
+            st = self.path.stat()
+            ino, maj, minr = st.st_ino, os.major(st.st_dev), os.minor(st.st_dev)
+        except FileNotFoundError:
+            return None          # no lockfile at all -> definitively not held
+        except OSError:
+            return UNKNOWN       # stat failed for some OTHER reason -> blind
+        try:
+            text = Path("/proc/locks").read_text(encoding="utf-8")
+        except OSError:
+            return UNKNOWN       # cannot consult the kernel -> blind, NOT "free"
+        for line in text.splitlines():
+            parts = line.split()
+            # A blocked waiter renders as "1: -> FLOCK ...", shifting every
+            # field, so locate the token rather than trusting a fixed index.
+            try:
+                i = parts.index("FLOCK")
+            except ValueError:
+                continue
+            if i + 4 >= len(parts):
+                continue
+            d = parts[i + 4].split(":")
+            if len(d) != 3 or not d[2].isdigit():
+                continue
+            try:
+                if (int(d[0], 16), int(d[1], 16), int(d[2])) == (maj, minr, ino):
+                    return int(parts[i + 3])
+            except ValueError:
+                continue
+        return None
+
+    def _reap(self, rec: dict) -> None:
+        """Evict a stale holder. NEVER signals a pid that does not hold the lock.
+
+        T-2292 (specialist). This previously signalled `rec["pid"]` — a field the
+        LOCKFILE CONTAINS — guarded only by "is some process with that pid
+        alive". Two ways that is wrong, and _signal escalates to os.killpg, so
+        the blast radius is a whole PROCESS GROUP:
+
+          RECYCLED PID: holder dies, its record survives naming pid N, Linux
+          hands N to something unrelated -> we SIGTERM then SIGKILL an innocent
+          process group. Same defect class as T-2291, except that one only
+          suppressed a detector and this one kills.
+
+          SURVIVING HOLDER: the unlink was UNCONDITIONAL, so a holder that
+          ignored the signals lost its lockfile anyway. The next acquire
+          O_CREATs a NEW INODE, and flock is per-inode -> TWO LIVE LEASES on
+          one logical lock. Mutual exclusion is the entire product of this
+          module, so that outcome is worse than a failed acquire.
+        """
+        pid = rec.get("pid")
+        holder = self.flock_holder_pid()
+
+        if holder is UNKNOWN:
+            # T-2307: blind. Signalling risks an innocent group; unlinking
+            # risks forking a lock the kernel is still enforcing. Do NEITHER
+            # and let the acquire fail — recoverable and loud, which is the
+            # correct direction when mutual exclusion is the product.
+            return
+
+        if holder is not None and pid != holder:
+            # T-2311 (specialist): the kernel POSITIVELY names a live holder, and it
+            # is not the pid in the record text. Unlinking here is the
+            # SURVIVING-HOLDER case this docstring calls worse than a failed
+            # acquire — reached through a DEFINITE answer, so the T-2307 UNKNOWN
+            # split does not cover it.
+            #
+            # Production route needs no error at all, only acquire()'s own
+            # ordering (flock succeeds, THEN _write_record): A crashes leaving
+            # text=A; B flocks; C contends, reads A, finds A dead so stale,
+            # reaps, sees holder=B, B != A, and unlinks B's lockfile. C's retry
+            # O_CREATs a new inode and flock is per-inode -> two live leases.
+            #
+            # STALE TEXT IS NOT A REASON TO DISTURB A LIVE LOCK. Touch nothing;
+            # the acquire fails, which is recoverable and loud.
+            return
+
+        if holder is None:
+            # Nothing holds the lock — the record is a tombstone. Clear it so
+            # the retry can proceed, and send NO SIGNAL: we have no evidence
+            # this pid has anything to do with this lease. Orphan reapability
+            # lives here and is unaffected by the branch above.
+            try:
+                self.path.unlink()
+            except (FileNotFoundError, OSError):
+                pass
+            return
+
+        self._signal(pid, signal.SIGTERM)
+        deadline = time.time() + self.grace_secs
+        while time.time() < deadline and self.flock_holder_pid() == pid:
+            time.sleep(0.05)
+        if self.flock_holder_pid() == pid:
+            self._signal(pid, signal.SIGKILL)
+
+        # Only remove the record once the KERNEL agrees the lock is gone.
+        # Surviving holder -> leave it; acquire fails, which is the correct
+        # outcome and is recoverable. Unlinking here forks the lock instead.
+        if self.flock_holder_pid() is None:
+            try:
+                self.path.unlink()
+            except (FileNotFoundError, OSError):
+                pass
 
     @staticmethod
     def _signal(pid: int, sig: int) -> None:

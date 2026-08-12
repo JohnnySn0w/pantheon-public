@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import subprocess
@@ -56,6 +57,16 @@ CREDENTIALED_ACCOUNTS = {
     "specialist": "claude-research",
     "recovery": "claude-fallback",
     "the-ancestor": "the-ancestor",
+    # Mnemosyne (second head, ORG-042) — Claude OAuth like the fleet; added
+    # 2026-07-20 with the recovery→exocortex sudo grant (observation-only profile).
+    "mnemosyne": "exocortex",
+    # Metis + Atlas (sub-orchestrator seats, ORG-043) — independent Claude OAuth
+    # lineages from the 2026-07-21 batch (~mid-Aug refresh cliffs); added with
+    # the recovery→suborch* sudo grants (/etc/sudoers.d/61-fallback-suborch, T-1904/
+    # T-1905). Credential health only — their restart/wake semantics are orchestrator's
+    # bringup surface, so like the-ancestor they belong HERE, not in AGENT_CONFIG.
+    "metis": "suborch1",
+    "atlas": "suborch2",
 }
 
 # Tunable (env-overridable): re-alert cadence per (agent, problem class).
@@ -100,8 +111,14 @@ def _read_credential(agent: str, cfg: dict) -> tuple[str, dict | None]:
     except json.JSONDecodeError as e:
         return f"unparseable JSON: {e}", None
     oauth = data.get("claudeAiOauth", data)
-    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+    if not isinstance(oauth, dict):
         return "no accessToken field", None
+    if not oauth.get("accessToken"):
+        # Parseable-but-blanked (e.g. a rejected-refresh writeback, the 2026-07-20
+        # orchestrator signature): still MALFORMED for classify(), but the dict is returned
+        # so login-event tracking (T-1874) can fingerprint it as 'blanked' rather
+        # than lumping it with unreadable files.
+        return "no accessToken field", oauth
     return "ok", oauth
 
 
@@ -123,7 +140,7 @@ def classify(agent: str, cfg: dict, now: float | None = None) -> tuple[str, str]
     """
     now = time.time() if now is None else now
     status, oauth = _read_credential(agent, cfg)
-    if oauth is None:
+    if oauth is None or status != "ok":
         return "MALFORMED", f"credential {status}"
 
     refresh = oauth.get("refreshToken") or ""
@@ -188,6 +205,86 @@ def _alert(text: str) -> None:
     _send_telegram_alert(text)
 
 
+RECOVERY_INBOX = os.environ.get("PANTHEON_RECOVERY_INBOX", "/home/the-ancestor/mailbox/recovery")
+
+# T-1874: fleet login/rotation event log — every credential-fingerprint change is
+# recorded so the NEXT auth-death can be correlated against fleet login activity
+# (leading hypothesis for the 2026-07-20 orchestrator death: per-account OAuth session-cap
+# eviction — a new agent login kills the stalest agent's refresh token server-side).
+LOGIN_EVENTS_PATH = STATE_DIR / "login_events.jsonl"
+
+
+def _login_fingerprint(oauth: dict | None) -> str:
+    """Stable, secret-free fingerprint of a credential's login identity: the
+    refresh token's sha256 prefix + its expiry. Rotation or relogin changes it;
+    a rejected-refresh writeback collapses it to 'blanked'."""
+    if not isinstance(oauth, dict):
+        return "unreadable"
+    refresh = (oauth.get("refreshToken") or "").strip()
+    if not refresh:
+        return "blanked"
+    digest = hashlib.sha256(refresh.encode()).hexdigest()[:12]
+    return f"{digest}@{oauth.get('refreshTokenExpiresAt')}"
+
+
+def _track_login_event(agent: str, cfg: dict, now: float, state: dict) -> None:
+    """Record a login/rotation event when an agent's credential fingerprint
+    changes between fires. Fail-soft; own read so classify()'s contract is
+    untouched. Skips unreadable creds (no event; keeps last-known fp)."""
+    try:
+        _status, oauth = _read_credential(agent, cfg)
+        if oauth is None:
+            # Unreadable/unparseable file: no event; keep the last-known
+            # fingerprint so a transient sudo hiccup doesn't fabricate churn.
+            return
+        fp = _login_fingerprint(oauth)
+        key = f"fp:{agent}"
+        old = state.get(key)
+        if old == fp:
+            return
+        state[key] = fp
+        event = {
+            "ts": _fmt_ts(now), "agent": agent,
+            "old_fp": old, "new_fp": fp, "baseline": old is None,
+        }
+        STATE_DIR.mkdir(parents=True, exist_ok=True)
+        with LOGIN_EVENTS_PATH.open("a") as fh:
+            fh.write(json.dumps(event) + "\n")
+        _log(agent, f"login-event: fingerprint {old or '(first observation)'} -> {fp}")
+    except Exception as exc:
+        _log(agent, f"login-event tracking failed (non-fatal): {exc!r}")
+
+
+def _wake_recovery(agent: str, cls: str, detail: str) -> None:
+    """Drop the auth-dead finding into Recovery's ORG-026 mailbox alongside the the operator
+    page (T-1873): the operator still owns the browser tap, but Recovery woken within ~5min
+    runs the relogin LEGWORK (drive /login, capture the OAuth URL, hand it over
+    ready-to-tap) — the 2026-07-20 orchestrator outage sat 6h because the page alone got
+    lost in the operator's day. Fail-soft like disk_usage_monitor._wake_recovery: a mailbox
+    error must never break the alert path. Skipped when Recovery itself is the dead
+    agent (it cannot act on its own wake; the the operator page is the whole story)."""
+    if agent == "recovery":
+        return
+    try:
+        from tools import mailbox
+        mailbox.send(
+            RECOVERY_INBOX,
+            f"credential-{cls} on {agent}: {detail}\n"
+            f"Action (recovery): run sop/remediation/agent-oauth-relogin.md legwork NOW — "
+            f"confirm with credential_expiry_monitor --agent {agent} --dry-run, drive "
+            f"/login on the agent's pane, capture the OAuth URL, send it to the operator "
+            f"ready-to-tap, paste his returned code (check #STATE matches the live pane).",
+            "recovery",
+            subject=f"auth-dead: {agent} ({cls})",
+            # T-2237(a): a credential is dead or dying and only Recovery can drive the
+            # relogin. Sitting undrained IS the outage continuing.
+            severity="urgent",
+        )
+        _log(agent, "recovery mailbox wake dropped")
+    except Exception as exc:
+        _log(agent, f"recovery mailbox wake failed (non-fatal): {exc!r}")
+
+
 def check(agents: list[str], *, dry_run: bool, now: float | None = None) -> int:
     """Check each agent; alert (throttled) on any non-OK class. Returns problem count."""
     now = time.time() if now is None else now
@@ -201,6 +298,8 @@ def check(agents: list[str], *, dry_run: bool, now: float | None = None) -> int:
         cfg = {"sudo_user": sudo_user}
         cls, detail = classify(agent, cfg, now=now)
         _log(agent, f"{cls}: {detail}")
+        if not dry_run:
+            _track_login_event(agent, cfg, now, state)
         if cls == "OK":
             continue
         problems += 1
@@ -214,6 +313,7 @@ def check(agents: list[str], *, dry_run: bool, now: float | None = None) -> int:
                 f"Re-auth procedure: sop/remediation/agent-oauth-relogin.md "
                 f"(drive /login on the agent's pane → code-paste with the operator)."
             )
+            _wake_recovery(agent, cls, detail)
             state[f"{agent}:{cls}"] = now
             _log(agent, f"alerted the operator ({cls})")
         else:

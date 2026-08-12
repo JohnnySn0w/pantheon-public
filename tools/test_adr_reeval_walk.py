@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""Tests for tools/adr_reeval_walk.py (T-2527).
+
+Run: python3 -m unittest tools.test_adr_reeval_walk -v
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import textwrap
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest import mock
+
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tools import adr_reeval_walk as W  # noqa: E402
+
+
+def _write(d: Path, name: str, text: str) -> Path:
+    p = d / name
+    p.write_text(textwrap.dedent(text), encoding="utf-8")
+    return p
+
+
+# ---------------------------------------------------------------------------
+# Parsing
+# ---------------------------------------------------------------------------
+
+class ParseStructured(unittest.TestCase):
+    def test_structured_types_and_fires_default(self):
+        with TemporaryDirectory() as td:
+            p = _write(Path(td), "ORG-099-x.md", """\
+                ---
+                id: ORG-099
+                re_evaluate:
+                  - {id: R1, type: calendar, when: "2026-01-01"}
+                  - {id: R2, type: event, when: "second project online"}
+                  - {id: R3, type: event, when: "resolves:T-1234"}
+                  - {id: R4, type: metric, when: "fp_count >= 500"}
+                ---
+                # body
+                """)
+            ts = {t.trigger_id: t for t in W.parse_adr(p)}
+        # calendar defaults to auto-ticket (deterministic)
+        self.assertEqual(ts["ORG-099:R1"].ttype, "calendar")
+        self.assertEqual(ts["ORG-099:R1"].fires, "auto-ticket")
+        # plain event -> surface (not deterministic)
+        self.assertEqual(ts["ORG-099:R2"].fires, "surface")
+        # event with resolves:T-NNNN is reclassified to ticket -> deterministic
+        self.assertEqual(ts["ORG-099:R3"].ttype, "ticket")
+        self.assertEqual(ts["ORG-099:R3"].fires, "auto-ticket")
+        # metric -> auto-ticket type but only fires if instrumented (tested below)
+        self.assertEqual(ts["ORG-099:R4"].ttype, "metric")
+
+    def test_auto_ticket_on_nondeterministic_is_forced_to_surface(self):
+        with TemporaryDirectory() as td:
+            p = _write(Path(td), "ORG-099-x.md", """\
+                ---
+                id: ORG-099
+                re_evaluate:
+                  - {id: R1, type: event, when: "vibes", fires: auto-ticket}
+                ---
+                """)
+            t = W.parse_adr(p)[0]
+        # a non-deterministic type may never auto-file, even if it asks to
+        self.assertEqual(t.fires, "surface")
+
+
+class ParseProse(unittest.TestCase):
+    def test_bold_id_bullets(self):
+        with TemporaryDirectory() as td:
+            p = _write(Path(td), "ORG-053-x.md", """\
+                ---
+                id: ORG-053
+                ---
+                ## Re-evaluate when
+                - **ORG-053:R1** — the first Bridge runs;
+                - **ORG-053:R2** — a clean seed restores a persona.
+                """)
+            ts = {t.trigger_id: t for t in W.parse_adr(p)}
+        self.assertIn("ORG-053:R1", ts)
+        self.assertIn("ORG-053:R2", ts)
+        self.assertEqual(ts["ORG-053:R1"].source, "prose")
+        self.assertEqual(ts["ORG-053:R1"].fires, "surface")
+
+    def test_plain_bullets_get_synthesized_ids(self):
+        with TemporaryDirectory() as td:
+            p = _write(Path(td), "ORG-013-x.md", """\
+                ---
+                id: ORG-013
+                ---
+                ## Re-evaluate when
+                - Manual-block usage emerges as a regular pattern.
+                - Cross-repo depends_on becomes a thing.
+                """)
+            ts = {t.trigger_id: t for t in W.parse_adr(p)}
+        self.assertEqual(set(ts), {"ORG-013:S1", "ORG-013:S2"})
+        self.assertTrue(ts["ORG-013:S1"].when.startswith("Manual-block"))
+
+    def test_revisit_and_sunset_section_headers(self):
+        for header in ("## Revisit when", "## Sunset"):
+            with TemporaryDirectory() as td:
+                p = _write(Path(td), "ORG-020-x.md", f"""\
+                    ---
+                    id: ORG-020
+                    ---
+                    {header}
+                    - some real trigger condition here.
+                    """)
+                ts = W.parse_adr(p)
+            self.assertEqual(len(ts), 1, f"header {header!r} should be found")
+
+    def test_section_with_no_bullets_yields_nothing(self):
+        # ORG-010-style: the section is a schema DESCRIPTION, not triggers.
+        with TemporaryDirectory() as td:
+            p = _write(Path(td), "ORG-010-x.md", """\
+                ---
+                id: ORG-010
+                ---
+                ## Re-evaluate when
+                The trigger (event, date, or condition) that prompts a review.
+
+                ## Next section
+                - this bullet is in a different section and must be ignored.
+                """)
+            ts = W.parse_adr(p)
+        self.assertEqual(ts, [])
+
+    def test_no_reeval_section_yields_nothing(self):
+        # inline "revisit when" prose is deliberately NOT surfaced (precision).
+        with TemporaryDirectory() as td:
+            p = _write(Path(td), "ORG-001-x.md", """\
+                ---
+                id: ORG-001
+                ---
+                v0 assumes single ledger; revisit when the second project comes online.
+                """)
+            self.assertEqual(W.parse_adr(p), [])
+
+    def test_structured_wins_over_prose_same_id(self):
+        with TemporaryDirectory() as td:
+            p = _write(Path(td), "ORG-062-x.md", """\
+                ---
+                id: ORG-062
+                re_evaluate:
+                  - {id: R1, type: event, when: "PMB-1 built", fires: surface}
+                ---
+                ## Re-evaluate when
+                - **ORG-062:R1** — PMB-1 is first built and run (prose version).
+                """)
+            ts = W.parse_adr(p)
+        self.assertEqual(len(ts), 1)
+        self.assertEqual(ts[0].source, "structured")
+
+
+# ---------------------------------------------------------------------------
+# Deterministic evaluation
+# ---------------------------------------------------------------------------
+
+class TriggerFired(unittest.TestCase):
+    def _t(self, ttype, when, fires="auto-ticket"):
+        return W.Trigger("ORG-099", "ORG-099:R1", ttype, when, fires, "structured", when)
+
+    def test_calendar_past_due_fires(self):
+        t = self._t("calendar", "2026-01-01")
+        self.assertTrue(W.trigger_fired(t, now=dt.date(2026, 8, 3), resolved=set()))
+
+    def test_calendar_future_does_not_fire(self):
+        t = self._t("calendar", "2027-01-01")
+        self.assertFalse(W.trigger_fired(t, now=dt.date(2026, 8, 3), resolved=set()))
+
+    def test_ticket_resolved_fires(self):
+        t = self._t("ticket", "resolves:T-1234")
+        self.assertTrue(W.trigger_fired(t, now=dt.date(2026, 8, 3), resolved={"T-1234"}))
+
+    def test_ticket_unresolved_does_not_fire(self):
+        t = self._t("ticket", "resolves:T-1234")
+        self.assertFalse(W.trigger_fired(t, now=dt.date(2026, 8, 3), resolved={"T-9999"}))
+
+    def test_metric_crossed_fires_only_when_instrumented(self):
+        t = self._t("metric", "fp_count >= 500")
+        # not instrumented -> never fires (surface, not auto-fire)
+        self.assertFalse(W.trigger_fired(t, now=dt.date(2026, 8, 3), resolved=set()))
+        self.assertFalse(W.trigger_fired(t, now=dt.date(2026, 8, 3), resolved=set(), metrics={"fp_count": 200}))
+        self.assertTrue(W.trigger_fired(t, now=dt.date(2026, 8, 3), resolved=set(), metrics={"fp_count": 500}))
+
+    def test_surface_trigger_never_fires(self):
+        t = self._t("calendar", "2026-01-01", fires="surface")
+        self.assertFalse(W.trigger_fired(t, now=dt.date(2026, 8, 3), resolved=set()))
+
+    def test_event_never_fires_deterministically(self):
+        t = self._t("event", "second project online")
+        self.assertFalse(W.trigger_fired(t, now=dt.date(2026, 8, 3), resolved=set()))
+
+
+# ---------------------------------------------------------------------------
+# Dedup (the load-bearing correctness point)
+# ---------------------------------------------------------------------------
+
+class Dedup(unittest.TestCase):
+    def _make_tickets_root(self, td: Path, *, with_open_key: str | None = None) -> Path:
+        root = td / "tickets"
+        for sub in ("inbox", "active", "done"):
+            (root / sub).mkdir(parents=True)
+        if with_open_key is not None:
+            _write(root / "inbox", "T-9001.md", f"""\
+                ---
+                id: T-9001
+                created: 2026-08-03T00:00:00Z
+                requester: recovery
+                target: orchestrator
+                state: inbox
+                labels: [adr-reeval, "reeval:{with_open_key}", adr, process]
+                ---
+                # Re-evaluate
+
+                ## Ask
+                x
+
+                ## Context
+
+                ## Transition log
+                - filed
+                """)
+        return root
+
+    def test_finds_open_ticket_by_key(self):
+        with TemporaryDirectory() as td:
+            root = self._make_tickets_root(Path(td), with_open_key="ORG-062:R1")
+            self.assertEqual(W.existing_open_reeval_ticket("ORG-062:R1", root), "T-9001")
+
+    def test_absent_key_returns_none(self):
+        with TemporaryDirectory() as td:
+            root = self._make_tickets_root(Path(td), with_open_key="ORG-062:R1")
+            self.assertIsNone(W.existing_open_reeval_ticket("ORG-062:R2", root))
+
+    def test_done_ticket_does_not_dedup(self):
+        # a RESOLVED re-eval ticket must not suppress a re-fire (only open ones dedup)
+        with TemporaryDirectory() as td:
+            root = self._make_tickets_root(Path(td))
+            _write(root / "done", "T-9002.md", """\
+                ---
+                id: T-9002
+                created: 2026-08-03T00:00:00Z
+                requester: recovery
+                target: orchestrator
+                state: done
+                labels: [adr-reeval, "reeval:ORG-062:R1"]
+                ---
+                # x
+                ## Ask
+                x
+                ## Context
+                ## Transition log
+                - done
+                """)
+            self.assertIsNone(W.existing_open_reeval_ticket("ORG-062:R1", root))
+
+
+# ---------------------------------------------------------------------------
+# run_walk orchestration
+# ---------------------------------------------------------------------------
+
+class RunWalk(unittest.TestCase):
+    def _adrs(self, d: Path):
+        _write(d, "ORG-100-cal.md", """\
+            ---
+            id: ORG-100
+            re_evaluate:
+              - {id: R1, type: calendar, when: "2026-01-01", fires: auto-ticket}
+            ---
+            """)
+        _write(d, "ORG-101-surface.md", """\
+            ---
+            id: ORG-101
+            ---
+            ## Re-evaluate when
+            - a fuzzy human-judged condition about scaling.
+            """)
+
+    def test_fired_deterministic_autofiles_surface_listed(self):
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            adrs = tdp / "adr"; adrs.mkdir()
+            self._adrs(adrs)
+            root = tdp / "tickets"
+            for sub in ("inbox", "active", "done"):
+                (root / sub).mkdir(parents=True)
+            with mock.patch.object(W, "file_reeval_ticket", return_value="T-1234") as filer:
+                res = W.run_walk(now=dt.date(2026, 8, 3), adr_dir=adrs,
+                                 tickets_root=root, week_activity="scaling happened")
+            filer.assert_called_once()
+            self.assertEqual(res.filed, ["T-1234"])
+            self.assertEqual(res.fired, ["ORG-100:R1"])
+            self.assertEqual(res.deduped, [])
+            self.assertIn("ORG-101", res.watch_section)
+            self.assertIn("scaling", res.watch_section.lower())
+            self.assertNotIn("ORG-100", res.watch_section)  # deterministic not surfaced
+
+    def test_dedup_skips_autofile_on_rerun(self):
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            adrs = tdp / "adr"; adrs.mkdir()
+            self._adrs(adrs)
+            root = tdp / "tickets"
+            for sub in ("inbox", "active", "done"):
+                (root / sub).mkdir(parents=True)
+            # pre-existing open re-eval ticket for the same trigger
+            _write(root / "active", "T-8000.md", """\
+                ---
+                id: T-8000
+                created: 2026-08-03T00:00:00Z
+                requester: recovery
+                target: orchestrator
+                state: active
+                labels: [adr-reeval, "reeval:ORG-100:R1"]
+                ---
+                # x
+                ## Ask
+                x
+                ## Context
+                ## Transition log
+                - claimed
+                """)
+            with mock.patch.object(W, "file_reeval_ticket") as filer:
+                res = W.run_walk(now=dt.date(2026, 8, 3), adr_dir=adrs, tickets_root=root)
+            filer.assert_not_called()
+            self.assertEqual(res.filed, [])
+            self.assertEqual(res.deduped, ["ORG-100:R1"])
+
+    def test_dry_run_never_files(self):
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            adrs = tdp / "adr"; adrs.mkdir()
+            self._adrs(adrs)
+            root = tdp / "tickets"
+            for sub in ("inbox", "active", "done"):
+                (root / sub).mkdir(parents=True)
+            with mock.patch.object(W, "file_reeval_ticket") as filer:
+                res = W.run_walk(now=dt.date(2026, 8, 3), adr_dir=adrs,
+                                 tickets_root=root, dry_run=True)
+            filer.assert_not_called()
+            self.assertTrue(res.filed and res.filed[0].startswith("(dry-run)"))
+
+
+class WatchSection(unittest.TestCase):
+    def _t(self, tid, when):
+        return W.Trigger("ORG-101", tid, "prose", when, "surface", "prose", when)
+
+    def test_empty(self):
+        self.assertIn("No prose/event", W.build_watch_section([]))
+
+    def test_keyword_flag_intersects_activity(self):
+        t = self._t("ORG-101:S1", "cascade firing rate becomes load-significant")
+        flagged = W.build_watch_section([t], week_activity="the cascade path was touched")
+        self.assertIn("⚑", flagged)
+        unflagged = W.build_watch_section([t], week_activity="unrelated work")
+        # the row exists but without the flag
+        self.assertIn("ORG-101:S1", unflagged)
+        self.assertNotIn("⚑", unflagged.split("|---")[-1])
+
+
+# ---------------------------------------------------------------------------
+# Real-repo smoke: the walk parses the live adr/ without crashing
+# ---------------------------------------------------------------------------
+
+class RealRepoSmoke(unittest.TestCase):
+    def test_live_adrs_parse_and_org062_structured(self):
+        triggers = W.scan_adrs()  # real adr/ dir
+        by_id = {t.trigger_id: t for t in triggers}
+        # ORG-062 was seeded with structured R1-R4
+        for r in ("R1", "R2", "R3", "R4"):
+            self.assertIn(f"ORG-062:{r}", by_id)
+            self.assertEqual(by_id[f"ORG-062:{r}"].source, "structured")
+
+    def test_every_adr_frontmatter_parses_as_yaml(self):
+        """T-2591 lint: every ADR's frontmatter must be valid YAML. _load_yaml
+        returns {} on a parse failure, so a malformed title:/status: (an unquoted
+        value containing a colon) silently makes that ADR's frontmatter — id,
+        status, any structured re_evaluate: key — invisible to the walk. This is
+        the commit-time guard so that can't recur unnoticed (13 ADRs had drifted
+        into this state before it was caught). Shown to fail on a malformed ADR."""
+        import yaml
+        broken = []
+        for path in sorted(W.ADR_DIR.glob("*.md")):
+            if path.name.upper().startswith("README"):
+                continue
+            fm, _ = W._split_frontmatter(path.read_text(encoding="utf-8"))
+            if not fm.strip():
+                continue  # no frontmatter is legitimate; unparseable is not
+            try:
+                yaml.safe_load(fm)
+            except Exception as exc:  # noqa: BLE001 — any YAML error is a finding
+                broken.append(f"{path.name}: {type(exc).__name__}")
+        self.assertEqual(
+            broken, [],
+            "ADR(s) with unparseable frontmatter (invisible to every frontmatter "
+            "tool). Quote any title:/status: value containing a colon:\n  "
+            + "\n  ".join(broken))
+
+
+if __name__ == "__main__":
+    unittest.main()

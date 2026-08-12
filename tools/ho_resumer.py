@@ -128,9 +128,21 @@ def _is_stale_mtime(path: Path) -> bool:
 
 
 def _ho_already_running() -> bool:
-    """Return True if a `claude --resume` process is already running."""
+    """Return True if a `claude --resume` process is already running FOR THIS
+    ACCOUNT.
+
+    T-1956: scoped by uid. Unscoped `pgrep -f` on a box with nine agent
+    accounts, each running `claude`, would match ANY sibling account's
+    `claude ... --resume` — a false positive in the exact tool whose job is
+    recovering the HO. This script only ever runs as the HO account (it's
+    invoked by that account's own systemd user unit), so `os.getuid()` here
+    IS the HO account's uid — no separate config needed. A same-account
+    interactive HO session started via `claude --resume` in tmux still
+    matches — that's a true positive (HO genuinely running -> correct
+    decline).
+    """
     result = subprocess.run(
-        ["pgrep", "-f", _PGREP_PATTERN],
+        ["pgrep", "-u", str(os.getuid()), "-f", _PGREP_PATTERN],
         capture_output=True,
         text=True,
         check=False,

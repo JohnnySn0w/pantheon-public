@@ -1,3 +1,8 @@
+---
+symptom: "Agent turn ends silently mid-response after 'Server is temporarily limiting requests - Rate limited' - no retry, no log entry, no operator signal"
+fix: "activity_monitor.py P1.d predicate detects it via capture-pane plus the isApiErrorMessage/rate_limit jsonl flags and retry-injects to resume the abandoned turn"
+domain: anthropic-api, rate-limit, agent-liveness, silent-failure
+---
 # Anthropic API rate-limit aborts an agent's turn silently — no retry, no signal
 
 ## Symptom

@@ -491,6 +491,121 @@ def _seed_linter_repo(clone: Path, *, execstart_tail: str,
     )
 
 
+# ---------------------------------------------------------------------------
+# T-1937: seat CODE-path-to-main guard.
+# ---------------------------------------------------------------------------
+
+
+def _invoke_hook_with_refs(repo: Path, refs: str, user: str = "suborch1",
+                           remote: str = "origin", url: str = "git@example") -> subprocess.CompletedProcess:
+    """Invoke pre-push with ref lines on stdin and a stubbed `id -un`.
+
+    The guard is seat-gated on the unix user, which a test cannot change — so a
+    stub `id` earlier on PATH supplies the identity. Everything else (the range
+    diff) runs against the real synthetic repo.
+    """
+    stub_dir = repo / ".idstub"
+    stub_dir.mkdir(exist_ok=True)
+    stub = stub_dir / "id"
+    stub.write_text("#!/bin/sh\necho " + user + "\n")
+    stub.chmod(0o755)
+
+    run_env = os.environ.copy()
+    run_env["GIT_DIR"] = str(repo / ".git")
+    run_env["PATH"] = f"{stub_dir}:{run_env['PATH']}"
+    for k, v in (("GIT_AUTHOR_NAME", "Test"), ("GIT_AUTHOR_EMAIL", "t@e.com"),
+                 ("GIT_COMMITTER_NAME", "Test"), ("GIT_COMMITTER_EMAIL", "t@e.com")):
+        run_env[k] = v
+    return subprocess.run(
+        ["bash", str(PRE_PUSH_HOOK), remote, url],
+        cwd=repo, capture_output=True, text=True, check=False,
+        input=refs, env=run_env,
+    )
+
+
+def _commit_path(repo: Path, relpath: str) -> str:
+    """Create/modify a file at relpath, commit it, return the new HEAD sha."""
+    f = repo / relpath
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text((f.read_text() if f.exists() else "") + "x\n")
+    ident = os.environ.copy()
+    ident.update({
+        "GIT_AUTHOR_NAME": "Test", "GIT_AUTHOR_EMAIL": "t@e.com",
+        "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "t@e.com",
+    })
+    subprocess.run(["git", "add", relpath], cwd=repo, check=True,
+                   capture_output=True, env=ident)
+    subprocess.run(["git", "-c", "core.hooksPath=", "commit", "-q", "-m", f"touch {relpath}"],
+                   cwd=repo, check=True, capture_output=True, env=ident)
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, check=True,
+                          capture_output=True, text=True, env=ident).stdout.strip()
+
+
+class TestSeatCodePathGuard(unittest.TestCase):
+    """The guard must block CODE to main from a seat, and nothing else."""
+
+    def _repo_with(self, relpath: str):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        origin, clone = _make_origin_and_clone(Path(tmp.name))
+        base = subprocess.run(["git", "rev-parse", "HEAD"], cwd=clone, check=True,
+                              capture_output=True, text=True).stdout.strip()
+        head = _commit_path(clone, relpath)
+        return clone, origin, base, head
+
+    def test_blocks_code_path_push_to_main_from_seat(self) -> None:
+        clone, origin, base, head = self._repo_with("tools/whatever.py")
+        r = _invoke_hook_with_refs(
+            clone, f"refs/heads/main {head} refs/heads/main {base}\n")
+        self.assertEqual(r.returncode, 1, f"stderr={r.stderr!r}")
+        self.assertIn("BLOCKED", r.stderr)
+        self.assertIn("tools/whatever.py", r.stderr)
+
+    def test_allows_ledger_push_to_main_from_seat(self) -> None:
+        """The deploy-key bypass is load-bearing for parallel ticket/ledger
+        writers — this guard must not touch it."""
+        clone, origin, base, head = self._repo_with("ledger/2026-W30/x.jsonl")
+        r = _invoke_hook_with_refs(
+            clone, f"refs/heads/main {head} refs/heads/main {base}\n")
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+
+    def test_allows_ticket_push_to_main_from_seat(self) -> None:
+        clone, origin, base, head = self._repo_with("tickets/active/T-9999.md")
+        r = _invoke_hook_with_refs(
+            clone, f"refs/heads/main {head} refs/heads/main {base}\n")
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+
+    def test_allows_code_push_to_agent_branch(self) -> None:
+        """Branch pushes are the sanctioned code path — never blocked."""
+        clone, origin, base, head = self._repo_with("tools/whatever.py")
+        r = _invoke_hook_with_refs(
+            clone, f"refs/heads/agent/T-1 {head} refs/heads/agent/T-1 {base}\n")
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+
+    def test_allows_code_push_to_main_from_non_seat(self) -> None:
+        """Seat-gated: the HO's own push flow is unchanged."""
+        clone, origin, base, head = self._repo_with("tools/whatever.py")
+        r = _invoke_hook_with_refs(
+            clone, f"refs/heads/main {head} refs/heads/main {base}\n", user="claude")
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+
+    def test_fail_open_on_empty_stdin(self) -> None:
+        """A blocking read against absent stdin would brick every push on the
+        account — the failure the contract gate's comment warns about."""
+        clone, origin, base, head = self._repo_with("tools/whatever.py")
+        r = _invoke_hook_with_refs(clone, "")
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+
+    def test_warns_but_allows_unclassified_path(self) -> None:
+        """A path in neither set must surface loudly, not silently pick a side."""
+        clone, origin, base, head = self._repo_with("brandnewdir/thing.md")
+        r = _invoke_hook_with_refs(
+            clone, f"refs/heads/main {head} refs/heads/main {base}\n")
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertIn("brandnewdir/thing.md", r.stderr)
+        self.assertIn("neither code nor ticket/ledger", r.stderr)
+
+
 class TestContractGate(unittest.TestCase):
 
     def test_blocks_push_on_contract_violation(self) -> None:
@@ -556,6 +671,269 @@ class TestContractGate(unittest.TestCase):
             result.returncode, 0,
             f"missing linter must fail open (allow push); stderr={result.stderr!r}",
         )
+
+
+_ZERO = "0" * 40
+
+
+def _rev(repo: Path, ref: str = "HEAD") -> str:
+    return _git("rev-parse", ref, cwd=repo, check=True).stdout.strip()
+
+
+def _pre_fix_hook_path(tmpdir: Path) -> Path | None:
+    """Write origin/main's pre-push to a temp file for a non-vacuity comparison.
+
+    Returns None once origin/main ALREADY contains the T-1961 fix (i.e. after
+    this arc merged): at that point origin/main IS the fixed hook, so comparing
+    it against the live hook proves nothing and would false-fail. The caller
+    skips-with-reason in that case — the non-vacuity was genuinely established
+    pre-merge (and is in the ticket/PR record); a test that can only pass before
+    its own change merges must degrade to a skip, not a red on main.
+    """
+    raw = _git("show", "origin/main:.githooks/pre-push",
+               cwd=REPO_ROOT, check=True).stdout
+    if "_skip_freshness" in raw or "T-1961" in raw:
+        return None  # origin/main already has the fix — non-vacuity no longer testable here
+    dst = tmpdir / "pre-push.prefix"
+    dst.write_text(raw)
+    dst.chmod(0o755)
+    return dst
+
+
+def _invoke_hook_file(hook: Path, repo: Path, refs: str,
+                      remote: str = "origin", url: str = "git@example") -> subprocess.CompletedProcess:
+    run_env = os.environ.copy()
+    run_env["GIT_DIR"] = str(repo / ".git")
+    for k, v in (("GIT_AUTHOR_NAME", "Test"), ("GIT_AUTHOR_EMAIL", "t@e.com"),
+                 ("GIT_COMMITTER_NAME", "Test"), ("GIT_COMMITTER_EMAIL", "t@e.com")):
+        run_env[k] = v
+    return subprocess.run(
+        ["bash", str(hook), remote, url],
+        cwd=repo, capture_output=True, text=True, check=False,
+        input=refs, env=run_env,
+    )
+
+
+class TestFreshnessStdinCases(unittest.TestCase):
+    """T-1961: the freshness auto-rebase must skip deletes and deliberate
+    rewrites (read from stdin), while preserving the parallel-writer case.
+
+    Every case drives the REAL hook script against a synthetic repo, and proves
+    non-vacuity by running the pre-fix hook (origin/main's version) on the same
+    scenario — the discipline of lessons/2026-07-22-false-red-verifier-must-call-
+    prod-parser.md: test the surface, not a reimplementation.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.origin, self.clone = _make_origin_and_clone(self.tmp)
+        self.base = _rev(self.clone, "origin/main")
+
+    # -- (a) delete -------------------------------------------------------
+
+    def test_delete_push_skips_freshness(self) -> None:
+        """A ref deletion (local oid all-zeros) must skip the freshness rebase
+        entirely — even while local main is behind origin."""
+        # Make local main behind: advance origin, keep local at base.
+        _commit_file(self.clone, "b.txt", "x\n", "advance")
+        _git("push", "origin", "main", cwd=self.clone, check=True)
+        _git("reset", "--hard", self.base, cwd=self.clone, check=True)
+        refs = f"(delete) {_ZERO} refs/heads/stale-branch {self.base}\n"
+
+        r = _invoke_hook_with_refs(self.clone, refs)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("ref deletion", r.stderr)
+        self.assertNotIn("rebasing", r.stderr)
+
+    def test_delete_is_nonvacuous_prefix_hook_does_not_skip(self) -> None:
+        prefix = _pre_fix_hook_path(self.tmp)
+        if prefix is None:
+            self.skipTest("origin/main already contains the T-1961 fix; "
+                          "non-vacuity was proven pre-merge (PR/ticket record)")
+        refs = f"(delete) {_ZERO} refs/heads/stale-branch {self.base}\n"
+        r = _invoke_hook_file(prefix, self.clone, refs)
+        self.assertNotIn("ref deletion", r.stderr,
+                         "pre-fix hook must NOT have the delete carve-out (proves the fix is live)")
+
+    # -- (b) deliberate rewrite -------------------------------------------
+
+    def _make_rewrite(self) -> tuple[str, str]:
+        """Return (rewritten_local_oid, old_remote_oid) on a feature branch where
+        the old remote tip is NOT an ancestor of the local tip."""
+        _git("checkout", "-b", "feature", cwd=self.clone, check=True)
+        _commit_file(self.clone, "f.txt", "v1\n", "A")
+        _git("push", "-u", "origin", "feature", cwd=self.clone, check=True)
+        old = _rev(self.clone, "HEAD")
+        _git("reset", "--hard", self.base, cwd=self.clone, check=True)
+        _commit_file(self.clone, "f.txt", "v2\n", "A-prime")
+        new = _rev(self.clone, "HEAD")
+        return new, old
+
+    def test_rewrite_push_warns_and_skips(self) -> None:
+        new, old = self._make_rewrite()
+        self.assertFalse(
+            _git("merge-base", "--is-ancestor", old, new, cwd=self.clone).returncode == 0,
+            "fixture invalid: old must NOT be an ancestor of new",
+        )
+        refs = f"refs/heads/feature {new} refs/heads/feature {old}\n"
+        r = _invoke_hook_with_refs(self.clone, refs)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("deliberate history rewrite", r.stderr)
+        self.assertNotIn("rebase FAILED", r.stderr)
+
+    def test_rewrite_is_nonvacuous_prefix_hook_rebases(self) -> None:
+        new, old = self._make_rewrite()
+        prefix = _pre_fix_hook_path(self.tmp)
+        if prefix is None:
+            self.skipTest("origin/main already contains the T-1961 fix; "
+                          "non-vacuity was proven pre-merge (PR/ticket record)")
+        refs = f"refs/heads/feature {new} refs/heads/feature {old}\n"
+        r = _invoke_hook_file(prefix, self.clone, refs)
+        # pre-fix hook fetches + sees behind + rebases onto stale origin/feature
+        self.assertNotIn("deliberate history rewrite", r.stderr,
+                         "pre-fix hook lacks the rewrite carve-out")
+
+    # -- parallel-writer (must be preserved) ------------------------------
+
+    def test_parallel_writer_still_rebases(self) -> None:
+        """Local extends its known remote (remote oid IS an ancestor); a
+        divergent remote must still trigger the auto-rebase, unchanged."""
+        # origin/main advances (other writer), local adds its own commit off base.
+        staging = self.tmp / "staging2"
+        _git("clone", str(self.origin), str(staging), cwd=self.tmp, check=True)
+        _commit_file(staging, "other.txt", "remote\n", "remote-side")
+        _git("push", "origin", "main", cwd=staging, check=True)
+        _commit_file(self.clone, "mine.txt", "local\n", "local-side")
+        loid = _rev(self.clone, "HEAD")
+        # stdin remote oid = base (local's KNOWN remote, an ancestor of loid)
+        refs = f"refs/heads/main {loid} refs/heads/main {self.base}\n"
+
+        r = _invoke_hook_with_refs(self.clone, refs)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("rebasing", r.stderr)  # freshness ran, as before
+        # and the local now contains the remote-side commit
+        log = _git("log", "--oneline", cwd=self.clone, check=True).stdout
+        self.assertIn("remote-side", log)
+
+    # -- new branch -------------------------------------------------------
+
+    def test_new_branch_push_skips(self) -> None:
+        _git("checkout", "-b", "brand-new", cwd=self.clone, check=True)
+        _commit_file(self.clone, "n.txt", "new\n", "new")
+        loid = _rev(self.clone, "HEAD")
+        refs = f"refs/heads/brand-new {loid} refs/heads/brand-new {_ZERO}\n"
+        r = _invoke_hook_with_refs(self.clone, refs)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("new remote branch", r.stderr)
+        self.assertNotIn("rebasing", r.stderr)
+
+    # -- empty stdin falls through (fail-safe) ----------------------------
+
+    def test_empty_stdin_falls_through_to_freshness(self) -> None:
+        """No stdin → behave exactly as the pre-fix hook (run the freshness
+        check). Proven by an up-to-date repo: exit 0, no skip message."""
+        r = _invoke_hook_with_refs(self.clone, "")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("ref deletion", r.stderr)
+        self.assertNotIn("deliberate history rewrite", r.stderr)
+        self.assertNotIn("new remote branch", r.stderr)
+
+
+# ---------------------------------------------------------------------------
+# T-2077: ledger shard-placement WARN gate.
+# The gate runs the placement linter over the push range and WARNS on any
+# newly-added entry in the wrong ISO-week shard — but NEVER blocks (misplacement
+# is cosmetic: readers union-glob + key off entry_ts). Fleet-wide, main-only.
+# ---------------------------------------------------------------------------
+
+import json  # noqa: E402
+
+# 2026-07-26 (Sun) is ISO W30's last day; 2026-07-27 (Mon) is W31's first —
+# the rollover where boundary-spillover happens.
+_TS_W30 = "2026-07-26T12:00:00Z"
+_TS_W31 = "2026-07-27T12:00:00Z"
+_LEDGER_LINT_SRC = REPO_ROOT / "tools" / "ledger_placement_lint.py"
+_LEDGER_SHARD_SRC = REPO_ROOT / "tools" / "ledger_shard.py"
+
+
+def _seed_ledger_lint(clone: Path) -> None:
+    """Copy the real linter + its ledger_shard dependency into the clone so the
+    hook's `${REPO_ROOT}/tools/ledger_placement_lint.py` resolves."""
+    tools = clone / "tools"
+    tools.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(_LEDGER_LINT_SRC, tools / "ledger_placement_lint.py")
+    shutil.copy2(_LEDGER_SHARD_SRC, tools / "ledger_shard.py")
+
+
+def _commit_ledger_line(repo: Path, seg: str, entry: dict) -> str:
+    """Append one JSON entry to ledger/<seg>/<seg>.jsonl, commit, return HEAD."""
+    rel = f"ledger/{seg}/{seg}.jsonl"
+    f = repo / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text((f.read_text() if f.exists() else "") + json.dumps(entry) + "\n")
+    ident = {"GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@e.com",
+             "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@e.com"}
+    _git("add", rel, cwd=repo, check=True, env=ident)
+    _git("-c", "core.hooksPath=", "commit", "-q", "-m", f"ledger {seg}",
+         cwd=repo, check=True, env=ident)
+    return _git("rev-parse", "HEAD", cwd=repo, check=True, env=ident).stdout.strip()
+
+
+class TestLedgerPlacementWarn(unittest.TestCase):
+    """WARN (never block) on a newly-added misplaced ledger entry."""
+
+    def _setup(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        origin, clone = _make_origin_and_clone(Path(tmp.name))
+        base = _git("rev-parse", "HEAD", cwd=clone, check=True).stdout.strip()
+        return clone, base
+
+    def test_warns_but_does_not_block_on_misplaced_added_entry(self) -> None:
+        clone, base = self._setup()
+        _seed_ledger_lint(clone)
+        # a W31-ts entry written into the W30 shard = boundary spillover
+        head = _commit_ledger_line(
+            clone, "2026-W30", {"id": "spill-1", "ts": _TS_W31, "agent": "metis"})
+        r = _invoke_hook_with_refs(
+            clone, f"refs/heads/main {head} refs/heads/main {base}\n")
+        self.assertEqual(r.returncode, 0, f"must WARN not block; stderr={r.stderr!r}")
+        self.assertIn("wrong ISO-week shard", r.stderr)
+        self.assertIn("spill-1", r.stderr)
+        self.assertIn("NOT blocked", r.stderr)
+
+    def test_silent_on_correctly_placed_entry(self) -> None:
+        clone, base = self._setup()
+        _seed_ledger_lint(clone)
+        head = _commit_ledger_line(
+            clone, "2026-W30", {"id": "ok-1", "ts": _TS_W30, "agent": "metis"})
+        r = _invoke_hook_with_refs(
+            clone, f"refs/heads/main {head} refs/heads/main {base}\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("wrong ISO-week shard", r.stderr)
+
+    def test_fail_open_when_linter_absent(self) -> None:
+        # linter NOT seeded -> gate no-ops, push proceeds, no warn text
+        clone, base = self._setup()
+        head = _commit_ledger_line(
+            clone, "2026-W30", {"id": "spill-2", "ts": _TS_W31, "agent": "metis"})
+        r = _invoke_hook_with_refs(
+            clone, f"refs/heads/main {head} refs/heads/main {base}\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("wrong ISO-week shard", r.stderr)
+
+    def test_does_not_fire_on_non_main_ref(self) -> None:
+        # a branch push must not trigger the main-only ledger warn
+        clone, base = self._setup()
+        _seed_ledger_lint(clone)
+        head = _commit_ledger_line(
+            clone, "2026-W30", {"id": "spill-3", "ts": _TS_W31, "agent": "metis"})
+        r = _invoke_hook_with_refs(
+            clone, f"refs/heads/agent/T-1 {head} refs/heads/agent/T-1 {base}\n")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("wrong ISO-week shard", r.stderr)
 
 
 if __name__ == "__main__":

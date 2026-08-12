@@ -1,0 +1,24 @@
+[Unit]
+Description=Pantheon fleet host health — off-site reachability + CRITICAL-alarm poll of the home cluster (T-2454)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Off-site availability poller. recovery runs on the VPS, OFF both boxon and pve2, so it can still
+# reach the home cluster when the on-box netdata (CT201, an LXC on pve2) is down WITH its host.
+# Probes are READ-ONLY from outside — ICMP (ping) + netdata /api/v1/alarms over tailnet. No
+# credential for pve2, no netdata reconfig, no service restarts on the home hosts. DETECT + ALERT
+# only: an unreachable home host wants a human, not an automatic action on someone's home lab.
+#
+# TimeoutStartSec is generous vs the worst-case serial probe (3 hosts x [3 pings + a netdata GET])
+# so a slow-but-answering fleet never trips the monitor's OWN timeout — a monitor killed by its
+# timeout fires OnFailure and reports the monitor instead of the fault (the same-second-timeout trap).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/fleet_host_health.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

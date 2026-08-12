@@ -2,6 +2,9 @@
 Description=Pantheon stale-worktree sweeper — auto-remove merged+clean throwaway build worktrees (T-1324b; each carries a 10-20G Rust target/ that filled the VPS to 100% on 2026-06-25)
 Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
 
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
 [Service]
 Type=oneshot
 WorkingDirectory=%h/pantheon-config

@@ -1,0 +1,18 @@
+[Unit]
+Description=Pantheon consumer liveness — poll inbox-consumer completion recency every 5 min (T-2605)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# Every 5 minutes. The watched cadence is 10 min (inbox-consumer OnUnitActiveSec) and the STALLED
+# threshold is 30 min (3 cadences), so a 5-min poll surfaces a genuine stall within ~30-35 min. The
+# 6h per-verdict cooldown (in the tool) keeps a sustained stall from paging every poll; a CHANGED
+# verdict still speaks immediately.
+OnCalendar=*-*-* *:00/5:00
+# Persistent so a poll missed across a recovery reboot runs once on the way back up — a consumer that
+# went quiet before the reboot is exactly the case this has something to say about.
+Persistent=true
+RandomizedDelaySec=30
+Unit=pantheon-consumer-liveness.service
+
+[Install]
+WantedBy=timers.target

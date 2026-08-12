@@ -1,0 +1,68 @@
+[Unit]
+# T-2271: WIRED, and this is the unit the evidence most argued for. Measured over
+# 14 days before deciding (the ticket asked for counts, not reasoning):
+#   claude-telegram.service            0 failures / 19 starts
+#   claude-telegram-research.service   0 failures / 11 starts
+#   agent-monitor.service             35 failures  <- here
+# The 35 are real — 'timeout' and 'oom-kill' — on a droplet that has already been
+# force-restarted once for sustained memory pressure. ~2.5/day is not the alert
+# storm the omission was feared to cause; it is a recurring fault nobody was ever
+# told about, BECAUSE this unit had no OnFailure. The unit with the most failures
+# was the one with no alerting, which is the argument for wiring rather than
+# against it. Failure detail carried into its own ticket.
+#
+# T-2346 DIAGNOSED THOSE 35, and the reading above needs qualifying — "a recurring
+# fault nobody was told about" is not what most of them were:
+#   * The 'timeout' results are STOP timeouts, and they are the REMEDIATION
+#     WORKING. T-1885's wedge watchdog was ARMED on 2026-07-27; a wedged node
+#     event loop cannot answer SIGTERM, so each watchdog restart burned the
+#     default 90s TimeoutStopSec and then SIGKILLed. That is the expected
+#     signature of killing a wedge, not an independent defect. The watchdog was
+#     disarmed 2026-07-27T22:55Z pending the operator's fix-vs-retire steer (TG 6507).
+#   * The single 'oom-kill' (Jul 28 15:45) was COLLATERAL, not a cause. Measured
+#     at T-2346: anon 56.6 MB / RSS 70 MB after 5 days' uptime on a 7941 MB box.
+#     `MemoryCurrent` reads ~386 MB but that is 82% reclaimable page cache — do
+#     not quote it as a working set. The box's memory was going to the agent
+#     sessions (574/515/285/281/268 MB), which is what the operator restarted for.
+#   * IT IS NOT ONGOING. Watchdog stall rate collapsed across the 2026-07-28
+#     16:04 reboot: 392 HEALTHY / 59 STALLED on Jul 27 (13.1%) versus 3632 / 1
+#     since (0.03%), and that single stall self-recovered inside 2 minutes
+#     without reaching the 3-strike threshold. Zero unit failures in the 5 days
+#     since. So this is the ticket's own hypothesis (3) — symptom of the
+#     pre-reboot pressure, not a leak and not a cause.
+# Keep OnFailure. The wiring argument stands on its own; only the fault's
+# attribution changed.
+OnFailure=pantheon-unit-failure-alert@%n.service
+Description=Claude Code Agent Monitor dashboard
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/claude/GitHub/Claude-Code-Agent-Monitor
+Environment=CLAUDE_DASHBOARD_PORT=4820
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/node server/index.js
+Restart=on-failure
+RestartSec=5
+
+# T-2346 item 2: declare a ceiling so a future kill is DELIBERATE AND
+# ATTRIBUTABLE rather than global-OOM collateral. There is no leak to fix (anon
+# 56.6 MB after 5 days), so this is not a containment measure — it is so that if
+# this unit is ever killed again, the journal names THIS cgroup's limit instead
+# of leaving us re-deriving whether a 3rd-party node dashboard was cause or
+# casualty, which is the whole cost T-2346 paid.
+# MemoryHigh throttles and reclaims first (no kill); MemoryMax is the hard line.
+# Both count page cache, and this cgroup legitimately carries ~316 MB of it, so
+# the numbers are set well above the working set — a ceiling, not a constraint.
+MemoryHigh=768M
+MemoryMax=1G
+
+# T-2346 item 1, the 'timeout' half: those failures are STOP timeouts. A wedged
+# node event loop cannot answer SIGTERM, so every watchdog restart sat through
+# the default 90s TimeoutStopSec before SIGKILL. 20s is well past a healthy
+# exit (measured: sub-second) and stops a wedged stop from burning 90 seconds.
+TimeoutStopSec=20
+
+[Install]
+WantedBy=default.target

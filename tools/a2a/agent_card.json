@@ -1,0 +1,28 @@
+{
+  "protocolVersion": "1.0",
+  "name": "pantheon-specialist",
+  "description": "Science-team research seat of a Pantheon seed. Accepts bounded research requests (tech-watch style: multi-source, primary-source-cited, adversarially verified) and returns a written report with citations. Long-running; expect minutes to hours.",
+  "url": "http://127.0.0.1:41100/a2a",
+  "preferredTransport": "JSONRPC",
+  "version": "0.1.0-rung1",
+  "capabilities": {
+    "streaming": true,
+    "pushNotifications": false,
+    "stateTransitionHistory": true
+  },
+  "defaultInputModes": ["text/plain", "application/json"],
+  "defaultOutputModes": ["text/markdown", "application/json"],
+  "skills": [
+    {
+      "id": "research-request",
+      "name": "Research request",
+      "description": "Submit a research question with scope constraints; receive a cited markdown report. Requests above the seat's autonomy bar transition to INPUT_REQUIRED pending operator approval.",
+      "tags": ["research", "tech-watch", "verification"],
+      "inputModes": ["application/json", "text/plain"],
+      "outputModes": ["text/markdown", "application/json"],
+      "examples": [
+        "{\"question\": \"What changed in the MCP spec release scheduled 2026-07-28?\", \"depth\": \"standard\", \"scope\": {\"domains_hint\": [\"modelcontextprotocol.io\"], \"recency_days\": 30}}"
+      ]
+    }
+  ]
+}

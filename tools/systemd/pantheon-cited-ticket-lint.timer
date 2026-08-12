@@ -1,0 +1,19 @@
+# Weekly, Sunday 05:30 UTC — 30 min after pantheon-cited-hash-lint (05:00) so the
+# two citation sweeps land in the same window without contending for git or for
+# the reader's attention, and both stay clear of grooming (12:00) and the watch
+# loop (08:00).
+#
+# Cheaper than the hash lint despite a similar corpus: ordering is resolved from
+# two git calls up front and every per-citation question is then an integer
+# comparison, so cost scales with commits scanned rather than with findings.
+[Unit]
+Description=Pantheon cited-ticket lint — weekly fire (Sun 05:30 UTC)
+Documentation=file:///home/%u/pantheon-config/tools/cited_ticket_lint.py
+
+[Timer]
+OnCalendar=Sun *-*-* 05:30:00 UTC
+Persistent=true
+Unit=pantheon-cited-ticket-lint.service
+
+[Install]
+WantedBy=timers.target

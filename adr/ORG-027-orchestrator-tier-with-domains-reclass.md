@@ -4,6 +4,7 @@ id: ORG-027
 title: Reclass the always-on agents to orchestrator-tier-with-domains (retire the worker-vs-orchestrator split for persistent agents)
 status: Ratified 2026-06-05 by the operator via T-0789. Drafted 2026-06-04 by Recovery (T-0785, spawned from noodle T-0764).
 date: 2026-06-04
+build_disposition: no-build-needed
 ---
 
 # ORG-027 — Orchestrator-tier-with-domains reclass for the always-on agents

@@ -1,0 +1,19 @@
+[Unit]
+Description=Pantheon forgejo mirror verify — daily fire (21:00 UTC, a few hours after the mirrors' own 24h pull)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-2217.md
+
+[Timer]
+# Daily 21:00 UTC. Two reasons for that slot, both deliberate:
+#  - the mirrors were seeded ~18:50 UTC and carry mirror_interval=24h, so 21:00 lands a
+#    couple of hours AFTER their own pull — verifying just before a sync would report
+#    yesterday's state and call it today's.
+#  - clear of the 12:00 grooming / 12:30 spine-groom / 13:00 gc+drift cluster, so Recovery's
+#    digests don't stack in one minute.
+# Persistent so a fire missed across a reboot still runs — the box went down mid-day on
+# 2026-07-28 and a non-persistent daily would simply have skipped that day silently.
+OnCalendar=*-*-* 21:00:00 UTC
+Persistent=true
+Unit=pantheon-forgejo-mirror-verify.service
+
+[Install]
+WantedBy=timers.target

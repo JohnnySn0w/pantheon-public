@@ -7,6 +7,7 @@ nightly false alarms), and that alerting is throttled per (agent, class).
 """
 from __future__ import annotations
 
+import json
 import time
 import unittest
 from pathlib import Path
@@ -95,6 +96,8 @@ class CheckLoop(unittest.TestCase):
         with self._patched_classify(), \
              mock.patch.object(cem, "_load_state", return_value={}), \
              mock.patch.object(cem, "_save_state"), \
+             mock.patch.object(cem, "_track_login_event"), \
+             mock.patch.object(cem, "_wake_recovery") as mwake, \
              mock.patch.object(cem, "_alert") as malert:
             problems = cem.check(["specialist", "orchestrator"], dry_run=False, now=NOW)
         self.assertEqual(problems, 1)
@@ -104,18 +107,134 @@ class CheckLoop(unittest.TestCase):
     def test_dry_run_never_alerts(self):
         with self._patched_classify(), \
              mock.patch.object(cem, "_load_state", return_value={}), \
+             mock.patch.object(cem, "_wake_recovery") as mwake, \
              mock.patch.object(cem, "_alert") as malert:
             problems = cem.check(["specialist", "orchestrator"], dry_run=True, now=NOW)
         self.assertEqual(problems, 1)
         malert.assert_not_called()
+        mwake.assert_not_called()
 
     def test_cooldown_suppresses_repeat(self):
         with self._patched_classify(), \
              mock.patch.object(cem, "_load_state", return_value={"specialist:NO_REFRESH": NOW - 60}), \
              mock.patch.object(cem, "_save_state"), \
+             mock.patch.object(cem, "_track_login_event"), \
+             mock.patch.object(cem, "_wake_recovery") as mwake, \
              mock.patch.object(cem, "_alert") as malert:
             cem.check(["specialist", "orchestrator"], dry_run=False, now=NOW)
         malert.assert_not_called()
+        mwake.assert_not_called()
+
+
+class WardWake(unittest.TestCase):
+    """T-1873: the first (un-throttled) alert also wakes Recovery's mailbox so the
+    relogin legwork starts in minutes, not hours. Delivery seam always mocked —
+    tests must never write the real ORG-026 hub."""
+
+    def test_wake_fires_alongside_first_operator_alert(self):
+        with mock.patch("tools.mailbox.send") as msend:
+            cem._wake_recovery("orchestrator", "MALFORMED", "credential no accessToken field")
+        args, kwargs = msend.call_args
+        self.assertEqual(args[0], "/home/the-ancestor/mailbox/recovery")
+        self.assertIn("credential-MALFORMED on orchestrator", args[1])
+        self.assertIn("agent-oauth-relogin", args[1])
+        self.assertEqual(kwargs["subject"], "auth-dead: orchestrator (MALFORMED)")
+
+    def test_wake_skipped_when_recovery_is_the_dead_agent(self):
+        with mock.patch("tools.mailbox.send") as msend:
+            cem._wake_recovery("recovery", "NO_REFRESH", "empty refresh")
+        msend.assert_not_called()
+
+    def test_wake_failure_is_nonfatal_and_alert_path_survives(self):
+        def fake(agent, cfg, now=None):
+            return ("NO_REFRESH", "empty refresh") if agent == "specialist" else ("OK", "fine")
+        with mock.patch.object(cem, "classify", side_effect=fake), \
+             mock.patch.object(cem, "_load_state", return_value={}), \
+             mock.patch.object(cem, "_save_state"), \
+             mock.patch.object(
+                 cem, "CREDENTIALED_ACCOUNTS",
+                 {"specialist": "claude-research", "orchestrator": "claude"},
+             ), \
+             mock.patch("tools.mailbox.send", side_effect=PermissionError("hub")), \
+             mock.patch.object(cem, "_track_login_event"), \
+             mock.patch.object(cem, "_alert") as malert:
+            problems = cem.check(["specialist", "orchestrator"], dry_run=False, now=NOW)
+        self.assertEqual(problems, 1)
+        self.assertEqual(malert.call_count, 1)
+
+
+class LoginEventTracking(unittest.TestCase):
+    """T-1874: credential-fingerprint changes are recorded as login events so
+    auth-deaths can be correlated against fleet login activity."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        d = Path(self._tmp.name)
+        for p in [
+            mock.patch.object(cem, "STATE_DIR", d),
+            mock.patch.object(cem, "STATE_PATH", d / "state.json"),
+            mock.patch.object(cem, "LOGIN_EVENTS_PATH", d / "login_events.jsonl"),
+        ]:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _events(self):
+        if not cem.LOGIN_EVENTS_PATH.exists():
+            return []
+        return [json.loads(l) for l in cem.LOGIN_EVENTS_PATH.read_text().splitlines()]
+
+    def test_first_observation_logs_baseline_then_stays_quiet(self):
+        oauth = {"accessToken": "a", "refreshToken": "R1", "refreshTokenExpiresAt": 111}
+        state = {}
+        with mock.patch.object(cem, "_read_credential", return_value=("ok", oauth)):
+            cem._track_login_event("orchestrator", {}, NOW, state)
+            cem._track_login_event("orchestrator", {}, NOW + 3600, state)
+        evs = self._events()
+        self.assertEqual(len(evs), 1)
+        self.assertTrue(evs[0]["baseline"])
+        self.assertIn("fp:orchestrator", state)
+
+    def test_rotation_logs_event_with_old_and_new(self):
+        state = {}
+        o1 = {"accessToken": "a", "refreshToken": "R1", "refreshTokenExpiresAt": 111}
+        o2 = {"accessToken": "b", "refreshToken": "R2", "refreshTokenExpiresAt": 222}
+        with mock.patch.object(cem, "_read_credential", side_effect=[("ok", o1), ("ok", o2)]):
+            cem._track_login_event("specialist", {}, NOW, state)
+            cem._track_login_event("specialist", {}, NOW + 60, state)
+        evs = self._events()
+        self.assertEqual(len(evs), 2)
+        self.assertFalse(evs[1]["baseline"])
+        self.assertNotEqual(evs[1]["old_fp"], evs[1]["new_fp"])
+
+    def test_blanked_writeback_is_fingerprinted_as_blanked(self):
+        """The 2026-07-20 orchestrator signature: parseable file, empty tokens."""
+        state = {"fp:orchestrator": "abc@111"}
+        blanked = {"accessToken": "", "refreshToken": "", "refreshTokenExpiresAt": 999}
+        with mock.patch.object(cem, "_read_credential",
+                               return_value=("no accessToken field", blanked)):
+            cem._track_login_event("orchestrator", {}, NOW, state)
+        evs = self._events()
+        self.assertEqual(len(evs), 1)
+        self.assertEqual(evs[0]["new_fp"], "blanked")
+
+    def test_unreadable_cred_neither_logs_nor_clobbers_state(self):
+        state = {"fp:orchestrator": "abc@111"}
+        with mock.patch.object(cem, "_read_credential",
+                               return_value=("unreadable (rc=1: )", None)):
+            cem._track_login_event("orchestrator", {}, NOW, state)
+        self.assertEqual(self._events(), [])
+        self.assertEqual(state["fp:orchestrator"], "abc@111")
+
+    def test_blanked_cred_still_classifies_malformed(self):
+        """Guard the classify() contract across the _read_credential change."""
+        blanked = {"accessToken": "", "refreshToken": "", "refreshTokenExpiresAt": 999}
+        with mock.patch.object(cem, "_read_credential",
+                               return_value=("no accessToken field", blanked)):
+            cls, detail = cem.classify("orchestrator", {}, now=NOW)
+        self.assertEqual(cls, "MALFORMED")
+        self.assertIn("no accessToken", detail)
 
 
 class MainModes(unittest.TestCase):

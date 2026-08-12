@@ -1,3 +1,8 @@
+---
+symptom: "'gh run watch --exit-status' returns exit 0 while the run is still in_progress, falsely signalling CI success"
+fix: "The PAT's 403 on the annotations endpoint is swallowed - poll 'gh run view --json status,conclusion' until completed instead of trusting watch exit codes"
+domain: github, gh-cli, pat, ci
+---
 # Bug — `gh run watch` exits 0 spuriously under the fleet fine-grained PAT
 
 **Surfaced:** 2026-06-24, Echo T-1296 merge (Orchestrator). Reusable across any agent using `gh` with the fleet fine-grained PAT (`gh_token.env`).

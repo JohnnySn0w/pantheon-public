@@ -15,6 +15,7 @@ related:
   - tickets/active/T-0113.md
   - rulebook/principles.md (P1, P5)
   - rulebook/directives.md (D1, D3)
+build_disposition: built
 ---
 
 # ORG-007 — kino ↔ claude wire protocol

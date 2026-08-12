@@ -3,6 +3,7 @@ aliases: [ORG-013]
 title: Relational triggers on ticket resolve (auto-unblock cascade + blocked-revisit digest)
 status: Ratified 2026-06-07 by the operator (authored 2026-05-14)
 date: 2026-05-14
+build_disposition: built
 ---
 # ORG-013 — Relational triggers on ticket resolve (auto-unblock cascade + blocked-revisit digest)
 

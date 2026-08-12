@@ -1,0 +1,14 @@
+[Unit]
+Description=Pantheon ACP-bridge backlog watchdog for %i — poll every 5 minutes (T-1633)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-1633.md
+
+# Modeled on pantheon-context-fill-monitor@.timer (the closest %i-per-agent-poll
+# precedent). NOT auto-installed by this build.
+
+[Timer]
+OnCalendar=*-*-* *:0/5:00
+Persistent=true
+Unit=pantheon-acp-bridge-backlog@%i.service
+
+[Install]
+WantedBy=timers.target

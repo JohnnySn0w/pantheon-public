@@ -1,3 +1,8 @@
+---
+symptom: "Piping a password into 'sudo -S' while the same command carries a heredoc fails with 'Sorry, try again' three times even when the password is correct"
+fix: "The heredoc replaces the pipe as sudo's stdin so script lines are read as password attempts - never combine sudo -S with a heredoc; pass the script via file and the password via the pipe"
+domain: bash, sudo, stdin, false-alarm
+---
 # `pipe | sudo -S cmd <<heredoc` — heredoc steals stdin, sudo reads script lines as passwords
 
 **Symptom.** `cut/tr/cat <pw-file> | sudo -S bash -s <<'EOF' ... EOF` fails with `Sorry, try again` ×3 / `3 incorrect password attempts` even when the password is correct. Looks exactly like a rotated/broken password. Cost: a full false-alarm arc 2026-06-11/12 (ledger -181/-182/-183) — "broken password / no autonomous root path" narrative, an operator-lane ticket, two correction digests — when the password was valid the whole time.

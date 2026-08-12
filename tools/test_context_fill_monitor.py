@@ -23,20 +23,25 @@ state file — temp dirs / patches isolate everything.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
 import time
+import pathlib
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import DEFAULT, MagicMock, patch
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 import tools.context_fill_monitor as cfm
+import tools.context_fill_hold as cfh
 import tools.inbox_consumer as ic
 from tools.context_fill_monitor import (
     AGENT_CONFIG,
@@ -66,9 +71,84 @@ from tools.context_fill_monitor import (
 )
 
 
+def _seed_error_streak(agent: str, error_class: str, *, age: int | None = None) -> None:
+    """T-2607 PART 1: pre-seed the persistence marker as if the error was first
+    seen ``age`` seconds ago (default just past ERROR_PERSIST_SECONDS), so a
+    single main()/fire call under test sees a PERSISTED streak and fires. The
+    fire-path tests assert the FIRE's side-effects; the gate's own timing
+    (single-observation no-fire, two-observation fire, mid-retry-recovery clear)
+    is covered by ErrorPersistenceGateTests. Resolves the marker path through
+    cfm so it tracks PANTHEON_STATE_DIR exactly like production."""
+    if age is None:
+        age = cfm.ERROR_PERSIST_SECONDS + 5
+    p = cfm._error_persist_state_path_for_agent(agent, error_class)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(str(int(time.time()) - age), encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# T-2459: the three non-tombstone restart paths now DISPATCH a detached transient
+# unit (`systemd-run --user ... -- <handoff_and_restart argv>`) via subprocess.run
+# instead of BLOCKING via subprocess.Popen. These helpers read the dispatch off a
+# patched subprocess.run so a fire assertion checks the real (new) surface — and,
+# critically, a NO-fire assertion checks `not _dispatched(...)` rather than the
+# now-never-called Popen (which would make the negative test vacuous).
+# ---------------------------------------------------------------------------
+
+def _dispatch_calls(mock_run):
+    """The systemd-run detached-restart dispatch calls on a patched subprocess.run."""
+    calls = []
+    for c in mock_run.call_args_list:
+        argv = c.args[0] if c.args else c.kwargs.get("args")
+        if isinstance(argv, list) and argv and argv[0] == "systemd-run":
+            calls.append(argv)
+    return calls
+
+
+def _dispatched(mock_run) -> bool:
+    return bool(_dispatch_calls(mock_run))
+
+
+def _dispatch_joined(mock_run) -> str:
+    return " ".join(" ".join(map(str, argv)) for argv in _dispatch_calls(mock_run))
+
+
 # ---------------------------------------------------------------------------
 # compute_fill_tokens
 # ---------------------------------------------------------------------------
+
+
+class CapabilityCapGuidanceIsCorrectT2290(unittest.TestCase):
+    """T-2290: the alert used to assert the cap 'NEVER self-resolves' and to tell
+    the reader to switch the model pin or escalate a raise to the operator.
+
+    All three were wrong. The text says 'monthly spend limit' but the binding
+    constraint is the CURRENT TIME WINDOW (the operator, 2026-07-29), and it clears
+    on its own — orchestrator/metis/atlas each lost ~2h on 2026-07-29 and all resumed
+    unaided. Acting on the old guidance cost a false escalation and three
+    corrections. An alert that names the wrong remediation is the T-2310 class:
+    confidently wrong beats silent.
+    """
+
+    SRC = pathlib.Path(__file__).resolve().parent / "context_fill_monitor.py"
+
+    def setUp(self):
+        self.src = self.SRC.read_text(encoding="utf-8")
+
+    def test_does_not_claim_it_never_self_resolves(self):
+        self.assertNotIn("NEVER self-resolves", self.src)
+
+    def test_does_not_tell_the_reader_to_escalate_a_raise(self):
+        self.assertNotIn("escalate a raise-the-limit to the operator", self.src)
+
+    def test_states_the_self_resolving_window_and_the_default_action(self):
+        self.assertIn("SELF-RESOLVES WHEN THE USAGE WINDOW ROLLS", self.src)
+        self.assertIn("DEFAULT ACTION: WAIT", self.src)
+
+    def test_still_names_the_subagent_consequence(self):
+        """atlas's finding: the cap kills dispatched subagents while the main
+        loop keeps working, so a seat can look healthy while its work dies."""
+        self.assertIn("DISPATCHED SUBAGENTS", self.src)
 
 
 class TestComputeFillTokens(unittest.TestCase):
@@ -194,15 +274,16 @@ class TestFindLatestJsonl(unittest.TestCase):
 
     def test_uses_specified_sudo_user(self) -> None:
         # Verify the sudo user threads through to the subprocess argv.
-        # Mock getuser to a non-claude-research user so _sudo_prefix's same-user
-        # fast path (returns [] when sudo_user == getpass.getuser()) does NOT
+        # Mock the module-local user seam to a non-claude-research user so
+        # _sudo_prefix's same-user
+        # fast path (returns [] when sudo_user == _current_user()) does NOT
         # fire — otherwise this is account-dependent: green on claude, red on
         # claude-research (where sudo_user == the caller → no sudo prefix).
         # 'claude-fallback' = the unix user the monitor actually runs as (Recovery's
         # account; see module docstring), so this models the real cross-account fire.
         stdout = "1700000010 /path/x.jsonl\n"
         with patch("tools.context_fill_monitor.subprocess.run") as mock_run, \
-             patch("tools.context_fill_monitor.getpass.getuser", return_value="claude-fallback"):
+             patch("tools.context_fill_monitor._current_user", return_value="claude-fallback"):
             mock_run.return_value = self._mock_run(stdout)
             cfm.find_latest_jsonl(Path("/path"), "claude-research", "specialist")
         argv = mock_run.call_args[0][0]
@@ -539,25 +620,56 @@ class TestAgentConfig(unittest.TestCase):
         self.assertEqual(cfg["restart_target_pane"], "claude-telegram-bot:0")
 
     def test_specialist_present(self) -> None:
+        # T-2658: specialist is control-plane-supervised (T-2633 cutover) — the
+        # monitor's own cap-hit auto-restart must derive the consume unit,
+        # not the disabled bespoke restart_service instance.yaml still
+        # carries for documentation.
         self.assertIn("specialist", AGENT_CONFIG)
         cfg = AGENT_CONFIG["specialist"]
         self.assertEqual(cfg["sudo_user"], "claude-research")
-        self.assertEqual(cfg["restart_service"], "claude-telegram-research.service")
+        self.assertEqual(cfg["restart_service"], "pantheon-persona-consume@specialist.service")
         self.assertEqual(cfg["restart_target_pane"], "claude-research-bot:0")
+        self.assertEqual(cfg["supervisor"], "control-plane")
 
     def test_recovery_present(self) -> None:
         # Recovery is now in AGENT_CONFIG per ORG-020 Phase 1 (T-0309).
         # Recovery uses tombstone-write mode (use_tombstone=True) instead of direct restart.
+        # T-2684: recovery is control-plane-supervised (T-2590 cutover) — AGENT_CONFIG
+        # carries the derived consume unit + "supervisor" like specialist, even though
+        # cfm itself never dispatches recovery's restart directly (write_tombstone-only);
+        # the derived value is what restart_drain.py's own DRAIN_AGENT_CONFIG mirrors.
         self.assertIn("recovery", AGENT_CONFIG)
         cfg = AGENT_CONFIG["recovery"]
         self.assertEqual(cfg["sudo_user"], "claude-fallback")
-        self.assertEqual(cfg["restart_service"], "claude-telegram-fallback.service")
+        self.assertEqual(cfg["restart_service"], "pantheon-persona-consume@recovery.service")
+        self.assertEqual(cfg["supervisor"], "control-plane")
         self.assertTrue(cfg.get("use_tombstone"), "Recovery config must have use_tombstone=True")
 
+    def test_hook_allowlist_covers_every_configured_agent(self) -> None:
+        # T-1945 structural guard (Atlas, via T-1947 D-17): a persona in
+        # AGENT_CONFIG with no HOOK_ALLOWLIST entry gets ZERO hook checking,
+        # guarded only by a runtime log line nobody reads. Fail loudly at
+        # test-time instead. Born-green 2026-07-22 (both maps carry the same
+        # 6 keys).
+        missing = sorted(set(cfm.AGENT_CONFIG) - set(cfm.HOOK_ALLOWLIST))
+        self.assertEqual(
+            missing, [],
+            "agent(s) in AGENT_CONFIG with no HOOK_ALLOWLIST entry get ZERO "
+            "hook checking, guarded only by a log line",
+        )
+
     def test_per_agent_required_keys_present(self) -> None:
-        required = {"jsonl_dir", "sudo_user", "restart_service", "restart_mode", "restart_target_pane"}
+        # T-1945: mirrors _validate_config's contract — observation-only
+        # entries (mnemosyne keeps real restart fields she happens to have;
+        # the seats carry none) need only the read-path keys. Restart keys are
+        # required exactly for the agents something can fire. Do NOT "fix" a
+        # failure here by inventing restart_service values for observation-only
+        # entries — a nonexistent service name is the wrong-layer-GREEN trap.
+        base = {"jsonl_dir", "sudo_user"}
+        restart = {"restart_service", "restart_mode", "restart_target_pane"}
         for agent, cfg in AGENT_CONFIG.items():
             with self.subTest(agent=agent):
+                required = base if cfg.get("observation_only") else base | restart
                 missing = required - set(cfg.keys())
                 self.assertFalse(missing, f"{agent}: missing keys {missing}")
 
@@ -565,6 +677,91 @@ class TestAgentConfig(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # main flow
 # ---------------------------------------------------------------------------
+
+
+class TestHookCheckWardFanOut(unittest.TestCase):
+    """T-1945: recovery's cycle is the execution home for hook_check_via_recovery personas.
+
+    Personas with no @agent timer instance (mnemosyne, metis, atlas) get their
+    hook-drift security check run from main('recovery'); other agents' cycles do
+    not fan out. Without this, an allowlist entry alone is armed-but-unprobed.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        os.environ["PANTHEON_STATE_DIR"] = str(self.tmp / "state")
+        os.environ["PANTHEON_CONTEXT_WINDOW"] = "1000"
+        self._p_hook = patch.object(cfm, "maybe_alert_hook_deviation")
+        self.hook = self._p_hook.start(); self.addCleanup(self._p_hook.stop)
+        self._p_repo = patch.object(cfm, "maybe_alert_undeclared_repos")
+        self._p_repo.start(); self.addCleanup(self._p_repo.stop)
+
+    def tearDown(self) -> None:
+        for k in ("PANTHEON_STATE_DIR", "PANTHEON_CONTEXT_WINDOW"):
+            os.environ.pop(k, None)
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _quiet_probe(cmd, **kwargs):
+        """subprocess.run side_effect: no jsonl found, dir present → clean bail."""
+        joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+        if "find " in joined and "*.jsonl" in joined:
+            return MagicMock(returncode=0, stdout="", stderr="")
+        if "test -d" in joined:
+            return MagicMock(returncode=0, stdout="PRESENT\n", stderr="")
+        return MagicMock(returncode=0, stdout="", stderr="")
+
+    def _fanned_agents(self) -> list[str]:
+        return [c[0][0] for c in self.hook.call_args_list]
+
+    def test_recovery_cycle_fans_out_to_flagged_personas(self) -> None:
+        with patch("tools.context_fill_monitor.subprocess.run", side_effect=self._quiet_probe):
+            cfm.main(["--agent", "recovery"])
+        called = self._fanned_agents()
+        expected = {a for a, c in AGENT_CONFIG.items() if c.get("hook_check_via_recovery")}
+        self.assertTrue(expected, "no hook_check_via_recovery personas configured — fan-out untestable")
+        self.assertEqual(called[0], "recovery")  # own check still first
+        for persona in expected:
+            self.assertIn(persona, called)
+        # Exactly one call per persona (own + fan-out, no duplicates).
+        self.assertEqual(len(called), 1 + len(expected))
+
+    def test_non_recovery_cycle_does_not_fan_out(self) -> None:
+        with patch("tools.context_fill_monitor.subprocess.run", side_effect=self._quiet_probe):
+            cfm.main(["--agent", "orchestrator"])
+        self.assertEqual(self._fanned_agents(), ["orchestrator"])
+
+    # --- T-1980 wiring regression guards (pane-modal-review NIT: placement is
+    # "correct by inspection today but could regress silently") ---
+
+    def test_recovery_cycle_sweeps_cap_detectors_for_flagged_personas(self) -> None:
+        # The observation-agent cap sweep must ride the recovery fan-out — same
+        # personas as the hook check, exactly once each, and NOT recovery itself
+        # (recovery gets its cap detectors via the main flow, not the sweep).
+        with patch("tools.context_fill_monitor.subprocess.run", side_effect=self._quiet_probe), \
+             patch.object(cfm, "_sweep_cap_detectors_for") as sweep:
+            cfm.main(["--agent", "recovery"])
+        swept = [c[0][0] for c in sweep.call_args_list]
+        expected = {a for a, c in AGENT_CONFIG.items() if c.get("hook_check_via_recovery")}
+        self.assertTrue(expected, "no hook_check_via_recovery personas — sweep untestable")
+        self.assertEqual(sorted(swept), sorted(expected))
+        self.assertNotIn("recovery", swept)
+
+    def test_non_recovery_cycle_does_not_sweep_cap_detectors(self) -> None:
+        with patch("tools.context_fill_monitor.subprocess.run", side_effect=self._quiet_probe), \
+             patch.object(cfm, "_sweep_cap_detectors_for") as sweep:
+            cfm.main(["--agent", "orchestrator"])
+        sweep.assert_not_called()
+
+    def test_consent_fallback_stays_behind_the_no_jsonl_bail(self) -> None:
+        # _maybe_fire_consent_fallback sits AFTER the "jsonl is None -> bail"
+        # guard in main(); a regression hoisting it above the guard would fire
+        # it with no session to read. _quiet_probe yields no jsonl -> clean bail.
+        with patch("tools.context_fill_monitor.subprocess.run", side_effect=self._quiet_probe), \
+             patch.object(cfm, "_maybe_fire_consent_fallback") as consent:
+            cfm.main(["--agent", "orchestrator"])
+        consent.assert_not_called()
 
 
 class TestMainFlow(unittest.TestCase):
@@ -664,18 +861,18 @@ class TestMainFlow(unittest.TestCase):
     def test_above_threshold_fires_restart_orchestrator(self) -> None:
         find_stdout = "1700000010 /path/sess.jsonl\n"
         usage_stdout = self._usage_line(input_tokens=100, cache_creation=300, cache_read=300) + "\n"
-        with patch("tools.context_fill_monitor.subprocess.run") as mock_run, \
-             patch("tools.context_fill_monitor.subprocess.Popen") as mock_popen:
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
             mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
-            mock_popen.side_effect = self._patch_popen()
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
-        popen_invocations = [str(c) for c in mock_popen.call_args_list]
-        self.assertTrue(any("handoff_and_restart" in s for s in popen_invocations))
+        # T-2459: the restart is DISPATCHED as a detached transient unit, not blocked.
+        self.assertTrue(_dispatched(mock_run), "threshold restart should have dispatched")
+        dispatch = _dispatch_joined(mock_run)
+        self.assertIn("handoff_and_restart", dispatch)
         # T-0179 supervised first-fire revealed handoff-file was unset; per-agent
         # path must thread through to handoff_and_restart.sh's --handoff-file flag.
-        self.assertTrue(
-            any("--handoff-file /home/claude/HANDOFF.md" in s for s in popen_invocations),
+        self.assertIn(
+            "--handoff-file /home/claude/HANDOFF.md", dispatch,
             "Orchestrator restart invocation did not include --handoff-file /home/claude/HANDOFF.md",
         )
         # Per-agent state file lands at the orchestrator-specific path.
@@ -690,35 +887,45 @@ class TestMainFlow(unittest.TestCase):
         # without this the sudo_user_seen assertion is account-dependent (fails
         # when the suite runs as claude-research, the specialist restart's own account).
         with patch("tools.context_fill_monitor.subprocess.run") as mock_run, \
-             patch("tools.context_fill_monitor.subprocess.Popen") as mock_popen, \
-             patch("tools.context_fill_monitor.getpass.getuser", return_value="claude-fallback"):
+             patch("tools.context_fill_monitor._current_user", return_value="claude-fallback"):
             mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
-            mock_popen.side_effect = self._patch_popen()
             rc = main(["--agent", "specialist"])
         self.assertEqual(rc, 0)
-        # The handoff_and_restart.sh invocation goes through Popen (T-0590 (b));
-        # all argv assertions read from mock_popen.call_args_list.
-        invocations = mock_popen.call_args_list
+        # T-2459: the handoff_and_restart.sh argv is DISPATCHED inside the
+        # systemd-run transient unit; all argv assertions read the dispatch call.
+        dispatches = _dispatch_calls(mock_run)
+        self.assertTrue(dispatches, "Specialist restart did not dispatch a detached unit")
         sudo_user_seen = False
         specialist_service_seen = False
-        for inv in invocations:
-            argv = inv[0][0]
-            if isinstance(argv, list):
-                if "claude-research" in argv:
-                    sudo_user_seen = True
-                joined = " ".join(argv)
-                if "claude-telegram-research.service" in joined:
-                    specialist_service_seen = True
+        bespoke_service_seen = False
+        supervisor_flag_seen = False
+        for argv in dispatches:
+            joined = " ".join(argv)
+            if "claude-research" in argv:
+                sudo_user_seen = True
+            # T-2658: specialist is control-plane-supervised (T-2633 cutover) —
+            # the monitor's own cap-hit auto-restart must fire the derived
+            # consume unit, never the disabled bespoke unit, and must pass
+            # --supervisor control-plane (this is the exact live landmine
+            # path — context_fill_monitor's auto-restart, independent of
+            # restart_drain.py's tombstone path).
+            if "pantheon-persona-consume@specialist.service" in joined:
+                specialist_service_seen = True
+            if "claude-telegram-research.service" in joined:
+                bespoke_service_seen = True
+            if "--supervisor control-plane" in joined:
+                supervisor_flag_seen = True
         self.assertTrue(sudo_user_seen, "Specialist run did not sudo as claude-research")
         self.assertTrue(specialist_service_seen, "Specialist run did not reference its restart service")
+        self.assertFalse(bespoke_service_seen, "Specialist run must not restart the disabled bespoke unit")
+        self.assertTrue(supervisor_flag_seen, "Specialist run did not pass --supervisor control-plane")
         # T-0179 supervised first-fire: --handoff-file must be specialist-specific
         # (was previously unset, defaulting to /home/claude/HANDOFF.md which
         # claude-research can't read).
-        specialist_handoff_seen = False
-        for inv in invocations:
-            argv = inv[0][0]
-            if isinstance(argv, list) and "--handoff-file /home/claude-research/HANDOFF.md" in " ".join(argv):
-                specialist_handoff_seen = True
+        specialist_handoff_seen = any(
+            "--handoff-file /home/claude-research/HANDOFF.md" in " ".join(argv)
+            for argv in dispatches
+        )
         self.assertTrue(specialist_handoff_seen,
                         "Specialist run did not include --handoff-file /home/claude-research/HANDOFF.md")
         # Per-agent state file lands at the specialist-specific path.
@@ -762,14 +969,11 @@ class TestMainFlow(unittest.TestCase):
     def test_threshold_boundary_at_exactly_threshold_fires(self) -> None:
         find_stdout = "1700000010 /path/sess.jsonl\n"
         usage_stdout = self._usage_line(input_tokens=600) + "\n"
-        with patch("tools.context_fill_monitor.subprocess.run") as mock_run, \
-             patch("tools.context_fill_monitor.subprocess.Popen") as mock_popen:
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
             mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
-            mock_popen.side_effect = self._patch_popen()
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
-        popen_invocations = [str(c) for c in mock_popen.call_args_list]
-        self.assertTrue(any("handoff_and_restart" in s for s in popen_invocations))
+        self.assertTrue(_dispatched(mock_run))  # T-2459 detached dispatch
 
     def test_no_jsonl_bails_clean(self) -> None:
         with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
@@ -788,22 +992,19 @@ class TestMainFlow(unittest.TestCase):
         os.environ["CONTEXT_FILL_THRESHOLD"] = "0.30"
         find_stdout = "1700000010 /path/sess.jsonl\n"
         usage_stdout = self._usage_line(input_tokens=400) + "\n"
-        with patch("tools.context_fill_monitor.subprocess.run") as mock_run, \
-             patch("tools.context_fill_monitor.subprocess.Popen") as mock_popen:
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
             mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
-            mock_popen.side_effect = self._patch_popen()
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
-        popen_invocations = [str(c) for c in mock_popen.call_args_list]
-        self.assertTrue(any("handoff_and_restart" in s for s in popen_invocations))
+        self.assertTrue(_dispatched(mock_run))  # T-2459 detached dispatch
 
     def test_restart_failure_returns_one(self) -> None:
         find_stdout = "1700000010 /path/sess.jsonl\n"
         usage_stdout = self._usage_line(input_tokens=700) + "\n"
-        with patch("tools.context_fill_monitor.subprocess.run") as mock_run, \
-             patch("tools.context_fill_monitor.subprocess.Popen") as mock_popen:
-            mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
-            mock_popen.side_effect = self._patch_popen(restart_rc=1)
+        # restart_rc=1: the systemd-run dispatch itself fails to register (a real
+        # dispatch failure) → rc 1, no cooldown state armed (T-2459).
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
+            mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout, restart_rc=1)
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 1)
         state_path = Path(os.environ["PANTHEON_STATE_DIR"]) / "context_fill_orchestrator_last_restart.json"
@@ -1101,10 +1302,13 @@ class TestRestartSuccessNotification(unittest.TestCase):
         self.assertEqual(rc, 0)
         return notify
 
-    def test_main_direct_success_invokes_notify_restarted_mode(self) -> None:
+    def test_main_direct_success_invokes_notify_dispatched_mode(self) -> None:
+        # T-2459: the direct (non-tombstone) path now DISPATCHES a detached unit,
+        # so the success notification reports mode="dispatched", not "restarted"
+        # ("a dispatch must not be recorded as a successful restart").
         notify = self._run_main("orchestrator", extra_popen=True)
         notify.assert_called_once()
-        self.assertEqual(notify.call_args.kwargs.get("mode"), "restarted")
+        self.assertEqual(notify.call_args.kwargs.get("mode"), "dispatched")
 
     def test_main_tombstone_success_invokes_notify_tombstone_mode(self) -> None:
         notify = self._run_main("recovery", extra_popen=False)
@@ -1264,6 +1468,71 @@ class TestDetectSustainedApiErrors(unittest.TestCase):
         self.assertFalse(detect_sustained_api_errors([], time.time()))
 
 
+class TestContextFillHoldMainFlow(TestMainFlow):
+    """T-2615: the explicit hold gates the absolute-threshold path only.
+
+    Reuses TestMainFlow's fixtures/env (PANTHEON_STATE_DIR etc — the hold
+    state file must land in the same state dir the monitor reads from)."""
+
+    def test_no_hold_still_fires_state1_regression_guard(self) -> None:
+        """State 1 (normal-full, no hold) must still fire — same fixture as
+        TestMainFlow.test_above_threshold_fires_restart_orchestrator, re-asserted
+        here as the explicit regression guard for this ticket."""
+        find_stdout = "1700000010 /path/sess.jsonl\n"
+        usage_stdout = self._usage_line(input_tokens=100, cache_creation=300, cache_read=300) + "\n"
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
+            mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
+            rc = main(["--agent", "orchestrator"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(_dispatched(mock_run), "no hold present — the normal-full restart must still fire")
+
+    def test_active_hold_suppresses_absolute_threshold_fire(self) -> None:
+        """State 2 (manual-hold, fill above threshold) must NOT fire."""
+        cfh.set_hold("orchestrator", hours=1, reason="deliberate hold", set_by="recovery")
+        find_stdout = "1700000010 /path/sess.jsonl\n"
+        usage_stdout = self._usage_line(input_tokens=100, cache_creation=300, cache_read=300) + "\n"
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
+            mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
+            rc = main(["--agent", "orchestrator"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(_dispatched(mock_run), "an active hold must suppress the absolute-threshold restart")
+
+    def test_expired_hold_fires_bounded_mask_invariant(self) -> None:
+        """A hold past its TTL must NOT suppress — a lapsed hold letting the
+        safety restart re-engage is correct behavior, not a regression."""
+        now = time.time()
+        cfh.set_hold("orchestrator", hours=1, now=now - 3700)  # set 1h+ in the past, ttl 1h -> expired
+        find_stdout = "1700000010 /path/sess.jsonl\n"
+        usage_stdout = self._usage_line(input_tokens=100, cache_creation=300, cache_read=300) + "\n"
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
+            mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
+            rc = main(["--agent", "orchestrator"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(_dispatched(mock_run), "an expired hold must not mask the safety restart")
+
+    def test_hold_on_one_agent_does_not_suppress_another(self) -> None:
+        cfh.set_hold("orchestrator", hours=1)
+        find_stdout = "1700000010 /path/sess.jsonl\n"
+        usage_stdout = self._usage_line(input_tokens=100, cache_creation=300, cache_read=300) + "\n"
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run, \
+             patch("tools.context_fill_monitor._current_user", return_value="claude-fallback"):
+            mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
+            rc = main(["--agent", "specialist"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(_dispatched(mock_run), "specialist has no hold of its own — must still fire")
+
+    def test_below_threshold_with_active_hold_still_bails_clean(self) -> None:
+        """A hold below threshold changes nothing observable — no fire either way."""
+        cfh.set_hold("orchestrator", hours=1)
+        find_stdout = "1700000010 /path/sess.jsonl\n"
+        usage_stdout = self._usage_line(input_tokens=50, cache_creation=50) + "\n"
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
+            mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
+            rc = main(["--agent", "orchestrator"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(_dispatched(mock_run))
+
+
 class TestApiHealthMainFlow(unittest.TestCase):
     """main()'s API-health path for Recovery (tombstone-mode)."""
 
@@ -1309,6 +1578,7 @@ class TestApiHealthMainFlow(unittest.TestCase):
         return side_effect
 
     def test_recovery_writes_api_health_tombstone(self) -> None:
+        _seed_error_streak("recovery", "api_health")  # T-2607: fire-path test — persist the streak
         now = time.time()
         find_stdout = "1700000010 /path/sess.jsonl\n"
         with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
@@ -1325,6 +1595,35 @@ class TestApiHealthMainFlow(unittest.TestCase):
         # api-health state file written; context-fill state file NOT (cooldown isolation).
         self.assertTrue((self.state_dir / "context_fill_recovery_api_health.json").exists())
         self.assertFalse((self.state_dir / "context_fill_recovery_last_restart.json").exists())
+
+    def test_persistence_gate_two_observations_required(self) -> None:
+        # T-2607 PART 1 (wiring proof): a SINGLE poll that catches a sustained
+        # error run must NOT force-restart — the gate requires the error to
+        # persist into a second observation. First main() writes the first-seen
+        # marker + no tombstone; once the streak ages past the floor, the next
+        # main() fires. This is the "distinguish a moment from a state" contract.
+        marker = self.state_dir / "context_fill_recovery_api_health_error_first_seen_at"
+        now = time.time()
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
+            mock_run.side_effect = self._patch("1700000010 /path/sess.jsonl\n", _error_run(now, 6, step=150))
+            rc = main(["--agent", "recovery"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(
+            (self.state_dir / "restart_requested_recovery.json").exists(),
+            "single observation must NOT fire a force-restart (old one-shot behaviour)",
+        )
+        self.assertTrue(marker.exists(), "first sighting must write the persistence marker")
+        # Age the streak past the floor (simulate the same error still present a poll later).
+        marker.write_text(str(int(time.time()) - (cfm.ERROR_PERSIST_SECONDS + 5)), encoding="utf-8")
+        now2 = time.time()
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
+            mock_run.side_effect = self._patch("1700000010 /path/sess.jsonl\n", _error_run(now2, 6, step=150))
+            rc = main(["--agent", "recovery"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(
+            (self.state_dir / "restart_requested_recovery.json").exists(),
+            "an error persisting across two observations MUST fire",
+        )
 
     def test_default_off_no_fire(self) -> None:
         now = time.time()
@@ -1392,6 +1691,7 @@ class TestApiHealthIntegration(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_end_to_end_api_health_tombstone(self) -> None:
+        _seed_error_streak("recovery", "api_health")  # T-2607: fire-path test — persist the streak
         now = time.time()
         # Write a real jsonl in chronological order (oldest first); tac reverses
         # it to newest-first. A sustained 400-run + trailing metadata records.
@@ -1401,7 +1701,7 @@ class TestApiHealthIntegration(unittest.TestCase):
         jsonl.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
 
         recovery_sudo_user = AGENT_CONFIG["recovery"]["sudo_user"]
-        with patch("tools.context_fill_monitor.getpass.getuser", return_value=recovery_sudo_user):
+        with patch("tools.context_fill_monitor._current_user", return_value=recovery_sudo_user):
             rc = main(["--agent", "recovery"])
 
         self.assertEqual(rc, 0)
@@ -1417,7 +1717,7 @@ class TestApiHealthIntegration(unittest.TestCase):
         jsonl.write_text("\n".join(json.dumps(r) for r in records) + "\n", encoding="utf-8")
 
         recovery_sudo_user = AGENT_CONFIG["recovery"]["sudo_user"]
-        with patch("tools.context_fill_monitor.getpass.getuser", return_value=recovery_sudo_user):
+        with patch("tools.context_fill_monitor._current_user", return_value=recovery_sudo_user):
             rc = main(["--agent", "recovery"])
 
         self.assertEqual(rc, 0)
@@ -1805,6 +2105,56 @@ class TestStalenessRing(unittest.TestCase):
         self.assertEqual(cfm.read_fill_history(Path("/no/such/file.json")), [])
 
 
+class TestSubagentBlockGuard(unittest.TestCase):
+    """T-1776 (redesigned): _subagent_tokens + subagent_block_disposition."""
+
+    REAL = "  \u25EF impl-t1767-bus  Arc-intent: ... 9m 21s \u00b7 \u2193 385.3k tokens"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["PANTHEON_STATE_DIR"] = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(lambda: os.environ.pop("PANTHEON_STATE_DIR", None))
+
+    def test_tokens_parse_real_line(self):
+        self.assertEqual(cfm._subagent_tokens(self.REAL), 385.3)
+
+    def test_tokens_none_when_no_subagent(self):
+        self.assertIsNone(cfm._subagent_tokens("\u276f idle prompt"))
+        self.assertIsNone(cfm._subagent_tokens(None))
+
+    def test_tokens_ignores_stray_bullet_on_prior_line(self):
+        # Per-line anchor: a bullet ending the previous line must NOT let a metrics
+        # line below it match (the review's cross-newline concern).
+        two = "\u2022 some prose bullet\nfoo 9m 21s \u2193 385.3k tokens"
+        self.assertIsNone(cfm._subagent_tokens(two))
+
+    def _disp(self, pane, jsonl="sess.jsonl"):
+        with patch.object(cfm, "_capture_pane_text", return_value=pane):
+            return cfm.subagent_block_disposition("specialist", {}, jsonl)
+
+    def test_no_subagent_line_fires(self):
+        self.assertEqual(self._disp("\u276f idle"), "fire")
+
+    def test_first_reading_holds(self):
+        self.assertEqual(self._disp("\u25EF x 9m 15s \u2193 385.3k tokens"), "hold")
+
+    def test_growing_tokens_suppress(self):
+        self.assertEqual(self._disp("\u25EF x 9m 15s \u2193 385.3k tokens"), "hold")
+        self.assertEqual(self._disp("\u25EF x 9m 20s \u2193 390.0k tokens"), "suppress")
+
+    def test_frozen_tokens_fire_even_if_timer_advances(self):
+        # THE DANGEROUS CASE (review BLOCKER): tokens frozen but the wall-clock
+        # timer ticks. Must FIRE — a wedged-but-rendering subagent is a real wedge.
+        self.assertEqual(self._disp("\u25EF x 9m 15s \u2193 385.3k tokens"), "hold")
+        self.assertEqual(self._disp("\u25EF x 9m 25s \u2193 385.3k tokens"), "fire")
+
+    def test_main_jsonl_change_resets_comparison(self):
+        self.assertEqual(self._disp("\u25EF x 9m 15s \u2193 385.3k tokens", "a.jsonl"), "hold")
+        # different main session -> prior reading discarded -> hold again
+        self.assertEqual(self._disp("\u25EF x 9m 20s \u2193 390.0k tokens", "b.jsonl"), "hold")
+
+
 class TestStalenessDetection(unittest.TestCase):
     """T-0857: end-to-end main() wedge detection (the specialist regression)."""
 
@@ -1869,8 +2219,70 @@ class TestStalenessDetection(unittest.TestCase):
             rc = main(["--agent", "specialist"])
         self.assertEqual(rc, 0)
         # A restart fired despite below-threshold fill (Popen invoked).
-        self.assertTrue(mpop.called, "wedge restart should have fired")
+        self.assertTrue(_dispatched(mrun), "wedge restart should have fired")
         self.mock_notify.assert_called_once()
+
+    def test_active_hold_does_not_mask_a_real_wedge(self) -> None:
+        """T-2615 state 3 / the load-bearing safety boundary: an active
+        context_fill_hold must NEVER suppress wedge/staleness recovery. Same
+        specialist-outage fixture as the regression test above, plus an active
+        hold on the SAME agent — the wedge must still fire."""
+        cfh.set_hold("specialist", hours=1, reason="unrelated deliberate hold")
+        find = "1700000010 /path/sess.jsonl\n"
+        usage = self._usage_line(164)  # 164/1000 = 16.4%, below 50%
+        self._seed_ring("specialist", 164, "sess.jsonl", 3)  # +1 in main = 4 = frozen
+        with patch("tools.context_fill_monitor.subprocess.run") as mrun, \
+             patch("tools.context_fill_monitor.subprocess.Popen") as mpop:
+            mrun.side_effect = self._side_effect(find, usage, verify_rc=7)  # wedged
+            mpop.side_effect = lambda cmd, **kw: MagicMock(
+                stdout=iter(["ok\n"]), wait=MagicMock(return_value=0))
+            rc = main(["--agent", "specialist"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(_dispatched(mrun), "an active hold must never mask a real wedge")
+        self.mock_notify.assert_called_once()
+
+    def test_subagent_growing_tokens_suppresses_wedge_fire(self) -> None:
+        """T-1776: frozen main-jsonl + pane wedged (rc 7), but the subagent's
+        streamed tokens GREW since last poll -> subagent-blocked -> NO restart.
+        Seed the prior subagent-token reading so this poll has a comparison."""
+        find = "1700000010 /path/sess.jsonl\n"
+        usage = self._usage_line(164)
+        self._seed_ring("specialist", 164, "sess.jsonl", 3)
+        # Prior reading: 385.3k for THIS main jsonl (sess.jsonl).
+        import json as _json
+        cfm._subagent_token_state_path_for_agent("specialist").write_text(
+            _json.dumps({"jsonl": "sess.jsonl", "tokens": 385.3}))
+        pane = "\u25EF impl-x  ... 9m 25s \u2193 390.0k tokens"  # tokens grew
+        with patch("tools.context_fill_monitor.subprocess.run") as mrun, \
+             patch("tools.context_fill_monitor.subprocess.Popen") as mpop, \
+             patch.object(cfm, "_maybe_fire_spend_limit", return_value=False), \
+             patch.object(cfm, "_capture_pane_text", return_value=pane):
+            mrun.side_effect = self._side_effect(find, usage, verify_rc=7)
+            rc = main(["--agent", "specialist"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(_dispatched(mrun), "subagent-blocked session must NOT be restarted")
+        self.mock_notify.assert_not_called()
+
+    def test_frozen_subagent_tokens_still_fires(self) -> None:
+        """THE DANGEROUS CASE end-to-end: subagent line present but tokens FROZEN
+        vs the prior poll (a wedged subagent) -> the wedge STILL fires."""
+        find = "1700000010 /path/sess.jsonl\n"
+        usage = self._usage_line(164)
+        self._seed_ring("specialist", 164, "sess.jsonl", 3)
+        import json as _json
+        cfm._subagent_token_state_path_for_agent("specialist").write_text(
+            _json.dumps({"jsonl": "sess.jsonl", "tokens": 385.3}))
+        pane = "\u25EF impl-x  ... 9m 25s \u2193 385.3k tokens"  # timer ticked, tokens FROZEN
+        with patch("tools.context_fill_monitor.subprocess.run") as mrun, \
+             patch("tools.context_fill_monitor.subprocess.Popen") as mpop, \
+             patch.object(cfm, "_maybe_fire_spend_limit", return_value=False), \
+             patch.object(cfm, "_capture_pane_text", return_value=pane):
+            mrun.side_effect = self._side_effect(find, usage, verify_rc=7)
+            mpop.side_effect = lambda cmd, **kw: MagicMock(
+                stdout=iter(["ok\n"]), wait=MagicMock(return_value=0))
+            rc = main(["--agent", "specialist"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(_dispatched(mrun), "a frozen (wedged) subagent must still fire recovery")
 
     def test_frozen_but_idle_pane_does_not_fire(self) -> None:
         """Frozen fill but a healthy-idle pane (verify rc 0) → NO restart."""
@@ -1882,7 +2294,7 @@ class TestStalenessDetection(unittest.TestCase):
             mrun.side_effect = self._side_effect(find, usage, verify_rc=0)  # idle
             rc = main(["--agent", "specialist"])
         self.assertEqual(rc, 0)
-        self.assertFalse(mpop.called, "must NOT restart a healthy-idle agent")
+        self.assertFalse(_dispatched(mrun), "must NOT restart a healthy-idle agent")
         self.mock_notify.assert_not_called()
 
     def test_climbing_fill_never_fires(self) -> None:
@@ -1899,7 +2311,7 @@ class TestStalenessDetection(unittest.TestCase):
             mrun.side_effect = self._side_effect(find, usage, verify_rc=7)
             rc = main(["--agent", "specialist"])
         self.assertEqual(rc, 0)
-        self.assertFalse(mpop.called)
+        self.assertFalse(_dispatched(mrun))
 
     def test_disabled_dark_does_not_fire(self) -> None:
         """With STALENESS_ENABLED off (the shipped default), a frozen+wedged
@@ -1913,7 +2325,7 @@ class TestStalenessDetection(unittest.TestCase):
             mrun.side_effect = self._side_effect(find, usage, verify_rc=7)
             rc = main(["--agent", "specialist"])
         self.assertEqual(rc, 0)
-        self.assertFalse(mpop.called)
+        self.assertFalse(_dispatched(mrun))
         # verify_startup must not even be consulted when disabled.
         self.assertFalse(any("verify_startup" in str(c) for c in mrun.call_args_list))
 
@@ -2003,12 +2415,30 @@ class TestMisconfigJsonlDir(unittest.TestCase):
         self.assertFalse(cfm._missing_dir_marker_path("orchestrator").exists())
 
     def test_inconclusive_probe_no_alert(self) -> None:
+        # Inconclusive probe with the account PRESENT (transient sudo failure) → stay
+        # benign, fail-open. Pin account_exists=True so this is host-independent (does
+        # not rely on the real 'claude' account existing on the test box).
         with patch("tools.context_fill_monitor.subprocess.run",
                    side_effect=self._find_empty_probe("", probe_rc=1)), \
+             patch.object(cfm, "account_exists", return_value=True), \
              patch.object(cfm, "send_telegram", return_value=True) as send:
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
         send.assert_not_called()
+
+    def test_inconclusive_probe_missing_account_alerts(self) -> None:
+        # T-2071: an inconclusive dir probe BECAUSE the sudo_user account does not
+        # exist (leftover reference-instance defaults on a fork's box) must alert
+        # loudly instead of the fail-safe-benign fallthrough — otherwise the monitor
+        # silently watches nothing.
+        with patch("tools.context_fill_monitor.subprocess.run",
+                   side_effect=self._find_empty_probe("", probe_rc=1)), \
+             patch.object(cfm, "account_exists", return_value=False), \
+             patch.object(cfm, "send_telegram", return_value=True) as send:
+            rc = main(["--agent", "orchestrator"])
+        self.assertEqual(rc, 0)
+        send.assert_called_once()
+        self.assertTrue(cfm._missing_dir_marker_path("orchestrator").exists())
 
     def test_marker_cleared_when_dir_reappears(self) -> None:
         marker = cfm._missing_dir_marker_path("orchestrator")
@@ -2023,6 +2453,16 @@ class TestMisconfigJsonlDir(unittest.TestCase):
 
 class TestValidateConfig(unittest.TestCase):
     """T-0824 part 3b: --validate checks persona keys + account-aware path resolution."""
+
+    def setUp(self) -> None:
+        # The fixtures below use PERSONA names (orchestrator/specialist/recovery) as sudo_user, not
+        # the real Unix accounts — so the T-2071 account-existence check would reject
+        # them. Neutralize that axis for the path/structural/small-window tests (each
+        # isolates its own intended failure); the dedicated account tests below drive
+        # account_exists explicitly instead.
+        p = patch.object(cfm, "account_exists", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
 
     @staticmethod
     def _fixture(extra: dict | None = None) -> dict:
@@ -2082,6 +2522,37 @@ class TestValidateConfig(unittest.TestCase):
         del fixture["recovery"]["restart_service"]
         with patch.object(cfm, "AGENT_CONFIG", fixture):
             self.assertEqual(cfm._validate_config(), 1)
+
+    def test_missing_account_fails(self) -> None:
+        # T-2071 seeder footgun: an agent whose sudo_user account does not exist on
+        # the box must FAIL --validate loudly (leftover reference-instance defaults).
+        # Override the setUp neutralizer: recovery's account is "missing", the rest exist.
+        with patch.object(cfm, "AGENT_CONFIG", self._fixture()), \
+             patch.object(cfm, "account_exists", side_effect=lambda a: a != "recovery"):
+            self.assertEqual(cfm._validate_config(), 1)
+
+    def test_all_accounts_present_still_passes(self) -> None:
+        # Complement: with every account present the same fixture passes (proves the
+        # account check is the only thing test_missing_account_fails flipped).
+        with patch.object(cfm, "AGENT_CONFIG", self._fixture()), \
+             patch.object(cfm, "account_exists", return_value=True):
+            self.assertEqual(cfm._validate_config(), 0)
+
+    def test_observation_only_missing_account_soft_notes_not_fails(self) -> None:
+        # T-2071: an observation-only agent (forward-looking placeholder — a seat can
+        # be registered before its account is provisioned) with a MISSING account is a
+        # SOFT note, not a hard --validate failure. Mirrors the relaxed restart-field
+        # requirements for observation-only entries. A fire-path agent with the same
+        # missing account WOULD hard-fail (test_missing_account_fails).
+        fixture = self._fixture()
+        fixture["metis"] = {
+            "jsonl_dir": Path("/nonhome/suborch1/projects"),
+            "sudo_user": "suborch1",
+            "observation_only": True,
+        }
+        with patch.object(cfm, "AGENT_CONFIG", fixture), \
+             patch.object(cfm, "account_exists", side_effect=lambda a: a != "suborch1"):
+            self.assertEqual(cfm._validate_config(), 0)
 
     def test_missing_this_account_path_fails(self) -> None:
         # A jsonl_dir UNDER this account's home that does not exist → hard-fail.
@@ -2165,7 +2636,7 @@ class TestApiHealthDirectFlow(unittest.TestCase):
             os.environ.pop(k, None)
         self._tmp.cleanup()
 
-    def _run_side_effect(self, find_stdout: str, tac_records):
+    def _run_side_effect(self, find_stdout: str, tac_records, dispatch_rc: int = 0):
         tac_stdout = "\n".join(json.dumps(r) for r in tac_records) + "\n"
         def side_effect(cmd, **kwargs):
             joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
@@ -2173,6 +2644,9 @@ class TestApiHealthDirectFlow(unittest.TestCase):
                 return MagicMock(returncode=0, stdout=find_stdout, stderr="")
             if "tac " in joined:
                 return MagicMock(returncode=0, stdout=tac_stdout, stderr="")
+            # T-2459: the detached restart dispatch (systemd-run ... handoff_and_restart).
+            if isinstance(cmd, list) and cmd and cmd[0] == "systemd-run":
+                return MagicMock(returncode=dispatch_rc, stdout="Running as unit: x\n", stderr="")
             return MagicMock(returncode=0, stdout="", stderr="")
         return side_effect
 
@@ -2193,15 +2667,17 @@ class TestApiHealthDirectFlow(unittest.TestCase):
         )
 
     def test_orchestrator_api_health_fires_with_skip_ack(self) -> None:
+        _seed_error_streak("orchestrator", "api_health")  # T-2607: fire-path test — persist the streak
         now = time.time()
         find_stdout = "1700000010 /path/sess.jsonl\n"
         with patch("tools.context_fill_monitor.subprocess.run",
-                   side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150))), \
-             patch("tools.context_fill_monitor.subprocess.Popen",
-                   side_effect=self._popen_side_effect(0)) as mp:
+                   side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150))) as mock_run, \
+             patch("tools.context_fill_monitor.subprocess.Popen") as mp:
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
-        joined = self._popen_joined(mp)
+        # T-2459: force-restart is DISPATCHED (detached), never blocked in-cgroup.
+        mp.assert_not_called()
+        joined = _dispatch_joined(mock_run)
         self.assertIn("handoff_and_restart", joined)
         self.assertIn("--skip-ack", joined)  # force path
         # Direct agent: NO tombstone; api-health state IS written; context-fill state NOT.
@@ -2210,15 +2686,16 @@ class TestApiHealthDirectFlow(unittest.TestCase):
         self.assertFalse((self.state_dir / "context_fill_orchestrator_last_restart.json").exists())
 
     def test_specialist_api_health_fires_with_skip_ack(self) -> None:
+        _seed_error_streak("specialist", "api_health")  # T-2607: fire-path test — persist the streak
         now = time.time()
         find_stdout = "1700000010 /path/sess.jsonl\n"
         with patch("tools.context_fill_monitor.subprocess.run",
-                   side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150))), \
-             patch("tools.context_fill_monitor.subprocess.Popen",
-                   side_effect=self._popen_side_effect(0)) as mp:
+                   side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150))) as mock_run, \
+             patch("tools.context_fill_monitor.subprocess.Popen") as mp:
             rc = main(["--agent", "specialist"])
         self.assertEqual(rc, 0)
-        joined = self._popen_joined(mp)
+        mp.assert_not_called()  # T-2459: detached dispatch, no block
+        joined = _dispatch_joined(mock_run)
         self.assertIn("--skip-ack", joined)
         self.assertIn("claude-research", joined)  # sudo'd as specialist's account
         self.assertFalse((self.state_dir / "restart_requested_specialist.json").exists())
@@ -2229,11 +2706,11 @@ class TestApiHealthDirectFlow(unittest.TestCase):
         now = time.time()
         find_stdout = "1700000010 /path/sess.jsonl\n"
         with patch("tools.context_fill_monitor.subprocess.run",
-                   side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150))), \
-             patch("tools.context_fill_monitor.subprocess.Popen",
-                   side_effect=self._popen_side_effect(0)) as mp:
+                   side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150))) as mock_run, \
+             patch("tools.context_fill_monitor.subprocess.Popen") as mp:
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
+        self.assertFalse(_dispatched(mock_run))  # T-2459: no detached dispatch either
         mp.assert_not_called()
         self.assertFalse((self.state_dir / "context_fill_orchestrator_api_health.json").exists())
 
@@ -2242,39 +2719,136 @@ class TestApiHealthDirectFlow(unittest.TestCase):
         now = time.time()
         find_stdout = "1700000010 /path/sess.jsonl\n"
         with patch("tools.context_fill_monitor.subprocess.run",
-                   side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150))), \
-             patch("tools.context_fill_monitor.subprocess.Popen",
-                   side_effect=self._popen_side_effect(0)) as mp:
+                   side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150))) as mock_run, \
+             patch("tools.context_fill_monitor.subprocess.Popen") as mp:
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
+        self.assertFalse(_dispatched(mock_run))  # T-2459: no detached dispatch either
         mp.assert_not_called()
 
     def test_fire_failure_returns_1_and_no_api_health_state(self) -> None:
+        _seed_error_streak("orchestrator", "api_health")  # T-2607: fire-path test — persist the streak
         now = time.time()
         find_stdout = "1700000010 /path/sess.jsonl\n"
+        # dispatch_rc=1: the systemd-run dispatch fails to register → real failure.
         with patch("tools.context_fill_monitor.subprocess.run",
-                   side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150))), \
-             patch("tools.context_fill_monitor.subprocess.Popen",
-                   side_effect=self._popen_side_effect(1)), \
+                   side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150), dispatch_rc=1)), \
              patch.object(cfm, "maybe_alert_restart_failure_threshold"):
             rc = main(["--agent", "orchestrator"])
-        self.assertEqual(rc, 1)  # failed fire surfaces non-zero
+        self.assertEqual(rc, 1)  # failed dispatch surfaces non-zero
         # State NOT written on failure (cooldown must not be armed against a non-fire);
         # failure counter IS bumped.
         self.assertFalse((self.state_dir / "context_fill_orchestrator_api_health.json").exists())
         self.assertTrue((self.state_dir / "restart_failure_count_orchestrator.json").exists())
 
-    def test_success_resets_failure_count(self) -> None:
+    def test_dispatch_does_not_reset_failure_count_synchronously(self) -> None:
+        # T-2459: a successful DISPATCH is not a confirmed restart, so it must NOT
+        # reset the failure count here (that happens cross-cycle in
+        # reconcile_prior_dispatch once the transient unit's exit status is known).
+        # A pending-dispatch marker IS recorded for that later reconciliation.
+        _seed_error_streak("orchestrator", "api_health")  # T-2607: fire-path test — persist the streak
         now = time.time()
         find_stdout = "1700000010 /path/sess.jsonl\n"
         with patch("tools.context_fill_monitor.subprocess.run",
                    side_effect=self._run_side_effect(find_stdout, _error_run(now, 6, step=150))), \
-             patch("tools.context_fill_monitor.subprocess.Popen",
-                   side_effect=self._popen_side_effect(0)), \
              patch.object(cfm, "reset_restart_failure_count") as reset:
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
-        reset.assert_called_once_with("orchestrator")
+        reset.assert_not_called()
+        self.assertTrue((self.state_dir / "restart_pending_dispatch_orchestrator.json").exists())
+
+
+# ---------------------------------------------------------------------------
+# T-2607 PART 1: two-observation persistence gate (_check_error_persistent)
+# ---------------------------------------------------------------------------
+
+
+class ErrorPersistenceGateTests(unittest.TestCase):
+    """The persistence gate that wraps the three error detectors' detect→fire
+    transition. A fire requires the error to survive from one poll into the next
+    (a state, not a moment). Timing is driven deterministically via the ``now``
+    param; markers land in a tmp PANTHEON_STATE_DIR."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["PANTHEON_STATE_DIR"] = str(Path(self._tmp.name) / "state")
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(lambda: os.environ.pop("PANTHEON_STATE_DIR", None))
+        self.persist = cfm.ERROR_PERSIST_SECONDS
+
+    def _marker(self, agent: str, cls: str) -> Path:
+        return cfm._error_persist_state_path_for_agent(agent, cls)
+
+    # --- the two mutation directions ---
+    def test_single_observation_does_not_fire(self) -> None:
+        # Direction A (shown-to-fail vs the old one-shot behaviour): one observation
+        # never fires; it only records the first-seen marker.
+        self.assertFalse(cfm._check_error_persistent("recovery", "api_health", True, now=1000))
+        self.assertTrue(self._marker("recovery", "api_health").exists())
+        self.assertEqual(self._marker("recovery", "api_health").read_text().strip(), "1000")
+
+    def test_two_observations_past_floor_fire(self) -> None:
+        # Direction B: the same error still present a full floor later fires.
+        m = self._marker("recovery", "api_health")
+        m.parent.mkdir(parents=True, exist_ok=True)
+        m.write_text("1000")
+        self.assertTrue(
+            cfm._check_error_persistent("recovery", "api_health", True, now=1000 + self.persist)
+        )
+
+    def test_second_observation_under_floor_does_not_fire(self) -> None:
+        m = self._marker("recovery", "api_health")
+        m.parent.mkdir(parents=True, exist_ok=True)
+        m.write_text("1000")
+        self.assertFalse(
+            cfm._check_error_persistent("recovery", "api_health", True, now=1000 + 10)
+        )
+
+    def test_negative_detect_clears_marker(self) -> None:
+        m = self._marker("recovery", "api_health")
+        m.parent.mkdir(parents=True, exist_ok=True)
+        m.write_text("1000")
+        self.assertFalse(cfm._check_error_persistent("recovery", "api_health", False, now=2000))
+        self.assertFalse(m.exists(), "a negative detect must clear the streak marker")
+
+    def test_mid_retry_recovery_clears_then_needs_fresh_two_observations(self) -> None:
+        # obs1 error -> marker; obs2 recovered -> cleared; obs3 error even LONG after
+        # the original first-seen must be treated as a FRESH first sighting (no fire),
+        # because the streak was broken. Only a later persisting obs fires.
+        self.assertFalse(cfm._check_error_persistent("recovery", "api_health", True, now=1000))
+        self.assertFalse(cfm._check_error_persistent("recovery", "api_health", False, now=1100))
+        self.assertFalse(self._marker("recovery", "api_health").exists())
+        self.assertFalse(
+            cfm._check_error_persistent("recovery", "api_health", True, now=1000 + self.persist + 500),
+            "a recovered-then-recurring error must not fire on its first fresh sighting",
+        )
+        self.assertTrue(
+            cfm._check_error_persistent(
+                "recovery", "api_health", True, now=1000 + 2 * self.persist + 1000
+            )
+        )
+
+    def test_corrupt_marker_treated_as_first_sighting(self) -> None:
+        m = self._marker("recovery", "api_health")
+        m.parent.mkdir(parents=True, exist_ok=True)
+        m.write_text("not-a-timestamp")
+        self.assertFalse(cfm._check_error_persistent("recovery", "api_health", True, now=5000))
+        self.assertEqual(m.read_text().strip(), "5000", "corrupt marker rewritten to now")
+
+    def test_markers_are_separate_per_class(self) -> None:
+        # An api_health streak must NOT satisfy the model_outage gate — model_outage
+        # sees its own first sighting even though api_health has persisted.
+        self.assertFalse(cfm._check_error_persistent("recovery", "api_health", True, now=1000))
+        self.assertFalse(
+            cfm._check_error_persistent("recovery", "model_outage", True, now=1000 + self.persist + 5)
+        )
+        self.assertTrue(self._marker("recovery", "model_outage").exists())
+
+    def test_markers_are_separate_per_agent(self) -> None:
+        self.assertFalse(cfm._check_error_persistent("orchestrator", "api_health", True, now=1000))
+        self.assertFalse(
+            cfm._check_error_persistent("specialist", "api_health", True, now=1000 + self.persist + 5)
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -2812,6 +3386,7 @@ class TestModelOutageMainFlow(unittest.TestCase):
         return se
 
     def test_alerts_and_does_not_restart(self) -> None:
+        _seed_error_streak("recovery", "model_outage")  # T-2607: fire-path test — persist the streak
         now = time.time()
         find_stdout = "1700000010 /path/sess.jsonl\n"
         with patch.object(ic, "_send_alert_via_recovery") as recovery, patch(
@@ -2947,6 +3522,7 @@ class TestAuthOutageMainFlow(unittest.TestCase):
         return se
 
     def test_alerts_direct_to_operator_and_does_not_restart(self) -> None:
+        _seed_error_streak("recovery", "auth_outage")  # T-2607: fire-path test — persist the streak
         now = time.time()
         find_stdout = "1700000010 /path/sess.jsonl\n"
         with patch.object(ic, "_send_telegram_alert") as operator, patch(
@@ -3039,17 +3615,38 @@ class ResolveContextWindowTests(unittest.TestCase):
 
     def test_per_agent_windows_match_their_model(self):
         # T-1357: agent windows are NOT uniform — pin each to its MODEL.
-        # T-1497 (fable promo, Jul 1-7 2026): all three agents run
-        # --model claude-fable-5, whose window is 1M NATIVELY (harness registry
-        # context:{window:1e6, native_1m:true}; live confirmation 2026-07-02 —
-        # a recovery fable session served cache_read=584k, past the old 524,288
-        # opus ceiling, without harness force-compaction). ON "BUMP DOWN"
-        # revert orchestrator/specialist to STANDARD_OPUS_CONTEXT_WINDOW (bare opus-4-8
-        # asymptotes ~519-521k — T-1357).
+        #
+        # T-2134 (2026-07-28) — THE EXPECTATION BELOW IS STILL 1M, BUT FOR A NEW
+        # REASON, and the old "revert on bump down" note is now a FOOTGUN:
+        # the fleet no longer runs claude-fable-5. All four supervise scripts were
+        # read directly and every agent runs an Opus-class model advertising a 1M
+        # window, so DEFAULT_CONTEXT_WINDOW_TOKENS is correct ON PURPOSE here, not
+        # by leftover.
+        #
+        # DO NOT "revert orchestrator/specialist to STANDARD_OPUS_CONTEXT_WINDOW" as the
+        # earlier note (and project_fable_bump revert step 2) instructs. The
+        # trigger is min(500_000, 0.70 x window), so that change would move them
+        # from a 500_000-token trigger to ~367_002 — 27% earlier, materially more
+        # restarts on the two busiest agents, for nothing. Confirmed against live
+        # behaviour: specialist's restarts log "fill 51% >= threshold 50%", exactly
+        # 500_000 over a 1M window. See the warning block at the
+        # STANDARD_OPUS_CONTEXT_WINDOW definition in context_fill_monitor.py.
+        #
+        # Historical basis, kept because it is the evidence for 1M: T-1497 live
+        # confirmation 2026-07-02 — a recovery session served cache_read=584k, past
+        # the old 524,288 ceiling, without harness force-compaction.
         expected = {
             "orchestrator": DEFAULT_CONTEXT_WINDOW_TOKENS,
             "specialist": DEFAULT_CONTEXT_WINDOW_TOKENS,
             "recovery": DEFAULT_CONTEXT_WINDOW_TOKENS,
+            # Mnemosyne (second head, exocortex account) runs claude-fable-5
+            # like the fleet; observation-only entry — no context-fill timer
+            # instance exists for her (auto-restart deferred to her call).
+            "mnemosyne": DEFAULT_CONTEXT_WINDOW_TOKENS,
+            # T-1945: ORG-043 seats — observation-only entries (hook-drift
+            # coverage via recovery's cycle); fleet model, default window.
+            "metis": DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "atlas": DEFAULT_CONTEXT_WINDOW_TOKENS,
         }
         for agent, cfg in AGENT_CONFIG.items():
             self.assertEqual(
@@ -3220,8 +3817,13 @@ class TestIdleAwareThresholdHelpers(unittest.TestCase):
         )
 
     def test_effective_idle_when_low_velocity(self):
+        # T-1497 part C: the idle ceiling is now capped to base + absolute grace, so
+        # on the 1M window it is 0.65 (650K), not the raw 0.90 (900K) fraction.
         thr = cfm.effective_fill_threshold(0.50, self._hist([700_000] * 5), self.W)
-        self.assertEqual(thr, cfm.CONTEXT_FILL_IDLE_THRESHOLD)
+        expected = min(cfm.CONTEXT_FILL_IDLE_THRESHOLD,
+                       0.50 + cfm.CONTEXT_FILL_IDLE_GRACE_TOKENS / self.W)
+        self.assertEqual(thr, expected)
+        self.assertEqual(thr, 0.65)  # concrete: 500K base + 150K grace on 1M
 
     def test_effective_base_when_high_velocity(self):
         # deltas 150k/poll > 31k cut → active → base
@@ -3240,22 +3842,42 @@ class TestIdleAwareThresholdHelpers(unittest.TestCase):
         self.assertEqual(thr, 0.50)
 
     def test_keep_going_bumps_still_classified_idle(self):
-        # ~25k keep-going bumps < 31k cut → idle on any window size.
+        # ~25k keep-going bumps < 31k cut → idle on any window size. The returned
+        # ceiling is the T-1497-part-C regrounded value (base + absolute grace),
+        # capped by 0.90 — 0.65 on this 1M window.
         thr = cfm.effective_fill_threshold(
             0.50, self._hist([520_000, 545_000, 570_000, 595_000, 620_000]), self.W
         )
-        self.assertEqual(thr, cfm.CONTEXT_FILL_IDLE_THRESHOLD)
+        self.assertEqual(
+            thr, min(cfm.CONTEXT_FILL_IDLE_THRESHOLD,
+                     0.50 + cfm.CONTEXT_FILL_IDLE_GRACE_TOKENS / self.W)
+        )
 
     def test_effective_base_when_disabled(self):
         with patch.object(cfm, "CONTEXT_FILL_IDLE_THRESHOLD", 0.50):
             thr = cfm.effective_fill_threshold(0.50, self._hist([700_000] * 5), self.W)
             self.assertEqual(thr, 0.50)
 
-    def test_effective_base_when_invariant_violated(self):
-        # idle 0.98 on 1M → (1-0.98)×1M = 20k ≤ 31k cut → refuse to raise.
+    def test_high_idle_fraction_is_capped_by_absolute_grace(self):
+        # T-1497 part C: a high configured idle fraction (0.98) is CAPPED to
+        # base + absolute grace (0.65 on 1M), not honoured at 0.98 — the grace
+        # regrounding bounds the ceiling regardless of the fraction. (Pre-part-C
+        # this scenario instead tripped the safety invariant → base; the cap now
+        # keeps the feature active at a safe 0.65.)
         with patch.object(cfm, "CONTEXT_FILL_IDLE_THRESHOLD", 0.98):
             thr = cfm.effective_fill_threshold(0.50, self._hist([700_000] * 5), self.W)
-            self.assertEqual(thr, 0.50)
+            self.assertEqual(thr, 0.50 + cfm.CONTEXT_FILL_IDLE_GRACE_TOKENS / self.W)
+
+    def test_idle_grace_is_window_independent_absolute(self):
+        # T-1497 part C: the idle GRACE (ceiling − base) is a fixed absolute token
+        # count, not a window fraction — so it no longer balloons as the window grows.
+        for window, base in ((1_000_000, 0.50), (2_000_000, 0.25)):
+            thr = cfm.effective_fill_threshold(
+                base, self._hist([int(base * window)] * 5), window
+            )
+            self.assertGreater(thr, base, "idle feature still active")
+            grace_tokens = (thr - base) * window
+            self.assertLessEqual(grace_tokens, cfm.CONTEXT_FILL_IDLE_GRACE_TOKENS + 1)
 
     def test_small_window_silently_disables_idle_feature(self):
         # T-1497 documented coupling: (1-0.90)×200k = 20k ≤ 31k → invariant
@@ -3280,15 +3902,12 @@ class TestIdleAwareThresholdMainFlow(TestMainFlow):
         self._seed_history("orchestrator", [700, 700, 700, 700, 700])
         find_stdout = "1700000010 /path/sess.jsonl\n"
         usage_stdout = self._usage_line(input_tokens=700) + "\n"
-        with patch("tools.context_fill_monitor.subprocess.run") as mock_run, \
-             patch("tools.context_fill_monitor.subprocess.Popen") as mock_popen:
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
             mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
-            mock_popen.side_effect = self._patch_popen()
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
-        popen_invocations = [str(c) for c in mock_popen.call_args_list]
         self.assertFalse(
-            any("handoff_and_restart" in s for s in popen_invocations),
+            _dispatched(mock_run),  # T-2459: no detached dispatch on an idle hold
             "idle 70%-fill session should ride below the 90% ceiling, not restart",
         )
         state_path = Path(os.environ["PANTHEON_STATE_DIR"]) / "context_fill_orchestrator_last_restart.json"
@@ -3299,15 +3918,12 @@ class TestIdleAwareThresholdMainFlow(TestMainFlow):
         self._seed_history("orchestrator", [220, 340, 460, 580, 700])
         find_stdout = "1700000010 /path/sess.jsonl\n"
         usage_stdout = self._usage_line(input_tokens=700) + "\n"
-        with patch("tools.context_fill_monitor.subprocess.run") as mock_run, \
-             patch("tools.context_fill_monitor.subprocess.Popen") as mock_popen:
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
             mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
-            mock_popen.side_effect = self._patch_popen()
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
-        popen_invocations = [str(c) for c in mock_popen.call_args_list]
         self.assertTrue(
-            any("handoff_and_restart" in s for s in popen_invocations),
+            _dispatched(mock_run),  # T-2459 detached dispatch
             "active high-velocity session at 70% should restart at the base 50% margin",
         )
 
@@ -3316,17 +3932,957 @@ class TestIdleAwareThresholdMainFlow(TestMainFlow):
         self._seed_history("orchestrator", [950, 950, 950, 950, 950])
         find_stdout = "1700000010 /path/sess.jsonl\n"
         usage_stdout = self._usage_line(input_tokens=950) + "\n"
-        with patch("tools.context_fill_monitor.subprocess.run") as mock_run, \
-             patch("tools.context_fill_monitor.subprocess.Popen") as mock_popen:
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
             mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
-            mock_popen.side_effect = self._patch_popen()
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
-        popen_invocations = [str(c) for c in mock_popen.call_args_list]
         self.assertTrue(
-            any("handoff_and_restart" in s for s in popen_invocations),
+            _dispatched(mock_run),  # T-2459 detached dispatch
             "an idle session past the 90% idle ceiling must still restart",
         )
+
+
+class TestBuildRestartArgv(unittest.TestCase):
+    """T-1795: single source of truth for the restart argv, shared by the
+    blocking (fire_restart) and detached (fire_restart_detached) paths."""
+
+    CFG = {
+        "restart_bin": "/tmp/fake-handoff.sh",
+        "restart_service": "claude-telegram.service",
+        "restart_mode": "user",
+        "restart_target_pane": "claude-telegram-bot:0",
+        "handoff_file": "/tmp/HANDOFF.md",
+        "sudo_user": "claude",
+    }
+
+    def test_cross_account_argv_shape(self):
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            argv = cfm.build_restart_argv(self.CFG, "orchestrator")
+        self.assertEqual(argv[:5], ["sudo", "-nu", "claude", "bash", "-c"])
+        # The inner command stays ONE bash -c string element.
+        self.assertEqual(len(argv), 6)
+        inner = argv[5]
+        # XDG_RUNTIME_DIR must reach the sudo'd bash UNEXPANDED.
+        self.assertIn("XDG_RUNTIME_DIR=/run/user/$(id -u) /tmp/fake-handoff.sh", inner)
+        self.assertIn("--service claude-telegram.service", inner)
+        self.assertIn("--mode user", inner)
+        self.assertIn("--target-pane claude-telegram-bot:0", inner)
+        self.assertIn("--handoff-file /tmp/HANDOFF.md", inner)
+        self.assertIn("--lockfile /tmp/handoff_and_restart_orchestrator.lock", inner)
+        self.assertNotIn("--skip-ack", inner)
+
+    def test_skip_ack_and_lockfile_override(self):
+        cfg = dict(self.CFG, restart_lockfile="/tmp/custom.lock")
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            inner = cfm.build_restart_argv(cfg, "orchestrator", skip_ack=True)[-1]
+        self.assertIn("--skip-ack", inner)
+        self.assertIn("--lockfile /tmp/custom.lock", inner)
+
+    def test_self_account_has_no_sudo_prefix(self):
+        cfg = dict(self.CFG, sudo_user="claude-fallback")
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            argv = cfm.build_restart_argv(cfg, "recovery")
+        self.assertEqual(argv[:2], ["bash", "-c"])
+
+    def test_no_supervisor_flag_when_cfg_omits_it(self) -> None:
+        """T-2658 regression guard: a bespoke seat's cfg (no "supervisor" key,
+        exactly self.CFG above) must produce byte-identical argv to
+        pre-T-2658 — no --supervisor flag at all."""
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            inner = cfm.build_restart_argv(self.CFG, "orchestrator")[-1]
+        self.assertNotIn("--supervisor", inner)
+
+    def test_supervisor_flag_present_for_control_plane_cfg(self) -> None:
+        """T-2658: a control-plane seat's cfg carries --supervisor control-plane
+        through to the argv fired against handoff_and_restart.sh."""
+        cfg = dict(self.CFG, supervisor="control-plane")
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            inner = cfm.build_restart_argv(cfg, "specialist")[-1]
+        self.assertIn("--supervisor control-plane", inner)
+
+    def test_fire_restart_consumes_build_restart_argv(self):
+        # Parity pin: the blocking path must build its argv through the SAME
+        # helper as the detached path so the two can never drift apart.
+        fake_proc = MagicMock()
+        fake_proc.stdout = iter([])
+        fake_proc.wait.return_value = 0
+        with patch.object(cfm, "build_restart_argv", return_value=["argv-sentinel"]) as bra, \
+             patch("subprocess.Popen", return_value=fake_proc) as popen, \
+             patch.object(cfm, "_log"):
+            cfm.fire_restart(self.CFG, "orchestrator")
+        bra.assert_called_once_with(self.CFG, "orchestrator", False)
+        self.assertEqual(popen.call_args.args[0], ["argv-sentinel"])
+
+
+class TestFireRestartDetached(unittest.TestCase):
+    """T-1795: remediation from short-budget oneshot units must DISPATCH the
+    restart into a sibling transient unit, never block in-unit (the 2026-07-17
+    mid-handoff-ack cgroup-SIGKILL)."""
+
+    CFG = TestBuildRestartArgv.CFG
+
+    @staticmethod
+    def _run_result(rc=0):
+        r = MagicMock()
+        r.returncode = rc
+        r.stdout = "Running as unit: x\n"
+        r.stderr = ""
+        return r
+
+    def test_dispatch_argv_contract(self):
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"), \
+             patch.object(cfm.subprocess, "run", return_value=self._run_result()) as run, \
+             patch.object(cfm.time, "time", return_value=1234567):
+            ok, output, unit = cfm.fire_restart_detached(self.CFG, "orchestrator")
+        self.assertTrue(ok)
+        self.assertEqual(unit, "pantheon-channel-remediate-orchestrator-1234567")
+        argv = run.call_args.args[0]
+        # Exact head: --user is load-bearing (without it systemd-run targets
+        # the SYSTEM manager and every dispatch fails); the bare -- separates
+        # properties from the wrapped command.
+        self.assertEqual(
+            argv[:8],
+            ["systemd-run", "--user", "--collect", "--unit", unit,
+             "-p", f"RuntimeMaxSec={cfm.DETACHED_RESTART_RUNTIME_MAX_SECONDS}", "--"],
+        )
+        # Tail is EXACTLY the shared argv (kept a Python list end-to-end,
+        # never shell-joined).
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            self.assertEqual(argv[8:], cfm.build_restart_argv(self.CFG, "orchestrator"))
+        self.assertIn("XDG_RUNTIME_DIR=/run/user/$(id -u)", argv[-1])
+
+    def test_runtime_max_exceeds_script_wall_clock(self):
+        # Layering invariant: handoff_and_restart.sh's own watchdog
+        # (HANDOFF_RESTART_WALL_CLOCK_SECS default 1800) must fire BEFORE the
+        # cgroup backstop, else the backstop reproduces the T-1795 mid-ack
+        # kill at a different number.
+        self.assertGreater(cfm.DETACHED_RESTART_RUNTIME_MAX_SECONDS, 1800)
+
+    def test_nonzero_rc_is_dispatch_failure(self):
+        with patch.object(cfm.subprocess, "run", return_value=self._run_result(rc=1)):
+            ok, _output, _unit = cfm.fire_restart_detached(self.CFG, "orchestrator")
+        self.assertFalse(ok)
+
+    def test_dispatch_exceptions_never_raise(self):
+        # check_agent's blanket except would mask a raise here AFTER the
+        # escalation alert but BEFORE the state write — consecutive would
+        # never increment. The function must contain its own failures.
+        for exc in (subprocess.TimeoutExpired(cmd="x", timeout=30), OSError("no bus")):
+            with patch.object(cfm.subprocess, "run", side_effect=exc):
+                ok, output, _unit = cfm.fire_restart_detached(self.CFG, "orchestrator")
+            self.assertFalse(ok)
+            self.assertIn("dispatch error", output)
+
+    def test_collect_false_omits_flag_and_skip_ack_threads(self):
+        # T-2459: context-fill dispatches with collect=False so a FAILED unit
+        # LINGERS for reconcile to read, and skip_ack must reach the wrapped argv.
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"), \
+             patch.object(cfm.subprocess, "run", return_value=self._run_result()) as run, \
+             patch.object(cfm.time, "time", return_value=1234567):
+            cfm.fire_restart_detached(
+                self.CFG, "orchestrator",
+                unit_prefix=cfm.CTXFILL_REMEDIATE_UNIT_PREFIX, skip_ack=True, collect=False,
+            )
+        argv = run.call_args.args[0]
+        self.assertNotIn("--collect", argv)
+        self.assertIn("--skip-ack", argv[-1])
+        self.assertIn(f"{cfm.CTXFILL_REMEDIATE_UNIT_PREFIX}-orchestrator-1234567", argv)
+
+    def test_collect_true_default_keeps_channel_liveness_contract(self):
+        # The channel-liveness caller relies on --collect (default): unchanged.
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"), \
+             patch.object(cfm.subprocess, "run", return_value=self._run_result()) as run, \
+             patch.object(cfm.time, "time", return_value=1234567):
+            cfm.fire_restart_detached(self.CFG, "orchestrator")
+        self.assertIn("--collect", run.call_args.args[0])
+
+
+class TestDetachedDispatchReconcile(unittest.TestCase):
+    """T-2459: the detached-dispatch replacement for the blocking fire_restart.
+
+    A DISPATCH is not a restart. The transient unit's exit status, read a cycle
+    later by reconcile_prior_dispatch, is what feeds the T-0584 failure-count net
+    (reset on success / bump+alert on failure) the synchronous return used to feed.
+    Dispatching to a systemd-run --user SIBLING unit (outside the caller cgroup)
+    is what makes a caller TimeoutStartSec kill unable to orphan the restart."""
+
+    CFG = {
+        "restart_bin": "/tmp/fake-handoff.sh",
+        "restart_service": "claude-telegram.service",
+        "restart_mode": "user",
+        "restart_target_pane": "claude-telegram-bot:0",
+        "handoff_file": "/tmp/HANDOFF.md",
+        "sudo_user": "claude",
+    }
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.state_dir = Path(self._tmp.name) / "state"
+        os.environ["PANTHEON_STATE_DIR"] = str(self.state_dir)
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(lambda: os.environ.pop("PANTHEON_STATE_DIR", None))
+
+    @staticmethod
+    def _show(props: dict) -> str:
+        return "\n".join(f"{k}={v}" for k, v in props.items())
+
+    def _pending_path(self, agent="orchestrator"):
+        return cfm._pending_dispatch_path_for_agent(agent)
+
+    def _seed_pending(self, agent="orchestrator", unit="pantheon-ctxfill-remediate-orchestrator-1"):
+        cfm.record_pending_dispatch(agent, unit, "context_fill_threshold")
+        return unit
+
+    # --- dispatch bookkeeping ---
+    def test_dispatch_ok_records_pending(self):
+        with patch.object(cfm, "fire_restart_detached", return_value=(True, "ok", "unit-x")):
+            ok, _out, unit = cfm.dispatch_detached_restart(self.CFG, "orchestrator", reason="r")
+        self.assertTrue(ok)
+        self.assertEqual(unit, "unit-x")
+        self.assertEqual(cfm._read_state_file(self._pending_path())["unit"], "unit-x")
+
+    def test_dispatch_failure_records_no_pending(self):
+        with patch.object(cfm, "fire_restart_detached", return_value=(False, "boom", "unit-x")):
+            ok, _out, _unit = cfm.dispatch_detached_restart(self.CFG, "orchestrator", reason="r")
+        self.assertFalse(ok)
+        self.assertIsNone(cfm._read_state_file(self._pending_path()))
+
+    def test_dispatch_uses_out_of_cgroup_sibling_unit_never_blocks(self):
+        # No-orphan proof: the restart is registered as a systemd-run --user
+        # SIBLING unit (outside the caller oneshot's cgroup), never a blocking
+        # in-cgroup Popen — so a caller TimeoutStartSec SIGKILL cannot orphan it.
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"), \
+             patch.object(cfm.subprocess, "run",
+                          return_value=MagicMock(returncode=0, stdout="Running as unit: x", stderr="")) as run, \
+             patch.object(cfm.subprocess, "Popen",
+                          side_effect=AssertionError("restart must not block via Popen (T-2459)")), \
+             patch.object(cfm.time, "time", return_value=42):
+            ok, _out, unit = cfm.dispatch_detached_restart(self.CFG, "orchestrator", reason="context_fill_threshold")
+        self.assertTrue(ok)
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:2], ["systemd-run", "--user"])
+        self.assertTrue(unit.startswith(f"{cfm.CTXFILL_REMEDIATE_UNIT_PREFIX}-orchestrator-"))
+
+    # --- cross-cycle reconciliation ---
+    def test_reconcile_no_pending_is_noop(self):
+        with patch.object(cfm.subprocess, "run") as run:
+            cfm.reconcile_prior_dispatch("orchestrator")
+        run.assert_not_called()
+
+    def test_reconcile_unit_gone_resets_count(self):
+        self._seed_pending()
+        cfm.bump_restart_failure_count("orchestrator", "old failure")
+        with patch.object(cfm.subprocess, "run", return_value=MagicMock(
+                returncode=0,
+                stdout=self._show({"LoadState": "not-found", "ActiveState": "inactive",
+                                   "Result": "success", "ExecMainStatus": "0"}),
+                stderr="")):
+            cfm.reconcile_prior_dispatch("orchestrator")
+        self.assertFalse(cfm._restart_failure_state_path_for_agent("orchestrator").exists())
+        self.assertIsNone(cfm._read_state_file(self._pending_path()))
+
+    def test_reconcile_still_running_leaves_pending(self):
+        self._seed_pending()
+        with patch.object(cfm.subprocess, "run", return_value=MagicMock(
+                returncode=0,
+                stdout=self._show({"LoadState": "loaded", "ActiveState": "activating",
+                                   "Result": "success", "ExecMainStatus": ""}),
+                stderr="")):
+            cfm.reconcile_prior_dispatch("orchestrator")
+        self.assertIsNotNone(cfm._read_state_file(self._pending_path()))
+
+    def test_reconcile_failed_unit_bumps_alerts_and_resetfailed(self):
+        unit = self._seed_pending()
+        seen = []
+        def run_se(cmd, **kw):
+            seen.append(cmd)
+            if isinstance(cmd, list) and cmd[:3] == ["systemctl", "--user", "show"]:
+                return MagicMock(returncode=0, stdout=self._show(
+                    {"LoadState": "loaded", "ActiveState": "failed",
+                     "Result": "exit-code", "ExecMainStatus": "4"}), stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(cfm.subprocess, "run", side_effect=run_se), \
+             patch.object(cfm, "RESTART_FAILURE_ALERT_THRESHOLD", 1), \
+             patch.object(cfm, "maybe_alert_restart_failure_threshold") as alert:
+            cfm.reconcile_prior_dispatch("orchestrator")
+        self.assertTrue(cfm._restart_failure_state_path_for_agent("orchestrator").exists())
+        alert.assert_called_once()
+        self.assertTrue(any(isinstance(c, list) and c[:3] == ["systemctl", "--user", "reset-failed"]
+                            and unit in c for c in seen),
+                        "lingering failed unit was not reset-failed")
+        self.assertIsNone(cfm._read_state_file(self._pending_path()))
+
+    def test_reconcile_unqueryable_leaves_pending(self):
+        # A slow/absent bus (rc!=0, empty stdout → {} props) must fail-open and
+        # leave the marker for a later cycle — never a false success/failure.
+        self._seed_pending()
+        with patch.object(cfm.subprocess, "run",
+                          return_value=MagicMock(returncode=1, stdout="", stderr="no bus")):
+            cfm.reconcile_prior_dispatch("orchestrator")
+        self.assertIsNotNone(cfm._read_state_file(self._pending_path()))
+
+
+class TestBuildAgentConfig(unittest.TestCase):
+    """T-2076 SAFETY NET: the AGENT_CONFIG built from instance.yaml + _MONITOR_TUNING
+    is PROVABLY equal to the former hardcoded literals for the reference instance, so
+    the instance-driven refactor is a verified no-op for the live fleet.
+
+    REFERENCE_LITERALS is a frozen snapshot of the pre-refactor AGENT_CONFIG. If a
+    deliberate reference-instance change moves a value (a new account, a renamed
+    service), update instance.yaml/_MONITOR_TUNING AND this snapshot together — a diff
+    here is the tripwire that the build drifted from the intended live config."""
+
+    REFERENCE_LITERALS = {
+        "orchestrator": {
+            "jsonl_dir": Path("/home/claude/.claude/projects/-home-claude"),
+            "sudo_user": "claude", "context_window": cfm.DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "restart_service": "claude-telegram.service", "restart_mode": "user",
+            "restart_target_pane": "claude-telegram-bot:0",
+            "handoff_file": "/home/claude/HANDOFF.md",
+            "restart_bin": "/home/claude/pantheon-config/tools/handoff_and_restart.sh",
+            "supervise_script": "/home/claude/.local/bin/claude-bot-supervise.sh",
+            "model_pin": "claude-opus-4-8",
+        },
+        # T-2658: specialist is control-plane-supervised (T-2633 cutover) —
+        # restart_service is DERIVED to the consume unit and "supervisor" is
+        # carried, same deliberate reference-instance change as
+        # test_restart_drain.TestBuildDrainConfig.REFERENCE_LITERALS.
+        # T-2682: control-plane seats launch cwd=<account>/pantheon-config, so
+        # jsonl_dir is DERIVED to the -home-<account>-pantheon-config slug (the
+        # dir the live session actually writes to) — not the plain -home-<account>.
+        "specialist": {
+            "jsonl_dir": Path("/home/claude-research/.claude/projects/-home-claude-research-pantheon-config"),
+            "sudo_user": "claude-research", "context_window": cfm.DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "restart_service": "pantheon-persona-consume@specialist.service", "restart_mode": "user",
+            "restart_target_pane": "claude-research-bot:0",
+            "handoff_file": "/home/claude-research/HANDOFF.md",
+            "restart_bin": "/home/claude-research/pantheon-config/tools/handoff_and_restart.sh",
+            "supervise_script": "/home/claude-research/.local/bin/specialist-bot-supervise.sh",
+            "model_pin": "claude-opus-4-8",
+            "supervisor": "control-plane",
+        },
+        # T-2684: recovery is control-plane-supervised (T-2590 cutover) —
+        # restart_service is DERIVED to the consume unit and "supervisor" is
+        # carried, same deliberate reference-instance change as
+        # test_restart_drain.TestBuildDrainConfig.REFERENCE_LITERALS.
+        # T-2682: jsonl_dir DERIVED to the -home-<account>-pantheon-config slug
+        # (control-plane cwd=pantheon-config) — the live-session dir cfm must
+        # watch; the plain slug was the recovery context-fill blind-spot.
+        "recovery": {
+            "jsonl_dir": Path("/home/claude-fallback/.claude/projects/-home-claude-fallback-pantheon-config"),
+            "sudo_user": "claude-fallback",
+            "restart_service": "pantheon-persona-consume@recovery.service", "restart_mode": "user",
+            "restart_target_pane": "claude-telegram-bot-fallback:0",
+            "handoff_file": "/home/claude-fallback/HANDOFF.md",
+            "restart_bin": "/home/claude-fallback/pantheon-config/tools/handoff_and_restart.sh",
+            "supervise_script": "/home/claude-fallback/.local/bin/recovery-bot-supervise.sh",
+            "model_pin": "claude-opus-4-8", "use_tombstone": True,
+            "supervisor": "control-plane",
+        },
+        "mnemosyne": {
+            "jsonl_dir": Path("/home/exocortex/.claude/projects/-home-exocortex"),
+            "sudo_user": "exocortex", "context_window": cfm.DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "restart_service": "claude-telegram-exocortex.service", "restart_mode": "user",
+            "restart_target_pane": "claude-telegram-bot-exocortex:0",
+            "handoff_file": "/home/exocortex/HANDOFF.md",
+            "observation_only": True, "remediate": False, "hook_check_via_recovery": True,
+        },
+        "metis": {
+            "jsonl_dir": Path("/home/suborch1/.claude/projects/-home-suborch1"),
+            "sudo_user": "suborch1",
+            "observation_only": True, "remediate": False, "hook_check_via_recovery": True,
+        },
+        "atlas": {
+            "jsonl_dir": Path("/home/suborch2/.claude/projects/-home-suborch2"),
+            "sudo_user": "suborch2",
+            "observation_only": True, "remediate": False, "hook_check_via_recovery": True,
+        },
+    }
+
+    def test_built_config_matches_reference_literals(self) -> None:
+        self.assertEqual(cfm._build_agent_config(), self.REFERENCE_LITERALS)
+
+    def test_module_level_config_is_the_built_config(self) -> None:
+        # The module global AGENT_CONFIG is what the builder produced (no drift between
+        # the callable and the value the monitor actually uses).
+        self.assertEqual(cfm.AGENT_CONFIG, self.REFERENCE_LITERALS)
+
+    def test_every_tuned_persona_has_a_fallback_binding(self) -> None:
+        # T-2076 review #3: in a manifest-less env the build relies on the fallback
+        # binding map; every persona the monitor tunes must be present there or it
+        # silently drops from AGENT_CONFIG when instance.yaml is absent.
+        from tools import agent_role_map as arm
+        missing = sorted(set(cfm._MONITOR_TUNING) - set(arm._FALLBACK_PERSONA_TO_BINDING))
+        self.assertEqual(missing, [], f"tuned persona(s) with no fallback binding: {missing}")
+
+    def test_missing_restart_mode_defaults_to_user(self) -> None:
+        # T-2076 review #1: a fork binding with restart_service but no restart_mode
+        # must still yield restart_mode='user' (not an absent key that KeyErrors at
+        # fire time behind a false-green --validate).
+        fake = {"account": "acct", "restart_service": "x.service", "restart_pane": "x:0"}
+        with patch.object(cfm, "_MONITOR_TUNING", {"orchestrator": {}}), \
+             patch.object(cfm, "_instance_binding", return_value=fake):
+            built = cfm._build_agent_config()
+        self.assertEqual(built["orchestrator"]["restart_mode"], "user")
+        self.assertEqual(built["orchestrator"]["restart_service"], "x.service")
+
+
+# ---------------------------------------------------------------------------
+# T-2791: decoupled model_pin drift guard
+# ---------------------------------------------------------------------------
+
+
+def _read_model_token(script_path: pathlib.Path) -> str | None:
+    """Parse the --model token out of a supervise script's CLAUDE_ARGS line.
+
+    Repo-local file read, not model_stepper.read_supervisor_model (removed
+    T-2737) — no subprocess, no sudo, no live-fleet dependency."""
+    try:
+        text = script_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    # The launch flag is the authoritative pin (the CLAUDE_ARGS=... line). Skip
+    # comment lines first: specialist's script mentions "--model pins ..." in a
+    # comment, which a whole-file regex would grab ("pins") before reaching the
+    # real launch line (T-2791 review catch).
+    for line in text.splitlines():
+        if line.lstrip().startswith("#"):
+            continue
+        m = re.search(r"--model\s+(\S+)", line)
+        if m:
+            return m.group(1)
+    return None
+
+
+class TestModelPinMatchesSuperviseScripts(unittest.TestCase):
+    """T-2791: re-creates the invariant of the removed
+    TestLiveSupervisePinIsStillWhatWeRecorded (T-2737 deleted it along with
+    model_stepper), decoupled from that module.
+
+    The removed test read the LIVE deployed script cross-account via sudo +
+    model_stepper.read_supervisor_model, and compared against a separate
+    _OBSERVED_LIVE_MODEL_PIN sentinel — needed because model_pin was
+    *intentionally* stale then (T-2134). Now that model_pin is meant to match
+    the fleet, this reads the REPO COPY (tools/systemd/<supervise_script_name>)
+    directly off disk and asserts it equals _MONITOR_TUNING's own model_pin —
+    no sentinel, no sudo, no fleet-host dependency, so it runs identically in
+    CI and locally.
+    """
+
+    def _fire_path_agents(self):
+        return {
+            persona: tuning
+            for persona, tuning in cfm._MONITOR_TUNING.items()
+            if "supervise_script_name" in tuning and "model_pin" in tuning
+        }
+
+    def test_model_pin_matches_repo_supervise_script(self):
+        agents = self._fire_path_agents()
+        self.assertTrue(agents, "no fire-path agent has both supervise_script_name and model_pin")
+
+        systemd_dir = pathlib.Path(cfm.__file__).resolve().parent / "systemd"
+        present = {
+            persona: systemd_dir / tuning["supervise_script_name"]
+            for persona, tuning in agents.items()
+            if (systemd_dir / tuning["supervise_script_name"]).is_file()
+        }
+        # Absent script != guard failure (a partial checkout legitimately has
+        # none) — but a tripwire blind on every agent is not a tripwire.
+        if not present:
+            self.skipTest(f"no supervise scripts found under {systemd_dir}")
+
+        checked = 0
+        for persona, script_path in present.items():
+            live = _read_model_token(script_path)
+            with self.subTest(agent=persona):
+                self.assertIsNotNone(
+                    live,
+                    f"{script_path} exists but its --model could not be parsed. "
+                    f"The T-2791 pin-drift guard is BLIND for {persona} — fix the "
+                    f"parse before trusting any green run of this class.")
+                checked += 1
+                self.assertEqual(
+                    live, agents[persona]["model_pin"],
+                    f"{persona}'s model_pin ({agents[persona]['model_pin']!r}) no "
+                    f"longer matches {script_path}'s --model ({live!r}). Update "
+                    f"_MONITOR_TUNING's model_pin for {persona} to match — it is "
+                    f"the fleet's declared model, CI-guarded against the live "
+                    f"supervise scripts.")
+
+        # Non-zero denominator: without this the loop above could pass over an
+        # empty `present` filter and report success having verified nothing.
+        self.assertGreater(checked, 0, "verified zero agents — a clean null over no data")
+
+
+class AllowlistStalenessTests(unittest.TestCase):
+    """T-1965: allowlisted-but-unwired basenames are surfaced, not silently
+    left as pre-blessed names."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["PANTHEON_STATE_DIR"] = str(Path(self._tmp.name) / "state")
+        self.cfg = {"sudo_user": "claude-fallback", "jsonl_dir": Path("/tmp/x")}
+
+    def tearDown(self) -> None:
+        os.environ.pop("PANTHEON_STATE_DIR", None)
+        self._tmp.cleanup()
+
+    def _with_settings(self, settings_json: str, allow: set):
+        fake = MagicMock(returncode=0, stdout=settings_json, stderr="")
+        return patch("tools.context_fill_monitor.subprocess.run", return_value=fake), \
+               patch.dict(cfm.HOOK_ALLOWLIST, {"testagent": allow})
+
+    def test_stale_entry_detected(self) -> None:
+        settings = json.dumps({"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": "/home/x/hooks/live-hook.sh"}]}]}})
+        p1, p2 = self._with_settings(settings, {"live-hook.sh", "retired-hook.sh"})
+        with p1, p2:
+            self.assertEqual(
+                cfm.check_allowlist_staleness("testagent", self.cfg), ["retired-hook.sh"])
+
+    def test_quoted_path_counts_as_referenced(self) -> None:
+        # The false-staleness trap found live at build time (orchestrator's
+        # hook-handler.js is wired via a QUOTED path): the guard must share
+        # _script_basenames, not whitespace-split.
+        settings = json.dumps({"hooks": {"PreToolUse": [{"hooks": [
+            {"type": "command", "command": 'node "/home/x/agent monitor/hook-handler.js"'}]}]}})
+        p1, p2 = self._with_settings(settings, {"hook-handler.js"})
+        with p1, p2:
+            self.assertEqual(cfm.check_allowlist_staleness("testagent", self.cfg), [])
+
+    def test_unparseable_command_does_not_count_as_reference(self) -> None:
+        settings = json.dumps({"hooks": {"SessionStart": [{"hooks": [
+            {"type": "command", "command": 'broken "unclosed quote hook-x.sh'}]}]}})
+        p1, p2 = self._with_settings(settings, {"hook-x.sh"})
+        with p1, p2:
+            self.assertEqual(cfm.check_allowlist_staleness("testagent", self.cfg), ["hook-x.sh"])
+
+    def test_empty_allowlist_no_op(self) -> None:
+        p1, p2 = self._with_settings("{}", set())
+        with p1, p2:
+            self.assertEqual(cfm.check_allowlist_staleness("testagent", self.cfg), [])
+
+    def test_unreadable_settings_fail_open(self) -> None:
+        fake = MagicMock(returncode=1, stdout="", stderr="")
+        with patch("tools.context_fill_monitor.subprocess.run", return_value=fake), \
+             patch.dict(cfm.HOOK_ALLOWLIST, {"testagent": {"a.sh"}}):
+            self.assertEqual(cfm.check_allowlist_staleness("testagent", self.cfg), [])
+
+    def test_alert_throttled_weekly(self) -> None:
+        settings = json.dumps({"hooks": {}})
+        p1, p2 = self._with_settings(settings, {"gone.sh"})
+        sent = []
+        with p1, p2, patch("tools.inbox_consumer._send_alert_via_recovery",
+                           side_effect=lambda m, v: sent.append(v)):
+            cfm.maybe_alert_allowlist_staleness("testagent", self.cfg)
+            cfm.maybe_alert_allowlist_staleness("testagent", self.cfg)
+        self.assertEqual(len(sent), 1, "second finding within the window must throttle")
+
+
+class CapabilityCapDetectorTests(unittest.TestCase):
+    """T-1980: JSONL capability-cap detector (isApiErrorMessage 429 + cap content)."""
+
+    @staticmethod
+    def _rec(is_err, text, ago=10, typ="assistant", status=429):
+        import time as _t
+        ts = _t.strftime("%Y-%m-%dT%H:%M:%S.000Z", _t.gmtime(_t.time() - ago))
+        return {"type": typ, "isApiErrorMessage": is_err, "apiErrorStatus": status,
+                "message": {"content": text}, "timestamp": ts}
+
+    def setUp(self):
+        import time as _t
+        self.now = _t.time()
+        self.cap = self._rec(True, "You've hit your monthly spend limit. Run /usage-credits ... or switch models to continue this chat.")
+        self.ok = self._rec(False, "Sure, here is the review result.")
+
+    def test_sustained_cap_run_fires(self):
+        self.assertTrue(cfm.detect_capability_cap([self.cap, self.cap, self.cap], self.now))
+
+    def test_recovered_session_breaks_run(self):
+        # newest assistant turn is a success -> not currently capped
+        self.assertIsNone(cfm.detect_capability_cap([self.ok, self.cap, self.cap], self.now))
+
+    def test_transient_429_without_cap_content_does_not_fire(self):
+        blip = self._rec(True, "Overloaded, retrying shortly")
+        self.assertIsNone(cfm.detect_capability_cap([blip, blip], self.now))
+
+    def test_below_min_run_does_not_fire(self):
+        self.assertIsNone(cfm.detect_capability_cap([self.cap, self.ok], self.now))
+
+    def test_stale_cap_beyond_recency_does_not_fire(self):
+        old = self._rec(True, "monthly spend limit ... switch models", ago=3600)
+        self.assertIsNone(cfm.detect_capability_cap([old, old], self.now))
+
+    def test_interleaved_metadata_does_not_break_run(self):
+        meta = {"type": "queue-operation", "message": {"content": ""}}
+        user = {"type": "user", "message": {"content": "kick"}}
+        self.assertTrue(cfm.detect_capability_cap([self.cap, meta, user, self.cap], self.now))
+
+    def test_returns_the_matched_text(self):
+        out = cfm.detect_capability_cap([self.cap, self.cap], self.now)
+        self.assertIn("spend limit", out.lower())
+
+    def test_fire_gated_off_by_env(self):
+        with patch.dict(os.environ, {"PANTHEON_CAPABILITY_CAP_ENABLED": "0"}):
+            self.assertFalse(cfm._maybe_fire_capability_cap("orchestrator", {"sudo_user": "claude"}, Path("/x")))
+
+    def test_fire_alerts_recovery_on_detection(self):
+        cfg = {"sudo_user": "claude"}
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, {"PANTHEON_STATE_DIR": d, "PANTHEON_CAPABILITY_CAP_ENABLED": "1"}), \
+             patch.object(cfm, "read_recent_records", return_value=[self.cap, self.cap]), \
+             patch("tools.inbox_consumer._send_alert_via_recovery") as alert:
+            fired = cfm._maybe_fire_capability_cap("orchestrator", cfg, Path("/x"))
+        self.assertTrue(fired)
+        self.assertEqual(alert.call_count, 1)
+        self.assertEqual(alert.call_args[0][1], cfm.CAPABILITY_CAP_ALERT_LABEL)
+
+    def test_fire_no_alert_when_healthy(self):
+        cfg = {"sudo_user": "claude"}
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, {"PANTHEON_STATE_DIR": d, "PANTHEON_CAPABILITY_CAP_ENABLED": "1"}), \
+             patch.object(cfm, "read_recent_records", return_value=[self.ok, self.ok]), \
+             patch("tools.inbox_consumer._send_alert_via_recovery") as alert:
+            fired = cfm._maybe_fire_capability_cap("orchestrator", cfg, Path("/x"))
+        self.assertFalse(fired)
+        alert.assert_not_called()
+
+
+class ConsentFallbackDetectorTests(unittest.TestCase):
+    """T-1980 signal-void fix: model_consent_fallback SYSTEM-record detector.
+
+    The Fable-5 weekly-CREDITS cap surfaces DIFFERENTLY from the isApiErrorMessage
+    spend cap — a single system record the harness auto-recovers from — so it needs
+    its own detector + a distinct action-nudge (verify the supervisor pin), not the
+    WEDGED alarm."""
+
+    @staticmethod
+    def _fallback(original="claude-fable-5", fallback="claude-opus-4-8[1m]"):
+        # NOTE: fields are TOP-LEVEL on the system record, not under message.content.
+        return {
+            "type": "system",
+            "subtype": "model_consent_fallback",
+            "level": "warning",
+            "originalModel": original,
+            "fallbackModel": fallback,
+            "content": (
+                "Switched to Opus 4.8 (1M context) for this session - "
+                "Fable 5 requires usage credits - /model to change"
+            ),
+        }
+
+    @staticmethod
+    def _asst(text="Sure, done."):
+        return {"type": "assistant", "message": {"content": text}}
+
+    # --- pure detector ---
+
+    def test_detects_fallback_and_returns_models(self):
+        out = cfm.detect_consent_fallback([self._fallback()])
+        self.assertEqual(out, ("claude-fable-5", "claude-opus-4-8[1m]"))
+
+    def test_detects_among_assistant_records(self):
+        recs = [self._asst(), self._asst(), self._fallback(), self._asst()]
+        self.assertEqual(cfm.detect_consent_fallback(recs)[0], "claude-fable-5")
+
+    def test_wrong_subtype_does_not_fire(self):
+        rec = self._fallback()
+        rec["subtype"] = "some_other_system_event"
+        self.assertIsNone(cfm.detect_consent_fallback([rec]))
+
+    def test_non_capped_original_model_does_not_fire(self):
+        # A consent-fallback FROM opus (not a capped tier) is not our nudge signal.
+        self.assertIsNone(cfm.detect_consent_fallback([self._fallback(original="claude-opus-4-8")]))
+
+    def test_empty_and_no_system_records_return_none(self):
+        self.assertIsNone(cfm.detect_consent_fallback([]))
+        self.assertIsNone(cfm.detect_consent_fallback([self._asst(), self._asst()]))
+
+    def test_returns_newest_when_multiple(self):
+        # records are most-recent-first; the first (newest) match wins.
+        newer = self._fallback(fallback="claude-opus-4-8[1m]")
+        older = self._fallback(fallback="claude-opus-4-8")
+        self.assertEqual(cfm.detect_consent_fallback([newer, older])[1], "claude-opus-4-8[1m]")
+
+    def test_missing_fallback_field_yields_empty_string(self):
+        rec = self._fallback()
+        del rec["fallbackModel"]
+        self.assertEqual(cfm.detect_consent_fallback([rec]), ("claude-fable-5", ""))
+
+    # --- fire path (alert-only, cooldown, env gate) ---
+
+    def test_fire_gated_off_by_env(self):
+        with patch.dict(os.environ, {"PANTHEON_CONSENT_FALLBACK_ENABLED": "0"}):
+            self.assertFalse(
+                cfm._maybe_fire_consent_fallback("mnemosyne", {"sudo_user": "exocortex"}, Path("/x"))
+            )
+
+    def test_fire_nudges_recovery_on_detection(self):
+        cfg = {"sudo_user": "exocortex"}
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, {"PANTHEON_STATE_DIR": d, "PANTHEON_CONSENT_FALLBACK_ENABLED": "1"}), \
+             patch.object(cfm, "read_recent_records", return_value=[self._fallback()]), \
+             patch("tools.inbox_consumer._send_alert_via_recovery") as alert:
+            fired = cfm._maybe_fire_consent_fallback("mnemosyne", cfg, Path("/x"))
+        self.assertTrue(fired)
+        self.assertEqual(alert.call_count, 1)
+        self.assertEqual(alert.call_args[0][1], cfm.CONSENT_FALLBACK_ALERT_LABEL)
+        # distinct from the WEDGED alarm: an auto-fell-back / pin-verify nudge.
+        body = alert.call_args[0][0]
+        self.assertIn("AUTO-FELL-BACK", body)
+        self.assertIn("pin", body.lower())
+        self.assertNotIn("WEDGED", body)
+
+    def test_fire_no_alert_when_no_fallback(self):
+        cfg = {"sudo_user": "exocortex"}
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, {"PANTHEON_STATE_DIR": d, "PANTHEON_CONSENT_FALLBACK_ENABLED": "1"}), \
+             patch.object(cfm, "read_recent_records", return_value=[self._asst(), self._asst()]), \
+             patch("tools.inbox_consumer._send_alert_via_recovery") as alert:
+            fired = cfm._maybe_fire_consent_fallback("mnemosyne", cfg, Path("/x"))
+        self.assertFalse(fired)
+        alert.assert_not_called()
+
+    def test_cooldown_suppresses_second_fire(self):
+        cfg = {"sudo_user": "exocortex"}
+        with tempfile.TemporaryDirectory() as d, \
+             patch.dict(os.environ, {"PANTHEON_STATE_DIR": d, "PANTHEON_CONSENT_FALLBACK_ENABLED": "1"}), \
+             patch.object(cfm, "read_recent_records", return_value=[self._fallback()]), \
+             patch("tools.inbox_consumer._send_alert_via_recovery") as alert:
+            first = cfm._maybe_fire_consent_fallback("mnemosyne", cfg, Path("/x"))
+            second = cfm._maybe_fire_consent_fallback("mnemosyne", cfg, Path("/x"))
+        self.assertTrue(first)
+        self.assertFalse(second)  # cooldown state written on first fire
+        self.assertEqual(alert.call_count, 1)
+
+
+class CapDetectorSweepTests(unittest.TestCase):
+    """T-1980 coverage-void fix: recovery's cycle sweeps the alert-only cap detectors for
+    observation_only agents (mnemosyne + seats) that have no @agent monitor timer."""
+
+    def test_sweep_runs_detectors_when_jsonl_present(self):
+        cfg = {"sudo_user": "exocortex", "jsonl_dir": Path("/home/exocortex/x")}
+        with patch.object(cfm, "_projects_dir_for_agent", return_value=Path("/p")), \
+             patch.object(cfm, "find_latest_jsonl", return_value=Path("/p/sess.jsonl")), \
+             patch.object(cfm, "_maybe_fire_capability_cap") as cap, \
+             patch.object(cfm, "_maybe_fire_consent_fallback") as consent, \
+             patch.object(cfm, "_maybe_fire_spend_limit") as spend:
+            cfm._sweep_cap_detectors_for("mnemosyne", cfg)
+        cap.assert_called_once()
+        consent.assert_called_once()
+        spend.assert_called_once()
+
+    def test_sweep_skips_jsonl_detectors_when_no_session(self):
+        # A fresh/dark agent (no jsonl) still gets the pane-based spend check, but the
+        # JSONL detectors are correctly skipped rather than fed a None path.
+        cfg = {"sudo_user": "suborch1"}
+        with patch.object(cfm, "_projects_dir_for_agent", return_value=Path("/p")), \
+             patch.object(cfm, "find_latest_jsonl", return_value=None), \
+             patch.object(cfm, "_maybe_fire_capability_cap") as cap, \
+             patch.object(cfm, "_maybe_fire_consent_fallback") as consent, \
+             patch.object(cfm, "_maybe_fire_spend_limit") as spend:
+            cfm._sweep_cap_detectors_for("metis", cfg)
+        cap.assert_not_called()
+        consent.assert_not_called()
+        spend.assert_called_once()
+
+    def test_sweep_is_fail_soft(self):
+        # A hiccup locating the jsonl must never propagate out and wedge recovery's cycle.
+        cfg = {"sudo_user": "exocortex"}
+        with patch.object(cfm, "_projects_dir_for_agent", side_effect=RuntimeError("boom")):
+            try:
+                cfm._sweep_cap_detectors_for("mnemosyne", cfg)
+            except Exception as exc:  # noqa: BLE001
+                self.fail(f"_sweep_cap_detectors_for must be fail-soft, raised {exc!r}")
+
+
+class MainLoopAndSubagentHealthAreIndependent(unittest.TestCase):
+    """T-2298. I paged the operator with 'three agents wedged, orchestrator down two
+    hours'. Nothing was down. One of the four states a single snapshot conflates
+    is a HEALTHY MAIN LOOP whose dispatched SUBAGENTS are capped — the seat keeps
+    producing turns, so every main-loop metric reads healthy, while the work it
+    dispatched dies. atlas found it from inside; nothing outside could see it."""
+
+    def _err(self, ts, *, sidechain=False, status=400):
+        return {"type": "assistant", "isApiErrorMessage": True,
+                "apiErrorStatus": status, "timestamp": ts,
+                **({"isSidechain": True} if sidechain else {})}
+
+    def _ok(self, ts, *, sidechain=False):
+        return {"type": "assistant", "timestamp": ts,
+                **({"isSidechain": True} if sidechain else {})}
+
+    def test_subagent_errors_do_not_make_the_MAIN_loop_look_wedged(self):
+        """A restart does not fix a capped subagent — it would destroy a healthy
+        main loop to treat a problem somewhere else."""
+        now = 1_700_000_000.0
+        recs = [self._err(f"2023-11-14T22:13:{s:02d}.000Z", sidechain=True)
+                for s in (20, 15, 10, 5)]
+        self.assertFalse(
+            cfm.detect_sustained_api_errors(recs, now),
+            "subagent errors must not extend a MAIN-LOOP error run")
+
+    def test_a_subagent_success_does_not_clear_a_real_main_loop_run(self):
+        """The mirror, and the one that would have been easy to get backwards: a
+        subagent responding proves nothing about whether the MAIN loop can."""
+        now = 1_700_000_000.0
+        recs = ([self._ok("2023-11-14T22:13:19.000Z", sidechain=True)]
+                + [self._err(f"2023-11-14T22:1{m}:00.000Z") for m in (3, 2, 1)])
+        self.assertTrue(
+            cfm.detect_sustained_api_errors(recs, now, min_run=3, min_span_seconds=60),
+            "a sidechain success must not break a genuine main-loop run")
+
+    def test_subagent_errors_are_reported_SEPARATELY(self):
+        now = 1_700_000_000.0
+        # ⚠️ The fixture MUST contain main-loop errors too, or this test cannot
+        # detect the filter being dropped — with only sidechain errors present,
+        # counting everything gives the same answer as counting sidechain-only.
+        # Mutation caught exactly that: my first version passed with the filter
+        # removed. A fixture that cannot express the failure cannot test for it.
+        recs = ([self._err(f"2023-11-14T22:13:{s:02d}.000Z", sidechain=True)
+                 for s in (20, 15)]
+                + [self._err("2023-11-14T22:12:00.000Z")]        # MAIN loop error
+                + [self._err("2023-11-14T22:11:00.000Z")]        # MAIN loop error
+                + [self._ok("2023-11-14T22:13:19.000Z")])
+        summary = cfm.subagent_error_summary(recs, now)
+        self.assertEqual(summary["errors"], 2,
+                         "must count SUBAGENT errors only — the 2 main-loop "
+                         "errors here are a different question with a different "
+                         "remedy (a restart fixes one and destroys the other)")
+        self.assertTrue(summary["recent"])
+
+    def test_no_subagent_errors_reads_as_clean_not_unknown(self):
+        now = 1_700_000_000.0
+        summary = cfm.subagent_error_summary([self._ok("2023-11-14T22:13:19.000Z")], now)
+        self.assertEqual(summary["errors"], 0)
+        self.assertIsNone(summary["newest_age_s"])
+        self.assertFalse(summary["recent"])
+
+
+class TestReportFlag(TestMainFlow):
+    """T-2709: --report is a read-only readout (latest usage + fill %-of-window
+    for --agent), reusing read_latest_usage/read_fill_history. Structurally
+    can never fall through into the monitor/remediation loop below it in
+    main() -- test_report_triggers_no_remediation is the load-bearing safety
+    assertion (patches every alert/restart/write entry point main() could
+    reach and asserts none were called + zero files written under the state
+    dir). Subclasses TestMainFlow to reuse its setUp/tearDown env fixtures
+    and _usage_line/_patch_subprocess helpers (same pattern as
+    TestContextFillHoldMainFlow / TestIdleAwareThresholdMainFlow above)."""
+
+    # Every side-effecting entry point main() could reach on the monitor/
+    # remediation path, keyed by their names on the cfm module. --report must
+    # never touch any of these.
+    REMEDIATION_NAMES = (
+        "maybe_alert_hook_deviation",
+        "maybe_alert_allowlist_staleness",
+        "maybe_alert_undeclared_repos",
+        "reconcile_prior_dispatch",
+        "_maybe_fire_api_health",
+        "_maybe_fire_model_outage",
+        "_maybe_fire_auth_outage",
+        "_maybe_fire_capability_cap",
+        "_maybe_fire_consent_fallback",
+        "_maybe_fire_spend_limit",
+        "append_fill_reading",
+        "_maybe_fire_staleness",
+        "dispatch_detached_restart",
+        "fire_restart",
+        "write_last_restart_state",
+        "write_tombstone",
+    )
+
+    def _run_report(self, find_stdout: str, usage_stdout: str, agent: str = "orchestrator"):
+        """Run main(["--agent", agent, "--report"]) with subprocess.run mocked
+        per the given find/tac fixtures; returns (rc, stdout_text, stderr_text)."""
+        out_buf, err_buf = io.StringIO(), io.StringIO()
+        with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
+            mock_run.side_effect = self._patch_subprocess(find_stdout, usage_stdout)
+            with contextlib.redirect_stdout(out_buf), contextlib.redirect_stderr(err_buf):
+                rc = main(["--agent", agent, "--report"])
+        return rc, out_buf.getvalue(), err_buf.getvalue(), mock_run
+
+    def test_report_prints_usage_and_fill_pct(self) -> None:
+        find_stdout = "1700000010 /path/sess.jsonl\n"
+        usage_stdout = self._usage_line(input_tokens=250) + "\n"
+        rc, out, _err, _mock_run = self._run_report(find_stdout, usage_stdout)
+        self.assertEqual(rc, 0)
+        self.assertIn("agent: orchestrator", out)
+        self.assertIn("/path/sess.jsonl", out)
+        self.assertIn("tokens: 250 / 1000", out)
+        self.assertIn("fill_pct: 25.00%", out)
+        # T-2709 disposition: threshold_pct is kept (self-check needs a
+        # comparator, not just a raw fill%). ABSOLUTE_TOKENS=500 / window
+        # 1000 = 50% base threshold under this fixture's env.
+        self.assertIn("threshold_pct: 50.00%", out)
+
+    def test_report_history_tail_printed_when_present(self) -> None:
+        find_stdout = "1700000010 /path/sess.jsonl\n"
+        usage_stdout = self._usage_line(input_tokens=250) + "\n"
+        hist_path = cfm._fill_history_path_for_agent("orchestrator")
+        for tok in (100, 150, 200):
+            cfm.append_fill_reading(hist_path, "orchestrator", tok, Path("/path/sess.jsonl"))
+        rc, out, _err, _mock_run = self._run_report(find_stdout, usage_stdout)
+        self.assertEqual(rc, 0)
+        self.assertIn("history", out)
+        for tok in (100, 150, 200):
+            self.assertIn(f"tokens={tok}", out)
+
+    def test_report_history_tail_capped_to_last_ten(self) -> None:
+        # Simulates an unbounded/oversized ring file (e.g. hand-edited or a
+        # future larger STALENESS_POLLS) -- read_fill_history itself applies
+        # no cap, so the PRINTER must defensively cap to the last 10.
+        find_stdout = "1700000010 /path/sess.jsonl\n"
+        usage_stdout = self._usage_line(input_tokens=250) + "\n"
+        hist_path = cfm._fill_history_path_for_agent("orchestrator")
+        entries = [{"ts": 1000 + i, "tokens": i, "jsonl": "sess.jsonl"} for i in range(15)]
+        hist_path.parent.mkdir(parents=True, exist_ok=True)
+        hist_path.write_text(json.dumps({"agent": "orchestrator", "readings": entries}) + "\n", encoding="utf-8")
+        rc, out, _err, _mock_run = self._run_report(find_stdout, usage_stdout)
+        self.assertEqual(rc, 0)
+        matches = [int(x) for x in re.findall(r"tokens=(\d+)", out)]
+        self.assertEqual(matches, list(range(5, 15)), "history tail must be exactly the last 10 readings, in order")
+
+    def test_report_triggers_no_remediation(self) -> None:
+        find_stdout = "1700000010 /path/sess.jsonl\n"
+        usage_stdout = self._usage_line(input_tokens=250) + "\n"
+        with patch.multiple(cfm, **{name: DEFAULT for name in self.REMEDIATION_NAMES}) as mocks:
+            rc, out, _err, mock_run = self._run_report(find_stdout, usage_stdout)
+        self.assertEqual(rc, 0)
+        for name, mock_fn in mocks.items():
+            mock_fn.assert_not_called()
+        state_dir = Path(os.environ["PANTHEON_STATE_DIR"])
+        files = list(state_dir.rglob("*")) if state_dir.exists() else []
+        self.assertEqual(files, [], f"--report must write ZERO state files; found {files}")
+        invocations = [str(c) for c in mock_run.call_args_list]
+        self.assertFalse(any("handoff_and_restart" in s for s in invocations))
+        self.assertFalse(any("systemd-run" in s for s in invocations))
+        self.assertIn("agent: orchestrator", out)
+
+    def test_report_missing_jsonl_errors_nonzero(self) -> None:
+        with patch.multiple(cfm, **{name: DEFAULT for name in self.REMEDIATION_NAMES}) as mocks:
+            rc, _out, err, mock_run = self._run_report(find_stdout="", usage_stdout="")
+        self.assertEqual(rc, 2)
+        self.assertIn("no session jsonl", err)
+        for name, mock_fn in mocks.items():
+            mock_fn.assert_not_called()
+        invocations = [str(c) for c in mock_run.call_args_list]
+        self.assertFalse(any("handoff_and_restart" in s for s in invocations))
+
+    def test_report_unusable_usage_errors_nonzero(self) -> None:
+        find_stdout = "1700000010 /path/sess.jsonl\n"
+        with patch.multiple(cfm, **{name: DEFAULT for name in self.REMEDIATION_NAMES}) as mocks:
+            rc, _out, err, _mock_run = self._run_report(find_stdout, usage_stdout="")
+        self.assertEqual(rc, 2)
+        self.assertIn("no readable usage", err)
+        for name, mock_fn in mocks.items():
+            mock_fn.assert_not_called()
+
+    def test_report_respects_unknown_agent_argparse_gate(self) -> None:
+        # Cheap regression insurance: --report must not bypass the existing
+        # argparse `choices=AGENT_CONFIG.keys()` gate on --agent.
+        rc = main(["--agent", "bogus", "--report"])
+        self.assertEqual(rc, 2)
 
 
 if __name__ == "__main__":

@@ -1,8 +1,9 @@
 ---
 aliases: [ORG-021]
-title: Pantheon ticket-state taxonomy: 3 directory states; substates-as-frontmatter
+title: "Pantheon ticket-state taxonomy: 3 directory states; substates-as-frontmatter"
 status: Ratified 2026-06-07 by the operator (authored 2026-05-19)
 date: 2026-05-19
+build_disposition: built
 ---
 # ORG-021 — Pantheon ticket-state taxonomy: 3 directory states; substates-as-frontmatter
 

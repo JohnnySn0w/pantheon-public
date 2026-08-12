@@ -5,6 +5,8 @@ no-op + fail-open (13-14), integration seam (15).
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 import subprocess
@@ -366,6 +368,91 @@ class TestResearchHandler(_SpineFixtureTestCase):
         self.assertIn("Beta survey on cybernetics", beta[0])
 
 
+class TestDescriptionFallbackChain(unittest.TestCase):
+    """T-2103 + T-2182: the fallback legs that stop a capture indexing as a bare
+    em-dash. Written knowledge the prior-art grep cannot find has the cost of
+    being written and none of the benefit (ORG-012)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _subdir(self, name: str, files: dict) -> Path:
+        d = self.root / name
+        d.mkdir(parents=True)
+        for rel, body in files.items():
+            (d / rel).write_text(body)
+        return d
+
+    def test_third_leg_lifts_prose_from_any_md_when_no_readme_or_notes(self):
+        """T-2103: a subdir holding only report.md must not index as an em-dash."""
+        self._subdir("2026-01-01-topic", {"report.md": "# Report\n\nFindings on the thing.\n"})
+        rows = sig.research_handler(self.root)
+        self.assertIn("Findings on the thing.", rows[0])
+        self.assertNotIn("| — |", rows[0])
+
+    def test_readme_still_wins_over_other_md(self):
+        """Precedence guard: the third leg must not shadow the documented order."""
+        self._subdir("2026-01-02-topic", {
+            "README.md": "# R\n\nCanonical description.\n",
+            "report.md": "# Report\n\nSecondary text.\n",
+        })
+        rows = sig.research_handler(self.root)
+        self.assertIn("Canonical description.", rows[0])
+        self.assertNotIn("Secondary text.", rows[0])
+
+    def test_frontmatter_title_used_when_file_has_no_heading(self):
+        """T-2182: frontmatter-first notes with no `#` heading yielded "" before."""
+        self._subdir("2026-01-03-topic", {
+            "notes.md": "---\ntitle: Codex spec review (backfill)\ndate: 2026-01-03\n---\n",
+        })
+        rows = sig.research_handler(self.root)
+        self.assertIn("Codex spec review (backfill)", rows[0])
+        self.assertNotIn("| — |", rows[0])
+
+    def test_prose_still_preferred_over_frontmatter_title(self):
+        self._subdir("2026-01-04-topic", {
+            "notes.md": "---\ntitle: Frontmatter title\n---\n\n# Heading\n\nReal prose here.\n",
+        })
+        rows = sig.research_handler(self.root)
+        self.assertIn("Real prose here.", rows[0])
+        self.assertNotIn("Frontmatter title", rows[0])
+
+    def test_prose_on_line_one_with_no_heading_is_used(self):
+        """T-2183 class-B: README with prose on line 1, no `#`, no frontmatter.
+        Six episodic dirs are this shape and rendered only because a sibling
+        notes.md rescued them — rename the sibling and they became em-dashes."""
+        self._subdir("2026-01-06-topic", {
+            "README.md": "Diagnosis of the thing (2026-01-06). Root cause plus fix.\n",
+        })
+        rows = sig.research_handler(self.root)
+        self.assertIn("Diagnosis of the thing", rows[0])
+        self.assertNotIn("| — |", rows[0])
+
+    def test_heading_present_still_takes_paragraph_after_it_not_from_top(self):
+        """Precedence: with a heading, pre-title matter must NOT be picked up."""
+        self._subdir("2026-01-07-topic", {
+            "README.md": "> banner line before the title\n\n# Title\n\nThe real body.\n",
+        })
+        rows = sig.research_handler(self.root)
+        self.assertIn("The real body.", rows[0])
+        self.assertNotIn("banner line", rows[0])
+
+    def test_unterminated_frontmatter_is_treated_as_opaque(self):
+        self.assertEqual(sig._first_paragraph_from_top(["---", "title: x", "no closing fence"]), "")
+
+    def test_mid_document_hr_is_not_treated_as_frontmatter(self):
+        """A stray `---` is a horizontal rule; only a block STARTING the file counts."""
+        self.assertEqual(sig._frontmatter_title(["# H", "", "---", "title: not frontmatter"]), "")
+
+    def test_no_md_at_all_still_falls_through_to_em_dash(self):
+        """Correct, not a miss: there is no prose to lift from a .txt-only dir."""
+        self._subdir("2026-01-05-topic", {"data.txt": "raw bytes\n"})
+        rows = sig.research_handler(self.root)
+        self.assertIn("| — |", rows[0])
+
+
 class TestToolsHandler(_SpineFixtureTestCase):
     def test_spine_index_groom_tools_handler_lists_scripts_with_purpose_from_module_docstring(self):
         rows = sig.tools_handler(self.fixtures / "tools_dir")
@@ -567,123 +654,267 @@ class TestLedgerHandlerWeeklyShards(unittest.TestCase):
             Path("/l") / "2026-W18" / "SPINE.md",
         )
 
+    def test_ts_less_entry_spines_by_derived_id_ts_not_file_location(self):
+        # T-1879: a ts-less entry with a valid id prefix must group by its
+        # OWN derived ts, not by whichever shard file it physically sits in.
+        # Place a ts-less entry whose id derives to W18 inside the W19 shard
+        # file; it must appear in 2026-W18/SPINE.md (with the derived
+        # timestamp rendered, not "?") and NOT in 2026-W19/SPINE.md.
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger"
+            ledger.mkdir()
+            (ledger / "INDEX.md").write_text(self.INDEX_SEED)
+            (ledger / "2026-W18").mkdir()
+            (ledger / "2026-W19").mkdir()
+            ts_less_entry = json.dumps({
+                "id": "2026-04-30T00:00:00Z-001",
+                "agent": "recovery",
+                "action": "land_ts_less",
+                "justifies_via": ["P5"],
+            })
+            (ledger / "2026-W19" / "2026-W19.jsonl").write_text(ts_less_entry + "\n")
+            with patch.object(sig, "_ledger_commit_and_push") as mock_commit:
+                sig.ledger_handler(ledger, cwd=Path(tmp))
+                self.assertEqual(mock_commit.call_count, 1)
+            w18_spine = (ledger / "2026-W18" / "SPINE.md").read_text()
+            self.assertIn("2026-04-30T00:00:00Z-001", w18_spine)
+            # The derived timestamp is rendered in the TS column, not "?".
+            self.assertIn("| `2026-04-30T00:00:00Z-001` | 2026-04-30T00:00:00Z |", w18_spine)
+            # No entry derived to W19, so its SPINE.md is never written at
+            # all (proves the entry did NOT route there by file location).
+            w19_spine_path = ledger / "2026-W19" / "SPINE.md"
+            self.assertFalse(w19_spine_path.exists())
+            # INDEX.md also picked up the entry.
+            after = (ledger / "INDEX.md").read_text()
+            self.assertIn("2026-04-30T00:00:00Z-001", after)
+
+
+# ---------------------------------------------------------------------------
+# T-1881: ledger-handler observability + the root-cause reproduction.
+#
+# Diagnosis: the reported "silent skip" of 3 --commit-prod fires was NOT a
+# cache or worktree-dispatch bug — it was those fires' fresh /tmp worktrees
+# racing the T-1879 entry_ts-fallback merge landing on origin/main. A fetch
+# before the merge ran the OLD entry_ts (no id-derived-ts fallback) against
+# ledger data whose SPINE.md was ALSO generated by that same old entry_ts —
+# regenerating reproduced byte-identical text, a correct no-op. The REAL bug
+# is that groom_dirs' ledger special-case never printed anything on its
+# success path (committed or noop) — only on error — so a correct no-op and
+# a silent break were indistinguishable from the log. Separately, a genuine
+# SystemExit-escapes-except-Exception hole could abort the rest of a fire.
+# ---------------------------------------------------------------------------
+
+
+class TestLedgerHandlerObservability(unittest.TestCase):
+    """The success path (dry_run=False) must always print a status line,
+    distinguishing 'ran — committed' from 'ran — noop' (T-1881; previously
+    neither printed anything)."""
+
+    INDEX_SEED = (
+        "# Ledger Index\n\n## 2026\n\n"
+        "| ID | Action | Agent | Justifies-via |\n|---|---|---|---|\n"
+    )
+
+    def _entry(self, eid: str, ts: str, action: str = "x") -> str:
+        return json.dumps({
+            "id": eid, "ts": ts, "agent": "recovery",
+            "action": action, "justifies_via": ["P5"],
+        })
+
+    def test_ledger_handler_success_path_prints_noop_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger"
+            ledger.mkdir()
+            seg = "2026-W18"
+            (ledger / seg).mkdir()
+            (ledger / seg / f"{seg}.jsonl").write_text(
+                self._entry("2026-04-30T00:00:00Z-001", "2026-04-30T00:00:00Z") + "\n"
+            )
+            (ledger / "INDEX.md").write_text(
+                self.INDEX_SEED
+                + "| `2026-04-30T00:00:00Z-001` | x | recovery | P5 |\n"
+            )
+            entries = sig._read_jsonl_entries(ledger / seg / f"{seg}.jsonl")
+            (ledger / seg / "SPINE.md").write_text(sig._build_segment_spine(seg, entries))
+
+            handler_map = {ledger: sig.ledger_handler}
+            buf = io.StringIO()
+            with patch.object(sig, "_ledger_commit_and_push") as mock_commit, \
+                 contextlib.redirect_stdout(buf):
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmp))
+
+            self.assertEqual(mock_commit.call_count, 0, "already-current fixture must not commit")
+            out = buf.getvalue()
+            self.assertIn("ledger", out)
+            self.assertIn("noop", out.lower())
+
+    def test_ledger_handler_success_path_prints_committed_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger"
+            ledger.mkdir()
+            seg = "2026-W18"
+            (ledger / seg).mkdir()
+            (ledger / seg / f"{seg}.jsonl").write_text(
+                self._entry("2026-04-30T00:00:00Z-001", "2026-04-30T00:00:00Z", "land_a") + "\n"
+                + self._entry("2026-04-30T01:00:00Z-001", "2026-04-30T01:00:00Z", "land_b") + "\n"
+            )
+            (ledger / "INDEX.md").write_text(self.INDEX_SEED)  # missing both rows
+
+            handler_map = {ledger: sig.ledger_handler}
+            buf = io.StringIO()
+            with patch.object(sig, "_ledger_commit_and_push") as mock_commit, \
+                 contextlib.redirect_stdout(buf):
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmp))
+
+            self.assertEqual(mock_commit.call_count, 1, "new entries must trigger a commit")
+            out = buf.getvalue()
+            self.assertIn("ledger", out)
+            self.assertIn("committed", out.lower())
+
+
+class TestLedgerHandlerSystemExitHandling(unittest.TestCase):
+    """A SystemExit raised by _ledger_commit_and_push (e.g. a real
+    commit_scoped failure) must be caught and reported like any other error —
+    NOT propagate uncaught and abort every later dir in the same fire."""
+
+    INDEX_SEED = (
+        "# Ledger Index\n\n## 2026\n\n"
+        "| ID | Action | Agent | Justifies-via |\n|---|---|---|---|\n"
+    )
+
+    def _entry(self, eid: str, ts: str, action: str = "x") -> str:
+        return json.dumps({
+            "id": eid, "ts": ts, "agent": "recovery",
+            "action": action, "justifies_via": ["P5"],
+        })
+
+    def test_ledger_handler_systemexit_from_commit_does_not_abort_loop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger"
+            ledger.mkdir()
+            seg = "2026-W18"
+            (ledger / seg).mkdir()
+            (ledger / seg / f"{seg}.jsonl").write_text(
+                self._entry("2026-04-30T00:00:00Z-001", "2026-04-30T00:00:00Z") + "\n"
+            )
+            (ledger / "INDEX.md").write_text(self.INDEX_SEED)  # missing the row -> a real diff to commit
+
+            # A second, generic dir sorting AFTER "ledger" alphabetically —
+            # proves the loop survives the ledger handler's SystemExit.
+            notes = Path(tmp) / "notes_after_ledger"
+            notes.mkdir()
+            (notes / "alpha.md").write_text("# Alpha\nAlpha note.\n")
+            (notes / "README.md").write_text(
+                "# Notes\n<!-- AUTOGEN-START spine-index -->\n<!-- AUTOGEN-END spine-index -->\n"
+            )
+
+            handler_map = {ledger: sig.ledger_handler, notes: sig.notes_handler}
+            buf_out, buf_err = io.StringIO(), io.StringIO()
+            with patch.object(sig, "_ledger_commit_and_push", side_effect=SystemExit("boom: push failed")), \
+                 patch.object(sig, "_commit_dir_change") as mock_commit_dir, \
+                 contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmp))
+
+            # The SystemExit must be caught and reported, not propagate.
+            self.assertIn("error in ledger handler", buf_err.getvalue())
+            self.assertIn("boom: push failed", buf_err.getvalue())
+            # The second dir must still have been processed (loop survived).
+            notes_readme = (notes / "README.md").read_text()
+            self.assertIn("alpha.md", notes_readme)
+            mock_commit_dir.assert_called_once()
+
+
+class TestLedgerHandlerRootCauseReproduction(unittest.TestCase):
+    """T-1881 root-cause reproduction: same on-disk ledger data, two entry_ts
+    implementations. The OLD (pre-T-1879) entry_ts has no id-derived-ts
+    fallback for ts-less entries, so it reproduces exactly what already-
+    committed SPINE.md content was built from — a genuinely correct no-op.
+    The fixed entry_ts (module default) finds the previously-invisible
+    ts-less entry and produces a real diff. This is the actual mechanism
+    behind the reported symptom, not a cache or worktree-dispatch bug."""
+
+    INDEX_SEED = (
+        "# Ledger Index\n\n## 2026\n\n"
+        "| ID | Action | Agent | Justifies-via |\n|---|---|---|---|\n"
+    )
+
+    def _entry(self, eid: str, ts: str, action: str = "x") -> str:
+        return json.dumps({
+            "id": eid, "ts": ts, "agent": "recovery",
+            "action": action, "justifies_via": ["P5"],
+        })
+
+    def test_regen_with_old_entry_ts_is_correct_noop_vs_new_entry_ts_finds_diff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger"
+            ledger.mkdir()
+            seg = "2026-W18"
+            (ledger / seg).mkdir()
+            ts_having = self._entry("2026-04-30T00:00:00Z-001", "2026-04-30T00:00:00Z", "land_a")
+            ts_less = json.dumps({
+                "id": "2026-04-30T01:00:00Z-001", "agent": "recovery",
+                "action": "land_ts_less", "justifies_via": ["P5"],
+            })  # no "ts" key; id still carries a valid %Y-%m-%dT...Z prefix
+            (ledger / seg / f"{seg}.jsonl").write_text(ts_having + "\n" + ts_less + "\n")
+            (ledger / "INDEX.md").write_text(
+                self.INDEX_SEED
+                + "| `2026-04-30T00:00:00Z-001` | land_a | recovery | P5 |\n"
+                + "| `2026-04-30T01:00:00Z-001` | land_ts_less | recovery | P5 |\n"
+            )  # both ids already indexed -> INDEX.md itself is current either way
+
+            # Pre-write SPINE.md exactly as the OLD (pre-T-1879) entry_ts would
+            # have built it: the ts-less entry is invisible, only the
+            # ts-having one groups into the segment.
+            old_only_entries = [json.loads(ts_having)]
+            (ledger / seg / "SPINE.md").write_text(sig._build_segment_spine(seg, old_only_entries))
+
+            def old_entry_ts(entry):
+                ts = entry.get("ts")
+                return ts if isinstance(ts, str) else None
+
+            handler_map = {ledger: sig.ledger_handler}
+
+            # --- Pass 1: simulate a worktree fetched BEFORE the T-1879 merge ---
+            with patch.object(sig, "entry_ts", side_effect=old_entry_ts), \
+                 patch.object(sig, "_ledger_commit_and_push") as mock_commit_old:
+                result_old = sig.ledger_handler(ledger, cwd=Path(tmp))
+            self.assertFalse(result_old, "old entry_ts must reproduce the stale SPINE.md byte-for-byte -> correct no-op")
+            self.assertEqual(mock_commit_old.call_count, 0)
+
+            # --- Pass 2: the T-1879-fixed entry_ts (module default, unpatched) ---
+            with patch.object(sig, "_ledger_commit_and_push") as mock_commit_new:
+                result_new = sig.ledger_handler(ledger, cwd=Path(tmp))
+            self.assertTrue(result_new, "fixed entry_ts must find the previously-invisible ts-less entry and commit")
+            self.assertEqual(mock_commit_new.call_count, 1)
+            spine_after = (ledger / seg / "SPINE.md").read_text()
+            self.assertIn("2026-04-30T01:00:00Z-001", spine_after)
+
 
 # ---------------------------------------------------------------------------
 # Cache + sentinel + idempotence tests.
 # ---------------------------------------------------------------------------
 
 
-class TestCacheHit(unittest.TestCase):
-    def test_spine_index_groom_skips_dirs_with_unchanged_mtime_via_cache_hit(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            d = Path(tmpdir) / "research"
-            d.mkdir()
-            (d / "README.md").write_text("# R\n<!-- AUTOGEN-START spine-index -->\n<!-- AUTOGEN-END spine-index -->\n")
-            # Max mtime of anything in d.
-            current_mtime = max(p.stat().st_mtime for p in d.rglob("*"))
-            warm_cache = {str(d): current_mtime + 100.0}
+# ---------------------------------------------------------------------------
+# T-2184: SIX CACHE TEST CLASSES REMOVED WITH THE CACHE ITSELF.
+#
+# TestCacheHit, TestToolMtimeGenerationMarker, TestCacheKeyShape,
+# TestDryRunNeverSkips, TestSubdirContentMtime, TestCacheSchemaVersionBump.
+#
+# They were not deleted for being weak — several were sharp, and two pinned real
+# shipped bugs. They are gone because their SUBJECT is gone: groom_dirs no longer
+# consults an mtime cache, so there is no hit to assert, no key to shape, no
+# generation marker to invalidate, and no dry-run priming to forbid. A test whose
+# subject no longer exists cannot fail, and a suite full of tests that cannot fail
+# reads as coverage.
+#
+# The invariant those tests were ultimately protecting — "a region that changed on
+# disk gets regenerated" — is now structural rather than asserted: every registered
+# dir is scanned every fire, so there is no skip path to get wrong. What remains
+# worth testing is that scanning produces the right rows, which is what the handler
+# classes above and the idempotence classes below already do.
+# ---------------------------------------------------------------------------
 
-            call_counter = {"n": 0}
-            original = sig.research_handler
-
-            def counting_handler(path):
-                call_counter["n"] += 1
-                return original(path)
-
-            handler_map = {d: counting_handler}
-
-            with patch.object(sig, "_load_cache", return_value={sig.CACHE_SCHEMA_VERSION: True, "dirs": warm_cache}), \
-                 patch.object(sig, "_save_cache"):
-                sig.groom_dirs(handler_map, dry_run=True)
-
-            self.assertEqual(call_counter["n"], 0, "Handler should not be called on cache hit")
-
-
-class TestSubdirContentMtime(unittest.TestCase):
-    """T-1466: the mtime used to invalidate the cache for subdir-handler dirs
-    (incidents/research/skills) must catch CONTENT edits to a subdir's files,
-    not just structural (subdir add/remove) changes."""
-
-    def test_content_edit_in_subdir_readme_bumps_handler_mtime(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            d = Path(tmpdir) / "incidents"
-            d.mkdir()
-            sub = d / "2026-01-01-some-incident"
-            sub.mkdir()
-            readme = sub / "README.md"
-            readme.write_text("# Title\n\n## General failure shape\n\nold\n")
-
-            # Pin all mtimes to a known base so the test is wall-clock-free.
-            base = 1_000_000.0
-            for p in (readme, sub, d):
-                os.utime(p, (base, base))
-            before = sig._dir_mtime_for_handler(d, sig.incidents_handler)
-
-            # Edit ONLY the file content + advance ONLY the file mtime; keep the
-            # subdir + parent dir mtimes pinned, exactly as the OS behaves when a
-            # file is modified in place (parent-dir mtime is untouched).
-            readme.write_text("# Title\n\n## General failure shape\n\nNEW\n")
-            os.utime(readme, (base + 100, base + 100))
-            os.utime(sub, (base, base))
-            os.utime(d, (base, base))
-            after = sig._dir_mtime_for_handler(d, sig.incidents_handler)
-
-            self.assertGreater(
-                after, before,
-                "content-aware mtime must catch a subdir README content edit (T-1466)")
-            # Lock in the contrast: the dir-only scan (used pre-fix) does NOT
-            # catch it — that gap is the bug this fixes.
-            self.assertEqual(
-                sig._max_mtime_subdirs(d), base,
-                "_max_mtime_subdirs is dir-mtime-only by design")
-
-    def test_watch_reports_stays_structure_only(self):
-        # watch_reports_handler emits subdir NAMES only — it must keep using the
-        # cheaper dir-only mtime, not the content-aware one.
-        with tempfile.TemporaryDirectory() as tmpdir:
-            d = Path(tmpdir) / "watch"
-            d.mkdir()
-            self.assertEqual(
-                sig._dir_mtime_for_handler(d, sig.watch_reports_handler),
-                sig._max_mtime_subdirs(d))
-
-
-class TestCacheSchemaVersionBump(unittest.TestCase):
-    def test_spine_index_groom_invalidates_cache_on_schema_version_bump(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            d = Path(tmpdir) / "notes"
-            d.mkdir()
-            (d / "README.md").write_text("# N\n<!-- AUTOGEN-START spine-index -->\n<!-- AUTOGEN-END spine-index -->\n")
-
-            # Write cache file with old schema version (0, not current 1).
-            cache_file = Path(tmpdir) / "index_groom_cache.json"
-            cache_file.write_text(json.dumps({
-                "schema_version": 0,
-                "dirs": {str(d): 9999999999.0},  # future mtime — would be cache-hit if schema matched
-            }))
-
-            # Save a reference to the real function BEFORE any patching.
-            real_load_cache = sig._load_cache.__func__ if hasattr(sig._load_cache, "__func__") else sig._load_cache
-
-            # Verify schema invalidation via the real function.
-            loaded = real_load_cache(cache_file)
-            self.assertEqual(loaded["dirs"], {}, "Old schema_version must wipe cached dirs")
-
-            call_counter = {"n": 0}
-
-            def counting_handler(path):
-                call_counter["n"] += 1
-                return []
-
-            handler_map = {d: counting_handler}
-
-            # groom_dirs with the schema-invalidated (empty) cache must call handler.
-            with patch.object(sig, "_load_cache", return_value=loaded), \
-                 patch.object(sig, "_save_cache"), \
-                 patch.object(sig, "_commit_dir_change"):
-                sig.groom_dirs(handler_map, dry_run=True)
-
-            self.assertGreater(call_counter["n"], 0, "Handler must be called when schema version mismatches")
 
 
 class TestSentinelRegionProtection(unittest.TestCase):
@@ -731,22 +962,27 @@ class TestIdempotence(unittest.TestCase):
 
             handler_map = {d: sig.bugs_handler}
 
-            with patch.object(sig, "_load_cache", return_value={"schema_version": sig.CACHE_SCHEMA_VERSION, "dirs": {}}), \
-                 patch.object(sig, "_save_cache"), \
-                 patch.object(sig, "_commit_dir_change"):
-                sig.groom_dirs(handler_map, dry_run=False)
+            # T-2184: this test used to prime a warm cache so the second pass
+            # took the cache-hit branch — which meant it asserted that a run
+            # WHICH DID NOT REGENERATE left the README alone. That is a tautology,
+            # not idempotence. With the cache gone the second pass genuinely
+            # re-scans, re-derives every row and re-writes the region, so the
+            # equality below is now the real property: regenerating from unchanged
+            # disk state produces byte-identical output.
+            with patch.object(sig, "_commit_dir_change") as mock_commit:
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmpdir))
                 after_first = readme.read_text()
 
-                # Update cache to reflect current mtime so second run is cache-hit.
-                current_mtime = max(p.stat().st_mtime for p in d.rglob("*"))
-                warm = {"schema_version": sig.CACHE_SCHEMA_VERSION, "dirs": {str(d): current_mtime + 100.0}}
-                with patch.object(sig, "_load_cache", return_value=warm), \
-                     patch.object(sig, "_save_cache"), \
-                     patch.object(sig, "_commit_dir_change"):
-                    sig.groom_dirs(handler_map, dry_run=False)
-                    after_second = readme.read_text()
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmpdir))
+                after_second = readme.read_text()
 
             self.assertEqual(after_first, after_second, "Second run must produce identical README")
+            # The second pass must find nothing to commit — write_sentinel_region
+            # returns False on an unchanged region, so exactly one commit total.
+            self.assertEqual(
+                mock_commit.call_count, 1,
+                "second groom regenerated identical rows, so it must not commit again",
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -779,10 +1015,8 @@ class TestNoCommitWhenNoDiff(unittest.TestCase):
 
             handler_map = {d: sig.notes_handler}
 
-            with patch.object(sig, "_load_cache", return_value={"schema_version": sig.CACHE_SCHEMA_VERSION, "dirs": {}}), \
-                 patch.object(sig, "_save_cache"), \
-                 patch.object(sig, "_commit_dir_change", side_effect=fake_commit):
-                sig.groom_dirs(handler_map, dry_run=False)
+            with patch.object(sig, "_commit_dir_change", side_effect=fake_commit):
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmpdir))
 
             self.assertEqual(len(commit_calls), 0, "No commit should fire when regenerated rows match existing region")
 
@@ -884,11 +1118,9 @@ class TestEndToEndFixtureRepo(unittest.TestCase):
                 notes: sig.notes_handler,
             }
 
-            with patch.object(sig, "_load_cache", return_value={"schema_version": sig.CACHE_SCHEMA_VERSION, "dirs": {}}), \
-                 patch.object(sig, "_save_cache"), \
-                 patch.object(sig, "_commit_dir_change"), \
+            with patch.object(sig, "_commit_dir_change"), \
                  patch.object(sig, "pull_repo_or_warn"):
-                sig.groom_dirs(handler_map, dry_run=False)
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmpdir))
 
             # research README: row for 2026-04-29-test-survey.
             research_text = (research / "README.md").read_text()
@@ -949,10 +1181,8 @@ class TestLessonsHandler(_SpineFixtureTestCase):
             )
             commit_calls = []
             handler_map = {d: sig.notes_handler}
-            with patch.object(sig, "_load_cache", return_value={"schema_version": sig.CACHE_SCHEMA_VERSION, "dirs": {}}), \
-                 patch.object(sig, "_save_cache"), \
-                 patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
-                sig.groom_dirs(handler_map, dry_run=False)
+            with patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmpdir))
             self.assertEqual(len(commit_calls), 0, "No commit should fire when region already matches")
 
 
@@ -1017,10 +1247,8 @@ class TestRulebookPoliciesHandler(_SpineFixtureTestCase):
             )
             commit_calls = []
             handler_map = {d: sig.notes_handler}
-            with patch.object(sig, "_load_cache", return_value={"schema_version": sig.CACHE_SCHEMA_VERSION, "dirs": {}}), \
-                 patch.object(sig, "_save_cache"), \
-                 patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
-                sig.groom_dirs(handler_map, dry_run=False)
+            with patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmpdir))
             self.assertEqual(len(commit_calls), 0)
 
 
@@ -1055,10 +1283,8 @@ class TestSopStandardHandler(_SpineFixtureTestCase):
             )
             commit_calls = []
             handler_map = {d: sig.notes_handler}
-            with patch.object(sig, "_load_cache", return_value={"schema_version": sig.CACHE_SCHEMA_VERSION, "dirs": {}}), \
-                 patch.object(sig, "_save_cache"), \
-                 patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
-                sig.groom_dirs(handler_map, dry_run=False)
+            with patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmpdir))
             self.assertEqual(len(commit_calls), 0)
 
 
@@ -1093,10 +1319,8 @@ class TestSopRemediationHandler(_SpineFixtureTestCase):
             )
             commit_calls = []
             handler_map = {d: sig.notes_handler}
-            with patch.object(sig, "_load_cache", return_value={"schema_version": sig.CACHE_SCHEMA_VERSION, "dirs": {}}), \
-                 patch.object(sig, "_save_cache"), \
-                 patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
-                sig.groom_dirs(handler_map, dry_run=False)
+            with patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmpdir))
             self.assertEqual(len(commit_calls), 0)
 
 
@@ -1143,10 +1367,8 @@ class TestPinnedRulesHandler(_SpineFixtureTestCase):
             )
             commit_calls = []
             handler_map = {d: sig.pinned_rules_handler}
-            with patch.object(sig, "_load_cache", return_value={"schema_version": sig.CACHE_SCHEMA_VERSION, "dirs": {}}), \
-                 patch.object(sig, "_save_cache"), \
-                 patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
-                sig.groom_dirs(handler_map, dry_run=False)
+            with patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmpdir))
             self.assertEqual(len(commit_calls), 0, "No commit should fire when region already matches")
 
 
@@ -1203,10 +1425,8 @@ class TestSkillsHandler(_SpineFixtureTestCase):
             )
             commit_calls = []
             handler_map = {d: sig.skills_handler}
-            with patch.object(sig, "_load_cache", return_value={"schema_version": sig.CACHE_SCHEMA_VERSION, "dirs": {}}), \
-                 patch.object(sig, "_save_cache"), \
-                 patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
-                sig.groom_dirs(handler_map, dry_run=False)
+            with patch.object(sig, "_commit_dir_change", side_effect=lambda *a, **kw: commit_calls.append(a)):
+                sig.groom_dirs(handler_map, dry_run=False, cwd=Path(tmpdir))
             self.assertEqual(len(commit_calls), 0, "No commit should fire when region already matches")
 
 

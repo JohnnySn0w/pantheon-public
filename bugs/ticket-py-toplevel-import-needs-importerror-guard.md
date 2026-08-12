@@ -1,3 +1,8 @@
+---
+symptom: "A new bare top-level import in tools/ticket.py breaks tests that spawn it from throwaway worktrees checked out before the imported module existed"
+fix: "Wrap new top-level tools/ imports in ticket.py in try/except ImportError with a degraded fallback so cross-worktree invocations still reach main()"
+domain: pantheon, python-imports, ticket-py, worktree
+---
 # Gotcha: a new top-level import in `tools/ticket.py` needs a `try/except ImportError` guard
 
 **Surfaced:** 2026-06-13/14 during T-0761 component-4 (the `provision_repos` import added to `ticket.py`).

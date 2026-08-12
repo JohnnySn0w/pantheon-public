@@ -35,6 +35,7 @@ flips at deploy time; the flip is driven solely by the on-disk presence of
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from pathlib import Path
 
@@ -53,6 +54,11 @@ _ARCHIVE_MARKER = "archive"
 # "ISO 8601 UTC", concretely `%Y-%m-%dT%H:%M:%SZ`).
 TS_FORMAT = "%Y-%m-%dT%H:%M:%SZ"
 
+# Fixed formatted width of TS_FORMAT (e.g. "2026-07-20T00:10:23Z" == 20 chars).
+# Every ORG-001 id opens with this prefix followed by `-<suffix>` (T-1879),
+# so the prefix can be sliced by length before validating.
+_ID_TS_PREFIX_LEN = len("YYYY-MM-DDTHH:MM:SSZ")
+
 
 def segment_for_ts(ts_str: str) -> str:
     """Return the `<ISO-year>-W<NN>` segment id for an ISO-8601 UTC timestamp.
@@ -67,6 +73,32 @@ def segment_for_ts(ts_str: str) -> str:
     dt = datetime.strptime(ts_str, TS_FORMAT)
     iso_year, iso_week, _ = dt.isocalendar()
     return f"{iso_year}-W{iso_week:02d}"
+
+
+def entry_ts(entry: dict) -> str | None:
+    """Return the best-effort ISO-8601 UTC ts for a ledger entry, or None.
+
+    Prefers entry["ts"] when it is a str (the common case, untouched).
+    Falls back to deriving it from entry["id"]'s leading `%Y-%m-%dT%H:%M:%SZ`
+    prefix (every ORG-001 id opens with this, followed by `-<suffix>`) for
+    the 86 hand-written entries across 2026-W27..W30 missing `ts` (T-1879).
+    Validated via strptime against TS_FORMAT rather than a blind slice, so a
+    malformed or absent id yields None instead of a bogus timestamp.
+    """
+    ts = entry.get("ts")
+    if isinstance(ts, str):
+        return ts
+
+    eid = entry.get("id")
+    if not isinstance(eid, str):
+        return None
+
+    candidate = eid[:_ID_TS_PREFIX_LEN]
+    try:
+        datetime.strptime(candidate, TS_FORMAT)
+    except ValueError:
+        return None
+    return candidate
 
 
 def current_segment_shard(ledger_dir: Path, now: datetime) -> Path:
@@ -118,6 +150,98 @@ def ensure_segment_dir(target: Path) -> None:
     also covers the legacy-file case (its parent `ledger/` already exists).
     """
     target.parent.mkdir(parents=True, exist_ok=True)
+
+
+def existing_entry_ids(ledger_dir: Path) -> set[str]:
+    """Every `id` currently present across the whole ledger (T-2407).
+
+    Reads the same union every reader reads (`iter_ledger_entry_files`), so a
+    duplicate cannot hide by living in a different shard from its twin — which
+    is how the historical nine came about: same id, adjacent lines, one shard,
+    nothing looking across the set.
+
+    Malformed lines are SKIPPED rather than raised on. This function's only
+    caller is a uniqueness guard, and a guard that crashes on a pre-existing
+    bad line converts an unrelated defect into a total append outage. A line
+    that will not parse also cannot collide.
+    """
+    ids: set[str] = set()
+    for path in iter_ledger_entry_files(ledger_dir):
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                value = json.loads(line).get("id")
+            except (json.JSONDecodeError, AttributeError):
+                continue
+            if isinstance(value, str) and value:
+                ids.add(value)
+    return ids
+
+
+def append_entry(ledger_dir: Path, entry: dict) -> Path:
+    """Append a ledger entry to the shard its OWN timestamp belongs in (T-2077).
+
+    Correct-by-construction hand-append path: the shard is chosen via
+    `segment_for_ts(entry_ts(entry))` — the entry's own ts, NOT wall-clock
+    `now` — so an entry written near/after a week rollover (or a backdated
+    one) still lands in the right shard. This closes the boundary-spillover
+    gap that `current_write_target` cannot: that helper keys off the caller-
+    supplied `now`, and an ad-hoc hand-append that hardcodes a shard path
+    bypasses it entirely (the actual cause of the historical misplacements).
+
+    Honors the same legacy-file transition as `current_write_target`: while
+    `ledger_dir/2026.jsonl` still exists, appends there. Creates the segment
+    dir if needed. Serializes `entry` as one compact JSON line. Returns the
+    path written to.
+
+    Raises ValueError if the entry has no parseable ts (segment_for_ts's
+    contract — callers that must not silently mis-shard rely on this), or if
+    the entry's `id` is ALREADY PRESENT anywhere in the ledger (T-2407).
+
+    The duplicate-id refusal is writer-side prevention, per
+    `sop/remediation/auto-commit-collision-on-id-class.md`. An append-only
+    chain whose ids are not unique cannot address its own records: lookup by
+    id returns two rows, and a `supersedes` naming that id corrects both or
+    neither. Nine such pairs exist historically (2026-05-14..05-20 sync-alerts,
+    each pair byte-equivalent, so no conflicting DECISION content was lost —
+    see ledger/README.md); they are frozen, not repaired, because the chain is
+    append-only and rewriting it to fix an addressing defect would forfeit the
+    property the addressing exists to serve.
+
+    This refuses BEFORE opening the file, so a rejected append leaves the
+    ledger byte-identical.
+    """
+    legacy = ledger_dir / LEGACY_LEDGER_FILENAME
+    entry_id = entry.get("id")
+    if isinstance(entry_id, str) and entry_id:
+        if entry_id in existing_entry_ids(ledger_dir):
+            raise ValueError(
+                f"ledger entry id {entry_id!r} already exists — ids must be unique "
+                "so lineage lookup and `supersedes` resolve to exactly one record. "
+                "Re-stamp with `date -u` (a collision usually means a reused or "
+                "hand-copied id, not a same-second write)."
+            )
+    if legacy.is_file():
+        target = legacy
+    else:
+        ts = entry_ts(entry)
+        if ts is None:
+            raise ValueError(
+                "ledger entry has no parseable ts (entry['ts'] or id prefix); "
+                "cannot determine its ISO-week shard"
+            )
+        segment = segment_for_ts(ts)
+        target = ledger_dir / segment / f"{segment}.jsonl"
+    ensure_segment_dir(target)
+    with target.open("a") as fh:
+        fh.write(json.dumps(entry) + "\n")
+    return target
 
 
 def iter_ledger_entry_files(ledger_dir: Path) -> list[Path]:

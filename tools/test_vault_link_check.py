@@ -90,6 +90,18 @@ class RunEndToEnd(unittest.TestCase):
         _write(self.root, "rulebook/policy.md", "see [[really-dead]]")
         self.assertEqual(vlc.run(self.root), 1)
 
+    def test_code_ref_dotted_identifier_not_dead(self):
+        # T-1597 follow-up: [[tool_executor.source]] / [[hooks.<Event>]] are code
+        # refs in prose, not vault links — must not FAIL a curated dir.
+        _write(self.root, "rulebook/policy.md",
+               "see [[tool_executor.source]] and [[hooks.<Event>]] for the shape")
+        self.assertEqual(vlc.run(self.root), 0)
+
+    def test_plain_dead_word_still_fails(self):
+        # A non-dotted bare word with no target is still a real dead link.
+        _write(self.root, "rulebook/policy.md", "see [[nonexistent-note]]")
+        self.assertEqual(vlc.run(self.root), 1)
+
     def test_obsidian_dir_skipped(self):
         _write(self.root, ".obsidian/whatever.md", "[[ghost]]")
         _write(self.root, "notes/x.md", "clean")

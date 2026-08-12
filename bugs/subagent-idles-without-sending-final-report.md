@@ -4,6 +4,14 @@ fix: "Recovery that worked 3/3: a pointed HO->worker SendMessage status-check/nu
 domain: pantheon, subagents, reviewer, sendmessage, idle, teams, dispatch, liveness
 ---
 
+## Occurrence update (2026-07-19, orch-T1792 — first PROJECT-ORCHESTRATOR case, running total 12/12)
+
+Orchestrator tier, idle-instead-of-ACT variant: orch-T1792 received the dispatcher's "U1 APPROVE — proceed to U2" relay at 08:42, idled twice (08:43/08:44, no action summary), and had spawned nothing by the 09:00 ground-truth check (no new worker, no lane processes, arc task-list frozen). Pointed status-check nudge at 09:01 with the "the send itself is your deliverable" wording → U2 implementer spawned at 09:02 (tasks-dir symlink mtime) and a full state report delivered. The orchestrator's own framing ("crossed in flight — ground truth was just behind") is contradicted by the symlink timestamp; treat post-nudge "already done" claims as recovery, not refutation of the stall. TRIAGE REFINEMENT from this instance: the reliable spawn-evidence signal is the tasks/ dir transcript symlink (`/tmp/claude-<uid>/<cwd-slug>/<session>/tasks/*.output`, mtime = spawn time), NOT the teams inbox file — inbox files can lag or stay absent for Agent-tool children.
+
+## Occurrence update (2026-07-19, vc-200s..vc-240s — 5× Explore-type, running total 17/17)
+
+All FIVE Explore-type read-only analysts in the T-1793 fan-out idled without sending their final report; one pointed nudge each ("the send itself is the deliverable") recovered all five with complete, high-quality reports within ~2 min. New signal: the failure appears SYSTEMATIC for Explore-type named background spawns (5/5 in one batch) — their final-text does not auto-relay as a teammate-message the way implementer-type spawns' reports did in the same session. Dispatcher posture for Explore fan-outs: expect the nudge round; budget it into the arc.
+
 > **Promoted as load-bearing to `lessons/2026-07-07-subagent-completion-signal-is-report-plus-idle.md`** (T-1611, ORG-012 §2). This file stays as the surgical-fix catalog: occurrence log, triage commands, nudge wording.
 
 ## Occurrence update (2026-07-08, impl-T1617 — 2 more background-wake drops, running total 10/10)

@@ -1,0 +1,27 @@
+[Unit]
+Description=Pantheon mirror drift-sweep — detect mirrors fallen behind source + auto-file refresh tickets (T-1994)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-1994.md
+After=network-online.target
+Wants=network-online.target
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
+# ARMED 2026-07-23 (T-1994): ownership map blessed by the operator (TG 3988) + supervised
+# first-run verified. --commit-prod makes the sweep auto-file refresh tickets on real
+# drift (routed to the pair's refresh_target=recovery); the proof-of-life digest sends
+# every fire regardless. Gated pairs remain detect-but-never-file. To revert to dark,
+# drop --commit-prod; to disarm entirely, `systemctl --user disable --now pantheon-mirror-drift.timer`.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/mirror_drift_sweep.py --commit-prod
+StandardOutput=journal
+StandardError=journal
+# ls-remote of 3 sources + a cache fetch + rev-list; 10min is generous headroom.
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=default.target

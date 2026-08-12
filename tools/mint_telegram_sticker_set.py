@@ -3,10 +3,12 @@
 
 Token is read from env STICKER_BOT_TOKEN (never stored/committed). Owner user_id
 from env OWNER_USER_ID (default the operator 456474197 — must have /start-ed the bot).
-Structure from argv[1]: 'combined' (one Pantheon set, default) or 'per-agent'
-(one set per agent). Writes the returned file_ids + real set_name back into the
-manifest. Telegram rejects duplicate set names, so re-running over an existing
-set errors loudly — deleteStickerSet or rename first.
+Structure from argv[1]: 'combined' (one Pantheon set, default), 'per-agent'
+(one set per agent), or 'append-combined' (add manifest entries with blank
+file_id values to the existing combined set). Writes the returned file_ids +
+real set_name back into the manifest. Telegram rejects duplicate set names, so
+re-running 'combined' over an existing set errors loudly — use
+'append-combined' for later additions, or deleteStickerSet / rename first.
 
 First mint: the combined `pantheon_pack_by_panethon_codex_bot` (24 stickers),
 2026-06-09. NOTE: getStickerSet file_ids are per-bot — a different sending bot
@@ -24,7 +26,7 @@ API = f"https://api.telegram.org/bot{TOKEN}"
 EMOJI = {"idle": "\U0001F916", "shipped": "\U0001F680", "approved": "✅",
          "investigating": "\U0001F50D", "thinking": "\U0001F914", "wedged": "⚠️"}
 REACTION_ORDER = ["idle", "shipped", "approved", "investigating", "thinking", "wedged"]
-AGENT_ORDER = ["orchestrator", "specialist", "recovery", "codex"]
+AGENT_ORDER = ["orchestrator", "specialist", "recovery", "codex", "mnemosyne"]
 
 
 def call(method, fields=None, files=None):
@@ -75,6 +77,54 @@ def mint_one(name, title, entries, manifest):
     return f"https://t.me/addstickers/{name}"
 
 
+def append_combined(manifest):
+    """Add entries with blank file_id values to the existing combined set."""
+    entries = []
+    for agent in AGENT_ORDER:
+        for agent_name, reaction, path, ref in entries_for_agent(manifest, agent):
+            if not ref.get("file_id"):
+                entries.append((agent_name, reaction, path, ref))
+    if not entries:
+        die("append-combined found no manifest entries with blank file_id")
+
+    set_names = {manifest[agent]["set_name"] for agent, *_rest in entries}
+    if len(set_names) != 1:
+        die(f"append-combined expected one set_name, got {sorted(set_names)}")
+    name = set_names.pop()
+
+    for agent, reaction, path, _ref in entries:
+        r = call("uploadStickerFile", fields={"user_id": OWNER, "sticker_format": "static"},
+                 files={"sticker": path})
+        if not r.get("ok"):
+            die(f"uploadStickerFile failed for {agent}/{reaction}", r)
+        sticker = {"sticker": r["result"]["file_id"], "format": "static",
+                   "emoji_list": [EMOJI[reaction]]}
+        r = call("addStickerToSet", fields={
+            "user_id": OWNER, "name": name, "sticker": json.dumps(sticker)})
+        if not r.get("ok"):
+            die(f"addStickerToSet failed for {agent}/{reaction}", r)
+
+    r = call("getStickerSet", fields={"name": name})
+    if not r.get("ok"):
+        die(f"getStickerSet failed for {name}", r)
+    got = r["result"]["stickers"]
+    if len(got) < len(entries):
+        die(f"{name} returned fewer stickers than just appended", r)
+    for (_a, _rx, _p, ref), st in zip(entries, got[-len(entries):]):
+        ref["file_id"] = st["file_id"]
+    return f"https://t.me/addstickers/{name}"
+
+
+def entries_for_agent(manifest, agent):
+    out = []
+    by_reaction = {s["reaction"]: s for s in manifest[agent]["stickers"]}
+    for reaction in REACTION_ORDER:
+        s = by_reaction.get(reaction)
+        if s:
+            out.append((agent, reaction, f"{STICKERS_DIR}/{s['file']}", s))
+    return out
+
+
 def main():
     structure = (sys.argv[1] if len(sys.argv) > 1 else "combined").lower()
     me = call("getMe")
@@ -86,26 +136,21 @@ def main():
     manifest = json.load(open(MANIFEST))
     links = []
 
-    def entries_for(agent):
-        out = []
-        by_reaction = {s["reaction"]: s for s in manifest[agent]["stickers"]}
-        for reaction in REACTION_ORDER:
-            s = by_reaction.get(reaction)
-            if s:
-                out.append((agent, reaction, f"{STICKERS_DIR}/{s['file']}", s))
-        return out
-
     if structure == "per-agent":
         for agent in AGENT_ORDER:
             name = f"pantheon_{agent}_by_{bot}"
             link = mint_one(name, f"Pantheon — {agent.capitalize()}",
-                            entries_for(agent), manifest)
+                            entries_for_agent(manifest, agent), manifest)
             manifest[agent]["set_name"] = name
             links.append(f"{agent}: {link}")
             print(f"  minted {name} -> {link}")
+    elif structure == "append-combined":
+        link = append_combined(manifest)
+        links.append(f"combined append: {link}")
+        print(f"  appended missing stickers -> {link}")
     else:  # combined
         name = f"pantheon_pack_by_{bot}"
-        all_entries = [e for a in AGENT_ORDER for e in entries_for(a)]
+        all_entries = [e for a in AGENT_ORDER for e in entries_for_agent(manifest, a)]
         link = mint_one(name, "Pantheon", all_entries, manifest)
         for agent in AGENT_ORDER:
             manifest[agent]["set_name"] = name

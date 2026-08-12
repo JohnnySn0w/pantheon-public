@@ -75,7 +75,17 @@ RAM_URGENT_MB = int(os.environ.get("PANTHEON_RAM_URGENT_MB", "512"))
 CPU_LOAD15_WARN_MULT = float(os.environ.get("PANTHEON_CPU_LOAD15_WARN_MULT", "2.5"))
 
 # Agent homes to size in the breakdown (best-effort; du runs as each owner).
-AGENT_HOMES = ("claude", "claude-research", "claude-fallback", "the-ancestor", "codex")
+#
+# DERIVED from instance.yaml (T-2256). Was a hand-carried five that predated
+# ORG-042/ORG-043, so exocortex/suborch1/suborch2 were never sized — and the
+# "best-effort" in the line above is about the du CALL failing, not about which
+# homes are in scope, so three homes were absent from every top-consumers
+# breakdown with nothing marking their absence. That is the signature this
+# ticket exists to remove: a disk alert naming the biggest home is worth exactly
+# as much as the enumeration behind it.
+from tools.agent_role_map import fleet_accounts  # noqa: E402
+
+AGENT_HOMES = fleet_accounts()
 
 STATE_DIR = Path.home() / ".local" / "state" / "pantheon"
 STATE_PATH = STATE_DIR / "disk_usage_alert_state.json"
@@ -227,6 +237,9 @@ def _wake_recovery(kind: str, body: str) -> None:
             "verifying no owner process is using them, FYI the owning agent.",
             "recovery",
             subject=f"{kind}: self-wake for triage",
+            # T-2237(a): only sent at WARN/URGENT breach, and a disk that fills
+            # while the notice waits takes the fleet with it.
+            severity="urgent",
         )
     except Exception as exc:
         _log(f"recovery self-wake failed (non-fatal): {exc!r}")

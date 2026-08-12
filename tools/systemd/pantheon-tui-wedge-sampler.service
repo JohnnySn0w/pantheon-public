@@ -1,0 +1,32 @@
+[Unit]
+Description=Pantheon TUI-wedge sampler — measure the healthy pane-moving/jsonl-frozen ceiling (T-1369)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-1369.md
+After=network.target
+
+# Deliberately NO OnFailure= alert, unlike the mail-staleness detector next to
+# it. That unit alerts because a mail failure presents as silence, so a silent
+# detector failure reproduces the defect. This one is a MEASUREMENT with no
+# operational duty: nothing degrades if a sample is missed, and paging a human
+# about a gap in a sampling series is the alarm that teaches people to skip
+# alarms. Gaps are visible in the data itself — a failed capture breaks a run
+# rather than bridging it, which is the fail-safe direction for the number.
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# Read-only by construction: captures panes, stats jsonl mtimes, appends a
+# sample line. It holds no send/alert callable and contains no send-keys string,
+# and there is a test asserting both. It must never gain restart authority —
+# that belongs to the detector this is measuring FOR, not to the instrument.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/tui_wedge_sampler.py --sample
+
+StandardOutput=journal
+StandardError=journal
+# A hung cross-account pane capture must not wedge the timer. Well under the
+# fire interval so a stuck run cannot overlap its successor.
+TimeoutStartSec=45s
+
+[Install]
+WantedBy=default.target

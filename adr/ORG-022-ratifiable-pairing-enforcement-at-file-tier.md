@@ -3,6 +3,7 @@ aliases: [ORG-022]
 title: Ratification label ↔ ratifiable_files pairing enforcement at ticket-file-tier
 status: Ratified 2026-05-19
 date: 2026-05-19
+build_disposition: built
 ---
 # ORG-022 — Ratification label ↔ ratifiable_files pairing enforcement at ticket-file-tier
 

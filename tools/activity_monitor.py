@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import hashlib
 import re
 import subprocess
 import sys
@@ -224,6 +225,7 @@ def write_poke_state(
     pre_poke_jsonl_mtime: int | None = None,
     consecutive_ineffective: int = 0,
     escalated: bool = False,
+    modal_dismissals: int = 0,
 ) -> None:
     """Persist the last-poke state. The bounded-poke fields (T-1363) are optional
     and backward-compatible: legacy callers omit them and the file is unchanged
@@ -233,6 +235,9 @@ def write_poke_state(
       so the NEXT cycle can tell whether this poke advanced the session (worked).
     - consecutive_ineffective: running count of pokes that did NOT advance.
     - escalated: this fire suppressed the poke + escalated (stuck, not idle).
+    - modal_dismissals: Enter-confirms sent at the cap modal (T-1369), which is
+      what bounds that remediation across cycles. Written only when non-zero so
+      every existing state file and its assertions keep their exact shape.
     """
     data = {
         "ts": int(time.time()),
@@ -244,6 +249,8 @@ def write_poke_state(
         data["pre_poke_jsonl_mtime"] = int(pre_poke_jsonl_mtime)
     if escalated:
         data["escalated"] = True
+    if modal_dismissals:
+        data["modal_dismissals"] = int(modal_dismissals)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(data) + "\n", encoding="utf-8")
 
@@ -270,6 +277,13 @@ def poke_effectiveness_decision(
     advances its main jsonl mtime. So if the prior poke (SAME predicate) recorded
     a pre-poke mtime and the jsonl has NOT advanced past it, that poke was
     ineffective — the session is stuck, not idle.
+
+    NAME COLLISION NOTE (T-1950): this `consecutive_ineffective` is a
+    DIFFERENT metric from tools/keep_going.py's same-named counter. This one
+    keys on jsonl-mtime advance (did the session take a turn at all); keep
+    going's keys on agent-tagged LEDGER entries (did the nudge produce owned,
+    recorded work) and is explicitly NOT an activity metric. Don't aggregate
+    or compare the two by name.
 
     Returns (suppress, consecutive_ineffective, reason), where
     consecutive_ineffective is the UPDATED count to persist with this fire.
@@ -353,6 +367,97 @@ def latest_jsonl_mtime(jsonl_dir: Path, sudo_user: str) -> int | None:
         return int(float(raw))
     except ValueError:
         return None
+
+
+# T-2387: how far back to look for a NON-ERROR assistant turn. 200 mirrors
+# context_fill_monitor.API_HEALTH_TAIL_LINES (same file, same sudo'd tail read).
+# Sizing matters in one direction only: if a genuinely-working seat's newest
+# non-error assistant record falls OUTSIDE this window, this reads as "no
+# productive turn" and the caller treats the seat as idle. The cost of that is a
+# spurious POKE — activity_monitor nudges, it does not restart — which is why a
+# generous window plus a low-harm consequence is an acceptable trade here and
+# would NOT be on context_fill_monitor's force-restart path.
+PRODUCTIVE_TAIL_LINES = 200
+
+# T-2387 ship-dark. Default OFF: the liveness sites keep their existing
+# turn-counting behaviour until this is armed per-agent via a systemd drop-in,
+# per the T-1126 supervised-first-fire convention. Arming changes which seats
+# look idle, and therefore which get poked.
+PRODUCTIVE_LIVENESS_ENABLED = os.environ.get(
+    "PANTHEON_PRODUCTIVE_LIVENESS_ENABLED", "0") == "1"
+
+
+def latest_productive_jsonl_mtime(
+    jsonl_dir: Path, sudo_user: str, agent: str = "?"
+) -> int | None:
+    """Epoch of the newest assistant turn that was NOT an API error (T-2387).
+
+    WHY THIS EXISTS SEPARATELY FROM `latest_jsonl_mtime`, and why that function
+    was deliberately NOT changed in place: the two answer DIFFERENT questions
+    with OPPOSITE requirements for an error turn.
+
+      "did the session take a turn at all?"  — poke-effectiveness. An error turn
+          COUNTS: the poke landed, the session woke, it produced output. That is
+          `latest_jsonl_mtime`, and it is correct as written.
+      "is this seat doing work?"             — liveness. An error turn must NOT
+          count. This function.
+
+    Conflating them is the T-2387 defect: atlas hit the monthly spend cap and
+    produced 23 turns / 23 errors on 07-30 and 22 / 22 on 07-31 — 59 identical
+    failures across two days — and every check asking "did it produce a turn"
+    answered YES for the entire outage. mtime advances on an error just as
+    happily as on real work.
+
+    KEYED ON THE OUTCOME BOOLEAN, NOT ON A STATUS OR A STRING. The runtime sets
+    `isApiErrorMessage` on the record itself, so this covers the spend cap (429),
+    the api-health case (400), model-outage (404) and every error class nobody
+    has met yet, with no enumeration to maintain. The tree already carries four
+    detectors keyed to specific error identities — including a literal substring
+    match on "monthly spend limit" — and each new class has arrived as a new
+    narrow detector. That is the pattern this breaks.
+
+    THIS IS ONE ARM OF TWO. It sees turns that RAN and errored. It cannot see a
+    seat producing no record at all — a crashloop, a wedged tool, a dead harness.
+    That case is covered by the caller's existing staleness threshold: with no
+    productive turn found this returns None, the caller's activity clock falls
+    back to its other signals, and an idle seat trips the normal idle gate.
+
+    Returns None when no non-error assistant turn is found in the window, or on
+    any read failure (fail-open, mirroring `read_recent_records`).
+    """
+    try:  # lazy import: context_fill_monitor is heavy and only needed when armed
+        from tools.context_fill_monitor import (  # noqa: PLC0415
+            _parse_iso8601_to_epoch, find_latest_jsonl, read_recent_records,
+        )
+    except ImportError:  # pragma: no cover - import shape varies by runner
+        from context_fill_monitor import (  # type: ignore[no-redef]  # noqa: PLC0415
+            _parse_iso8601_to_epoch, find_latest_jsonl, read_recent_records,
+        )
+
+    jsonl = find_latest_jsonl(Path(jsonl_dir), sudo_user, agent)
+    if jsonl is None:
+        return None
+    for rec in read_recent_records(jsonl, sudo_user, agent, limit=PRODUCTIVE_TAIL_LINES):
+        if rec.get("type") != "assistant" or rec.get("isApiErrorMessage"):
+            continue
+        ts = _parse_iso8601_to_epoch(rec.get("timestamp"))
+        if ts is not None:
+            return int(ts)
+    return None
+
+
+def liveness_jsonl_mtime(jsonl_dir: Path, sudo_user: str, agent: str = "?") -> int | None:
+    """The jsonl activity signal for LIVENESS callers, ship-dark switched (T-2387).
+
+    Armed  → newest non-error assistant turn (a seat erroring in a loop goes quiet).
+    Default→ `latest_jsonl_mtime`, byte-for-byte the pre-T-2387 behaviour.
+
+    Poke-effectiveness callers must NOT use this — they want the turn-counting
+    signal regardless of outcome. See `latest_productive_jsonl_mtime`.
+    """
+    if PRODUCTIVE_LIVENESS_ENABLED:
+        return latest_productive_jsonl_mtime(jsonl_dir, sudo_user, agent)
+    return latest_jsonl_mtime(jsonl_dir, sudo_user)
 
 
 def active_team_inboxes(teams_dir: Path, sudo_user: str) -> bool:
@@ -805,6 +910,223 @@ def is_cyber_refusal_message(obj: dict) -> bool:
     return isinstance(sd, dict) and sd.get("category") == CYBER_REFUSAL_CATEGORY
 
 
+# --- cap-state classification (T-1369, pre-poke gate branches 2+3) -----------
+# Both strings MEASURED from live outages, not guessed — the ticket's own
+# instruction. Separator is U+00B7 MIDDLE DOT in both; a regex written from a
+# paraphrase ("limit - resets") would silently never match.
+#   session: "You've hit your session limit · resets 9:40am (UTC)"
+#            (orchestrator, 38x, 2026-08-02 06:28-09:34Z)
+#   spend:   "You've hit your monthly spend limit · raise it at claude.ai/..."
+#            (atlas, 59x, 2026-07-30/31, a 48h outage — T-2387)
+#
+# ⚠️ THE TWO BEHAVE OPPOSITELY, and the discriminator is IN the strings
+# ("resets" vs "raise it"). The session limit self-clears at the stated time —
+# verified end-to-end 2026-08-02: cap named 09:40, first successful turn minutes
+# after, zero intervention. The spend limit holds until a HUMAN raises it —
+# T-2290's falsification: atlas erred every turn for two days. A generic
+# "limit" substring collapses two branches that need opposite routing.
+_CAP_SESSION_RE = re.compile(r"hit your session limit.*resets\s+(\S+(?:\s*\([A-Z]+\))?)")
+_CAP_SPEND_RE = re.compile(r"hit your (?:monthly|weekly)?\s*spend limit")
+
+
+def classify_cap_message(obj: dict) -> tuple[str, str | None] | None:
+    """Pure: classify a parsed jsonl line as a cap-error assistant turn.
+
+    Returns ("session_limit", reset_hint) — self-clears at reset_hint;
+            ("spend_limit", None)         — holds until a human acts;
+            None                          — not a cap error.
+
+    Keys on the newest assistant turn's TEXT, requiring isApiErrorMessage —
+    an agent DISCUSSING cap strings (this fleet writes tickets full of them)
+    must not read as capped. That guard is load-bearing: recovery's own transcript
+    quotes both wire strings verbatim many times over.
+    """
+    if not isinstance(obj, dict) or obj.get("type") != "assistant":
+        return None
+    if not obj.get("isApiErrorMessage"):
+        return None
+    msg = obj.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        texts = [b.get("text", "") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+    else:
+        return None
+    blob = " ".join(texts)
+    m = _CAP_SESSION_RE.search(blob)
+    if m:
+        return ("session_limit", m.group(1))
+    if _CAP_SPEND_RE.search(blob):
+        return ("spend_limit", None)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# T-1369 branch 4: the PANE-ONLY cap modal.
+#
+# Specimen captured live off orchestrator 2026-08-02 (specimens/orchestrator_cap_modal_pane.txt)
+# after it sat wedged ~50 minutes PAST its own printed reset and the operator had to
+# ask "can u check on orchestrator". This state is invisible to detect_cap_state: the
+# session-limit error IS in the jsonl, but the thing keeping the seat down is the
+# `/rate-limit-options` menu holding the TUI. The jsonl branch correctly declines
+# to poke and correctly declines to escalate (a session limit self-clears) — and
+# then the cap clears and the seat STILL does not move, because the modal is up.
+#
+#     What do you want to do?
+#     ❯ 1. Stop and wait for limit to reset
+#       2. Upgrade your plan
+#     Enter to confirm · Esc to cancel
+#
+# ⚠️ SAFETY, and it is the whole design: option 2 SPENDS MONEY, which is
+# the operator's lane under the standing financial rule. Enter confirms WHATEVER the
+# cursor sits on. So it is not enough to recognise the menu — we must read where
+# the ❯ actually IS and refuse to touch the keyboard unless it is on option 1.
+# "Recognise the menu, press Enter" is the version of this that buys a plan.
+_MODAL_QUESTION = "What do you want to do?"
+_MODAL_OPT1 = "Stop and wait for limit to reset"
+_MODAL_OPT2 = "Upgrade your plan"
+_MODAL_CURSOR = "❯"
+# capture_pane() uses `tmux capture-pane -p` (no -e), so production text has no
+# escapes — but the specimen was captured WITH -e, and a detector that only works
+# on whichever form the fixture happens to be in is a detector tested against
+# itself. Strip unconditionally so both forms take the same path.
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+MODAL_SAFE = "cap_modal_option1"
+MODAL_UNSAFE = "cap_modal_unsafe_selection"
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
+
+
+def classify_cap_modal(pane_text: str | None) -> str | None:
+    """Pure: classify a pane capture as the /rate-limit-options menu.
+
+    MODAL_SAFE   — the menu is up AND the cursor is on option 1 (stop and wait).
+                   Enter here is the same keystroke a human would send, and it
+                   spends nothing.
+    MODAL_UNSAFE — the menu is up but the cursor is NOT provably on option 1
+                   (on option 2, or no cursor line found at all). NEVER send
+                   keys in this state; hand it to a human.
+    None         — not this menu. Anything unrecognised is None, so a pane we
+                   cannot parse is never treated as dismissable.
+
+    Requires BOTH option labels, not just the question: "What do you want to
+    do?" is a generic TUI prompt and matching it alone would make every future
+    menu look like this one.
+    """
+    if not pane_text:
+        return None
+    text = _strip_ansi(pane_text)
+    if _MODAL_QUESTION not in text:
+        return None
+    if _MODAL_OPT1 not in text or _MODAL_OPT2 not in text:
+        return None
+    # Locate the cursor by looking at the OPTION lines specifically, not at the
+    # first line carrying the glyph. In the real specimen the '❯' also prefixes
+    # the shell prompt line ('❯ /rate-limit-options', the command that opened the
+    # menu), which sits ABOVE the options — a first-match scan reads that line,
+    # finds no option-1 text, and calls a perfectly safe modal unsafe. Caught by
+    # testing against the captured pane instead of a hand-typed approximation.
+    opt1_selected = opt2_selected = False
+    for line in text.splitlines():
+        if _MODAL_OPT1 in line and _MODAL_CURSOR in line:
+            opt1_selected = True
+        elif _MODAL_OPT2 in line and _MODAL_CURSOR in line:
+            opt2_selected = True
+    if opt1_selected and not opt2_selected:
+        return MODAL_SAFE
+    return MODAL_UNSAFE
+
+
+def _session_cap_modal(cfg: dict) -> str | None:
+    """Pre-poke gate seam for the pane modal, parallel to _session_cap_state.
+
+    No configured pane → None, not a KeyError. Two reasons, and the second is
+    the one that matters: an agent can legitimately have no pane (specialist-a2a by
+    construction), and this call sits on the dispatch path that EVERY poke goes
+    through, so a cfg without the key must degrade rather than shell out or
+    raise. Subscript here would also mean any test exercising _dispatch_poke
+    without stubbing this seam runs a live `tmux capture-pane` against a
+    sibling's real session — the existing cap-gate tests were saved from exactly
+    that only by naming their key differently.
+    """
+    pane = cfg.get("tmux_target_pane")
+    if not pane:
+        return None
+    return classify_cap_modal(capture_pane(pane, cfg.get("sudo_user")))
+
+
+def send_modal_confirm(cfg: dict) -> bool:
+    """Send a BARE Enter to confirm the highlighted menu option.
+
+    Deliberately NOT send_poke(): that sends prompt TEXT and then Enter, and
+    typing text into a live menu is how a dismissal becomes a selection. Callers
+    must have classified MODAL_SAFE first — this function does not re-check.
+    """
+    pane = cfg["tmux_target_pane"]
+    cmd = _sudo(cfg["sudo_user"]) + [
+        "bash", "-c",
+        f"XDG_RUNTIME_DIR=/run/user/$(id -u) tmux send-keys -t {pane} Enter",
+    ]
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=_TMUX_TIMEOUT_SECONDS
+        )
+        return r.returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+
+
+# Bounded remediation (feedback_bounded_repeating_remediation): a dismissal that
+# does not take must not become an infinite Enter-presser. Three attempts across
+# cycles, tracked in the poke state, then escalate and hold.
+MAX_MODAL_DISMISSALS = int(os.environ.get("ACTIVITY_MONITOR_MAX_MODAL_DISMISSALS", "3"))
+
+
+def detect_cap_state(jsonl_path: Path, sudo_user: str) -> tuple[str, str | None] | None:
+    """Cap-state of the MOST-RECENT assistant turn, or None.
+
+    Same shape and fail-safe direction as detect_cyber_refusal: a later
+    non-cap assistant message means the agent recovered → None; any read or
+    parse failure → None (never mis-route a healthy session on a probe glitch).
+    """
+    cmd = _sudo(sudo_user) + ["bash", "-c", f"tac {jsonl_path} | head -n 200"]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+            timeout=_JSONL_PROBE_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            continue
+        # First assistant line in tac order == most-recent assistant turn.
+        return classify_cap_message(obj)
+    return None
+
+
+def _session_cap_state(cfg: dict) -> tuple[str, str | None] | None:
+    """Pre-poke gate seam for cap-state, parallel to _session_cyber_blocked."""
+    jsonl = find_latest_jsonl(cfg["jsonl_dir"], cfg["sudo_user"])
+    if jsonl is None:
+        return None
+    return detect_cap_state(jsonl, cfg["sudo_user"])
+
+
 def _session_cyber_blocked(cfg: dict) -> bool:
     """Pre-poke gate helper (T-1363 inc.3): True iff the agent's session is
     currently cyber-blocked — its most-recent assistant turn is a cyber-safeguard
@@ -1042,7 +1364,9 @@ def check_p1a(cfg: dict, idle_threshold_seconds: int) -> bool:
     ledger_ts = latest_ledger_entry_ts_for_agent(
         cfg["pantheon_config_path"], cfg["sudo_user"], cfg["ledger_agent_id"]
     ) or 0
-    jsonl_ts = latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+    # T-2387: LIVENESS site — an error turn must not count as activity.
+    jsonl_ts = liveness_jsonl_mtime(
+        cfg["jsonl_dir"], cfg["sudo_user"], cfg.get("agent", "?")) or 0
     latest_activity = max(ledger_ts, jsonl_ts)
     if latest_activity == 0:
         # Can't determine activity → fail-open (don't fire).
@@ -1166,7 +1490,9 @@ def check_p1c(
     if not active_team_inboxes(teams_dir, cfg["sudo_user"]):
         return False
     # Conjunct 2: dispatcher dormant (no-pending-wakeup proxy + no-activity).
-    jsonl_ts = latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+    # T-2387: LIVENESS site — a dispatcher erroring every wake is dormant, not busy.
+    jsonl_ts = liveness_jsonl_mtime(
+        cfg["jsonl_dir"], cfg["sudo_user"], cfg.get("agent", "?")) or 0
     ledger_ts = latest_ledger_entry_ts_for_agent(
         cfg["pantheon_config_path"], cfg["sudo_user"], cfg["ledger_agent_id"]
     ) or 0
@@ -1200,7 +1526,8 @@ P1B_POKE_PROMPT = (
     "[activity-monitor P1.b] You appear to be in self-imposed wait-state while"
     " the operator is away (>15min since his last inbound). Per"
     " sop/standard/ho-absent-operator-keep-working.md: record progress on the"
-    " awaited item, shelve it (ticket.py block <id> --reason ...), and swap to"
+    " awaited item, shelve it (ticket.py block <id> --not-before/--depends-on"
+    " — ORG-019; the old --reason flag was retired with blocked/), and swap to"
     " the next actionable. Pull queue now."
 )
 
@@ -1291,6 +1618,85 @@ def _escalate_stuck(cfg: dict, agent: str, predicate: str, msg: str, vocab: str,
 
 
 # ---------------------------------------------------------------------------
+# T-2632 PART 2: park-attribution (asserted-only core)
+#
+# Distinguish a seat that is QUIET-BY-DESIGN (parked) from one that is WEDGED,
+# so quiet-by-design does not read as a wedge. This is the reusable CORE — a pure,
+# fail-safe query. WIRING it into the wedge disposition (activity_monitor's
+# suppress/_escalate_stuck decision + the context-fill staleness wedge) is the
+# gated fresh-context step (T-2632): a caller uses (attributable → suppress the
+# escalate-alert; unattributed → escalate-to-Recovery as today), and MUST NOT let
+# attribution gate an auto-restart.
+#
+# Why asserted-only: the T-2632 investigation found the annotation's INFERRED
+# from-a-live-handle attribution is not safely implementable with today's
+# observables — session-level handles (Task/ScheduleWakeup/Monitor) are
+# harness-internal (not disk-queryable cross-account), and the only queryable
+# "timer" surface is the fleet systemd timers, which are ALWAYS present with a
+# pending next-fire, so keying off them would attribute EVERY quiet and mask
+# EVERY wedge. The inferred half is blocked on a harness-exposed session-handle
+# registry. This core therefore consults only DECLARED signals.
+# ---------------------------------------------------------------------------
+
+
+def _hold_signal(agent: str, now: float | None) -> tuple[bool, str] | None:
+    """Asserted-hold signal: an active, TTL-bounded context_fill_hold means the
+    seat's quiet is a declared hold. Import-wrapped (run-as-package / run-as-script)
+    and fail-safe — any error returns None ('no signal', so the wedge proceeds)."""
+    try:
+        try:
+            from tools.context_fill_hold import hold_status  # package / tests
+        except ImportError:
+            from context_fill_hold import hold_status  # script (prod)
+        st = hold_status(agent, now=now)
+        if st.get("active"):
+            return (True, f"context_fill_hold active (reason={st.get('reason') or 'unspecified'})")
+    except Exception:
+        return None
+    return None
+
+
+def quiet_is_attributable(
+    agent: str,
+    *,
+    now: float | None = None,
+    signals=None,
+) -> tuple[bool, str]:
+    """Is this seat's QUIET attributable to a DECLARED intentional-silence signal?
+    Returns (attributable, reason).
+
+    Asserted sources (declared intent, NOT inferred):
+      1. an active context_fill_hold (TTL-bounded operator/agent hold);
+      2. [wiring pass] the seat's session-owning systemd unit DISABLED — the
+         TG-6694 deliberate pause — supplied via `signals` (mirrors
+         channel_liveness_monitor._is_deliberately_paused, which resolves the
+         unit name + sudo_user this pure core deliberately does not carry).
+
+    `signals` is an iterable of callables `(agent, now) -> (bool, reason) | None`,
+    evaluated after the built-in hold check; the first truthy result wins. It is
+    the extension point the wiring pass uses to add the unit-disabled probe (and,
+    eventually, a harness session-handle signal) without changing this contract.
+
+    FAIL-SAFE — the load-bearing invariant (T-2632 design #2 / T-2615 'a hold must
+    never mask a real wedge'): any error or ambiguity yields (False, ...). 'Not
+    attributable' means the wedge signal PROCEEDS to alert, so this can never mask
+    a wedge. Callers use the result ONLY to downgrade a wedge's DISPOSITION
+    (escalate-alert vs suppress-alert), NEVER to gate an auto-restart.
+    """
+    checks = [_hold_signal]
+    if signals:
+        checks.extend(signals)
+    for check in checks:
+        try:
+            result = check(agent, now)
+        except Exception:
+            result = None  # fail-safe: a broken signal never attributes
+        if result and result[0]:
+            return (True, result[1])
+    return (False, "unattributed — no declared hold/pause explains the quiet")
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -1320,6 +1726,108 @@ def _dispatch_poke(
         # Detect it up front and SUPPRESS: it needs a RESTART, not a poke. (Restart-
         # routing via route_failure_alert is the next increment; for now suppress +
         # an escalated marker, which is the same shape as the effectiveness-suppress.)
+        # Cap gate (T-1369 branches 2+3), BEFORE the cyber gate: cheaper probe of
+        # the same surface, and both cap states share the property that a poke is
+        # futile — MEASURED 2026-08-02: the waker kicked a session-capped orchestrator 8x
+        # over 3.5h, every kick delivered, every turn an error, pane back to idle.
+        # Bounded, correct, useless. Also: a capped session's jsonl ADVANCES on
+        # each failed kick (error turns are still turns), which fools the
+        # effectiveness signal exactly the way the cyber comment below describes.
+        # Modal gate (T-1369 branch 4), BEFORE the jsonl cap gate: when the
+        # `/rate-limit-options` menu is up it is the modal, not the cap, that
+        # holds the seat down — orchestrator sat on one ~50 min past its own reset with
+        # the jsonl branch below behaving exactly as designed. The jsonl branch
+        # cannot see this state, and its correct "self-clears, no escalation"
+        # ruling is precisely what makes the modal invisible. Also a poke here is
+        # worse than futile: send_poke types TEXT into a live menu.
+        modal = _session_cap_modal(cfg)
+        if modal == MODAL_SAFE:
+            prior = read_poke_state(state_path) or {}
+            attempts = int(prior.get("modal_dismissals", 0) or 0)
+            if attempts < MAX_MODAL_DISMISSALS:
+                sent = send_modal_confirm(cfg)
+                _log(agent, f"{predicate}: cap MODAL up, cursor on option 1 "
+                            f"(stop+wait) — sent Enter (attempt {attempts + 1}"
+                            f"/{MAX_MODAL_DISMISSALS}, ok={sent}) (T-1369)")
+                write_poke_state(
+                    state_path, agent, predicate,
+                    pre_poke_jsonl_mtime=latest_jsonl_mtime(
+                        cfg["jsonl_dir"], cfg["sudo_user"]) or 0,
+                    consecutive_ineffective=int(
+                        prior.get("consecutive_ineffective", 0) or 0),
+                    escalated=bool(prior.get("escalated")),
+                    modal_dismissals=attempts + 1,
+                )
+                return 0 if sent else 1
+            # Bound reached: the menu is still up after N confirms, so pressing
+            # Enter is not the remedy and repeating it is just noise on someone
+            # else's keyboard.
+            _log(agent, f"{predicate}: cap MODAL still up after "
+                        f"{MAX_MODAL_DISMISSALS} confirms — holding (T-1369)")
+            _escalate_stuck(
+                cfg, agent, predicate,
+                msg=(f"🪟 [{predicate}] {agent} is held by the /rate-limit-options "
+                     f"MODAL and {MAX_MODAL_DISMISSALS} Enter-confirms did not "
+                     f"clear it. Poking suppressed (a poke types text into a live "
+                     f"menu). Needs a human at the pane."),
+                vocab="cap-modal", state_path=state_path,
+                cur_mtime=latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0,
+                consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
+            )
+            return 0
+        if modal == MODAL_UNSAFE:
+            # The menu is up but the cursor is not provably on option 1. Option 2
+            # SPENDS MONEY — the operator's lane — so this branch never touches the
+            # keyboard, no matter how wedged the seat looks.
+            prior = read_poke_state(state_path) or {}
+            _log(agent, f"{predicate}: cap MODAL up with cursor NOT on option 1 — "
+                        f"NOT sending keys (option 2 spends); escalating (T-1369)")
+            _escalate_stuck(
+                cfg, agent, predicate,
+                msg=(f"🛑 [{predicate}] {agent} is on the /rate-limit-options modal "
+                     f"and the selection is NOT 'stop and wait'. Refusing to send "
+                     f"Enter: the other option is 'Upgrade your plan', which spends "
+                     f"— that is the operator's lane. Needs a human at the pane."),
+                vocab="cap-modal-unsafe", state_path=state_path,
+                cur_mtime=latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0,
+                consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
+            )
+            return 0
+        cap = _session_cap_state(cfg)
+        if cap is not None:
+            kind, reset_hint = cap
+            if kind == "session_limit":
+                # SELF-CLEARS at the time printed in the message — verified live
+                # (cap said 09:40, first good turn minutes after, no intervention).
+                # So: no poke (futile), and NO escalation either — paging a human
+                # for a state with a printed expiry is the alarm that teaches
+                # people to skip alarms. The next cycle re-probes; once the cap
+                # clears this branch stops taken and normal poking resumes. That
+                # IS the retry route — the retry is the timer's own cadence.
+                _log(agent, f"{predicate}: session CAPPED (session limit, resets "
+                            f"{reset_hint or 'per message'}) — NOT poking; "
+                            f"self-clears, no escalation (T-1369)")
+                return 0
+            # spend_limit: holds until a HUMAN raises it (T-2290 falsification:
+            # atlas erred every turn for 48h). Alert + hold — escalate ONCE
+            # (transition-gated inside _escalate_stuck), never poke. The cap
+            # itself is the operator's lane per the standing financial rule; the
+            # escalation records the seat-state, it does not ask for a raise.
+            cur_mtime = latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+            prior = read_poke_state(state_path) or {}
+            _log(agent, f"{predicate}: session CAPPED (spend limit) — NOT poking; "
+                        f"holds until raised, escalating once (T-1369)")
+            _escalate_stuck(
+                cfg, agent, predicate,
+                msg=(f"⛔ [{predicate}] {agent} is SPEND-CAPPED — every turn errors "
+                     f"and the cap does NOT self-reset (T-2290/T-2387: atlas sat 48h "
+                     f"in this state reading as alive). Poking suppressed. The cap "
+                     f"is the operator's lane; this alert records the seat-state, it is "
+                     f"not a raise request."),
+                vocab="spend-cap", state_path=state_path, cur_mtime=cur_mtime,
+                consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
+            )
+            return 0
         if _session_cyber_blocked(cfg):
             cur_mtime = latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
             prior = read_poke_state(state_path) or {}
@@ -1369,6 +1877,123 @@ def _dispatch_poke(
         return 0
     _log(agent, f"{predicate} poke send failed")
     return 1
+
+
+# ---------------------------------------------------------------------------
+# TUI-alive-but-not-emitting wedge (T-1369 final branch)
+# ---------------------------------------------------------------------------
+#
+# The wedge: the pane keeps changing (spinner animating — TUI render loop alive)
+# while the session jsonl stays frozen (no productive turn emitted). A perfectly
+# HEALTHY agent in a long silent turn produces the SAME observation — pane moves,
+# jsonl still — so the ONLY thing separating "wedged, restart it" from "working,
+# leave it alone" is DURATION. The threshold below was MEASURED, not guessed:
+# tui_wedge_sampler ran 60s cadence over 2026-08-03..05 across known-healthy
+# operation and recorded the run-length distribution of this exact ambiguous
+# state — orchestrator n=110 runs, max 779s (~13min), 71% <=120s, thin tail (3/110
+# >600s); recovery n=20, max 541s. The healthy ceiling is ~13min.
+#
+# The threshold is set at 1800s — ~2.3x orchestrator's measured max — with deliberate
+# margin on the CHEAP-failure side. The sampler measures a run FROM THE LAST
+# UNAMBIGUOUS SAMPLE (T-1369 hygiene: fails toward SHORTER runs), so the true
+# healthy ceiling sits ABOVE the observed one; and the action here is a page to
+# Recovery RECOMMENDING a restart (never an auto-restart — same disposition as the
+# cyber branch). A threshold that fails LOW pages Recovery for a healthy long turn
+# (alarm fatigue); one that fails high delays a real wedge. 1800s buys margin
+# against the false page while still catching a wedge ~30min in, versus the
+# status quo of "sits until a human notices" (measured at hours, T-1369 history).
+TUI_WEDGE_JSONL_FROZEN_SECONDS = int(os.environ.get(
+    "ACTIVITY_MONITOR_TUI_WEDGE_FROZEN_SECONDS", str(30 * 60)))
+# Two pane captures this far apart decide "animating". A Claude Code spinner
+# repaints several times a second, so a ~2s gap reliably shows motion on a live
+# render loop and shows none on a still idle prompt.
+TUI_WEDGE_MOTION_PROBE_GAP_SECONDS = float(os.environ.get(
+    "ACTIVITY_MONITOR_TUI_WEDGE_PROBE_GAP", "2"))
+
+
+def _pane_fp(text: str | None) -> str | None:
+    """Truncated sha256 of pane text, or None for a None capture. A fingerprint,
+    not the text: the motion test only needs equality, and this branch has no
+    business retaining a copy of a sibling's working screen."""
+    if text is None:
+        return None
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def pane_is_animating(cfg: dict, gap_seconds: float) -> bool | None:
+    """True iff the pane text CHANGES across two captures `gap_seconds` apart.
+
+    A changing pane means the TUI render loop is alive (spinner animating); it
+    says NOTHING about whether the backend is emitting — that is the whole point,
+    it is the ambiguous half of the wedge signal. A still pane (unchanged) is an
+    idle prompt or a frozen static screen. Returns None when it cannot tell (no
+    configured pane, or either capture failed) — the caller treats None as "do
+    not fire", never as motion."""
+    pane = cfg.get("tmux_target_pane")
+    if not pane:
+        return None
+    first = capture_pane(pane, cfg.get("sudo_user"))
+    if first is None:
+        return None
+    time.sleep(gap_seconds)
+    second = capture_pane(pane, cfg.get("sudo_user"))
+    if second is None:
+        return None
+    return _pane_fp(first) != _pane_fp(second)
+
+
+def check_tui_wedge(
+    cfg: dict, frozen_threshold: int, probe_gap: float
+) -> tuple[bool, str]:
+    """The TUI-alive-but-not-emitting wedge detector (T-1369 final branch).
+
+    Fires (True) iff ALL of:
+      1. the session jsonl has emitted no PRODUCTIVE turn for > frozen_threshold
+         (liveness mtime, so an error-turn does not reset it — same signal p1a
+         uses); AND
+      2. the freeze is UNEXPLAINED — no cap modal, no cap state, no cyber block.
+         Each of those is a KNOWN freeze-cause with its own branch that owns the
+         remedy; a capped/blocked seat's liveness is frozen too, so without this
+         guard the wedge branch would double-fire on a state already handled; AND
+      3. the pane is ANIMATING (changes across a short gap) — i.e. not sitting
+         still at an idle prompt (which is p1a's poke path, not a wedge).
+
+    Read-only: it stats mtimes and captures panes, nothing else. It never sends
+    keys and never restarts — the ACTION (a restart RECOMMENDATION to Recovery) is
+    the caller's. Returns (fired, human-readable reason).
+
+    Ordering matters for cost and safety: the cheap duration gate (1) short-
+    circuits first, so the cap/cyber probes and the ~2s pane motion probe only
+    run once a seat is already long-frozen. The explained-cause guards (2) run
+    BEFORE the motion probe so a capped seat never even gets probed for motion.
+    """
+    jsonl_ts = liveness_jsonl_mtime(
+        cfg["jsonl_dir"], cfg["sudo_user"], cfg.get("agent", "?")) or 0
+    if jsonl_ts == 0:
+        # Cannot measure the freeze → fail-open (do not fire), same direction
+        # as check_p1a's activity==0 guard.
+        return (False, "no liveness jsonl mtime — cannot measure freeze (fail-open)")
+    frozen_for = int(time.time()) - jsonl_ts
+    if frozen_for < frozen_threshold:
+        return (False, f"jsonl frozen {frozen_for}s < threshold {frozen_threshold}s")
+    # Long freeze. Is a KNOWN state holding it? Those branches own the remedy.
+    if _session_cap_modal(cfg) is not None:
+        return (False, f"frozen {frozen_for}s but cap MODAL up — its branch owns it")
+    if _session_cap_state(cfg) is not None:
+        return (False, f"frozen {frozen_for}s but CAPPED — the cap branch owns it")
+    if _session_cyber_blocked(cfg):
+        return (False, f"frozen {frozen_for}s but CYBER-BLOCKED — its branch owns it")
+    # Unexplained long freeze. Distinguish the moving-pane wedge from a plain
+    # still idle prompt (p1a territory).
+    animating = pane_is_animating(cfg, probe_gap)
+    if animating is None:
+        return (False, f"frozen {frozen_for}s, no known cause, but pane capture "
+                       f"failed — cannot confirm animation (fail-open)")
+    if not animating:
+        return (False, f"frozen {frozen_for}s, no known cause, but pane is STILL "
+                       f"(idle-at-prompt, not the moving-pane wedge)")
+    return (True, f"jsonl frozen {frozen_for}s (>{frozen_threshold}s) with pane "
+                  f"ANIMATING and no cap/modal/cyber cause — TUI-alive-not-emitting")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1433,6 +2058,12 @@ def main(argv: list[str] | None = None) -> int:
     max_ineffective_pokes = int(os.environ.get(
         "ACTIVITY_MONITOR_MAX_INEFFECTIVE_POKES", MAX_INEFFECTIVE_POKES_DEFAULT
     ))
+    # TUI-alive-but-not-emitting wedge (T-1369 final) — ship dark. A restart-
+    # RECOMMENDING branch (never auto-restart) gets the same default-off,
+    # supervised-first-fire treatment as every other consequential branch here.
+    tui_wedge_enabled = os.environ.get(
+        "ACTIVITY_MONITOR_TUI_WEDGE_ENABLED", ""
+    ).strip().lower() in ("1", "true", "yes", "on")
 
     state_path = _state_path_for_agent(agent)
     cooldown_map = {
@@ -1445,6 +2076,59 @@ def main(argv: list[str] | None = None) -> int:
     if in_cooldown(state_path, cooldown_map):
         _log(agent, "in cooldown; skipping")
         return 0
+
+    # TUI-wedge (T-1369 final) — evaluated BEFORE the poke predicates, and
+    # independent of a ticket queue: a wedge is a wedge whether or not there is
+    # queued work, and p1a's 1-hour idle threshold would otherwise let a seat
+    # that has been frozen-but-animating for 30+ minutes sit unremarked. Ship
+    # dark. The action is an escalation to Recovery RECOMMENDING a restart, bounded
+    # to one page per episode by _escalate_stuck's transition gate — never an
+    # auto-restart, so a false fire costs a page, not a killed session.
+    if tui_wedge_enabled:
+        wedged, reason = check_tui_wedge(
+            cfg, TUI_WEDGE_JSONL_FROZEN_SECONDS, TUI_WEDGE_MOTION_PROBE_GAP_SECONDS)
+        if wedged:
+            cur_mtime = latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+            prior = read_poke_state(state_path) or {}
+            # T-2632 PART 2 (park-attribution wiring): before paging an ambiguous-
+            # QUIET wedge, check whether the freeze is attributable to a DECLARED
+            # signal — an active context_fill_hold. A deliberately-held session can
+            # legitimately sit in a long turn (pane-animating + jsonl-frozen — exactly
+            # this branch's signature), so a hold EXPLAINS the freeze; suppress the
+            # page. This downgrades only the ALERT — this branch never auto-restarts,
+            # so attribution can never mask a wedge into a restart (design #2 / the
+            # T-2615 "a hold must never mask a real wedge" invariant holds trivially
+            # here: there is no restart to mask). Unattributed quiet escalates exactly
+            # as before. Hold is the sufficient asserted signal for THIS path: a
+            # UNIT-disabled deliberate pause stops the session, so its pane cannot
+            # animate → check_tui_wedge condition #3 fails → this branch never fires
+            # for a paused seat regardless. Fail-safe: quiet_is_attributable returns
+            # (False, …) on any error, so a broken hold-lookup pages (never silently
+            # suppresses).
+            attributable, why = quiet_is_attributable(agent)
+            if attributable:
+                _log(agent, f"TUI-WEDGE fired: {reason} — quiet is ATTRIBUTABLE "
+                            f"({why}); SUPPRESSING the page (declared hold, not a wedge) (T-2632)")
+                return 0
+            _log(agent, f"TUI-WEDGE fired: {reason} — escalating restart "
+                        f"recommendation to Recovery (T-1369)")
+            _escalate_stuck(
+                cfg, agent, "tui_wedge",
+                msg=(f"🧊 [tui_wedge] {agent} looks WEDGED: its session jsonl has "
+                     f"emitted no productive turn for "
+                     f">{TUI_WEDGE_JSONL_FROZEN_SECONDS // 60}min while its pane is "
+                     f"still ANIMATING (TUI render loop alive, backend not emitting), "
+                     f"and no cap/modal/cyber state explains the freeze. The measured "
+                     f"healthy ceiling for this pane-moving-jsonl-frozen state is "
+                     f"~13min (T-1369 sampler, n=110), so this is well past it. "
+                     f"Recommend a RESTART to clear the wedge — but VERIFY at the pane "
+                     f"first: a genuinely long single turn is the one benign cause, "
+                     f"and this branch recommends, it does not auto-restart."),
+                vocab="tui-wedge", state_path=state_path, cur_mtime=cur_mtime,
+                consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
+            )
+            return 0
+        _log(agent, f"TUI-wedge: not fired ({reason})")
 
     # Check P1.a first (it's a stronger signal: completely-idle).
     if check_p1a(cfg, idle_threshold):

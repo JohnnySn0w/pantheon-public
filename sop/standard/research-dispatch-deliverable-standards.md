@@ -77,6 +77,14 @@ Any research or claim-verification on a **security/cyber-sensitive topic** — `
 
 > **Note (axis scope):** this carve-out is scoped to the **cyber-classifier-wedge** axis only — there is no classifier to trip on a model card. It does **not** waive *indirect-prompt-injection* isolation for untrusted targets; that orthogonal axis is governed by [`web-research-isolation.md`](web-research-isolation.md) (this SOP's general-web sibling). Non-cyber + *untrusted* (arbitrary crawl/social mirrors) → still isolate per that SOP; non-cyber + *trusted* (arxiv/docs/official sources) → orchestrator-direct OK.
 
+## Standard 5 — Dispatcher-side deliverable verification (ad-hoc dispatches)
+
+*(Added 2026-07-14 by Orchestrator, T-1771 sweep S3 promotion — Specialist-crystallized from `knowledge/episodic/2026-07-13-silent-failure-vs-pantheon-posture/notes.md`; below-goal methodology adopted under msgs 3733/3735, digest-surfaced.)*
+
+Every **ad-hoc Agent-tool dispatch whose deliverable is a file** gets a **files-on-disk check** (exists, non-empty, expected shape/frontmatter) before its result is used or relayed; every **decision-changing claim** in a dispatch report gets **one primary-source spot-check**. This generalizes what `tools/watch_runner.py` already enforces structurally for cron'd dispatches (file-exists + frontmatter) to the dispatches nothing enforces. Role-defining for any orchestrator-tier agent (HO, Specialist, PO tier).
+
+**Why:** LLM self-reports are optimized to sound complete — fluency is an anti-signal, not evidence (arXiv 2606.09863 false-success finding; same family as the standing `feedback_dispatch_brief_claims_are_unverified` + `feedback_no_fabricated_tool_results` pins). The report saying "written to X" is a claim, not an artifact.
+
 ## Common failure modes
 
 - **Headline-number-without-harness** — citing a benchmark figure with no setup/baseline/generalization line (Standard 1 anti-pattern; the wrong-conclusion risk).

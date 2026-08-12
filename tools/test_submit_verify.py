@@ -65,7 +65,7 @@ class TestProfiles(unittest.TestCase):
 
     def test_get_profile_returns_dict(self):
         self.assertEqual(sv.get_profile("claude-code")["pending_strategy"],
-                         "paste_sentinel")
+                         "composer_holds_text")
         self.assertEqual(sv.get_profile("codex")["pending_strategy"],
                          "composer_holds_text")
 
@@ -81,10 +81,10 @@ class TestProfiles(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------- #
-# Pending predicate — paste_sentinel (claude-code).                           #
+# Pending predicate — composer + paste sentinel (claude-code).                #
 # --------------------------------------------------------------------------- #
 
-class TestPasteSentinelPredicate(unittest.TestCase):
+class TestClaudeCodePendingPredicate(unittest.TestCase):
     def setUp(self):
         self.profile = sv.get_profile("claude-code")
 
@@ -92,13 +92,24 @@ class TestPasteSentinelPredicate(unittest.TestCase):
         pane = "some output\n[Pasted text +12 lines]\n❯ "
         self.assertTrue(sv.submit_pending(self.profile, pane, "irrelevant"))
 
-    def test_not_pending_when_sentinel_absent(self):
+    def test_pending_when_uncollapsed_composer_holds_injected_text(self):
+        text = "Drain the Pantheon mailbox and acknowledge exactly one message"
+        pane = f"some output\n❯ {text}\n"
+        self.assertTrue(sv.submit_pending(self.profile, pane, text))
+
+    def test_not_pending_when_composer_cleared(self):
         pane = "some output\n❯ \n"
         self.assertFalse(sv.submit_pending(self.profile, pane, "irrelevant"))
 
-    def test_paste_sentinel_ignores_injected_text(self):
-        # claude-code strategy keys on the pane sentinel, not the injected text.
-        self.assertFalse(sv.submit_pending(self.profile, "clean", ""))
+    def test_matching_history_above_live_composer_is_not_pending(self):
+        text = "Drain the Pantheon mailbox and acknowledge exactly one message"
+        pane = f"❯ {text}\n● completed\n❯ \n"
+        self.assertFalse(sv.submit_pending(self.profile, pane, text))
+
+    def test_profile_carries_composer_fallback(self):
+        self.assertEqual(self.profile["composer_glyph"], "❯")
+        self.assertEqual(self.profile["needle_len"], 48)
+        self.assertEqual(self.profile["paste_sentinel_scope"], "whole_pane")
 
 
 # --------------------------------------------------------------------------- #
@@ -108,6 +119,10 @@ class TestPasteSentinelPredicate(unittest.TestCase):
 class TestComposerPredicate(unittest.TestCase):
     def setUp(self):
         self.profile = sv.get_profile("codex")
+
+    def test_profile_keeps_history_safe_sentinel_scope(self):
+        self.assertEqual(
+            self.profile["paste_sentinel_scope"], "composer_region")
 
     def test_pending_when_composer_holds_text(self):
         text = "[inbound Telegram DM from the operator | chat_id=456 | message_id=7] hi there"
@@ -169,6 +184,48 @@ class TestUnknownStrategy(unittest.TestCase):
     def test_unknown_strategy_raises(self):
         with self.assertRaises(ValueError):
             sv.submit_pending({"pending_strategy": "bogus"}, "pane", "text")
+
+
+# --------------------------------------------------------------------------- #
+# ready_for_submission — runtime input readiness predicate (T-2382).          #
+# --------------------------------------------------------------------------- #
+
+class TestReadyForSubmission(unittest.TestCase):
+    """Distinct from submit_pending: this asks "would a submit right now
+    actually be accepted?", not "did my already-injected text go through?".
+    Mirrors recovery_boot_kick.sh's idle-confirm conjunction (frame + idle glyph
+    + not-a-modal), generalized to accept either harness's composer glyph."""
+
+    def test_ready_claude_code_idle_prompt(self):
+        pane = "some output\n╭──────────╮\n│ box │\n╰──────────╯\n❯ \n"
+        self.assertTrue(sv.ready_for_submission(pane))
+
+    def test_ready_codex_idle_prompt(self):
+        pane = "codex output\n" + ("─" * 25) + "\n› \n"
+        self.assertTrue(sv.ready_for_submission(pane))
+
+    def test_not_ready_when_dialog_present(self):
+        pane = (
+            "some output\n╭──────────╮\n│ box │\n╰──────────╯\n"
+            "Enter to confirm, Esc to cancel\n❯ \n"
+        )
+        self.assertFalse(sv.ready_for_submission(pane))
+
+    def test_not_ready_when_empty(self):
+        self.assertFalse(sv.ready_for_submission(""))
+
+    def test_not_ready_when_junk_pane(self):
+        self.assertFalse(sv.ready_for_submission("random junk with no frame or glyph\n"))
+
+    def test_not_ready_when_fresh_tui_not_yet_framed(self):
+        # A composer glyph can render before the TUI has finished drawing its
+        # prompt-frame box — must not false-green on the glyph alone.
+        pane = "starting up...\n❯ \n"
+        self.assertFalse(sv.ready_for_submission(pane))
+
+    def test_not_ready_when_frame_present_but_no_glyph(self):
+        pane = "╭──────────╮\n│ box │\n╰──────────╯\nno composer glyph yet\n"
+        self.assertFalse(sv.ready_for_submission(pane))
 
 
 # --------------------------------------------------------------------------- #
@@ -254,6 +311,82 @@ class TestSubmitVerifyCodex(unittest.TestCase):
         )
         self.assertFalse(r.ok)
         self.assertIn("unconfirmed", r.detail)
+
+
+class TestCodexCollapsedPaste(unittest.TestCase):
+    """T-2408: large pastes collapse to "[Pasted Content N chars]" and REPLACE
+    the composer glyph line — the needle check goes blind exactly then.
+
+    The fixture is TONIGHT'S REAL PANE (2026-08-02 10:57Z), reflow and all —
+    two collapsed kicks sat at an idle prompt for hours while submit-verify had
+    reported both submitted. A 4.5h comms gap, ended by one manual Enter.
+    """
+
+    # Verbatim shape from the live capture: no '›' line anywhere, the collapsed
+    # marker fused with reflowed tail text, status bar at rest.
+    REAL_PANE_PENDING = (
+        "  current turn first.\n"
+        "  [Pasted Content 1012 chars]e/codex/pantheon-config/tools'); import mailbox; "
+        "print(mailbox.consume('/home/the-ancestor/mailbox/codex', lambda m: ...\n"
+        "  ORG-026 Path A). Run it bare — your session holds the pantheon-mailbox group natively\n"
+        "  [Pasted Content 1012 chars] #2e/codex/pantheon-config/tools'); import mailbox; ...\n"
+        "\n"
+        "  gpt-5.6-sol xhigh fast · ~ · Main [default]\n"
+    )
+    # Post-submit shape (also measured): marker gone, placeholder composer back.
+    REAL_PANE_SUBMITTED = (
+        "\u25e6 Working (0s \u2022 esc to interrupt)\n"
+        "\n"
+        "\u203a Run /review on my current changes\n"
+        "\n"
+        "  gpt-5.6-sol xhigh fast · ~ · Main [default]\n"
+    )
+    WAKE_TEXT = ("You have 4 unread inter-agent messages in your mailbox (from "
+                 "mail_staleness, orchestrator). QUEUED, oldest first ...")
+
+    def setUp(self):
+        self.profile = sv.get_profile("codex")
+
+    def test_collapsed_paste_reads_PENDING(self):
+        # The defect: this read False ("submitted") while the paste sat unsent.
+        self.assertTrue(sv.submit_pending(
+            self.profile, self.REAL_PANE_PENDING, self.WAKE_TEXT))
+
+    def test_submitted_pane_reads_not_pending(self):
+        # And the guard must not over-fire: post-submit, placeholder composer,
+        # no marker → not pending. A false PENDING here retries Enter into a
+        # composer whose placeholder suggestion an Enter might RUN.
+        self.assertFalse(sv.submit_pending(
+            self.profile, self.REAL_PANE_SUBMITTED, self.WAKE_TEXT))
+
+    def test_marker_in_history_above_live_composer_is_not_pending(self):
+        # T-1054's scroll-up hazard applied to the sentinel: a lingering marker
+        # ABOVE a live '›' composer line is history, not a pending paste.
+        pane = ("  [Pasted Content 900 chars] old submitted thing\n"
+                "\u203a Type a message\n"
+                "  status\n")
+        self.assertFalse(sv.submit_pending(self.profile, pane, self.WAKE_TEXT))
+
+    def test_marker_ON_the_composer_line_is_pending(self):
+        """T-2408 second specimen, measured ~1h after the first fix landed: the
+        collapsed block can render ON the '›' composer line itself. The first
+        fix scoped the sentinel to lines AFTER the last glyph line and would
+        have false-greened this shape. One specimen is provenance, not
+        coverage."""
+        pane = ("\u203a [Pasted Content 1020 chars], the hub must be in your "
+                "config.toml [sandbox_workspace_write] writable_roots.)\n"
+                "  first.\n"
+                "\n"
+                "  gpt-5.6-sol xhigh fast · ~ · Main [default]\n")
+        self.assertTrue(sv.submit_pending(self.profile, pane, self.WAKE_TEXT))
+
+    def test_short_injection_needle_path_unchanged(self):
+        # Short texts never collapse; the composer-needle path must still work.
+        text = "[inbound Telegram DM from the operator | chat_id=9] yo"
+        self.assertTrue(sv.submit_pending(
+            self.profile, f"\u203a {text}\n  status\n", text))
+        self.assertFalse(sv.submit_pending(
+            self.profile, "\u203a Type a message\n  status\n", text))
 
 
 # --------------------------------------------------------------------------- #

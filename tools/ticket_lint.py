@@ -189,11 +189,20 @@ class DepGraphFinding:
         its feature parent, which already depends on the carrier). Found live
         2026-06-08 (T-0367 <-> T-0470). Neither the per-file frontmatter lint
         nor a done/missing-dep scan catches these.
-      - "stale_done_dep": an OPEN ticket whose depends_on names an already-DONE
-        ticket that ORG-013 cascade-unblock failed to strip (T-0971 fixes that
-        forward-only; nothing retroactively scans). Harmless to readiness (done
-        deps already count as satisfied) but it is bookkeeping cruft and a
-        signal cascade-unblock missed a case. 2 instances found+fixed 2026-06-08.
+      - "stale_done_dep": an OPEN ticket whose depends_on names already-DONE
+        tickets AND WHOSE EVERY DEP IS DONE — the state ORG-013 cascade-unblock
+        should have cleared outright (T-0971 fixes that forward-only; nothing
+        retroactively scans). Harmless to readiness (done deps already count as
+        satisfied) but it is bookkeeping cruft and a real signal the cascade
+        missed a case. 2 instances found+fixed 2026-06-08.
+
+        NARROWED at T-2396, and the exclusion is the point: a done dep beside a
+        still-OPEN dep is NOT flagged, because the cascade deliberately declines
+        to fire on a partial resolve and T-2177 prunes all done deps together
+        when the last one lands. That state is self-healing, so flagging it
+        emitted permanent unactionable entries into the same section as the
+        deadlock class — and its detail string accused cascade-unblock of a miss
+        it had not made.
     """
     kind: str          # "cycle" | "stale_done_dep"
     detail: str        # human-readable description (ticket ids + the issue)
@@ -969,15 +978,40 @@ def detect_dep_graph_issues(tickets_root: Path) -> list[DepGraphFinding]:
 
     findings: list[DepGraphFinding] = []
 
-    # (1) Stale done-deps: an open ticket pointing at an already-resolved dep.
+    # (1) Stale done-deps: an open ticket whose depends_on is ENTIRELY done.
+    #
+    # T-2396 — the all-done gate is load-bearing, not a tightening for neatness.
+    # ORG-013 cascade-unblock guards on _all_other_deps_done() and DELIBERATELY
+    # skips a partial resolve ("multi-dep partial-resolve; wait for the rest");
+    # T-2177 then prunes EVERY done dep at once when the last one lands. So a done
+    # dep sitting beside a still-open dep is expected, self-healing state with
+    # nothing to fix — flagging it produced permanent unactionable entries (live:
+    # T-2089, T-2219) in the same digest section that carries dependency CYCLES,
+    # i.e. real deadlocks, and taught the reader to skip it. Worse, the old detail
+    # string blamed cascade-unblock for a case it correctly declined, which cost a
+    # session tracing a ticket.py bug that does not exist.
+    #
+    # `any(... != "done")` treats an UNKNOWN dep id as not-done, so it suppresses
+    # too. That is deliberate: the cascade is fail-closed on ids it cannot reason
+    # about, so it would not have fired there either. A dangling dep id is a
+    # different defect and belongs to a different check.
     for tid in sorted(deps):
-        for dep in deps[tid]:
-            if state.get(dep) == "done":
-                findings.append(DepGraphFinding(
-                    kind="stale_done_dep",
-                    detail=(f"{tid} depends_on {dep}, which is DONE — "
-                            "cascade-unblock should have removed it"),
-                ))
+        tid_deps = deps[tid]
+        if not tid_deps or any(state.get(d) != "done" for d in tid_deps):
+            continue
+        for dep in tid_deps:
+            findings.append(DepGraphFinding(
+                kind="stale_done_dep",
+                # Attribution stays deliberately open. Every dep being done means
+                # depends_on SHOULD be empty, but the two ways to get here differ:
+                # cascade-unblock missed it, or the dep was added onto an
+                # already-resolved ticket (which the cascade never gets a chance to
+                # clear, since it only fires on resolve). Naming one would repeat
+                # this check's old mistake of asserting a cause it cannot see.
+                detail=(f"{tid} depends_on {dep}, which is DONE — every dep on "
+                        f"{tid} is done, so depends_on should be empty (cascade "
+                        "missed it, or it was added post-resolve)"),
+            ))
 
     # (2) Cycles among OPEN tickets. An edge A->B is a LIVE blocker only if B is
     #     also open (a done dep is satisfied, not a deadlock edge). Standard DFS
@@ -1014,6 +1048,113 @@ def detect_dep_graph_issues(tickets_root: Path) -> list[DepGraphFinding]:
         if color[tid] == WHITE:
             _dfs(tid, [])
 
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# T-2833: unanchored / bad not_before date-gate scan (report-only).
+#
+# Every not_before date gate must carry a `operator:<T-NNNN|tg:MSGID>` anchor
+# (ticket.py enforces this at SET time; this scan surfaces PRE-EXISTING gates
+# grandfathered before the rule, and any hand-edited violation the CLI didn't
+# gate). A date gate may mean exactly one thing — "the operator picked this date" —
+# so a gate that is unanchored, malformed, or cites a non-existent ticket is a
+# candidate for migration to a --depends-on dependency or an event-driven watch.
+# ---------------------------------------------------------------------------
+
+# Mirror of ticket.py's anchor rule (kept local to avoid a lint->ticket import
+# cycle; the shapes must stay in sync). Two legal forms: operator:<T-NNNN|tg:digits>
+# and event:<KIND>:<param> with KIND a closed enum (cert-expiry/key-expiry/
+# cadence/window) — the closed set keeps "fresh_session" out.
+_LINT_OPERATOR_ANCHOR_RE = re.compile(r"^operator:(T-\d{4}|tg:\d+)$")
+_LINT_EVENT_ANCHOR_KINDS = ("cert-expiry", "key-expiry", "cadence", "window")
+_LINT_EVENT_ANCHOR_RE = re.compile(
+    r"^event:(?:" + "|".join(_LINT_EVENT_ANCHOR_KINDS) + r"):.+$"
+)
+
+
+@dataclass
+class UnanchoredGateFinding:
+    """A not_before date gate that fails the T-2833 anchor rule (report-only).
+
+    kinds:
+      - "unanchored"      — not_before set, no not_before_anchor at all.
+      - "malformed"       — anchor present but not operator:<T-NNNN|tg:MSGID>
+                            (e.g. the `event:fresh_session` / `operator:fresh_session`
+                            free-text bypass the CLI now refuses).
+      - "dangling"        — anchor is operator:T-NNNN but that ticket does not exist.
+    """
+    tid: str
+    kind: str      # "unanchored" | "malformed" | "dangling"
+    detail: str
+
+
+def _ticket_scalar_field(path: Path, key: str) -> str | None:
+    """Read one scalar frontmatter field's value (or None). Same lightweight,
+    validation-free idiom as _ticket_depends_on — a ticket missing some OTHER
+    required field is still analyzed."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+    fm = m.group(1) if m else text
+    fm_match = re.search(rf"^{re.escape(key)}:\s*(.+)$", fm, re.MULTILINE)
+    if not fm_match:
+        return None
+    val = fm_match.group(1).strip()
+    return val or None
+
+
+def detect_unanchored_gates(tickets_root: Path) -> list[UnanchoredGateFinding]:
+    """Corpus scan (inbox+active) for not_before gates that fail the anchor rule.
+
+    Report-only, no mutation. Dangling-ref resolution checks against ALL states
+    (an operator-anchor may cite a resolved decision ticket in done/)."""
+    # All ticket ids across every state, for dangling-ref resolution.
+    all_ids: set[str] = set()
+    for st in _DEP_GRAPH_ALL_STATES:
+        d = tickets_root / st
+        if not d.exists():
+            continue
+        for entry in d.iterdir():
+            if entry.is_file() and TICKET_FILENAME_RE.fullmatch(entry.name):
+                all_ids.add(entry.stem)
+
+    findings: list[UnanchoredGateFinding] = []
+    for st in STATES_TO_LINT:  # inbox + active only (done gates are inert)
+        d = tickets_root / st
+        if not d.exists():
+            continue
+        for entry in sorted(d.iterdir()):
+            if not entry.is_file() or not TICKET_FILENAME_RE.fullmatch(entry.name):
+                continue
+            not_before = _ticket_scalar_field(entry, "not_before")
+            if not not_before:
+                continue  # no date gate → nothing to anchor
+            tid = entry.stem
+            anchor = _ticket_scalar_field(entry, "not_before_anchor")
+            if not anchor:
+                findings.append(UnanchoredGateFinding(
+                    tid, "unanchored",
+                    f"{tid}: not_before {not_before} has no anchor — migrate to "
+                    "--depends-on or an event-driven watch, or anchor to the operator"))
+                continue
+            m = _LINT_OPERATOR_ANCHOR_RE.match(anchor)
+            if m:
+                ref = m.group(1)
+                if ref.startswith("T-") and ref not in all_ids:
+                    findings.append(UnanchoredGateFinding(
+                        tid, "dangling",
+                        f"{tid}: not_before anchor cites {ref}, which does not exist"))
+                continue
+            if _LINT_EVENT_ANCHOR_RE.match(anchor):
+                continue  # valid real-world-event anchor
+            findings.append(UnanchoredGateFinding(
+                tid, "malformed",
+                f"{tid}: not_before anchor {anchor!r} is not "
+                "operator:<T-NNNN|tg:MSGID> or event:<kind>:<param> "
+                "(free-text reasons aren't gates)"))
     return findings
 
 
@@ -1139,6 +1280,7 @@ def build_lint_digest(
     retarget_verb: str = "Retargeted to originator",
     orphan_ratifications: list[OrphanRatification] | None = None,
     dep_graph_findings: list[DepGraphFinding] | None = None,
+    unanchored_gates: list[UnanchoredGateFinding] | None = None,
     warned: list[LintResult] | None = None,
 ) -> str:
     """Render the lint digest as plain text (no Markdown parse_mode).
@@ -1161,12 +1303,13 @@ def build_lint_digest(
     retargeted = retargeted or []
     orphan_ratifications = orphan_ratifications or []
     dep_graph_findings = dep_graph_findings or []
+    unanchored_gates = unanchored_gates or []
     warned = warned or []
     header = f"[Recovery · ticket-lint · {now_iso}]"
 
     if (not auto_fixed and not flagged and not retargeted
             and not orphan_ratifications and not dep_graph_findings
-            and not warned):
+            and not unanchored_gates and not warned):
         return (
             f"{header}\n\n"
             f"All {total_scanned} ticket(s) scanned: all clean.\n"
@@ -1223,6 +1366,21 @@ def build_lint_digest(
                 "(cascade-unblock should have)."
             )
             lines.append("")
+
+    # T-2833: not_before date gates that fail the anchor rule.
+    if unanchored_gates:
+        lines.append(
+            f"Unanchored/bad date gates — a not_before must anchor to the operator "
+            f"or be a depends_on ({len(unanchored_gates)}):"
+        )
+        for g in unanchored_gates:
+            lines.append(f"  - [{g.kind}] {g.detail}")
+        lines.append(
+            "    Fix: clear the date (ticket.py block <id> --clear-not-before) and "
+            "either --depends-on a real blocker, use an event-driven watch, or "
+            "re-set with --not-before-anchor operator:<T-NNNN|tg:MSGID>."
+        )
+        lines.append("")
 
     # T-1105 / ORG-034: serves-field nudges — soft advisory, last section so
     # malformation sections read first. Never blocks or affects exit code.
@@ -1350,6 +1508,10 @@ def _do_lint(
     # (report-only; no mutation).
     dep_graph_findings = detect_dep_graph_issues(_tickets_root)
 
+    # T-2833: corpus-level not_before-anchor scan — unanchored / malformed /
+    # dangling date gates (report-only; surfaces gates for migration).
+    unanchored_gates = detect_unanchored_gates(_tickets_root)
+
     # T-1105 / ORG-034: serves-field advisory warnings. Pass all scanned paths
     # to warn_tickets(); it self-filters to inbox-only (single source of truth
     # for that predicate). Warns never affect failures, push, or exit code.
@@ -1442,6 +1604,7 @@ def _do_lint(
             retarget_verb=retarget_verb,
             orphan_ratifications=orphan_ratifications,
             dep_graph_findings=dep_graph_findings,
+            unanchored_gates=unanchored_gates,
             warned=warn_results,
         )
         if failures > 0 or not commit_ok:

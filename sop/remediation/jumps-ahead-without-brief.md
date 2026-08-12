@@ -4,7 +4,7 @@
 
 ## Failure shape
 
-A pre-staged worker (typically implementer; sometimes reviewer) starts emitting artifacts before receiving its dispatch brief. The worker exists in-session via TeamCreate's pre-staging mechanism — its persona prompt loaded, the team context visible — but no orchestrator-issued brief has yet been delivered. The worker proceeds anyway, often inferring the task from team-name conventions, persona-default context, or prior-cycle recall.
+A pre-staged worker (typically implementer; sometimes reviewer) starts emitting artifacts before receiving its dispatch brief. The worker exists in-session — spawned via the Agent tool with a name and persona, brief to follow via SendMessage (the pre-stage-by-exception pattern; ORG-036's default is orchestrator self-spawn WITH the brief inline, which structurally avoids this SOP's window) — but no dispatcher-issued brief has yet been delivered. The worker proceeds anyway, often inferring the task from its name, persona-default context, or prior-cycle recall. *(Historical variants below reference the TeamCreate-era pre-stage mechanism, removed in CC 2.1.178; the failure shape survives wherever spawn and brief are separated in time.)*
 
 Distinct from `plan-first-violation` (worker has the brief but skips plan-tier and jumps to code). Distinct from `claimed-prior-approval` (worker invents approval that wasn't given). This is **brief-absence variance**: the worker had nothing concrete to comply with, so they extrapolated.
 
@@ -31,7 +31,7 @@ The pattern is structurally the EARLIEST failure in a cycle's discipline chain �
 
 Ranked by precedent + cost.
 
-*Terms used below.* "Brief" = the orchestrator's complete dispatch brief, carrying scope + hard-stops + readback-gates + brief-named tests if applicable. "Pre-stage" = TeamCreate'd worker spawned but not yet dispatched. "Stay-idle window" = the time between pre-stage and brief-dispatch when the worker must produce no artifacts.
+*Terms used below.* "Brief" = the dispatcher's complete dispatch brief, carrying scope + hard-stops + readback-gates + brief-named tests if applicable. "Pre-stage" = a worker spawned (Agent + name) but not yet dispatched — the by-exception pattern whose brief arrives via a later SendMessage. "Stay-idle window" = the time between pre-stage and brief-dispatch when the worker must produce no artifacts.
 
 **Path A — Orchestrator REBOUND + brief-delivery + stay-idle-rule reaffirmation.** *Default for first-occurrence; tests whether the worker honors the stay-idle rule once explicitly delivered.*
 
@@ -52,7 +52,7 @@ Ranked by precedent + cost.
 - HO does: SendMessage-shutdown the current workers, then Agent-spawn a fresh cycle with new orchestrator + new implementer + new reviewer; persona briefs (`~/.claude/agents/<persona>.md`) audited for stay-idle rule presence — if absent or weakened, file a persona-amendment ticket (separate ticket, HO-direct or Recovery-target per `claude-config` submodule conventions); new team's dispatch brief carries the readback-gate from Path B.
 - Why: persona-conditioning regression isn't fixable at brief-tier; it needs persona-tier amendment. Path C separates the live-cycle remediation (fresh team) from the persona-tier discipline (separate amendment ticket).
 - Expected outcome: live cycle proceeds with corrected discipline; persona-amendment ticket addresses the systemic source.
-- When to escalate: if Path C also surfaces jumps-ahead, bubble up — pattern signals harness-tier issue (TeamCreate's pre-stage mechanism may need a structural change, e.g., explicit "ready" signal from orchestrator before workers receive any context). Candidate research-dispatch.
+- When to escalate: if Path C also surfaces jumps-ahead, bubble up — pattern signals harness-tier issue (the spawn-then-brief pre-stage pattern may need a structural change, e.g., explicit "ready" signal from the dispatcher before workers receive any context). Candidate research-dispatch.
 
 ## Autonomous-vs-bubble-up D3 placement
 
@@ -66,7 +66,7 @@ This SOP is the *post-jump-ahead* remediation. The *pre-jump-ahead* discipline l
 
 1. **Persona-brief stay-idle rule** — every implementer/reviewer persona brief at `~/.claude/agents/<persona>.md` carries the stay-idle rule verbatim ("you do not emit artifacts before receiving a dispatch brief from your orchestrator"). Tracked by `claude-config` submodule. Per b33-incident-followup; T-0170 was the first cycle with the amendment fully applied. Codified now as standard discipline.
 2. **Pre-stage timing discipline** — orchestrator pattern: dispatch brief *immediately* after pre-stage spawn, never with a gap. The "stay-idle window" should be measured in seconds, not minutes — minimize the variance surface. Per `sop/standard/team-orchestrator-dispatch-checklist.md`.
-3. **Harness-tier ready-signal** — speculative: TeamCreate / Agent could withhold the pre-staged worker's first turn until an explicit "ready" signal from the orchestrator. No mechanism today; candidate Anthropic feedback / harness-research per `lessons/structural-enforcement-retires-the-prose-rule.md`. If such a primitive lands, layers 1 + 2 retire.
+3. **Harness-tier ready-signal** — speculative: the Agent tool could withhold a pre-staged worker's first turn until an explicit "ready" signal from the dispatcher. No mechanism today; candidate Anthropic feedback / harness-research per `lessons/structural-enforcement-retires-the-prose-rule.md`. If such a primitive lands, layers 1 + 2 retire. *(ORG-036's spawn-with-brief-inline default already structurally avoids the window for the common case.)*
 
 Until structural enforcement lands at layer 3, layers 1 + 2 are the prevention surface and this SOP fires when either lapses.
 

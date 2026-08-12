@@ -219,7 +219,7 @@ After all three cycles pass:
 1. Resolve T-0042 with the end-to-end acceptance evidence (`PANTHEON_ACTOR=orchestrator python3 tools/ticket.py resolve T-0042 --with "..."`).
 2. Append a B9-arc-completion ledger entry chaining T-0051 + T-0052 + T-0042 ids and the smoke-fire results.
 3. Co-author this checklist's content into git so it's preserved (this section was a TODO placeholder until first-fire). Already done if you're reading this in committed form.
-4. Shut down the b9-inbox-consumer team via SendMessage `shutdown_request` to b9-lead and b9-implementer; then `TeamDelete b9-inbox-consumer`.
+4. Shut down the b9-inbox-consumer workers via SendMessage `shutdown_request` to b9-lead and b9-implementer. *(Mechanics re-expressed 2026-07-19, T-1817: TeamCreate/TeamDelete were removed in CC 2.1.178 — teams are session-implicit with no teardown verb; the shutdown concern is "no orphaned background teammate," which the shutdown_request round satisfies on its own.)*
 5. Recovery picks up T-0053 (Recovery-side install) on her own flow; her supervised first-fire is a sibling exercise scoped to the claude-fallback user.
 
 ## How to handle a stuck inject

@@ -1145,7 +1145,8 @@ class TestRetargetDetachedHeadPush(unittest.TestCase):
         repo_tools = Path(__file__).resolve().parent
         wt_tools = self._env.repo_path / "tools"
         wt_tools.mkdir(parents=True, exist_ok=True)
-        for fname in ("ticket.py", "_git_utils.py", "agent_role_map.py", "hermes_action.py"):
+        for fname in ("ticket.py", "_git_utils.py", "agent_role_map.py", "hermes_action.py",
+                      "_md_table.py"):  # T-1936: ticket.py's README-row emitter imports it
             src = repo_tools / fname
             if src.exists():
                 shutil.copy2(src, wt_tools / fname)
@@ -1231,6 +1232,92 @@ class TestRetargetDetachedHeadPush(unittest.TestCase):
         self.assertNotIn("target: operator", text)
 
 
+class TestUnanchoredGates(unittest.TestCase):
+    """detect_unanchored_gates: T-2833 not_before-anchor scan (unanchored / malformed / dangling)."""
+
+    def setUp(self) -> None:
+        _require_lint(self)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tickets = Path(self._tmp.name)
+        for st in ("inbox", "active", "done"):
+            (self.tickets / st).mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _mk(self, tid, state, not_before=None, anchor=None):
+        lines = ["---", f"id: {tid}", "target: recovery", f"state: {state}"]
+        if not_before:
+            lines.append(f"not_before: {not_before}")
+        if anchor:
+            lines.append(f"not_before_anchor: {anchor}")
+        fm = "\n".join(lines) + "\n---\n\n" + f"# {tid}\n\n## Transition log\n\n- x\n"
+        (self.tickets / state / f"{tid}.md").write_text(fm, encoding="utf-8")
+
+    def _detect(self):
+        return ticket_lint.detect_unanchored_gates(self.tickets)
+
+    def test_no_not_before_not_flagged(self):
+        self._mk("T-0001", "inbox")
+        self.assertEqual(self._detect(), [])
+
+    def test_unanchored_flagged(self):
+        self._mk("T-0001", "inbox", not_before="2026-09-01T00:00:00Z")
+        fs = self._detect()
+        self.assertEqual([(f.tid, f.kind) for f in fs], [("T-0001", "unanchored")])
+
+    def test_freetext_anchor_flagged_malformed(self):
+        self._mk("T-0001", "active", not_before="2026-09-01T00:00:00Z",
+                 anchor="event:fresh_session")
+        self.assertEqual([f.kind for f in self._detect()], ["malformed"])
+
+    def test_dangling_ticket_anchor_flagged(self):
+        self._mk("T-0001", "inbox", not_before="2026-09-01T00:00:00Z",
+                 anchor="operator:T-7777")
+        self.assertEqual([f.kind for f in self._detect()], ["dangling"])
+
+    def test_valid_ticket_anchor_not_flagged(self):
+        self._mk("T-0002", "done")  # the cited decision ticket exists (resolved)
+        self._mk("T-0001", "inbox", not_before="2026-09-01T00:00:00Z",
+                 anchor="operator:T-0002")
+        self.assertEqual(self._detect(), [])
+
+    def test_valid_tg_anchor_not_flagged(self):
+        self._mk("T-0001", "inbox", not_before="2026-09-01T00:00:00Z",
+                 anchor="operator:tg:5644")
+        self.assertEqual(self._detect(), [])
+
+    def test_valid_event_anchor_not_flagged(self):
+        # T-2833(b): a closed-enum real-world-event anchor is compliant.
+        self._mk("T-0001", "inbox", not_before="2026-09-10T00:00:00Z",
+                 anchor="event:cert-expiry:snowis.me")
+        self.assertEqual(self._detect(), [])
+
+    def test_bad_event_kind_flagged_malformed(self):
+        self._mk("T-0001", "inbox", not_before="2026-09-10T00:00:00Z",
+                 anchor="event:whenever:x")
+        self.assertEqual([f.kind for f in self._detect()], ["malformed"])
+
+    def test_done_gate_not_scanned(self):
+        # done/ gates are inert — not in STATES_TO_LINT.
+        self._mk("T-0001", "done", not_before="2026-09-01T00:00:00Z")
+        self.assertEqual(self._detect(), [])
+
+    def test_digest_section_rendered_when_present(self):
+        g = ticket_lint.UnanchoredGateFinding("T-0001", "unanchored", "T-0001: no anchor")
+        digest = ticket_lint.build_lint_digest(
+            "2026-08-11", auto_fixed=[], flagged=[], total_scanned=1,
+            unanchored_gates=[g])
+        self.assertIn("Unanchored/bad date gates", digest)
+        self.assertIn("T-0001", digest)
+
+    def test_digest_section_omitted_when_empty(self):
+        digest = ticket_lint.build_lint_digest(
+            "2026-08-11", auto_fixed=[], flagged=[], total_scanned=1,
+            unanchored_gates=[])
+        self.assertNotIn("Unanchored/bad date gates", digest)
+
+
 class TestDepGraphIssues(unittest.TestCase):
     """detect_dep_graph_issues: corpus-level cycle + stale-done-dep detection (T-0975)."""
 
@@ -1277,6 +1364,51 @@ class TestDepGraphIssues(unittest.TestCase):
         self.assertEqual(findings[0].kind, "stale_done_dep")
         self.assertIn("T-0001", findings[0].detail)
         self.assertIn("T-0009", findings[0].detail)
+
+    def test_done_dep_with_another_dep_still_open_is_NOT_flagged(self) -> None:
+        """T-2396: the partial-resolve case is EXPECTED state, not a defect.
+
+        ORG-013 cascade-unblock guards on _all_other_deps_done() and deliberately
+        skips a partial resolve ("multi-dep partial-resolve; wait for the rest"), and
+        T-2177 then prunes EVERY done dep at once when the last one lands. So a done
+        dep sitting beside a still-open dep is self-healing by construction — there is
+        nothing to fix, and flagging it accused ticket.py of a bug it does not have.
+        Live false positives this closes: T-2089 [T-2009 done, T-2306 open] and
+        T-2219 [T-2222 done, T-2250 open], both reported every grooming run.
+        """
+        self._mk("T-0001", "inbox", ["T-0009", "T-0010"])
+        self._mk("T-0009", "done", [])
+        self._mk("T-0010", "inbox", [])
+        stale = [f for f in self._detect() if f.kind == "stale_done_dep"]
+        self.assertEqual(
+            stale, [],
+            "flagged a done dep on a ticket that is still legitimately gated by "
+            "another OPEN dep — the cascade correctly declined to fire here",
+        )
+
+    def test_all_deps_done_is_still_flagged_and_names_every_dep(self) -> None:
+        """The complement, and the case that must NOT be lost: when EVERY dep is done
+        the cascade should have fired and left depends_on empty, so this is a real
+        miss — the T-2177 bug class. Both deps are reported, not just one."""
+        self._mk("T-0001", "inbox", ["T-0009", "T-0010"])
+        self._mk("T-0009", "done", [])
+        self._mk("T-0010", "done", [])
+        stale = [f for f in self._detect() if f.kind == "stale_done_dep"]
+        self.assertEqual(len(stale), 2)
+        self.assertEqual(
+            sorted(d for f in stale for d in ("T-0009", "T-0010") if d in f.detail),
+            ["T-0009", "T-0010"],
+        )
+
+    def test_unknown_dep_does_not_resurrect_the_false_positive(self) -> None:
+        """A dep id that resolves to no ticket must keep the finding SUPPRESSED, not
+        act as a done-equivalent. The cascade is fail-closed on ids it cannot reason
+        about, so it would not have fired here either; treating unknown as satisfied
+        would reintroduce exactly the false positive this ticket removed."""
+        self._mk("T-0001", "inbox", ["T-0009", "T-9999"])
+        self._mk("T-0009", "done", [])
+        stale = [f for f in self._detect() if f.kind == "stale_done_dep"]
+        self.assertEqual(stale, [])
 
     def test_done_dep_is_not_a_cycle_edge(self) -> None:
         # T-0001 -> T-0002 (open) and T-0002 -> T-0001 BUT T-0002 is done.

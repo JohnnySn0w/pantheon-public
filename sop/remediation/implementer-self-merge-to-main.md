@@ -26,7 +26,7 @@ Pattern: every recurrence has the same shape (worker briefed on plan-first + no-
 
 Ranked by precedent + cost. HO applies one of Paths A/B/C; never "do nothing."
 
-*Terms used below.* "HO-direct" = HO doing the work in their own session (no worker dispatch / no TeamCreate). Faster for small scope but consumes HO context budget; per D8 the ceiling is 3+ edits / >2 files / ~50 LoC / any design-decision — past that, halt and redispatch via team-pattern. "Fresh-team redispatch" = HO terminates the current implementer-context and spawns a new TeamCreate'd cycle with carry-forward DECISIONS + readback-gate + triple-defense brief language; per D8 the trigger is N=2 plan iterations stuck in the same context.
+*Terms used below.* "HO-direct" = HO doing the work in their own session (no worker dispatch). Faster for small scope but consumes HO context budget; per D8 the ceiling is 3+ edits / >2 files / ~50 LoC / any design-decision — past that, halt and redispatch via team-pattern. "Fresh-team redispatch" = HO terminates the current implementer-context and spawns a fresh orchestrator+worker cycle (Agent-name spawns on the session's implicit team, orchestrator self-spawns its workers per ORG-036) with carry-forward DECISIONS + readback-gate + triple-defense brief language; per D8 the trigger is N=2 plan iterations stuck in the same context.
 
 **Path A — Revert + HO-direct re-implementation.** *Highest precedent; default for single-self-merge incidents.*
 - HO does: `git revert <commit>` on main immediately on detection; re-implements the work HO-direct using the original brief (or via fresh-team if scope warrants).
@@ -36,7 +36,7 @@ Ranked by precedent + cost. HO applies one of Paths A/B/C; never "do nothing."
 
 **Path B — Revert + redispatch with carry-forward DECISIONS.** *Use when implementer-context shows sticky-belief drift OR HO-direct re-implementation would burn HO's context budget. Two sub-shapes ranked by escalation cost — try B1 first.*
 
-- **B1: Worker-only redispatch** (default; cheaper; preserves orchestrator context). HO does: revert; ask the orchestrator to terminate the current implementer-context + spawn a fresh implementer with carry-forward DECISIONS set + readback-gate at plan-tier + triple-defense brief language. Orchestrator-context stays warm — no TeamCreate cycle. Use when sticky-belief is implementer-tier only.
+- **B1: Worker-only redispatch** (default; cheaper; preserves orchestrator context). HO does: revert; ask the orchestrator to terminate the current implementer-context + spawn a fresh implementer with carry-forward DECISIONS set + readback-gate at plan-tier + triple-defense brief language. Orchestrator-context stays warm — no whole-cycle respawn. Use when sticky-belief is implementer-tier only.
 - **B2: Whole-team redispatch** (escalation; only if B1 also drifts OR orchestrator-context shows contamination from the prior worker's framing). HO does: SendMessage-shutdown the existing team, then Agent-spawn a fresh cycle with new orchestrator + new implementer + new reviewer; same carry-forward DECISIONS + readback-gate + triple-defense.
 - Why: per D8 sticky-belief discipline (N=2 trigger), fresh-context is the structural reset; B1 keeps the reset minimum-traversal per D10 (only the contaminated tier resets). Whole-team escalation reserved for the rare case where sticky-belief has bled up-tier.
 - Expected outcome: clean re-land via the new context; original implementer's session-context becomes "burned" for this cycle (B1) or whole prior team is replaced (B2).

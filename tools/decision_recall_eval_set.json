@@ -1,0 +1,145 @@
+{
+  "_note": "Hand-labeled eval set for T-2816 (decision-recall PoC). Authored BEFORE any retriever tuning against these scenarios or their expected labels — the discipline the brief asked for, so this set isn't fit to whatever the retriever happens to score well on. The one retriever change made before this file existed (adding 'about'/'without'/etc. to the stopword list) was driven by a SYNTHETIC unit-test fixture finding (tools/test_decision_recall_poc.py), not by these scenarios or the real ADR corpus. Positive scenarios are deliberately paraphrased away from the trigger-sidecar wording (tools/decision_recall_triggers.json), not copied from it, to avoid testing string-matching rather than retrieval. Negative scenarios split into 'easy' (no topical relation to any sidecar ADR) and 'hard' (topically adjacent to a sidecar ADR but should NOT fire it) to actually stress precision/false-trigger-rate, not just hit-rate. This is a rough first signal from one author's judgment calls, not ground truth — see decision_recall_poc_RESULTS.md for the caveat this carries into the numbers.",
+  "scenarios": [
+    {
+      "scenario": "About to resolve T-2100, which three other inbox tickets list as a depends_on dependency -- do I need to manually go move those tickets forward myself?",
+      "expected": ["ORG-013"]
+    },
+    {
+      "scenario": "A ticket in inbox/ has been sitting for days with depends_on pointing at a ticket that resolved yesterday -- is that supposed to clear itself automatically?",
+      "expected": ["ORG-013"]
+    },
+    {
+      "scenario": "Drafting a new ratify ticket for a design note -- trying to decide whether the ratifiable_files field should point at the notes/ draft itself or somewhere else.",
+      "expected": ["ORG-015"]
+    },
+    {
+      "scenario": "Committing a new standing-topic write-up under research/2026-08-11-topic/ instead of knowledge/episodic/.",
+      "expected": ["ORG-017"]
+    },
+    {
+      "scenario": "This ticket can't proceed until Thursday -- should I git mv it into tickets/blocked/ or just leave it sitting in inbox/?",
+      "expected": ["ORG-019"]
+    },
+    {
+      "scenario": "Filing a ticket with labels: [ratification] but I haven't set --ratifiable-file yet -- will ticket.py let that through as-is?",
+      "expected": ["ORG-022"]
+    },
+    {
+      "scenario": "Two agent instances need to hand off a task reliably -- should we stand up a small message broker between claude and claude-research for it?",
+      "expected": ["ORG-026"]
+    },
+    {
+      "scenario": "Provisioning a fourth long-lived Claude Code seat on the VPS -- should it share the existing claude unix account or get its own?",
+      "expected": ["ORG-033"]
+    },
+    {
+      "scenario": "Writing the opening line of a dispatch brief for an implementer and not sure what to put first.",
+      "expected": ["ORG-034"]
+    },
+    {
+      "scenario": "About to dispatch a project-orchestrator for a multi-ticket arc -- should I pre-spawn its implementer and reviewer myself first?",
+      "expected": ["ORG-036"]
+    },
+    {
+      "scenario": "The orchestrator I just launched hasn't spawned any workers of its own yet -- is HO supposed to be doing that on its behalf?",
+      "expected": ["ORG-036"]
+    },
+    {
+      "scenario": "Drafting an ADR status line that says the document was ratified by the operator -- does it need a Telegram message id cited for that claim to count?",
+      "expected": ["ORG-040"]
+    },
+    {
+      "scenario": "Post-compaction, I'm not sure if this policy file was actually ratified or if I just drafted it and forgot to follow up.",
+      "expected": ["ORG-040"]
+    },
+    {
+      "scenario": "Adding a new git remote to a repo's config with the literal https clone URL hardcoded in, since that's fastest right now.",
+      "expected": ["ORG-046"]
+    },
+    {
+      "scenario": "Sketching how our seed will prove its identity to an external Pantheon-like seed run by somebody else entirely.",
+      "expected": ["ORG-047"]
+    },
+    {
+      "scenario": "Writing an installer step that copies a secret file directly into a brand new persona's home directory to bootstrap it.",
+      "expected": ["ORG-050"]
+    },
+    {
+      "scenario": "Designing a sudoers rule that would let one agent's unix account read another account's credentials directly.",
+      "expected": ["ORG-050", "ORG-051"]
+    },
+    {
+      "scenario": "Storing a freshly issued bot token as a plain .pass file sitting in the account's home directory.",
+      "expected": ["ORG-051"]
+    },
+    {
+      "scenario": "Kicking off a brand new repo for a side project without connecting it to anything else Pantheon is already building.",
+      "expected": ["ORG-053"]
+    },
+    {
+      "scenario": "Trying to figure out if 'the project' means this one git repo, or the longer-running program the repo happens to be part of.",
+      "expected": ["ORG-054"]
+    },
+    {
+      "scenario": "Standing up a brand new daemon for an agent without writing down what should happen if it goes down.",
+      "expected": ["ORG-056"]
+    },
+    {
+      "scenario": "Decommissioning a service and realizing nobody wrote down its removal contract or degradation limits.",
+      "expected": ["ORG-056"]
+    },
+    {
+      "scenario": "Proposing to start building the voice interface before the installer-and-seed-viability stage has any exit evidence at all.",
+      "expected": ["ORG-061"]
+    },
+    {
+      "scenario": "Fixing a typo in a code comment inside tools/ticket.py.",
+      "expected": []
+    },
+    {
+      "scenario": "Checking free disk space on the VPS before kicking off a big download.",
+      "expected": []
+    },
+    {
+      "scenario": "Renaming a local Python loop variable for readability in a script nobody else touches.",
+      "expected": []
+    },
+    {
+      "scenario": "Looking up what time it currently is in Chicago.",
+      "expected": []
+    },
+    {
+      "scenario": "Restarting a systemd --user service after a routine unit-file edit, same daemon, same contract, nothing new.",
+      "expected": []
+    },
+    {
+      "scenario": "Grepping tickets/inbox/ for anything unclaimed to pick up next, not resolving anything with dependants of its own.",
+      "expected": []
+    },
+    {
+      "scenario": "Reading an already-ratified ADR to understand existing architecture, not drafting a new ratification claim of any kind.",
+      "expected": []
+    },
+    {
+      "scenario": "Adding one more example to an existing test file's docstring list of covered cases.",
+      "expected": []
+    },
+    {
+      "scenario": "Pushing a routine commit to an agent/<task> branch that a reviewer already approved earlier today.",
+      "expected": []
+    },
+    {
+      "scenario": "Reading the weekly ledger shard to see what happened yesterday.",
+      "expected": []
+    },
+    {
+      "scenario": "A teammate asks what your favorite color is.",
+      "expected": []
+    },
+    {
+      "scenario": "Grepping bugs/ for a known footgun before touching a file, the way the existing feedback-recall hook already covers.",
+      "expected": []
+    }
+  ]
+}

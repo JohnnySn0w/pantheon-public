@@ -1,0 +1,21 @@
+[Unit]
+Description=Pantheon fleet clone-currency check — read-only per-seat drift detector, mailbox-alerts orchestrator on drift (T-2798/T-2794 option-b)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Read-only across the fleet: `git rev-parse HEAD` only -- own account direct,
+# every other account via `sudo -S -k -u <account>`, password piped from
+# /home/claude/root.env (orchestrator has no NOPASSWD cross-account sudo, unlike
+# recovery's monitors). Never fetches/pulls/mutates a seat's clone. Alerts
+# orchestrator's own mailbox on drift or an unverifiable seat -- pulls stay
+# supervised (T-2794 option-b).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/fleet_clone_currency_check.py --check
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=3min

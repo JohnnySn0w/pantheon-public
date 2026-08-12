@@ -84,6 +84,10 @@ the migration crosses a language boundary that warrants its own scope.
 
 ---
 
+## Recovery carve-out INVARIANT (T-1826 design, T-1829 landed)
+
+The producer-repoint program (send-keys → `mailbox.send()`, T-1826) migrates **work-turn** producers only. The following stay pane-based (`send_keys_submit.sh`) **permanently — this is a design invariant, not a rollout phase**: `ho_resumer` (post-cap-hit resume), `restart_drain` → `handoff_and_restart.sh` (restart choreography), `context_fill_monitor` / `activity_monitor` / Recovery `verify_startup` de-wedge pokes, and all cross-agent recovery injections per this SOP. Why: the recovery layer must not ride the mechanism it exists to recover — a wedged/dead session consumes no mailbox, and the bridge/waker being the wedged component is exactly the failure these tools break. Pane-level send-keys is the lowest common denominator that works on a sick session. Full rationale: `knowledge/episodic/2026-07-20-producer-repoint-mailbox-design/notes.md` §1.
+
 ## Test coverage
 
 `tools/test_send_keys_submit.sh` — 5 cases:

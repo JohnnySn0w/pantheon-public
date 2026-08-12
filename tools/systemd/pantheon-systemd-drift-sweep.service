@@ -1,0 +1,29 @@
+[Unit]
+Description=Pantheon cross-account systemd-unit drift sweep — report installed-vs-repo drift on every seat, from recovery (T-2444)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# RECOVERY-ONLY by construction: the sweep reads every pantheon account's
+# ~/.config/systemd/user via recovery's NOPASSWD sudo — the capability the per-seat
+# lint cannot use, and the reason a paused/low-activity seat's drift is otherwise
+# invisible (coverage is proportional to activity; staleness is inverse to it).
+#
+# REPORT, NEVER SYNC. Reads only. It names drift on other seats' substrate and
+# routes an alert; a human decides whether to re-copy, because the repo is
+# canonical for CONTENT but not automatically CORRECT (the T-2444 recon found one
+# unit whose INSTALLED copy was right and whose repo copy was stale). It holds no
+# authority to mutate another account and takes none.
+#
+# TimeoutStartSec exceeds 8 accounts x the reader's 45s probe budget with room to
+# spare; a monitor killed by its own timeout would fire OnFailure and report the
+# monitor rather than the drift (the same-second-timeout trap).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/systemd_drift_sweep.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=8min

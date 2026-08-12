@@ -1,0 +1,22 @@
+[Unit]
+Description=Pantheon memory-snapshot coverage monitor — detect a per-seat snapshot timer that has silently STOPPED (T-2838; the T-1871 mnemosyne rot: snapshots quietly ceased ~07-29 and nobody noticed for ~12 days)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Per covered memory-bearing seat (recovery/orchestrator/specialist/atlas/metis via
+# pantheon-agent-state-snapshot.timer; mnemosyne via mnemosyne-state-snapshot.timer),
+# check that the seat's snapshot TIMER is active+enabled with a near-future fire —
+# the idle-seat-proof signal (a healthy timer on a quiet seat legitimately produces
+# no new commit, so commit-age would false-alarm; timer health does not). Cross-account
+# systemd + git reads via Recovery's sudo grants. A stalled timer routes to the Recovery-triage
+# channel (Recovery-fixable: restart the timer). Fail-open; always exits 0.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/memory_snapshot_coverage_monitor.py --all
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=3min

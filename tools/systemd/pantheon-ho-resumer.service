@@ -3,6 +3,9 @@ Description=Pantheon HO auto-resumer — poll and fire claude --resume on cap-hi
 Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
 After=network.target
 
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
 [Service]
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
@@ -11,4 +14,15 @@ Environment=PATH=%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/python3 %h/pantheon-config/tools/ho_resumer.py
 StandardOutput=journal
 StandardError=journal
-TimeoutStartSec=10min
+# T-1957: the resumer subprocess.run BLOCKS through the ENTIRE resumed
+# `claude --resume <sid> -p` turn inside this oneshot's activation — a real
+# resumed HO work-turn routinely exceeds any fixed bound, and TimeoutStartSec
+# SIGTERMs the whole control-group at the deadline (mechanism live-verified
+# 2026-07-23: Result=timeout, status=15/TERM, unit failed). infinity is
+# DELIBERATE: the resume IS the work, and the timer's no-overlap semantics
+# (no re-activation while active) plus the state-file rotation already bound
+# re-fire behavior; a wedged resume is watched by the fleet monitors, not by
+# killing the session mid-turn. TimeoutStopSec stays bounded so an explicit
+# `systemctl --user stop` still terminates promptly.
+TimeoutStartSec=infinity
+TimeoutStopSec=90s

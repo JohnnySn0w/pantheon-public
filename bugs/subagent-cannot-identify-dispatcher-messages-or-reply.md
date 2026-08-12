@@ -45,6 +45,12 @@ operational pacing/scope directives, not authority to bypass guards.
 
 ## Relation
 
+- **One mechanism, four entries** (cross-linked 2026-07-14, T-1769): this is
+  the reverse (dispatcher→worker) direction of the completion-misroute
+  family — see `teammate-orchestrator-agent-dispatch-completion-routes-to-main.md`
+  (June original, status now structural-standing) and
+  `team-subagent-async-worker-completions-notify-session-main.md` (07-12
+  lead-relay pattern).
 - `nested-subagent-completion-notification-routes-to-main-not-spawner.md` —
   the outbound half of the same blindness.
 - `teammate-background-task-completion-wake-drop.md` — the wake layer.

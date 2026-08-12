@@ -1,8 +1,9 @@
 ---
 aliases: [ORG-010]
-title: Three-tier framework: Principles + Directives + Policies
+title: "Three-tier framework: Principles + Directives + Policies"
 status: Ratified
 date: 2026-05-10
+build_disposition: built
 ---
 # ORG-010 — Three-tier framework: Principles + Directives + Policies (ORG-002 extension)
 

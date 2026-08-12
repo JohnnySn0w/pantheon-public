@@ -1,0 +1,9 @@
+[Unit]
+Description=Pantheon OOM shield sweep — re-pin agent sessions every 2 min (T-1927)
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=2min
+
+[Install]
+WantedBy=timers.target

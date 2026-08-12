@@ -51,6 +51,7 @@ The original T-0157/T-0196 founding set, retained as a historical record of what
 ## Auto-index
 
 <!-- AUTOGEN-START spine-index -->
+| [`acp-bridge-recovery.md`](acp-bridge-recovery.md) | **Status:** Draft 2026-07-26 (Author: Recovery; filed from the mnemosyne context-wedge + specialist T-2038 cap-loop recurrences. Pending the operator ratification per the sop/remediation per-SOP ratification rule.) |
 | [`agent-oauth-relogin.md`](agent-oauth-relogin.md) | ## Failure shape |
 | [`agent-spend-limit-wedge.md`](agent-spend-limit-wedge.md) | ## Failure shape |
 | [`auto-commit-collision-on-id-class.md`](auto-commit-collision-on-id-class.md) | **Status:** **Ratified 2026-06-08 by the operator.** Draft 2026-05-13 (T-0196 #9 of 9; pending the operator ratification per T-0157 framework). |
@@ -62,6 +63,7 @@ The original T-0157/T-0196 founding set, retained as a historical record of what
 | [`orchestrator-tier-skip-on-approval.md`](orchestrator-tier-skip-on-approval.md) | **Status:** **Ratified 2026-06-08 by the operator.** Draft 2026-05-12 (T-0196 #6 of 9; pending the operator ratification per T-0157 framework). |
 | [`persona-daemon-liveness-recovery.md`](persona-daemon-liveness-recovery.md) | **Status:** Draft 2026-06-06 (T-0873; generalizes `recovery-service-recovery.md` to all three personas per the 2026-05-21 incident's stated recurrence vector). Author: Recovery. Pending the operator ratification per the sop/remediation per-SOP ratification rule. |
 | [`plan-first-violation.md`](plan-first-violation.md) | **Status:** Ratified 2026-05-10 (T-0196 #3 of 9; the operator msg_1218 + msg_1220 + msg_1223 critique → e5a34ea amendments → msg_1236 "with the amendments, 196 and 197 should be fine"). HO may now autonomously apply Paths A/B1/B2 per the D3 placement; Path C remains always-bubble-up. |
+| [`pve2-hung-box-power-recovery.md`](pve2-hung-box-power-recovery.md) | Recovery can force a power-cycle of pve2 without a human at the machine, using the IKEA smart plug on pve2's mains, driven through Home Assistant. This is the out-of-band recovery path from T-2019. |
 | [`routing-mis-routing-to-team-lead.md`](routing-mis-routing-to-team-lead.md) | **Status:** **Ratified 2026-06-08 by the operator.** Draft 2026-05-12 (T-0196 #7 of 9; pending the operator ratification per T-0157 framework). |
 | [`socket-activated-agent-daemon-gotchas.md`](socket-activated-agent-daemon-gotchas.md) | **Status:** **Ratified 2026-06-07 by the operator.** Drafted 2026-06-05 by Specialist (T-0832, consolidating PR-2 from T-0780 sweep); |
 | [`telegram-plugin-mcp-drop-recovery.md`](telegram-plugin-mcp-drop-recovery.md) | **Status:** Draft 2026-06-06 (operator-requested in-incident, msg 2705 — he provided the canonical remediation; pending formal ratification per the sop/remediation per-SOP ratification rule). Author: Recovery. Filed from [`incidents/2026-06-06-orchestrator-telegram-plugin-drop`](../../incidents/2026-06-06-orchestrator-telegram-plugin-drop/README.md). |

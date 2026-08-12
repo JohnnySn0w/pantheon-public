@@ -3,6 +3,7 @@ aliases: [ORG-020]
 title: Self-triggered restart mechanism for all Pantheon agents
 status: Ratified 2026-05-20
 date: 2026-05-20
+build_disposition: built
 ---
 # ORG-020 — Self-triggered restart mechanism for all Pantheon agents
 

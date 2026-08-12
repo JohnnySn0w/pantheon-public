@@ -89,6 +89,12 @@ A verify-then-decide that **closes** a workstream as "satisfied-by-construction 
 
 The cheap-action exception still applies in proportion: a close that is genuinely trivial and has **no governing forward-spec** (a pure conversational-ack close, a mechanical status flip) does not need the second read. The gate is for close-as-satisfied against a *spec* that could have un-deferred the work.
 
+## Large-target re-scoping (applies to ANY reviewer/monitor dispatch, not just pre-impl)
+
+*(Added 2026-07-14 by Orchestrator, T-1771 sweep S3 promotion — Specialist-crystallized from `knowledge/episodic/2026-07-13-silent-failure-vs-pantheon-posture/notes.md` §Classifier-Context-Rot; below-goal methodology adopted under msgs 3733/3735, digest-surfaced.)*
+
+When the review/monitoring target is large (long transcripts, multi-thousand-line diffs, whole-corpus audits), **chunk the target into sub-scopes and dispatch per chunk** rather than letting one reviewer run toward its context ceiling. A context-restart mid-review is NOT re-scoping — the restarted reviewer has lost the accumulated target, not gained a fresh scope. Empirical grounding: monitor-style reviewers miss dangerous/defective actions 2–30x more often past ~800K benign tokens of accumulated target; incremental re-scoping is the strongest known mitigation (arXiv 2605.12366). Dispatcher-side rule: size the target BEFORE dispatching; if it plausibly exceeds a comfortable fraction of the reviewer's window, pre-split by file-set / time-slice / commit-range and synthesize the chunk verdicts yourself.
+
 ## Boundary
 
 This SOP covers **pre-implementation** reviewer dispatch (review the TICKET before code is written) **and close-not-build dispositions** (review the disposition artifact before ratification, §above). It does NOT cover:

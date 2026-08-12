@@ -3,6 +3,7 @@ aliases: [ORG-017]
 title: Unify `watch/` + `research/` under `knowledge/` (Option C)
 status: Ratified 2026-05-17
 date: 2026-05-17
+build_disposition: built
 ---
 # ORG-017 — Unify `watch/` + `research/` under `knowledge/` (Option C)
 

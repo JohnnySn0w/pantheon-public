@@ -1,0 +1,24 @@
+[Unit]
+Description=Pantheon well-trod pathing stats — daily fleet doc-traversal snapshot (T-1811)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.npm-global/bin
+# Default-safe contract: the script refuses (exit 64) without an explicit mode;
+# --commit-prod is the ONLY prod-writing path. Collection sudo-reads sibling
+# transcripts (Recovery NOPASSWD grants), writes knowledge/stats/welltrod/,
+# scope-guarded commit + push. Kino serves the committed snapshot read-only.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/welltrod_stats.py --collect --commit-prod
+StandardOutput=journal
+StandardError=journal
+# Worst case is wide: up to 60 sessions x 2 remote agents each read via sudo cat
+# (120s/file ceiling in doc_traversal_report) + fetch/rebase/push. 15min risked a
+# cgroup SIGKILL mid-commit on a slow day (T-1191 class).
+TimeoutStartSec=30min

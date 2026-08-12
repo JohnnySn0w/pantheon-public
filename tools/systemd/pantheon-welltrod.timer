@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon well-trod pathing stats — daily 09:20 UTC fleet doc-traversal snapshot
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 09:20:00 UTC
+Persistent=true
+Unit=pantheon-welltrod.service
+
+[Install]
+WantedBy=timers.target

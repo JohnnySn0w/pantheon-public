@@ -295,6 +295,183 @@ class TestRatifyLiftStatusLine(unittest.TestCase):
         self.assertIn("Amended 2026-05-10", result)
         self.assertNotIn("Awaiting", result)
 
+    # -- T-2847: marker-family strip + possessive holder ---------------------
+
+    def test_org065_exact_shape_fully_cleaned(self) -> None:
+        """T-2847 (a): the exact ORG-065 bug shape (git history verified,
+        commit 72b513965e's parent) lifts to a clean Ratified line with NO
+        residual Proposed/DRAFT/awaiting/HITL:Proposed, and the genuine
+        lineage sentence + Design-first trailer both survive.
+        """
+        content = (
+            "# ORG-065 — First-class dependency graph\n\n"
+            "**Status:** Proposed (agent-authored, unratified) — DRAFT "
+            "awaiting the operator's ratification. The operator directed this ADR on "
+            "2026-08-08 (relayed via the codex mailbox, confirmed directly "
+            "on Telegram, TG7326) at the same time he ratified T-2169 — "
+            "the prose closure-discipline this ADR is the structural "
+            "version of. **HITL: Proposed.** Design-first: this ADR fixes "
+            "the model and the migration shape; it deliberately does "
+            "**not** commit to tooling implementation (that is a build "
+            "ticket gated on ratification).\n\n"
+        )
+        result, warnings = self._call(content, self.root)
+        self.assertIsNotNone(result)
+
+        status_line = [
+            l for l in result.splitlines() if l.startswith("**Status:**")
+        ][0]
+
+        # Clean Ratified prefix, no residual pre-ratification markers.
+        self.assertIn("**Ratified", status_line)
+        self.assertIn("by the operator.", status_line)
+        self.assertNotIn("Proposed", status_line)
+        self.assertNotIn("DRAFT", status_line)
+        self.assertNotIn("awaiting", status_line.lower())
+
+        # HITL flipped, not stripped.
+        self.assertIn("**HITL: Ratified.**", status_line)
+
+        # Genuine lineage + trailer preserved verbatim.
+        self.assertIn(
+            "the operator directed this ADR on 2026-08-08", status_line
+        )
+        self.assertIn(
+            "the prose closure-discipline this ADR is the structural "
+            "version of.",
+            status_line,
+        )
+        self.assertIn("Design-first:", status_line)
+        self.assertIn(
+            "gated on ratification).", status_line
+        )
+
+    def test_strips_possessive_awaiting_clause_alone(self) -> None:
+        """T-2847 (b): possessive "Awaiting the operator's ratification." (no
+        surrounding Proposed/DRAFT markers) is stripped; preceding history
+        preserved. Regression guard for the bug's root cause #1 — the old
+        regex required whitespace-then-"ratification" directly after an
+        optional "the operator", so "the operator's ratification" never matched.
+        """
+        content = (
+            "# Doc\n\n"
+            "**Status:** Drafted 2026-05-01. Awaiting the operator's "
+            "ratification.\n\n"
+        )
+        result, warnings = self._call(content, self.root)
+        self.assertIsNotNone(result)
+        self.assertIn("**Ratified", result)
+        self.assertNotIn("Awaiting", result)
+        self.assertNotIn("the operator's ratification", result)
+        self.assertIn("Drafted 2026-05-01", result)
+
+    def test_generic_holder_possessive_awaiting_clause(self) -> None:
+        """T-2847 (b) generalization: any holder possessive (not just
+        the operator), e.g. "the operator's ratification", is also stripped.
+        """
+        content = (
+            "# Doc\n\n"
+            "**Status:** Drafted 2026-05-01. Awaiting the operator's "
+            "ratification.\n\n"
+        )
+        result, warnings = self._call(content, self.root)
+        self.assertIsNotNone(result)
+        self.assertNotIn("Awaiting", result)
+        self.assertNotIn("operator's ratification", result)
+        self.assertIn("Drafted 2026-05-01", result)
+
+    def test_leading_drafted_lineage_not_mistaken_for_draft_marker(
+        self,
+    ) -> None:
+        """T-2847 pre-mortem regression guard: the new leading-"DRAFT"
+        marker strip must NOT fire on "Drafted <date>" lineage text at the
+        start of the line (word-prefix collision — "DRAFT" is a substring
+        prefix of "Drafted"). Caught by hand-trace at plan-tier; this test
+        makes it a structural guarantee.
+        """
+        content = (
+            "# Doc\n\n"
+            "**Status:** Drafted 2026-05-01 by Orchestrator (T-0300). Awaiting "
+            "ratification.\n\n"
+        )
+        result, warnings = self._call(content, self.root)
+        self.assertIsNotNone(result)
+        self.assertIn("Drafted 2026-05-01 by Orchestrator (T-0300).", result)
+        self.assertNotIn("Awaiting", result)
+
+    def test_leading_proposed_with_dash_draft_stripped(self) -> None:
+        """A leading "Proposed — DRAFT awaiting ratification." (no
+        parenthetical qualifier, em-dash separator only — the ORG-069/070/
+        071/072-style convention) is fully stripped.
+        """
+        content = (
+            "# Doc\n\n"
+            "**Status:** Proposed — DRAFT awaiting the operator ratification. "
+            "Author of record: Orchestrator (HO).\n\n"
+        )
+        result, warnings = self._call(content, self.root)
+        self.assertIsNotNone(result)
+        self.assertNotIn("Proposed", result)
+        self.assertNotIn("DRAFT", result)
+        self.assertNotIn("awaiting", result.lower())
+        self.assertIn("Author of record: Orchestrator (HO).", result)
+
+    # -- T-2847 part-3 option (b): frontmatter staleness warning -------------
+
+    def test_frontmatter_status_stale_after_body_lift_warns(self) -> None:
+        """Frontmatter `status:` still reading a pre-ratification marker
+        after a successful body lift produces an actionable warning naming
+        the doc + the stale value.
+        """
+        content = (
+            "---\n"
+            "aliases: [ORG-999]\n"
+            "status: Proposed 2026-08-08 by Orchestrator (HO) — DRAFT awaiting "
+            "the operator ratification\n"
+            "---\n"
+            "# Doc\n\n"
+            "**Status:** Drafted 2026-05-01. Awaiting the operator's "
+            "ratification.\n\n"
+        )
+        result, warnings = self._call(content, self.root)
+        self.assertIsNotNone(result)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("test-doc.md", warnings[0])
+        self.assertIn("frontmatter status:", warnings[0])
+        self.assertIn("Proposed", warnings[0])
+
+    def test_frontmatter_no_status_key_no_warning(self) -> None:
+        """Frontmatter present but with no `status:` key: no staleness
+        warning (nothing to compare against).
+        """
+        content = (
+            "---\n"
+            "aliases: [ORG-999]\n"
+            "---\n"
+            "# Doc\n\n"
+            "**Status:** Drafted 2026-05-01. Awaiting the operator's "
+            "ratification.\n\n"
+        )
+        result, warnings = self._call(content, self.root)
+        self.assertIsNotNone(result)
+        self.assertEqual(warnings, [])
+
+    def test_frontmatter_already_ratified_no_warning(self) -> None:
+        """Frontmatter `status:` already starts with "Ratified": no
+        staleness warning, even though the body needed lifting.
+        """
+        content = (
+            "---\n"
+            "status: Ratified 2026-06-06 by the operator via T-0845\n"
+            "---\n"
+            "# Doc\n\n"
+            "**Status:** Drafted 2026-05-01. Awaiting the operator's "
+            "ratification.\n\n"
+        )
+        result, warnings = self._call(content, self.root)
+        self.assertIsNotNone(result)
+        self.assertEqual(warnings, [])
+
 
 class TestRatifyLiftViaResolve(RatifyLiftUnitBase):
     """Integration-unit tests: resolve a ratify ticket and check doc is staged."""

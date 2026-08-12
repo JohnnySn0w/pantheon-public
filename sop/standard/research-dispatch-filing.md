@@ -25,6 +25,25 @@ This resolves the P5-vs-P7 tension explicitly: the researcher **enumerating** a 
 2. **On report return**, the dispatching tier files each enumerated follow-up: `ticket.py file --requester <persona> --target <orchestrator> --labels from-research,... --ask "<the 1-line ask>"`. Default low-priority / for-triage; target the orchestrator (orchestrator/recovery), not the operator.
 3. HO triages on the next grooming pass (prioritize, `block`, or resolve-as-stale).
 
+## Brief corrections (T-2614)
+
+Distinct from `## Follow-ups` (new work to file) — this is for a defect in the researcher's OWN dispatch brief (stale scope, dead seed URL, wrong prior-anchor citation). Emit it as a `brief_corrections:` frontmatter list, not prose:
+
+```
+---
+surface: routine
+headline: ...
+brief_corrections:
+  - seed source X is 404; correct URL is Y
+---
+```
+
+`watch_runner.py`'s land path accumulates these per-topic (stable content-hash id, deduped on re-land) and `compute_due_briefs()` appends any un-cleared ones to that topic's next brief as a marked "pending — not yet folded into topics.md" section, so the next cycle's researcher sees the correction instead of re-deriving it. `knowledge/watch/topics.md` is never auto-edited (D2) — an operator folds the correction in by hand, then clears it: `python3 tools/watch_runner.py --clear-correction --topic <slug> --id <id> [--note ...]`. See T-2509 (design ruling) / T-2614 (build).
+
+## Cross-topic ownership (T-2523)
+
+Distinct from `## Follow-ups` (new work) and `brief_corrections:` (own-brief defects) — this governs which topic OWNS a finding the B11 actuation phase files. A researcher may declare an OPTIONAL `belongs_to_topic: <slug>` frontmatter field (alias `duplicate_of_topic`) when the SAME event it reports, raising the SAME ask, is genuinely owned by another topic. When it is set AND the named primary topic also fired that run, `watch_runner.actuate_phase` files a cross-reference NOTE pointing at that topic instead of a second peer actuation ticket — so triage adjudicates the one event once (closes the T-2488/T-2502 one-event-two-tickets case). Leave it OFF when the same event legitimately raises a DIFFERENT ask in your topic (both angles deserve their own ticket); a self-reference is ignored. The field lives in the researcher prompt contract in `build_brief` (`tools/watch_runner.py`); see T-2523 (commit e825bffb7).
+
 ## Common failure modes
 
 - **Surface-don't-file** (the retired anti-pattern): listing follow-ups in prose and leaving filing "to HO". Recurred on the deep-research eval AND T-0735 (Yegge). Fix: file them.

@@ -1,0 +1,13 @@
+[Unit]
+Description=Pantheon mirror drift-sweep — weekly fire (Mon 13:00 UTC, after the daily grooming/watch loops)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-1994.md
+
+[Timer]
+# Weekly, Monday 13:00 UTC — offset an hour past the daily 12:00 UTC grooming
+# so the two Recovery digests don't fire in the same minute.
+OnCalendar=Mon *-*-* 13:00:00 UTC
+Persistent=true
+Unit=pantheon-mirror-drift.service
+
+[Install]
+WantedBy=timers.target

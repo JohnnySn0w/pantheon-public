@@ -2,8 +2,9 @@
 aliases: [ORG-031]
 id: ORG-031
 title: Harness-abstraction adapter + generalized daemon-onboarding (codex = first non-claude case)
-status: RATIFIED 2026-06-09 by the operator (via T-0897, resolved 2026-06-09T03:12:58Z). Drafted 2026-06-06 by Orchestrator (HO). Ratifies T-0712 deliverable (2): the adapter interface, the Option-(b) policy decision, and the harness-agnostic onboarding procedure. Codifies decisions; execution of the onboarder generalization is sub-ticketed (T-0898) and reversibility-classified.
+status: "RATIFIED 2026-06-09 by the operator (via T-0897, resolved 2026-06-09T03:12:58Z). Drafted 2026-06-06 by Orchestrator (HO). Ratifies T-0712 deliverable (2): the adapter interface, the Option-(b) policy decision, and the harness-agnostic onboarding procedure. Codifies decisions; execution of the onboarder generalization is sub-ticketed (T-0898) and reversibility-classified."
 date: 2026-06-06
+build_disposition: built
 ---
 
 # ORG-031 — Harness-abstraction adapter + generalized daemon-onboarding
@@ -58,6 +59,10 @@ PantheonHarnessAdapter
 
 External corroboration, same harvest: Paperclip independently converged on approval-at-org-tier — the same shape as this ADR's Option (b) — which is independent-design evidence the policy-partition choice is correct. Source: knowledge/episodic/2026-06-29-paperclip-orchestration-tier-eval/notes.md; harvest ticket T-1579. These bind the §Ratify-trigger item-2 skeleton implementation when it lands; nothing already-built changes.
 
+**Addendum 2026-07-15 (T-1740 — code-level verification against the live ACP adapter):** the 2026-07-06 amendment's three fields are confirmed unimplemented as of this date. Concretely, for the skeleton-implementation ratify-trigger item to close: (1) `tools/harness_adapter/base.py` needs a post-execution result type — none exists today; `exec_headless()` currently returns a pre-execution `argv` list, not a result — the three fields attach to this new type, not to an existing one. (2) The live ACP bridge (`tools/acp_bridge.py`) is independent of `PantheonHarnessAdapter` (no import relationship) and is the nearest real analogue to validate the result-type shape against: `AcpTransport._recv_until()` currently discards all non-matching wire messages (the `on_log`-equivalent gap, concretely) and `AcpBridge.handle_message()` reads only `stopReason` from the `session/prompt` result (the cost/usage-equivalent gap). (3) Whether `costUsd`/`usage` can be sourced from the ACP wire protocol itself, versus only from the harness's own transcript (as T-1730's billing check did), is unverified and should be checked empirically before finalizing the field's semantics — do not assume wire-native availability. `model` rides the already-ratified field set (it varies per-role within a harness). Full comparison: knowledge/episodic/2026-06-29-paperclip-orchestration-tier-eval/adapter-contract-harvest-T-1740.md (also records the (e) npm-package/hot-register DEFER, revisit trigger: third non-claude harness or out-of-monorepo adapter author).
+
+**Note (T-1740):** `provider` (as distinct from `model`) is deliberately not part of the adapter result contract — Pantheon's adapter classes are provider-exclusive (`ClaudeHarnessAdapter` ≡ Anthropic, `CodexHarnessAdapter` ≡ OpenAI), so the field would duplicate information already available from which adapter executed. Revisit only if a future harness binding is itself provider-polymorphic (none is, as of this writing).
+
 **Three partitions, each with a rule:**
 1. **Generalized (the seven):** one abstract call, mechanical per-harness key/filename translation. These form the adapter's body.
 2. **Bridge surfaces (the two harness-specific):** `inbound` and hook-trust/approval-defaults get a **real per-harness implementation**, not a thin mapping. `inbound` for non-claude agents is poll-and-inject through the harness's own turn API (tmux send-keys or per-inbound `exec`), explicitly NOT the `claude/channel` MCP capability.
@@ -80,6 +85,8 @@ Generalize `sop/standard/adding-restart-capability-to-a-new-agent.md` into a **h
 This is a **sub-ticketed** deliverable (below), not executed by this ADR.
 
 **Fulfilled by:** `sop/standard/onboarding-a-new-harness.md` (sub-ticket 1 below; drafted T-1031, 2026-06-09) — the harness-agnostic onboarder this section calls for. (Back-reference added T-1202 to make the ADR↔SOP link bidirectional.)
+
+**Migration companion (T-2633, 2026-08-07 — back-reference per the operator TG 7170):** the onboarder above stands up a NEW agent/harness. Migrating an EXISTING claude persona off its bespoke telegram-bot supervisor onto this ADR's role-keyed control plane is the complementary case, documented in `sop/standard/migrating-an-existing-persona-onto-the-control-plane.md` (generic tool `tools/persona_cutover.sh` / `persona_rollback.sh`, extracted from the Recovery T-2590 cutover; Specialist was the second migration and the extraction point). It resolves persona→role and leans on this ADR's role-keyed control plane + ORG-050's installer contract; it is a deliberately SEPARATE transitional migration tool, not a `persona_installer` verb — the legacy-bespoke-teardown it wraps around the installer call is a one-time concern that does not belong in the steady-state installer.
 
 ---
 

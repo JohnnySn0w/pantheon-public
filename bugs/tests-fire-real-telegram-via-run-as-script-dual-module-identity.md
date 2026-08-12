@@ -1,3 +1,8 @@
+---
+symptom: "The tools/ test suite fires real Telegram notifications and mock patches silently miss with call_count 0"
+fix: "Run-as-script imports create dual module identities - never sys.path.insert(tools/) in a test, import as tools.<mod> and run pytest from repo root; the conftest autouse fixture deadens TELEGRAM_ENV as backstop"
+domain: pantheon, pytest, python-imports, telegram, test-isolation
+---
 # Tests fire real Telegram notifs / mocks silently miss — run-as-script vs run-as-package dual module identity
 
 **Symptom(s)**

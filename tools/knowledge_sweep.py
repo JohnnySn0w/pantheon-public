@@ -368,9 +368,42 @@ def _check_day_index_drift() -> None:
     Contract: NEVER fails the sweep (equivalent to the lint's `--warn`), achieved
     by swallowing the gate-mode returncode here — we run gate-mode (no `--warn`)
     because the returncode is the stable drift signal, then surface any drift to
-    stderr (systemd-journal) + the runner log (next digest summarizer), but the
-    sweep's own exit is never affected. Best-effort: any error invoking the lint
-    is logged and ignored, never propagated.
+    stderr (systemd-journal), but the sweep's own exit is never affected.
+    Best-effort: any error invoking the lint is logged and ignored, never
+    propagated.
+
+    ⚠️ CORRECTED 2026-07-29 (T-2358, specialist). This paragraph used to end "+ the
+    runner log (next digest summarizer)". THAT MITIGATION DOES NOT EXIST and never
+    did: `watch_digest.py` contains no reference to RUNNER_LOG (verified with a
+    known-positive so the zero is a fact about the file, not a broken read), and
+    repo-wide RUNNER_LOG has writers and no readers. So the drift reaches the
+    journal and stops there — nothing summarises it to anyone.
+
+    Kept as a correction rather than a clean edit because of what the sentence was
+    DOING. The swallow above is correct and stays. But a swallowed failure is only
+    acceptable if something downstream catches it, and this docstring named a
+    catcher that was never wired — so the justification for passing silently was
+    itself the unverified part. That is the same shape as the comfort sentence in
+    artifact_gc (T-2309): the line that makes a reviewer stop looking is exactly
+    the line that was false.
+
+    MEASURED COST (specialist, from the runner log): 21 days of undetected drift in two
+    episodes — 2026-06-28..07-13, escalating 1 -> 4 items, and 2026-07-23..07-27,
+    1 item. Not hypothetical.
+
+    RESOLVED 2026-07-29 (T-2363, decided by recovery, wired by specialist). Journal-only was
+    considered and rejected on the measurement above: "it is in the journal" is a
+    reporting surface only if something reads the journal unprompted, and nothing
+    does. The real surface is now a drift row in the daily watch digest —
+    `watch_digest.collect_day_index_drift()`, silent on a clean day, LOUD if the
+    lint itself fails, so digest silence means "ran and clean" and nothing else.
+    Regression tests: `tools/test_watch_digest.py::TestDayIndexDriftRow`.
+
+    The digest recomputes the count from disk rather than receiving it from this
+    function. That is deliberate: handing it over would couple the two units in
+    fire order and add a staleness mode in which a stale zero reads exactly like a
+    clean day. This function's swallow is therefore unchanged, and no signal here
+    is load-bearing for the report.
     """
     lint_bin = REPO_ROOT / "tools" / "lint_report_day_index.py"
     reports_dir = REPO_ROOT / "knowledge" / "watch" / "reports"

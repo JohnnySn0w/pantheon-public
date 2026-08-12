@@ -2,7 +2,7 @@
 aliases: [ORG-032]
 id: ORG-032
 title: Money-engine orchestration shape — status-quo now, dedicated agent at actuation-un-defer (the ORG-031 onboarder retires the cost objection)
-status: Adopted 2026-06-11 by Orchestrator (HO) — autonomous under P/D justification per the operator msg 3733 (principles-as-ratification; ratify-asks below goal-level retired). Resolves T-0377. Decision is trigger-based: Option D/A now, committed to Option B at the named trigger. NOTE: the STATE-2 trigger (un-defer of revenue-project actuation) remains goal-level and the operator's.
+status: "Adopted 2026-06-11 by Orchestrator (HO) — autonomous under P/D justification per the operator msg 3733 (principles-as-ratification; ratify-asks below goal-level retired). Resolves T-0377. Decision is trigger-based: Option D/A now, committed to Option B at the named trigger. NOTE: the STATE-2 trigger (un-defer of revenue-project actuation) remains goal-level and the operator's."
 date: 2026-06-08
 ---
 

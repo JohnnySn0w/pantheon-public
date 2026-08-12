@@ -1,0 +1,39 @@
+{
+  "source": "bugs/seed-own-suite-expected-failures.md",
+  "classes": [
+    {
+      "id": "role-vocab-self-collision",
+      "count": 15,
+      "targets": [
+        {
+          "module": "tools/test_ticket_lint.py",
+          "test_class": "TestReposFieldGate",
+          "count": 12
+        },
+        {
+          "module": "tools/test_ticket_normalization.py",
+          "count": 3
+        }
+      ]
+    },
+    {
+      "id": "clear-set-content-dependent",
+      "count": 11,
+      "targets": [
+        {
+          "module": "tools/test_policy_outflow_sync.py",
+          "count": 2
+        },
+        {
+          "module": "tools/test_s3star_audit_runner.py",
+          "count": 9
+        }
+      ]
+    }
+  ],
+  "excluded": {
+    "id": "claude-config-coupling",
+    "tracked_as": "T-1294",
+    "note": "real coupling to fix, not to skip"
+  }
+}

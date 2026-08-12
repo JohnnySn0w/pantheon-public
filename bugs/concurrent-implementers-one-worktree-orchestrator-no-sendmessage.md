@@ -1,3 +1,8 @@
+---
+symptom: "Two implementer subagents edit one worktree concurrently - piled-up cargo/clippy runs contend on the target lock and a frozen transcript mtime reads as a stall"
+fix: "Never double-drive a worktree an orchestrator already dispatched onto; use ps not transcript-mtime for build-heavy liveness; sub-dispatch rides parent-driven Agent spawn per ORG-036/ORG-037"
+domain: pantheon, echo, dispatch-pattern, worktree, subagents
+---
 # Bug — two implementers writing one worktree concurrently (project-orchestrator has no SendMessage)
 
 **Surfaced:** 2026-06-26, Echo T-1316 Phase-A arc. Filed by Orchestrator (HO); root cause flagged by the `echo-T1316` project-orchestrator from inside the arc.

@@ -102,6 +102,7 @@ Runs after §Pre-merge smoke is green. Symmetric self-merge default per T-0224 v
 - **`success: true` on SendMessage assumed-equal-to-delivered** — items 2.6 (verify recipients exist) + 4.1 (correct routing) together catch this.
 - **DECISIONS-by-reference** instead of operational embedding — item 5.1 catches this.
 - **No 3-REBOUND escape hatch named** — orchestrator drifts on unsolvable unit. Item 7.2 covers this.
+- **Worker report trusted without a deliverable check** — for file-deliverable dispatches, verify files-on-disk before using the result; spot-check decision-changing claims against a primary source. Rule lives at [`research-dispatch-deliverable-standards.md`](research-dispatch-deliverable-standards.md) §Standard 5 (T-1771).
 
 ## DECISIONS (SOP-tier)
 

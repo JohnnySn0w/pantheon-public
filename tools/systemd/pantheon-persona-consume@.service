@@ -1,0 +1,26 @@
+[Unit]
+Description=Pantheon harness-neutral runtime/wake controller for persona %i
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PANTHEON_INSTANCE_MANIFEST=%h/pantheon-config/instance.yaml
+Environment=PANTHEON_HARNESS_HOME=%h
+Environment=PANTHEON_PERSONA_CWD=%h/pantheon-config
+Environment=PANTHEON_MAILBOX_HUB=/home/the-ancestor/mailbox
+Environment=PANTHEON_PERSONA_STATE_DIR=%h/.local/state/pantheon/personas
+# The stable unit invokes Pantheon code only. The manifest selects the harness,
+# runtime profile, model, native permissions, quota source, and tmux target.
+# Interactive profiles wake the in-session persona without claiming its mail;
+# an explicitly selected batch profile may perform the leased drain itself.
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/persona_bringup.py consume --persona %i"
+TimeoutStartSec=30min
+# Cry-wolf discriminator (T-2586): exits 3/4/5 are SOFT, backoff-handled failures
+# that self-heal on the next fire — treat them as success so OnFailure does NOT
+# page on every transient blip. persona_bringup.py escalates a SUSTAINED soft
+# failure (>= SOFT_FAILURE_ALERT_STREAK consecutive fires) to exit 6
+# (EXIT_SOFT_PERSISTENT), which is NOT listed here, so OnFailure still fires for a
+# real, persistent outage. Unexpected codes (1/2) also remain failures. `sg`
+# propagates the child exit code faithfully, so the discriminator survives the wrap.
+SuccessExitStatus=3 4 5

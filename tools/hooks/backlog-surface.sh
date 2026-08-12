@@ -3,16 +3,20 @@
 # Part of pantheon-config T-0023.
 #
 # Logic:
-#   - Read /home/claude/pantheon-config/BACKLOG.md
+#   - Read <repo-root>/BACKLOG.md, where repo-root is derived from this
+#     script's own location (tools/hooks/backlog-surface.sh), not from
+#     $HOME or the invocation cwd — portable across daemons/clones.
 #   - Find headings matching ## B\d+ that do NOT contain "✓ CLOSED" or "CLOSED"
 #   - Emit one-line summary: "Open BACKLOG items: B2, B6"
-#   - If all closed or file missing, exit 0 with empty stdout
+#   - If all closed, file missing, or path derivation fails, exit 0 with
+#     empty stdout
 #
 # Failure mode: errors stay silent; never block session start.
 
 set -e
 
-BACKLOG=/home/claude/pantheon-config/BACKLOG.md
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." 2>/dev/null && pwd)" || REPO_ROOT=""
+BACKLOG="${REPO_ROOT:+$REPO_ROOT/BACKLOG.md}"
 
 # Drain stdin (Claude Code passes hook input JSON; we don't use it).
 cat >/dev/null 2>&1 || true

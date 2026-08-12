@@ -29,6 +29,31 @@ is a per-agent re-login, which needs the operator's browser.
   through its pane (below) and shipped `tools/credential_expiry_monitor.py` +
   the auth-dead detector so the next occurrence pages the operator pre-emptively.
 
+## Venue selection — WHERE to run /login (read before touching anything)
+
+The login MUST run in the agent's LIVE pane. **NEVER boot a scratch/second
+`claude` on the account to host the login modal** — `enabledPlugins` loads the
+telegram plugin on EVERY boot on that account (`--channels` absence does not
+protect), and the scratch steals the bot poller and kills the live bridge.
+Proven the hard way 2026-07-20: Recovery scratch-booted for exactly this reason and
+took down his own bridge mid-arc (fifth incident on memory
+`feedback_no_second_claude_with_telegram_plugin`).
+
+Per-agent venue:
+- **Another agent's pane** (specialist, orchestrator): Recovery drives it via sudo + send-keys —
+  the standard flow below.
+- **Your OWN account**: you cannot self-drive (the modal wedges your session with
+  nobody at the keyboard). A PEER drives your live pane per this SOP and runs the
+  the operator URL/code hop on the peer's own bridge; your session simply holds in the
+  modal until the peer pastes the code. Recovery↔orchestrator ran this both directions
+  2026-07-20 — it works cleanly.
+- **mnemosyne (exocortex)**: operator-direct (tmux-attach and run /login by hand)
+  or a peer pane-drive. Do NOT route the interactive flow through the
+  telegram-session → mailbox → ACP-session relay: a single runbook turn took
+  ~10 min on 2026-07-20 (vs the ~2-3 min the interactive hop needs), the operator
+  ended up doing it manually, and the stale runbook turn + queued stand-down
+  raced afterward. That relay is fine for async work, wrong for interactive.
+
 ## Recommended remediation
 
 Ranked. Recovery does the legwork; the browser auth step is the operator's (his Anthropic
@@ -45,9 +70,17 @@ credential — genuinely above the bar to do unilaterally).
    - Menu → select **1. Claude account with subscription** (`Enter`).
    - The pane prints an `https://claude.com/cai/oauth/authorize?...` URL and a
      `Paste code here if prompted >` input. Capture the full (line-wrapped) URL.
+   - The URL hard-wraps across pane lines: capture with `-p`/`-J` and JOIN the
+     lines from the `https://` line to the blank line — a bare grep gets only the
+     first ~80 chars and hands the operator a dead link.
 3. **Hand the URL to the operator** via Telegram. He opens it, authorizes with the Max
    account, and sends back the code. **Paste the code** into the waiting prompt:
    `tmux send-keys -t <pane> -l "<code>"` then `Enter`.
+   - **Paste-registration gotcha (2026-07-20, specialist):** the first `send-keys -l`
+     into the paste prompt sometimes silently doesn't register. After typing,
+     capture-pane and confirm the masked `*****` input is NON-EMPTY **before**
+     sending Enter; if empty, type it again. An Enter on an empty prompt looks
+     like an ignored/failed code when nothing was ever submitted.
    - **STATE MUST MATCH (2026-06-22 lesson — cost a round-trip).** The returned
      code is `CODE#STATE`. The trailing `STATE` must equal the `state=` of the URL
      **currently live in the pane**, not just any URL you sent earlier. If the operator
@@ -68,6 +101,19 @@ sudo -n -u claude-research bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) \
   tmux send-keys -t claude-research-bot:0 -l "/login"; \
   XDG_RUNTIME_DIR=/run/user/$(id -u) tmux send-keys -t claude-research-bot:0 Enter'
 ```
+
+## The ~30-day refresh cliff — pre-empt, don't react
+
+Refresh tokens live a FIXED ~30 days from login (verified byte-stable,
+2026-07-20 incident `incidents/2026-07-20-orchestrator-oauth-refresh-rejection/`). A
+mass relogin therefore creates a SYNCHRONIZED fleet-wide cliff ~30d later — the
+June-22 wave produced a single 07-22 18:12Z expiry for three agents at once.
+When the credential monitor shows expiries clustering, run a pre-emptive relogin
+arc a day or two early (T-1878 pattern: ~10 min of the operator's time, one URL/code
+hop per agent, zero outages) instead of waiting for the 401s. Note the fresh
+logins re-synchronize — tonight's arc set the NEXT cluster around 08-16→08-19;
+staggering logins across different days would break the cluster if that ever
+matters.
 
 ## Prevention (live)
 

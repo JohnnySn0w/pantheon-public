@@ -25,7 +25,10 @@ set -euo pipefail
 
 SESSION="claude-research-bot"
 CLAUDE_BIN="/home/claude-research/.npm-global/bin/claude"
-CLAUDE_ARGS="--channels plugin:telegram@claude-plugins-official"
+# --model pins claude-opus-4-8 (the operator TG 2026-08-03, fleet uniform on opus 4.8). The
+# launch flag is the authoritative pin and outranks settings.json. Backported here to
+# match the live supervise script — without it a redeploy would drop specialist's pin.
+CLAUDE_ARGS="--channels plugin:telegram@claude-plugins-official --model claude-opus-4-8 --permission-mode default"
 
 # NO sg-wrap (T-0783): claude-research is not in pantheon-shared and operates on
 # its OWN pantheon-config clone — no shared-group inheritance needed. The

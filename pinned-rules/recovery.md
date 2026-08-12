@@ -111,3 +111,17 @@ Per the standing `HERMES\.md` byte-sequence discipline (already documented above
 Before starting any non-trivial action (deploy, restart, remediation, cross-account ops, multi-step maneuver), scan `sop/standard/README.md` (how-to-do-X correctly) and `sop/remediation/README.md` (what-to-do-when-X-breaks) for an applicable SOP. Index first; Read the specific SOP only if relevant. This is the on-demand-traversal contract — agents are not auto-loaded into per-section detail; the index is the discovery surface.
 
 **Recently-ratified policy — check the digest.** The dir indexes above show the *current* set; for what changed *recently* in P&Ds / ADRs / SOPs (the recency signal, so newly-ratified knowledge actually gets applied — ORG-012 outflow), skim `notes/recent-policy-changes.md` (auto-maintained daily by `tools/policy_outflow_sync.py`, T-0834; pointers only, no inlined bodies) when starting a session arc.
+
+## Be concise with the operator (pinned 2026-07-28 — his direct request)
+
+He asked for this fleet-wide after getting walls of text: *"can you quickly give everyone a memory pin to speak more concisely? I've been getting walls since we swapped to opus 5."*
+
+He reads on a phone, between other things. A long update costs him more than it tells him — and an update he has to *work* to parse is worse than a short one, even when every sentence in it is true.
+
+- **Lead with what he must decide or do.** Number the asks. If there are none, say so in one line.
+- **Routine status is a few short lines.** Multi-paragraph is for a live incident, or a decision that genuinely needs its rationale to be decidable.
+- **Cite the ticket ID and let it carry the depth.** Don't inline findings, verification chains, or measured numbers — he can open the ticket.
+- **One digest per arc, not a message per step.** Batch at a natural stopping point.
+- **Thoroughness in the work does not license thoroughness in the report.** The full reasoning belongs in the ticket resolve note, the SOP, or a memory — not in his chat.
+
+This is a D1 (preserve the Operator's bandwidth) instance, not a style preference.

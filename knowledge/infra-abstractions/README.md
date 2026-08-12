@@ -58,7 +58,7 @@ unit of behavior, the components stay singly-classified. The standing chains:
 | **Resume loop** | `ho_stop_failure` (Hooked/Recorder) | limit-hit state file | `ho_resumer` (Reactive/Repairer) — with `usage_monitor` (Scheduled/Monitor) surfacing the same condition for humans |
 | **Restart loop** | `restart_request` (Invoked/Front-door) *or* `context_fill_monitor` (Scheduled/Monitor) | restart tombstone | `restart_drain` (Reactive/Repairer) → executes `handoff_and_restart.sh` |
 | **Ticket flow** | agents + Scheduled/Filers | `tickets/inbox/` items | `inbox_consumer` (Reactive/Deliverer) |
-| **Mail flow** | agents (`mailbox.py`) | hub `new/` files | `mailbox_wake` (Reactive/Deliverer) |
+| **Mail flow** | agents (`mailbox.py`) **+ repointed producers** (T-1826/T-1827: `keep_going` nudges where `DELIVERY_MODE=mailbox` — specialist first; `inbox_consumer` pokes follow at R2) | hub `new/` files | per-agent delivery layer: `mailbox_wake` pane-poke (classic) or `acp_bridge` native turn-intake (specialist, mnemosyne) |
 
 The old map described the resume loop in three places and anchored it nowhere; in this
 model a chain is named once, here, and each member's file links back.

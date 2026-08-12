@@ -28,9 +28,26 @@
 
 cat >/dev/null 2>&1 || true   # drain the hook-input JSON (unused)
 
-REPO="$HOME/pantheon-config"
 SUBDIR=".githooks"
 out=""
+
+# DISCOVERED, not hardcoded (2026-08-03, T-2392 sweep). This was pinned to
+# $HOME/pantheon-config, which left the exact 2026-06-09 failure reachable in
+# any OTHER repo carrying the same committed guard — and one was already in it:
+# pantheon-public shipped all three hooks (commit-msg, pre-commit, pre-push)
+# with core.hooksPath UNSET and nothing in .git/hooks, so a guard that refuses
+# the trigger correctly when invoked was never invoked at all. Verified by
+# direct-invoking it: exit 1 on a trigger message, exit 0 on a safe one.
+#
+# A repo that COMMITS a .githooks/ dir is asserting it wants those hooks run.
+# So cover every such repo under $HOME rather than a list someone has to
+# remember to extend — the list-you-must-remember is the same failure class
+# this hook exists to close. Per-repo semantics below are unchanged: SET only
+# when unset, WARN but never clobber a different value.
+shopt -s nullglob
+for REPO in "$HOME"/*/; do
+  REPO="${REPO%/}"
+  [[ -d "$REPO/$SUBDIR" ]] || continue
 
 # .git is a dir in the canonical clone, a file in linked worktrees; accept both.
 if [[ -d "$REPO/.git" || -f "$REPO/.git" ]]; then
@@ -55,6 +72,9 @@ if [[ -d "$REPO/.git" || -f "$REPO/.git" ]]; then
     fi
   done
 fi
+
+done
+shopt -u nullglob
 
 printf '%s' "$out"
 exit 0

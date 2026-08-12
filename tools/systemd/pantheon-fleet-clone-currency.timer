@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon fleet clone-currency check — daily drift detector for every seat's pantheon-config clone (T-2798/T-2794 option-b)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 10:15:00 UTC
+Persistent=true
+Unit=pantheon-fleet-clone-currency.service
+
+[Install]
+WantedBy=timers.target

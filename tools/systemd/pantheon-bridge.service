@@ -1,3 +1,8 @@
+# T-2271: NO OnFailure= here, deliberately. This unit is VERIFIED DEAD — disabled
+# and inactive, with its code archived at /opt/pantheon-bridge.archived (T-2264).
+# Wiring an alerter into a unit that cannot run would be alerting on nothing; the
+# reason is recorded HERE and not only in the ticket, because a reader of the unit
+# would otherwise see an unexplained omission and "fix" it.
 [Unit]
 Description=Pantheon Telegram bridge — single owner of getUpdates, multi-client SSE
 Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md

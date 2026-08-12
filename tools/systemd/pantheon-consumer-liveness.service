@@ -1,0 +1,28 @@
+[Unit]
+Description=Pantheon consumer liveness — detect an inbox-consumer that silently stops firing on an empty queue (T-2605)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Watches the slice no queue-keyed detector sees: a live inbox-consumer that stops COMPLETING
+# cycles while its queue is empty. Signal = each seat's oneshot service ExecMainExitTimestamp
+# (advances every 10-min cycle including skip:empty_inbox) read cross-account, READ-ONLY, via
+# `sudo -u <account> systemctl --user show`. DETECT + ALERT only — no enable/disable/restart.
+#
+# Deliberately NOT covered here, because other guards own it: a RUN that fails/hangs is caught by
+# the consumer service's own TimeoutStartSec=5min -> OnFailure; a never-armed timer by
+# verify_startup C8; a missing/disabled unit by delivery_reachability. This module's niche is the
+# timer that fired for weeks and then went quiet — nothing else watches that continuously.
+#
+# TimeoutStartSec is generous vs the worst-case serial probe (~7 seats x 3 sudo systemctl reads)
+# so a slow-but-answering fleet never trips the monitor's OWN timeout — a monitor killed by its
+# timeout fires OnFailure and reports the monitor instead of the fault.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/consumer_liveness_monitor.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

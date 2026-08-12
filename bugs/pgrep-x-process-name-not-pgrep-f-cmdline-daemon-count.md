@@ -30,3 +30,5 @@ For managed daemons, prefer `systemctl status/stop/restart <unit>` over signal-b
 ## Keywords
 
 pgrep, pkill, -f, -x, cmdline, process name, daemon count, +1 inflation, kill operator shell, phantom respawn, duplicate daemon, systemctl, T-0557, echo, deploy
+
+**Pattern lifted to lesson** (ORG-012 criterion 3): `lessons/2026-07-21-cmdline-substring-process-predicates-unsound.md` (kill/count instance).

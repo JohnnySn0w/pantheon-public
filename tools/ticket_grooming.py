@@ -74,7 +74,11 @@ from tools.watch_digest import read_telegram_token  # noqa: E402
 # Folded into the DAILY grooming digest (which Recovery already sends as proof-of-life)
 # so deadlock-class defects surface once daily, WITHOUT re-enabling the hourly
 # ticket_lint Telegram that the operator suppressed (msg_1934 / --no-digest).
-from tools.ticket_lint import detect_dep_graph_issues  # noqa: E402
+from tools.ticket_lint import detect_dep_graph_issues, detect_unanchored_gates  # noqa: E402
+# T-2806: reuse adr_reeval_walk's hardened `---`-frontmatter YAML parser for
+# build_disposition/scoping_ticket rather than re-implementing it -- inherits
+# its T-2591 "warn on malformed YAML, never silently drop" behavior for free.
+from tools.adr_reeval_walk import _load_yaml, _split_frontmatter  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TICKETS_ROOT = REPO_ROOT / "tickets"
@@ -614,12 +618,24 @@ _DONE_VERBS = ("resolved", "done")
 # Path extraction: a repo-relative-looking path with a known source/doc/config
 # extension. Anchored loosely; we post-filter illustrative/glob forms below.
 # Examples matched: tools/foo.py, path/to/x.sh, adr/ORG-001-foo.md, a/b/c.yaml.
-_KNOWN_PATH_EXTS = r"py|sh|md|yaml|yml|json|toml|txt|cfg|ini|service|sql|js|ts|html|css"
+_KNOWN_PATH_EXTS = r"py|sh|md|yaml|yml|json|jsonl|toml|txt|tsv|cfg|ini|service|sql|js|ts|html|css"
+# T-2361: the trailing (?![\w-]) boundary is the structural half of the fix and
+# matters more than which extensions are listed. Without it, a listed extension
+# matched a PREFIX of the real one — `ts` ⊂ `tsv`, `json` ⊂ `jsonl`, `sql` ⊂
+# `sqlite` — so `data/x.tsv` was mined as `data/x.ts`, a path nobody claimed;
+# _artifact_exists failed on it and the groomer false-reopened a correctly-done
+# ticket with `acceptance-unmet`. With the boundary, a prefix match backtracks
+# into the alternation (finding `tsv`/`jsonl`, now listed) or fails entirely —
+# and an UNLISTED extension (.sqlite) simply stops matching, which lands on this
+# module's stated side of doubt ("when in doubt, DON'T flag") instead of
+# flagging with certainty on a phantom path. `-` is in the lookahead alongside
+# \w so `tools/foo.py-backup` reads as not-a-claim rather than as `foo.py`.
 _PATH_RE = re.compile(
     r"(?<![\w/.-])"                       # not preceded by a path-char (avoid mid-token)
     r"([A-Za-z0-9_][\w./-]*"              # first segment
     r"/[\w./-]+"                          # at least one slash + more
     rf"\.(?:{_KNOWN_PATH_EXTS}))"
+    r"(?![\w-])"                          # T-2361: ext must END here, not prefix a longer one
 )
 # T-0973: a slash-joined filename LIST in prose (e.g. `repos.yaml/instance.yaml`,
 # meaning two separate files) is matched by _PATH_RE as ONE bogus path whose first
@@ -670,6 +686,27 @@ _SHA_RE = re.compile(
 _LANDING_CUE_RE = re.compile(
     r"\b(?:created|landed|added|shipped|wrote|writes to|commit(?:ted)?"
     r"|implemented in|at)\b",
+    re.IGNORECASE,
+)
+
+# NEGATED landing cue (T-1709 false-reopen): a resolution that transparently
+# says an artifact did NOT land ("hadn't landed on disk", "was never created",
+# "did not ship") must NOT be mined as a landing CLAIM. The clause-negation
+# guard misses this because the negation follows the path AND the past-negative
+# contractions ("hadn't") aren't in the general negation set. This matches a
+# negative auxiliary within a few words before a landing verb. Applied
+# CLAUSE-scoped (T-1741), not line-scoped: only the path whose own clause
+# contains the match is dropped, so a negated-landing phrase in one clause
+# does not suppress an unrelated, legitimately-landed path co-claimed in an
+# earlier clause on the same line ("landed tools/foo.py; no longer landed
+# tools/old.py" keeps foo.py). Safe under the false-negatives-over-false-
+# positives bias — a missed mis-close is cheaper than a false auto-reopen.
+_NEGATED_LANDING_RE = re.compile(
+    r"\b(?:not|never|no\s+longer|"
+    r"(?:had|has|have|was|were|is|are|did|does|do|would|could|will|won)"
+    r"(?:n['’]?t|\s+not))"
+    r"\s+(?:\w+\s+){0,2}?"
+    r"(?:created|landed|added|shipped|wrote|committed|implemented|ship|land|exist)",
     re.IGNORECASE,
 )
 
@@ -921,6 +958,27 @@ def _path_is_negated_in_clause(line: str, path_start: int) -> bool:
     return _NEGATION_MARKERS_RE.search(clause_segment) is not None
 
 
+def _clause_bounds(line: str, path_start: int, path_end: int) -> tuple[int, int]:
+    """Return the (start, end) offsets of the clause containing the path
+    token, bounded by the nearest `_CLAUSE_DELIMITERS_RE` matches before
+    `path_start` and at-or-after `path_end` (or the line's edges if none).
+
+    Unlike `_path_is_negated_in_clause` (prefix-only — negation must precede
+    the path), this returns the FULL clause, including text after the path.
+    Needed for the negated-landing check (T-1741): a negated landing verb can
+    follow the path ("<path> hadn't landed on disk yet" — T-1737), so the
+    scan must cover both sides of the path within its own clause.
+    """
+    start = 0
+    for m in _CLAUSE_DELIMITERS_RE.finditer(line[:path_start]):
+        start = m.end()
+    end = len(line)
+    m2 = _CLAUSE_DELIMITERS_RE.search(line, path_end)
+    if m2:
+        end = m2.start()
+    return start, end
+
+
 def _claim_region(body: str) -> str:
     """Return the body text where a closer asserts what landed.
 
@@ -1033,8 +1091,10 @@ def extract_artifacts(
         other_repo = _line_mentions_other_repo(line)
 
         # Paths — landing-cue gated, non-illustrative, not on a PR/branch line,
-        # not naming a sibling repo, not a mobile ticket-file path, not cross-repo.
-        if has_landing and not illustrative and not branch_or_pr and not other_repo:
+        # not naming a sibling repo, not a mobile ticket-file path, not cross-repo,
+        # not a negated-landing statement (checked per-path below, T-1741).
+        if (has_landing and not illustrative and not branch_or_pr
+                and not other_repo):
             paren_spans = _paren_spans(line)
             for m in _PATH_RE.finditer(line):
                 # T-0819 class-3 (path-granular parenthetical guard): a path
@@ -1061,6 +1121,20 @@ def extract_artifacts(
                     # line as a legitimate co-claimed artifact does NOT suppress the
                     # legitimate one.  Conservative-drop bias: when in doubt, drop.
                     if _path_is_negated_in_clause(line, m.start(1)):
+                        continue
+                    # Negated-landing guard (T-1709 origin, T-1741 clause-
+                    # scoping fix): if the path's own clause contains a
+                    # negated landing verb — before OR after the path
+                    # ("X hadn't landed", "no longer landed X") — drop it.
+                    # Clause-scoped, not line-scoped, so a negated-landing
+                    # phrase in one clause does not suppress a legitimately
+                    # landed path co-claimed in another clause on the same
+                    # line ("landed tools/foo.py; no longer landed
+                    # tools/old.py" keeps foo.py, drops old.py).
+                    clause_start, clause_end = _clause_bounds(
+                        line, m.start(1), m.end(1))
+                    if _NEGATED_LANDING_RE.search(
+                            line[clause_start:clause_end]) is not None:
                         continue
                     # Mobile ticket-file path — never a deliverable artifact.
                     if _TICKET_PATH_RE.match(path):
@@ -1568,6 +1642,24 @@ def _render_dep_graph_section(findings: list) -> str:
     return "\n".join(lines)
 
 
+def _render_unanchored_gates_section(findings: list) -> str:
+    """Render the T-2833 unanchored/bad date-gate section for the daily digest.
+
+    Surfaces not_before date gates that fail the anchor rule (unanchored,
+    malformed, or dangling-ref) so pre-existing/hand-edited arbitrary gates get
+    migrated to a --depends-on dependency, an event-driven watch, or a real
+    operator:<ref> anchor. Empty list -> empty string (section omitted)."""
+    if not findings:
+        return ""
+    lines: list[str] = [
+        f"📌 Unanchored/bad date gates ({len(findings)}) — a not_before must "
+        "anchor to the operator or be a depends_on:"
+    ]
+    for f in findings:
+        lines.append(f"  - [{getattr(f, 'kind', '?')}] {f.detail}")
+    return "\n".join(lines)
+
+
 def check_manifest_freshness(repo_root: Path, now: datetime,
                              max_age_days: int = 30) -> str | None:
     """T-1624: surface root-manifest staleness in the daily digest.
@@ -1595,6 +1687,410 @@ def check_manifest_freshness(repo_root: Path, now: datetime,
             + " — review against live reality (see T-1621 for the drift class).")
 
 
+# ---------------------------------------------------------------------------
+# T-1814: ratified-but-unbuilt ADR surfacing.
+#
+# WHY: a ratified ADR whose carved build ticket stalls in inbox/active can sit
+# silently while module docs + green tests advertise the fix as landed (the
+# motivating case: ADR-239 was operator-ratified 2026-07-05 but its build
+# ticket T-1602 sat unbuilt for weeks). Read-only, surfacing-only — no ticket
+# mutation, no commit; folded into the daily digest alongside the dep-graph
+# and stale-draft sections above.
+# ---------------------------------------------------------------------------
+
+# Filename recognition: this repo's own ADRs use `ORG-NNN-slug.md`; sibling
+# repos (echo-prismatic) use `ADR-NNN — slug.md`. Both are "ADRs" in this
+# org's convention (CLAUDE.md itself cites `adr/ORG-019-...md` as an ADR), so
+# both prefixes are scanned uniformly.
+_ADR_ID_RE = re.compile(r"^(ADR|ORG)-(\d+)")
+
+# Status-line anchor: `^\*\*Status:` (deliberately NOT requiring the closing
+# `**` immediately after the colon) tolerates BOTH bold-wrapping conventions
+# observed in the live corpus:
+#   (a) `**Status:** **Ratified ...**  Proposed (...)`  (ADR-239/ADR-232 shape)
+#   (b) `**Status: RATIFIED ...** (trailing prose)`      (ORG-028/030/031/032/036 shape)
+# The captured remainder is scanned for Ratified/exclusion words
+# case-insensitively regardless of which convention produced it — a stray
+# leading `**` in form (a)'s capture is cosmetic snippet noise, not a
+# correctness issue. A ratified ADR silently not surfacing because of a known
+# bold-wrapping variant is precisely the failure class this check exists to
+# kill (T-1814 plan amendment).
+_ADR_STATUS_LINE_RE = re.compile(r"^\*\*Status:\s*(.*)$", re.MULTILINE)
+
+_ADR_RATIFIED_RE = re.compile(r"\bRatified\b", re.IGNORECASE)
+
+# T-2825: alongside Superseded/Retired/Rejected, also excludes on a
+# NOT-YET-ratified negation phrase in the first sentence -- "unratified" and
+# "awaiting ... ratif[ication/y]" (e.g. "DRAFT awaiting the operator's
+# ratification"). This catches ORG-065's real shape: a genuinely-unratified
+# status line whose LATER clause happens to mention the operator ratifying an
+# unrelated ticket ("...at the same time he ratified T-2169"), which the
+# whole-line Ratified-anywhere-in-line scan otherwise treats as ratified.
+# Deliberately NOT a bare-leading-word check (e.g. excluding on a status line
+# that merely STARTS with "Proposed"/"Draft") -- ORG-019's real shape is
+# "Drafted 2026-05-18 ... **Ratified 2026-05-19T00:58Z by the operator...**" and
+# IS genuinely ratified; a leading-word exclusion would misclassify it (and
+# every Drafted-then-Ratified ADR), silently hiding a real ORG-014-class gap.
+# Corpus-verified against all 70 status-line-bearing adr/ files (T-2825): the
+# only flip is ORG-065 True->False; ORG-019/020/021 (all "Drafted..." shape)
+# and the other unratified drafts (ORG-062/063/064/067/069/070/071/072) are
+# unchanged.
+_ADR_EXCLUDE_STATUS_RE = re.compile(
+    r"\b(?:Superseded|Retired|Rejected|Unratified)\b"
+    r"|\bawaiting\b.*?\bratif\w*\b",
+    re.IGNORECASE,
+)
+
+_ADR_SNIPPET_MAX = 100
+
+
+def _default_adr_dirs() -> list[Path]:
+    """Default ADR directories: this repo's `adr/` + echo-prismatic's.
+
+    Evaluated at call time (not module load) so a `--repo-root` override
+    (main()'s global REPO_ROOT reassignment) is reflected.
+    """
+    return [REPO_ROOT / "adr", Path("/home/claude/echo-prismatic/adr")]
+
+
+def _iter_adr_files(adr_dir: Path) -> list[Path]:
+    """Return `ADR-*.md` and `ORG-*.md` files directly under `adr_dir`, sorted."""
+    files = list(adr_dir.glob("ADR-*.md")) + list(adr_dir.glob("ORG-*.md"))
+    return sorted(files)
+
+
+def _adr_status_snippet(text: str) -> str | None:
+    """Return the status-line remainder (text after `**Status:`), or None if
+    the file has no such line at all."""
+    m = _ADR_STATUS_LINE_RE.search(text)
+    if not m:
+        return None
+    return m.group(1).strip()
+
+
+def _is_ratified_status(status_text: str) -> bool:
+    """True iff `status_text` signals Ratified and is NOT excluded by a
+    Superseded/Retired/Rejected marker in its OWN status sentence. Exclusion
+    is checked first (locked design point 1: those words exclude even when
+    Ratified also appears).
+
+    Exclusion is scoped to the FIRST SENTENCE of the status line (up to the
+    first `.` followed by whitespace), not the whole line: real-corpus
+    testing against the T-1528/ADR-232 fixture found a genuinely-ratified
+    status line whose LATER `**Related:**` metadata references an unrelated
+    "PR #173 (superseded lever, do-not-merge)" — a whole-line exclusion scan
+    false-excludes a ratified ADR because of a co-mentioned unrelated
+    artifact. This mirrors the module's existing clause-scoped negation
+    pattern (`_path_is_negated_in_clause` / `_NEGATED_LANDING_RE`, T-1741)
+    rather than inventing a new convention. Ratified-detection stays
+    whole-line per the locked design ("Ratified-anywhere-in-line is the
+    signal") — only the exclusion scan is sentence-scoped.
+    """
+    first_sentence = re.split(r"(?<=\.)\s+", status_text, maxsplit=1)[0]
+    if _ADR_EXCLUDE_STATUS_RE.search(first_sentence):
+        return False
+    return _ADR_RATIFIED_RE.search(status_text) is not None
+
+
+def _truncate_snippet(text: str, limit: int = _ADR_SNIPPET_MAX) -> str:
+    """Cap a status-line snippet for compact digest rendering (design point 4)."""
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+@dataclass
+class RatifiedUnbuiltADR:
+    adr_id: str
+    status_snippet: str
+    open_tickets: list[tuple[str, str]]  # (tid, state)
+
+
+# T-2806: ADR frontmatter markers. `build_disposition` in {no-build-needed,
+# built} exempts an ADR from the zero-ticket backstop (HO Q1 ruling
+# 2026-08-10: both mean "not an open build gap" -- the field would not need
+# a third state if `built` behaved identically to `needs-build`).
+_ADR_EXEMPT_DISPOSITIONS = frozenset({"no-build-needed", "built"})
+
+# Built-in prefix -> label-template fallback, used when adr-namespaces.yaml
+# is absent or fails to parse (T-2806 design: this fully covers today's two
+# namespaces, so a missing/broken config is not a data-loss coverage gap the
+# way a missing ADR directory is -- see _load_adr_namespaces).
+_DEFAULT_ADR_NAMESPACES: dict[str, str] = {"ORG": "org-{num}", "ADR": "adr-{num}"}
+_ADR_NAMESPACES_CONFIG_FILENAME = "adr-namespaces.yaml"
+
+# ORG and ADR prefixes always cross-accept BOTH org-NNN and adr-NNN as join
+# labels regardless of what adr-namespaces.yaml configures (the operator TG 7593:
+# "accept both during migration" off the pre-T-2806 adr-NNN-only convention).
+# Accepted collision tradeoff during the migration period.
+_ADR_MIGRATION_SHIM_PREFIXES = frozenset({"ORG", "ADR"})
+
+def _adr_namespaces_config_path() -> Path:
+    """adr-namespaces.yaml lives at repo root (T-2806) -- sibling of
+    repos.yaml/instance.yaml, deliberately NOT under adr/ (D2-protected).
+    Evaluated at call time (not module load), mirroring _default_adr_dirs,
+    so a patched REPO_ROOT in tests is honored."""
+    return REPO_ROOT / _ADR_NAMESPACES_CONFIG_FILENAME
+
+
+def _load_adr_namespaces() -> dict[str, str]:
+    """Load the ADR-prefix -> build-label-template map.
+
+    Absent or unparseable config falls back SILENTLY to
+    `_DEFAULT_ADR_NAMESPACES` -- unlike a missing ADR directory this loses no
+    data, since the fallback already covers both namespaces in production
+    use today; the config's only job is extending to a future third prefix.
+    Malformed YAML still gets `_load_yaml`'s existing T-2591 stderr warning.
+    """
+    path = _adr_namespaces_config_path()
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return dict(_DEFAULT_ADR_NAMESPACES)
+    data = _load_yaml(text, source=str(path))
+    namespaces = data.get("namespaces") if isinstance(data, dict) else None
+    if not isinstance(namespaces, dict):
+        return dict(_DEFAULT_ADR_NAMESPACES)
+    out = dict(_DEFAULT_ADR_NAMESPACES)
+    for prefix, entry in namespaces.items():
+        if not isinstance(entry, dict):
+            continue
+        template = entry.get("label_template")
+        if isinstance(template, str) and template.strip():
+            out[str(prefix)] = template.strip()
+    return out
+
+
+def _acceptable_build_labels(
+    prefix: str, num: str, namespace_map: dict[str, str]
+) -> set[str]:
+    """The set of ticket labels that satisfy the build-ticket join for one
+    ADR. Primary = the configured template for `prefix`. ORG/ADR
+    additionally always cross-accept both `org-NNN` and `adr-NNN` regardless
+    of config (the migration shim, see `_ADR_MIGRATION_SHIM_PREFIXES`).
+    Falls back to `adr-{num}` if `prefix` has no config entry and isn't in
+    the shim set (unrecognized-prefix safety net).
+    """
+    labels: set[str] = set()
+    template = namespace_map.get(prefix)
+    if template:
+        labels.add(template.format(num=num))
+    if prefix in _ADR_MIGRATION_SHIM_PREFIXES:
+        labels.add(f"org-{num}")
+        labels.add(f"adr-{num}")
+    if not labels:
+        labels.add(f"adr-{num}")
+    return labels
+
+
+def _adr_frontmatter(text: str, source: str = "?") -> dict:
+    """Parse an ADR's `---`-delimited YAML frontmatter (build_disposition /
+    scoping_ticket live here, T-2806). See the module-level import comment:
+    reuses `tools.adr_reeval_walk`'s hardened parser rather than
+    re-implementing it."""
+    fm_block, _body = _split_frontmatter(text)
+    return _load_yaml(fm_block, source=source)
+
+
+def _adr_build_disposition(fm: dict) -> str | None:
+    val = fm.get("build_disposition") if isinstance(fm, dict) else None
+    return val.strip() if isinstance(val, str) and val.strip() else None
+
+
+def _adr_scoping_ticket(fm: dict) -> str | None:
+    val = fm.get("scoping_ticket") if isinstance(fm, dict) else None
+    return val.strip() if isinstance(val, str) and val.strip() else None
+
+
+def _scoping_ticket_state(tickets_root: Path, tid: str) -> str | None:
+    """T-2826: 'done' / 'open' / None (absent) for a `scoping_ticket` tid, by
+    exact `<tid>.md` membership under tickets/{done,inbox,active}. Read-only
+    file-existence check, not a full `parse_ticket` -- only the open/done/
+    absent distinction matters for the exemption below, and this mirrors
+    `adr_scoping_lint.check_adr_frontmatter`'s own light-touch handling of
+    the same field."""
+    if (tickets_root / "done" / f"{tid}.md").exists():
+        return "done"
+    if (tickets_root / "inbox" / f"{tid}.md").exists():
+        return "open"
+    if (tickets_root / "active" / f"{tid}.md").exists():
+        return "open"
+    return None
+
+
+def _build_label_index(tickets_root: Path) -> dict[str, list[tuple[str, str]]]:
+    """One pass over tickets/{inbox,active,done}, indexing every ticket that
+    carries `build`, keyed by EACH of its other labels -> [(tid, state), ...]
+    (sorted by tid within each label). Indexing by every label (not just an
+    `adr-NNN`/`org-NNN`-shaped subset) keeps this genuinely config-driven —
+    a namespace config entry can name any label shape (T-2806 design point
+    2's "a new prefix is a config add, not a code change" only holds if the
+    index doesn't itself hardcode the shape it's willing to see).
+
+    T-2806: the zero-ticket-blindness fix needs `done`-state coverage (a
+    ratified ADR's only build ticket may already be closed), but
+    tickets/done runs to ~2.6k files -- re-scanning it per-ADR (71 ADRs
+    today) would be ~169k ticket-parses/run. This single pass amortizes the
+    cost across the whole run instead: O(tickets) once, O(1) lookup per ADR
+    -- fewer total parses than the pre-fix inbox+active-only per-ADR scan.
+    """
+    index: dict[str, list[tuple[str, str]]] = {}
+    for state in ("inbox", "active", "done"):
+        d = tickets_root / state
+        if not d.exists():
+            continue
+        for path in sorted(d.iterdir()):
+            if not (path.is_file() and TICKET_FILENAME_RE.fullmatch(path.name)):
+                continue
+            try:
+                ticket = parse_ticket(path)
+            except TicketError:
+                continue
+            labels = ticket.fields.get("labels")
+            if not isinstance(labels, list) or "build" not in labels:
+                continue
+            tid = str(ticket.fields.get("id", path.stem))
+            for label in labels:
+                if isinstance(label, str):
+                    index.setdefault(label, []).append((tid, state))
+    for entries in index.values():
+        entries.sort(key=lambda t: t[0])
+    return index
+
+
+def _find_build_tickets_for_adr(
+    label_index: dict[str, list[tuple[str, str]]],
+    prefix: str,
+    num: str,
+    namespace_map: dict[str, str],
+) -> list[tuple[str, str]]:
+    """Return every (tid, state) build ticket matching this ADR, across ALL
+    states (inbox/active/done) — the caller splits out 'open' (non-done) for
+    display. Sorted by tid, deduped by tid (a tid appearing under >1
+    acceptable label — e.g. both the migration-shim and config-driven labels
+    — counts once)."""
+    seen: dict[str, str] = {}
+    for label in _acceptable_build_labels(prefix, num, namespace_map):
+        for tid, state in label_index.get(label, []):
+            seen[tid] = state
+    return sorted(seen.items())
+
+
+def find_ratified_unbuilt_adrs(
+    adr_dirs: list[Path], tickets_root: Path
+) -> tuple[list[RatifiedUnbuiltADR], list[str]]:
+    """Scan `adr_dirs` for ratified, needs-build ADRs lacking a build ticket.
+
+    Read-only, no mutation, no commit (never routed through the commit path
+    the staleness/acceptance checks use). Returns `(flagged, coverage_gaps)`:
+      - `flagged`: one entry per ratified, needs-build ADR that EITHER has a
+        stalled OPEN build ticket OR has ZERO build tickets in any state at
+        all (T-2806: the latter is the ORG-014 class this check exists to
+        catch — an ADR whose only build ticket is already `done` is NOT
+        flagged; `build_disposition: no-build-needed`/`built` are exempt).
+        Sorted by adr_id.
+      - `coverage_gaps`: str(path) for every configured ADR dir absent on
+        this host — always populated when absent, never a silent skip
+        (design point 3). adr-namespaces.yaml being absent/malformed is NOT
+        surfaced here — see `_load_adr_namespaces`, its fallback loses no
+        data.
+    """
+    flagged: list[RatifiedUnbuiltADR] = []
+    coverage_gaps: list[str] = []
+    namespace_map = _load_adr_namespaces()
+    label_index = _build_label_index(tickets_root)
+    for adr_dir in adr_dirs:
+        # Path.exists() re-raises EACCES (pathlib swallows only ENOENT-class
+        # errors), and the cross-repo default dir lives under a 700/750-mode
+        # sibling home this account may not traverse (T-1867: first live fire
+        # crashed here). Unreadable-on-this-host is a coverage gap exactly
+        # like absent-on-this-host — surfaced, never a crash.
+        try:
+            adr_dir_exists = adr_dir.exists()
+        except OSError as exc:
+            coverage_gaps.append(f"{adr_dir} (unreadable: {exc.strerror})")
+            continue
+        if not adr_dir_exists:
+            coverage_gaps.append(str(adr_dir))
+            continue
+        for path in _iter_adr_files(adr_dir):
+            m = _ADR_ID_RE.match(path.name)
+            if not m:
+                continue
+            prefix, num = m.group(1), m.group(2)
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            status_text = _adr_status_snippet(text)
+            if status_text is None or not _is_ratified_status(status_text):
+                continue
+            fm = _adr_frontmatter(text, source=path.name)
+            if _adr_build_disposition(fm) in _ADR_EXEMPT_DISPOSITIONS:
+                continue
+            # T-2826: an OPEN scoping_ticket (inbox/active) already satisfies
+            # the same tracked edge `adr_scoping_lint.check_adr_frontmatter`
+            # accepts at creation time -- exempt symmetrically. A DONE or
+            # missing-on-disk scoping ticket does NOT exempt: falls through
+            # to the normal join so the flag re-arms if the scoping ticket
+            # closed without producing build work (self-healing, not a
+            # permanent mask).
+            scoping_ticket = _adr_scoping_ticket(fm)
+            if scoping_ticket and _scoping_ticket_state(tickets_root, scoping_ticket) == "open":
+                continue
+            all_tickets = _find_build_tickets_for_adr(
+                label_index, prefix, num, namespace_map
+            )
+            open_tickets = [t for t in all_tickets if t[1] != "done"]
+            if all_tickets and not open_tickets:
+                # Every matching ticket is already done -> already built.
+                continue
+            flagged.append(
+                RatifiedUnbuiltADR(
+                    adr_id=f"{prefix}-{num}",
+                    status_snippet=_truncate_snippet(status_text),
+                    open_tickets=open_tickets,
+                )
+            )
+    flagged.sort(key=lambda f: f.adr_id)
+    return flagged, coverage_gaps
+
+
+def _coverage_gap_suffix(gap: str) -> str:
+    """'unavailable' for gaps carrying an '(unreadable: ...)' reason (T-1867),
+    'absent' for plain missing-dir paths."""
+    return "unavailable" if "(unreadable:" in gap else "absent"
+
+
+def _render_ratified_unbuilt_adr_section(
+    flagged: list["RatifiedUnbuiltADR"], coverage_gaps: list[str]
+) -> str:
+    """Render the T-1814 ratified-but-unbuilt-ADR section for the digest.
+
+    Empty ONLY when both `flagged` and `coverage_gaps` are empty (mirrors the
+    sibling sections' empty->omit convention) — a configured-but-absent ADR
+    dir always renders its coverage-gap line, so absence is never silently
+    dropped (design point 3). Fires every daily run while the condition
+    holds — repetition is intended (standing signal, design point 4).
+    """
+    if not flagged and not coverage_gaps:
+        return ""
+    lines = [f"\U0001F4D0 Ratified ADRs with unbuilt build ticket(s) ({len(flagged)}):"]
+    for f in flagged:
+        if f.open_tickets:
+            tickets_str = ", ".join(f"{tid} ({state})" for tid, state in f.open_tickets)
+            lines.append(f"  - {f.adr_id} ({f.status_snippet}) - open: {tickets_str}")
+        else:
+            # T-2806: the zero-ticket case (the ORG-014 class) -- an explicit
+            # message, not a misleading blank "open: " that reads as a bug.
+            lines.append(
+                f"  - {f.adr_id} ({f.status_snippet}) - NO BUILD TICKET FOUND (zero-ticket gap)"
+            )
+    for gap in coverage_gaps:
+        lines.append(f"  coverage gap: {gap} {_coverage_gap_suffix(gap)} on this host")
+    return "\n".join(lines)
+
+
 def build_digest(
     now_iso: str,
     flagged: list[FlaggedTicket],
@@ -1603,8 +2099,11 @@ def build_digest(
     active_queue_section: str | None = None,
     reopened: list["ReopenedTicket"] | None = None,
     dep_graph_findings: list | None = None,
+    unanchored_gate_findings: list | None = None,
     stale_draft_findings: list["StaleDraftTicket"] | None = None,
     manifest_line: str | None = None,
+    ratified_unbuilt_findings: list["RatifiedUnbuiltADR"] | None = None,
+    adr_coverage_gaps: list[str] | None = None,
 ) -> str:
     """Render the digest as plain text (no Markdown).
 
@@ -1625,7 +2124,11 @@ def build_digest(
     hermes_suffix = f"\n{hermes_line}" if hermes_line else ""
     reopened_section = _render_reopened_section(reopened or [])
     dep_graph_section = _render_dep_graph_section(dep_graph_findings or [])
+    unanchored_gates_section = _render_unanchored_gates_section(unanchored_gate_findings or [])
     stale_draft_section = _render_stale_draft_section(stale_draft_findings or [])
+    ratified_unbuilt_section = _render_ratified_unbuilt_adr_section(
+        ratified_unbuilt_findings or [], adr_coverage_gaps or []
+    )
 
     if not flagged:
         body = (
@@ -1636,10 +2139,14 @@ def build_digest(
         )
         if dep_graph_section:
             body += "\n" + dep_graph_section + "\n"
+        if unanchored_gates_section:
+            body += "\n" + unanchored_gates_section + "\n"
         if stale_draft_section:
             body += "\n" + stale_draft_section + "\n"
         if reopened_section:
             body += "\n" + reopened_section + "\n"
+        if ratified_unbuilt_section:
+            body += "\n" + ratified_unbuilt_section + "\n"
         if active_queue_section:
             body += "\n" + active_queue_section + "\n"
         if manifest_line:
@@ -1670,10 +2177,14 @@ def build_digest(
     result = "\n".join(parts)
     if dep_graph_section:
         result += "\n" + dep_graph_section + "\n"
+    if unanchored_gates_section:
+        result += "\n" + unanchored_gates_section + "\n"
     if stale_draft_section:
         result += "\n" + stale_draft_section + "\n"
     if reopened_section:
         result += "\n" + reopened_section + "\n"
+    if ratified_unbuilt_section:
+        result += "\n" + ratified_unbuilt_section + "\n"
     if active_queue_section:
         result += "\n" + active_queue_section + "\n"
     if manifest_line:
@@ -1889,6 +2400,14 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         help=f"override active-state default ({DEFAULT_STALE_AFTER['active']}); format <N>h or <N>d",
     )
+    p.add_argument(
+        "--adr-dirs",
+        default=None,
+        help=(
+            "comma-separated ADR directories to scan for ratified-but-unbuilt "
+            "ADRs (T-1814); default: <repo>/adr, /home/claude/echo-prismatic/adr"
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -1953,6 +2472,13 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
+    # T-1814: resolve ADR dirs (CLI override or default), after any
+    # --repo-root reassignment above so the default picks up the right REPO_ROOT.
+    if args.adr_dirs:
+        adr_dirs = [Path(p.strip()) for p in args.adr_dirs.split(",") if p.strip()]
+    else:
+        adr_dirs = _default_adr_dirs()
+
     # --dry-run: scan current state (shared tree) + report; no writes.
     if args.dry_run:
         to_append_dry: list[FlaggedTicket] = []
@@ -2007,6 +2533,27 @@ def main(argv: list[str] | None = None) -> int:
                 print(
                     f"    [STALE-DRAFT] {d.tid} ({d.state}, {_format_age(d.age)} since "
                     f"draft dated {d.header_date.date().isoformat()})"
+                )
+        ratified_unbuilt_dry, adr_gaps_dry = find_ratified_unbuilt_adrs(adr_dirs, TICKETS_ROOT)
+        if not ratified_unbuilt_dry and not adr_gaps_dry:
+            print("  no ratified-but-unbuilt ADRs found.")
+        else:
+            print(
+                f"  ratified-but-unbuilt ADR(s) ({len(ratified_unbuilt_dry)}):"
+            )
+            for r in ratified_unbuilt_dry:
+                if r.open_tickets:
+                    tickets_str = ", ".join(f"{tid} ({state})" for tid, state in r.open_tickets)
+                    print(f"    [ADR-UNBUILT] {r.adr_id} ({r.status_snippet}) - open: {tickets_str}")
+                else:
+                    print(
+                        f"    [ADR-UNBUILT] {r.adr_id} ({r.status_snippet}) - "
+                        "NO BUILD TICKET FOUND (zero-ticket gap)"
+                    )
+            for gap in adr_gaps_dry:
+                print(
+                    f"    [COVERAGE-GAP] {gap} "
+                    f"{_coverage_gap_suffix(gap)} on this host"
                 )
         return 0
 
@@ -2129,10 +2676,22 @@ def main(argv: list[str] | None = None) -> int:
     # class defects surface despite the hourly ticket_lint running --no-digest.
     dep_graph_findings = detect_dep_graph_issues(TICKETS_ROOT)
 
+    # T-2833: not_before date gates that fail the anchor rule (unanchored /
+    # malformed / dangling-ref). Read-only; surfaced daily so pre-existing
+    # arbitrary gates get migrated to a depends_on / event-watch / operator-anchor.
+    unanchored_gate_findings = detect_unanchored_gates(TICKETS_ROOT)
+
     # T-1586: interactive-required tickets carrying a stale dated DRAFT/
     # proposal section with no open operator-facing link. Read-only, over the
     # shared tree (same rationale as the dep-graph scan above).
     stale_draft_findings = find_stale_draft_tickets(TICKETS_ROOT, now)
+
+    # T-1814: ratified-but-unbuilt ADR surfacing. Read-only, over the shared
+    # tree (same rationale as the dep-graph/stale-draft scans above) — NOT
+    # routed through the commit path the staleness/acceptance checks use.
+    ratified_unbuilt_findings, adr_coverage_gaps = find_ratified_unbuilt_adrs(
+        adr_dirs, TICKETS_ROOT
+    )
 
     # Digest: always send (proof-of-life), unless --no-digest.
     if not args.no_digest:
@@ -2142,8 +2701,11 @@ def main(argv: list[str] | None = None) -> int:
             active_queue_section=active_queue_section,
             reopened=reopened,
             dep_graph_findings=dep_graph_findings,
+            unanchored_gate_findings=unanchored_gate_findings,
             stale_draft_findings=stale_draft_findings,
             manifest_line=check_manifest_freshness(REPO_ROOT, now),
+            ratified_unbuilt_findings=ratified_unbuilt_findings,
+            adr_coverage_gaps=adr_coverage_gaps,
         )
         if failures > 0:
             digest = digest + f"\nWARNING: ticket_grooming auto-commit reported {failures} failure(s); see stderr.\n"

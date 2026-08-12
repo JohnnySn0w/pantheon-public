@@ -6,6 +6,10 @@ domain: pantheon, echo, worktrees, dispatch-pattern, claude-code-harness
 
 # Worker pre-flight passes, then absolute-path drift into the main checkout
 
+## Occurrence update (2026-07-19, impl-T1804 — SELF-CAUGHT + self-recovered variant)
+
+Recurrence with the best-case recovery shape: the implementer's first two edits landed on `/home/claude/echo-prismatic` (canonical main) despite a passing pre-flight; it CAUGHT THE SLIP ITSELF before any build — the tell was a background test run showing a STALE TEST NAME its plan should have replaced (the old test still present = the edit went somewhere else). Recovery followed this entry's fix verbatim (verified only-working-tree damage, `git restore` the file, confirmed status+diff empty, byte-diffed worktree copy vs restored main copy, re-applied in the worktree, re-ran pre-flight before every subsequent call) and it DISCLOSED unprompted in its report. HO independently verified main clean before accepting. New detection tell for the catalog: an unexpected stale artifact (old test name, old log line) in your own verification output = your edits may be landing in a different tree than your checks.
+
 ## Observed (T-1656 implementer, 2026-07-10)
 
 Pre-flight was correct (`git rev-parse --show-toplevel` → `/tmp/echo-T-1656`).

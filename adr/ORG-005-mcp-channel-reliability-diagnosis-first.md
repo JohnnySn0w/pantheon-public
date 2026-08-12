@@ -1,8 +1,17 @@
 ---
 aliases: [ORG-005]
-title: MCP channel reliability: diagnosis-first fix path
+title: "MCP channel reliability: diagnosis-first fix path"
 status: Ratified 2026-05-04
 date: 2026-05-04
+# re_evaluate: machine-checkable mirror of this ADR's inline re-eval prose,
+# consumed by tools/adr_reeval_walk.py (T-2527). Backfilled per T-2530.
+re_evaluate:
+  - id: R1
+    type: event
+    when: "the trust-posture re-eval cycle runs"
+    fires: surface
+    text: "the two dispatch-discipline patterns (ratified-design-vs-current-priority drift; symptom-as-design-input vs root-cause-first) fold into feedback memory and re-evaluate when the trust-posture re-eval cycle runs"
+build_disposition: built
 ---
 # ORG-005 — MCP channel reliability: diagnosis-first fix path
 

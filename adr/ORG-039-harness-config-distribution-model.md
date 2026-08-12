@@ -39,6 +39,7 @@ For **each** harness-config repo (`claude-code-config`, `codex-config`), partiti
   - **MCP wiring placeholders** — server registration shape with `${...}`-style token/path placeholders,
   - the **`pantheon-org-discipline` skill** (org-wide worker conventions — generic by construction),
   - **pinned-rules STRUCTURE** — the `pinned-rules/` README + section skeleton/template, not the filled briefs.
+  - > A fork records its harness-layer delta (which of these FRAMEWORK templates it customized) in the same root-level `FORK.md` that ORG-029 blesses for the framework layer — see ORG-029 Addendum "fork conventions" + `sop/standard/pantheon-bringup.md` §11. One fork-owned delta-index spans both layers.
 - **INSTANCE (stays in the reference fork; never ships; like ORG-029's CLEAR set):**
   - persona-brief **content** (the actual `orchestrator.md`/`recovery.md`/`specialist.md` text — operational state, account specifics, history),
   - **tokens / secrets** (bot tokens, deploy keys, API credentials),
@@ -56,6 +57,7 @@ A self-hoster authors **one** `instance.yaml` (ORG-028's manifest, extended) map
 The distribution ships a **lightweight but explicit** provisioning contract so the bundle boots:
 - unix users/groups (or a documented **single-user mode**), mailbox dir creation + perms, config symlink/install locations, env/secret **placeholders**, **systemd-user / tmux launch examples**, deploy-key/SSH expectations, and a **per-role boot smoke**.
 - **Release gates (both required before a harness template ships):** (a) a **leakage scan** — no secrets, persona-brief content, account names, or absolute host paths present in the FRAMEWORK set; (b) a **clean-home dry-run** — agents boot from the template alone in a throwaway account.
+- **Genericization convention — dangling upstream references (T-1987, non-blocking):** bare `T-NNNN` ticket refs and `ADR-NNN` design refs not resolvable within a mirror are upstream-internal provenance, not leaks. They are handled by a standing one-line README note (safe-to-ignore), NOT stripped and NOT added to the leak-scan fail-gate. See [[notes/2026-07-27-mirror-dangling-refs-convention]].
 
 ### 4. Decoupling contract — a fork without the harness repo must not half-break
 

@@ -53,6 +53,7 @@ import json
 import re
 import sys
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -362,8 +363,24 @@ def scan_all(
 # committed), "declined" (recovery judged it should stay soft — a decline is itself
 # signal that it is not promotable, so we never re-propose it). Any recorded
 # fingerprint is skipped on the next sweep regardless of status.
+#
+# T-2827 (P4 traceability): entries also carry `filed_at` / `decided_at` —
+# ISO-8601 UTC decision timestamps. Both are ADDITIVE and OPTIONAL: entries
+# written before T-2827 simply lack them (never fabricated — see load_ledger/
+# set_status), and both readers below tolerate absence. Shaped so a future
+# ORG-065 lineage-graph ingestion has a real "when" to query, not just a
+# "what" — no graph code lands here, this is just the durable substrate for it.
 
 LEDGER_STATUSES = ("filed", "landed", "declined")
+
+
+def _now_stamp(now: datetime | None = None) -> str:
+    """ISO-8601 UTC, `Z`-suffixed (matches the convention used elsewhere in
+    this repo, e.g. tools/_git_utils.py, tools/activity_digest.py). `now` is
+    an injectable clock (default the real clock) so callers/tests can pin a
+    deterministic timestamp — same shape as tools/_audit.py's `now` param."""
+    dt = now if now is not None else datetime.now(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def load_ledger(path: Path) -> dict:
@@ -383,23 +400,31 @@ def filter_unledgered(candidates: list[Candidate], ledger: dict) -> list[Candida
     return [c for c in candidates if c.fingerprint not in ledger]
 
 
-def record_ledger(path: Path, candidates: list[Candidate], status: str) -> dict:
+def record_ledger(path: Path, candidates: list[Candidate], status: str,
+                  *, now: datetime | None = None) -> dict:
     """Merge candidates into the ledger under `status` and persist. Returns the
     updated ledger. Existing entries are not downgraded blindly — a 'landed' or
     'declined' fingerprint is left as-is (re-recording as 'filed' would be a
-    regression); only genuinely new fingerprints are added."""
+    regression); only genuinely new fingerprints are added.
+
+    A newly-added entry gets `filed_at` (T-2827) IFF `status == "filed"` — the
+    field means "when this candidate was first filed for review"; stamping it
+    under any other status would make it lie about what happened (P4)."""
     if status not in LEDGER_STATUSES:
         raise ValueError(f"status must be one of {LEDGER_STATUSES}, got {status!r}")
     ledger = load_ledger(path)
     for c in candidates:
         if c.fingerprint in ledger:
             continue
-        ledger[c.fingerprint] = {
+        entry = {
             "status": status,
             "source": c.source,
             "title": c.title,
             "check_kind": c.check_kind,
         }
+        if status == "filed":
+            entry["filed_at"] = _now_stamp(now)
+        ledger[c.fingerprint] = entry
     path.write_text(json.dumps(ledger, indent=2, sort_keys=True), encoding="utf-8")
     return ledger
 
@@ -470,19 +495,28 @@ def file_candidates(candidates: list[Candidate], surface_dir: Path,
 # --- Recovery review of a filed surface (inc 3b/4) ------------------------------
 
 
-def set_status(ledger_path: Path, fingerprint: str, status: str) -> dict:
+def set_status(ledger_path: Path, fingerprint: str, status: str,
+               *, now: datetime | None = None) -> dict:
     """Transition a ledger entry to a TERMINAL review status (landed|declined).
     Unlike record_ledger (which only ADDS new fingerprints and never downgrades),
     this is the recovery-review verb: a 'filed' candidate becomes 'landed' or
     'declined'. Idempotent — re-declining a declined fingerprint is a no-op. A
-    fingerprint not previously seen is recorded directly (a pre-emptive decline)."""
+    fingerprint not previously seen is recorded directly (a pre-emptive decline).
+
+    `decided_at` (T-2827) is stamped on first assignment or on a genuine status
+    change; a redundant identical re-call leaves it alone — decided_at records
+    when the decision was actually MADE, and a no-op re-call is not a new
+    decision (P4: the timestamp must not drift on repeated identical review
+    verbs)."""
     if status not in ("landed", "declined"):
         raise ValueError(f"review status must be landed|declined, got {status!r}")
     ledger = load_ledger(ledger_path)
     entry = ledger.get(fingerprint)
     if entry is None:
-        ledger[fingerprint] = {"status": status}
+        ledger[fingerprint] = {"status": status, "decided_at": _now_stamp(now)}
     else:
+        if entry.get("status") != status:
+            entry["decided_at"] = _now_stamp(now)
         entry["status"] = status
     ledger_path.write_text(json.dumps(ledger, indent=2, sort_keys=True),
                            encoding="utf-8")
@@ -505,7 +539,12 @@ def _parse_frontmatter(text: str) -> dict:
 
 
 def _iter_candidate_files(surface_dir: Path):
-    """Yield (path, frontmatter) for each candidate .md (README.md excluded)."""
+    """Yield (path, frontmatter) for each PENDING candidate .md (README.md
+    excluded). `surface_dir.glob("*.md")` is intentionally NON-recursive: it
+    must NEVER become `**/*.md` (or similar), because `decided/` — the
+    T-2827 archive subdir — lives under `surface_dir` and its files must not
+    resurface as pending. That non-recursion is the whole structural guarantee
+    the pending-list / dedup-filter rely on."""
     if not surface_dir.is_dir():
         return
     for p in sorted(surface_dir.glob("*.md")):
@@ -527,15 +566,78 @@ def list_pending(surface_dir: Path) -> list[dict]:
     return [fm for _p, fm in _iter_candidate_files(surface_dir)]
 
 
+# --- Decided-candidate archive (T-2827 defect 2) ----------------------------
+# land/decline used to DELETE the candidate .md — destroying the invariant,
+# draft, rationale, and any decline reasoning regardless of outcome. Instead
+# the reviewed file is stamped + MOVED into `decided/`, a subdir of the same
+# surface. It ships for free in promote_lessons_cron.py's existing
+# `commit_scoped(["promotion-candidates"], ...)` scope — verified at source
+# that `git add -- promotion-candidates` (allow_prefix=True) recursively
+# stages subdirs, so no cron change is needed.
+
+DECIDED_SUBDIR = "decided"
+
+
+def _rewrite_decision_frontmatter(text: str, status: str, decided_at: str) -> str:
+    """Return `text` with its frontmatter `status:` flipped to the terminal
+    outcome and `decided_at:` set — the candidate BODY (invariant/draft/
+    rationale) is untouched. That preservation is the point of defect 2."""
+    if not text.startswith("---"):
+        # No frontmatter (shouldn't happen for a rendered candidate) — prepend
+        # one rather than silently dropping the decision.
+        return f"---\nstatus: {status}\ndecided_at: {decided_at}\n---\n\n{text}"
+    end = text.find("\n---", 3)
+    if end == -1:
+        return text
+    header, body = text[3:end], text[end + 4:]
+    out_lines = []
+    seen_status = seen_decided = False
+    for line in header.splitlines():
+        key = line.split(":", 1)[0].strip() if ":" in line else None
+        if key == "status":
+            out_lines.append(f"status: {status}")
+            seen_status = True
+        elif key == "decided_at":
+            out_lines.append(f"decided_at: {decided_at}")
+            seen_decided = True
+        else:
+            out_lines.append(line)
+    if not seen_status:
+        out_lines.append(f"status: {status}")
+    if not seen_decided:
+        out_lines.append(f"decided_at: {decided_at}")
+    return "---" + "\n".join(out_lines) + "\n---" + body
+
+
+def _archive_decided_candidate(surface_dir: Path, fpath: Path, status: str,
+                               decided_at: str) -> Path:
+    """Stamp the outcome into `fpath`'s frontmatter and move it into
+    `decided/`, overwriting idempotently if a same-named file is already
+    there (never errors on a pre-existing name)."""
+    text = fpath.read_text(encoding="utf-8")
+    new_text = _rewrite_decision_frontmatter(text, status, decided_at)
+    decided_dir = surface_dir / DECIDED_SUBDIR
+    decided_dir.mkdir(parents=True, exist_ok=True)
+    dest = decided_dir / fpath.name
+    dest.write_text(new_text, encoding="utf-8")
+    fpath.unlink()
+    return dest
+
+
 def review_candidate(surface_dir: Path, ledger_path: Path, fingerprint: str,
-                     decision: str) -> bool:
-    """Apply a recovery decision: set the ledger status (landed|declined) and delete
-    the candidate file. Returns True if a candidate file was removed. The ledger
-    is updated regardless (so a decline sticks even if the file was already gone)."""
-    set_status(ledger_path, fingerprint, "landed" if decision == "land" else "declined")
+                     decision: str, *, now: datetime | None = None) -> bool:
+    """Apply a recovery decision: set the ledger status (landed|declined), stamp
+    decided_at, and PRESERVE the candidate file by archiving it to `decided/`
+    (T-2827 — never deleted). Returns True if a candidate file was archived.
+    The ledger is updated regardless (so a decline sticks even if the file was
+    already gone). `now` is resolved once and threaded into both the ledger
+    write and the archived file's stamp so they never drift."""
+    status = "landed" if decision == "land" else "declined"
+    resolved_now = now if now is not None else datetime.now(timezone.utc)
+    set_status(ledger_path, fingerprint, status, now=resolved_now)
     fpath = find_candidate_file(surface_dir, fingerprint)
     if fpath is not None:
-        fpath.unlink()
+        _archive_decided_candidate(surface_dir, fpath, status, _now_stamp(resolved_now))
         return True
     return False
 
@@ -609,7 +711,7 @@ def main(argv: list[str] | None = None) -> int:
         decision = "decline" if args.decline else "land"
         removed = review_candidate(args.candidates_dir, args.ledger, fp, decision)
         print(f"promote_lessons: {decision}d {fp} "
-              f"({'file removed' if removed else 'no file found; ledger updated'}).")
+              f"({'file archived to decided/' if removed else 'no file found; ledger updated'}).")
         return 0
 
     candidates = scan_all(args.lessons_dir, args.bugs_dir, args.memory_dir)

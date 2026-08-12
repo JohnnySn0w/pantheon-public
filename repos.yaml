@@ -23,7 +23,10 @@
 # — widen them only via ticket + the operator's call, never silently.
 #
 # Grants are keyed on instance role-keys (ORG-030 Q4): orchestrator,
-# specialist, recovery. The role→persona binding is in instance.yaml.
+# specialist, recovery, peer-daemon-codex, and — added 2026-07-21 by
+# T-1922 — sub-orchestrator-1, sub-orchestrator-2, second-head. The role→persona
+# binding is in instance.yaml, which agent_role_map reads at import time (it is a
+# LIVE lookup, not documentation — see that file's status header).
 # Access levels: ro (clone/read for cross-reference), rw (clone + push).
 
 schema_version: 1
@@ -33,12 +36,19 @@ schema_version: 1
 always_available:
   - repo: pantheon-config
     access: rw
-    agents: [orchestrator, specialist, recovery]
+    # Seats + second head added 2026-07-21 (T-1922). NOTE: validate_repos_field does
+    # NOT read this block — it reads each repo's own `grants:` map below. This list is
+    # the documentation half; the grants entry is the functional half. Both are kept in
+    # step deliberately (adding here alone would silently fail to clear lint).
+    agents: [orchestrator, specialist, recovery, sub-orchestrator-1, sub-orchestrator-2, second-head]
 
 repos:
   - name: pantheon-config
     description: orchestration hub (principles, directives, ADRs, ledger, tickets, tooling)
-    grants: { orchestrator: rw, specialist: rw, recovery: rw }
+    # sub-orchestrator-1/-2 + second-head added 2026-07-21 (T-1922), descriptive-of-current-
+    # reality per this file's own grants policy: all three personas already hold working
+    # pantheon-config push keys and have been committing here. Not a widening.
+    grants: { orchestrator: rw, specialist: rw, recovery: rw, sub-orchestrator-1: rw, sub-orchestrator-2: rw, second-head: rw }
 
   - name: pantheon-bridge
     description: "RETIRED (dead) — the ORG-004 shared getUpdates poller + SSE fanout is no longer running anywhere; every agent self-polls via the per-agent telegram plugin (T-0719/T-0759 failure class). Repo kept for history; do not revive without a design pass."
@@ -46,15 +56,15 @@ repos:
 
   - name: echo-prismatic
     description: Echo voice-agent stack (project-tier ADR-201+)
-    grants: { orchestrator: rw }
+    grants: { orchestrator: rw, sub-orchestrator-2: rw }   # atlas granted 2026-08-08 (the operator TG7351) for the T-2675 Echo retask; ssh alias github-echo-prismatic, deploy key echo_prismatic_deploy
 
   - name: echo-recorder
     description: echo audio-capture web app
-    grants: { orchestrator: rw }
+    grants: { orchestrator: rw, sub-orchestrator-2: rw }   # atlas granted 2026-08-08 (the operator TG7351); ssh alias github-echo-recorder
 
   - name: echo_vault
     description: echo architecture vault
-    grants: { orchestrator: rw }
+    grants: { orchestrator: rw, sub-orchestrator-2: ro }   # atlas granted 2026-08-08 (the operator TG7351), read-only; ssh alias github-echo-vault, deploy key echo_vault_deploy
 
   - name: pantheon-pwa
     description: operator-facing PWA (kino)
@@ -80,7 +90,7 @@ repos:
   # grants policy — access below predates this entry and traces to tickets):
   - name: codex-config
     description: codex agent config + telegram bridge (poller/daemon, MAILBOX.md runbook); LIVE repo
-    grants: { third-party-auditor: rw, recovery: rw }   # recovery deploy key codex_config_deploy (T-1044/T-1046 arcs); canonical recovery clone ~/work/codex-config
+    grants: { peer-daemon-codex: rw, recovery: rw }   # recovery deploy key codex_config_deploy (T-1044/T-1046 arcs); canonical recovery clone ~/work/codex-config
   - name: codex-config-template
     description: genericized codex-config release template (T-1472); private mirror example-org/codex-config-template published by HO (T-1501); public flip operator-gated
     grants: { orchestrator: rw }

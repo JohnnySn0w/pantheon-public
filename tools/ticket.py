@@ -38,7 +38,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 # Make `from tools._git_utils import ...` work both as a script
@@ -51,11 +51,19 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools._git_utils import (  # noqa: E402  — after sys.path bootstrap.
+    PULL_FETCH_FAILED_PREFIX,
+    PULL_NOT_AHEAD_PREFIX,
+    PULL_REBASE_CONFLICT_PREFIX,
     _git,
     _hermes_scan_file,
     _hermes_scan_message,
+    git_mutation_lock,
     pull_or_rebase_strict,
     push_with_retry,
+)
+from tools._md_table import _md_row  # noqa: E402  — leaf module, re-only (T-1936)
+from tools.agent_role_map import (  # noqa: E402  — after sys.path bootstrap.
+    account_persona_map as _account_persona_map,
 )
 
 # T-0761 c4: clone-on-demand repo provisioning (called after a successful claim).
@@ -74,7 +82,8 @@ TICKETS_ROOT = REPO_ROOT / "tickets"
 STATES = ("inbox", "active", "done")  # ORG-019: blocked/ retired
 
 # MUST stay in sync with sibling at pantheon-pwa/src/server/ticketRoutes.ts
-RATIFIABLE_REPO_ALLOWLIST = ("pantheon-config", "revenue-project", "echo-prismatic", "pantheon-pwa")
+RATIFIABLE_REPO_ALLOWLIST = ("pantheon-config", "revenue-project", "echo-prismatic", "pantheon-pwa",
+                             "pantheon-public")  # T-1964: seed ratify surfaces live here (T-1933 arc)
 
 FRONT_MATTER_FIELD_ORDER = (
     "id",
@@ -87,9 +96,20 @@ FRONT_MATTER_FIELD_ORDER = (
     "labels",
     "stale_after",
     "not_before",
+    # T-2833: the mandatory justification for a not_before date gate. Registered
+    # adjacent to not_before so the pair renders together; a date gate must carry
+    # a `operator:<ref>` anchor (see _validate_not_before_anchor). Scalar, not a list.
+    "not_before_anchor",
+    # T-2209: the symmetric inverse of not_before. `not_before` says "not yet";
+    # `decide_by` says "not later than". Registered here rather than left to the
+    # unknown-keys round-trip fallback so it renders in a stable position next
+    # to its sibling — a field that survives only as an unrecognised leftover is
+    # one schema tidy-up away from being silently dropped.
+    "decide_by",
     "ratifiable_files",
     "intent",
     "serves",
+    "retest_status",
 )
 # ORG-019: blocked_by / unblock_when / unblock_check removed from schema.
 # Legacy tickets may still carry these fields; serialize_front_matter emits
@@ -102,9 +122,12 @@ OPTIONAL_FRONT_MATTER = (
     "labels",
     "stale_after",
     "not_before",
+    "not_before_anchor",  # T-2833
+    "decide_by",
     "ratifiable_files",
     "intent",
     "serves",
+    "retest_status",
 )
 LIST_FIELDS = ("depends_on", "labels", "ratifiable_files")
 
@@ -114,6 +137,18 @@ LIST_FIELDS = ("depends_on", "labels", "ratifiable_files")
 # noodle  — "the operator's eye welcome; no urgent action" (design-noodle, parking-the-question)
 # Not set for target != operator (the field is target=operator-specific surface).
 INTENT_VOCAB = ("action", "ratify", "noodle")
+
+# T-2613: `retest_status` — ORG-038 S3* independent-re-test-to-close structural
+# gate. Only s3star_audit_runner.py's finding filer sets this today (via
+# `file --retest-status`), but the vocabulary is owned by the schema, not by
+# whichever caller happens to set it — same reasoning as INTENT_VOCAB above.
+# pending    — awaiting independent re-verification (routes into re-test brief)
+# verified   — an independent re-test recorded a PASS verdict (closed)
+# overridden — an explicit non-verdict closure (closed; reason lives in the
+#              transition log, not this field)
+# A ticket with NO retest_status field is treated as pre-existing/closed —
+# see tools/s3star_audit_runner.py find_open_retest_tickets for the read side.
+RETEST_STATUS_VOCAB = ("pending", "verified", "overridden")
 
 TICKET_FILENAME_RE = re.compile(r"T-(\d{4})\.md$")
 
@@ -247,11 +282,19 @@ def _actor() -> str:
 
 # OS account → persona, for the one-active WIP cap (T-0877). A clone's OS user
 # identifies its persona even when PANTHEON_ACTOR is unset.
-_OS_USER_PERSONA: dict[str, str] = {
-    "claude": "orchestrator",
-    "claude-research": "specialist",
-    "claude-fallback": "recovery",
-}
+#
+# DERIVED from instance.yaml (T-2256). This literal was COMPLETE when it was
+# repointed — T-2255 had just added the entry it was missing — and it is
+# repointed anyway, because the defect this ticket closes is not "the list is
+# wrong", it is "there are twenty lists". This one is the ticket's own worked
+# example: `exocortex` was absent while the LATER ORG-043 seats were present, so
+# `_claiming_persona()` fell through to `_resolve_persona()`, which hands back
+# "exocortex" unchanged while that seat's tickets carry "mnemosyne". The cap
+# keyed on a value no ticket could ever match, one seat ran uncapped for eight
+# days, and nothing surfaced it — a fail-open guard is silent by construction.
+# Leaving a correct copy standing just means the next persona gets added by
+# whoever happens to be standing in front of one of the other nineteen.
+_OS_USER_PERSONA: dict[str, str] = _account_persona_map()
 
 
 def _claiming_persona() -> str:
@@ -656,6 +699,66 @@ def _find_ticket(tid: str) -> Path:
     raise TicketError(f"ticket not found: {tid}")
 
 
+def _ticket_exists(tid: str) -> bool:
+    """Non-raising existence check across all states (inbox/active/done).
+    The boolean sibling of _find_ticket, for anchor resolution (T-2833)."""
+    if not re.fullmatch(r"T-\d{4}", tid):
+        return False
+    fname = f"{tid}.md"
+    return any((TICKETS_ROOT / state / fname).exists() for state in STATES)
+
+
+# T-2833: the legal forms of a not_before date-gate anchor. A date gate is
+# anchored to the operator OR to a real-world blocker (the operator's directive, TG
+# 5641/5651) — never to a free-text reason. Two forms only:
+#   operator:<T-NNNN|tg:MSGID> — the operator picked this date: a ticket recording his
+#     decision (must resolve) or a Telegram message id (specific + auditable).
+#   event:<KIND>:<param>      — a genuine real-world trigger, KIND from a CLOSED
+#     enum of real deadline/cadence types. The closed set is the whole point:
+#     "fresh_session" is not a KIND, so the free-text bypass has no home, while a
+#     real cert/key deadline or a maintenance cadence can stay a simple dated
+#     gate. The param is descriptive (e.g. event:cert-expiry:snowis.me), required.
+# An arbitrary reason ("fresh session", "be careful", "not urgent") fits NEITHER
+# form — it is a pickup note in the body, or the real blocker is a --depends-on
+# dependency. Enforced everywhere a not_before is SET; pre-existing unanchored
+# gates are grandfathered in the files and surfaced by ticket_lint.
+_OPERATOR_ANCHOR_RE = re.compile(r"^operator:(T-\d{4}|tg:\d+)$")
+_EVENT_ANCHOR_KINDS = ("cert-expiry", "key-expiry", "cadence", "window")
+_EVENT_ANCHOR_RE = re.compile(r"^event:(?:" + "|".join(_EVENT_ANCHOR_KINDS) + r"):.+$")
+
+
+def _validate_not_before_anchor(anchor: str | None) -> str:
+    """Return the normalized not_before anchor, or raise TicketError. Enforced at
+    every point a not_before date is SET (ticket.py block/file); pre-existing
+    unanchored gates are grandfathered in the files and surfaced by ticket_lint."""
+    _forms = ("operator:<T-NNNN|tg:MSGID> (the operator picked the date) OR event:<"
+              + "|".join(_EVENT_ANCHOR_KINDS) + ">:<param> (a real-world "
+              "deadline/cadence)")
+    if not anchor or not anchor.strip():
+        raise TicketError(
+            f"a not_before date gate requires --not-before-anchor {_forms}. A "
+            "'fresh session / be careful / not urgent' reason is a pickup note in "
+            "the body, never a gate; a ticket dependency is --depends-on. [T-2833]"
+        )
+    a = anchor.strip()
+    m = _OPERATOR_ANCHOR_RE.match(a)
+    if m:
+        ref = m.group(1)
+        if ref.startswith("T-") and not _ticket_exists(ref):
+            raise TicketError(
+                f"--not-before-anchor cites {ref}, which does not exist in "
+                "inbox/active/done — an operator-anchor ticket ref must resolve. [T-2833]"
+            )
+        return a
+    if _EVENT_ANCHOR_RE.match(a):
+        return a
+    raise TicketError(
+        f"invalid --not-before-anchor {a!r}: must be {_forms}. No free-text "
+        "anchors — an arbitrary reason belongs in --depends-on or a body "
+        "pickup-note, not a date gate. [T-2833]"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Transition-log helpers.
 # ---------------------------------------------------------------------------
@@ -695,10 +798,86 @@ def append_transition(body: str, actor: str, verb: str, detail: str | None) -> s
     return body + entry + "\n"
 
 
+def _published_parent_sha() -> str | None:
+    """Short sha of the last PUBLISHED parent — `merge-base HEAD origin/main`.
+
+    T-2203 introduced this stamp against local HEAD. T-2360 replaced that,
+    because HEAD is the one commit guaranteed to be rewritten: this repo's
+    pre-push hook REBASES onto origin/main, and a resolve is normally made
+    while the branch is ahead (commit the code, then resolve the ticket). So
+    the stamp named a commit the very next push destroyed. Measured: 22 of 33
+    unreachable citations in the repo came from here, regenerating one per
+    ticket operation — which is why T-2272's lint could never converge.
+
+    The merge-base is durable BY CONSTRUCTION: it is already on origin/main, so
+    nothing can rewrite it, and a reader can actually fetch and check it, which
+    is the whole point of "checkable". When HEAD is already on origin/main it
+    returns HEAD, so the previously-correct case is unchanged.
+
+    It reads the LOCAL origin/main ref, so a long-unfetched clone stamps an
+    older commit. That is fine and deliberate: older-but-real beats
+    newer-but-rewritten. Every value this returns is a commit that exists on
+    the remote.
+
+    FAIL-OPEN, unchanged from T-2203 — no sha rather than a wrong one, and
+    never block a transition on provenance. `_git` swallows non-zero exits, but
+    a missing binary or unreadable repo raises OSError, so the whole thing is
+    wrapped. The regex checks are not paranoia: an empty stdout would otherwise
+    stamp a blank sha and produce a line that looks authoritative and says
+    nothing.
+
+    NO HEAD FALLBACK, deliberately. When origin/main is absent (fresh clone, no
+    remote, test fixture) this returns None and the line degrades to the
+    pre-T-2203 shape. Falling back to HEAD would silently reintroduce the exact
+    rewritable stamp this replaces, in precisely the situation nobody inspects.
+    """
+    try:
+        base = _git("merge-base", "HEAD", "origin/main")
+        if base.returncode != 0:
+            return None
+        full = (base.stdout or "").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", full):
+            return None
+        res = _git("rev-parse", "--short", full)
+        if res.returncode != 0:
+            return None
+        sha = (res.stdout or "").strip()
+        return sha if re.fullmatch(r"[0-9a-f]{7,40}", sha) else None
+    except Exception:  # noqa: BLE001 — fail-open is the whole point
+        return None
+
+
 def _format_transition_entry(ts: str, actor: str, verb: str, detail: str | None) -> str:
+    """Render one transition-log bullet, stamped with the last PUBLISHED parent
+    (T-2203; the source of the sha revised by T-2360 — see
+    `_published_parent_sha`, which explains why local HEAD was the wrong parent
+    to name even though the INTENT below was always right).
+
+    WHAT THE SHA MEANS, precisely, because the obvious reading is wrong: it is
+    the PARENT commit — the repo state this note was written AGAINST — not the
+    commit this transition is about to create. The latter is unobtainable by
+    construction: the sha of a commit depends on the file contents, and the
+    file contains this line, so a note can never carry its own landed sha.
+
+    The parent sha is the more useful of the two anyway, because it is what
+    makes staleness CHECKABLE, which is the actual ask. Worked example from
+    the same night this landed: T-2194 was filed at 13:32Z describing a bug
+    that T-2172 had fixed at 12:37Z. Reconstructing that took reading the
+    code, then `git log -S`, then comparing timestamps. A HEAD stamp on the
+    filing turns it into one `merge-base --is-ancestor`.
+
+    PLACEMENT IS LOAD-BEARING: the stamp goes AFTER the verb. Two consumers
+    parse these lines with the verb anchored to the actor bracket —
+    activity_digest.py's `\\] resolved` and weekly_ticket_summary.py's
+    `\\[(?P<actor>[^\\]]+)\\]\\s+(?P<action>resolved|...)`. Inserting the sha
+    before the verb silently breaks BOTH (they would match nothing and report
+    zero resolves, which reads as a quiet week rather than as a bug).
+    """
+    sha = _published_parent_sha()
+    stamp = f" @{sha}" if sha else ""
     if detail:
-        return f"- {ts} [{actor}] {verb}; {detail}"
-    return f"- {ts} [{actor}] {verb}"
+        return f"- {ts} [{actor}] {verb}{stamp}; {detail}"
+    return f"- {ts} [{actor}] {verb}{stamp}"
 
 
 # ---------------------------------------------------------------------------
@@ -763,6 +942,26 @@ def _build_commit_message(verb: str, tid: str, title: str | None, detail: str | 
         if detail:
             short = detail if len(detail) <= 60 else detail[:57] + "..."
             subject = f"tickets: retarget {tid} — {short}"
+    elif verb == "annotate":
+        subject = f"tickets: annotate {tid}"
+        if detail:
+            short = detail if len(detail) <= 60 else detail[:57] + "..."
+            subject = f"tickets: annotate {tid} — {short}"
+    elif verb == "supersede-ask":
+        # T-2247. Distinct subject from `annotate`: this one CHANGES WHAT THE
+        # TICKET INSTRUCTS, which a log-scanner reading subjects must be able to
+        # tell apart from a free-form note that changes nothing.
+        subject = f"tickets: supersede-ask {tid}"
+        if detail:
+            short = detail if len(detail) <= 60 else detail[:57] + "..."
+            subject = f"tickets: supersede-ask {tid} — {short}"
+    elif verb == "addendum":
+        # T-2205. Distinct subject from `annotate` so the post-resolution
+        # correction is legible in `git log` without opening the ticket.
+        subject = f"tickets: addendum {tid}"
+        if detail:
+            short = detail if len(detail) <= 60 else detail[:57] + "..."
+            subject = f"tickets: addendum {tid} — {short}"
     elif verb == "close-noodle":
         subject = f"tickets: close-noodle {tid}"
         if detail:
@@ -845,7 +1044,7 @@ def _partition_done_rows(
         created_iso = t.fields.get("created", "")
         filed = created_iso[:10] if len(created_iso) >= 10 else "?"
         full_rows.append(
-            f"| {tid} | {state} | {title} | {requester} → {target} | {filed} |"
+            _md_row(tid, state, title, f"{requester} → {target}", filed)
         )
 
     if not collapsed:
@@ -869,8 +1068,13 @@ def _partition_done_rows(
         hi = tids[0]   # highest ID in the collapsed subset for this month
         lo = tids[-1]  # lowest  ID in the collapsed subset for this month
         digest_lines.append(
-            f"| {month} | done (digest) | {count} done"
-            f" · {lo}–{hi} · grep tickets/done/ | — | — |"
+            _md_row(
+                month,
+                "done (digest)",
+                f"{count} done · {lo}–{hi} · grep tickets/done/",
+                "—",
+                "—",
+            )
         )
 
     return full_rows, digest_lines
@@ -926,7 +1130,7 @@ def _rebuild_readme_table(tickets_root: Path, readme_path: Path) -> bool:
         created_iso = t.fields.get("created", "")
         filed = created_iso[:10] if len(created_iso) >= 10 else "?"
         live_rows.append(
-            f"| {tid} | {state} | {title} | {requester} → {target} | {filed} |"
+            _md_row(tid, state, title, f"{requester} → {target}", filed)
         )
 
     # Apply done-row decay: top README_DONE_ROW_FLOOR by ID stay as full rows;
@@ -1048,8 +1252,104 @@ def _board_conflict_resolver(unmerged_paths: list[str], cwd: Path) -> bool:
     return _git("add", "--", "tickets/README.md", cwd=cwd).returncode == 0
 
 
-def _pull_if_needed(no_push: bool) -> None:
+# T-2333: _pull_if_needed's pre-mutation pull (`pull_or_rebase_strict`) has TWO
+# distinct failure shapes with OPPOSITE truth about local state, and one hint
+# text used to be printed for both:
+#   - ff refused, clone not ahead (usually a dirty tree): the pull genuinely
+#     ran before any write, so "nothing has been written yet" holds.
+#   - ff refused, clone ahead, rebase-onto-origin then hit a real conflict
+#     (T-0846 self-heal path, reachable only when a PRIOR op already committed
+#     and its push was lost/failed): a local commit demonstrably EXISTS. The
+#     old single hint asserted "nothing written" here too — false, and it
+#     steered the reader toward re-running, which on the `file` op allocates a
+#     SECOND ticket id for content already committed under the first (T-2333).
+# Selection is on the RETURN-VALUE PREFIX `pull_or_rebase_strict` itself
+# emits (_git_utils.PULL_NOT_AHEAD_PREFIX / PULL_REBASE_CONFLICT_PREFIX),
+# never on git's own free text — git's wording is locale/version-dependent
+# and was never a safe discriminator (T-2204's docstring already says so).
+
+_PULL_FAILURE_HINT_FF = (
+    "ticket.py runs an ff-only pull BEFORE touching any file (T-0244), so a "
+    "failure here means nothing has been written yet. The usual cause is a "
+    "DIRTY WORKING TREE in this clone — git's own message ('Please commit your "
+    "changes or stash them before you merge') never mentions that ticket.py "
+    "pulled, or why. Fix: commit or stash the unrelated changes "
+    "(`git -C {repo} status`), then re-run."
+).format(repo=REPO_ROOT)
+
+_PULL_FAILURE_HINT_REBASE_CONFLICT = (
+    "ticket.py's pre-write pull found this clone AHEAD of origin/main and "
+    "tried to rebase those local unpushed commits onto the fresh tip (T-0846) "
+    "— the self-heal for a STRANDED COMMIT left by a PRIOR ticket op (e.g. its "
+    "push lost a race or failed after the commit). That rebase hit a real "
+    "conflict, so it was ABORTED and this clone was restored to its "
+    "pre-rebase state: your local commit(s) STILL EXIST on this branch — run "
+    "`git -C {repo} log --oneline origin/main..HEAD` to see them. "
+    "DO NOT RE-RUN this operation: on the `file` op, re-running allocates a "
+    "SECOND ticket id for content already committed under the first. Inspect "
+    "the conflicting path(s) named above and reconcile by hand (or ask a "
+    "human) before retrying."
+).format(repo=REPO_ROOT)
+
+_PULL_FAILURE_HINT_FETCH = (
+    "ticket.py's pre-write pull could not reach origin at all — the fetch "
+    "failed before any merge or rebase was attempted, so NOTHING HAS BEEN "
+    "WRITTEN and no local commit was created. This is a NETWORK or "
+    "REMOTE-AUTH problem, not a state problem in this clone: check "
+    "connectivity and credentials (`git -C {repo} fetch origin main` will "
+    "reproduce it directly). RE-RUNNING IS SAFE once the remote is reachable "
+    "— unlike the rebase-conflict case, no id was allocated and no state was "
+    "moved, so there is nothing to double up."
+).format(repo=REPO_ROOT)
+
+_PULL_FAILURE_HINT_UNKNOWN = (
+    "ticket.py's pre-write pull failed for a reason this hint cannot "
+    "classify — it can assert NEITHER that nothing has been written NOR that "
+    "a local commit exists. Check `git -C {repo} status` and `git -C {repo} "
+    "log --oneline origin/main..HEAD` before deciding whether it is safe to "
+    "re-run."
+).format(repo=REPO_ROOT)
+
+
+def _pull_failure_hint(msg: str) -> str:
+    """Select the T-2333-correct hint for a `pull_or_rebase_strict` failure `msg`.
+
+    Discriminates on `_git_utils`'s own return-value prefixes (see the module
+    comment above) so an unrecognised failure — one that matches neither
+    prefix — falls back to a hint that claims neither invariant, rather than
+    silently inheriting the (possibly false) ff-path wording.
+    """
+    if msg.startswith(PULL_REBASE_CONFLICT_PREFIX):
+        return _PULL_FAILURE_HINT_REBASE_CONFLICT
+    if msg.startswith(PULL_NOT_AHEAD_PREFIX):
+        return _PULL_FAILURE_HINT_FF
+    if msg.startswith(PULL_FETCH_FAILED_PREFIX):
+        return _PULL_FAILURE_HINT_FETCH
+    return _PULL_FAILURE_HINT_UNKNOWN
+
+
+def _pull_if_needed(no_push: bool, *, strict: bool = True) -> None:
     """Pre-mutation pull. Called by callers BEFORE filesystem changes (T-0244).
+
+    strict=False (T-2204) downgrades a pull failure to a WARNING and proceeds.
+
+    ONLY legitimate for operations that neither allocate an ID nor move state
+    — in practice `annotate`, which appends a note to a ticket that already
+    exists at a path already known. Being a few commits behind cannot make
+    that note wrong; the append is additive and the commit is scoped to the
+    one file.
+
+    It must NOT be relaxed for file/claim/resolve/block/retarget: those
+    allocate the next ID or move a ticket between directories, and a stale
+    view of origin makes them allocate a colliding ID or transition from a
+    state that is no longer real.
+
+    The failure this fixes: a dirty tree aborted the internal pull, which
+    failed EVERY write in the clone — including annotate. So the moment the
+    tree was dirty, the tool used to REPORT the problem died the same way as
+    the tool used to fix it, and the remediation path and the reporting path
+    failed together. Keeping annotate alive means an agent can always leave a
+    record of what it hit, even in a clone it cannot currently transition.
 
     Failure modes for git pull (network down, ff-not-possible, no remote in
     hermetic e2e) used to leave the working tree mid-transition with files
@@ -1076,7 +1376,21 @@ def _pull_if_needed(no_push: bool) -> None:
     # still abort + fail loud inside pull_or_rebase_strict.
     ok, msg = pull_or_rebase_strict(conflict_resolver=_board_conflict_resolver)
     if not ok:
-        raise TicketError(msg)
+        # T-2204: name the cause and the fix in BOTH paths. git's own text
+        # ("Please commit your changes or stash them before you merge.
+        # Aborting") never says that ticket.py pulled, or why, so the operator
+        # sees a merge error for a merge they did not run. T-2333: which cause
+        # gets named must match which failure this actually was — see
+        # `_pull_failure_hint`.
+        hint = _pull_failure_hint(msg)
+        if strict:
+            raise TicketError(f"{msg}\n\n{hint}")
+        print(
+            f"ticket.py: WARNING: pre-write pull failed; continuing anyway "
+            f"(this operation neither allocates an ID nor moves state, so a "
+            f"stale view cannot make it wrong).\n{msg}\n\n{hint}",
+            file=sys.stderr,
+        )
 
 
 def _commit_and_push(
@@ -1243,6 +1557,95 @@ def _parse_csv_list(raw: str | None) -> list[str]:
 _MAX_FILE_RETRIES = 3
 
 
+_NEAR_DUPLICATE_WINDOW_MINUTES = 30
+_NEAR_DUPLICATE_MIN_SHARED_LABELS = 2
+
+
+def _parse_iso(raw: str) -> datetime:
+    """Parse a ticket `created:` stamp. Trailing `Z` → `+00:00` (fromisoformat
+    only learned to accept `Z` in 3.11, and these stamps are all `Z`-suffixed)."""
+    return datetime.fromisoformat(str(raw).strip().replace("Z", "+00:00"))
+
+
+def _recent_neighbours(labels: list[str], now_iso: str, *,
+                       window_minutes: int = _NEAR_DUPLICATE_WINDOW_MINUTES,
+                       min_shared: int = _NEAR_DUPLICATE_MIN_SHARED_LABELS,
+                       exclude: str | None = None,
+                       ) -> list[tuple[str, str, list[str]]]:
+    """Tickets filed in the last `window_minutes` sharing >= `min_shared` labels.
+
+    T-2260. Twice in one night two agents filed the same finding four minutes
+    apart, each having looked at the same surface and written up what they
+    found rather than assuming the other would — which is the behaviour we
+    want. The gap is that `file` writes into inbox/ with no awareness of what
+    landed a moment ago, and neither author had reason to poll.
+
+    A WARNING, NEVER A BLOCK, and that is a design constraint rather than
+    caution: sibling tickets deliberately split from one arc are routine here
+    and share labels by construction, so a blocking check would fire on the
+    behaviour it is meant to protect. Label overlap plus a time window is an
+    admitted PROXY for "same finding"; it is enough because the reader is an
+    author who already knows what they just wrote and can dismiss it in a
+    second. Deliberately no semantic similarity and no model call — a proxy
+    that surfaces the neighbour beats a cleverer one that adjudicates.
+
+    Returns (tid, title, shared_labels), newest first. Never raises: a
+    scan failure must not cost a filing.
+    """
+    mine = {l.strip().lower() for l in labels if l.strip()}
+    if len(mine) < min_shared:
+        return []
+    try:
+        cutoff = _parse_iso(now_iso) - timedelta(minutes=window_minutes)
+    except Exception:
+        return []
+
+    out: list[tuple[str, str, list[str], str]] = []
+    for state in STATES:
+        d = TICKETS_ROOT / state
+        if not d.is_dir():
+            continue
+        for path in d.glob("T-*.md"):
+            if exclude is not None and path.stem == exclude:
+                continue
+            try:
+                fields, body = parse_front_matter(path.read_text(encoding="utf-8"))
+                created = fields.get("created")
+                if not isinstance(created, str):
+                    continue
+                if _parse_iso(created) < cutoff:
+                    continue
+                theirs = {str(l).strip().lower()
+                          for l in (fields.get("labels") or []) if str(l).strip()}
+                shared = sorted(mine & theirs)
+                if len(shared) >= min_shared:
+                    out.append((path.stem, _extract_title(body), shared, created))
+            except Exception:
+                continue
+    out.sort(key=lambda r: r[3], reverse=True)
+    return [(tid, title, shared) for tid, title, shared, _ in out]
+
+
+def _warn_near_duplicates(labels: list[str], now_iso: str,
+                          *, exclude: str | None = None) -> None:
+    """Print recent label-overlapping neighbours to stderr. Never raises."""
+    try:
+        neighbours = _recent_neighbours(labels, now_iso, exclude=exclude)
+    except Exception:
+        return
+    if not neighbours:
+        return
+    print(
+        f"note: {len(neighbours)} ticket(s) filed in the last "
+        f"{_NEAR_DUPLICATE_WINDOW_MINUTES} min share >= "
+        f"{_NEAR_DUPLICATE_MIN_SHARED_LABELS} labels with this one. "
+        f"Not a duplicate check — just putting the neighbours in front of you:",
+        file=sys.stderr,
+    )
+    for tid, title, shared in neighbours:
+        print(f"  {tid}  [{','.join(shared)}]  {title}", file=sys.stderr)
+
+
 def cmd_file(args: argparse.Namespace) -> int:
     title = args.title.strip()
     if not title:
@@ -1373,7 +1776,12 @@ def cmd_file(args: argparse.Namespace) -> int:
             if args.stale_after:
                 fields["stale_after"] = args.stale_after.strip()
             if args.not_before:
+                # T-2833: a date gate at file-time must carry a resolvable
+                # operator:<ref> anchor, same rule as `block`.
                 fields["not_before"] = _parse_not_before(args.not_before.strip())
+                fields["not_before_anchor"] = _validate_not_before_anchor(
+                    getattr(args, "not_before_anchor", None)
+                )
             raw_ratifiable = getattr(args, "ratifiable_file", None) or []
             if raw_ratifiable:
                 fields["ratifiable_files"] = _parse_ratifiable_files(
@@ -1439,6 +1847,12 @@ def cmd_file(args: argparse.Namespace) -> int:
             if isinstance(raw_serves, str) and raw_serves.strip():
                 fields["serves"] = raw_serves.strip()
 
+            # T-2613 / ORG-038: retest_status — vocab already enforced by argparse
+            # `choices=RETEST_STATUS_VOCAB` on the flag itself.
+            raw_retest_status = getattr(args, "retest_status", None)
+            if isinstance(raw_retest_status, str) and raw_retest_status.strip():
+                fields["retest_status"] = raw_retest_status.strip()
+
             # Pull-first (T-0244): must succeed BEFORE writing the new file so
             # a pull failure doesn't leave an untracked ticket file orphaned.
             # Skipped when no_push=True.
@@ -1492,10 +1906,15 @@ def cmd_file(args: argparse.Namespace) -> int:
             # a non-ff failure and this loop re-allocates a fresh ID (T-0786 race
             # design), rather than push_with_retry rebasing an add/add collision.
             # T-0852: the impl child (if spawned) lands in the SAME atomic commit.
+            # T-1770 Part b: _commit_and_push's own add+commit(+push) span runs
+            # under the shared git_mutation_lock — no prior git-mv here (a brand
+            # new ticket file is untracked until _commit_and_push's own `git add`,
+            # so nothing to protect before this call, unlike _do_transition).
             affected = [new_path] if child_path is None else [new_path, child_path]
-            _commit_and_push(
-                affected, commit_message, no_push=no_push, rebase_on_nonff=False
-            )
+            with git_mutation_lock(label=f"file {tid}"):
+                _commit_and_push(
+                    affected, commit_message, no_push=no_push, rebase_on_nonff=False
+                )
             if child_path is not None:
                 print(
                     f"filed {tid} → tickets/inbox/{tid}.md "
@@ -1504,6 +1923,13 @@ def cmd_file(args: argparse.Namespace) -> int:
                 )
             else:
                 print(f"filed {tid} → tickets/inbox/{tid}.md")
+            # T-2260: AFTER the write, deliberately. The warning must never be
+            # mistaken for a gate, and a filing that succeeded must read as
+            # succeeded; the neighbours are for the author's next second of
+            # judgement, not for this command's exit status. Excludes the
+            # ticket just filed (its own `created` is `created`, but it is
+            # matched out by tid) — see _recent_neighbours.
+            _warn_near_duplicates(labels, created, exclude=tid)
             return 0
         except TicketError as exc:
             err = str(exc)
@@ -1524,6 +1950,22 @@ def cmd_file(args: argparse.Namespace) -> int:
             if child_path is not None and child_path.exists():
                 child_path.unlink()
             _git("reset", "HEAD~1")
+            # T-2172: the undone commit ALSO carried the regenerated
+            # tickets/README.md table. A soft reset leaves that regeneration in
+            # the working tree, so the clone is left dirty with a file no
+            # subsequent op expects — and the scope guard (which requires the
+            # staged set to equal exactly the ticket paths) then refuses EVERY
+            # later ticket op in that clone until someone cleans it by hand.
+            # A push race would silently wedge the whole board.
+            #
+            # Safe to discard rather than preserve: the table is derived state,
+            # rebuilt from the filesystem by _rebuild_readme_table on the next
+            # attempt, so nothing is lost. Best-effort — a failure here must not
+            # mask the push error we are retrying.
+            try:
+                _git("checkout", "--", "tickets/README.md")
+            except Exception:  # noqa: BLE001 - never mask last_push_err
+                pass
 
     raise TicketError(
         f"git push failed after {_MAX_FILE_RETRIES} attempts: {last_push_err}"
@@ -1558,89 +2000,126 @@ def _do_transition(
     new_dir.mkdir(parents=True, exist_ok=True)
     new_path = new_dir / old_path.name
 
-    # 0. Pull-first (T-0244). Must succeed BEFORE any filesystem mutation so a
-    #    pull failure leaves the working tree clean. Skipped when no_push=True.
-    _pull_if_needed(no_push)
+    # T-1770 Part b: the ENTIRE mutate → stage → commit → push span for this
+    # transition is one atomic critical section against other writers on the
+    # same shared checkout (bugs/ticket-py-shared-checkout-interleaved-writer-
+    # race.md). The lock must start BEFORE the pull/git-mv (both touch the
+    # shared index/working tree) and extend through `_commit_and_push`, not
+    # just wrap the commit call — a `git mv` staged-but-uncommitted outside
+    # the lock is exactly what a concurrent writer's unrelated `git commit`
+    # (no pathspec — commits the WHOLE index) can silently sweep up.
+    with git_mutation_lock(label=f"{verb} {tid}"):
+        # 0. Pull-first (T-0244). Must succeed BEFORE any filesystem mutation so
+        #    a pull failure leaves the working tree clean. Skipped when
+        #    no_push=True.
+        _pull_if_needed(no_push)
 
-    # 1. git mv (renames index entry + working-tree file in one step).
-    rel_old = str(old_path.relative_to(REPO_ROOT))
-    rel_new = str(new_path.relative_to(REPO_ROOT))
-    res = _git("mv", rel_old, rel_new)
-    if res.returncode != 0:
-        raise TicketError(
-            f"git mv failed: {res.stderr.strip() or res.stdout.strip()}"
-        )
-
-    # 2. Edit front matter + append transition log.
-    text = new_path.read_text(encoding="utf-8")
-    fields, body = parse_front_matter(text)
-    fields["state"] = new_state
-    actor = _actor()
-    log_verb = _LOG_VERB.get(verb, verb)
-    body = append_transition(body, actor, log_verb, detail)
-    new_text = _build_ticket_text(fields, body)
-    new_path.write_text(new_text, encoding="utf-8")
-
-    # 2b. Cascade callback (T-0328): runs after parent mv+edit, returns
-    # additional paths to fold into the commit. Callback is responsible
-    # for its own git mv + frontmatter edits. Failure raises TicketError
-    # which propagates and aborts before commit.
-    cascade_paths: list[Path] = []
-    if cascade_callback is not None:
-        cascade_paths = cascade_callback(tid)
-
-    # 2c. Ratify-lift (T-0491): when resolving a ratify-intent ticket that has
-    # ratifiable_files, rewrite each same-repo doc's first **Status:** line to
-    # "Ratified <YYYY-MM-DD> by the operator." in the same atomic commit. Cross-repo
-    # entries and missing Status lines emit warnings but never block the resolve.
-    # This is a best-effort convenience lift — HO can hand-tune edge cases.
-    # Gate: verb==resolve AND intent==ratify AND ratifiable_files non-empty
-    #       AND resolution-with-summary does NOT start with "Rejected:".
-    # The "Rejected:" carve-out (T-0641): pantheon-pwa's /reject route also
-    # shells `ticket.py resolve --with "Rejected: ..."` for the artifact-
-    # rejection verb (T-0342). Without this guard the lift fires on rejected
-    # ratify tickets too, rewriting the artifact's Status to "Ratified by
-    # the operator" even though the operator rejected. Caught in T-0637 smoke (2026-05-27).
-    # lift_paths is kept SEPARATE from cascade_paths so the cascade commit-message
-    # tail and stdout print are gated on real cascade dependants only (T-0491 fix).
-    lift_paths: list[Path] = []
-    if verb == "resolve":
-        ratify_intent = fields.get("intent") == "ratify"
-        ratifiable_files_list = fields.get("ratifiable_files") or []
-        summary_str = (detail or "").lstrip()
-        is_reject = summary_str.startswith("Rejected:")
-        if ratify_intent and ratifiable_files_list and not is_reject:
-            lift_warnings: list[str] = []
-            lift_paths = _apply_ratify_lift(
-                ratifiable_files_list, REPO_ROOT, lift_warnings
+        # 0b. T-2140: RE-VERIFY STATE INSIDE THE LOCK, AFTER THE PULL.
+        #
+        # The state check above ran OUTSIDE this critical section, so it proves
+        # nothing by the time we get here — two processes can both pass it and
+        # both arrive. The pull makes it worse rather than better: it can itself
+        # bring in another writer's transition of this very ticket, so even a
+        # single-writer race is real. Acting on the pre-lock paths would `git mv`
+        # a path that has moved, or double-transition a ticket someone else
+        # already advanced.
+        #
+        # This is the check-then-act half of T-2140 finding (1) ("the WIP cap is
+        # not a lock — it is evaluated per invocation, not held for the life of
+        # the work"). It does not make the cap a true lock across a whole
+        # claim→resolve span, which is a bigger design question; it does make a
+        # single transition atomic with respect to its own precondition.
+        current = _find_ticket(tid)
+        if current.parent.name != expected_state:
+            raise TicketError(
+                f"concurrent-transition conflict: {tid} was in `{expected_state}` "
+                f"when checked but is in `{current.parent.name}` now — another "
+                f"writer transitioned it while this {verb} was waiting for the "
+                f"lock. Nothing was changed. Re-read the ticket and retry "
+                f"(T-2140)."
             )
-            for w in lift_warnings:
-                print(f"warning: ratify-lift: {w}", file=sys.stderr)
+        old_path = current
+        new_path = new_dir / old_path.name
 
-    # 3. Build commit message + auto-commit pipeline. Both old and new
-    #    paths must be staged so the rename is captured atomically.
-    title = _extract_title(body)
-    commit_message = _build_commit_message(verb, tid, title, detail)
-    if cascade_paths:
-        # Only real cascade-unblock results go here — NOT lift_paths.
-        cascade_count = len(cascade_paths)
-        commit_message = (
-            commit_message + f"\n\nAuto-unblock cascade per ORG-013 (orig. T-0328): "
-            f"{cascade_count} dependant"
-            f"{'s' if cascade_count != 1 else ''} had depends_on updated in place."
-        )
-    subject = commit_message.splitlines()[0]
-    if len(subject) > 100:
-        print(
-            f"warning: commit subject {len(subject)} chars (>100): {subject!r}",
-            file=sys.stderr,
-        )
+        # 1. git mv (renames index entry + working-tree file in one step).
+        rel_old = str(old_path.relative_to(REPO_ROOT))
+        rel_new = str(new_path.relative_to(REPO_ROOT))
+        res = _git("mv", rel_old, rel_new)
+        if res.returncode != 0:
+            raise TicketError(
+                f"git mv failed: {res.stderr.strip() or res.stdout.strip()}"
+            )
 
-    _commit_and_push(
-        [old_path, new_path] + cascade_paths + lift_paths,
-        commit_message,
-        no_push=no_push,
-    )
+        # 2. Edit front matter + append transition log.
+        text = new_path.read_text(encoding="utf-8")
+        fields, body = parse_front_matter(text)
+        fields["state"] = new_state
+        actor = _actor()
+        log_verb = _LOG_VERB.get(verb, verb)
+        body = append_transition(body, actor, log_verb, detail)
+        new_text = _build_ticket_text(fields, body)
+        new_path.write_text(new_text, encoding="utf-8")
+
+        # 2b. Cascade callback (T-0328): runs after parent mv+edit, returns
+        # additional paths to fold into the commit. Callback is responsible
+        # for its own git mv + frontmatter edits. Failure raises TicketError
+        # which propagates and aborts before commit.
+        cascade_paths: list[Path] = []
+        if cascade_callback is not None:
+            cascade_paths = cascade_callback(tid)
+
+        # 2c. Ratify-lift (T-0491): when resolving a ratify-intent ticket that has
+        # ratifiable_files, rewrite each same-repo doc's first **Status:** line to
+        # "Ratified <YYYY-MM-DD> by the operator." in the same atomic commit. Cross-repo
+        # entries and missing Status lines emit warnings but never block the resolve.
+        # This is a best-effort convenience lift — HO can hand-tune edge cases.
+        # Gate: verb==resolve AND intent==ratify AND ratifiable_files non-empty
+        #       AND resolution-with-summary does NOT start with "Rejected:".
+        # The "Rejected:" carve-out (T-0641): pantheon-pwa's /reject route also
+        # shells `ticket.py resolve --with "Rejected: ..."` for the artifact-
+        # rejection verb (T-0342). Without this guard the lift fires on rejected
+        # ratify tickets too, rewriting the artifact's Status to "Ratified by
+        # the operator" even though the operator rejected. Caught in T-0637 smoke (2026-05-27).
+        # lift_paths is kept SEPARATE from cascade_paths so the cascade commit-message
+        # tail and stdout print are gated on real cascade dependants only (T-0491 fix).
+        lift_paths: list[Path] = []
+        if verb == "resolve":
+            ratify_intent = fields.get("intent") == "ratify"
+            ratifiable_files_list = fields.get("ratifiable_files") or []
+            summary_str = (detail or "").lstrip()
+            is_reject = summary_str.startswith("Rejected:")
+            if ratify_intent and ratifiable_files_list and not is_reject:
+                lift_warnings: list[str] = []
+                lift_paths = _apply_ratify_lift(
+                    ratifiable_files_list, REPO_ROOT, lift_warnings
+                )
+                for w in lift_warnings:
+                    print(f"warning: ratify-lift: {w}", file=sys.stderr)
+
+        # 3. Build commit message + auto-commit pipeline. Both old and new
+        #    paths must be staged so the rename is captured atomically.
+        title = _extract_title(body)
+        commit_message = _build_commit_message(verb, tid, title, detail)
+        if cascade_paths:
+            # Only real cascade-unblock results go here — NOT lift_paths.
+            cascade_count = len(cascade_paths)
+            commit_message = (
+                commit_message + f"\n\nAuto-unblock cascade per ORG-013 (orig. T-0328): "
+                f"{cascade_count} dependant"
+                f"{'s' if cascade_count != 1 else ''} had depends_on updated in place."
+            )
+        subject = commit_message.splitlines()[0]
+        if len(subject) > 100:
+            print(
+                f"warning: commit subject {len(subject)} chars (>100): {subject!r}",
+                file=sys.stderr,
+            )
+
+        _commit_and_push(
+            [old_path, new_path] + cascade_paths + lift_paths,
+            commit_message,
+            no_push=no_push,
+        )
     print(f"{verb} {tid} → tickets/{new_state}/{tid}.md")
     if cascade_paths:
         # Only print cascade line for real cascade-unblock results.
@@ -1781,17 +2260,36 @@ def cmd_block(args: argparse.Namespace) -> int:
                               with --not-before and --depends-on). No-op + no commit
                               if not_before is already absent.
 
+    T-1975 extension (the dep-clearing inverse of --depends-on, for a wrong gate):
+      --clear-dep T-NNNN      remove a specific dep (repeatable). CLEAN ERROR if the
+                              named dep is absent — it names a target, so a miss is
+                              surfaced, not silently ignored.
+      --clear-deps            remove ALL deps. Idempotent no-op + no commit if empty
+                              (names no target, so nothing to surface).
+    A clear op is a removal: it cannot combine with an add (--not-before/--depends-on),
+    and only one clear op runs per call. These are the MANUAL path for a wrong gate;
+    ORG-013 cascade-unblock remains the AUTOMATIC path when a parent resolves.
+
     The ticket stays in its current state directory (inbox/ or active/).
-    At least one of --not-before, --depends-on, or --clear-not-before must be supplied.
-    Refuses on done/ tickets.
+    At least one gate operation must be supplied. Refuses on done/ tickets.
     """
     not_before_raw: str | None = getattr(args, "not_before", None)
+    not_before_anchor_raw: str | None = getattr(args, "not_before_anchor", None)
     depends_on_list: list[str] = getattr(args, "depends_on", None) or []
     clear_not_before: bool = getattr(args, "clear_not_before", False)
+    clear_dep_list: list[str] = getattr(args, "clear_dep", None) or []
+    clear_deps_all: bool = getattr(args, "clear_deps", False)
     no_push: bool = getattr(args, "no_push", False)
 
+    # T-2833: --not-before-anchor only makes sense when SETTING a not_before date.
+    if not_before_anchor_raw and not not_before_raw:
+        raise TicketError(
+            "block: --not-before-anchor requires --not-before (an anchor justifies "
+            "a date gate; there is no date to anchor without --not-before)"
+        )
+
     # --clear-not-before is mutually exclusive with --not-before and --depends-on.
-    if clear_not_before and not_before_raw:
+    if clear_not_before and (not_before_raw or not_before_anchor_raw):
         raise TicketError(
             "block: --clear-not-before is mutually exclusive with --not-before"
         )
@@ -1800,10 +2298,30 @@ def cmd_block(args: argparse.Namespace) -> int:
             "block: --clear-not-before is mutually exclusive with --depends-on"
         )
 
-    # Must supply at least one gate (original check extended to include clear_not_before).
-    if not not_before_raw and not depends_on_list and not clear_not_before:
+    # T-1975: the dep-clearing inverse of --depends-on. --clear-dep removes named
+    # dep(s); --clear-deps removes all. A clear op is a REMOVAL, so it cannot
+    # combine with an add (--not-before/--depends-on) in the same call, and only
+    # one clear op runs per call (removing and adding, or two different removals,
+    # in one call would be ambiguous). This is the MANUAL path for a wrong gate;
+    # ORG-013 cascade-unblock stays the AUTOMATIC path that removes a dep when its
+    # parent resolves — no interplay beyond coexistence.
+    if (clear_dep_list or clear_deps_all) and (not_before_raw or depends_on_list):
         raise TicketError(
-            "block: must specify at least one of --not-before or --depends-on"
+            "block: --clear-dep/--clear-deps cannot combine with --not-before/--depends-on "
+            "(remove and add in separate calls)"
+        )
+    if sum([clear_not_before, bool(clear_dep_list), clear_deps_all]) > 1:
+        raise TicketError(
+            "block: the clear flags (--clear-not-before / --clear-dep / --clear-deps) "
+            "are mutually exclusive; one clear operation per call"
+        )
+
+    # Must supply at least one gate operation.
+    if not (not_before_raw or depends_on_list or clear_not_before
+            or clear_dep_list or clear_deps_all):
+        raise TicketError(
+            "block: must specify at least one of --not-before, --depends-on, "
+            "--clear-not-before, --clear-dep, or --clear-deps"
         )
 
     # --clear-not-before branch: lift calendar gate, stay in current lane.
@@ -1822,13 +2340,17 @@ def cmd_block(args: argparse.Namespace) -> int:
             )
             return 0
         del fields["not_before"]
+        # T-2833: a cleared gate must not leave a dangling anchor behind.
+        fields.pop("not_before_anchor", None)
         actor = _actor()
         body = append_transition(body, actor, "not_before gate cleared", None)
         new_text = _build_ticket_text(fields, body)
-        _pull_if_needed(no_push)
-        path.write_text(new_text, encoding="utf-8")
-        commit_message = f"tickets: {args.ticket} not_before cleared\n"
-        _commit_and_push([path], commit_message, no_push=no_push)
+        # T-1770 Part b: pull → write → commit is one atomic critical section.
+        with git_mutation_lock(label=f"block --clear-not-before {args.ticket}"):
+            _pull_if_needed(no_push)
+            path.write_text(new_text, encoding="utf-8")
+            commit_message = f"tickets: {args.ticket} not_before cleared\n"
+            _commit_and_push([path], commit_message, no_push=no_push)
         state_dir = path.parent.name
         print(
             f"block {args.ticket} --clear-not-before → tickets/{state_dir}/{args.ticket}.md "
@@ -1836,10 +2358,66 @@ def cmd_block(args: argparse.Namespace) -> int:
         )
         return 0
 
-    # Validate and normalize not_before if provided.
+    # T-1975: --clear-dep / --clear-deps branch — remove ticket-dep gate(s).
+    if clear_dep_list or clear_deps_all:
+        path = _find_ticket(args.ticket)
+        if path.parent.name == "done":
+            raise TicketError(
+                f"state-mismatch: {args.ticket} is in `done`; cannot clear block gate on closed ticket"
+            )
+        text = path.read_text(encoding="utf-8")
+        fields, body = parse_front_matter(text)
+        current_deps: list[str] = list(fields.get("depends_on") or [])
+
+        if clear_deps_all:
+            if not current_deps:
+                # Idempotent no-op — matches --clear-not-before; skip commit.
+                print(f"block {args.ticket}: depends_on already empty; no change")
+                return 0
+            new_deps: list[str] = []
+            note = "all depends_on gates cleared"
+            summary = "all deps cleared"
+        else:
+            # --clear-dep names SPECIFIC targets. A named dep that isn't present is
+            # a clean ERROR, not a silent no-op: the caller asked to remove a
+            # particular thing that isn't there, and surfacing that beats pretending
+            # it worked. (This is the PRINCIPLED asymmetry with --clear-deps /
+            # --clear-not-before, which are idempotent because they name no target.)
+            missing = [d for d in clear_dep_list if d not in current_deps]
+            if missing:
+                raise TicketError(
+                    f"block --clear-dep: {args.ticket} has no dep(s) {missing}; "
+                    f"current depends_on = {current_deps or '[]'}"
+                )
+            new_deps = [d for d in current_deps if d not in clear_dep_list]
+            note = f"depends_on gate(s) cleared: {', '.join(clear_dep_list)}"
+            summary = f"deps cleared: {', '.join(clear_dep_list)}"
+
+        fields["depends_on"] = new_deps
+        actor = _actor()
+        body = append_transition(body, actor, note, None)
+        new_text = _build_ticket_text(fields, body)
+        # T-1770 Part b: pull → write → commit is one atomic critical section.
+        with git_mutation_lock(label=f"block --clear-dep {args.ticket}"):
+            _pull_if_needed(no_push)
+            path.write_text(new_text, encoding="utf-8")
+            commit_message = f"tickets: {args.ticket} {summary}\n"
+            _commit_and_push([path], commit_message, no_push=no_push)
+        state_dir = path.parent.name
+        print(
+            f"block {args.ticket} → tickets/{state_dir}/{args.ticket}.md "
+            f"({summary}; file stays in place)"
+        )
+        return 0
+
+    # Validate and normalize not_before if provided. T-2833: a date gate MUST
+    # carry a resolvable operator:<ref> anchor — validated up front so we refuse
+    # before touching the ticket / git.
     not_before: str | None = None
+    not_before_anchor: str | None = None
     if not_before_raw:
         not_before = _parse_not_before(not_before_raw.strip())
+        not_before_anchor = _validate_not_before_anchor(not_before_anchor_raw)
 
     # Find the ticket (any non-done state).
     path = _find_ticket(args.ticket)
@@ -1848,50 +2426,96 @@ def cmd_block(args: argparse.Namespace) -> int:
             f"state-mismatch: {args.ticket} is in `done`; cannot set block gate on closed ticket"
         )
 
-    # Pull-first (T-0244).
-    _pull_if_needed(no_push)
+    # T-1770 Part b: pull → edit → commit is one atomic critical section
+    # against other writers on the shared checkout (no git-mv here — the
+    # file stays in place — but the frontmatter edit must not be exposed to
+    # an interleaved concurrent commit before it lands in this one).
+    with git_mutation_lock(label=f"block {args.ticket}"):
+        # Pull-first (T-0244).
+        _pull_if_needed(no_push)
 
-    # Edit frontmatter in-place.
-    text = path.read_text(encoding="utf-8")
-    fields, body = parse_front_matter(text)
+        # Edit frontmatter in-place.
+        text = path.read_text(encoding="utf-8")
+        fields, body = parse_front_matter(text)
 
-    # Merge depends_on: union of existing + new deps (preserves any already set).
-    existing_deps: list[str] = fields.get("depends_on") or []
-    if depends_on_list:
-        merged_deps = list(existing_deps)
-        for dep in depends_on_list:
-            if not re.fullmatch(r"T-\d{4}", dep):
-                raise TicketError(f"--depends-on value {dep!r} does not match T-NNNN format")
-            if dep not in merged_deps:
-                merged_deps.append(dep)
-        fields["depends_on"] = merged_deps
+        # Merge depends_on: union of existing + new deps (preserves any already set).
+        existing_deps: list[str] = fields.get("depends_on") or []
+        if depends_on_list:
+            merged_deps = list(existing_deps)
+            for dep in depends_on_list:
+                if not re.fullmatch(r"T-\d{4}", dep):
+                    raise TicketError(f"--depends-on value {dep!r} does not match T-NNNN format")
+                if dep not in merged_deps:
+                    merged_deps.append(dep)
+            fields["depends_on"] = merged_deps
 
-    if not_before:
-        fields["not_before"] = not_before
+        if not_before:
+            fields["not_before"] = not_before
+            fields["not_before_anchor"] = not_before_anchor  # T-2833 (validated above)
 
-    # Build log detail line.
-    detail_parts: list[str] = []
-    if not_before:
-        detail_parts.append(f"not_before: {not_before}")
-    if depends_on_list:
-        detail_parts.append(f"depends_on: [{', '.join(depends_on_list)}]")
-    detail = "; ".join(detail_parts)
+        # Build log detail line.
+        detail_parts: list[str] = []
+        if not_before:
+            detail_parts.append(f"not_before: {not_before} (anchor: {not_before_anchor})")
+        if depends_on_list:
+            detail_parts.append(f"depends_on: [{', '.join(depends_on_list)}]")
+        detail = "; ".join(detail_parts)
 
-    actor = _actor()
-    body = append_transition(body, actor, "blocked", detail)
-    new_text = _build_ticket_text(fields, body)
-    path.write_text(new_text, encoding="utf-8")
+        actor = _actor()
+        body = append_transition(body, actor, "blocked", detail)
+        new_text = _build_ticket_text(fields, body)
+        path.write_text(new_text, encoding="utf-8")
 
-    commit_message = _build_commit_message("block", args.ticket, _extract_title(body), detail)
-    _commit_and_push([path], commit_message, no_push=no_push)
+        commit_message = _build_commit_message("block", args.ticket, _extract_title(body), detail)
+        _commit_and_push([path], commit_message, no_push=no_push)
     state_dir = path.parent.name
     print(f"block {args.ticket} → tickets/{state_dir}/{args.ticket}.md (gate set; file stays in place)")
     return 0
 
 
+def _warn_unmet_deps(tid: str, verb: str) -> None:
+    """WARN (never block) when a ticket is closed with an unmet depends_on (T-2220).
+
+    MEASURED instance: T-2113 sits in done/ with `depends_on: [T-2154]` while
+    T-2154 is still in inbox/. The work completed with its stated gate unmet and
+    nothing objected at any point, so the record says "gated" and the history says
+    otherwise — a false record nobody can see.
+
+    ⚠️ DELIBERATELY A WARNING, NOT A BLOCK, and the ticket says so explicitly.
+    Overtaking a stale or mis-specified gate is legitimate and common — T-2113 did
+    real work and the GATE was wrong, not the work. Blocking would add a new way
+    to wedge the queue in exchange for a record-keeping problem, which is a bad
+    trade. The point is that the inconsistency stops being silent, not that it
+    stops being possible.
+
+    Fail-soft in every direction: any read error and we say nothing. A close must
+    never fail because its advisory could not be computed.
+    """
+    try:
+        deps = list(parse_ticket(_find_ticket(tid)).fields.get("depends_on") or [])
+        if not deps:
+            return
+        unmet = []
+        for dep in deps:
+            try:
+                dep_state = parse_ticket(_find_ticket(dep)).fields.get("state")
+            except Exception:
+                dep_state = None  # unknown id — cannot call it met
+            if dep_state != "done":
+                unmet.append(f"{dep} ({dep_state or 'not found'})")
+        if unmet:
+            print(f"warning: {verb} {tid} with UNMET depends_on: {', '.join(unmet)}. "
+                  f"Not blocking — overtaking a stale gate is legitimate — but the "
+                  f"ticket's own record will say it was gated on work that is not "
+                  f"done. Clear or correct the gate if it was wrong (T-2220).")
+    except Exception:
+        return
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
     detail = getattr(args, "with_summary", None)
-    return _do_transition(
+    _warn_unmet_deps(args.ticket, "resolving")
+    rc = _do_transition(
         tid=args.ticket,
         expected_state="active",
         new_state="done",
@@ -1900,6 +2524,12 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         no_push=getattr(args, "no_push", False),
         cascade_callback=_cascade_unblock_dependants,
     )
+    # T-2273: AFTER the transition, and only on success. The warning asks a
+    # question at the one moment the author is still present; it must never look
+    # like a gate on the resolve, and a failed resolve has nothing to ask about.
+    if rc == 0:
+        _warn_recurrence_prediction(detail or "", args.ticket)
+    return rc
 
 
 # ---------------------------------------------------------------------------
@@ -2146,6 +2776,18 @@ def _find_dependants(parent_tid: str) -> list[Path]:
     return dependants
 
 
+def _dep_is_done(dep: str) -> bool:
+    """True iff `dep` is a well-formed ticket id currently in done/.
+
+    Malformed ids return False so they are never pruned — same fail-closed
+    posture as `_all_other_deps_done`, which refuses to auto-unblock on an
+    id it cannot check (T-2177).
+    """
+    if not re.fullmatch(r"T-\d{4}", dep):
+        return False
+    return (TICKETS_ROOT / "done" / f"{dep}.md").exists()
+
+
 def _all_other_deps_done(deps: list[str], just_resolved_tid: str) -> bool:
     """True iff every dep besides just_resolved_tid is currently in done/."""
     for dep in deps:
@@ -2185,9 +2827,26 @@ def _cascade_unblock_dependants(parent_tid: str) -> list[Path]:
         if not _all_other_deps_done(deps, parent_tid):
             continue  # multi-dep partial-resolve; wait for the rest
 
-        # Remove parent_tid from depends_on in frontmatter.
+        # Remove parent_tid AND every already-done dep from depends_on (T-2177).
+        #
+        # The guard above (_all_other_deps_done) reasons over the WHOLE dep set;
+        # this mutation used to touch a SINGLE member. That asymmetry was the bug:
+        # for depends_on [A, B], A resolving skipped correctly, then B resolving
+        # fired and removed only B — stranding A, a DONE ticket, as a live gate
+        # with no remaining cascade opportunity to clear it. The dependant looked
+        # dep-blocked permanently. Whenever a precondition is evaluated over a set
+        # and the action applies to one member, look here.
+        #
+        # Pruned EXPLICITLY rather than cleared to []: the function is fail-closed
+        # on malformed dep ids, and clearing would silently discard an unparseable
+        # entry that the guard deliberately refused to reason about. In practice
+        # the guard means the result is [] whenever it fires — but that is a
+        # consequence, not the rule being implemented.
         fields = t.fields
-        remaining_deps = [d for d in deps if d != parent_tid]
+        remaining_deps = [
+            d for d in deps
+            if d != parent_tid and not _dep_is_done(d)
+        ]
         fields["depends_on"] = remaining_deps
 
         # T-0971 arm-A: strip any auto_delivered / auto_delivered_at stamp unconditionally.
@@ -2220,22 +2879,86 @@ def _cascade_unblock_dependants(parent_tid: str) -> list[Path]:
 _PANTHEON_CONFIG_REPO_NAME = "pantheon-config"
 
 # Tolerant regex for "awaiting … ratification" clauses to strip after the
-# Ratified prefix is prepended.  Matches common phrasings (with or without
-# "the operator", with or without trailing period, with or without bold markers).
+# Ratified prefix is prepended.  Matches common phrasings — no holder, a bare
+# holder ("the operator"), or a possessive holder ("the operator's", "the operator's") —
+# with or without trailing period, with or without bold markers. The holder
+# clause is bounded to exactly one optional word so it can never swallow
+# unrelated multi-word prose (T-2847).
 # Non-fatal if nothing matches — the prepended Ratified is authoritative.
 _AWAITING_RATIFICATION_RE = re.compile(
-    r"\*{0,2}"            # optional bold-open **
+    r"\*{0,2}"                        # optional bold-open **
     r"Awaiting"
-    r"(?:\s+the operator)?"    # optional "the operator"
+    r"(?:\s+(?:the\s+)?\w+(?:'s)?)?"  # optional single-word holder clause:
+                                       # "the operator", "the operator's", "the operator's"
     r"\s+ratification"
     r"\.?"                # optional trailing period
-    r"\*{0,2}"            # optional bold-close **
-    r"\s*",               # trailing whitespace
+    r"\*{0,2}"             # optional bold-close **
+    r"\s*",                # trailing whitespace
+    re.IGNORECASE,
+)
+
+# Leading "Proposed" status marker (with its typical "(agent-authored,
+# unratified)"-style qualifier) to strip before prepending the Ratified
+# prefix. Anchored to the START of the rest-of-line and \b-bounded so it can
+# only ever remove the actual leading marker — never an embedded/mid-sentence
+# "Proposed", and never a false-positive prefix match (e.g. "Proposed" is
+# NOT a prefix collision risk the way "DRAFT"/"Drafted" is, but the \b is
+# kept for symmetry + defense) (T-2847).
+_LEADING_PROPOSED_RE = re.compile(
+    r"^\s*\*{0,2}\bProposed\b\*{0,2}"
+    r"(?:\s*\([^)]*\))?"       # optional "(agent-authored, unratified)"-style qualifier
+    r"\s*[—;:,\-]*\s*",        # optional connecting punctuation before the next clause
+    re.IGNORECASE,
+)
+
+# Leading "DRAFT" status marker — same shape/rationale as _LEADING_PROPOSED_RE.
+# \b is load-bearing here: without it, "DRAFT" matches the first 5 letters of
+# "Drafted", corrupting genuine "Drafted <date>" lineage text (T-2847 design
+# trace caught this before it shipped).
+_LEADING_DRAFT_RE = re.compile(
+    r"^\s*\*{0,2}\bDRAFT\b\*{0,2}"
+    r"(?:\s*\([^)]*\))?"
+    r"\s*[—;:,\-]*\s*",
+    re.IGNORECASE,
+)
+
+# Flips a "**HITL: Proposed.**"-style tag to "**HITL: Ratified.**", matching
+# the existing bold-wrap-whole-tag convention (rather than stripping it —
+# HITL is a distinct field, not free prose to remove) (T-2847).
+_HITL_PROPOSED_RE = re.compile(
+    r"(\*{0,2}HITL:\s*)Proposed(\.?\*{0,2})",
     re.IGNORECASE,
 )
 
 # Regex that matches the FIRST **Status:** line (captures the rest-of-line).
 _STATUS_LINE_RE = re.compile(r"^(\*\*Status:\*\*)[ \t]*(.*)", re.MULTILINE)
+
+# Frontmatter block (between the leading "---" fence pair) and its `status:`
+# key, used only to WARN (never rewrite — T-2847 part-3 option (b)) when the
+# frontmatter status: still reads a pre-ratification marker after a body lift.
+_FRONTMATTER_BLOCK_RE = re.compile(r"\A---\n(.*?)\n---", re.DOTALL)
+_FRONTMATTER_STATUS_LINE_RE = re.compile(r"^status:[ \t]*(.*)$", re.MULTILINE)
+
+
+def _stale_frontmatter_status_value(content: str) -> str | None:
+    """Return the frontmatter `status:` value if present and NOT already
+    Ratified-prefixed, else None (no frontmatter, no status: key, empty
+    value, or value already starting with "Ratified").
+    """
+    fm_match = _FRONTMATTER_BLOCK_RE.match(content)
+    if fm_match is None:
+        return None
+    status_match = _FRONTMATTER_STATUS_LINE_RE.search(fm_match.group(1))
+    if status_match is None:
+        return None
+    value = status_match.group(1).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+        value = value[1:-1].strip()
+    if not value:
+        return None
+    if value.lower().startswith("ratified"):
+        return None
+    return value
 
 
 def _lift_ratifiable_doc_status(
@@ -2250,12 +2973,21 @@ def _lift_ratifiable_doc_status(
 
     Appends human-readable warning strings to *warnings* for:
       - no **Status:** line found
+      - frontmatter `status:` still reads a pre-ratification marker after a
+        successful body lift (T-2847 part-3 option (b) — body-only lift;
+        frontmatter is warned-on-stale, never auto-rewritten)
     Does NOT raise on any of these — callers must not block on lift failure.
 
     The Ratified prefix format is: **Ratified <YYYY-MM-DD> by the operator.**
-    Any trailing/embedded "Awaiting … ratification" clause (tolerant regex)
-    is stripped; the rest of the line (Drafted/Authored/Amended history) is
-    preserved as lineage.
+    The pre-ratification marker family — a leading "Proposed" (with its
+    typical "(agent-authored, unratified)" qualifier), a leading "DRAFT",
+    and any "Awaiting … ratification" clause (tolerant regex, incl.
+    possessive holders like "the operator's") — is stripped so the resulting
+    line is internally consistent; a "**HITL: Proposed.**" tag is flipped to
+    "**HITL: Ratified.**" rather than stripped (T-2847). Genuine lineage
+    (Drafted/Authored/Amended <date> … history) is preserved — the strip
+    regexes are anchored to the START of the rest-of-line and \\b-bounded so
+    they can only remove the actual leading marker, never embedded prose.
     """
     try:
         content = doc_path.read_text(encoding="utf-8")
@@ -2278,8 +3010,17 @@ def _lift_ratifiable_doc_status(
     if stripped_rest.lower().startswith("**ratified") or stripped_rest.lower().startswith("ratified"):
         return None
 
-    # Strip awaiting-clause (best-effort; non-fatal if nothing matches).
-    rest_cleaned = _AWAITING_RATIFICATION_RE.sub("", rest).rstrip()
+    # Strip the pre-ratification marker family (best-effort; non-fatal if
+    # nothing matches). Order matters: leading "Proposed" first, then
+    # leading "DRAFT" (handles "Proposed (...) — DRAFT ..." as well as a
+    # bare "DRAFT ..." with no "Proposed"), then the awaiting-clause, then
+    # flip any HITL:-tag in place.
+    rest_cleaned = rest
+    rest_cleaned = _LEADING_PROPOSED_RE.sub("", rest_cleaned)
+    rest_cleaned = _LEADING_DRAFT_RE.sub("", rest_cleaned)
+    rest_cleaned = _AWAITING_RATIFICATION_RE.sub("", rest_cleaned)
+    rest_cleaned = _HITL_PROPOSED_RE.sub(r"\1Ratified\2", rest_cleaned)
+    rest_cleaned = rest_cleaned.rstrip()
 
     # Build the Ratified prefix.  Date is UTC per brief.
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -2295,6 +3036,20 @@ def _lift_ratifiable_doc_status(
     new_content = content[: m.start()] + new_status_line + content[m.end():]
 
     doc_path.write_text(new_content, encoding="utf-8")
+
+    # T-2847 part-3 option (b): body is authoritative and now lifted; the
+    # frontmatter status: field is NOT rewritten (free-form prose corpus,
+    # no schema — rewriting risks YAML/prose corruption for no structural
+    # gain). Warn actionably if it still reads pre-ratification.
+    stale_value = _stale_frontmatter_status_value(new_content)
+    if stale_value is not None:
+        warnings.append(
+            f"{doc_path.relative_to(repo_root)!s}: body Status lifted to "
+            "Ratified, but frontmatter status: still reads a "
+            f"pre-ratification marker ({stale_value!r}); reconcile "
+            "frontmatter manually."
+        )
+
     return new_content
 
 
@@ -2417,100 +3172,530 @@ def cmd_retarget(args: argparse.Namespace) -> int:
         )
         return 0
 
-    # Pull-first (T-0244): must succeed BEFORE overwriting the ticket file so
-    # a pull failure doesn't leave an edited-but-uncommitted file on disk.
-    # Skipped when no_push=True.
-    _pull_if_needed(args.no_push)
+    # T-1770 Part b: pull → (optional git-mv) → edit → commit is one atomic
+    # critical section against other writers on the shared checkout — the
+    # lock must start before the pull (and any git-mv) and extend through
+    # `_commit_and_push`.
+    with git_mutation_lock(label=f"retarget {args.ticket}"):
+        # Pull-first (T-0244): must succeed BEFORE overwriting the ticket file
+        # so a pull failure doesn't leave an edited-but-uncommitted file on
+        # disk. Skipped when no_push=True.
+        _pull_if_needed(args.no_push)
 
-    # Determine target state. Default: cross-actor retarget resets to inbox
-    # unless --keep-state is passed or the ticket is already in inbox.
-    new_state = old_state if (keep_state or old_state == "inbox") else "inbox"
+        # Determine target state. Default: cross-actor retarget resets to inbox
+        # unless --keep-state is passed or the ticket is already in inbox.
+        new_state = old_state if (keep_state or old_state == "inbox") else "inbox"
 
-    fields["target"] = new_target
+        fields["target"] = new_target
 
-    # T-0465: intent disambiguation tracks target=operator status.
-    raw_intent = getattr(args, "intent", None)
-    if isinstance(raw_intent, str) and raw_intent.strip():
-        intent = raw_intent.strip()
-        if intent not in INTENT_VOCAB:
-            raise TicketError(
-                f"--intent {intent!r} not in vocab {INTENT_VOCAB}; "
-                f"choose one of: {', '.join(INTENT_VOCAB)}"
+        # T-0465: intent disambiguation tracks target=operator status.
+        raw_intent = getattr(args, "intent", None)
+        dropped_intent: str | None = None
+        if isinstance(raw_intent, str) and raw_intent.strip():
+            intent = raw_intent.strip()
+            if intent not in INTENT_VOCAB:
+                raise TicketError(
+                    f"--intent {intent!r} not in vocab {INTENT_VOCAB}; "
+                    f"choose one of: {', '.join(INTENT_VOCAB)}"
+                )
+            if new_target != "operator":
+                raise TicketError(
+                    f"--intent is target=operator-specific; refusing for new target={new_target!r}"
+                )
+            # T-1321: explicit intent=ratify requires ratifiable_files to already
+            # be present in the ticket's frontmatter.  cmd_retarget has no
+            # --ratifiable-file argument, so the effective check is the existing
+            # fields dict (already populated from parse_front_matter above).
+            if intent == "ratify" and not fields.get("ratifiable_files"):
+                raise TicketError(
+                    "intent=ratify requires ratifiable_files to already be set in "
+                    "the ticket's frontmatter; add them before retargeting to "
+                    "intent=ratify (per ORG-015)"
+                )
+            fields["intent"] = intent
+        elif new_target == "operator" and "intent" not in fields:
+            # Newly retargeted to operator without explicit --intent: auto-default
+            # (ratify if ratifiable_files present, else action) per cmd_file pattern.
+            fields["intent"] = "ratify" if fields.get("ratifiable_files") else "action"
+        elif new_target != "operator" and "intent" in fields:
+            # Retargeted away from operator: intent no longer applicable; drop it
+            # (target=operator-specific surface per T-0465). NOT a loss of the
+            # ticket's ratify nature: ratifiable_files survive the retarget, and
+            # the elif above AUTO-RESTORES intent when the ticket is retargeted
+            # back to operator (ratify if ratifiable_files present). The round-trip
+            # is therefore self-healing — pinned by
+            # test_cmd_retarget_to_operator_no_intent_autorestores_ratify.
+            dropped_intent = fields.pop("intent")
+
+        # T-1103 / ORG-034: serves — arc-intent field. When --serves is given,
+        # overwrite (or set) the field. When absent, leave existing serves: intact.
+        raw_serves = getattr(args, "serves", None)
+        if isinstance(raw_serves, str) and raw_serves.strip():
+            fields["serves"] = raw_serves.strip()
+
+        # T-2350: drop the PREVIOUS target's delivery stamp. `auto_delivered` is
+        # a dispatch mutex (T-0864 arm-B / the T-0768 incident pattern): while it
+        # is set, inbox delivery for this ticket is suppressed. Handing the
+        # ticket to a new target without clearing it means the new target can sit
+        # undispatched behind a stamp recording a delivery that was made to
+        # someone else — and nothing reports it, because the retarget itself
+        # succeeds and the `target` field is correct.
+        #
+        # The cascade-unblock path already pops these unconditionally for exactly
+        # this reason (T-0971 arm-A). This mirrors it rather than inventing a
+        # second policy; keep the two in step.
+        #
+        # Cleared VISIBLY, in the transition log. A silent mutation of a
+        # dispatch-affecting field is what made the original defect hard to find.
+        had_ad = fields.pop("auto_delivered", None)
+        had_ad_at = fields.pop("auto_delivered_at", None)
+
+        actor = _actor()
+        log_verb = _LOG_VERB["retarget"]
+        detail = f"{old_target} → {new_target}"
+        if note:
+            detail = f"{detail}; {note}"
+        if new_state != old_state:
+            detail = f"{detail}; state {old_state} → {new_state} (cross-actor reset)"
+        if had_ad is not None or had_ad_at is not None:
+            detail = f"{detail}; auto_delivered stamp cleared"
+        if dropped_intent is not None:
+            detail = (
+                f"{detail}; intent={dropped_intent} dropped "
+                "(operator-specific; auto-restores on return to operator)"
             )
-        if new_target != "operator":
-            raise TicketError(
-                f"--intent is target=operator-specific; refusing for new target={new_target!r}"
-            )
-        # T-1321: explicit intent=ratify requires ratifiable_files to already
-        # be present in the ticket's frontmatter.  cmd_retarget has no
-        # --ratifiable-file argument, so the effective check is the existing
-        # fields dict (already populated from parse_front_matter above).
-        if intent == "ratify" and not fields.get("ratifiable_files"):
-            raise TicketError(
-                "intent=ratify requires ratifiable_files to already be set in "
-                "the ticket's frontmatter; add them before retargeting to "
-                "intent=ratify (per ORG-015)"
-            )
-        fields["intent"] = intent
-    elif new_target == "operator" and "intent" not in fields:
-        # Newly retargeted to operator without explicit --intent: auto-default
-        # (ratify if ratifiable_files present, else action) per cmd_file pattern.
-        fields["intent"] = "ratify" if fields.get("ratifiable_files") else "action"
-    elif new_target != "operator" and "intent" in fields:
-        # Retargeted away from operator: intent no longer applicable; drop it
-        # (target=operator-specific surface per T-0465).
-        fields.pop("intent")
+        body = append_transition(body, actor, log_verb, detail)
 
-    # T-1103 / ORG-034: serves — arc-intent field. When --serves is given,
-    # overwrite (or set) the field. When absent, leave existing serves: intact.
-    raw_serves = getattr(args, "serves", None)
-    if isinstance(raw_serves, str) and raw_serves.strip():
-        fields["serves"] = raw_serves.strip()
+        # If state changes, also git-mv the file to the new state directory.
+        paths_to_stage: list[Path] = [path]
+        if new_state != old_state:
+            fields["state"] = new_state
+            new_dir = TICKETS_ROOT / new_state
+            new_dir.mkdir(parents=True, exist_ok=True)
+            new_path = new_dir / path.name
+            old_path_abs = path
+            rel_old = str(path.relative_to(REPO_ROOT))
+            rel_new = str(new_path.relative_to(REPO_ROOT))
+            res = _git("mv", rel_old, rel_new)
+            if res.returncode != 0:
+                raise TicketError(
+                    f"git mv failed: {res.stderr.strip() or res.stdout.strip()}"
+                )
+            path = new_path
+            paths_to_stage = [old_path_abs, new_path]
 
-    actor = _actor()
-    log_verb = _LOG_VERB["retarget"]
-    detail = f"{old_target} → {new_target}"
-    if note:
-        detail = f"{detail}; {note}"
-    if new_state != old_state:
-        detail = f"{detail}; state {old_state} → {new_state} (cross-actor reset)"
-    body = append_transition(body, actor, log_verb, detail)
+        new_text = _build_ticket_text(fields, body)
+        path.write_text(new_text, encoding="utf-8")
 
-    # If state changes, also git-mv the file to the new state directory.
-    paths_to_stage: list[Path] = [path]
-    if new_state != old_state:
-        fields["state"] = new_state
-        new_dir = TICKETS_ROOT / new_state
-        new_dir.mkdir(parents=True, exist_ok=True)
-        new_path = new_dir / path.name
-        old_path_abs = path
-        rel_old = str(path.relative_to(REPO_ROOT))
-        rel_new = str(new_path.relative_to(REPO_ROOT))
-        res = _git("mv", rel_old, rel_new)
-        if res.returncode != 0:
-            raise TicketError(
-                f"git mv failed: {res.stderr.strip() or res.stdout.strip()}"
-            )
-        path = new_path
-        paths_to_stage = [old_path_abs, new_path]
-
-    new_text = _build_ticket_text(fields, body)
-    path.write_text(new_text, encoding="utf-8")
-
-    title = _extract_title(body)
-    commit_message = _build_commit_message(
-        "retarget", args.ticket, title, detail
-    )
-    subject = commit_message.splitlines()[0]
-    if len(subject) > 100:
-        print(
-            f"warning: commit subject {len(subject)} chars (>100): {subject!r}",
-            file=sys.stderr,
+        title = _extract_title(body)
+        commit_message = _build_commit_message(
+            "retarget", args.ticket, title, detail
         )
+        subject = commit_message.splitlines()[0]
+        if len(subject) > 100:
+            print(
+                f"warning: commit subject {len(subject)} chars (>100): {subject!r}",
+                file=sys.stderr,
+            )
 
-    _commit_and_push(paths_to_stage, commit_message, no_push=args.no_push)
+        _commit_and_push(paths_to_stage, commit_message, no_push=args.no_push)
     state_suffix = f" (state {old_state} → {new_state})" if new_state != old_state else ""
     print(f"retarget {args.ticket} → {new_target}{state_suffix}")
+    return 0
+
+
+def _warn_recent_other_annotators(body: str, actor: str) -> None:
+    """Warn if ANOTHER actor wrote to this ticket's transition log recently.
+
+    T-2260's "one thing to check before building". Scoped to one ticket, so it
+    is a measurement rather than the label-overlap proxy `file` has to use.
+    Never raises; a scan failure must not cost an annotation.
+    """
+    try:
+        cutoff = _parse_iso(_now_iso()) - timedelta(
+            minutes=_NEAR_DUPLICATE_WINDOW_MINUTES)
+        others: list[tuple[str, str]] = []
+        for line in body.splitlines():
+            m = re.match(r"^- (\S+) \[([^\]]+)\]", line.strip())
+            if not m:
+                continue
+            stamp, who = m.group(1), m.group(2)
+            if who == actor:
+                continue
+            try:
+                if _parse_iso(stamp) >= cutoff:
+                    others.append((stamp, who))
+            except Exception:
+                continue
+        if not others:
+            return
+        print(
+            f"note: {len(others)} entr(ies) from another actor in the last "
+            f"{_NEAR_DUPLICATE_WINDOW_MINUTES} min on this ticket — check you are "
+            f"not restating their finding:",
+            file=sys.stderr,
+        )
+        for stamp, who in others[-3:]:
+            print(f"  {stamp} [{who}]", file=sys.stderr)
+    except Exception:
+        return
+
+
+def cmd_annotate(args: argparse.Namespace) -> int:
+    """Append a dated transition-log note with NO state change (T-1972).
+
+    Fills the gap where a note needs to land on a ticket's own record but
+    nothing about its state changes: `retarget --to <same>` no-ops without
+    writing the note, hand-editing the file is barred by the direct-edit
+    convention, and a ledger entry splits the ticket's record across two
+    surfaces. This is retarget's same-state path minus the target edit: append
+    + commit + push, one file, no git-mv.
+
+    Refuses on `done/` — appending to a closed ticket's resolve-evidence is a
+    different concern (resolve owns that surface). Refuses on an empty/
+    whitespace-only note — a no-op write is not worth a commit.
+    """
+    note = (getattr(args, "note", "") or "").strip()
+    if not note:
+        raise TicketError(
+            "annotate requires a non-empty --note (an empty note is a no-op; "
+            "nothing to append)"
+        )
+
+    path = _find_ticket(args.ticket)
+    if path.parent.name == "done":
+        raise TicketError(
+            f"state-mismatch: {args.ticket} is in `done`; annotate refuses on "
+            f"done (appending to a closed ticket's resolve-evidence is a "
+            f"separate concern)"
+        )
+
+    # Same atomic critical section as retarget's same-state path (T-1770 Part b):
+    # lock spans pull → edit → commit against other writers on the shared checkout.
+    with git_mutation_lock(label=f"annotate {args.ticket}"):
+        # T-2204: annotate is the ONE write that does not need to be current —
+        # it appends to a ticket that already exists at a path already
+        # resolved, and the commit is scoped to that single file. A dirty tree
+        # used to abort the internal pull and take EVERY write down with it,
+        # so the reporting path died exactly when the remediation path did.
+        # Degrade to a warning here; every state-moving/ID-allocating caller
+        # stays strict. --no-pull skips the pull outright for the same reason.
+        _pull_if_needed(
+            args.no_push or getattr(args, "no_pull", False), strict=False
+        )
+
+        text = path.read_text(encoding="utf-8")
+        fields, body = parse_front_matter(text)
+        actor = _actor()
+        # verb="note" (not a state verb) so a scanner distinguishes a free
+        # annotation from a lifecycle event like "claimed"/"resolved".
+        body = append_transition(body, actor, "note", note)
+        new_text = _build_ticket_text(fields, body)
+        path.write_text(new_text, encoding="utf-8")
+
+        title = _extract_title(body)
+        commit_message = _build_commit_message("annotate", args.ticket, title, note)
+        subject = commit_message.splitlines()[0]
+        if len(subject) > 100:
+            print(
+                f"warning: commit subject {len(subject)} chars (>100): {subject!r}",
+                file=sys.stderr,
+            )
+        _commit_and_push([path], commit_message, no_push=args.no_push)
+
+    print(f"annotate {args.ticket}: note appended")
+    # T-2260 asked whether the same warning belongs here. It does, but NOT the
+    # same warning: the file-time signal is "a similar ticket exists", which
+    # needs label overlap as a proxy for sameness. On annotate the target is
+    # already one specific ticket, so the question collapses to "did someone
+    # else write here in the last few minutes" — a precise check with no
+    # false-positive class, rather than a proxy. The near-miss it catches is
+    # the one the filing named: two agents annotating the same ticket with the
+    # same finding produces no duplicate ID and therefore leaves no trace to
+    # notice later.
+    _warn_recent_other_annotators(body, actor)
+    return 0
+
+
+# T-2273: shapes an author uses when they have just predicted a recurrence.
+# Deliberately SURFACE-SYNTAX, not semantics — the same admitted-proxy posture as
+# the T-2260 near-duplicate warning, and for the same reason: the reader is the
+# author, one second after writing the sentence, and they can answer in one
+# second. A cleverer matcher that adjudicates would be worse than a crude one
+# that asks.
+_RECURRENCE_PREDICTION_PATTERNS = (
+    r"\bwill hit the same\b",
+    r"\bwill (?:also )?(?:hit|see|face|encounter) this\b",
+    r"\bthe next \w+(?: \w+)? will\b",
+    r"\brecurs? (?:when|if|on)\b",
+    r"\bwill recur\b",
+    r"\bwill happen again\b",
+    r"\bsame thing will\b",
+    r"\bwill trip (?:over )?(?:the|this) same\b",
+    r"\bnext (?:new[- ])?\w+ deploy will\b",
+    r"\banyone (?:who|doing) .{0,40}will\b",
+    r"\bthis will bite\b",
+    r"\bwill bite (?:the|whoever|anyone)\b",
+)
+
+
+def _recurrence_predictions(text: str) -> list[str]:
+    """Return the matched fragments of `text` that predict a recurrence.
+
+    T-2273. A finding recorded in a RESOLVED ticket's prose is on nobody's
+    queue: a resolve note enters the audit chain and exits every queue in the
+    same act. The worked case is Recovery's T-2188 note — correct diagnosis, correct
+    root cause, an explicit prediction that the next new-agent deploy would hit
+    it — followed within a day by two agents rediscovering it from scratch. The
+    class definition is atlas's reviewer's: **"silently skipped" and "loudly
+    recorded where nobody will look again" produce the same outcome.**
+
+    Verified before building (T-1885 duplicate-instrument trap): knowledge_sweep
+    covers lessons/ + bugs/ + incidents/ + notes/ + memory pins. `tickets/done/`
+    is NOT in its corpus, so nothing installed catches this.
+
+    Never raises; a scan failure must not cost a resolve.
+    """
+    found: list[str] = []
+    for pat in _RECURRENCE_PREDICTION_PATTERNS:
+        for m in re.finditer(pat, text, re.IGNORECASE):
+            s, e = max(0, m.start() - 40), min(len(text), m.end() + 40)
+            found.append("…" + text[s:e].replace("\n", " ").strip() + "…")
+    return found
+
+
+def _warn_recurrence_prediction(text: str, tid: str) -> None:
+    """Ask, at resolve time, whether a predicted recurrence needs a ticket."""
+    try:
+        hits = _recurrence_predictions(text or "")
+    except Exception:
+        return
+    if not hits:
+        return
+    print(
+        f"note: this resolve note predicts a recurrence. A finding in a resolved "
+        f"ticket is on nobody's queue — {tid} is about to leave every queue it was "
+        f"on. If the prediction needs an owner, file it now (T-2273):",
+        file=sys.stderr,
+    )
+    for h in hits[:3]:
+        print(f"  {h}", file=sys.stderr)
+
+
+_SUPERSEDED_ASK_MARKER = "SUPERSEDED ASK"
+# Deliberately BOLD TEXT, not a `###` subheading. inbox_consumer._ask_body()
+# terminates its extraction on `\n##`, which `###` also matches — so a
+# subheading here would truncate the auto-delivered prompt at exactly this
+# line and the superseded original would never reach the acting agent. The
+# block above it says "act on this, not on the text below": that sentence has
+# to refer to text the reader can actually see, and the reader is often an
+# injected prompt rather than a person.
+_ORIGINAL_ASK_MARKER = "**Original Ask (superseded — kept for the record):**"
+
+
+def _supersede_ask_section(body: str, correction: str, actor: str, stamp: str) -> str:
+    """Return `body` with `correction` prepended INSIDE the `## Ask` section.
+
+    T-2247. The Ask is the field most likely to be acted on and, until now, the
+    only one with no correction path: `annotate` appends to the transition log,
+    which on a long ticket puts the fix hundreds of lines below the instruction
+    it fixes.
+
+    WHY THE CORRECTION GOES INSIDE THE SECTION rather than anywhere else on the
+    ticket, and this is the load-bearing reason rather than a formatting
+    preference: `inbox_consumer._ask_body()` extracts EXACTLY this section and
+    injects it as the auto-delivered prompt. For an auto-delivered ticket, text
+    outside `## Ask` is not merely read late — **it is not delivered at all.**
+    A correction in the transition log reaches a human scrolling down and
+    reaches the acting agent never.
+
+    WHY THE ORIGINAL IS KEPT rather than overwritten: what was asked is part of
+    the record, and a ticket whose Ask can be silently rewritten is a ticket
+    whose dispatch cannot be audited (P4). This is a prepend plus a demotion,
+    not an edit — the original moves under a marked subheading, intact.
+
+    Repeated supersedes stack newest-first, each with its own stamp, and the
+    original is demoted only once. So the reading order is always: newest
+    correction, older corrections, original.
+    """
+    m = re.search(r"(##\s+Ask\s*\n)(.*?)(?=\n##\s|\Z)", body, re.DOTALL)
+    if m is None:
+        raise TicketError(
+            "supersede-ask: could not locate a `## Ask` section in this ticket. "
+            "The section heading is what inbox_consumer extracts for the "
+            "auto-delivered prompt, so a ticket without one has no correctable "
+            "Ask — use annotate."
+        )
+    heading, current = m.group(1), m.group(2)
+
+    block = (
+        f"> ⚠️ **{_SUPERSEDED_ASK_MARKER} — corrected {stamp} by {actor}.** "
+        f"Act on this, not on the text below it.\n>\n"
+        + "\n".join(f"> {line}" if line.strip() else ">"
+                    for line in correction.strip().splitlines())
+        + "\n"
+    )
+
+    if _ORIGINAL_ASK_MARKER in current:
+        # Already superseded once: stack this correction above the previous
+        # ones, leaving the single demotion marker where it is.
+        new_section = "\n" + block + "\n" + current.lstrip("\n")
+    else:
+        new_section = (
+            "\n" + block + "\n"
+            + _ORIGINAL_ASK_MARKER + "\n\n"
+            + current.strip("\n") + "\n"
+        )
+
+    # Repeated supersedes would otherwise accumulate a blank line per round.
+    rebuilt = body[:m.start()] + heading + new_section + body[m.end():]
+    return re.sub(r"\n{3,}", "\n\n", rebuilt)
+
+
+def cmd_supersede_ask(args: argparse.Namespace) -> int:
+    """Correct a stale `## Ask` in place, preserving the original (T-2247).
+
+    Refuses on `done/` for the same reason `annotate` does: a closed ticket's
+    Ask is history, and resolve owns that surface. Refuses on an empty
+    correction.
+    """
+    correction = (getattr(args, "with_correction", "") or "").strip()
+    if not correction:
+        raise TicketError(
+            "supersede-ask requires a non-empty --with (an empty correction "
+            "would demote the original Ask and replace it with nothing)"
+        )
+
+    path = _find_ticket(args.ticket)
+    if path.parent.name == "done":
+        raise TicketError(
+            f"state-mismatch: {args.ticket} is in `done`; supersede-ask refuses "
+            f"on done (a closed ticket's Ask is history — use addendum)"
+        )
+
+    with git_mutation_lock(label=f"supersede-ask {args.ticket}"):
+        _pull_if_needed(
+            args.no_push or getattr(args, "no_pull", False), strict=False
+        )
+        text = path.read_text(encoding="utf-8")
+        fields, body = parse_front_matter(text)
+        actor = _actor()
+        stamp = _now_iso()
+        body = _supersede_ask_section(body, correction, actor, stamp)
+        # The transition log still records it — the in-section block is for the
+        # READER, the log line is for anyone scanning the ticket's history.
+        body = append_transition(
+            body, actor, "note",
+            f"[{_SUPERSEDED_ASK_MARKER}] {correction}",
+        )
+        path.write_text(_build_ticket_text(fields, body), encoding="utf-8")
+
+        title = _extract_title(body)
+        commit_message = _build_commit_message(
+            "supersede-ask", args.ticket, title, correction)
+        subject = commit_message.splitlines()[0]
+        if len(subject) > 100:
+            print(
+                f"warning: commit subject {len(subject)} chars (>100): {subject!r}",
+                file=sys.stderr,
+            )
+        _commit_and_push([path], commit_message, no_push=args.no_push)
+
+    print(f"supersede-ask {args.ticket}: Ask corrected in place")
+    return 0
+
+
+# Rendered verb for a post-resolution addendum (T-2205). Chosen so the line is
+# self-describing to a human scanner AND inert to the two consumers that parse
+# these lines: activity_digest.py matches `\] resolved` and
+# weekly_ticket_summary.py matches `\[actor\]\s+(resolved|resolve|close-action|
+# close-noodle)\b`. "post-resolution addendum" contains "resolution", never the
+# token "resolved" in verb position, so an addendum cannot be miscounted as a
+# second resolve — which would inflate every throughput digest.
+_ADDENDUM_VERB = "post-resolution addendum"
+
+
+def cmd_addendum(args: argparse.Namespace) -> int:
+    """Append a post-resolution addendum to a `done/` ticket (T-2205).
+
+    A resolved ticket's record was immutable with no correction path: annotate
+    hard-refuses on done/, and there is no reopen/amend. So a resolve note that
+    later turned out to be wrong — or that a peer's measurement superseded —
+    could not be corrected on the surface a reader actually reads. The record
+    stayed confidently wrong.
+
+    Deliberately NOT implemented by relaxing annotate's refusal. That refusal
+    protects a real property: resolve owns the outcome surface, and you should
+    not be able to quietly rewrite how a closed ticket ended. This is a
+    distinct operation with the opposite bias — maximum visibility instead of
+    silence:
+
+      (a) APPEND-ONLY. It calls append_transition, which only ever adds a
+          bullet. No existing line is edited, so the original resolve evidence
+          is untouched and remains readable exactly as written.
+      (b) VISIBLY POST-RESOLUTION. The verb says so in words, and because the
+          log is chronological the addendum necessarily renders BELOW the
+          `resolved` line — a reader sees the original outcome and the later
+          correction as two events, in order, rather than one revised claim.
+      (c) VINTAGE LEGIBLE. It inherits the T-2203 HEAD stamp, so the addendum
+          carries the repo state it was written against — which is the whole
+          point when the thing being corrected is "this note was already stale
+          when it was written."
+
+    Mirror-image guard to annotate's: this REFUSES on anything not in done/,
+    and points at annotate. Two operations, two disjoint domains, neither able
+    to do the other's job by accident.
+    """
+    note = (getattr(args, "note", "") or "").strip()
+    if not note:
+        raise TicketError(
+            "addendum requires a non-empty --note (an empty addendum is a "
+            "no-op; nothing to append)"
+        )
+
+    path = _find_ticket(args.ticket)
+    if path.parent.name != "done":
+        raise TicketError(
+            f"state-mismatch: {args.ticket} is in `{path.parent.name}`, not "
+            f"`done`; addendum is the post-resolution correction path. Use "
+            f"`annotate` for a ticket that is still open."
+        )
+
+    with git_mutation_lock(label=f"addendum {args.ticket}"):
+        # Same reasoning as annotate (T-2204): appending to a ticket that
+        # already exists at a path already resolved neither allocates an ID nor
+        # moves state, so a stale view cannot make the addendum wrong.
+        _pull_if_needed(
+            args.no_push or getattr(args, "no_pull", False), strict=False
+        )
+
+        text = path.read_text(encoding="utf-8")
+        fields, body = parse_front_matter(text)
+        actor = _actor()
+        body = append_transition(body, actor, _ADDENDUM_VERB, note)
+        new_text = _build_ticket_text(fields, body)
+
+        # Build the commit message BEFORE writing (T-2205, found by running
+        # this for real): _build_commit_message raises on an unrecognised verb,
+        # and the original ordering wrote the file first — so the very first
+        # live invocation left the ticket modified in the working tree with no
+        # commit, which is the same write-then-abort shape T-0244 hoisted the
+        # pull out of _commit_and_push to prevent. Everything that can refuse
+        # now refuses before anything on disk changes.
+        title = _extract_title(body)
+        commit_message = _build_commit_message("addendum", args.ticket, title, note)
+
+        path.write_text(new_text, encoding="utf-8")
+
+        subject = commit_message.splitlines()[0]
+        if len(subject) > 100:
+            print(
+                f"warning: commit subject {len(subject)} chars (>100): {subject!r}",
+                file=sys.stderr,
+            )
+        _commit_and_push([path], commit_message, no_push=args.no_push)
+
+    print(f"addendum {args.ticket}: post-resolution addendum appended")
     return 0
 
 
@@ -2532,6 +3717,35 @@ def _iter_all_tickets() -> list[Ticket]:
         )
         for name in names:
             out.append(parse_ticket(d / name))
+    return out
+
+
+def compute_unblocks(tickets: list[Ticket]) -> dict[str, list[str]]:
+    """Reverse index of `depends_on` (T-2720): unblocks[T] = ids of tickets
+    whose depends_on contains T.
+
+    DERIVED-ON-READ, never persisted to frontmatter — depends_on stays the
+    single source of truth; a stored reverse edge would need cascade upkeep
+    and could desync (see ORG-013 cascade-unblock, which already maintains
+    depends_on itself).
+
+    Every id present in `tickets` gets a key, even with zero dependents
+    (empty list) — callers never need to guard a KeyError. A dependent
+    counts regardless of ITS OWN state (inbox/active/done); the target id
+    of a depends_on edge does not need to be present in `tickets` (e.g. a
+    partial/test corpus) — that id still gets a key via setdefault.
+    """
+    out: dict[str, list[str]] = {
+        (t.fields.get("id") or t.path.stem): [] for t in tickets
+    }
+    for t in tickets:
+        tid = t.fields.get("id") or t.path.stem
+        for dep in t.fields.get("depends_on") or []:
+            dep = str(dep).strip()
+            if dep:
+                out.setdefault(dep, []).append(tid)
+    for deps in out.values():
+        deps.sort()
     return out
 
 
@@ -2558,7 +3772,13 @@ def _format_age(created_iso: str, now: datetime | None = None) -> str:
 
 
 def cmd_list(args: argparse.Namespace) -> int:
-    tickets = _iter_all_tickets()
+    all_tickets = _iter_all_tickets()
+    # T-2720: unblocks is computed over the FULL corpus, before any of the
+    # filters below apply — a --target/--state/--label filter narrows which
+    # ROWS print, not what a shown ticket unblocks (a dependent outside the
+    # filter still counts).
+    unblocks = compute_unblocks(all_tickets) if args.show_unblocks else {}
+    tickets = all_tickets
     if args.state:
         tickets = [t for t in tickets if t.fields.get("state") == args.state]
     if args.target:
@@ -2593,11 +3813,15 @@ def cmd_list(args: argparse.Namespace) -> int:
     w_age = max(len(r[4]) for r in rows)
 
     for r in rows:
-        print(
+        line = (
             f"{r[0]:<{w_id}}  {r[1]:<{w_state}}  "
             f"{r[2]:<{w_req}} → {r[3]:<{w_tgt}}  "
             f"{r[4]:>{w_age}}  {r[5]}"
         )
+        deps = unblocks.get(r[0]) or []
+        if deps:
+            line += f"  unblocks: {', '.join(deps)}"
+        print(line)
     return 0
 
 
@@ -2626,6 +3850,8 @@ def cmd_ready(args: argparse.Namespace) -> int:
     """
     now = datetime.now(timezone.utc)
     tickets = _iter_all_tickets()
+    # T-2720: unblocks over the full unfiltered corpus — see cmd_list.
+    unblocks = compute_unblocks(tickets) if args.show_unblocks else {}
     ready = []
     for t in tickets:
         if t.fields.get("state") not in ("inbox", "active"):
@@ -2640,7 +3866,58 @@ def cmd_ready(args: argparse.Namespace) -> int:
         ready.append(t)
 
     if not ready:
-        print("(no ready tickets)")
+        # T-2220: "(no ready tickets)" is AMBIGUOUS between "nothing to do, rest"
+        # and "your queue is deadlocked" — and that ambiguity cost specialist an arc.
+        # A three-way depends_on deadlock (T-2107/T-2160, itself a recurrence of
+        # T-2106/T-2107) made `ready --target specialist` return nothing, which reads as
+        # correctly-gated. Specialist said it would have sat on it.
+        #
+        # So an empty result now states WHY it is empty. Same defect class as an
+        # empty grep whose zero could not have been otherwise: the output was
+        # identical in the healthy and the wedged case, so it could not
+        # discriminate the only two states a reader cares about.
+        scope = f" for target '{args.target}'" if args.target else ""
+        dep_blocked, date_blocked = [], []
+        for t in tickets:
+            if t.fields.get("state") not in ("inbox", "active"):
+                continue
+            if args.target and t.fields.get("target") != args.target:
+                continue
+            if t.fields.get("depends_on"):
+                dep_blocked.append(t.fields.get("id", "?"))
+            else:
+                nb = t.fields.get("not_before")
+                if nb and not _not_before_passed(nb, now):
+                    date_blocked.append(t.fields.get("id", "?"))
+        if not dep_blocked and not date_blocked:
+            print(f"(no ready tickets{scope} — and none blocked either: the queue "
+                  f"is genuinely EMPTY, not gated)")
+            return 0
+        print(f"(no ready tickets{scope} — but {len(dep_blocked)} dep-gated, "
+              f"{len(date_blocked)} date-gated, so the queue is NOT empty)")
+        if dep_blocked:
+            print(f"  dep-gated:  {', '.join(sorted(dep_blocked))}")
+        if date_blocked:
+            print(f"  date-gated: {', '.join(sorted(date_blocked))}")
+        # A cycle among those is a DEADLOCK, not a gate — it will never clear on
+        # its own, so it is the one case that needs a human now. Lazy import:
+        # ticket_lint imports FROM this module, so a top-level import would be
+        # circular. Fail-soft — a read-only listing must never fail because its
+        # advisory could not be computed.
+        try:
+            from tools.ticket_lint import detect_dep_graph_issues
+            blocked_set = set(dep_blocked)
+            cycles = [f for f in detect_dep_graph_issues(TICKETS_ROOT)
+                      if f.kind == "cycle"]
+            hits = [f for f in cycles
+                    if not blocked_set or any(t in f.detail for t in blocked_set)]
+            for f in hits:
+                print(f"  ⛔ DEADLOCK — {f.detail}")
+            if hits:
+                print("     A cycle never clears on its own. Break it by correcting "
+                      "the wrong edge (`ticket.py block <id> --clear-deps`).")
+        except Exception:
+            pass
         return 0
 
     rows = [
@@ -2660,15 +3937,19 @@ def cmd_ready(args: argparse.Namespace) -> int:
     w_tgt = max(len(r[3]) for r in rows)
     w_age = max(len(r[4]) for r in rows)
     for r in rows:
-        print(
+        line = (
             f"{r[0]:<{w_id}}  {r[1]:<{w_state}}  "
             f"{r[2]:<{w_req}} → {r[3]:<{w_tgt}}  "
             f"{r[4]:>{w_age}}  {r[5]}"
         )
+        deps = unblocks.get(r[0]) or []
+        if deps:
+            line += f"  unblocks: {', '.join(deps)}"
+        print(line)
     return 0
 
 
-def _ticket_brief(t: "Ticket") -> dict:
+def _ticket_brief(t: "Ticket", unblocks: dict[str, list[str]] | None = None) -> dict:
     """Compact JSON-serializable view of a ticket for `prime` output."""
     return {
         "id": t.fields.get("id"),
@@ -2680,6 +3961,9 @@ def _ticket_brief(t: "Ticket") -> dict:
         "depends_on": t.fields.get("depends_on") or [],
         "not_before": t.fields.get("not_before"),
         "created": t.fields.get("created"),
+        # T-2720: derived, unconditional on this JSON surface (no noise cost
+        # here — see compute_unblocks). Empty list, never absent.
+        "unblocks": (unblocks or {}).get(t.fields.get("id") or t.path.stem, []),
     }
 
 
@@ -2696,6 +3980,9 @@ def cmd_prime(args: argparse.Namespace) -> int:
     """
     now = datetime.now(timezone.utc)
     tickets = _iter_all_tickets()
+    # T-2720: over the full corpus, incl. done — a dependent's state doesn't
+    # change whether the depended-on ticket unblocks it.
+    unblocks = compute_unblocks(tickets)
 
     def _match_target(t):
         return not args.target or t.fields.get("target") == args.target
@@ -2725,10 +4012,10 @@ def cmd_prime(args: argparse.Namespace) -> int:
     recently_done = done_sorted[: max(0, args.done_limit)]
 
     payload = {
-        "ready": [_ticket_brief(t) for t in ready],
-        "blocked": [_ticket_brief(t) for t in blocked],
-        "active": [_ticket_brief(t) for t in active],
-        "recently_done": [_ticket_brief(t) for t in recently_done],
+        "ready": [_ticket_brief(t, unblocks) for t in ready],
+        "blocked": [_ticket_brief(t, unblocks) for t in blocked],
+        "active": [_ticket_brief(t, unblocks) for t in active],
+        "recently_done": [_ticket_brief(t, unblocks) for t in recently_done],
         "counts": {
             "ready": len(ready),
             "blocked": len(blocked),
@@ -2745,18 +4032,114 @@ def cmd_prime(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 
+class _NoRepeatStore(argparse.Action):
+    """A single-valued option given TWICE is an error, not last-wins (T-2315).
+
+    argparse's default `store` keeps the LAST value and drops the rest with no
+    warning and exit 0. That is the actual defect behind T-2302 — specialist's
+    narrowing, which I then failed to follow one step: allow_abbrev=False closed
+    the route (`--label` as a prefix of `--labels`) and left the defect intact on
+    the canonical spelling. Measured after that fix:
+
+        --labels mailbox --labels reliability   -> 'reliability'   silent loss
+        --depends-on T-1111 --depends-on T-2222 -> 'T-2222'        A GATE DROPPED
+        --serves P1 --serves P7                 -> 'P7'            silent loss
+
+    All 15 value-taking options on `file` were plain stores, so the loss was
+    reachable by anyone who never abbreviated anything — and the abbreviation fix
+    made one case WORSE, by pointing readers at the canonical spelling as if it
+    were safe.
+
+    The depends-on case is the severe one: a dropped dependency silently
+    UN-GATES a ticket, which is a correctness defect in the queue rather than
+    lost metadata.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        seen = getattr(namespace, "_ticket_seen_opts", None)
+        if seen is None:
+            seen = set()
+            setattr(namespace, "_ticket_seen_opts", seen)
+        if self.dest in seen:
+            # T-2315 follow-up (specialist): this string is printed by EVERY
+            # subcommand, so it must not assert anything true of only one. The
+            # first version ended "...and how a --depends-on repeat would
+            # un-gate a ticket. Pass ONE value" — printed verbatim on `block`,
+            # where --depends-on is an append action and repeating it is the
+            # CORRECT idiom. So the error argued the reader out of the right
+            # usage, on the subcommand where it is right. An error that fires
+            # correctly and then misdirects is the T-2310/T-2290 shape, and I
+            # shipped it into the fix for the previous instance.
+            parser.error(
+                f"{option_string} given more than once, and it stores a SINGLE value — "
+                f"argparse would keep only the LAST and drop the rest silently (exit 0, "
+                f"no warning). That is how T-2243/T-2295/T-2299 lost labels. Pass one "
+                f"{option_string} (comma-separated if it takes a list). Options declared "
+                f"action='append' — e.g. `block --depends-on` — are unaffected and may "
+                f"legitimately repeat."
+            )
+        seen.add(self.dest)
+        setattr(namespace, self.dest, values)
+
+
+class _NoAbbrevParser(argparse.ArgumentParser):
+    """ArgumentParser with prefix-abbreviation OFF (T-2302, specialist).
+
+    argparse's allow_abbrev defaults True, so ANY unambiguous prefix of a long
+    flag is silently accepted. That turned `file --label a --label b` into a
+    single-valued `--labels` assignment with last-wins semantics: exit 0, no
+    warning, nothing echoed, three of four labels GONE.
+
+    Measured: specialist filed T-2295 ("do not leave a well-formed maildir at the
+    old hub") with four labels and it stored one. The dropped
+    `post-office-rename` is precisely the label someone sweeps for BEFORE
+    performing that cut, so the ticket existed and was unfindable at the one
+    moment it exists to be found. Labels are the DISCOVERY surface; losing them
+    is not cosmetic. Verified in git history: at filing (2e9c233e4) the
+    frontmatter read `labels: [failure-presents-as-absence]` — the LAST value
+    passed, exactly as last-wins predicts.
+
+    Wider than labels: every long flag on every subcommand was silently
+    abbreviable, so any near-miss typo that happened to be a unique prefix was
+    accepted. Off now. `file --label` is a hard error, while `list --label`
+    keeps working because it is a REAL flag there — that collision is precisely
+    what made the silent case so easy to hit.
+
+    Checked before landing: no in-tree caller relies on an abbreviation.
+    """
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
+    def add_argument(self, *args, **kwargs):
+        """Default value-taking long options to the no-repeat store (T-2315).
+
+        Applied here rather than at ~40 call sites so a NEW flag inherits the
+        protection instead of having to remember it. Explicit actions
+        (store_true, append, help, version) are left alone, as are positionals.
+        """
+        is_option = bool(args) and str(args[0]).startswith("-")
+        if is_option and "action" not in kwargs and kwargs.get("nargs") is None:
+            kwargs["action"] = _NoRepeatStore
+        return super().add_argument(*args, **kwargs)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     actor_help = (
         "Actor identity for the transition-log entry comes from "
         "$PANTHEON_ACTOR if set, else the OS username (getpass.getuser())."
     )
-    p = argparse.ArgumentParser(
+    p = _NoAbbrevParser(
         prog="ticket.py",
         description=(
             "Pantheon ticket lifecycle CLI. " + actor_help
         ),
     )
-    sub = p.add_subparsers(dest="cmd", required=True)
+    # parser_class propagates the no-abbrev rule to EVERY subcommand;
+    # setting it on the top-level parser alone would not (T-2302).
+    sub = p.add_subparsers(dest="cmd", required=True,
+                           parser_class=_NoAbbrevParser)
 
     f = sub.add_parser("file", help="file a new ticket in inbox/")
     f.add_argument(
@@ -2787,6 +4170,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="earliest dispatch date/time: YYYY-MM-DD (interpreted as 00:00:00Z) "
              "or YYYY-MM-DDTHH:MM:SSZ",
+    )
+    f.add_argument(
+        "--not-before-anchor",
+        dest="not_before_anchor",
+        default=None,
+        metavar="operator:REF|event:KIND:param",
+        help="T-2833: REQUIRED with --not-before. Anchors the date gate to the operator "
+             "OR a real-world blocker: operator:<T-NNNN|tg:MSGID> or "
+             "event:<cert-expiry|key-expiry|cadence|window>:<param>. No free-text.",
     )
     f.add_argument(
         "--ratifiable-file",
@@ -2847,6 +4239,15 @@ def _build_parser() -> argparse.ArgumentParser:
              "housekeeping tickets. Optional; the ticket-lint will WARN (never "
              "fail) on new inbox tickets that omit this field.",
     )
+    f.add_argument(
+        "--retest-status",
+        dest="retest_status",
+        default=None,
+        choices=RETEST_STATUS_VOCAB,
+        help="T-2613 / ORG-038: S3* independent-re-test-to-close structural gate. "
+             "Optional; set by s3star_audit_runner.py's finding filer to 'pending' "
+             "at file time. Not for general ticket-filing use.",
+    )
     f.set_defaults(func=cmd_file)
 
     c = sub.add_parser("claim", help="move ticket inbox/ → active/")
@@ -2861,6 +4262,69 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="commit locally but skip git push; the next pushing op (or a manual push) carries it to origin")
     uc.set_defaults(func=cmd_unclaim)
 
+    an = sub.add_parser(
+        "annotate",
+        help="append a transition-log note with NO state change (T-1972)",
+    )
+    an.add_argument("ticket")
+    an.add_argument(
+        "--note",
+        required=True,
+        help="note text to append to the transition log (empty/whitespace refused)",
+    )
+    an.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                    help="commit locally but skip git push; the next pushing op (or a manual push) carries it to origin")
+    # T-2204: annotate-only. Offered for annotate and NOT for the state-moving
+    # subcommands on purpose — those must not be given a way to skip the pull.
+    an.add_argument("--no-pull", dest="no_pull", action="store_true", default=False,
+                    help="skip the pre-write pull (annotate only; it neither allocates an ID nor "
+                         "moves state, so a stale view cannot make the note wrong). A pull failure "
+                         "is already only a warning here — use this to skip the attempt entirely.")
+    an.set_defaults(func=cmd_annotate)
+
+    # T-2247: the ONLY correction path that reaches an auto-delivered worker.
+    # inbox_consumer._ask_body() extracts `## Ask` and injects exactly that as
+    # the prompt, so a correction anywhere else on the ticket is not delivered
+    # at all — not merely delivered late.
+    sa = sub.add_parser(
+        "supersede-ask",
+        help="correct a stale `## Ask` IN PLACE, keeping the original below it "
+             "(T-2247) — the only correction the auto-consumer delivers",
+    )
+    sa.add_argument("ticket")
+    sa.add_argument(
+        "--with", dest="with_correction", required=True,
+        help="the corrected instruction. Prepended inside `## Ask`; the original "
+             "is demoted under a marked subheading, never deleted.",
+    )
+    sa.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                    help="commit locally but skip git push; the next pushing op (or a manual push) carries it to origin")
+    sa.add_argument("--no-pull", dest="no_pull", action="store_true", default=False,
+                    help="skip the pre-write pull (same reasoning as annotate: no ID allocation, "
+                         "no state move)")
+    sa.set_defaults(func=cmd_supersede_ask)
+
+    # T-2205: the post-resolution correction path. Disjoint from annotate by
+    # construction — annotate refuses on done/, addendum refuses on everything
+    # else — so neither can do the other's job by accident.
+    ad = sub.add_parser(
+        "addendum",
+        help="append a VISIBLY post-resolution addendum to a done/ ticket "
+             "(append-only; does not touch the resolve evidence) (T-2205)",
+    )
+    ad.add_argument("ticket")
+    ad.add_argument(
+        "--note",
+        required=True,
+        help="addendum text to append (empty/whitespace refused)",
+    )
+    ad.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                    help="commit locally but skip git push; the next pushing op (or a manual push) carries it to origin")
+    ad.add_argument("--no-pull", dest="no_pull", action="store_true", default=False,
+                    help="skip the pre-write pull (same reasoning as annotate: append-only, no ID "
+                         "allocation, no state move)")
+    ad.set_defaults(func=cmd_addendum)
+
     b = sub.add_parser(
         "block",
         help="set not_before / depends_on gate on a ticket (frontmatter edit; no dir move)"
@@ -2874,7 +4338,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help=(
             "Calendar gate: earliest pickup date. "
             "Formats: YYYY-MM-DD (interpreted as 00:00:00Z) or YYYY-MM-DDTHH:MM:SSZ. "
-            "inbox_consumer suppresses until the timestamp passes."
+            "inbox_consumer suppresses until the timestamp passes. "
+            "T-2833: requires --not-before-anchor."
+        ),
+    )
+    b.add_argument(
+        "--not-before-anchor",
+        dest="not_before_anchor",
+        default=None,
+        metavar="operator:REF",
+        help=(
+            "T-2833: REQUIRED with --not-before. Anchors the date gate to the operator OR "
+            "a real-world blocker — operator:<T-NNNN|tg:MSGID> (a ticket ref must "
+            "resolve) OR event:<cert-expiry|key-expiry|cadence|window>:<param> (a "
+            "genuine deadline/cadence). No free-text: an arbitrary 'not now' reason "
+            "is a --depends-on dependency or a body pickup-note, never a bare date."
         ),
     )
     b.add_argument(
@@ -2899,6 +4377,31 @@ def _build_parser() -> argparse.ArgumentParser:
             "Mutually exclusive with --not-before and --depends-on. "
             "No-op (no commit) if not_before is already absent. "
             "Ticket stays in its current lane."
+        ),
+    )
+    b.add_argument(
+        "--clear-dep",
+        dest="clear_dep",
+        action="append",
+        default=None,
+        metavar="T-NNNN",
+        help=(
+            "T-1975: remove a specific depends_on gate (repeatable). The manual "
+            "inverse of --depends-on, for correcting a wrongly-set dep. "
+            "Mutually exclusive with the add flags and the other clear flags. "
+            "CLEAN ERROR (not a no-op) if the named dep is not present — it names "
+            "a specific target, so a miss is surfaced rather than silently ignored."
+        ),
+    )
+    b.add_argument(
+        "--clear-deps",
+        dest="clear_deps",
+        action="store_true",
+        default=False,
+        help=(
+            "T-1975: remove ALL depends_on gates. No-op (no commit) if already "
+            "empty — idempotent, since it names no specific target (cf. --clear-dep). "
+            "Mutually exclusive with the add flags and the other clear flags."
         ),
     )
     b.add_argument("--no-push", dest="no_push", action="store_true", default=False,
@@ -2996,6 +4499,11 @@ def _build_parser() -> argparse.ArgumentParser:
     ls.add_argument("--state", choices=STATES, default=None)
     ls.add_argument("--target", default=None)
     ls.add_argument("--label", default=None)
+    ls.add_argument(
+        "--show-unblocks", action="store_true",
+        help="annotate each row with the derived reverse of depends_on — "
+             "which tickets THIS one unblocks (T-2720). Off by default.",
+    )
     ls.set_defaults(func=cmd_list)
 
     rdy = sub.add_parser(
@@ -3004,6 +4512,11 @@ def _build_parser() -> argparse.ArgumentParser:
              "not_before passed) — read-only",
     )
     rdy.add_argument("--target", default=None, help="filter by target persona")
+    rdy.add_argument(
+        "--show-unblocks", action="store_true",
+        help="annotate each row with the derived reverse of depends_on — "
+             "which tickets THIS one unblocks (T-2720). Off by default.",
+    )
     rdy.set_defaults(func=cmd_ready)
 
     pr = sub.add_parser(

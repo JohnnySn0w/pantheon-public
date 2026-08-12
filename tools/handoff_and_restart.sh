@@ -14,6 +14,21 @@
 #   7. Capture the target pane and grep for steady-state sentinel pattern.
 #   0 = success.
 #
+# T-2658 — control-plane-supervised seats (--supervisor control-plane, e.g.
+# specialist post-T-2633-cutover): steps 5/6 branch.
+#   5. tmux kill-session on the target pane's session FIRST (abort if it
+#      survives), THEN systemctl restart — $SERVICE is the caller-resolved
+#      pantheon-persona-consume@<persona>.service, not a bespoke unit; a live
+#      matching pane would otherwise make runtime_controller.ensure_runtime()
+#      just REUSE the old process instead of restarting it.
+#   6. poll runtime_scope_owned_and_session_live (tools/t2590_cutover_verify_
+#      lib.sh) instead of `systemctl is-active` — the consume unit is
+#      Type=oneshot with no RemainAfterExit, so it is never is-active after
+#      it exits; the real witness is the pane it started.
+# Step 7 (composer-ready pane sentinel) is unchanged for both branches — it
+# is already supervisor-agnostic. See tickets/active/T-2658.md (or
+# tickets/done/T-2658.md once resolved) for the full design.
+#
 # Defaults assume HO's substrate (claude.service, --user mode, default
 # HANDOFF.md path) but every behavioral knob is parameterized — see flags.
 #
@@ -39,6 +54,13 @@ set -u
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=send_keys_submit.sh
 source "$SCRIPT_DIR/send_keys_submit.sh"
+# T-2658: runtime_scope_owned_and_session_live — the control-plane-branch
+# readiness predicate for step 6 (see the header comment above). Sourced
+# unconditionally (cheap, function-only, no top-level side effects — same
+# posture as send_keys_submit.sh) so it's available regardless of which
+# --supervisor value this invocation ends up with.
+# shellcheck source=t2590_cutover_verify_lib.sh
+source "$SCRIPT_DIR/t2590_cutover_verify_lib.sh"
 
 # ---------------------------------------------------------------------------
 # Defaults.
@@ -52,9 +74,25 @@ PROMPT_TEXT=""                           # default below if unset
 ACK_TIMEOUT=600                          # 10 min — HO writing a handoff
 STEADY_TIMEOUT=60                        # 1 min — fresh session warming up
 POLL_INTERVAL=2                          # seconds between mtime/pane polls
+SUPERVISOR="bespoke"                     # T-2658: bespoke | control-plane — branches steps 5/6
+# The singleton control-plane tmux scope (tools/runtime_controller.py's
+# TMUX_RUNTIME_SCOPE_UNIT). Not a CLI flag — production has exactly one value
+# and every control-plane-supervised seat shares it; PROC_ROOT below is the
+# test seam instead.
+RUNTIME_SCOPE_UNIT="pantheon-runtime-tmux.scope"
+PROC_ROOT="${HANDOFF_RESTART_PROC_ROOT:-/proc}"  # T-2658 test seam only
 # INJECT_ENTER_DELAY, PENDING_PASTE_SENTINEL, SUBMIT_RETRIES are now defined
 # in send_keys_submit.sh (sourced above). Values: 0.7 / '[Pasted text' / 2.
-VERIFY_PATTERN='(╭─+╮|─{20,})'          # Claude Code prompt-frame top edge (corner-framed or bare horizontal run)
+# T-2330/T-2351-adjacent (CI red, 2026-07-29): the quantifiers MUST wrap `─` in a
+# group. `─` is 3 bytes (E2 94 80) and in a non-UTF-8 (byte) locale a bare `─+` /
+# `─{20,}` binds the quantifier to the LAST BYTE only — "E2 94 then 0x80 repeated" —
+# which no real box-drawing run can produce, so the frame check silently never
+# matches. `❯` carries no quantifier and keeps matching, so the failure presents as
+# a half-passing conjunction rather than as a locale problem. Grouping makes the
+# quantifier apply to the whole character and is identical under UTF-8.
+# Found because the self-hosted runner runs a byte locale while all four agent seats
+# are C.UTF-8: `LC_ALL=C` reproduces the CI failure here exactly (15/18, same list).
+VERIFY_PATTERN='(╭(─)+╮|(─){20,})'      # Claude Code prompt-frame top edge (corner-framed or bare horizontal run)
 IDLE_SENTINEL='❯'                        # positive idle-prompt cursor; T-0528: empirical 90-frame Recovery-restart capture showed `❯` rendered in every frame from t+1s, while `? for shortcuts` rendered in only 1/90 — so `❯` is the reliable boot-window match. Stale OR-alternates (? for shortcuts, ctrl+t to hide tasks) removed.
 DIALOG_EXCLUDE='Enter to confirm|Esc to cancel'  # negative: any of these in the pane DISQUALIFIES the steady-state match. T-0528: `❯` alone false-passes the dev-channels confirm dialog (option cursor is also `❯`), defeating T-0172's dialog guard. The dialog's footer markers are highly specific to Claude Code's confirm/cancel UI and are not present in normal idle/prose output.
 # T-0721: the dev-channels development-channels startup confirm a freshly-restarted
@@ -64,6 +102,19 @@ DIALOG_EXCLUDE='Enter to confirm|Esc to cancel'  # negative: any of these in the
 # auto-resolve cron clears it (the wedge window the operator flagged 2026-06-02).
 # EXACT fixed-string match only.
 BOOT_DIALOG_SENTINEL='I am using this for local development'
+# T-2210: a SECOND boot modal exists (Claude Code v2.1.220) — 'Try the new
+# fullscreen renderer?' with options '1. Yes, try it' / '2. Not now'. It wedged
+# exocortex/mnemosyne after the operator's droplet restart on 2026-07-28.
+#
+# ⚠️ IT IS DISMISSED WITH 2, NOT 1, AND THAT IS THE WHOLE REASON IT IS A SEPARATE
+# CONSTANT. For the dev-channels dialog option 1 is the benign acknowledgement.
+# For this one option 1 is "Yes, try it" — accepting a RENDERER CHANGE on a peer's
+# live session, which nobody asked for and which this fleet's recovery tooling
+# reads the pane of (a renderer swap has already caused one false 'recovery
+# tooling is broken' alarm here). Declining is the only safe automatic answer: a
+# de-wedger exists to restore comms, not to opt a peer into a UI change. That is
+# what I did by hand on 2026-07-28 and it is now encoded.
+BOOT_RENDERER_SENTINEL='Try the new fullscreen renderer'
 # Deny-list (regex): dangerous / non-boot confirms that must NEVER be auto-dismissed
 # by the restart. If ANY is co-present we do NOT press 1 — fall through to exit 7
 # (fail-closed; the human/cron handles it). Defends the "boot sentinel present in
@@ -73,6 +124,8 @@ BOOT_DISMISS_DENYLIST='Do you want to (proceed|make this edit|overwrite|create|d
 LOCKFILE="/tmp/handoff_and_restart.$(id -u).lock"  # per-UID: HO (claude) and Recovery (claude-fallback) drive different services and must not contend on — or EPERM each other out of — one shared /tmp lock
 DRY_RUN=0
 SKIP_ACK=0                               # T-0510: force-restart mode — skip steps 2-4 (handoff prompt + ack-wait)
+DISMISS_MODAL=0                          # T-2829: send Escape before the handoff prompt to clear a blocking permission modal (fail-closed — Escape CANCELS/denies, never approves). Opt-in; autonomous wedge-recovery passes it, the operator's attended manual restart does not.
+HARD_RESTART_ON_ACK_TIMEOUT=0            # T-2829: on step-4 ack timeout, fall through to the restart (steps 5-8) instead of exit 4, so a session that cannot hand off (e.g. modal-wedged) is still recovered rather than left wedged. Opt-in.
 NO_RESTART=0                             # T-1049: pause mode — run steps 1-4 + graveyard, then STOP (no restart). For the fleet-reboot quiesce: each agent finishes + writes HANDOFF + is graveyard'd + pauses, then the machine reboots.
 KICK_ENABLED=1                           # T-0172: post-step-7 HANDOFF kick (default on; --no-kick to disable)
 KICK_PROMPT=""                           # default below if unset
@@ -123,6 +176,23 @@ Optional:
                               go straight to restart. For agents that cannot write a handoff (e.g. a
                               session 400ing on every API request). Steps 5-8 (restart, is-active,
                               steady-state, kick) still run, so the one wrapper still owns systemctl.
+  --dismiss-modal             T-2829: before the handoff prompt (step 3), send a single Escape to the
+                              target pane to clear any blocking permission modal. Escape CANCELS the
+                              modal (denies the pending action) — the fail-closed direction; it never
+                              presses an approval key. Lets a session wedged behind a modal (e.g. a
+                              settings.json-edit confirm) receive + act on the handoff prompt instead
+                              of ignoring it. Safe blind-send in the restart context: idle pane → no-op;
+                              mid-turn → interrupt (we are restarting anyway); modal → dismiss. Ignored
+                              under --skip-ack (no handoff prompt to protect). Off by default.
+  --hard-restart-on-ack-timeout
+                              T-2829: on step-4 ack timeout, instead of exit 4, log + fall through to
+                              the restart (steps 5-8) — a hard restart. Guarantees recovery of a session
+                              that cannot hand off (modal-wedged, or otherwise not progressing) rather
+                              than abandoning it wedged (the pre-T-2829 hole that left specialist stuck on a
+                              settings.json modal ~3.3d). The fresh handoff is lost, but the prior
+                              cycle's handoff + graveyard remain. Paired with --dismiss-modal by the
+                              autonomous wedge-recovery path (restart_drain graceful invocation): Escape
+                              first (preserve the handoff), hard-restart if it still can't. Off by default.
   --no-restart                pause mode (T-1049): run steps 1-4 + graveyard archive (prompt the agent to
                               finish + write its HANDOFF, wait for the mtime ack, snapshot to the
                               graveyard), then STOP — skip the restart and all post-restart steps (5-8).
@@ -130,10 +200,23 @@ Optional:
                               the machine reboot (driven by the fleet orchestrator) is what cycles it.
                               Mutually exclusive with --skip-ack (which has no fresh handoff to graveyard).
   --dry-run                   print plan; perform no side effects
+  --supervisor <bespoke|control-plane>
+                              default: bespoke. T-2658: control-plane seats (a persona cut
+                              over to the harness-manager control plane, e.g. specialist post-
+                              T-2633) are NOT restarted via a plain `systemctl restart` of
+                              $SERVICE — step 5 first tmux-kills the target pane's session
+                              (aborting if it survives), then restarts $SERVICE (the caller-
+                              resolved pantheon-persona-consume@<persona> unit); step 6 polls
+                              runtime-scope + session liveness instead of `systemctl is-
+                              active` (a Type=oneshot consume unit is never is-active after
+                              it exits). bespoke (the default) is BYTE-IDENTICAL to pre-T-2658
+                              behavior — this flag is fully additive.
 
 Exit codes:
   0 success; 1 lock; 2 pre-mtime; 3 prompt-send; 4 ack-timeout;
-  5 restart; 6 is-active; 7 steady-state; 8 kick-send; 64 usage error.
+  5 restart (bespoke: systemctl restart failed; control-plane: also covers a
+    kill-session that didn't take); 6 is-active / runtime-not-live; 7 steady-state;
+  8 kick-send; 64 usage error.
 EOF
 }
 
@@ -154,8 +237,11 @@ while [[ $# -gt 0 ]]; do
     --kick-prompt)     KICK_PROMPT="$2"; shift 2 ;;
     --no-kick)         KICK_ENABLED=0; shift ;;
     --skip-ack)        SKIP_ACK=1; shift ;;
+    --dismiss-modal)   DISMISS_MODAL=1; shift ;;
+    --hard-restart-on-ack-timeout) HARD_RESTART_ON_ACK_TIMEOUT=1; shift ;;
     --no-restart)      NO_RESTART=1; shift ;;
     --dry-run)         DRY_RUN=1; shift ;;
+    --supervisor)      SUPERVISOR="$2"; shift 2 ;;
     -h|--help)         usage; exit 0 ;;
     *) echo "unknown arg: $1" >&2; usage; exit 64 ;;
   esac
@@ -169,6 +255,10 @@ fi
 case "$MODE" in
   user|system) ;;
   *) echo "--mode must be 'user' or 'system'" >&2; exit 64 ;;
+esac
+case "$SUPERVISOR" in
+  bespoke|control-plane) ;;
+  *) echo "--supervisor must be 'bespoke' or 'control-plane'" >&2; exit 64 ;;
 esac
 if [[ "$NO_RESTART" == "1" && "$SKIP_ACK" == "1" ]]; then
   echo "--no-restart and --skip-ack are mutually exclusive (skip-ack has no fresh handoff to graveyard, and no-restart skips the restart skip-ack exists to perform)" >&2
@@ -215,6 +305,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   cat <<EOF
 DRY RUN — no side effects.
   service:           $SERVICE ($MODE)
+  supervisor:        $SUPERVISOR
   target pane:       $TARGET_PANE
   handoff file:      $HANDOFF_FILE
   ack timeout:       ${ACK_TIMEOUT}s
@@ -261,13 +352,36 @@ SCRIPT_PID=$$
   # not under arbitrary test harnesses), so we walk the descendant tree
   # via pkill -P instead. Covers the actual production wedge — a hung
   # `tmux send-keys -l` child of the script.
+  #
+  # T-2617: the sleep is BACKGROUNDED (not run in the foreground with
+  # `sleep ... || exit 0`) so this subshell can install its own TERM trap
+  # and OWN the shutdown ordering of its child. The prior shape signalled
+  # the sleep (via the outer EXIT trap's `pkill -P`) and this subshell
+  # (via `kill`) as two INDEPENDENT targets, then only `wait`ed for this
+  # subshell — which has no trap of its own and can be reaped on SIGTERM
+  # regardless of whether the sleep has actually finished dying. Under
+  # real CPU contention the sleep can take measurably longer than this
+  # subshell to act on its own SIGTERM, so this subshell exits first,
+  # orphaning the sleep under init for up to its full budget (confirmed
+  # 20/20 reproducible with a deterministically slow-to-die stand-in;
+  # unreproducible via 660 probabilistic-load trials — see T-2617). Now
+  # this subshell explicitly kills + reaps its own sleep child (below)
+  # before it exits, so the outer EXIT trap's `wait "$WATCHDOG_PID"`
+  # cannot return until the sleep is actually gone.
+  sleep "$WALL_CLOCK_TIMEOUT_SECS" &
+  SLEEP_PID=$!
   # An INTERRUPTED sleep is the EXIT trap's cancel signal, not a timeout —
   # without this guard the subshell races the trap's follow-up kill and can
   # proceed into the FATAL branch on a clean exit, printing a spurious FATAL
   # and TERMing the exiting script (observed 2026-07-06 on orchestrator's first
   # idle-ceiling restart: 'cycle complete' then FATAL at 153s of an 1800s
-  # budget — T-1536).
-  sleep "$WALL_CLOCK_TIMEOUT_SECS" || exit 0
+  # budget — T-1536). On cancel: kill + reap the sleep, then exit quietly
+  # (T-2617: reap happens HERE, inside this subshell, so it is guaranteed
+  # complete before this subshell itself exits).
+  trap 'kill "$SLEEP_PID" 2>/dev/null; wait "$SLEEP_PID" 2>/dev/null; exit 0' TERM
+  wait "$SLEEP_PID"
+  # Reaching here (no TERM trap fired) means the sleep ran its full budget
+  # naturally — a genuine wedge, not a cancel.
   # Belt-and-braces: if the script is already gone, there is nothing to reap.
   kill -0 "$SCRIPT_PID" 2>/dev/null || exit 0
   echo "[handoff-and-restart] FATAL: wall-clock timeout ${WALL_CLOCK_TIMEOUT_SECS}s exceeded; killing script PID $SCRIPT_PID and descendants" >&2
@@ -278,12 +392,12 @@ SCRIPT_PID=$$
   kill -KILL "$SCRIPT_PID" 2>/dev/null || true
 ) &
 WATCHDOG_PID=$!
-# Clean shutdown: cancel the watchdog when the script exits normally so
-# the sleep doesn't outlive us. The subshell `( sleep ...; ...; )` has
-# multiple commands → bash forks then runs sleep as a child of the
-# subshell PID, so signalling the watchdog PID alone leaves the sleep
-# orphaned. pkill -P kills the sleep before we kill the parent.
-trap 'pkill -P "$WATCHDOG_PID" 2>/dev/null; kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null' EXIT
+# Clean shutdown: cancel the watchdog when the script exits normally so the
+# sleep doesn't outlive us. T-2617: no longer independently `pkill -P`s the
+# sleep here — the subshell's own TERM trap (above) now owns killing +
+# reaping its sleep child before it exits, so a plain `kill` + `wait` on the
+# subshell alone is sufficient and can no longer race the child's death.
+trap 'kill "$WATCHDOG_PID" 2>/dev/null; wait "$WATCHDOG_PID" 2>/dev/null' EXIT
 
 # ---------------------------------------------------------------------------
 # Stale-flock takeover (T-0584 Layer 2).
@@ -397,6 +511,26 @@ log "pre-prompt mtime: $PRE_MTIME ($HANDOFF_FILE)"
 # Step 3: deliver the prompt via tmux send-keys.
 # ---------------------------------------------------------------------------
 
+# T-2829: pre-dismiss a blocking permission modal so a modal-wedged session can
+# actually RECEIVE the handoff prompt below. When a session sits on a modal (e.g.
+# "Do you want to make this edit to settings.json?"), the modal captures input —
+# send_keys_submit's text lands on the modal, not the composer, so the session
+# never sees the prompt, never writes a handoff, and step 4 times out (the
+# 2026-08-11 specialist wedge). Escape CANCELS/denies whatever modal is focused — the
+# fail-closed direction — so it is safe to send blind in the restart context:
+#   idle pane  → no-op (clears the empty input line)
+#   mid-turn   → interrupts the current turn (acceptable; we are restarting)
+#   modal      → dismisses it (denies the pending action)
+# One Escape only (minimal). Anything it can't clear is caught by the ack-timeout
+# hard-restart fallback (step 4). Opt-in via --dismiss-modal; the autonomous
+# wedge-recovery path passes it, the operator's attended manual restart does not.
+if [[ "$DISMISS_MODAL" == "1" ]]; then
+  log "dismiss-modal: sending Escape to $TARGET_PANE to clear any blocking modal (fail-closed) [T-2829]"
+  tmux send-keys -t "$TARGET_PANE" Escape 2>/dev/null \
+    || log "dismiss-modal: Escape send failed (non-fatal); proceeding to handoff prompt"
+  sleep "$POLL_INTERVAL"
+fi
+
 # Deliver via send_keys_submit: literal text, then a delayed Enter so the TUI
 # paste-mode debounce settles and the prompt actually submits (T-0519).
 if ! send_keys_submit "$TARGET_PANE" "$PROMPT_TEXT"; then
@@ -420,10 +554,21 @@ while (( $(date +%s) < ack_deadline )); do
   fi
   sleep "$POLL_INTERVAL"
 done
+# T-2829: ack-outcome branch.
+#   success                                   → archive the fresh handoff (below), then restart.
+#   timeout + --hard-restart-on-ack-timeout   → fall through to the restart (steps 5-8) WITHOUT an
+#                                                archive (no fresh handoff was written; the prior
+#                                                cycle's snapshot remains) — recovers a wedged session
+#                                                instead of abandoning it (the specialist modal-wedge hole).
+#   timeout without the flag                  → exit 4 (pre-T-2829 default; operator/cron handles it).
 if [[ "$ack_ok" != "1" ]]; then
-  err "ack timeout after ${ACK_TIMEOUT}s; HANDOFF.md mtime unchanged"
-  exit 4
-fi
+  if [[ "$HARD_RESTART_ON_ACK_TIMEOUT" == "1" ]]; then
+    err "ack timeout after ${ACK_TIMEOUT}s; HANDOFF.md mtime unchanged — HARD-RESTART fallback (steps 5-8) instead of abandoning a wedged session (--hard-restart-on-ack-timeout) [T-2829]"
+  else
+    err "ack timeout after ${ACK_TIMEOUT}s; HANDOFF.md mtime unchanged"
+    exit 4
+  fi
+else
 
 # T-0766 (Veneration graveyard): snapshot the freshly-written handoff to on-disk local
 # state (NOT the repo — portability + no .git bloat, msg 2758) so a successor can READ its
@@ -439,6 +584,20 @@ GRAVEYARD_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # self-pairing <ts>-<uuid> stem contract.
 GRAVEYARD_UUID="$(python3 "$(dirname "$0")/graveyard.py" detect-uuid \
       --projects-dir "$HOME/.claude/projects" 2>/dev/null || echo unknown)"
+
+# T-2638: conservation check BEFORE the archive call below — at this point
+# graveyard.py's latest snapshot is still the PRIOR cycle's handoff, so this
+# compares two genuinely consecutive HANDOFF rewrites (the archive call right
+# after this turns the current text into the new latest). Advisory only: it
+# only ever prints ALERT lines on suspected silent detail loss (context
+# collapse / whole-section loss) and never blocks the restart — no exit-code
+# branching here on purpose, since a `python | sed` pipe would mask the
+# python exit code under `set -u` without `pipefail` anyway; the alert lines
+# already carry through stdout/stderr regardless.
+python3 "$(dirname "$0")/handoff_conservation.py" check \
+      --handoff-file "$HANDOFF_FILE" \
+      2>&1 | sed 's/^/  [handoff-conservation] /'
+
 if ! python3 "$(dirname "$0")/graveyard.py" archive \
       --handoff-file "$HANDOFF_FILE" \
       --reason "graceful_restart" \
@@ -447,6 +606,8 @@ if ! python3 "$(dirname "$0")/graveyard.py" archive \
       2>&1 | sed 's/^/  [graveyard] /'; then
   log "graveyard archive failed (non-fatal); see [graveyard] lines above"
 fi
+
+fi  # T-2829: end ack-outcome branch (archive only on a successful ack)
 
 fi  # end SKIP_ACK guard (steps 2-4)
 
@@ -484,6 +645,31 @@ done
 # ---------------------------------------------------------------------------
 # Step 5: systemctl restart.
 # ---------------------------------------------------------------------------
+
+# TARGET_PANE is "session:window" or "session:window.pane" — the session
+# component is everything before the first ':'. Used by both the
+# control-plane kill-session below and step 6's readiness predicate.
+TARGET_SESSION="${TARGET_PANE%%:*}"
+
+if [[ "$SUPERVISOR" == "control-plane" ]]; then
+  # T-2658: kill the target session FIRST. runtime_controller.ensure_runtime()
+  # (invoked by the consume unit below) REUSES a live matching pane rather
+  # than restarting it — a plain `systemctl restart` of the consume unit
+  # against a still-live pane would be a silent no-op, not a restart.
+  # Companion units (e.g. specialist's acp-bridge, T-2648) are DELIBERATELY left
+  # untouched: they hold their own tmux session on the same default socket,
+  # so killing only this session neither tears down the shared tmux server
+  # (when a companion session survives) nor requires special-casing when it
+  # doesn't — ensure_runtime()/_start_runtime() already handle both "server
+  # survives" (respawn onto the existing scope) and "server died" (recreate
+  # the scope from scratch) generically.
+  tmux kill-session -t "$TARGET_PANE" 2>/dev/null || true
+  if tmux has-session -t "$TARGET_SESSION" 2>/dev/null; then
+    err "control-plane session $TARGET_SESSION survived kill-session — refusing to fire $SERVICE against a still-live pane"
+    exit 5
+  fi
+  log "control-plane: killed session $TARGET_SESSION pre-restart"
+fi
 
 if ! systemctl "$SYSTEMCTL_FLAG" restart "$SERVICE"; then
   err "systemctl $SYSTEMCTL_FLAG restart $SERVICE failed"
@@ -525,36 +711,64 @@ for _staged in "${PANE_LOG_DIR:-$HOME/.local/log/pantheon}"/pane-timed-*.log.dyi
 done
 
 # ---------------------------------------------------------------------------
-# Step 6: systemctl is-active fast-fail.
+# Step 6: readiness fast-fail — systemctl is-active (bespoke) or runtime
+# scope/session liveness (control-plane).
 # ---------------------------------------------------------------------------
 
-# is-active is the unit-level readiness signal: it goes "active" once the
-# ExecStart process is running. Doesn't tell us the app inside is ready —
-# step 7 covers that. But it fast-fails quickly if the unit's start failed
-# (e.g. ExecStart returned non-zero), saving us the full steady-state wait.
-isactive_deadline=$(( $(date +%s) + STEADY_TIMEOUT ))
-isactive_ok=0
-while (( $(date +%s) < isactive_deadline )); do
-  state=$(systemctl "$SYSTEMCTL_FLAG" is-active "$SERVICE" 2>/dev/null || true)
-  case "$state" in
-    active)
-      isactive_ok=1
-      log "unit is-active: $state"
+if [[ "$SUPERVISOR" == "control-plane" ]]; then
+  # T-2658: $SERVICE is a Type=oneshot pantheon-persona-consume@<persona>
+  # unit with no RemainAfterExit — it is NEVER is-active after ExecStart
+  # exits, so `systemctl is-active` is the wrong witness here (ExecStart
+  # already ran to completion by the time the BLOCKING `systemctl restart`
+  # above returned — Type=oneshot's restart job waits for ExecStart to exit,
+  # so persona_bringup.py consume -> wake_persistent_runtime ->
+  # ensure_runtime's own internal pane/scope verification already ran; this
+  # poll is a safety net, not the primary wait). The real witness is the
+  # pane runtime_controller.ensure_runtime() started: a live target session
+  # whose tmux server is cgroup-owned by the control-plane scope.
+  scope_deadline=$(( $(date +%s) + STEADY_TIMEOUT ))
+  scope_ok=0
+  while (( $(date +%s) < scope_deadline )); do
+    if runtime_scope_owned_and_session_live "$TARGET_SESSION" "$RUNTIME_SCOPE_UNIT" "$PROC_ROOT"; then
+      scope_ok=1
+      log "runtime scope/session live: $TARGET_SESSION under $RUNTIME_SCOPE_UNIT"
       break
-      ;;
-    failed)
-      err "unit is-active: failed"
-      exit 6
-      ;;
-    *)
-      # activating, inactive, deactivating: keep polling
-      ;;
-  esac
-  sleep "$POLL_INTERVAL"
-done
-if [[ "$isactive_ok" != "1" ]]; then
-  err "is-active timeout after ${STEADY_TIMEOUT}s; last state: ${state:-unknown}"
-  exit 6
+    fi
+    sleep "$POLL_INTERVAL"
+  done
+  if [[ "$scope_ok" != "1" ]]; then
+    err "runtime scope/session-live timeout after ${STEADY_TIMEOUT}s; session=$TARGET_SESSION scope=$RUNTIME_SCOPE_UNIT"
+    exit 6
+  fi
+else
+  # is-active is the unit-level readiness signal: it goes "active" once the
+  # ExecStart process is running. Doesn't tell us the app inside is ready —
+  # step 7 covers that. But it fast-fails quickly if the unit's start failed
+  # (e.g. ExecStart returned non-zero), saving us the full steady-state wait.
+  isactive_deadline=$(( $(date +%s) + STEADY_TIMEOUT ))
+  isactive_ok=0
+  while (( $(date +%s) < isactive_deadline )); do
+    state=$(systemctl "$SYSTEMCTL_FLAG" is-active "$SERVICE" 2>/dev/null || true)
+    case "$state" in
+      active)
+        isactive_ok=1
+        log "unit is-active: $state"
+        break
+        ;;
+      failed)
+        err "unit is-active: failed"
+        exit 6
+        ;;
+      *)
+        # activating, inactive, deactivating: keep polling
+        ;;
+    esac
+    sleep "$POLL_INTERVAL"
+  done
+  if [[ "$isactive_ok" != "1" ]]; then
+    err "is-active timeout after ${STEADY_TIMEOUT}s; last state: ${state:-unknown}"
+    exit 6
+  fi
 fi
 
 # ---------------------------------------------------------------------------
@@ -596,11 +810,17 @@ while (( $(date +%s) < steady_deadline )); do
     # Single-shot (boot_dialog_dismissed) so we never re-press. Any OTHER dialog
     # (or denylisted marker co-present) → no dismiss → fall through to exit 7
     # (fail-closed). Per T-0721 adversarial review (safe shape C).
-    if (( ! boot_dialog_dismissed )) \
-       && printf '%s' "$pane" | grep -qF "$BOOT_DIALOG_SENTINEL" \
+    # T-2210: two known boot modals, and they take DIFFERENT options — 1 for the
+    # dev-channels confirm, 2 ("Not now") for the fullscreen-renderer offer, where
+    # option 1 would accept a renderer change on this session. Kept symmetric with
+    # verify_startup.sh, whose constants this file is byte-pinned to.
+    boot_opt=""
+    if printf '%s' "$pane" | grep -qF "$BOOT_DIALOG_SENTINEL"; then boot_opt=1
+    elif printf '%s' "$pane" | grep -qF "$BOOT_RENDERER_SENTINEL"; then boot_opt=2; fi
+    if (( ! boot_dialog_dismissed )) && [[ -n "$boot_opt" ]] \
        && ! printf '%s' "$pane" | grep -Eq "$BOOT_DISMISS_DENYLIST"; then
-      log "step-7: dev-channels startup dialog detected — dismissing inline (option 1) [T-0721]"
-      send_keys_submit "$TARGET_PANE" "1" \
+      log "step-7: known startup dialog detected — dismissing inline (option $boot_opt) [T-0721/T-2210]"
+      send_keys_submit "$TARGET_PANE" "$boot_opt" \
         || log "step-7: boot-dialog dismiss send failed; will fall through to exit 7 if it persists"
       boot_dialog_dismissed=1
       sleep "$POLL_INTERVAL"

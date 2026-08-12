@@ -30,6 +30,7 @@ Run `mcp__pantheon-mcp-codex__codex_second_opinion` as a **detail skeptic over a
 - Auto-memory pin `reference_codex_second_opinion_fit.md` — the same triptych in HO's user-scope memory.
 - `rulebook/directives.md` D10 (context-frugality — don't spend a codex call where a local check settles it).
 - `adr/ORG-018` — codex-as-MCP-tool (this is the second-opinion-at-plan-review shape of that decision).
+- [`codex-planning-spec-review.md`](codex-planning-spec-review.md) / `adr/ORG-041` — **sibling channel, not a supersedure**: the mandatory planning-phase gate for qualifying arcs (multi-unit / new-component / third-party-protocol / supervised-infrastructure), with its own triggers. This SOP stays the ad-hoc falsifiable-detail-check channel of the same `codex_second_opinion` tool.
 
 ## Authoring discipline
 

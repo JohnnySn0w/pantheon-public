@@ -320,23 +320,36 @@ def commit_and_push(modified_paths: list[Path], message: str) -> tuple[bool, str
             return False, f"HERMES guard refused: {detail}"
     if not _hermes_scan_message(message):
         return False, "HERMES guard refused: commit message"
-    # Stage.
-    for p in modified_paths:
-        rel = str(p.relative_to(_REPO_ROOT))
-        r = _git("add", rel)
-        if r.returncode != 0:
-            return False, f"git add {rel} failed: {r.stderr.strip()}"
-    # Commit.
-    r = _git("commit", "-m", message)
-    if r.returncode != 0:
-        # Could be "nothing to commit" — treat as no-op success.
-        if "nothing to commit" in r.stdout.lower() or "nothing to commit" in r.stderr.lower():
-            return True, "nothing to commit"
-        return False, f"git commit failed: {r.stderr.strip()}"
-    # Push.
-    r = _git("push", "origin", "main")
-    if r.returncode != 0:
-        return False, f"git push failed: {r.stderr.strip().splitlines()[-1] if r.stderr else 'unknown'}"
+    # T-2336: pathspec-scoped commit + git_mutation_lock. The bare pathspec-less
+    # `git commit` here had the writer4 shape — with a concurrent writer's files
+    # staged on this shared checkout, it would commit THEM under this message.
+    # The pathspec keeps foreign staged files out even if a writer bypasses the
+    # lock; the lock serializes with every lock-taking writer.
+    try:
+        from tools._git_utils import GitMutationLockTimeout, git_mutation_lock
+    except ImportError:  # bare run with cwd=tools/
+        from _git_utils import GitMutationLockTimeout, git_mutation_lock  # type: ignore
+    rels = [str(p.relative_to(_REPO_ROOT)) for p in modified_paths]
+    try:
+        with git_mutation_lock(label=message.splitlines()[0][:60]):
+            # Stage.
+            for rel in rels:
+                r = _git("add", rel)
+                if r.returncode != 0:
+                    return False, f"git add {rel} failed: {r.stderr.strip()}"
+            # Commit — pathspec-scoped to exactly the staged set above.
+            r = _git("commit", "-m", message, "--", *rels)
+            if r.returncode != 0:
+                # Could be "nothing to commit" — treat as no-op success.
+                if "nothing to commit" in r.stdout.lower() or "nothing to commit" in r.stderr.lower():
+                    return True, "nothing to commit"
+                return False, f"git commit failed: {r.stderr.strip()}"
+            # Push.
+            r = _git("push", "origin", "main")
+            if r.returncode != 0:
+                return False, f"git push failed: {r.stderr.strip().splitlines()[-1] if r.stderr else 'unknown'}"
+    except GitMutationLockTimeout as exc:
+        return False, f"git mutation lock timeout: {exc}"
     return True, ""
 
 

@@ -1,4 +1,5 @@
 [Unit]
+OnFailure=pantheon-unit-failure-alert@%n.service
 Description=Pantheon cross-repo spine grooming — owner-run (orchestrator) grooming of pantheon-pwa + revenue-project doc indexes (T-0666)
 Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
 

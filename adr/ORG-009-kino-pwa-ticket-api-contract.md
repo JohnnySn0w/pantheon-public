@@ -3,6 +3,17 @@ aliases: [ORG-009]
 title: kino PWA ticket-API contract
 status: Ratified 2026-05-10
 date: 2026-05-10
+# re_evaluate: machine-checkable mirror of this ADR's inline re-eval prose,
+# consumed by tools/adr_reeval_walk.py (T-2527) during the weekly-review walk.
+# type: calendar|metric|event ; fires: auto-ticket (deterministic only) | surface.
+# Backfilled per T-2530 (inline-only trigger was previously uncaught).
+re_evaluate:
+  - id: R1
+    type: event
+    when: "sustained write-rate becomes load-bearing"
+    fires: surface
+    text: "revisit the ticket-API write-rate handling if/when sustained write-rate becomes load-bearing"
+build_disposition: built
 ---
 # ORG-009 — kino PWA ticket-API contract
 

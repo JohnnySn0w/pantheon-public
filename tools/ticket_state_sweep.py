@@ -51,7 +51,7 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools.ledger_shard import iter_ledger_entry_files  # noqa: E402
+from tools.ledger_shard import entry_ts, iter_ledger_entry_files  # noqa: E402
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TICKETS_ROOT = REPO_ROOT / "tickets"
@@ -363,7 +363,7 @@ def _scan_target_operator(
     # action shapes like `ratify_*` or `close_*`).
     recent_referenced: set[str] = set()
     for entry in ledger_entries:
-        ts_str = entry.get("ts", "") or ""
+        ts_str = entry_ts(entry) or ""
         try:
             ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
         except ValueError:

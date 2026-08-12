@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import graveyard as gy  # noqa: E402
@@ -39,6 +40,89 @@ class GraveyardTest(unittest.TestCase):
         self.assertIn("abc123", idx)
         self.assertIn("ctx-fill", idx)
         self.assertIn("Recovery Handoff", idx)  # summary = first meaningful line, header-stripped
+
+    def test_archive_required_writes_readable_snapshot_and_index(self):
+        p = gy.archive_required(
+            "recovery",
+            "# Recovery Handoff\nBuilding the mailbox.",
+            jsonl_uuid="strict123",
+            reason="forced-cap",
+            ts="2026-06-06T23:40:00Z",
+            root=self.root,
+        )
+        self.assertTrue(p.exists())
+        self.assertEqual(p.read_text(), "# Recovery Handoff\nBuilding the mailbox.")
+        self.assertEqual(gy.latest("recovery", root=self.root)["uuid"], "strict123")
+        self.assertEqual(
+            gy.latest_handoff_text("recovery", root=self.root),
+            "# Recovery Handoff\nBuilding the mailbox.",
+        )
+
+    def test_archive_required_snapshot_fsync_failure_raises_and_does_not_index(self):
+        real_fsync = os.fsync
+        calls = []
+
+        def fail_first_fsync(fd):
+            calls.append(fd)
+            if len(calls) == 1:
+                raise OSError("snapshot fsync sabotage")
+            return real_fsync(fd)
+
+        with mock.patch.object(gy.os, "fsync", side_effect=fail_first_fsync):
+            with self.assertRaises(gy.GraveyardDurabilityError):
+                gy.archive_required(
+                    "recovery",
+                    "strict body",
+                    jsonl_uuid="snapfail",
+                    reason="forced-cap",
+                    ts="2026-06-06T23:40:00Z",
+                    root=self.root,
+                )
+
+        self.assertEqual(list((self.root / "recovery" / "2026-06-06").glob("*.md")), [])
+        self.assertFalse((self.root / "recovery" / "index.md").exists())
+        self.assertEqual(gy.entries("recovery", root=self.root), [])
+
+    def test_archive_required_index_fsync_failure_raises_and_removes_snapshot(self):
+        real_fsync = os.fsync
+        calls = []
+
+        def fail_index_fsync(fd):
+            calls.append(fd)
+            if len(calls) == 3:
+                raise OSError("index fsync sabotage")
+            return real_fsync(fd)
+
+        with mock.patch.object(gy.os, "fsync", side_effect=fail_index_fsync):
+            with self.assertRaises(gy.GraveyardDurabilityError):
+                gy.archive_required(
+                    "recovery",
+                    "strict body",
+                    jsonl_uuid="indexfail",
+                    reason="forced-cap",
+                    ts="2026-06-06T23:40:00Z",
+                    root=self.root,
+                )
+
+        self.assertEqual(list((self.root / "recovery" / "2026-06-06").glob("*.md")), [])
+        self.assertEqual((self.root / "recovery" / "index.md").read_text(), "")
+        self.assertEqual(gy.entries("recovery", root=self.root), [])
+
+    def test_archive_required_rename_failure_raises_and_does_not_index(self):
+        with mock.patch.object(gy.os, "replace", side_effect=OSError("rename sabotage")):
+            with self.assertRaises(gy.GraveyardDurabilityError):
+                gy.archive_required(
+                    "recovery",
+                    "strict body",
+                    jsonl_uuid="renamefail",
+                    reason="forced-cap",
+                    ts="2026-06-06T23:40:00Z",
+                    root=self.root,
+                )
+
+        self.assertEqual(list((self.root / "recovery" / "2026-06-06").glob("*.md")), [])
+        self.assertFalse((self.root / "recovery" / "index.md").exists())
+        self.assertEqual(gy.entries("recovery", root=self.root), [])
 
     # ------------------------------------------------------------ companion (T-1636)
     def test_companion_gzips_beside_snapshot_and_consumes_source(self):
@@ -96,6 +180,39 @@ class GraveyardTest(unittest.TestCase):
         self.assertIsNotNone(dest)
         self.assertTrue(dest.exists())
         self.assertTrue(src.exists())
+
+    # ---------------------------------------------------------- cred scrub (T-1683)
+    def test_scrub_redacts_credential_forms(self):
+        cases = [
+            ("sshpass -p 'SentHome0290' ssh h", "SentHome0290"),
+            ("sshpass -p hunter2 ssh x", "hunter2"),
+            ("export PASSWORD=abc123 && go", "abc123"),
+            ('Authorization: Bearer eyJ.abc.def', "eyJ.abc.def"),
+            ("key = sk-ant-oat01-AAAABBBBCCCCDDDD", "AAAABBBBCCCCDDDD"),
+            ("api_key: mysecretkey12345", "mysecretkey12345"),
+        ]
+        for line, secret in cases:
+            out = gy.scrub_credentials(line)
+            self.assertNotIn(secret, out, f"leak: {line!r} -> {out!r}")
+            self.assertIn("<redacted-cred>", out)
+
+    def test_scrub_leaves_non_credentials_intact(self):
+        line = "coil temp device 620b89b6 kept; dropped orphan 7b25eda8"
+        self.assertEqual(gy.scrub_credentials(line), line)
+
+    def test_companion_archive_redacts_creds_in_gz(self):
+        import gzip
+        self._archive("recovery", "# H\nx", uuid="uu")
+        src = Path(self._tmp.name) / "pane-timed-recovery.log"
+        src.write_text("run: sshpass -p 'topsecretpw' ssh host\ncoil temp ok\n")
+        dest = gy.archive_companion("recovery", src, jsonl_uuid="uu",
+                                    ts="2026-06-06T23:40:00Z", root=self.root)
+        self.assertIsNotNone(dest)
+        with gzip.open(dest, "rt") as fh:
+            body = fh.read()
+        self.assertNotIn("topsecretpw", body)
+        self.assertIn("<redacted-cred>", body)
+        self.assertIn("coil temp ok", body)  # non-cred content preserved
 
     def test_filename_is_fs_safe_and_sortable(self):
         p = self._archive("recovery", "x", uuid="u1", ts="2026-06-06T23:40:00Z")

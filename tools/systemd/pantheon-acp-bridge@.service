@@ -1,0 +1,64 @@
+[Unit]
+Description=Pantheon mailbox->ACP inbound bridge for %i — ORG-031 Unit 2 (T-1633)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-1633.md
+After=network.target
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+# T-2264: this unit was the ONE delivery-critical unit in this directory without the line, and the gap
+# was measured, not theorised — 2026-07-28, same box, same evening, same delivery path:
+#   pantheon-mailbox-wake@metis   HAS this line -> failed 21:47:04Z, routed to Recovery, surfaced in minutes.
+#   pantheon-acp-bridge@mnemosyne LACKED it     -> tmux session died ~19:20Z, status=1/FAILURE, restarted
+#                                                  20:50:14Z. NINETY MINUTES INVISIBLE; surfaced only
+#                                                  because the operator happened to ask.
+# Restart=always does NOT make this redundant: metis measured that OnFailure fires per-failure even under
+# Restart=always (refuting its own earlier reasoning), so a crash-loop alerts every cycle rather than
+# healing silently. A unit that restarts itself forever is exactly the one whose failures are invisible.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+# NOT auto-installed by any provision script. This template exists so a later,
+# SUPERVISED HO+the operator pilot flip has a ready-to-install unit — installing,
+# enabling, or starting this unit is a separate cross-account step, not part of
+# the T-1633 Unit 2 build.
+
+[Service]
+# Supervised wrapper (NOT Type=oneshot), mirrors pantheon-ancestor-daemon.service:
+# the wrapper stays alive as MainPID for as long as the tmux-hosted bridge lives,
+# so a dead session => wrapper exits => Restart=always respawns it.
+Type=simple
+Environment=ACP_BRIDGE_AGENT=%i
+# The mangled-cwd invariant (context_fill_monitor.py's per-agent jsonl_dir
+# mapping): each agent's REAL cwd for its live session is its own home, NOT the
+# pantheon-config checkout — keep this WorkingDirectory as %h.
+WorkingDirectory=%h
+ExecStart=%h/pantheon-config/tools/acp-bridge-supervise.sh
+# Belt-and-suspenders for the orphaned-cgroup hazard (T-1689): the supervise
+# script's own TERM/EXIT trap is the primary teardown, this is a second line
+# of defense in case the trap doesn't fire (e.g. SIGKILL escalation after
+# TimeoutStopSec). Session name must match ACP_BRIDGE_SESSION's default in
+# acp-bridge-supervise.sh (acp-bridge-$ACP_BRIDGE_AGENT, and
+# ACP_BRIDGE_AGENT=%i above), hence the literal acp-bridge-%i here. Leading
+# `-` ignores the exit code: in the common case the trap already killed the
+# session, so this second call legitimately errors "session not found" and
+# must not flip the unit into a failed state on a normal stop.
+ExecStopPost=-/usr/bin/tmux kill-session -t acp-bridge-%i
+Restart=always
+RestartSec=5
+# T-2543: a `systemctl stop/restart` sends SIGTERM to the supervise script while
+# it blocks in `sleep` (its poll loop); under `set -euo pipefail` the interrupted
+# sleep propagates as exit 143 (journal: `code=exited, status=143`). Without this
+# line systemd counts that clean stop as Failed and fires OnFailure= above, so
+# EVERY graceful restart paged Recovery a spurious "unit FAILED" — cry-wolf that
+# masks the real outage OnFailure exists to catch. The trap test
+# (test_acp_bridge_supervise_trap.sh) already treats 143 as a clean stop; this
+# makes systemd agree. NOT SIGTERM-the-signal: the script EXITS 143, it is not
+# killed by the signal, so the numeric code is what must be whitelisted. A
+# genuine start failure (non-143) and a TimeoutStopSec SIGKILL escalation (137)
+# are deliberately NOT whitelisted and still alert.
+SuccessExitStatus=143
+StandardOutput=journal
+StandardError=journal
+# No ANTHROPIC_*/CLAUDE_CODE_* Environment= lines — the API-key-shadow money-trap
+# (a leak silently flips subscription billing to metered API billing).
+
+[Install]
+WantedBy=default.target

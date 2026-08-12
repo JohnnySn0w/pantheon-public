@@ -14,6 +14,23 @@ the dot — so the contiguous 9-byte trigger never appears in this file's
 source).  Verification: `grep -cF` for the unescaped form against this file
 must return 0.
 
+Also runs the T-2314 main-guard lint (`tools/main_guard_lint.py`) against the
+STAGED BLOB content of staged `tools/*.py` files only — catches top-level
+definitions stranded below a `__main__` guard at authoring time, on every
+seat, closing the trigger gap the pytest live-tree test (the --no-verify /
+hookless-clone backstop) leaves open for direct-to-main pushes. Fail-OPEN on
+any infrastructural error (import/decode/ast failure — see
+`_main_guard_lint_findings`); fail-CLOSED on an actual finding.
+
+Also runs the T-2650 ledger JSON-validity check
+(`tools/ledger_placement_lint.py --staged` / `lint_staged_validity`) against
+ledger lines newly ADDED in the staged diff under `ledger/**/*.jsonl` —
+catches a missing-`}` (or otherwise unparseable/non-object) entry at commit
+time, before it ever reaches origin/main (see `_ledger_validity_findings`).
+Scoped to added lines only, so it can never block on pre-existing/legacy
+ledger content. Fail-OPEN on any infrastructural error (import/scan
+failure); fail-CLOSED on a genuinely unparseable added line.
+
 Activation:
     git config core.hooksPath .githooks
     (or run tools/install_hooks.sh which does this idempotently)
@@ -38,16 +55,35 @@ from tools._git_utils import _HERMES_PATTERN  # noqa: E402
 
 
 def _staged_files() -> list[str]:
-    """Return list of staged file paths (added/modified, not deleted)."""
+    """Return list of staged file paths (added/modified, not deleted).
+
+    T-2325: uses `-z` (NUL-separated, no quoting) rather than the default
+    line-based output. With `core.quotePath` at its default, a path git
+    considers unusual comes back ESCAPED AND DOUBLE-QUOTED — a file named
+    `tools/bad_<non-utf8>_name.py` renders as a string whose first character is
+    a literal `"`. Two consumers then silently skip it: `_main_guard_lint_
+    findings` filters on `p.startswith("tools/")`, which is false for the
+    quoted form, and `_read_staged_blob` hands the bogus path to `git show`,
+    which fails and returns None. The byte-sequence half is the one that
+    matters — that is a path by which contaminated content reaches a commit
+    with this guard never having read it.
+
+    Fixed at intake rather than by un-escaping downstream, so both consumers
+    are repaired at once and neither has to know `core.quotePath` exists.
+
+    Decoded with surrogateescape so a non-UTF-8 filename survives the round
+    trip: subprocess re-encodes these strings back to the original bytes on
+    POSIX, so `git show :<path>` in `_read_staged_blob` still resolves.
+    """
     result = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM"],
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM", "-z"],
         capture_output=True,
-        text=True,
         check=False,
     )
     if result.returncode != 0:
         return []
-    return [line for line in result.stdout.splitlines() if line]
+    decoded = result.stdout.decode("utf-8", "surrogateescape")
+    return [path for path in decoded.split("\0") if path]
 
 
 def _read_staged_blob(path: str) -> bytes | None:
@@ -111,6 +147,121 @@ def _warn_directive_drift(staged: list[str]) -> None:
         print("", file=sys.stderr)
 
 
+def _main_guard_lint_findings(staged: list[str]) -> list[str] | None:
+    """Staged-blob main-guard lint (T-2314).
+
+    Returns a list of human-readable finding strings (empty list = clean), or
+    None only when the `main_guard_lint` module itself is unavailable (import
+    error) — that is a single SHARED dependency, so an import failure blinds
+    every file identically and there is nothing left to scan.  Fail-OPEN,
+    mirroring `_hook_allowlist_drift`'s `except Exception: return None` shape
+    below, because this hook gates every seat's commits fleet-wide (the
+    T-1102 blast radius: a lint bug here must never brick filing).
+
+    Per-file errors (a staged blob that fails to read or decode, or a
+    `lint_source` crash on one specific file's `ast` parse) are caught PER
+    FILE inside the scan loop, not around the whole loop — an infrastructural
+    problem on one staged file must not discard a real finding already
+    computed on a different staged file in the same commit (round-1 REBOUND:
+    the wide-try shape let a garbage-bytes sibling file silently swallow a
+    genuine violation). Each per-file failure prints its own warning naming
+    the path and continues scanning the rest; the overall return is still a
+    (possibly non-empty) list, never None, in that case.
+
+    Only scans STAGED `tools/*.py` files via `_read_staged_blob` (not
+    whatever happens to be on disk), so an inherited dirty tree can never
+    block an unrelated commit — same scoping as the HERMES scan above.
+    """
+    targets = [p for p in staged if p.startswith("tools/") and p.endswith(".py")]
+    if not targets:
+        return []
+
+    try:
+        from tools.main_guard_lint import lint_source
+    except Exception as exc:  # fail-OPEN: whole module unavailable, nothing to scan
+        print(
+            "main-guard lint WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — main_guard_lint unavailable, "
+            "SKIPPING main-guard lint entirely, commit allowed",
+            file=sys.stderr,
+        )
+        return None
+
+    findings: list[str] = []
+    for path in targets:
+        try:
+            blob = _read_staged_blob(path)
+            if blob is None:
+                continue
+            src = blob.decode("utf-8")
+            for f in lint_source(src, path):
+                findings.append(
+                    f"{path}:{f.lineno}  {f.name} ({f.kind}) — stranded below "
+                    f"the __main__ guard opening at line {f.guard_lineno}"
+                )
+        except Exception as exc:  # fail-OPEN per file: one bad file must not
+            # blind the scan to a real finding on a sibling staged file.
+            print(
+                "main-guard lint WARNING (non-blocking, fail-open): "
+                f"{path}: {exc.__class__.__name__}: {exc} — SKIPPING "
+                "main-guard lint for this file, commit allowed for it",
+                file=sys.stderr,
+            )
+            continue
+    return findings
+
+
+def _ledger_validity_findings(staged: list[str]) -> list[str] | None:
+    """Staged ledger JSON-validity findings (T-2650).
+
+    Returns a list of human-readable finding strings (empty list = clean), or
+    None only when the check itself could not run (import failure, or an
+    unexpected exception from the scan) -- fail-OPEN, mirroring
+    `_main_guard_lint_findings`'s exact shape: a broken guard must never brick
+    a ledger commit. `lint_staged_validity` is ALSO internally fail-open on
+    every `git`-command failure (bad repo state, etc.), so this outer guard
+    only needs to catch an import problem or a genuine bug in the scan itself.
+
+    Cheap-skips (returns `[]` without importing anything) when no staged path
+    starts with `ledger/` -- the overwhelmingly common commit.
+
+    Only ever BLOCKS on a genuinely unparseable/non-object line newly ADDED
+    to a `ledger/**/*.jsonl` path in this commit (see
+    `ledger_placement_lint.lint_staged_validity`'s added-lines-only scoping)
+    -- it can never fire on pre-existing/legacy ledger content.
+    """
+    if not any(p.startswith("ledger/") for p in staged):
+        return []
+
+    try:
+        from tools.ledger_placement_lint import (
+            format_validity_lines,
+            lint_staged_validity,
+        )
+    except Exception as exc:  # fail-OPEN: module unavailable, nothing to scan
+        print(
+            "ledger-validity WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — ledger_placement_lint unavailable, "
+            "SKIPPING ledger validity check, commit allowed",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        invalid = lint_staged_validity(repo_root=_REPO_ROOT)
+    except Exception as exc:  # fail-OPEN: belt-and-suspenders over the
+        # function's own internal fail-open, for a genuine bug in the scan.
+        print(
+            "ledger-validity WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — SKIPPING ledger validity "
+            "check, commit allowed",
+            file=sys.stderr,
+        )
+        return None
+
+    return format_validity_lines(invalid)
+
+
 def _hook_allowlist_drift() -> tuple[str, list[str]] | None:
     """Blocking hook<->allowlist pairing guard (T-1102).
 
@@ -150,6 +301,9 @@ def main() -> int:
 
         print(format_failure(drift[0], drift[1]), file=sys.stderr)
 
+    main_guard_findings = _main_guard_lint_findings(staged)
+    ledger_validity_findings = _ledger_validity_findings(staged)
+
     if failures:
         print("", file=sys.stderr)
         print("HERMES discipline violation — commit refused.", file=sys.stderr)
@@ -165,7 +319,38 @@ def main() -> int:
         print("", file=sys.stderr)
         return 1
 
-    # Hook-allowlist pairing drift blocks the commit even with no HERMES failure.
+    if main_guard_findings:
+        print("", file=sys.stderr)
+        print("main-guard lint violation — commit refused.", file=sys.stderr)
+        print("", file=sys.stderr)
+        for detail in main_guard_findings:
+            print(f"  {detail}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            '  Move the `if __name__ == "__main__":` guard to the END of the file.',
+            file=sys.stderr,
+        )
+        print("  Fix the file(s), re-stage, and retry.", file=sys.stderr)
+        print("", file=sys.stderr)
+        return 1
+
+    if ledger_validity_findings:
+        print("", file=sys.stderr)
+        print("ledger JSON-validity violation — commit refused.", file=sys.stderr)
+        print("", file=sys.stderr)
+        for detail in ledger_validity_findings:
+            print(f"  {detail}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  A ledger line ADDED in this commit is not parseable JSON (or not a "
+            "JSON object). Fix the entry, re-stage, and retry.",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        return 1
+
+    # Hook-allowlist pairing drift blocks the commit even with no HERMES/main-guard/
+    # ledger-validity failure.
     return 1 if drift is not None else 0
 
 

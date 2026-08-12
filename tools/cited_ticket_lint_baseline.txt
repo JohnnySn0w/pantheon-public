@@ -1,0 +1,33 @@
+# cited_ticket_lint baseline — forward references already in history when the lint
+# was introduced (T-2300, 2026-07-29).
+#
+# These are REAL defects, not false positives. They are listed here because a commit
+# message cannot be edited: the only way to "fix" one is to rewrite published
+# history, which is far more damaging than the wrong pointer. Without this file the
+# weekly sweep would go red on these same four rows forever, and a weekly red nobody
+# can action is exactly the alarm fatigue that gets a gate muted.
+#
+# Keyed on (short_sha, ticket_id) deliberately — a new or rewritten commit inherits
+# no exemption, so this can only ever suppress the specific citations audited below.
+#
+# DO NOT add rows merely to silence a NEW finding. Prevention belongs at commit
+# time: file first, then cite the id the allocator RETURNED. Once a bad citation is
+# already published, however, its commit message is just as immutable as the rows
+# that predated this lint. The post-publication procedure is therefore: independently
+# confirm ancestry; audit whether the id captured unrelated work or the intended
+# ticket merely landed later; repair every mutable shared surface if the referent is
+# wrong; then baseline ONLY the exact (sha, id) pair with that rationale. The row
+# records an unfixable historical defect — it does not declare the citation correct.
+#
+# Each row was confirmed by hand with `git merge-base --is-ancestor <birth> <sha>`
+# — an independent mechanism from the rev-list ordering the lint itself uses — and
+# its present-day referent was audited before the row was accepted.
+#
+# format: <short-sha> <ticket-id>   # what the citation actually points at now
+
+a17cea9dc T-2325   # resolve note for T-2314; T-2325 was allocated later
+c0ebbca86 T-2299   # mail_staleness device+inode fix; T-2299 filed after the fix landed
+5136f287b T-1975   # depends_on cleanup on T-1974; T-1975 did not exist yet
+b5efaaed9 T-1949   # resolve note for T-1947; T-1949 allocated afterwards
+299c4df0a T-2388   # intended Grand Project review; ticket was allocated elsewhere but landed on main later
+eedf05fb6 T-2366   # intended T-2344 CI-capacity follow-up, filed 59s after the citing commit

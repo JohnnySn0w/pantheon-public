@@ -3,10 +3,7 @@
 # The instance:/roles: blocks below bind the REFERENCE operator's personas,
 # accounts, and token-file paths. They are kept as a worked example of the
 # schema, NOT config to run as-is. A new operator replaces them with their own
-# bindings (same role keys: orchestrator / specialist / recovery, plus the
-# optional sub-orchestrator N+ tier and the two opt-in extras — memory-hub,
-# third-party-auditor — described inline below and framed as a Viable System
-# Model instantiation in knowledge/vsm-instantiation.md).
+# bindings (same role keys: orchestrator / specialist / recovery).
 # token_ref values are PATHS to credential files, not secrets. Persona→role
 # neutralization of the wider scaffolding is ORG-030 Phase-3 (in progress).
 # ============================================================================
@@ -19,20 +16,318 @@
 # instance. A different operator's fork ships its own instance.yaml binding the SAME roles
 # to its own personas and accounts — that is what makes the rest of the config portable.
 #
-# Status: v1 — authored 2026-06-07 (T-0882, ORG-030 Phase 0). ADDITIVE: no tooling reads this
-# yet (verified 2026-07-07: ticket_lint/repo_registry have no instance.yaml reader). ORG-030
-# Phase 1 re-keys repos.yaml grants persona→role and teaches the consumers to resolve
-# role→persona THROUGH this manifest; repos.yaml grants ARE role-keyed today, the reader half
-# is still pending. Until then this file is documentation-of-record, not a live lookup.
+# Status: v1 — authored 2026-06-07 (T-0882, ORG-030 Phase 0).
+#
+# CORRECTED 2026-07-21 (T-1922, atlas): this file IS a live lookup — the prior status text
+# ("no tooling reads this yet ... documentation-of-record, not a live lookup", verified
+# 2026-07-07) was stale when written. `tools/agent_role_map._load_instance_role_map()` reads
+# the `roles:` stanza below at IMPORT time and builds _PERSONA_TO_INSTANCE_ROLE from it;
+# `tools/ticket_lint.py` imports resolve_instance_role() from there, so ticket lint resolves
+# through this file transitively. The reader landed 2026-06-07 in the ORG-030-P1 commit
+# (26fd34f3), a month BEFORE the 2026-07-07 verification line — the verification checked only
+# for a DIRECT open() in ticket_lint/repo_registry and missed the indirection.
+#
+# Proof (re-runnable) — VOID SINCE 2026-07-29; kept as record, superseded by the block below.
+# It read: `resolve_instance_role('codex')` → 'peer-daemon-codex', a binding that exists ONLY
+# here and NOT in agent_role_map._FALLBACK_PERSONA_TO_INSTANCE_ROLE; if the file were inert the
+# call would fall through and return 'codex'.
+#
+# CORRECTED AGAIN 2026-07-29 (T-2281, atlas, commit 674cd7456 on branch agent/T-2281): the proof
+# above no longer discriminates, and this file is still a live lookup — the correction is to the
+# EVIDENCE, not to the claim. T-2281 added codex and the-ancestor to
+# _FALLBACK_PERSONA_TO_INSTANCE_ROLE, completing that mirror from 6 of 8 to 8 of 8 so it stops
+# silently under-covering the fleet in manifest-less environments. Consequence: measured both
+# ways, `resolve_instance_role('codex')` returns 'peer-daemon-codex' whether this file loads or
+# not. The old probe now yields the "live" answer by luck, and would keep reporting "live" after
+# this file genuinely went inert.
+#
+# NO READ-ONLY PROBE REPLACES IT, and inventing one that merely looks like it works would repeat
+# exactly the failure this header exists to record. Both maps derived from the `roles:` stanza are
+# now byte-equal to their fallbacks (role-keys since T-2281, bindings since T-2256), and
+# instance_binding() exposes only `account` plus the restart_* keys — never the manifest-only
+# fields (harness, token_ref, session, domain). So no output of agent_role_map can distinguish a
+# loaded manifest from an inert one. Do not add a probe here without first checking that it fails
+# when the manifest is absent; the previous one did not.
+#
+# WHAT TO READ INSTEAD: agent_role_map._load_instance_role_map() and _load_instance_bindings().
+# Both deliberately swallow every failure and return their fallback (fail-safe: a missing manifest
+# must not break the import chain), which is precisely why no caller can observe the difference.
+#
+# LIVENESS CHECK THAT STILL WORKS (a temporary edit, not a call — make it, observe, then REVERT):
+# perturb a role-key below, e.g. `peer-daemon-codex` → `peer-daemon-codex-PROBE`, and
+# resolve_instance_role('codex') returns 'peer-daemon-codex-PROBE' while the fallback still says
+# 'peer-daemon-codex'. The output follows THIS file, which is the thing being demonstrated.
+# Verified 2026-07-29 (T-2281). tools/test_instance_role_grants.py Guard D goes red on that edit,
+# which is the same signal from the suite.
+#
+# AUTOMATED SINCE 2026-07-29 (T-2316): Guard F's F2 and F6 perform exactly the perturbation above on
+# a tmp-dir COPY of this file, so the check now runs in the suite without anyone editing this file.
+# Read the scope precisely: they import a FRESH COPY of agent_role_map rooted at the perturbed copy
+# and assert THAT module follows it — F2 its constants, F6 its public API. The LIVE module is never
+# re-checked against a perturbed manifest, and cannot be without editing this file for real. So the
+# manual procedure stays documented on purpose: it is what a human does by hand when debugging the
+# live process, and green F2/F6 is not a substitute for being able to check by hand.
+#
+# KNOWN CONSEQUENCE of completing the mirror (T-2281) — CLOSED 2026-07-29 by T-2316, which added the
+# closing guard: tools/test_instance_role_grants.py, class TestManifestWasActuallyLoaded (Guard F).
+# It asserts this file is READ and that what it says reaches the public API (resolve_instance_role,
+# instance_binding, account_persona*, fleet_accounts). Sourcing alone was the guard's first cut and
+# was NOT enough — see WHAT CLOSED IT below. The consequence as it stood is kept VERBATIM below —
+# superseded, not overwritten, the same discipline as the VOID proof above — because it is the
+# record of what was true and how it was measured:
+#
+#     no test now asserts that this file was actually LOADED. Every sync guard
+#     in tools/test_instance_role_grants.py is satisfiable by total loader failure, because fallback
+#     and loaded map are identical. Guard A was the only accidental detector of an inert manifest, and
+#     removing its environment-dependence was the POINT of T-2281. Measured blind spot: a schema
+#     migration renaming `persona:` to `agent:` with the role-keys left intact parses fine, yields no
+#     personas, silently falls back, and goes FULLY GREEN post-fix (it failed pre-fix). Bounded: a
+#     deleted or syntactically-corrupt manifest is still caught, by Guard C, which reads this file
+#     directly.
+#
+# WHAT CLOSED IT — SIX tests, each watched going red on a real sabotage (falsification recorded in
+# the T-2316 commits). F1 compares the loaded maps against an independent parse of this file, catching
+# exactly the measured blind spot above; F2 is the liveness check above, automated, at the constant
+# level; F3 hands both loaders a synthetic manifest sharing no persona, role-key or account with
+# either fallback; F4 pins that the loader resolves THIS path and not a drifted one; F5 pins the
+# fail-safe contract; F6 asserts the PUBLIC API follows a perturbed copy.
+#
+# Two load-bearing details, so nobody simplifies this back down to the one-line check the block's
+# original wording implied:
+#   1. With the loader neutered but this file healthy, F1 alone stays GREEN — loaded == fallback ==
+#      parse. "Compare the loaded map to an independent parse" is NOT on its own a detector of a
+#      dead loader.
+#   2. SOURCING IS NOT DELIVERY, and the guard's first cut asserted only sourcing. Rewiring just
+#      resolve_instance_role() and instance_binding() to the fallback — leaving the loaded maps
+#      genuinely sourced from this file — measured FULLY GREEN across the guard file (15) and the
+#      account-axis suite (30). Likewise replacing the derived account→persona map with an
+#      enumerated literal: green everywhere, and then adding a role below reached
+#      _PERSONA_TO_BINDING while account_persona() returned None for its account. F6 exists for
+#      that, and it is the reason this block says "reaches the public API" and not "was loaded".
+#
+# Consequence for editors: adding or changing a `roles:` entry below is a FUNCTIONAL change to
+# ticket-lint grant resolution, not documentation. The fallback map in agent_role_map.py is a
+# sync mirror for environments without this manifest, not the source of truth.
+#
+# Still pending (ORG-030 Phase 1 remainder): repos.yaml grants ARE role-keyed today; teaching
+# the other consumers to resolve role→persona through this manifest is not yet done.
 #
 # Field freshness: refreshed + VERIFIED 2026-07-07 (T-1621, the operator TG 3698) — the original
 # `# verify` markers are resolved below with what verification actually found (two of the
 # three guessed token_refs were wrong).
 
+manifest_version: 2
+
+# Additive ORG-049 installer contract. Existing consumers continue to read the
+# top-level `instance:` and `roles:` mappings unchanged.
+persona_installer:
+  schema: pantheon-persona-install/v1
+  framework:
+    source: pantheon-config
+    revision: runtime
+  paths:
+    repo: pantheon-config
+    unit_dir: .config/systemd/user
+    state_dir: .local/state/pantheon/persona-installer
+  mailbox:
+    hub: /home/the-ancestor/mailbox
+    group: pantheon-mailbox
+    probe_peer: orchestrator
+    # T-2683: hub-owner is a NEW field, resolved by tools/mailbox_onboard.py.
+    # LIVE value = the-ancestor (matches current reality, no drift). The code-side
+    # default (tools/mailbox_onboard.py DEFAULT_HUB_OWNER) is "post-office", reached
+    # only by a fresh seed with no field here -- do not flip this live value to
+    # post-office as part of this change; that is a separate future migration
+    # (T-2693), not this ticket. required_units intentionally left unpopulated here
+    # -- see tools/mailbox_onboard.py module docstring GAP 2.
+    hub_owner: the-ancestor
+    # T-2702: allowlist of personas whose SOLE architectural wake path is the
+    # standalone pantheon-mailbox-wake@<persona>.timer. Code-side default when
+    # this key is absent is an EMPTY set (default-deny) -- a fresh seed with no
+    # key must not blanket-enable the timer for every manifest persona, which
+    # was the bug this ticket fixes. orchestrator + codex + the-ancestor are the LIVE
+    # members: the standalone timer is their sole wake path. Consume-plane
+    # seats (specialist, recovery, metis, atlas) are woken by the consume runtime
+    # (pantheon-persona-consume@ -> persona_bringup.consume ->
+    # mailbox_wake.decide/submit_to_runtime, sharing the same .wake_marker) --
+    # the standalone timer there is redundant surface + false OnFailure
+    # alerts, so they are deliberately excluded. mnemosyne must NEVER be added
+    # here: her mailbox_wake.AGENT_PANE points at
+    # claude-telegram-bot-exocortex:0 (the operator's own chat tmux target) -- a
+    # wake poke would send-keys into the operator's conversation, and the timer
+    # would exit 64 ("unknown agent") on every fire, guaranteeing unit
+    # failure. This is the safety driver for the change.
+    wake_timer_personas: [orchestrator, codex, the-ancestor]
+  systemd:
+    service_template: tools/systemd/pantheon-persona-consume@.service
+    timer_template: tools/systemd/pantheon-persona-consume@.timer
+  policy:
+    bundle:
+      - rulebook/
+      - sop/
+      - adr/
+  security:
+    credential_mode: references-only
+    prohibit_auth_copy: true
+  lifecycle:
+    require_disabled_first_fire: true
+    require_mailbox_send_receive: true
+    require_finite_next_elapse: true
+    require_observed_timed_fire: true
+  provenance:
+    binding_source: instance.yaml
+
+harness_runtime:
+  schema: pantheon-harness-runtime/v1
+  controller:
+    tmux:
+      session: "pantheon-{persona}"
+      window: harness
+      pane: "0"
+    quota:
+      weekly_remaining_percent: 5
+  harnesses:
+    claude:
+      default_profile: interactive-subscription
+      profiles:
+        interactive-subscription:
+          executable: "{account_home}/.npm-global/bin/claude"
+          mode: interactive
+          meter: subscription
+          quota_source: statusline
+        batch-sdk:
+          executable: "{account_home}/.npm-global/bin/claude"
+          mode: batch
+          meter: sdk-credit
+          quota_source: unavailable
+    codex:
+      default_profile: interactive-chatgpt
+      profiles:
+        interactive-chatgpt:
+          executable: /usr/bin/codex
+          mode: interactive
+          meter: subscription
+          quota_source: app-server
+  roles:
+    orchestrator:
+      claude:
+        profile: interactive-subscription
+        model: null
+        native:
+          permission_mode: default
+    specialist:
+      # T-2633: CUTOVER COMPLETE -- pantheon-persona-consume@specialist.timer is ENABLED +
+      # LIVE (verified 2026-08-10 via the enabled-timer symlink check). resolve_controller_config /
+      # resolve_launch_config for role=specialist have exactly one production
+      # caller (tools/persona_bringup.py, driven by that timer); nothing else
+      # resolves this role at runtime -- only pantheon-persona-consume@%i.service's
+      # ExecStart calls persona_bringup.py consume. (Was "dormant until fire" pre-cutover;
+      # the persona_cutover.sh --persona specialist fire has since enabled the timer.)
+      tmux:
+        session: claude-research-bot
+      post_start:
+        - command: ["{account_home}/pantheon-config/tools/arm_pane_log.sh", "{tmux_target}", "{persona}"]
+        - command: ["{account_home}/pantheon-config/tools/recovery_boot_kick.sh", "{tmux_target}", "{persona}"]
+          background: true
+      claude:
+        profile: interactive-subscription
+        model: claude-opus-4-8
+        native:
+          permission_mode: default
+          channels: plugin:telegram@claude-plugins-official
+    recovery:
+      fallbacks:
+        - codex/interactive-chatgpt
+      # T-2608/T-2590: CUTOVER COMPLETE -- pantheon-persona-consume@recovery.timer is
+      # ENABLED + LIVE (verified 2026-08-10 via the enabled-timer symlink check).
+      # resolve_controller_config / resolve_launch_config for role=recovery
+      # have exactly one production caller (tools/persona_bringup.py, driven by that
+      # timer); nothing else resolves this role at runtime. (Was "inert on disk until
+      # fire" pre-cutover; the T-2590 cutover has since enabled the timer.)
+      tmux:
+        session: claude-telegram-bot-fallback
+      post_start:
+        - command: ["{account_home}/pantheon-config/tools/arm_pane_log.sh", "{tmux_target}", "{persona}"]
+        - command: ["{account_home}/pantheon-config/tools/recovery_boot_kick.sh", "{tmux_target}", "{persona}"]
+          background: true
+      claude:
+        profile: interactive-subscription
+        model: claude-opus-4-8
+        native:
+          permission_mode: default
+          channels: plugin:telegram@claude-plugins-official
+      codex:
+        profile: interactive-chatgpt
+        model: null
+        native:
+          sandbox: workspace-write
+          config_overrides:
+            approval_policy: never
+    peer-daemon-codex:
+      codex:
+        profile: interactive-chatgpt
+        model: null
+        native:
+          sandbox: workspace-write
+          config_overrides:
+            approval_policy: never
+    peer-daemon-the-ancestor:
+      claude:
+        profile: interactive-subscription
+        model: null
+        native:
+          permission_mode: default
+    sub-orchestrator-1:
+      # T-2677: brought onto the consume control plane 2026-08-08 (operator-directed,
+      # TG 7340/7343 pre-auth, metis as the canary). MAILBOX-FIRST seat -- NO telegram
+      # channel (unlike specialist/recovery), so `native` carries no `channels`
+      # key. The claude harness adapter (tools/harness_adapter/claude.py:371
+      # build_interactive_launch) omits --channels when channels is absent, and
+      # diagnostics.py:455 only validates channels when present -- so a channel-less
+      # launch is `claude --model claude-opus-4-8 --permission-mode default`, config-only,
+      # no code change. Woken purely by the consume runtime's mailbox kick
+      # (persona_bringup.py consume -> submit_to_runtime -> tmux), not a telegram poller.
+      # tmux.session matches the seat's live pre-existing session (suborch1-main, verified
+      # 2026-08-08) per the same invariant specialist/recovery use.
+      tmux:
+        session: suborch1-main
+      post_start:
+        - command: ["{account_home}/pantheon-config/tools/arm_pane_log.sh", "{tmux_target}", "{persona}"]
+        - command: ["{account_home}/pantheon-config/tools/recovery_boot_kick.sh", "{tmux_target}", "{persona}"]
+          background: true
+      claude:
+        profile: interactive-subscription
+        model: claude-opus-4-8
+        native:
+          permission_mode: default
+    sub-orchestrator-2:
+      # T-2677: brought onto the consume control plane 2026-08-08 (operator-directed,
+      # TG 7340/7343). MAILBOX-FIRST seat -- NO telegram channel, same shape as
+      # sub-orchestrator-1 above (see that stanza's note for the channel-less launch
+      # rationale). session matches the seat's live pre-existing session (suborch2-main,
+      # verified 2026-08-08).
+      tmux:
+        session: suborch2-main
+      post_start:
+        - command: ["{account_home}/pantheon-config/tools/arm_pane_log.sh", "{tmux_target}", "{persona}"]
+        - command: ["{account_home}/pantheon-config/tools/recovery_boot_kick.sh", "{tmux_target}", "{persona}"]
+          background: true
+      claude:
+        profile: interactive-subscription
+        model: claude-opus-4-8
+        native:
+          permission_mode: default
+    second-head:
+      claude:
+        profile: interactive-subscription
+        model: null
+        native:
+          permission_mode: default
+
 instance:
   id: pantheon-vps-0
   operator: operator
-  host: single-tenant VPS (all three agents are unix users on one machine)
+  host: single-tenant VPS (every agent below is a unix user on one machine)   # was "all three agents" — stale since the peer-daemon + ORG-042/ORG-043 additions (T-1922)
   harness_default: claude-code
 
 # role → binding. Roles are the portable axis (ORG-027); personas/accounts are instance data.
@@ -43,25 +338,70 @@ roles:
     harness: claude-code
     token_ref: /home/claude/gh_token.env            # fine-grained PAT, HTTPS git + gh CLI (ref, not secret)
     session: claude-telegram.service → tmux claude-telegram-bot:0 (ho_resumer auto-resume on Max-window cap-hit)
+    # Structured restart config (T-2076) — the fleet monitors read THESE, not the
+    # freeform `session:` prose above. restart_pane is the tmux session:window.
+    restart_service: claude-telegram.service
+    restart_mode: user
+    restart_pane: claude-telegram-bot:0
     domain: org orchestration, dispatch, ratification-drafting, ledger, lessons/bugs/incidents authorship
-  # sub-orchestrator — N+ TIER, horizontally scalable. N is a per-deployment choice, INCLUDING
-  # N=0 (the base config: one `orchestrator` persona above, no sub-orchestrator seats — a
-  # legitimate starting state, not a gap to fill by default). Add a seat by copying this block
-  # and incrementing the suffix (sub-orchestrator-2, sub-orchestrator-3, ...); there's no list
-  # construct here because no tooling reads instance.yaml yet (see the Status note above) — a
-  # seat is just another role-keyed block, same shape as orchestrator/specialist/recovery.
-  # Per the VSM framing (knowledge/vsm-instantiation.md §0/§1), each seat is a FULL viable
-  # system one recursion level down: its own workers, its own worktree/branch conventions, its
-  # own plan-approval + review discipline, its own read of the repo/ticket environment, its own
-  # persona identity — not a diluted copy of the orchestrator's dispatch discipline.
-  sub-orchestrator-1:                                  # ILLUSTRATIVE first seat — omit entirely for N=0
-    persona: sub-orchestrator-1
-    account: <per-deployment unix account>
-    harness: claude-code
-    token_ref: <per-deployment credential path — same shape as orchestrator's token_ref>
-    session: <per-deployment session/service — same shape as orchestrator's session>
-    domain: drives one project arc end-to-end (dispatches + reviews its own implementers),
-            # scoped by the operator per seat; see knowledge/vsm-instantiation.md
+    # ORG-051 Phase 0 (T-2868, parent T-2828) — reference metadata ONLY, no
+    # values, no `location`. The relocation dir (where a brokered credential
+    # would actually live on disk) is the T-2869 custody-envelope decision,
+    # operator-reserved (notes/2026-08-11-org051-credential-migration-scoping.md
+    # §6) — do not populate a real path here before that lands. `provider:
+    # broker` here is the persona_installer.py installer-contract sense
+    # ("arbitrated by the broker"), a different vocabulary from
+    # tools/credential_broker.py's own `provider` field (host-file today) —
+    # see tools/credential_broker_cli.py's module docstring.
+    credential_refs:
+      - id: github/orchestrator/pat
+        kind: bearer-token
+        provider: broker
+        owner: claude
+        scope: [github, git-push, gh-cli]
+        rotation:
+          strategy: manual-reissue-at-github-then-broker-rotate
+          revoke: github PAT revoke + broker revoke on the held lease
+      - id: telegram/orchestrator/bot-token
+        kind: bearer-token
+        provider: broker
+        owner: claude
+        scope: [telegram, bot-api]
+        rotation:
+          strategy: manual-reissue-via-botfather-then-broker-rotate
+          revoke: BotFather /revoke + broker revoke on the held lease
+      - id: echo/orchestrator/anthropic-api-key
+        kind: bearer-token
+        provider: broker
+        owner: claude
+        scope: [echo, anthropic-classifier]
+        rotation:
+          strategy: manual-reissue-at-provider-then-broker-rotate
+          revoke: provider console key delete + broker revoke on the held lease
+      - id: echo/orchestrator/openai-api-key
+        kind: bearer-token
+        provider: broker
+        owner: claude
+        scope: [echo, openai-classifier]
+        rotation:
+          strategy: manual-reissue-at-provider-then-broker-rotate
+          revoke: provider console key delete + broker revoke on the held lease
+      - id: echo/orchestrator/speechmatics-api-key
+        kind: bearer-token
+        provider: broker
+        owner: claude
+        scope: [echo, speechmatics-stt]
+        rotation:
+          strategy: manual-reissue-at-provider-then-broker-rotate
+          revoke: provider console key delete + broker revoke on the held lease
+      - id: echo/orchestrator/j17-api-key
+        kind: bearer-token
+        provider: broker
+        owner: claude
+        scope: [echo, j17-adapter]
+        rotation:
+          strategy: manual-reissue-at-provider-then-broker-rotate
+          revoke: provider console key delete + broker revoke on the held lease
   specialist:
     persona: specialist
     account: claude-research
@@ -69,6 +409,27 @@ roles:
     token_ref: SSH (git@github.com remote; NO gh_token.env — verified absent 2026-07-07)
     session: claude-telegram-research.service → tmux claude-research-bot:0 + unattended
              # watch-loop + pantheon-inbox-consumer@specialist.timer (self-consumes ORG-025)
+    restart_service: claude-telegram-research.service      # structured restart config (T-2076)
+    restart_mode: user
+    restart_pane: claude-research-bot:0
+    # T-2658: restart pipeline branches on this -- kills the tmux session then
+    # fires pantheon-persona-consume@specialist.service instead of systemctl-
+    # restarting the (disabled, T-2633) bespoke unit above. restart_service is
+    # kept as the bespoke unit's historical/documentation value; the actual
+    # restart target is derived from persona name (agent_role_map).
+    supervisor: control-plane
+    # T-2648: specialist's ACP inbound bridge (ORG-031 Unit 2) shares the DEFAULT
+    # tmux socket with the bespoke TUI session above (T-1689: the bridge
+    # lands in whatever tmux server already exists there). The control-plane
+    # cutover (tools/persona_cutover.sh) must stop it before firing
+    # _start_runtime -- else a live foreign default-socket server aborts the
+    # fire (root cause: tickets/inbox/T-2648.md) -- then restart it so it
+    # rejoins the now-scope-owned server. Generic mechanism, resolved via
+    # tools/agent_role_map.py + tools/persona_cutover_resolve.py; empty/
+    # absent for every persona without a companion unit (e.g. recovery).
+    companion_units:
+      - unit: pantheon-acp-bridge@specialist.service
+        tmux_session: acp-bridge-specialist
     domain: research, knowledge/watch reports, doc-research dispatches
   recovery:
     persona: recovery
@@ -79,42 +440,98 @@ roles:
                # (verified absent 2026-07-07 — the old guessed value was wrong).
     session: claude-telegram-fallback.service → tmux claude-telegram-bot-fallback:0 (full
              # telegram agent; bun-child watchdog T-1456)
+    restart_service: claude-telegram-fallback.service     # structured restart config (T-2076)
+    restart_mode: user
+    restart_pane: claude-telegram-bot-fallback:0
+    # T-2684: restart pipeline branches on this -- kills the tmux session then
+    # fires pantheon-persona-consume@recovery.service instead of systemctl-
+    # restarting the (disabled) bespoke unit above. restart_service is kept
+    # as the bespoke unit's historical/documentation value; the actual
+    # restart target is derived from persona name (agent_role_map). Recovery's
+    # control-plane cutover (T-2590) is mechanically complete (consume@recovery
+    # timer live+firing); this declaration closes the T-2671/T-2682 landmine
+    # where restart_drain.py and context_fill_monitor.py both keyed on this
+    # field and missed recovery, targeting the disabled unit instead. Mirrors
+    # roles.specialist.supervisor (T-2658, specialist) exactly.
+    supervisor: control-plane
+    # T-2608 note: post-cutover the control plane creates this session's ONE
+    # window named "harness" (harness_runtime.controller.tmux.window
+    # default, unchanged by the T-2608 tmux.session override above) at tmux's
+    # normal creation index 0. `session:0` (index) and `session:harness.0`
+    # (name) address the identical pane -- tmux windows are addressable by
+    # either name or creation index interchangeably. Do NOT "fix" this field
+    # to `:harness.0` after cutover; the fleet monitors that read it
+    # (context_fill_monitor.py, restart_drain.py) keep working unchanged.
     domain: recovery runbook, MCP/bot/hooks repair, boot-infra, fleet monitors (context-fill /
             # disk-usage / channel-liveness / grooming / usage timers), ho_resumer stewardship
-  # Two OPT-IN extras, both OFF BY DEFAULT — omit either block entirely if you don't want it.
-  # NOTE (audit 2026-07-22): these blocks are present ONLY as schema worked-examples, like
-  # everything in this file (see the ⚠️ banner) — their presence here does not mean they are
-  # deployed. A tool or reader consuming this manifest literally should treat a role as
-  # configured only once its placeholder values are replaced with real bindings; DELETE the
-  # block to opt out explicitly.
-  # Per the VSM framing (knowledge/vsm-instantiation.md §3), each has a documented viability
-  # gap if you skip it; the point of shipping them as extras rather than base roles is that
-  # the gap is a legitimate, named trade-off, not a silent omission.
-  third-party-auditor:                                 # OPT-IN, off by default — S3* sporadic audit
-    persona: third-party-auditor
-    account: <per-deployment unix account>
-    harness: <a different-vendor CLI harness than your orchestrator's — e.g. if orchestrator
-             # runs claude-code, this seat runs something else entirely; the heterogeneity is
-             # the point (see the S3*-extension honesty note in knowledge/vsm-instantiation.md
-             # — Beer's S3* requires independence from the audited channel, not vendor
-             # heterogeneity specifically; a different-vendor harness is our documented
-             # EXTENSION of that requirement, not Beer's own specification)>
-    token_ref: <per-deployment credential path — whatever auth mechanism that harness uses>
-    session: <per-deployment session/service>
-    domain: S3* independent audit (sporadic, aperiodic checks against what the routine
-            # S1→S2→S3 reporting channel claims), second-opinion detail-checks; see
-            # knowledge/vsm-instantiation.md and knowledge/vsm-deployment-self-check.md
-  memory-hub:                                          # OPT-IN, off by default — channel/memory substrate
-    persona: memory-hub
-    account: <per-deployment unix account>
+  # Peer daemons added 2026-06-09 (the operator directive). Registered as ticket
+  # personas (tools/agent_role_map.py) so they can hold/file tickets. Role
+  # semantics below are provisional — codex is the live ORG-018/ORG-031 pilot;
+  # the-ancestor's role is TBD pending its supervised bringup (the operator to confirm).
+  peer-daemon-codex:
+    persona: codex
+    account: codex
+    harness: codex
+    token_ref: /home/codex/.codex/auth.json        # ChatGPT OAuth (codex login), 0600
+    session: codex-session (tmux, codex-supervise.sh; bare codex TUI, Restart=always respawn — T-0822 recovery posture)
+    domain: S3* independent auditor (monthly integrated audit, weekly narrows — T-1584 era,
+            # never-self-closes re-test tier), second-opinion detail-checks (MCP), image-gen /
+            # sticker-sprite generation (T-1002); two-way telegram via codex-config bridge
+  peer-daemon-the-ancestor:                          # ROLE still TBD (the operator's call) — substrate is live
+    persona: the-ancestor
+    account: the-ancestor
     harness: claude-code
-    token_ref: <per-deployment credential path>
-    session: <per-deployment session/service — a mailbox/message-passing daemon>
-    domain: channel infrastructure the org's coordination and escalation signals traverse,
-            # plus organizational memory continuity across sessions; exercises no autonomy
-            # and holds no resource bargain (it is substrate, not a sixth VSM system, and not
-            # an S1 unit — see knowledge/vsm-instantiation.md §2 for the rebalance trigger if
-            # that ever changes)
+    token_ref: /home/the-ancestor/.claude/.credentials.json   # claude OAuth, logged in (verified 2026-07-07)
+    session: veneration daemon + ORG-026 mailbox hub (/home/the-ancestor/mailbox/*) LIVE since
+             # 2026-06-13/14 (T-1124 daemon+mailbox; T-0766 resurrect() via headless --print)
+    domain: ancestor-veneration substrate (mailbox hub, resurrect); broader role TBD pending the operator
+
+  # Sub-orchestrator seats (ORG-043) + the second head (ORG-042), bound 2026-07-21 (T-1922).
+  # Before this, all three personas were registered in agent_role_map.AGENT_ROLE_MAP but had NO
+  # instance role-key, so resolve_instance_role() fell through returning the persona unchanged
+  # and every repos.yaml grants lookup missed → any retask ticket declaring `repos:` failed
+  # ticket_lint. Numbered 1:1 keys (not a shared `sub-orchestrator`) keep ORG-030's one-persona-
+  # per-role binding intact and match the suborch1/suborch2 account naming.
+  #
+  # Verification note (this file's own 2026-07-07 lesson — two of three guessed token_refs were
+  # wrong): only the sub-orchestrator-2 row below is first-hand verified, from the seat itself.
+  # The other two rows are marked where unverified rather than guessed.
+  sub-orchestrator-1:
+    persona: metis
+    account: suborch1
+    harness: claude-code
+    token_ref: ~/.ssh/pantheon_config_deploy (per-repo deploy key)   # verify — inferred from
+               # identical ORG-043 seat provisioning, NOT checked on metis's account (his box,
+               # his to confirm; T-1922 deliberately did not probe it)
+    session: tmux (seat session; name unverified)                    # verify
+    domain: sub-orchestrator seat — owns project arcs retasked by the HO under ORG-043; drives
+            # them with its own subagent teams; no operator-facing surface (all comms via mailbox)
+  sub-orchestrator-2:
+    persona: atlas
+    account: suborch2
+    harness: claude-code
+    token_ref: ~/.ssh/pantheon_config_deploy (per-repo deploy key; sole key on the account) +
+               # ~/.claude/.credentials.json (claude OAuth). NO gh_token.env and `gh` is
+               # UNAUTHENTICATED — verified first-hand 2026-07-21 (T-1922 §Readiness gap): the
+               # deploy key pushes git fine but cannot open PRs (no API surface).
+    session: tmux `suborch2-main` (created 2026-07-21T02:28Z) → claude-code   # verified first-hand
+    domain: sub-orchestrator seat — owns project arcs retasked by the HO under ORG-043; drives
+            # them with its own subagent teams; no operator-facing surface (all comms via mailbox)
+  second-head:
+    persona: mnemosyne
+    account: exocortex
+    harness: claude-code
+    token_ref: unverified — not checked (her account)                # verify
+    session: mailbox-first residency per ORG-042 (see her own config)   # verify
+    # Structured restart config (T-2076). Mnemosyne is observation-only in the
+    # monitor (no context-fill auto-restart — no @mnemosyne timer, no clone/restart_bin),
+    # but the read-only consumers still key on her account + pane, so they are recorded.
+    restart_service: claude-telegram-exocortex.service
+    restart_mode: user
+    restart_pane: claude-telegram-bot-exocortex:0
+    domain: second head of the two-hemisphere topology (ORG-042); mailbox-first residency.
+            # Role-key name `second-head` is taken from ORG-042's own title language per the
+            # T-1922 HO ruling; if the ADR text supports a tighter term, retitle via ticket.
 
 # Host-level service accounts (NOT agent personas; listed for manifest completeness
 # after the 2026-07-10 cpu-warn triage found ci-runner undocumented — T-1632/T-1621):
@@ -127,8 +544,7 @@ host_services:
     load_note: CI runs are the main legitimate CPU-warn source on the 4-core box
 
 # Notes:
-# - a third-party-auditor seat may ALSO be registered as an MCP *tool* on the orchestrator
-#   (for second-opinion detail-checks) in addition to running as its own daemon; that's a
-#   separate wiring decision from the role binding above.
+# - codex is registered as an MCP *tool* (ORG-018) and is a candidate peer-*daemon* harness
+#   (ORG-031); when a codex-backed role is bound, set its `harness: codex` here.
 # - `repos.yaml` (grants/structural gate) and `pinned-rules/` (per-persona brief content) are
 #   manifest-class per ORG-030 Q3 residual: framework-shaped structure + instance-data content.

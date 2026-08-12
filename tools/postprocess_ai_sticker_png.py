@@ -88,11 +88,45 @@ def read_png(path: Path) -> tuple[int, int, list[tuple[int, int, int, int]]]:
 
 
 def write_png(path: Path, width: int, height: int, pixels: list[tuple[int, int, int, int]]) -> None:
+    channels = 4
     raw = bytearray()
+    prev = bytearray(width * channels)
     for y in range(height):
-        raw.append(0)
+        row = bytearray()
         for x in range(width):
-            raw.extend(pixels[y * width + x])
+            row.extend(pixels[y * width + x])
+        candidates = [bytes([0]) + bytes(row)]
+
+        sub = bytearray(row)
+        for i in range(len(sub) - 1, -1, -1):
+            left = row[i - channels] if i >= channels else 0
+            sub[i] = (row[i] - left) & 0xFF
+        candidates.append(bytes([1]) + bytes(sub))
+
+        up = bytearray(row)
+        for i in range(len(up)):
+            up[i] = (row[i] - prev[i]) & 0xFF
+        candidates.append(bytes([2]) + bytes(up))
+
+        average = bytearray(row)
+        for i in range(len(average)):
+            left = row[i - channels] if i >= channels else 0
+            average[i] = (row[i] - ((left + prev[i]) >> 1)) & 0xFF
+        candidates.append(bytes([3]) + bytes(average))
+
+        paeth_row = bytearray(row)
+        for i in range(len(paeth_row)):
+            left = row[i - channels] if i >= channels else 0
+            up_pixel = prev[i]
+            up_left = prev[i - channels] if i >= channels else 0
+            paeth_row[i] = (row[i] - paeth(left, up_pixel, up_left)) & 0xFF
+        candidates.append(bytes([4]) + bytes(paeth_row))
+
+        def score(candidate: bytes) -> int:
+            return sum(abs(b - 256 if b > 127 else b) for b in candidate[1:])
+
+        raw.extend(min(candidates, key=score))
+        prev = row
 
     def chunk(kind: bytes, payload: bytes) -> bytes:
         return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)

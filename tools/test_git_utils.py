@@ -25,6 +25,10 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import io
+import contextlib
+import shutil
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, call, patch
@@ -260,6 +264,198 @@ class TestWithWorktreeTmpUnwritable(unittest.TestCase):
         self.assertIn("Permission denied", exc_msg,
                       "WorktreeError must include the underlying git error detail for traceability (P4)")
         # No partial state created: no dir is registered since add failed.
+
+
+class TestGitCommonDirCachePoisoning(unittest.TestCase):
+    """T-1931: the module-global cache must only ever hold a CONFIRMED directory.
+
+    Source: bugs/git-common-dir-global-cache-poisoned-by-mocked-subprocess.md.
+    T-1816 closed the empty-stdout door (the fallback is not cached); this covers
+    the non-empty-but-wrong door — `returncode=0` with arbitrary stdout, which is
+    exactly the shape a test that mocks `subprocess.run` broadly produces.
+
+    These are the first direct tests of `_git_common_dir()`: nothing exercised it
+    before (test_git_mutation_lock bypasses it via PANTHEON_GIT_MUTATION_LOCKFILE),
+    which is how both doors stayed open.
+
+    Hygiene, and the joke of this ticket: a test suite for cache poisoning must not
+    poison the cache. The module global is reset in BOTH setUp and tearDown so
+    neither a prior module nor these tests can leak a value into the process.
+    """
+
+    def setUp(self) -> None:
+        from tools import _git_utils
+
+        self.gu = _git_utils
+        self._saved = _git_utils._git_common_dir_cache
+        _git_utils._git_common_dir_cache = None
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self.gu._git_common_dir_cache = self._saved
+
+    def test_non_directory_result_is_returned_but_NOT_cached(self) -> None:
+        """The poisoning shape from the bug entry: plausible stdout, not a dir."""
+        bogus = self.tmp / "not-a-dir"
+        bogus.write_text("gitdir: /somewhere/else\n", encoding="utf-8")  # a FILE, like a linked worktree's .git
+
+        with patch("tools._git_utils.subprocess.run",
+                   return_value=_make_cp(0, f"{bogus}\n")) as m:
+            first = self.gu._git_common_dir()
+            self.assertEqual(first, bogus.resolve(),
+                             "returned path must be unchanged — we decline to CACHE, we do not reject")
+            self.assertIsNone(self.gu._git_common_dir_cache,
+                              "a non-directory must never enter the module-global cache")
+            self.gu._git_common_dir()
+            self.assertEqual(m.call_count, 2,
+                             "uncached → the next caller must re-resolve (that is the whole point)")
+
+    def test_real_directory_result_IS_cached(self) -> None:
+        """Guard against the fix degenerating into never-cache (a silent perf regression)."""
+        real = self.tmp / "common"
+        real.mkdir()
+
+        with patch("tools._git_utils.subprocess.run",
+                   return_value=_make_cp(0, f"{real}\n")) as m:
+            first = self.gu._git_common_dir()
+            self.assertEqual(first, real.resolve())
+            self.assertEqual(self.gu._git_common_dir_cache, real.resolve())
+            second = self.gu._git_common_dir()
+            self.assertEqual(second, real.resolve())
+            self.assertEqual(m.call_count, 1, "a confirmed directory must be cached — one subprocess call only")
+
+    def test_empty_stdout_fallback_still_uncached_T1816_regression(self) -> None:
+        """T-1816's half of the fix must survive this change."""
+        with patch("tools._git_utils.subprocess.run", return_value=_make_cp(0, "")) as m:
+            got = self.gu._git_common_dir()
+            self.assertEqual(got, self.gu.REPO_ROOT / ".git")
+            self.assertIsNone(self.gu._git_common_dir_cache)
+            self.gu._git_common_dir()
+            self.assertEqual(m.call_count, 2, "fallback must stay uncached (T-1816)")
+
+    def test_is_dir_raising_degrades_to_uncached_never_propagates(self) -> None:
+        """The validation must not raise inside the commit path — it degrades instead.
+
+        `Path.is_dir()` swallows OSError internally, so this forces the raise to prove
+        the wrapper earns its place rather than being decorative.
+        """
+        target = self.tmp / "whatever"
+
+        with patch("tools._git_utils.subprocess.run", return_value=_make_cp(0, f"{target}\n")), \
+             patch.object(Path, "is_dir", side_effect=OSError("ELOOP")):
+            got = self.gu._git_common_dir()  # must NOT raise
+            self.assertEqual(got, target.resolve())
+            self.assertIsNone(self.gu._git_common_dir_cache,
+                              "an unverifiable path must not be cached")
+
+
+class TestGitMutationLockT2140(unittest.TestCase):
+    """T-2140. The reported defect was 'stale lock, no PID-liveness check'.
+
+    MEASURED, and it is a MISDIAGNOSIS: the lock is fcntl.flock, held on the file
+    DESCRIPTOR and released by the kernel on process exit. A leftover file naming a
+    dead pid is a diagnostic breadcrumb, not a held lock — acquisition against one
+    succeeds in 0.000s. Adding stale-lock-BREAKING to a lock that cannot go stale
+    would introduce a real race (breaking a live holder) to fix a defect that does
+    not exist.
+
+    The genuine hazard is the OPPOSITE: deleting the lockfile destroys mutual
+    exclusion, because a contender opens the newly-created path and acquires
+    immediately. That is what these tests pin.
+    """
+
+    def setUp(self):
+        self.d = tempfile.mkdtemp(prefix="t2140-")
+        self.lock = os.path.join(self.d, "ops.lock")
+        self._prev = os.environ.get("PANTHEON_GIT_MUTATION_LOCKFILE")
+        os.environ["PANTHEON_GIT_MUTATION_LOCKFILE"] = self.lock
+
+    def tearDown(self):
+        if self._prev is None:
+            os.environ.pop("PANTHEON_GIT_MUTATION_LOCKFILE", None)
+        else:
+            os.environ["PANTHEON_GIT_MUTATION_LOCKFILE"] = self._prev
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_release_marks_the_file_RELEASED_not_a_live_pid(self):
+        """A leftover reading 'pid=<dead>' looks like a stuck holder — and that
+        misreading is what led an operator to delete a lockfile they had not
+        validated, which is the one action that genuinely breaks exclusion."""
+        from tools._git_utils import git_mutation_lock
+        with git_mutation_lock(timeout_secs=5, label="work"):
+            held = open(self.lock).read()
+        released = open(self.lock).read()
+        self.assertIn("pid=", held)
+        self.assertNotIn("RELEASED", held)
+        self.assertIn("RELEASED (not held)", released)
+        self.assertIn("NEVER delete this file", released)
+
+    def test_leftover_released_file_does_NOT_block_acquisition(self):
+        """The core misdiagnosis, pinned: a persisting file is not a held lock."""
+        from tools._git_utils import git_mutation_lock
+        with git_mutation_lock(timeout_secs=5, label="first"):
+            pass
+        self.assertTrue(os.path.exists(self.lock), "file is expected to persist")
+        t0 = time.monotonic()
+        with git_mutation_lock(timeout_secs=5, label="second"):
+            pass
+        self.assertLess(time.monotonic() - t0, 1.0,
+                        "a leftover lockfile must not delay acquisition")
+
+    def test_deleting_the_lockfile_mid_section_is_REPORTED(self):
+        """Cannot be prevented from either side; must not be silent."""
+        from tools._git_utils import git_mutation_lock
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with git_mutation_lock(timeout_secs=5, label="racy"):
+                os.unlink(self.lock)
+        out = err.getvalue()
+        self.assertIn("was DELETED", out)
+        self.assertIn("mutual exclusion was NOT in force", out)
+
+    def test_clean_section_emits_no_violation_warning(self):
+        from tools._git_utils import git_mutation_lock
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            with git_mutation_lock(timeout_secs=5, label="clean"):
+                pass
+        self.assertNotIn("NOT in force", err.getvalue())
+
+    def test_holder_hint_records_label_and_pid_while_held(self):
+        from tools._git_utils import git_mutation_lock
+        with git_mutation_lock(timeout_secs=5, label="claim T-9999"):
+            body = open(self.lock).read()
+        self.assertIn(f"pid={os.getpid()}", body)
+        self.assertIn("claim T-9999", body)
+
+
+
+
+
+class CommonDirMockedStdoutTest(unittest.TestCase):
+    """T-2336 third door of the T-1816/T-1931 hole: a broadly-mocked
+    subprocess.run hands _git_common_dir a MagicMock stdout — truthy .strip(),
+    fabricated relative fspath — and the first git_mutation_lock under such a
+    test mkdir(parents=True)s a literal `MagicMock/...` tree in the repo root.
+    A real subprocess(text=True) stdout is always str; non-str can only be a
+    test double and must take the uncached fallback."""
+
+    def test_non_str_stdout_falls_back_and_does_not_fabricate_a_path(self):
+        from unittest import mock as _m
+        from tools import _git_utils
+        _git_utils._git_common_dir_cache = None
+        self.addCleanup(setattr, _git_utils, "_git_common_dir_cache", None)
+        fake = _m.MagicMock(returncode=0)  # stdout is a child MagicMock — the trap
+        with _m.patch.object(_git_utils, "_git", return_value=fake):
+            out = _git_utils._git_common_dir()
+        self.assertEqual(out, _git_utils.REPO_ROOT / ".git",
+                         "non-str stdout must take the same fallback as empty stdout")
+        self.assertIsNone(_git_utils._git_common_dir_cache,
+                          "the fallback must stay uncached (T-1816)")
+        self.assertFalse((_git_utils.REPO_ROOT / "MagicMock").exists(),
+                         "no fabricated path may be materialized")
 
 
 if __name__ == "__main__":

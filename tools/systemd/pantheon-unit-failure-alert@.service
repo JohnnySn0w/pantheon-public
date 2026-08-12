@@ -1,0 +1,29 @@
+# Recovery-only today; generic by design (T-1868). Instance %i = the FAILED unit's
+# full name (referrers use `OnFailure=pantheon-unit-failure-alert@%n.service`).
+#
+# Leaf unit — deliberately NO OnFailure= here and NO RemainAfterExit: a failing
+# alert must never recurse into an alert storm, and RemainAfterExit=yes would
+# make a second failure's `start` a no-op while the first is still "active"
+# (dropping the second alert).
+#
+# Install (per account that references it):
+#   cp tools/systemd/pantheon-unit-failure-alert@.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+# (No enable/start — it is activated by OnFailure= on the referring units.)
+[Unit]
+Description=Pantheon unit-failure alert — route %i failure to Recovery triage (T-1868)
+Documentation=file:///home/%u/pantheon-config/tools/unit_failure_alert.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
+# `sg pantheon-mailbox -c` REQUIRED (T-1015): the ORG-026 hub is mode-2770 group
+# pantheon-mailbox and user-mode systemd cannot grant supplementary groups — without
+# the wrap the mailbox write dies with PermissionError and every alert would
+# silently take the Telegram fallback instead of waking Recovery.
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/unit_failure_alert.py --unit %i"
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=60s

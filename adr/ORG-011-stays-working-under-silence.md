@@ -3,6 +3,7 @@ aliases: [ORG-011]
 title: Structural enforcement for HO-stays-working-under-silence
 status: Ratified 2026-05-11
 date: 2026-05-11
+build_disposition: built
 ---
 # ORG-011 — Structural enforcement for HO-stays-working-under-silence
 

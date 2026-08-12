@@ -3,6 +3,7 @@ aliases: [ORG-033]
 title: Multi-instance architecture — Pantheon's three-Claude-Code-instance discipline (consolidating)
 status: Ratified 2026-06-10 by the operator (Telegram 3100)
 date: 2026-06-10
+build_disposition: no-build-needed
 ---
 # ORG-033 — Multi-instance architecture (consolidating ADR)
 

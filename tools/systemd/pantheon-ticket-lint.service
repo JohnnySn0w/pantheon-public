@@ -4,6 +4,9 @@ Documentation=file:///home/%u/pantheon-config/tickets/README.md
 After=network-online.target
 Wants=network-online.target
 
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
 [Service]
 Type=oneshot
 WorkingDirectory=%h/pantheon-config

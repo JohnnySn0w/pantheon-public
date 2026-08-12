@@ -74,7 +74,7 @@ Each turn appends; the ticket file becomes the conversation transcript. Audit-ch
 ## When this SOP doesn't apply
 
 - **Telegram-direct conversations with the operator** — via each agent's own per-agent Telegram self-poll surface (the shared bridge was decommissioned 2026-06-04, T-0767; kino's PWA chat remains a possible future home). Don't flip ticket targets at the operator for general comms (the operator's bandwidth is the constraint per D1; tickets are batch-comprehensible, Telegram is real-time).
-- **Inside-team SendMessage** (within a TeamCreate'd team) — that's the b9-pattern's intra-team comms surface (project-orchestrator ↔ implementer ↔ reviewer); ticket-flipping is the *inter-agent* (across separate Claude Code sessions / users) comms surface. Different mechanism for different scope.
+- **Inside-team SendMessage** (within a session's implicit agent team — Agent-name spawns, ORG-036) — that's the intra-team comms surface (project-orchestrator ↔ implementer ↔ reviewer); ticket-flipping is the *inter-agent* (across separate Claude Code sessions / users) comms surface. Different mechanism for different scope.
 - **One-shot HO-files-Recovery ticket where no reply is expected** — that's just a normal Recovery-target filing per the dispatch pattern. No flipping needed.
 - **Synchronous urgent comms** — file the ticket if needed for audit chain, but if response time matters, Telegram-nudge the operator out-of-band rather than wait for inbox-consumer cadence.
 

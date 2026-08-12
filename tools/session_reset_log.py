@@ -46,6 +46,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Repo root on sys.path so `from tools.agent_role_map import ...` resolves when this
+# file is run as a script (handoff_and_restart.sh calls it directly). Standard guard.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -81,7 +86,23 @@ SCHEMA = {
 }
 
 # Accounts to sweep when doing a cross-account read.
-KNOWN_ACCOUNTS = ("claude", "claude-fallback", "claude-research")
+#
+# DERIVED from instance.yaml (T-2256). Held the pre-ORG-042 three
+# (claude/claude-fallback/claude-research) — the exact deploy_hook signature: a
+# fleet-wide CLAIM ("all known accounts", below) over 3-of-8 coverage, with
+# per-account failures already documented as silently elided, feeding the PWA
+# stats surface. Nothing distinguished "this account had no events" from "this
+# account was never asked".
+#
+# COVERAGE IS NOT MEMBERSHIP — see read_events_cross_account()'s docstring. A
+# correct tuple here is necessary and not sufficient: the cross-account read
+# needs a matching `kino` sudoers entry per account, and that file lives in
+# another repo. T-2269 tracks it. The tuple being wrong is precisely what kept
+# that dependency invisible, so a correct tuple with a named, ticketed gap is
+# strictly better than leaving wrong answers standing.
+from tools.agent_role_map import fleet_accounts  # noqa: E402
+
+KNOWN_ACCOUNTS = fleet_accounts()
 
 _PANTHEON_STATE_DIR_DEFAULT = ".local/state/pantheon"
 _SESSION_RESETS_SUBDIR = "session_resets"
@@ -248,6 +269,23 @@ def read_events_cross_account(
     caller's own account, reads happen in-process (no sudo needed).
 
     Failures on a per-account basis are silently elided — best-effort merge.
+
+    WHAT "ALL KNOWN ACCOUNTS" DOES AND DOES NOT PROMISE (T-2256). KNOWN_ACCOUNTS
+    is now derived from instance.yaml, so MEMBERSHIP is canonical and a new seat
+    is swept from the day it is bound. COVERAGE is a separate property and is
+    NOT guaranteed here: reaching another account's 700-mode home requires a
+    matching entry in the `kino` sudoers file, which lives in the pantheon-pwa
+    repo (`scripts/sudoers/kino`, per T-0443) and is maintained by hand. An
+    account that is swept but has no sudoers entry produces a failed `sudo cat`,
+    which the elision above turns into zero rows — INDISTINGUISHABLE from an
+    account that genuinely logged nothing.
+
+    So: a missing account here is a membership bug (fixed structurally); a
+    missing sudoers entry is a coverage bug that this function cannot see and
+    will not report. T-2269 (depends_on T-2256) tracks bringing the sudoers file
+    up to the derived account set. Until it lands, treat a zero-row account as
+    UNKNOWN rather than as empty, and check the sudoers file before concluding a
+    seat had no session resets.
     """
     target_accounts = accounts if accounts is not None else list(KNOWN_ACCOUNTS)
     target_classes = classes if classes is not None else list(CLASSES)

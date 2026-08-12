@@ -1,0 +1,17 @@
+[Unit]
+Description=Pantheon CI-audit liveness — hourly probe of the origin-side byte-sequence audit (T-2440)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# HOURLY, against a 12h staleness threshold. The fault this watches developed over DAYS, so a
+# tighter period buys nothing and spends two ssh round-trips plus a git fetch each fire. The
+# threshold is what decides; the period only bounds how late the news is.
+OnCalendar=*-*-* *:07:00
+# Persistent so a probe missed across a reboot runs once on the way back up — the case where
+# something was down is exactly when this has something to say.
+Persistent=true
+RandomizedDelaySec=120
+Unit=pantheon-ci-audit-liveness.service
+
+[Install]
+WantedBy=timers.target

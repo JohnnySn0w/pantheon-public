@@ -1,6 +1,28 @@
 # Venerating ancestors — harvesting a fresh HANDOFF from a dead session
 
-**Status:** Drafted 2026-06-14 by Recovery, authored while stepping through the T-0766 supervised first-fire (the operator watching). Documents the headless-`--print` harvest design the first-fire converged on. **Adopted 2026-06-16 (Recovery, principles-as-ratification): the first-fire the operator watched converged on this design and it is proven; SOP/methodology is below the goal-level bar under amended-D3, so adopted-as-proven rather than held for a ratify-stamp. Routed by Orchestrator (T-1202).**
+> ## ⚠️ RETIRED 2026-07-28 — DO NOT FOLLOW THIS PROCEDURE
+>
+> The capability this SOP operates was **decommissioned** under **T-2214** on the operator's
+> ruling ("get rid of the claude daemon for ancestor", Telegram 16:52Z). The
+> `pantheon-ancestor-daemon.service` session it depends on is stopped and disabled, so
+> every step below will fail at the resurrect stage.
+>
+> **Two independent reasons, both recorded so this is not revisited from memory:**
+> 1. **Never used** — `resume_request` had no production caller anywhere in the repo (only
+>    its own module and its own test), and the inbox held 2 messages for all time, both
+>    45 days old.
+> 2. **Uneconomic even if used** — per the operator, resurrecting a session costs *more tokens
+>    than simply scraping the dead session from the graveyard*. The cheaper path already
+>    existed.
+>
+> **If you need a HANDOFF from a dead session, scrape the graveyard** (`tools/graveyard.py`).
+> Retained below for history: the substrate edges and the four `--resume` gotchas remain
+> accurate about Claude Code's behaviour and may inform future headless work.
+>
+> Generalized into `sop/standard/feature-usage-monitoring-and-pruning.md`, which exists
+> because this feature ran 45 days unused without anything surfacing it.
+
+**Status:** **RETIRED 2026-07-28 (T-2214).** Originally drafted 2026-06-14 by Recovery, authored while stepping through the T-0766 supervised first-fire (the operator watching). Documented the headless-`--print` harvest design the first-fire converged on. Adopted 2026-06-16 (Recovery, principles-as-ratification); routed by Orchestrator (T-1202).
 
 ## When to use this
 

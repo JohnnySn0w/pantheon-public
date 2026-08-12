@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon agent-monitor liveness watchdog — every 2 min HTTP-liveness probe (T-1885)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* *:0/2:00
+Persistent=false
+Unit=pantheon-agent-monitor-healthcheck.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,40 @@
+[Unit]
+Description=Pantheon CI-audit TIP COVERAGE — has the byte-sequence audit concluded for origin/main's tip (T-2441)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928).
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# ⚠️ THIS UNIT BELONGS ON THE `claude` SEAT AND ONLY THERE. It reads GitHub's API through `gh`,
+# and recovery holds no GitHub auth at all — which is precisely the gap T-2440 left open and this
+# closes. Do not "unify" it onto recovery's seat by shelling through `sudo -u claude gh`: that makes
+# one seat's credential a standing dependency of another seat's monitor, which is the coupling
+# T-2440 rejected on purpose.
+#
+# SECOND SIGNAL, not a replacement. pantheon-ci-audit-liveness.service (recovery, hourly) answers "is
+# the audit EXECUTING"; this answers "has the audit CONCLUDED for the sha that is on main right
+# now". They fail independently — the runner can be perfectly alive while the tip sits hours back
+# in an oldest-first queue, which is exactly the 2026-08-03 state where liveness read OK with 505
+# runs queued and the tip's own audit among them.
+#
+# DETECT + ALERT only. It re-runs nothing and re-dispatches nothing; an unaudited tip wants a
+# human deciding about the runner or the workflow, not an automatic re-trigger.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/ci_audit_liveness.py --mode tip
+
+StandardOutput=journal
+StandardError=journal
+
+# One `git fetch` plus one `gh api` call. Generous ceiling so a slow API cannot wedge the timer,
+# but well short of the timer period.
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=default.target

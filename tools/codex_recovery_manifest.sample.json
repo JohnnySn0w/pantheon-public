@@ -1,0 +1,13 @@
+{
+  "targets": {
+    "claude-fallback": {
+      "account": "claude-fallback",
+      "uid": 1001,
+      "tmux_session": "claude-telegram-bot-fallback",
+      "user_unit": "claude-telegram-fallback.service",
+      "foreground_exe_allowlist": [
+        "/home/claude-fallback/.npm-global/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+      ]
+    }
+  }
+}

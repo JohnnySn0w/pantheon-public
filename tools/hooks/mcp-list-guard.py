@@ -42,13 +42,38 @@ from pathlib import Path
 # command is prose/an argument, not an invocation (the T-1623 false positive).
 _QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
 
+# T-2251: command-substitution delimiters are SEGMENT boundaries, and must be
+# normalised to one before the command-position match runs.
+#
+# Without this, the env-assignment prefix below swallows `out=$(cd ` as though it
+# were a plain `VAR=value ` pair — `out` is the name, `$(cd` is a perfectly good
+# \S* value, the space closes it — which leaves the PATH token `/home/claude`
+# sitting in command position. `out=$(cd /home/claude && ...)`, an extremely
+# common shape for the account literally NAMED claude, was therefore read as an
+# invocation and denied. Neither `$( )` nor the `cd` alone does it; only together,
+# which is exactly what the T-2251 bisection found.
+#
+# Normalising `$(`, `)` and backtick to `;` makes them true separators. That fixes
+# the false positive AND keeps the deny posture where it belongs: `FOO=$(date)
+# claude -p hi` becomes `FOO=;date; claude -p hi`, where `claude` is genuinely in
+# command position and still blocks. Adding boundaries can only ever create more
+# command positions, never fewer — so this cannot turn a real invocation into a
+# miss, which is the direction that would reintroduce the 409 bridge-death.
+_SUBST_RE = re.compile(r"\$\(|\)|`")
+
 # `claude` (bare or path-invoked) in COMMAND position: start-of-string or after
 # a shell separator/substitution opener, optionally via `command`/`exec`/env
 # assignments. Captures the rest of that command segment for the safe-flag test.
 _CLAUDE_CMD_RE = re.compile(
     r"(?:^|[;&|`\n(])\s*"                   # command position
     r"(?:command\s+|exec\s+)?"              # common wrappers
-    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"   # env assignments
+    # env assignments. T-2251: the VALUE must not be able to cross a shell
+    # separator. It was `\S*`, which happily swallowed `$(cd ` (and, after the
+    # substitution normalisation above, `;cd `) as though it were one value —
+    # leaving the next token, a mere PATH like /home/claude, parsed as the
+    # command. Both halves are needed: normalisation alone still lost to `\S*`
+    # eating the `;` it had just inserted.
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=[^\s;&|`\n()]*\s+)*"
     r"(?:\S*/)?claude(?=\s|[;&|`)\n]|$)"    # bare or path-invoked; full token only
                                             # (claude-bot-supervise.sh must NOT match)
     r"([^;&|`\n]*)"                         # args until the next separator
@@ -69,7 +94,7 @@ def command_targets_mcp_list(command: str) -> bool:
     (Name kept for wiring/test compatibility.)"""
     if not command:
         return False
-    stripped = _QUOTED_RE.sub(" ", command)
+    stripped = _SUBST_RE.sub(";", _QUOTED_RE.sub(" ", command))
     for m in _CLAUDE_CMD_RE.finditer(stripped):
         args = m.group(1) or ""
         if _SAFE_ARGS_RE.search(args):

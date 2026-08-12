@@ -1,0 +1,20 @@
+{
+  "ORG-013": "resolving a ticket that other tickets list as a depends_on dependency; wondering whether dependants auto-unblock or need a manual sweep",
+  "ORG-015": "filing a ratification ticket and picking which file or path to name in ratifiable_files",
+  "ORG-017": "creating or referencing a path under watch/ or research/ instead of the unified knowledge/ tree",
+  "ORG-019": "wanting to mark a ticket blocked, or move a ticket file into a blocked/ directory",
+  "ORG-022": "filing a ticket with a ratification label but no ratifiable_files set, or the reverse",
+  "ORG-026": "building or debugging cross-agent messaging; considering a broker, socket, or tmux send-keys instead of the file-mailbox substrate",
+  "ORG-033": "spinning up a new long-lived agent seat or instance; blurring the unix-account isolation between Orchestrator, Specialist, and Recovery",
+  "ORG-034": "writing a dispatch brief or a DECISIONS section and unsure what to name as the served intent versus the how",
+  "ORG-036": "deciding whether HO should pre-stage workers before dispatching a project-orchestrator, or let it self-spawn",
+  "ORG-040": "writing 'Ratified by the operator' into a file without a Telegram message id or a corroborating ledger entry",
+  "ORG-046": "hardcoding a git remote URL in a repo instead of resolving it through the manifest",
+  "ORG-047": "designing how one Pantheon seed proves its identity to an external seed it doesn't control",
+  "ORG-050": "granting a credential, host privilege, or cross-account access while building an installer or persona-bringup step",
+  "ORG-051": "storing a password or API key as an informal home-directory .pass file instead of a credential reference",
+  "ORG-053": "starting a new project without placing it under the Grand Project developing whole",
+  "ORG-054": "unsure whether a repository, program, or backlog is 'the project' or just one representation of it",
+  "ORG-056": "installing or removing an organ (daemon or service) for an agent without naming its contract or degradation limits",
+  "ORG-061": "proposing to skip ahead in the recovery-to-embodiment stage sequence without falsifiable exit evidence"
+}

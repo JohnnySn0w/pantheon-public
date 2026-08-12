@@ -3,6 +3,7 @@ aliases: [ORG-012]
 title: Information-inflow bubble-up methodology
 status: Ratified 2026-05-14
 date: 2026-05-14
+build_disposition: built
 ---
 # ORG-012 — Information-inflow bubble-up methodology
 

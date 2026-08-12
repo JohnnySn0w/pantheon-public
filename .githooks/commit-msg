@@ -38,6 +38,24 @@ sys.path.insert(0, str(_REPO_ROOT))
 from tools._git_utils import _hermes_scan_message  # noqa: E402
 
 
+def _forward_ref_failures(message: str) -> list[str]:
+    """T-2404: ticket ids cited here but absent from the would-be commit tree.
+
+    Folded into THIS hook rather than shipped as its own file because git runs
+    exactly one commit-msg hook — a second script in .githooks/ would be
+    silently ignored, and the check would look installed while doing nothing.
+
+    Import-wrapped and exception-swallowing: this gate is an addition to a hook
+    whose existing HERMES duty is the more important one, and a broken import
+    here must never take that gate — or the ability to commit — down with it.
+    """
+    try:
+        from tools.forward_ref_gate import find_forward_refs, tickets_in_tree
+        return find_forward_refs(message, tickets_in_tree())
+    except Exception:  # noqa: BLE001
+        return []
+
+
 def main() -> int:
     if len(sys.argv) < 2:
         # git always passes the message file path; if missing, allow through
@@ -50,6 +68,10 @@ def main() -> int:
     except OSError:
         # Can't read the message file — allow through defensively.
         return 0
+
+    # Checked FIRST and independently: the HERMES gate predates this file's
+    # second duty and must not be reachable-only-if the newer check passes.
+    missing = _forward_ref_failures(message)
 
     if not _hermes_scan_message(message):
         print("", file=sys.stderr)
@@ -65,6 +87,11 @@ def main() -> int:
         )
         print("  Edit the message and retry.", file=sys.stderr)
         print("", file=sys.stderr)
+        return 1
+
+    if missing:
+        from tools.forward_ref_gate import _guidance
+        sys.stderr.write(_guidance(missing))
         return 1
 
     return 0

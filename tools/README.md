@@ -17,7 +17,11 @@ Before adding a new responsibility to any tool here, run the audit prompt from [
 | [`ticket_grooming.py`](ticket_grooming.py) | Cron'd staleness scanner. Scans `tickets/active/`, idempotently appends `[grooming] stale` entries past threshold (`4h` default), sends Telegram digest as proof-of-life. Runs under Recovery's user (`claude-fallback`), daily 12:00 UTC. | shipped 2026-05-02 (`694689f`); T-0453 ORG-019 retirement of blocked-state scope 2026-05-19 |
 | [`_git_utils.py`](_git_utils.py) | Shared HERMES regex + git-subprocess helpers for auto-commit pipelines. Used by `watch_runner.py`, `ticket.py`, `ticket_grooming.py`. | shipped 2026-05-02 (`9eecce5`) |
 | [`systemd/`](systemd/) | systemd-user-timer + service unit templates (canonical copies; installed at `~/.config/systemd/user/`, not version-controlled there). Includes `pantheon-watch.{service,timer}` (08:00 UTC daily, claude-research user) and `pantheon-grooming.{service,timer}` (12:00 UTC daily, claude-fallback/Recovery user). | shipped 2026-04-29; grooming units `3d2bf91` |
-| [`hooks/`](hooks/) | Claude Code session hooks owned by pantheon-config. Symlinked into `~/.claude/hooks/` (pattern mirrors `claude-config/agents/` → `~/.claude/agents/`). Currently: `handoff-auto-read.sh` (SessionStart, auto-reads fresh HANDOFF.md). | shipped 2026-05-02 (T-0008) |
+| [`harness_adapter/`](harness_adapter/) | ORG-031 binding/codec layer: typed headless exec/resume descriptors, native event parsing, structural results, durable inbound receipts, and namespaced diagnostics for Claude Code and Codex. Provider policy stays provider-specific. | T-2372 |
+| [`persona_bringup.py`](persona_bringup.py) | Resolve persona→role from `instance.yaml`, select or explicitly override the execution harness, diagnose the binding, run/resume structural turns, and consume durable persona mail with correlated replies plus unchanged-failure backoff. | T-2372 |
+| [`persona_installer.py`](persona_installer.py) | ORG-049 sibling provisioner: build digest-addressed typed plans from `instance.yaml`; preflight actor/privilege and ownership gates; apply, verify, and rollback through fixed operation backends; preserve credential references without copying values. | T-2381 |
+| [`a2a/`](a2a/) | A2A federation rung-1 surface (T-1882 ladder): `specialist_seat_server.py` (loopback JSON-RPC server, stub `research-request` skill), finalized Agent Card, systemd unit template, `PROVISION.md` (install steps + a2a-sdk 1.1.1 surface notes). Runs on the specialist account. | shipped 2026-07-20 (T-1886, PR #73) |
+| [`hooks/`](hooks/) | Claude Code session hooks owned by pantheon-config. **Deployment is MIXED per FILE _and_ per ACCOUNT — enumerate, never generalise.** Measured 2026-07-28: `handoff-auto-read.sh` is a regular-file COPY on claude / claude-research / claude-fallback; `verify-hook-integrity.sh` and `ensure-hooks-active.sh` are SYMLINKS into that account's own clone on all three; `backlog-surface.sh` is a symlink on **claude only** and does not exist on the other two. **Use `tools/deploy_hook.py`** — it probes `[ -L ]` per (file, account) as that account, pulls for symlinks, copies for regular files, refuses when it cannot tell, and refuses if the canonical is not yet on origin/main. Deploying by hand with `cp` writes THROUGH a symlink into a peer's git worktree and blocks their `ticket.py` (T-2195 → T-2204); I got this row wrong twice by generalising from one account's listing, including my own. | shipped 2026-05-02 (T-0008); deploy tool 2026-07-28 (T-2195) |
 | [`handoff_and_restart.sh`](handoff_and_restart.sh) | Graceful HO restart wrapper. Runs as Recovery (claude-fallback): nudges HO via tmux to write `/home/claude/HANDOFF.md` → waits for mtime advance → `systemctl restart` of the prime claude unit → verifies fresh session via `is-active` + tmux pane sentinel. Parameterized: `--tmux-session`, `--systemd-unit`, `--systemctl-mode {user,system}`, `--max-handoff-wait`, `--max-verify-wait`, `--verify-pattern`, `--dry-run`. Exit code = step that failed (1–7); usage error = 64. flock-serialized. | shipped 2026-05-02 (T-0008); deploy under Recovery via follow-on ticket |
 | [`test_handoff_and_restart.sh`](test_handoff_and_restart.sh) | Bash smoke test for the wrapper. Sandbox + PATH-override stubs for tmux/systemctl/stat; 9 cases (happy path, lock contention, each step's failure, custom verify pattern, dry-run, usage error). | shipped 2026-05-02 (T-0008) |
 | [`inbox_consumer.py`](inbox_consumer.py) | B9 inbox auto-consumer. Per-agent (`--agent <name>`): scans `tickets/inbox/`, idle-gates via tmux pane probe, injects claim+work prompt. Pre-fire git pull added 2026-05-07 (T-0118). Runs as `pantheon-inbox-consumer@<agent>.timer` on HO and Recovery (Specialist rollout in flight per T-0102). | shipped 2026-05-04 (T-0052); pull-fresh T-0118 |
@@ -27,7 +31,7 @@ Before adding a new responsibility to any tool here, run the audit prompt from [
 | [`hermes_history_audit.py`](hermes_history_audit.py) | HERMES byte-sequence whole-history audit. Scans every committed blob (across history) for the unescaped trigger. Belt to the local pre-commit hook. (The server-side audit Action was removed 2026-06-09 per the T-0049 downgrade — ledger -106.) | shipped 2026-05-03 (T-0030) |
 | [`hermes_diff_scan.py`](hermes_diff_scan.py) | HERMES unified-diff scanner — was the helper for the server-side audit Action (removed 2026-06-09, T-0049 downgrade); RETAINED pending the 2026-07-01 re-eval. NOT used by the pre-commit hook, which scans staged blobs via `_git_utils._HERMES_PATTERN` directly. | shipped 2026-05-03 |
 | [`install_hooks.sh`](install_hooks.sh) | Idempotent activator for `.githooks/` (HERMES pre-commit + commit-msg). Sets `core.hooksPath = .githooks`, verifies executability. See top-level README §Git hooks. | shipped 2026-05-03 (T-0029) |
-| `test_*.py` | Per-script unittest suite — `test_<X>.py` mirrors `<X>.py`. Run via `python3 -m unittest tools.test_<X>` (or full suite via `python3 -m unittest discover tools`) from repo root. Currently 12 test files covering every shipped script. | shipped alongside their targets |
+| `test_*.py` | Per-script unittest suite — `test_<X>.py` mirrors `<X>.py`. Run via `python3 -m unittest tools.test_<X>` (or full suite via `python3 -m unittest discover tools`) from repo root; `pytest tools -q` also works and is what CI runs. One test file per shipped script — count deliberately not stated here, it rots (it read "12" until 2026-07-23, when there were 108). Note the full suite takes ~1.5 min and some single modules take 20-40s: a short `timeout` on a probe reads as a hang, see `bugs/short-timeout-probe-reads-slow-suite-as-hang.md`. | shipped alongside their targets |
 
 ---
 
@@ -173,63 +177,117 @@ Canonical templates for the timer + service units. Install instructions in [`sys
 ## Auto-index
 
 <!-- AUTOGEN-START spine-index -->
+| [`acp_bridge.py`](acp_bridge.py) | tools/acp_bridge.py — mailbox -> ACP inbound bridge engine (T-1633, ORG-031 Unit 1). |
+| [`acp_bridge_backlog_watchdog.py`](acp_bridge_backlog_watchdog.py) | tools/acp_bridge_backlog_watchdog.py — ACP-bridge mailbox backlog watchdog |
+| [`acp_bridge_wetrun.py`](acp_bridge_wetrun.py) | tools/acp_bridge_wetrun.py — T-1633 empirical gate for tools/acp_bridge.py. |
 | [`activity_digest.py`](activity_digest.py) | Activity digest — 5hr cycle system-pulse signal to the operator's Telegram. |
 | [`activity_monitor.py`](activity_monitor.py) | activity_monitor — fire structural poke to an agent's pane when one of: |
 | [`adaptive_finish_detect.py`](adaptive_finish_detect.py) | adaptive_finish_detect — Audit-tier Stop hook for narrate-then-exit detection. |
 | [`adaptive_finish_digest.py`](adaptive_finish_digest.py) | tools/adaptive_finish_digest.py — weekly Telegram digest of adaptive-finish hits. |
+| [`adr_reeval_walk.py`](adr_reeval_walk.py) | ADR re-evaluation trigger walk (T-2527, design T-2526). |
+| [`adr_scoping_lint.py`](adr_scoping_lint.py) | Prevent-at-creation lint for ADR build-scoping (T-2806, the operator TG 7590). |
+| [`agent_monitor_healthcheck.py`](agent_monitor_healthcheck.py) | Agent-monitor liveness watchdog — structural guard for the node event-loop |
 | [`agent_role_map.py`](agent_role_map.py) | Persona-name <-> role-id resolution for Pantheon agents. |
 | [`ancestor_consume.py`](ancestor_consume.py) | tools/ancestor_consume.py — the-ancestor daemon's mailbox dispatch loop (T-0765 #2 glue). |
 | [`ancestor_liveness_monitor.py`](ancestor_liveness_monitor.py) | tools/ancestor_liveness_monitor.py — light alive-but-wedged recovery for the-ancestor (T-1134). |
 | [`artifact_gc.py`](artifact_gc.py) | Artifact-GC — sweep stale ticket-scoped evidence dirs (T-1360). |
 | [`auto_commit_contract_lint.py`](auto_commit_contract_lint.py) | auto_commit_contract_lint — structural enforcement of the auto-commit-cron default-safe contract. |
+| [`bugs_frontmatter_lint.py`](bugs_frontmatter_lint.py) | bugs_frontmatter_lint — enforce the bugs/ YAML frontmatter contract. |
 | [`channel_liveness_monitor.py`](channel_liveness_monitor.py) | Channel-liveness monitor — detect a comms-dark-but-session-healthy agent (T-0894). |
+| [`check_public_architecture_maps.py`](check_public_architecture_maps.py) | Validate public architecture diagrams as bounded derivatives of canon. |
+| [`ci_audit_liveness.py`](ci_audit_liveness.py) | tools/ci_audit_liveness.py — alert when the origin-side byte-sequence audit STOPS RUNNING (T-2440). |
+| [`ci_fleet_account_reconcile.py`](ci_fleet_account_reconcile.py) | tools/ci_fleet_account_reconcile.py — ORG-066 Rung-1 fleet-account reconciler (T-2219). |
+| [`cited_hash_lint.py`](cited_hash_lint.py) | cited_hash_lint — find commit hashes cited in tickets that are NOT on origin/main. |
+| [`cited_ticket_lint.py`](cited_ticket_lint.py) | cited_ticket_lint — find T-NNNN ids cited in commit messages that did not exist yet. |
+| [`claude_quota_probe.py`](claude_quota_probe.py) | Run one isolated Claude ping/pong turn to refresh subscription quota data. |
+| [`claude_statusline_capture.py`](claude_statusline_capture.py) | Persist Claude Code status-line quota data as a minimal atomic observation. |
+| [`codex_modal.py`](codex_modal.py) | tools/codex_modal.py -- shared codex first-run-modal detection + precise |
 | [`codex_modal_monitor.py`](codex_modal_monitor.py) | tools/codex_modal_monitor.py — detect codex wedged on a rate-limit model-switch |
+| [`codex_recovery.py`](codex_recovery.py) | codex-recovery broker — ORG-048 §5 privilege surface, increment 1 (T-2805). |
 | [`conftest.py`](conftest.py) | Suite-wide safety net: no test may fire a real Telegram notification. |
+| [`consume_onboard.py`](consume_onboard.py) | T-2679: one-command, persona-parameterized onboarding of a from-scratch, |
+| [`consumer_liveness_monitor.py`](consumer_liveness_monitor.py) | tools/consumer_liveness_monitor.py — a live inbox-consumer that SILENTLY stops |
+| [`context_fill_hold.py`](context_fill_hold.py) | context_fill_hold — explicit, TTL-bounded hold on context_fill_monitor's |
 | [`context_fill_monitor.py`](context_fill_monitor.py) | Context-fill monitor — auto-fire graceful restart on a Pantheon agent's session context-fill threshold. |
 | [`continuity_counter.py`](continuity_counter.py) | continuity_counter.py — Pantheon system-continuity day-count tool. |
+| [`credential_broker.py`](credential_broker.py) | Provider-neutral credential leases for Pantheon (ORG-051, T-2380). |
+| [`credential_broker_cli.py`](credential_broker_cli.py) | Installer-interface CLI over tools/credential_broker.py (ORG-051, T-2868). |
 | [`credential_expiry_monitor.py`](credential_expiry_monitor.py) | Proactive OAuth-credential-expiry monitor for the fleet (T-1216 / Jun-2026 401 outage). |
 | [`cycle_stats.py`](cycle_stats.py) | cycle_stats.py — read tool for the ledger-augmented metrics field. |
+| [`dangling_identifier_scan.py`](dangling_identifier_scan.py) | tools/dangling_identifier_scan.py — find identifiers that ONLY exist in prose (T-2151). |
+| [`decision_recall_poc.py`](decision_recall_poc.py) | Decision-recall PoC (T-2816) — offline retrieval-quality eval, NOT a live hook. |
+| [`delivery_reachability.py`](delivery_reachability.py) | tools/delivery_reachability.py — can each seat ACTUALLY receive a ticket right now? (T-2232) |
+| [`deploy_hook.py`](deploy_hook.py) | deploy_hook — deploy a pantheon-config hook to accounts WITHOUT writing through a symlink. |
 | [`directive_skill_drift_check.py`](directive_skill_drift_check.py) | Directive<->skill drift guard (T-0796). |
 | [`disk_usage_monitor.py`](disk_usage_monitor.py) | Proactive resource monitor for the fleet — disk + RAM + CPU (2026-06-26 the operator ask; RAM/CPU legs T-1632). |
 | [`dispatch.py`](dispatch.py) | Pantheon Dispatch contract + dispatch-ledger — schemaful cross-agent delegation audit. |
+| [`doc_traversal_report.py`](doc_traversal_report.py) | Transcript-mining observability — governance-doc traversal report (T-1805). |
+| [`durable_commit_lint.py`](durable_commit_lint.py) | durable_commit_lint — structural guard that keeps the T-2334 concurrent-writer |
+| [`failed_unit_reconcile.py`](failed_unit_reconcile.py) | failed_unit_reconcile — find unit failures whose ALERT never arrived (T-2362). |
+| [`fleet_clone_currency_check.py`](fleet_clone_currency_check.py) | tools/fleet_clone_currency_check.py — fleet clone-currency check (T-2798, T-2794 option-b). |
 | [`fleet_health.py`](fleet_health.py) | Read-only fleet-health verification sweep (T-1049 — the *verifiable* half). |
+| [`fleet_host_health.py`](fleet_host_health.py) | tools/fleet_host_health.py — off-site availability poller for the home cluster (T-2454). |
 | [`fleet_reboot.py`](fleet_reboot.py) | tools/fleet_reboot.py — Recovery-driven coordinated fleet reboot orchestration (T-1049). |
+| [`forgejo_mirror_verify.py`](forgejo_mirror_verify.py) | forgejo_mirror_verify — prove the github-mirror repos actually hold what they claim (T-2217). |
+| [`forward_ref_gate.py`](forward_ref_gate.py) | Reject a commit message citing a ticket that does not exist yet. |
 | [`graveyard.py`](graveyard.py) | tools/graveyard.py — durable HANDOFF archive for Veneration session-selection (T-0766). |
+| [`handoff_conservation.py`](handoff_conservation.py) | tools/handoff_conservation.py — detect silent detail loss across a HANDOFF rewrite (T-2638). |
+| [`heartbeat_write.py`](heartbeat_write.py) | Write a per-agent liveness heartbeat file (ORG-048 D2a). |
 | [`hermes_diff_scan.py`](hermes_diff_scan.py) | Scan git unified-diff output for byte-sequence discipline violations. |
 | [`hermes_history_audit.py`](hermes_history_audit.py) | Whole-history HERMES byte-sequence audit. |
+| [`hermes_local_audit.py`](hermes_local_audit.py) | Local byte-sequence discipline audit — origin-side coverage without a runner (T-2392). |
 | [`ho_resumer.py`](ho_resumer.py) | HO auto-resumer — reads the limit-hit state file and fires claude --resume. |
 | [`hook_allowlist_lint.py`](hook_allowlist_lint.py) | Hook-allowlist pairing lint (T-1102). |
 | [`inbox_consumer.py`](inbox_consumer.py) | Pantheon inbox auto-consumer. |
+| [`json_safe_edit.py`](json_safe_edit.py) | Concurrency-safe read-modify-write for shared JSON config (T-2329). |
 | [`keep_going.py`](keep_going.py) | tools/keep_going.py — periodic anti-idle nudge for a standing agent (T-0772 sibling). |
 | [`kick_verify.py`](kick_verify.py) | tools/kick_verify.py — post-kick verification + bounded re-fire (T-0899). |
 | [`kino_pwa_autodeploy.py`](kino_pwa_autodeploy.py) | kino-pwa auto-redeploy poller (T-0316, the "kino-pull-cron variant"). |
 | [`knowledge_sweep.py`](knowledge_sweep.py) | Pantheon scripted knowledge-sweep driver (ORG-012 Phase C, T-0781). |
+| [`ledger_placement_lint.py`](ledger_placement_lint.py) | Lint ledger entries for correct ISO-week shard placement (T-2077). |
 | [`ledger_shard.py`](ledger_shard.py) | Shared ledger-shard helpers for the weekly-subfolder layout (T-0148). |
 | [`links.py`](links.py) | Pantheon typed-link traversal surface — read-only index/query over existing data. |
 | [`lint_report_day_index.py`](lint_report_day_index.py) | lint_report_day_index.py — assert watch-report day-index READMEs match disk. |
+| [`mail_staleness.py`](mail_staleness.py) | Per-inbox mail-staleness detection — the PURE half (T-2157). |
+| [`mail_staleness_monitor.py`](mail_staleness_monitor.py) | mail_staleness_monitor — the impure shell around `mail_staleness.detect()` (T-2157). |
 | [`mailbox.py`](mailbox.py) | tools/mailbox.py — daemonless per-agent file-mailbox (ORG-026, T-0772). |
 | [`mailbox_mcp.py`](mailbox_mcp.py) | tools/mailbox_mcp.py — MCP stdio server wrapping tools/mailbox.py (T-1112). |
+| [`mailbox_onboard.py`](mailbox_onboard.py) | T-2683: convergent, manifest-driven full-lifecycle installer for the ORG-026 |
 | [`mailbox_wake.py`](mailbox_wake.py) | tools/mailbox_wake.py — the wake half of the ORG-026 mailbox (T-0772 deployment layer). |
+| [`main_guard_lint.py`](main_guard_lint.py) | main_guard_lint — catch top-level definitions that sit AFTER a `__main__` guard. |
 | [`memory_index.py`](memory_index.py) | tools/memory_index.py — keep MEMORY.md's pin inventory drift-free (ORG-035 / T-1130). |
 | [`memory_lint.py`](memory_lint.py) | tools/memory_lint.py — validate an agent's auto-memory pins (ORG-035 baseline; T-1129). |
 | [`memory_provenance_backfill.py`](memory_provenance_backfill.py) | tools/memory_provenance_backfill.py — add ORG-035 provenance fields to memory pins (T-1131). |
 | [`memory_search.py`](memory_search.py) | tools/memory_search.py — rg-backed search over an agent's memory pins (ORG-035 / T-1129). |
+| [`memory_snapshot_coverage_monitor.py`](memory_snapshot_coverage_monitor.py) | Coverage monitor for the fleet's memory-snapshot guard (T-2838 / T-1871 rot). |
 | [`migrate_ledger_to_weekly_shards.py`](migrate_ledger_to_weekly_shards.py) | One-shot migration: flat ledger/2026.jsonl → weekly subfolder shards (T-0148). |
 | [`mint_telegram_sticker_set.py`](mint_telegram_sticker_set.py) | Mint Telegram sticker set(s) from assets/stickers/manifest.json (T-1002). |
+| [`mirror_drift_sweep.py`](mirror_drift_sweep.py) | Weekly mirror drift-sweep (T-1994). |
+| [`mirror_state.py`](mirror_state.py) | Mirror publish-state manager (T-1994). |
+| [`neutralize_seed.py`](neutralize_seed.py) | Build the pantheon-public seed from a pantheon-config source tree. |
 | [`pantheon_config_sync.py`](pantheon_config_sync.py) | pantheon-config bidirectional sync — T-0211 Phase B. |
+| [`persona_bringup.py`](persona_bringup.py) | Harness-neutral persona diagnosis and headless bring-up. |
+| [`persona_cutover_resolve.py`](persona_cutover_resolve.py) | T-2633: persona-generic identity resolver for tools/persona_cutover.sh and |
+| [`persona_installer.py`](persona_installer.py) | Manifest-driven, fail-closed Pantheon persona installer. |
+| [`pgrep_predicate_lint.py`](pgrep_predicate_lint.py) | pgrep_predicate_lint — flag cmdline-substring process predicates in repo scripts. |
 | [`policy_outflow_sync.py`](policy_outflow_sync.py) | tools/policy_outflow_sync.py — ORG-012 OUTFLOW: keep briefs pointed at changed policy. |
 | [`postprocess_ai_sticker_png.py`](postprocess_ai_sticker_png.py) | Convert built-in image_gen chroma-key PNGs into 512x512 RGBA stickers. |
+| [`probe_mailbox_lease_holders.py`](probe_mailbox_lease_holders.py) | — |
 | [`promote_lessons.py`](promote_lessons.py) | Lessons → hooks promotion pipeline — detector (T-0649), increment 2. |
 | [`promote_lessons_cron.py`](promote_lessons_cron.py) | Weekly promotion-pipeline runner (T-0649 inc 4). |
 | [`provision_context_fill_monitor_dropins.py`](provision_context_fill_monitor_dropins.py) | Provision + verify the context-fill-monitor per-agent enablement drop-ins (T-1214). |
 | [`provision_repos.py`](provision_repos.py) | provision_repos.py — T-0761 component 4: clone-on-demand repo provisioning. |
 | [`reboot_safety.py`](reboot_safety.py) | Read-only PRE-reboot safety check: is the fleet's work all committed + pushed? |
 | [`repo_registry.py`](repo_registry.py) | repo_registry.py — shared repos.yaml loader (T-1136). |
+| [`resource_sampler.py`](resource_sampler.py) | resource_sampler — per-process memory attribution, so the NEXT spike is diagnosable (T-2213). |
 | [`restart_drain.py`](restart_drain.py) | Pantheon restart drain — process tombstone files and fire graceful restarts. |
 | [`restart_request.py`](restart_request.py) | Pantheon restart request — operator-facing CLI to trigger a graceful agent restart. |
 | [`retro_metrics.py`](retro_metrics.py) | retro_metrics.py — one-time best-effort retro-extraction of the cycle-stats |
+| [`runtime_controller.py`](runtime_controller.py) | Deterministic Pantheon runtime controller for persistent persona harnesses. |
 | [`s3star_audit_runner.py`](s3star_audit_runner.py) | tools/s3star_audit_runner.py — HO-side scheduler for the ORG-038 System-3* |
+| [`scrub_graveyard_companions.py`](scrub_graveyard_companions.py) | Retroactively scrub credentials from existing graveyard companion archives (T-1683). |
 | [`seed_genericize.py`](seed_genericize.py) | seed_genericize.py — T-1327 (recurring weekly). |
+| [`seed_rebrand.py`](seed_rebrand.py) | seed_rebrand.py — official Pantheon seed rebrand tool (T-2072). |
 | [`session_reset_log.py`](session_reset_log.py) | session_reset_log — structured event log for session-reset class events. |
 | [`session_reset_reconcile.py`](session_reset_reconcile.py) | session_reset_reconcile — daily cron that lands session-reset jsonl entries |
 | [`soak_filer.py`](soak_filer.py) | Pantheon suite-health soak filer (T-0991 option b / T-0992). |
@@ -237,15 +295,67 @@ Canonical templates for the timer + service units. Install instructions in [`sys
 | [`spine_index_groom.py`](spine_index_groom.py) | Pantheon spine-index groomer — idempotent sentinel-region updater for all spine READMEs. |
 | [`stale_worktree_sweeper.py`](stale_worktree_sweeper.py) | Stale git-worktree sweeper (T-1324 part b / 2026-06-25 VPS disk-full). |
 | [`submit_verify.py`](submit_verify.py) | tools/submit_verify.py — harness-aware tmux submit-verify (T-1048). |
+| [`systemd_drift_lint.py`](systemd_drift_lint.py) | systemd_drift_lint — repo unit definitions vs the copies systemd actually loads. |
+| [`systemd_drift_sweep.py`](systemd_drift_sweep.py) | tools/systemd_drift_sweep.py — cross-account systemd unit-drift, from ONE seat (T-2444). |
+| [`t2381_live_acceptance.py`](t2381_live_acceptance.py) | Disposable real-user-manager acceptance helper for T-2381. |
+| [`t2382_live_acceptance.py`](t2382_live_acceptance.py) | Tamper-evident live acceptance recorder for T-2382 tests 55-59. |
+| [`t2582_live_telegram_accept.py`](t2582_live_telegram_accept.py) | tools/t2582_live_telegram_accept.py — gated live Telegram send-accept leg (T-2582). |
+| [`t2598_live_codex_login_check.py`](t2598_live_codex_login_check.py) | tools/t2598_live_codex_login_check.py — gated live codex login-screen |
+| [`t2611_recovery_persona_apply.py`](t2611_recovery_persona_apply.py) | T-2611 driver: install-done precondition + real persona_installer apply |
 | [`tempfile_hygiene_lint.py`](tempfile_hygiene_lint.py) | tempfile_hygiene_lint — catch test temp-DIR creations with no registered cleanup. |
 | [`ticket.py`](ticket.py) | Pantheon ticket lifecycle CLI. |
 | [`ticket_grooming.py`](ticket_grooming.py) | Pantheon ticket-grooming staleness scanner. |
 | [`ticket_lint.py`](ticket_lint.py) | Pantheon ticket-lint — hourly frontmatter format scanner and auto-fixer. |
 | [`ticket_state_sweep.py`](ticket_state_sweep.py) | Pantheon ticket-state ↔ ledger consistency sweep. |
+| [`tui_wedge_sampler.py`](tui_wedge_sampler.py) | Measure how long a HEALTHY agent can look wedged (T-1369, last branch). |
+| [`unit_failure_alert.py`](unit_failure_alert.py) | OnFailure handler: route a systemd unit failure into Recovery-triage (T-1868). |
+| [`urgent_escalation.py`](urgent_escalation.py) | tools/urgent_escalation.py — the escalation-ladder leg of severity=urgent |
 | [`usage_monitor.py`](usage_monitor.py) | Pantheon — usage monitor. |
-| [`vault_link_check.py`](vault_link_check.py) | Vault link check — verify every [[wikilink]] in the repo resolves for Obsidian (T-1597). |
+| [`vault_link_check.py`](vault_link_check.py) | Vault link check — verify every `[[wikilink]]` in the repo resolves for Obsidian (T-1597). |
 | [`veneration.py`](veneration.py) | tools/veneration.py — the resume-the-dead recovery harness (T-0766). |
+| [`verify_hub_cut.py`](verify_hub_cut.py) | Post-cut gate for the T-2156 hub rename: the OLD path must not survive as a |
+| [`verify_seed.py`](verify_seed.py) | verify_seed.py — T-1678, independent post-build seed verifier. |
 | [`watch_digest.py`](watch_digest.py) | Pantheon watch-loop digest. |
 | [`watch_runner.py`](watch_runner.py) | Pantheon watch-loop driver. |
 | [`weekly_ticket_summary.py`](weekly_ticket_summary.py) | Pantheon weekly ticket-summary generator. |
+| [`welltrod_stats.py`](welltrod_stats.py) | Well-trod pathing stats — recurring fleet doc-traversal snapshot (T-1811). |
 <!-- AUTOGEN-END spine-index -->
+
+
+## Running this suite (seed note)
+
+Either runner works from the repo root:
+
+```
+python3 -m unittest discover tools     # ~1.5 min
+pytest tools -q
+```
+
+**Expect ~28 failures on a freshly built seed.** They are triaged and expected —
+artifacts of neutralization, not defects. The rationale is in
+`bugs/seed-own-suite-expected-failures.md`; the machine-readable list is
+`bugs/seed-own-suite-expected-failures.manifest.json`.
+
+**Only `pytest` applies that manifest** and renders those cases as skips: the
+consumer is a root `conftest.py`, and `unittest` never reads `conftest.py`. Under
+`unittest discover` you simply see the ~28 raw. Neither view is wrong — the
+pytest one is the curated one.
+
+Failures **outside** the modules named in that manifest are real regressions.
+
+Two timing notes, because both have been misread as hangs: the full suite takes
+~1.5 min, and some single modules take 20-40s on their own. A probe with a short
+`timeout` will SIGTERM mid-run and look exactly like an indefinite hang.
+
+## Seed-build tooling is not shipped (seed note)
+
+The Index above is the upstream table, and five of its rows —
+`neutralize_seed.py`, `seed_genericize.py`, `verify_seed.py` and the two
+matching `test_*.py` — have **no file here**. That is deliberate, not a broken
+build: those are the tools that produce this seed *from* the upstream repo. They
+cannot be neutralized (their substitution tables hold the very tokens they
+rewrite, so a self-pass corrupts them), and shipping them un-neutralized would
+carry operator identity into this tree. A seed is not rebuilt from itself, so
+nothing here needs them. Their absence also means the four
+`TestSeedScrubCoversTheAccountClass` cases in `test_account_persona_map.py`
+skip, rather than fail, in this tree.

@@ -42,7 +42,7 @@ to the owner who actions it:
 
 | Item class | Target | Intent | Notes |
 |---|---|---|---|
-| **Goal-level** decision/direction (which-projects · externals · money · secrets/payments · account-and-access grants · un-defer of an operator-deferred phase · vault ranges he authored — per the goal-level bar) | `operator` | `action` (or `ratify` once a ratifiable artifact exists) | **MUST ALSO be lean-surfaced to the operator (Telegram/digest).** `target=operator` has NO auto-delivery surface — `inbox_consumer` is agent-only, `activity_digest` posts only RESOLVED, `ticket_state_sweep` surfaces only operator-MOOT — so a goal-level ticket parked at `operator` with no explicit surface **ROTS UNSEEN** (root cause of the T-1195–1198 rot, surfaced by Orchestrator's mailbox flag 2026-06-16). The ticket is the durable record; the lean-surface is how he actually learns of it. |
+| **Goal-level** decision/direction (which-projects · externals · money · secrets/payments · account-and-access grants · un-defer of an operator-deferred phase · vault ranges he authored — per the goal-level bar) | `operator` | `action` (or `ratify` once a ratifiable artifact exists) | **MUST ALSO be lean-surfaced to the operator (Telegram/digest).** As of `278573602` (T-2199) there IS a fallback surface: `watch_digest` renders a "Parked on you" section from any `target: operator` ticket in `inbox/`/`active/` older than 2 days, 5 per fire, oldest-first, suppressed 7 days after a receipt. It is a SAFETY NET, not a substitute — it drips 5/week against a backlog that has run to 23, so a goal-level item you leave to it may wait weeks. Surface it yourself if it matters now. **The other three gaps still hold:** `inbox_consumer` is agent-only, `activity_digest` posts only RESOLVED, `ticket_state_sweep` surfaces only operator-MOOT. ⚑ **IF YOU HAND-RELAY, YOU MUST WRITE THE RECEIPT** — `ticket.py annotate <tid> --note "lean-surfaced; <what you sent, where, when>"`. `last_lean_surface()` is the ONLY suppressor, and it needs `lean-surfaced` as a whole `;`-delimited segment. No receipt → the digest re-sends the same item within 7 days and **the operator receives it twice**, which is a D1 cost out of the document whose purpose is protecting D1. The ticket is the durable record; the lean-surface is how he actually learns of it. (Root cause of the T-1195–1198 rot, surfaced by Orchestrator's mailbox flag 2026-06-16.) |
 | **Below-goal "decision"** (methodology · SOP · lesson-curation · ADR-tier · architecture · org-shape · infra-enforcement · remediation) | the **owning agent** — ADOPT; do NOT route to `operator` | `action` | Per principles-as-ratification (msg-3733 / amended-D3): the owning agent ADOPTS it under P/D justification + ledger; route the BUILD to that agent; the operator's surface is a **digest, not a ratify-ask**. **NEVER park a below-goal "decision" as `target:operator`** — that mislabel + the no-auto-delivery gap above is exactly what rotted T-1195–1198. |
 | Build a concrete artifact (new SOP, lesson, ADR, promotion) | the owning agent | `action` | A goal-level/ratifiable-tier artifact then files its OWN `intent=ratify` ticket with `--ratifiable-file` (two-step; don't pre-file ratify for a not-yet-built artifact). A below-bar artifact terminates at **Adopted** (no ratify ticket). |
 | Demotion / supersedure-trail bookkeeping | the owning agent | `action` | HO-autonomous where applicable; group a single bookkeeping class into one ticket. |
@@ -86,9 +86,13 @@ enforces). A below-bar artifact terminates at **Adopted**, no ratify step.
   (T-1195–1198 sat until Orchestrator's mailbox flag found them). Adopt it + route the
   build to the owning agent instead.
 - **Filing a goal-level decision to `operator` with no lean-surface.** The ticket
-  is correct but invisible — `target:operator` does not auto-deliver. Always pair
-  it with a Telegram/digest surface; the ticket is the record, the surface is
-  delivery.
+  is correct but nearly invisible — `target:operator` has no *prompt* delivery.
+  T-2199's digest slot is a weeks-deep safety net, not delivery. Always pair a
+  goal-level filing with a Telegram/digest surface; the ticket is the record,
+  the surface is delivery.
+- **Hand-relaying without writing the receipt.** You told him; the digest does
+  not know that, so it tells him again inside 7 days. Stamp it:
+  `ticket.py annotate <tid> --note "lean-surfaced; ..."`.
 
 ## Cross-references
 

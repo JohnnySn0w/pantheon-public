@@ -47,11 +47,56 @@ _STAGING_DIR = "/home/the-ancestor/harvest"
 # is the backstop for every other caller. Shared shape lives in mailbox.is_safe_inbox.
 _safe_inbox = mailbox.is_safe_inbox
 
-# agent → its inbox (default reply target). Mirrors the per-agent account map.
-_AGENT_INBOX = {
-    "orchestrator": "/home/claude/inbox",
-    "specialist": "/home/claude-research/inbox",
-    "recovery": "/home/claude-fallback/inbox",
+# agent → its inbox (default reply target): the ORG-026 Path A hub subdir
+# /home/the-ancestor/mailbox/<persona>, the same box every other fleet consumer
+# addresses (inbox_consumer.MAILBOX_HUB, mailbox_wake.MAILBOX_HUB,
+# credential_expiry_monitor.RECOVERY_INBOX, disk_usage_monitor, s3star_audit_runner).
+# Until T-2252 this map still held the PRE-ORG-026 per-account `~/<home>/inbox`
+# paths, so a reply to a request carrying no explicit reply_inbox went to a
+# retired location — dead for orchestrator (that per-home path does not exist on its
+# account at all) and silently orphaned for specialist (8 messages found sitting in
+# one). Both failure modes are indistinguishable from success at the sender.
+#
+# SECURITY — DO NOT "SIMPLIFY" THIS INTO str(MAILBOX_HUB / agent). The reply
+# target below is resolved as
+#     (explicit if _safe_inbox(explicit) else None) or _AGENT_INBOX.get(agent)
+#                                                  or _AGENT_INBOX.get(sender)
+# and BOTH `agent` and `sender` come from the untrusted payload and are never
+# re-checked by _safe_inbox. The "trusted (constant) per-agent inbox map"
+# guarantee that comment claims holds ONLY because this is a CLOSED ENUMERATION:
+# an unknown or hostile name resolves to None and the message is dropped. Compute
+# the path instead and every string becomes derivable — the no-derivable-reply-inbox
+# DROP path dies and a traversal value becomes trusted-by-construction. Write the
+# paths out. test_ancestor_consume.InboxMapTest guards both halves.
+_AGENT_INBOX: dict[str, str] = {
+    "orchestrator": "/home/the-ancestor/mailbox/orchestrator",
+    "specialist": "/home/the-ancestor/mailbox/specialist",
+    "recovery": "/home/the-ancestor/mailbox/recovery",
+    # ORG-042 (second head) + ORG-043 (sub-orchestrator seats). Absent from this
+    # map they got NO default reply target at all — the same silent-skip class
+    # T-2144 caught in inbox_consumer's DELIVERY_MODE.
+    "mnemosyne": "/home/the-ancestor/mailbox/mnemosyne",
+    "metis": "/home/the-ancestor/mailbox/metis",
+    "atlas": "/home/the-ancestor/mailbox/atlas",
+    # codex is a provisioned hub box (formerly provision_mailbox.sh
+    # agent_user/agent_home carried a codex case; that script is retired --
+    # tools/mailbox_onboard.py, T-2683) and a "mailbox"-mode delivery target
+    # (inbox_consumer.DELIVERY_MODE), so it can both receive and be replied to.
+    # T-2144 is literally the ticket about codex going undelivered while nothing
+    # said so; omitting it here would recreate that class.
+    "codex": "/home/the-ancestor/mailbox/codex",
+}
+
+# Personas that intentionally have NO default reply target, with the reason.
+# Mirrors inbox_consumer.DELIVERY_EXEMPT (T-2144) in shape and in spirit: every
+# persona in the registry is an EXPLICIT DECISION — mapped above, or exempt here
+# with a stated reason — and none can be silently absent. Silence is the whole
+# defect class; a persona missing from both is a gap the coverage test fails on.
+_NO_REPLY_INBOX: dict[str, str] = {
+    "the-ancestor": (
+        "this daemon itself, not a peer it replies to; decommissioned 2026-07-28 "
+        "(T-2214) with account + hub box retained but no session to deliver into"
+    ),
 }
 
 
@@ -82,8 +127,10 @@ def make_handler(*, resurrect_fn=resurrect, send_fn=None, staging_dir: str = _ST
             # Never silently ack-drop a resume request: notify a discoverable inbox so the
             # requester learns it failed, instead of the message vanishing into cur/.
             if reply_inbox:
+                # T-2237(a): the requester is waiting on a resume that FAILED. An
+                # undelivered failure reply is indistinguishable from success.
                 send(reply_inbox, {"type": RESUME_FAILURE, "agent": agent, "detail": detail},
-                     sender="ancestor")
+                     sender="ancestor", severity="urgent")
                 print(f"[ancestor] resume_failure for {agent!r} → {reply_inbox}: {detail}", file=sys.stderr)
             else:
                 print(f"[ancestor] DROPPED {msg.get('id')} (no derivable reply inbox): {detail}",

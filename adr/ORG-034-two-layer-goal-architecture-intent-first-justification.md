@@ -4,6 +4,7 @@ id: ORG-034
 title: "Two-layer goal architecture — arc-intents as the missing justification tier"
 status: Adopted 2026-06-12 (operator-ratified live, Telegram msgs 3761–3767, "Make it so" msg 3767)
 date: 2026-06-12
+build_disposition: no-build-needed
 ---
 
 # ORG-034 — Two-layer goal architecture: arc-intents as the missing justification tier

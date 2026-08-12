@@ -3,6 +3,7 @@ aliases: [ORG-025]
 id: ORG-025
 title: Specialist orchestration model — interactive-session watch-orchestration with researcher-subagent dispatch (retires headless claude -p watch billing)
 status: Ratified 2026-05-29 by the operator (T-0696); trigger mechanism folded in per msg_2683
+build_disposition: built
 ---
 
 # ORG-025 — Specialist orchestration model: interactive-session watch-orchestration with researcher-subagent dispatch

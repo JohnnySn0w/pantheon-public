@@ -1,3 +1,8 @@
+---
+symptom: "A freshly-added pantheon-pwa worktree fails vitest immediately with TSCONFIG_ERROR 'Tsconfig not found' for tests/setup.ts - the suite never runs"
+fix: "Run bun install then svelte-kit sync in the new worktree; the generated .svelte-kit tsconfig is untracked so it does not come with the checkout"
+domain: pantheon-pwa, vitest, sveltekit, bun, worktree
+---
 # pantheon-pwa fresh worktree: vitest fails `Tsconfig not found` until `bun install` + `svelte-kit sync`
 
 **Symptom.** A freshly-staged `git worktree add` of pantheon-pwa fails its web test suite immediately:

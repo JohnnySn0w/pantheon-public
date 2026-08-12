@@ -26,6 +26,17 @@ Each agent calibrates from its own observed baseline (`usage_monitor.py --propos
 | **Specialist** (science) | **136,200,000** | p99 of non-zero 5h windows (shifted from p95 at T-1584) | T-1584 ratified by the operator 2026-07-06 (supersedes T-0409/18.67M) | 1507 non-zero windows over ~57d at re-eval | Cron `--alert-tokens 136200000` since 2026-07-07 (Specialist self-actuated, T-1591 trail) |
 | **Recovery** (fallback) | **308,000,000** | p99 of non-zero 5h windows | T-1584 ratified by the operator 2026-07-06 (supersedes T-0069/172M) | 2069 snapshots at re-eval (Recovery's own re-run) | Cron `--alert-tokens 308000000 --send-telegram` since 2026-07-07 (T-1485) |
 
+### Fleet-wide alert kinds (T-1875, landed 2026-07-21 — PROPOSED tier, not yet operator-ratified)
+
+Two new `usage_monitor` alert kinds shipped opt-in per PR #75. Numbers below are **PROPOSED** (implementer-recommended, HO-endorsed); the weekly-quota absolute is deliberately unset — Anthropic's real weekly cap is undisclosed, and no fabricated stand-in ships:
+
+| Alert kind | Flag / env | PROPOSED value | Status |
+|---|---|---|---|
+| Weekly-quota pacing | `--weekly-pacing-pct` / `PANTHEON_WEEKLY_PACING_PCT` | **20.0** (live default — relative heuristic: last-24h burn rate would eat >20% of the remaining 7d budget ≈ exhaustion within ~5 days) | Shipped as default; ratify or amend at next threshold re-eval |
+| Weekly-quota absolute | `--weekly-quota-tokens` / `PANTHEON_WEEKLY_QUOTA_TOKENS` | **none** — calibrate from `--propose-threshold`'s 7d percentiles once ≥14 non-zero 7d snapshots exist (explicitly a reference, not a suggestion) | Unset until the operator ratifies a number |
+| Cache-health ratio | `--cache-ratio-threshold` / env equivalent | **0.5** recommended starting trip-wire (creation:read; approaching 1.0 = cache rewritten more than reused, the TTL-regression shape) over a 24h window | Opt-in only; no history for the new fields yet — revisit when percentiles populate |
+| Hourly burn anomaly (T-1897, PR #81) | `--enable-anomaly-alert` + `--anomaly-sigma` / `--anomaly-min-samples` / `--anomaly-consecutive-hours` (env `PANTHEON_ANOMALY_*`) | **3.0 / 30 / 2** — sigma per the gap-analysis ask; n≥30 CLT floor; 2 consecutive complete hours filters single heavy-work spikes while catching sustained loop/injection burns | Alerting off by default (collection unconditional); calibration via `--propose-threshold` hourly block once ≥14 buckets; ratify or amend at next re-eval |
+
 ## Rationale per row
 
 ### Orchestrator — 170M (p99)
@@ -69,7 +80,7 @@ Ratified 2026-05-11 by the operator (msg_989 via T-0069). Followed the same perc
 ## Re-evaluate
 
 - **Per row:** 30 days post-ratification (first fleet-wide re-eval ratified 2026-07-06; next trigger ≈2026-08-05). Each agent re-runs `--propose-threshold` on accumulated data; HO compares to current value; amends this catalog if the recomputed value differs materially.
-- **Catalog-wide:** when a new long-lived agent joins the org (Echo resumed; new project starts).
+- **Catalog-wide:** when a new long-lived agent joins the org (Echo resumed; new project starts). **Fired 3× 2026-07-19/20 (T-1917 note):** mnemosyne (ORG-042), metis + atlas (ORG-043) have no rows yet — deliberate, not drift: each row needs accumulated non-zero 5h-window `usage.jsonl` data first, and catalog additions route via the `--propose-threshold` proposal flow per T-1875's resolution. Add the three rows when their first 30-day accumulation supports a proposal.
 - **Distribution-shape change:** if a row's non-zero distribution turns multi-modal-beyond-bimodal or the saturation cluster shifts >2× from the baseline, surface as a separate ticket.
 
 ## Cross-link

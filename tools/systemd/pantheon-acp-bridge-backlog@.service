@@ -1,0 +1,27 @@
+[Unit]
+Description=Pantheon ACP-bridge backlog watchdog for %i — ORG-031 Unit 2 (T-1633)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-1633.md
+
+# NOT auto-installed by any provision script. Template only, for a later,
+# SUPERVISED pilot-flip install alongside pantheon-acp-bridge@.service.
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
+# `sg pantheon-mailbox -c` is REQUIRED (T-1015, 2026-06-09), mirroring
+# pantheon-mailbox-wake@.service exactly: the Path-A hub
+# (/home/the-ancestor/mailbox/%i/new) is mode-2770 group pantheon-mailbox, but a
+# user-mode systemd service runs with ONLY the account's primary group (user
+# systemd cannot grant supplementary groups — SupplementaryGroups= fails 216
+# on --user units). Without the wrap the watchdog can't traverse the hub, and
+# its own read_backlog() distinguishes that failure (BacklogUnreadable ->
+# ALERT) from a genuinely empty/absent inbox — but this wrap is what avoids
+# hitting that failure path on every single fire in the first place.
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/acp_bridge_backlog_watchdog.py --agent %i --check"
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=90s

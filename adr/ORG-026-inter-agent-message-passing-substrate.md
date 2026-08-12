@@ -3,6 +3,7 @@ aliases: [ORG-026]
 id: ORG-026
 title: Inter-agent message-passing substrate — daemonless file-mailbox (Maildir) + systemd --user .path wake
 status: Ratified 2026-06-05 by the operator (amendment — §4 resolves to LIFT design/DIY, not adopt-dependency; attack-surface minimization)
+build_disposition: built
 ---
 
 # ORG-026 — Inter-agent message-passing substrate: daemonless file-mailbox (Maildir) + systemd `--user .path` wake

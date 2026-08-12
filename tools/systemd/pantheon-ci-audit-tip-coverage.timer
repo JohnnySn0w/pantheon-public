@@ -1,0 +1,21 @@
+[Unit]
+Description=Pantheon CI-audit tip coverage — hourly GitHub-side read of origin/main's audit state (T-2441)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# HOURLY, offset from recovery's liveness probe (:07) so the two signals are not sampled in the same
+# instant — they are meant to disagree, and reading them a half hour apart makes a divergence
+# easier to attribute than a simultaneous pair would.
+#
+# The period does not decide anything: a fresh push is silent under the 15m dispatch grace, and a
+# queued tip is silent under the 4h pending threshold. Those thresholds are what page; the period
+# only bounds how late the news is.
+OnCalendar=*-*-* *:37:00
+# Catch up after a reboot — a monitor that quietly skips its window while the host was down is
+# the failure mode the whole ci-audit family exists to prevent.
+Persistent=true
+RandomizedDelaySec=120
+Unit=pantheon-ci-audit-tip-coverage.service
+
+[Install]
+WantedBy=timers.target

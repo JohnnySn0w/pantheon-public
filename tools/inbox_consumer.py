@@ -21,7 +21,14 @@ session cutoff/reset/cap-hit-resume. The wedge-health-detection path
 Skip-reason vocab:
   off_switch / cap_hit / recent_telegram / dispatch_locked / stamp_write_failed /
   empty_inbox / dependency_blocked / interactive_required / not_before_unmet /
-  tmux_unreachable / inject_pending_paste
+  tmux_unreachable / inject_pending_paste / mailbox_unreachable
+
+Step 8's delivery is per-agent switchable (T-1828 R2, mirrors keep_going.py's
+T-1827 R1 DELIVERY_MODE shape): "send-keys" (default, unchanged tmux inject) or
+"mailbox" (routes the locked prompt through mailbox.send() instead — the
+ORG-031 ACP intake pilot). Only specialist is flipped; see DELIVERY_MODE below. A
+mailbox-send failure raises SkipCycle("mailbox_unreachable") — same alerting
+class as tmux_unreachable, not a silent fallback to send-keys.
 """
 
 from __future__ import annotations
@@ -76,7 +83,10 @@ CONSECUTIVE_SKIP_ALERT_THRESHOLD = 6
 #
 # Remaining vocabs that DO trigger the alert (genuinely stuck / real problems):
 #   off_switch / cap_hit / tmux_unreachable / inject_pending_paste /
-#   stamp_write_failed (T-0717: persistent write failure warrants surfacing)
+#   stamp_write_failed (T-0717: persistent write failure warrants surfacing) /
+#   mailbox_unreachable (T-1828 R2: a persistent mailbox-send failure for the
+#   "mailbox" DELIVERY_MODE agents is the same class of real infra problem as
+#   tmux_unreachable — deliberately NOT added here)
 #
 # mid_turn is no longer emitted from main() (T-0717: dispatch-gating pane
 # scrape replaced by auto_delivered mutex; check_mid_turn removed).
@@ -186,6 +196,32 @@ _AGENT_HEALTH_CONFIG: dict[str, dict] = {
         "is_bridge_client": False,
         # Detect wedges, alert the operator, do NOT send-keys to auto-resolve.
         "alert_only": True,
+    },
+    # T-1919: the ORG-043 sub-orchestrator seats. Both mirror the SPECIALIST shape —
+    # bare `claude` with no --channels, so never pantheon-bridge clients
+    # (is_bridge_client False), and NO alert_only: that flag is Recovery's
+    # no-backstop special case (T-0559), not a default for non-HO agents.
+    #
+    # PROBED since T-1940: Recovery's monitored tuple in main() includes both
+    # seats, so the recovery-gated health loop probes them each cycle (pane
+    # capture via `sudo -n -u <unix_user>`; session names verified live
+    # 2026-07-21: suborch1-main / suborch2-main). Posture: auto-resolve
+    # allowed, same as specialist — alert_only is Recovery's no-backstop special case
+    # only. The seats' own consumer cycles still read only
+    # TMUX_TARGET_BY_AGENT, not this map.
+    "metis": {
+        "pane_target": "suborch1-main:0",
+        "unix_user": "suborch1",
+        "last_alert_path": _PANTHEON_STATE_DIR / "metis_health_last_alert_at",
+        "wedge_state_path": _PANTHEON_STATE_DIR / "metis_pane_wedge_first_seen_at",
+        "is_bridge_client": False,
+    },
+    "atlas": {
+        "pane_target": "suborch2-main:0",
+        "unix_user": "suborch2",
+        "last_alert_path": _PANTHEON_STATE_DIR / "atlas_health_last_alert_at",
+        "wedge_state_path": _PANTHEON_STATE_DIR / "atlas_pane_wedge_first_seen_at",
+        "is_bridge_client": False,
     },
 }
 
@@ -611,7 +647,115 @@ TMUX_TARGET_BY_AGENT: dict[str, str] = {
     # tmux_unreachable on every Recovery consumer cycle.
     "recovery": os.environ.get("PANTHEON_RECOVERY_TMUX_TARGET", "claude-telegram-bot-fallback"),
     "specialist": os.environ.get("PANTHEON_SPECIALIST_TMUX_TARGET", "claude-research-bot"),
+    # T-1919: ORG-043 seats. BARE session names (no ":0" window suffix) — this
+    # map feeds _resolve_tmux_target, whose value goes to send_keys_submit.sh;
+    # the ":0"-suffixed form belongs in _AGENT_HEALTH_CONFIG["pane_target"].
+    # Without these entries _resolve_tmux_target falls back to
+    # f"claude-{agent}-bot" → "claude-metis-bot", which is not a live session,
+    # so every cycle would inject nowhere and skip tmux_unreachable.
+    # Verified live 2026-07-21: `tmux list-sessions` on suborch1 shows exactly
+    # "suborch1-main".
+    "metis": os.environ.get("PANTHEON_METIS_TMUX_TARGET", "suborch1-main"),
+    "atlas": os.environ.get("PANTHEON_ATLAS_TMUX_TARGET", "suborch2-main"),
 }
+
+# Per-agent delivery mode for the step-8 ticket-poke (T-1828 R2). Same shape as
+# tools/keep_going.py's DELIVERY_MODE (T-1827 R1): "send-keys" (default,
+# byte-identical legacy pane-inject via inject()) or "mailbox" (routes the
+# locked prompt through mailbox.send() instead — the ORG-031 ACP intake
+# pilot). ONLY specialist is flipped; every other agent, and any agent absent from
+# this map, fails open to "send-keys" via .get(agent, "send-keys") at the
+# deliver() call site — never KeyError. Rollback = flip the entry back.
+DELIVERY_MODE = {
+    "orchestrator": "send-keys",
+    "specialist": "mailbox",
+    "recovery": "send-keys",
+    # T-2146: mnemosyne is a PURE-ACP agent — her intake is the ACP bridge
+    # (acp_bridge.py --agent mnemosyne --inbox .../mnemosyne --poll-interval 5),
+    # not a claude TUI pane. Mailbox mode is therefore the only correct route:
+    # deliver() returns after send_mailbox() and never touches tmux_target, and
+    # the bridge picks the message up within ~5s, so a mailbox delivery IS the
+    # wake. She must NOT get a pantheon-mailbox-wake@mnemosyne timer — the
+    # mailbox_wake.AGENT_PANE entry for her points at
+    # claude-telegram-bot-exocortex:0, which is the operator's own conversation
+    # surface; a wake poke would send-keys into it.
+    #
+    # No _AGENT_HEALTH_CONFIG entry is needed (and a stub would be actively
+    # wrong): the pane-capture paths read it via .get() and fail soft to None,
+    # and the one bracket access (_send_keys path) is unreachable in mailbox
+    # mode.
+    "mnemosyne": "mailbox",
+    # T-2144 (2026-07-28): codex, same PURE-ACP shape as mnemosyne. It runs its
+    # own supervisor + sandbox (codex-daemon.service, codex-config MAILBOX.md),
+    # NOT a claude TUI pane, so a send-keys inject has nothing to inject into.
+    #
+    # The gate named in the old comment here — "which account runs its consumer
+    # unit (T-2142)" — is RESOLVED, verified rather than assumed: codex's own
+    # account carries a pantheon-config clone, working systemd user timers
+    # (pantheon-mailbox-wake@codex.timer fires every 5min) and the
+    # pantheon-unit-failure-alert@ OnFailure target. So the unit runs on codex's
+    # account, exactly like every other agent's.
+    #
+    # Mailbox delivery IS the wake for codex: unlike mnemosyne it DOES have a
+    # pantheon-mailbox-wake@codex timer, which is what turns a mailbox poke into
+    # an actual nudge. No _AGENT_HEALTH_CONFIG entry, for the same reason given
+    # above — the pane paths .get() to None and the bracket access is
+    # unreachable in mailbox mode.
+    "codex": "mailbox",
+    # metis + atlas were previously ABSENT from this map and fell through to the
+    # .get(agent, "send-keys") default. Listing them explicitly changes no
+    # behaviour — it makes the map total, so the coverage test below can tell
+    # "deliberately send-keys" apart from "nobody ever considered this persona",
+    # which is exactly the distinction that hid codex for its whole existence.
+    #
+    # send-keys is right for these two IF they are running: both are pane agents
+    # by design.
+    #
+    # ⚠️ THE OLD NOTE HERE SAID "neither has a live session today" (measured
+    # 2026-07-28) AND IT ROTTED WITHIN HOURS. Both sessions came up 2026-07-28
+    # 22:55 and have run since — re-measured 2026-08-02, ~4d20h uptime, tmux
+    # sessions suborch1-main / suborch2-main, both idle at a healthy prompt.
+    # T-2232 still carries the stale framing ("dormant seats") and its option (c),
+    # "mark both DELIVERY_EXEMPT as dormant-by-design", would have written that
+    # falsehood into the classification. Do not act on the dormancy framing
+    # without re-measuring first.
+    #
+    # A LIVENESS CLAIM IS NOT A FACT TO RECORD IN A COMMENT — it is a reading that
+    # decays. What is durable is where to take it again:
+    #     ps -u suborch1 -o pid,etime,cmd | grep claude
+    #     sudo -n -u suborch1 tmux list-sessions      (XDG_RUNTIME_DIR=/run/user/$(id -u))
+    # Deliberately NOT asserted by a test: these seats may legitimately go up or
+    # down, so a test pinning either state would fail on a correct change. The
+    # coverage test below asserts CLASSIFICATION, which is the part that should
+    # not drift silently.
+    #
+    # Standing, and independent of liveness: atlas has NO inbox-consumer timer at
+    # all — confirmed twice, once by per-account enumeration and once by its
+    # absence from the TG 6694 pause manifest, which captured every other seat's.
+    # metis HAS one, currently paused by that manifest. So a ticket filed at atlas
+    # still goes nowhere, and that is now a LIVE seat with no delivery rather than
+    # a dormant one. metis's consumer historically passed only because its queue
+    # was empty (journal: "skip:empty_inbox") — never reaching the inject step.
+    "metis": "send-keys",
+    "atlas": "send-keys",
+}
+
+
+# Personas that intentionally have NO ticket delivery, with the reason. Anything
+# NOT here and NOT in DELIVERY_MODE is a silent gap — see test_inbox_consumer's
+# delivery-coverage test, which exists because codex and mnemosyne each went
+# without ticket delivery for their whole existence and nothing said so (T-2144).
+# The gap was invisible precisely because their MAILBOXES worked: agent-to-agent
+# mail landed fine, only the ticket poke was missing.
+DELIVERY_EXEMPT: dict[str, str] = {
+    "the-ancestor": "daemon decommissioned 2026-07-28 (T-2214); account + hub retained, no session to poke",
+}
+
+# Mirrors keep_going.py's own local MAILBOX_HUB copy (ORG-026 Path A hub
+# convention) — kept as a small self-contained duplicate for the same
+# self-contained-import reason keep_going.py gives; if the hub path drifts,
+# update both.
+MAILBOX_HUB = Path("/home/the-ancestor/mailbox")
 
 IDLE_SENTINELS: tuple[str, ...] = (
     "? for shortcuts",        # idle, no task list
@@ -659,6 +803,15 @@ from tools._pane_predicates import (  # noqa: E402
     extract_trust_dialog_path,
 )
 
+# Dual-identity-safe import (mirrors tools/keep_going.py's own mailbox import,
+# T-1827 R1): `python -m unittest discover tools` (package identity
+# tools.mailbox) and a bare run from inside tools/ both resolve to ONE module
+# object.
+try:
+    from tools import mailbox  # noqa: E402
+except ImportError:  # bare run with cwd=tools/
+    import mailbox  # type: ignore  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Domain types.
@@ -689,6 +842,15 @@ class TicketInfo:
 # ---------------------------------------------------------------------------
 # Gating checks.
 # ---------------------------------------------------------------------------
+
+
+# T-2336: the stamp/clear git writes must serialize with every other lock-taking
+# writer on this shared checkout (ticket.py, grooming, watch_runner). Imported at
+# module level so tests can patch `tools.inbox_consumer.git_mutation_lock`.
+try:
+    from tools._git_utils import GitMutationLockTimeout, git_mutation_lock
+except ImportError:  # bare run with cwd=tools/
+    from _git_utils import GitMutationLockTimeout, git_mutation_lock  # type: ignore
 
 
 def check_autonomy_off() -> None:
@@ -1144,34 +1306,46 @@ def _stamp_auto_delivered(ticket: TicketInfo) -> bool:
         rel_path = ticket.path
 
     commit_msg = f"tickets: stamp auto_delivered on {ticket.id}"
-    # git add
-    add_result = subprocess.run(
-        ["sg", "pantheon-shared", "-c",
-         f"git -C {REPO_ROOT} add {rel_path}"],
-        capture_output=True, text=True, check=False,
-    )
-    if add_result.returncode != 0:
-        print(f"[inbox_consumer] _stamp_auto_delivered git add failed (stamp written locally;"
-              f" push skipped): {add_result.stderr}", file=sys.stderr)
-        return True  # write succeeded; inject should proceed
+    # T-2336: two defenses against the writer4 corruption (a bare pathspec-less
+    # `git commit` swallowing ANOTHER writer's staged files under this message):
+    #   1. the commit is PATHSPEC-scoped (`-- <rel_path>`), so foreign staged
+    #      files cannot enter this commit even if a writer bypasses the lock;
+    #   2. add+commit+push run under git_mutation_lock, serializing with every
+    #      lock-taking writer (ticket.py, grooming, watch_runner).
+    # Lock timeout degrades exactly like the other failures here: best-effort,
+    # log + return True — the local stamp write already established the mutex.
+    try:
+        with git_mutation_lock(label=f"stamp auto_delivered {ticket.id}"):
+            add_result = subprocess.run(
+                ["sg", "pantheon-shared", "-c",
+                 f"git -C {REPO_ROOT} add {rel_path}"],
+                capture_output=True, text=True, check=False,
+            )
+            if add_result.returncode != 0:
+                print(f"[inbox_consumer] _stamp_auto_delivered git add failed (stamp written locally;"
+                      f" push skipped): {add_result.stderr}", file=sys.stderr)
+                return True  # write succeeded; inject should proceed
 
-    # git commit
-    commit_result = subprocess.run(
-        ["sg", "pantheon-shared", "-c",
-         f"git -C {REPO_ROOT} commit -m {subprocess.list2cmdline([commit_msg])}"],
-        capture_output=True, text=True, check=False,
-    )
-    if commit_result.returncode != 0:
-        print(f"[inbox_consumer] _stamp_auto_delivered git commit failed (stamp written locally;"
-              f" push skipped): {commit_result.stderr}", file=sys.stderr)
-        return True  # write succeeded; inject should proceed
+            commit_result = subprocess.run(
+                ["sg", "pantheon-shared", "-c",
+                 f"git -C {REPO_ROOT} commit -m {subprocess.list2cmdline([commit_msg])}"
+                 f" -- {rel_path}"],
+                capture_output=True, text=True, check=False,
+            )
+            if commit_result.returncode != 0:
+                print(f"[inbox_consumer] _stamp_auto_delivered git commit failed (stamp written locally;"
+                      f" push skipped): {commit_result.stderr}", file=sys.stderr)
+                return True  # write succeeded; inject should proceed
 
-    # git push with retry on non-ff (fetch + rebase, up to 3 attempts)
-    from tools._git_utils import push_with_retry
-    ok, detail = push_with_retry(REPO_ROOT)
-    if not ok:
-        print(f"[inbox_consumer] _stamp_auto_delivered push failed (stamp committed locally;"
-              f" HO pull may need manual ff-only merge): {detail}", file=sys.stderr)
+            # git push with retry on non-ff (fetch + rebase, up to 3 attempts)
+            from tools._git_utils import push_with_retry
+            ok, detail = push_with_retry(REPO_ROOT)
+            if not ok:
+                print(f"[inbox_consumer] _stamp_auto_delivered push failed (stamp committed locally;"
+                      f" HO pull may need manual ff-only merge): {detail}", file=sys.stderr)
+    except GitMutationLockTimeout as exc:
+        print(f"[inbox_consumer] _stamp_auto_delivered lock timeout (stamp written locally;"
+              f" commit deferred to a later cycle): {exc}", file=sys.stderr)
     return True  # write succeeded; inject should proceed
 
 
@@ -1210,27 +1384,35 @@ def _clear_auto_delivered(ticket: TicketInfo) -> bool:
     except ValueError:
         rel_path = ticket.path
     commit_msg = f"tickets: clear stale auto_delivered on {ticket.id} (lock release)"
-    add_result = subprocess.run(
-        ["sg", "pantheon-shared", "-c", f"git -C {REPO_ROOT} add {rel_path}"],
-        capture_output=True, text=True, check=False,
-    )
-    if add_result.returncode != 0:
-        print(f"[inbox_consumer] _clear_auto_delivered git add failed (cleared locally;"
-              f" push skipped): {add_result.stderr}", file=sys.stderr)
-        return True
-    commit_result = subprocess.run(
-        ["sg", "pantheon-shared", "-c",
-         f"git -C {REPO_ROOT} commit -m {subprocess.list2cmdline([commit_msg])}"],
-        capture_output=True, text=True, check=False,
-    )
-    if commit_result.returncode != 0:
-        print(f"[inbox_consumer] _clear_auto_delivered git commit failed (cleared locally;"
-              f" push skipped): {commit_result.stderr}", file=sys.stderr)
-        return True
-    ok, detail = push_with_retry(REPO_ROOT)
-    if not ok:
-        print(f"[inbox_consumer] _clear_auto_delivered push failed (cleared + committed locally): {detail}",
-              file=sys.stderr)
+    # T-2336: pathspec-scoped commit + git_mutation_lock — same two defenses and
+    # the same best-effort degradation as _stamp_auto_delivered above.
+    try:
+        with git_mutation_lock(label=f"clear auto_delivered {ticket.id}"):
+            add_result = subprocess.run(
+                ["sg", "pantheon-shared", "-c", f"git -C {REPO_ROOT} add {rel_path}"],
+                capture_output=True, text=True, check=False,
+            )
+            if add_result.returncode != 0:
+                print(f"[inbox_consumer] _clear_auto_delivered git add failed (cleared locally;"
+                      f" push skipped): {add_result.stderr}", file=sys.stderr)
+                return True
+            commit_result = subprocess.run(
+                ["sg", "pantheon-shared", "-c",
+                 f"git -C {REPO_ROOT} commit -m {subprocess.list2cmdline([commit_msg])}"
+                 f" -- {rel_path}"],
+                capture_output=True, text=True, check=False,
+            )
+            if commit_result.returncode != 0:
+                print(f"[inbox_consumer] _clear_auto_delivered git commit failed (cleared locally;"
+                      f" push skipped): {commit_result.stderr}", file=sys.stderr)
+                return True
+            ok, detail = push_with_retry(REPO_ROOT)
+            if not ok:
+                print(f"[inbox_consumer] _clear_auto_delivered push failed (cleared + committed locally): {detail}",
+                      file=sys.stderr)
+    except GitMutationLockTimeout as exc:
+        print(f"[inbox_consumer] _clear_auto_delivered lock timeout (cleared locally;"
+              f" commit deferred to a later cycle): {exc}", file=sys.stderr)
     return True
 
 
@@ -1321,6 +1503,50 @@ def inject(tmux_target: str, prompt: str) -> None:
         raise SkipCycle("tmux_unreachable")
 
 
+def mailbox_inbox_for(agent: str) -> Path:
+    """The mailbox hub inbox path for `agent` (ORG-026 Path A convention). Pure,
+    no I/O. Mirrors keep_going.py's function of the same name (T-1827 R1)."""
+    return MAILBOX_HUB / agent
+
+
+def send_mailbox(agent: str, prompt: str, *, inbox: Path | None = None) -> bool:
+    """Deliver the locked ticket-poke prompt via mailbox.send() instead of a
+    pane inject (T-1828 R2, mirrors keep_going.py's send_mailbox, T-1827 R1).
+
+    payload is `prompt` VERBATIM (format_prompt()'s output) — it already
+    satisfies the design note's state-pointer invariant, so it is never
+    reworded for this delivery path. `inbox` overrides the default hub path
+    (tests only; production always uses mailbox_inbox_for(agent))."""
+    box = inbox if inbox is not None else mailbox_inbox_for(agent)
+    try:
+        # sender="inbox_consumer", not the account persona or "keep_going"
+        # (T-1935 forensics precedent, applied to this distinct producer):
+        # provenance should name the PRODUCER, and this is a different
+        # producer from keep_going.py's nudges. With mailbox.send()'s
+        # pending-window dedupe (T-1935, default on), an identical unconsumed
+        # resend collapses onto the existing message rather than piling up.
+        mailbox.send(str(box), prompt, sender="inbox_consumer", subject="ticket poke")
+        return True
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"[inbox_consumer] mailbox send error: {exc!r}", file=sys.stderr)
+        return False
+
+
+def deliver(agent: str, tmux_target: str, prompt: str) -> None:
+    """Delivery-mode dispatch for the step-8 ticket-poke (T-1828 R2). Mirrors
+    keep_going.py's deliver() dispatch (T-1827 R1): the decision logic in
+    main() above is identical for every agent; only this final step is
+    per-agent switchable. Fail-open to send-keys for any agent missing from
+    DELIVERY_MODE. A mailbox-send failure raises SkipCycle("mailbox_unreachable")
+    — same alerting class as inject()'s tmux_unreachable, not a silent
+    fallback to send-keys."""
+    if DELIVERY_MODE.get(agent, "send-keys") == "mailbox":
+        if not send_mailbox(agent, prompt):
+            raise SkipCycle("mailbox_unreachable")
+        return
+    inject(tmux_target, prompt)
+
+
 # ---------------------------------------------------------------------------
 # Active-queue tail-surface (T-0383).
 # ---------------------------------------------------------------------------
@@ -1408,10 +1634,23 @@ def surface_active_ticket(
     {agent, ticket_id}. State lives in `state_path` (JSON dict keyed by
     "{agent}:{tid}" -> ISO timestamp string).
 
-    Returns a log vocab string "active_surface:{tid}" on successful inject,
-    or None if nothing to surface (no tickets, all rate-limited, inject failed).
+    Returns a log vocab string "active_surface:{tid}" on successful delivery,
+    or None if nothing to surface (no tickets, all rate-limited, delivery failed).
 
-    Fail-open on inject errors — a surface failure must not break the skip path.
+    Delivery goes through deliver() (T-2065), so this reminder honours the same
+    per-agent DELIVERY_MODE as the step-8 new-ticket poke. Before T-2065 it
+    called inject() unconditionally, which left a mailbox-mode agent (specialist)
+    getting new-ticket pokes over the mailbox but this reminder over the very
+    tmux pane-inject path T-1828 R2 exists to move it off.
+
+    Redelivery-safe: the payload points at durable ticket state ("check status
+    on T-NNNN — in progress, blocked-with-reason, or resolve"), so a replayed
+    reminder re-reads the ticket and no-ops if it has since moved. The one
+    point-in-time assertion it carries is the ">24h no transition" claim, which
+    a delayed redelivery can render stale; that is cosmetic, not corrupting,
+    because the instruction is to CHECK state rather than to assume it.
+
+    Fail-open on delivery errors — a surface failure must not break the skip path.
     """
     active_tickets = _list_active_tickets_for_agent(agent)
     if not active_tickets:
@@ -1456,9 +1695,23 @@ def surface_active_ticket(
         # This ticket is eligible — surface it.
         prompt = _format_active_surface_prompt(ticket, agent)
         try:
-            inject(tmux_target, prompt)
-        except SkipCycle:
-            return None  # inject failed (tmux issue); skip quietly
+            deliver(agent, tmux_target, prompt)
+        except SkipCycle as exc:
+            # Fail-open is REQUIRED here and is not a copy of deliver()'s
+            # contract: this function runs *inside* main()'s `except SkipCycle`
+            # handler (the T-0383 tail-surface on an already-skipped cycle), so
+            # re-raising could not produce deliver()'s intended skip-alerting —
+            # nothing above re-handles it as a skip, and check_consecutive_skips
+            # has already fired for the ORIGINAL vocab. Raising would only
+            # surface as the caller's generic "active surface failed".
+            #
+            # But a mailbox outage must not read like a routine tmux hiccup, so
+            # the vocab is logged rather than swallowed anonymously (T-2065).
+            print(
+                f"[inbox_consumer] active surface delivery failed for {agent}: {exc.vocab}",
+                file=sys.stderr,
+            )
+            return None
 
         # Update state file.
         log[state_key] = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -1554,7 +1807,119 @@ def _send_telegram_alert(text: str) -> None:
         print(f"[inbox_consumer] telegram alert failed: {e}", file=sys.stderr)
 
 
-def _send_to_recovery_pane(text: str) -> bool:
+_RECOVERY_ROUTING_LOG_DEFAULT = Path.home() / ".local" / "log" / "pantheon" / "recovery_alert_routing.log"
+RECOVERY_ROUTING_LOG = _RECOVERY_ROUTING_LOG_DEFAULT
+
+
+def _in_test_context() -> bool:
+    """Structural test-context signal for the OBSERVABILITY log (T-2351).
+
+    Deliberately NOT `_live_telegram_suppressed()`. That function honours
+    `PANTHEON_DISABLE_LIVE_TELEGRAM`, and a test that wants to exercise the real
+    injection BODY sets it to '0' to force-send — which is legitimate (the
+    subprocess is mocked, nothing reaches a pane) but ALSO switched this log
+    back on, so the test's synthetic routing decisions were appended to the
+    production log. That override means "run the real body", never "record this
+    as production history".
+
+    So this reads only the signal a test cannot turn off in service of an
+    unrelated goal: the prod entry points do not import unittest/pytest
+    (verified against inbox_consumer and context_fill_monitor), so their
+    presence in sys.modules is the same low-false-positive marker documented on
+    `_live_telegram_suppressed`, minus the override.
+    """
+    return (
+        "unittest" in sys.modules
+        or "pytest" in sys.modules
+        or bool(os.environ.get("PYTEST_CURRENT_TEST"))
+    )
+
+
+def _log_recovery_routing(outcome: str, vocab: str, why: str) -> None:
+    """Append one line recording how an operational alert was routed (T-2206).
+
+    Deliberately a plain append-only text log, not a state JSON: the question
+    this exists to answer ("is the fallback rare, or is it quietly the primary
+    path?") is about a SEQUENCE over time, and a single-valued state file can
+    only ever hold the most recent decision.
+
+    Best-effort — logging must never be able to suppress an alert. Any failure
+    here is swallowed: the alert itself is the load-bearing side effect, and a
+    full disk should degrade our observability, not our paging.
+
+    T-2351 — WHY THE TEST-CONTEXT GATE BELOW EXISTS. This log is a MEASUREMENT
+    SURFACE, and it was measuring the test suite. 123 of its 136 lines on
+    2026-07-29 were synthetic: `TestSendToWardPaneHelperDelegation` force-sends
+    to exercise the real body and its four cases append
+    routed/fallback/routed/routed on every full-suite run. The real production
+    numbers underneath were 13 alerts, ALL routed, ZERO fallback.
+
+    That pollution was not cosmetic — it was READ AS DATA and cost two tickets.
+    T-2282 measured "103 routed / 24 fallback" and T-2351 was filed on it,
+    reporting 24 real peer alerts a day being paged to the operator instead of
+    reaching Recovery. None of them existed. The suite-run cadence even supplied a
+    convincing mechanism: the firings tracked Recovery's working hours (a 5.5h
+    overnight gap, resuming 06:32) because that is when Recovery RUNS TESTS — the
+    same correlation the "injection fails while Recovery is busy" hypothesis
+    predicted, with the causation inverted.
+
+    The gate is therefore structural, not a convention: write iff we are not
+    under a test harness, OR the caller has redirected the path away from the
+    production default. Tests that legitimately assert log CONTENT already
+    patch `RECOVERY_ROUTING_LOG` to a tmpdir and keep working unchanged; a test that
+    does not redirect cannot write to the production log even by accident, and a
+    future one inherits that for free. Same reasoning as
+    `test_suppressed_context_does_not_write_a_routing_line`, which already held
+    that logging a decision nothing acted on "would fabricate history" — this
+    closes the force-send hole in that rule.
+    """
+    if RECOVERY_ROUTING_LOG == _RECOVERY_ROUTING_LOG_DEFAULT and _in_test_context():
+        return
+    try:
+        RECOVERY_ROUTING_LOG.parent.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        line = f"{ts} {outcome} vocab={vocab!r} {why}\n"
+        with RECOVERY_ROUTING_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:  # noqa: BLE001 — observability must never break delivery
+        pass
+
+
+def _send_to_recovery_pane_diagnosed(text: str) -> tuple[bool, str]:
+    """_send_to_recovery_pane plus the REASON, for T-2206.
+
+    The original returned a bare bool built from `returncode == 0` while
+    capturing the helper's stdout and stderr and discarding both — so the
+    fallback was unattributable by construction. You could see THAT it had
+    bypassed Recovery (the prefix made that visible, correctly) but never WHY:
+    session-name drift, a pane present but wedged, and the probe itself
+    erroring were indistinguishable from the outside.
+
+    Returns (ok, why). `why` names the resolved target and, on failure, the
+    exit code plus a stderr tail — enough to tell those three apart without a
+    reproduction.
+    """
+    recovery_target = _resolve_tmux_target("recovery")
+    if _live_telegram_suppressed():
+        return True, f"target={recovery_target} suppressed=1"
+    try:
+        result = subprocess.run(
+            [str(_SEND_KEYS_HELPER), recovery_target, text],
+            capture_output=True, text=True, check=False,
+            env={**os.environ, "INJECT_ENTER_DELAY": str(INJECT_ENTER_DELAY)},
+        )
+    except OSError as exc:
+        # The probe itself failing is a THIRD failure mode, and the old bool
+        # could not express it — an exception here propagated instead of
+        # falling back, so an alert could be lost rather than rerouted.
+        return False, f"target={recovery_target} probe-error={exc!r}"
+    if result.returncode == 0:
+        return True, f"target={recovery_target} rc=0"
+    err = " ".join((result.stderr or "").split())[-400:]
+    return False, f"target={recovery_target} rc={result.returncode} stderr={err!r}"
+
+
+def _send_to_recovery_pane(text: str, vocab: str = "") -> bool:
     """Inject alert text into Recovery's tmux pane via send_keys_submit.sh.
 
     T-0538: delegates to tools/send_keys_submit.sh (single source of truth for
@@ -1569,6 +1934,11 @@ def _send_to_recovery_pane(text: str) -> bool:
     ~14-alert flood into Recovery's session during a full-discover run). Returns True
     (treat as a no-op delivery) under suppression so callers skip the fallback path.
     Opt back into the real body in a unit test via PANTHEON_DISABLE_LIVE_TELEGRAM=0.
+
+    T-2206: also records the routing decision AND its reason to
+    RECOVERY_ROUTING_LOG. Kept inside this function on purpose — it is the single
+    boundary every existing test already stubs, so a stubbed test suppresses
+    the injection and the log together, and no new mock surface is introduced.
     """
     if _live_telegram_suppressed():
         print(
@@ -1576,13 +1946,9 @@ def _send_to_recovery_pane(text: str) -> bool:
             file=sys.stderr,
         )
         return True
-    recovery_target = _resolve_tmux_target("recovery")
-    result = subprocess.run(
-        [str(_SEND_KEYS_HELPER), recovery_target, text],
-        capture_output=True, text=True, check=False,
-        env={**os.environ, "INJECT_ENTER_DELAY": str(INJECT_ENTER_DELAY)},
-    )
-    return result.returncode == 0
+    ok, why = _send_to_recovery_pane_diagnosed(text)
+    _log_recovery_routing("routed" if ok else "fallback", vocab, why)
+    return ok
 
 
 def count_consecutive_skips(agent: str) -> int:
@@ -1807,6 +2173,60 @@ def _bottom_region_shows_live_input(pane: str) -> bool:
     has_liveness = any(s in bottom for s in _WEDGE_LIVENESS_SENTINELS)
     has_footer = any(f in bottom for f in _WEDGE_DIALOG_FOOTERS)
     return has_liveness and not has_footer
+
+
+# Sentinels that mean "at an idle prompt", as distinct from "alive". The split is
+# already documented on _WEDGE_LIVENESS_SENTINELS above; this names it so callers
+# cannot collapse it by accident.
+_IDLE_AT_PROMPT_SENTINELS: tuple[str, ...] = (
+    "? for shortcuts",       # idle at prompt, no task list
+    "ctrl+t to hide tasks",  # idle at prompt, task list visible
+)
+_GENERATING_SENTINEL = "esc to interrupt"
+
+
+def pane_idle_state(pane: str) -> bool | None:
+    """THREE-state pane classification: True=idle at prompt, False=generating,
+    None=unknown. Built for T-2158 condition 5 and T-2157; deliberately lives
+    beside _bottom_region_shows_live_input so the two cannot drift apart.
+
+    WHY THIS IS NOT _bottom_region_shows_live_input, and why reusing that one
+    would be a bug: that predicate answers "is the TUI loop ALIVE (not blocked on
+    a modal)", and it is TRUE for a busily-generating agent — all three liveness
+    sentinels satisfy it. Correct for wedge detection, wrong here. A caller that
+    used it as an idle check would read a busy agent as idle: condition 5 would
+    re-kick it every sweep (kick spam), and a mail-backlog detector would alert on
+    healthy-busy-with-unread, which is the exact false positive the idle+unread
+    framing exists to eliminate.
+
+    None means UNKNOWN and callers MUST NOT act on it — same contract as
+    session_key(): "a flaky query must not cause kick spam". Unknown arises from an
+    empty/unreadable capture, a modal footer (the loop is blocked, so neither idle
+    nor generating is the right answer), or no recognised sentinel at all — which
+    is how a foreign substrate (codex's different TUI, mnemosyne's absent pane)
+    degrades to today's behaviour rather than to noise.
+
+    Reads only the bottom region, and preserves the _WEDGE_DIALOG_FOOTERS
+    exclusion, for the T-0716 reason: a sentinel appearing in SCROLLBACK — a
+    captured peer dialog, or an alert quoting the sentinel verbatim — must not be
+    read as the pane's current state.
+    """
+    if not pane or not pane.strip():
+        return None
+    non_blank = [ln for ln in pane.splitlines() if ln.strip()]
+    bottom = "\n".join(non_blank[-_WEDGE_BOTTOM_REGION_LINES:])
+    if any(f in bottom for f in _WEDGE_DIALOG_FOOTERS):
+        return None  # blocked on a modal — neither idle nor generating
+    # PRECEDENCE IS DELIBERATE — do not reorder. A pane can show BOTH a task-list
+    # line and "esc to interrupt"; generating must win. The asymmetry is the point:
+    # a busy agent misread as idle causes kick spam and false alerts, while an idle
+    # agent misread as busy costs one wasted sample. Pinned by
+    # test_generating_wins_when_both_sentinels_present.
+    if _GENERATING_SENTINEL in bottom:
+        return False
+    if any(s in bottom for s in _IDLE_AT_PROMPT_SENTINELS):
+        return True
+    return None
 
 
 def _check_pane_wedge_persistent() -> tuple[str, str] | None:
@@ -2183,6 +2603,71 @@ def _send_telegram_info(text: str) -> None:
     _send_telegram_alert(text)
 
 
+# T-2237 rev2 part 2: per-vocab cooldown for the `[recovery routed]` AUDIT pings.
+# 6h, so a class that alerts all day still surfaces to the operator a few times —
+# long enough to collapse a flood, short enough that the routing never goes
+# silently dark on him. Vocab is deliberately the key and is low-cardinality by
+# construction (a fixed class name, usually plus the agent), so this collapses
+# repeats WITHIN a class without ever hiding a class he has not heard about.
+ROUTED_AUDIT_COOLDOWN_SECONDS = int(
+    os.environ.get("PANTHEON_ROUTED_AUDIT_COOLDOWN_SECONDS", str(6 * 3600)))
+_ROUTED_AUDIT_STATE_PATH_DEFAULT = _PANTHEON_STATE_DIR / "recovery_routed_audit_last_at.json"
+ROUTED_AUDIT_STATE_PATH = _ROUTED_AUDIT_STATE_PATH_DEFAULT
+
+
+def _routed_audit_state_is_production(path: Path | None) -> bool:
+    """True iff we would touch Recovery's REAL throttle state from a test harness.
+
+    Same structural gate as `_log_recovery_routing`, for the same reason it exists:
+    a test that does not redirect the path must not be able to reach production
+    state even by accident. Here the failure would be quieter than that incident
+    and worse — a suite run would stamp cooldowns that then SUPPRESS real audit
+    pings to the operator, and the missing pings look exactly like an absence of
+    alerts. Reads are gated too, so tests never inherit Recovery's live cooldowns
+    and stay deterministic.
+    """
+    effective = ROUTED_AUDIT_STATE_PATH if path is None else path
+    return effective == _ROUTED_AUDIT_STATE_PATH_DEFAULT and _in_test_context()
+
+
+def _load_routed_audit_state(path: Path | None = None) -> dict:
+    """{vocab: last_audit_epoch}. Any unreadable/wrong shape degrades to empty —
+    this gates a NOTIFICATION, so failing toward sending is the safe direction."""
+    if _routed_audit_state_is_production(path):
+        return {}
+    p = ROUTED_AUDIT_STATE_PATH if path is None else path
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(v, (int, float))}
+
+
+def _routed_audit_throttled(vocab: str, path: Path | None = None) -> bool:
+    last = _load_routed_audit_state(path).get(vocab)
+    if not isinstance(last, (int, float)):
+        return False
+    return (time.time() - last) < ROUTED_AUDIT_COOLDOWN_SECONDS
+
+
+def _record_routed_audit(vocab: str, path: Path | None = None) -> None:
+    if _routed_audit_state_is_production(path):
+        return
+    p = ROUTED_AUDIT_STATE_PATH if path is None else path
+    state = _load_routed_audit_state(p)
+    state[vocab] = time.time()
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        # A state-write failure must not swallow the audit that follows it, and
+        # must not break routing. Worst case we under-throttle — the old behaviour.
+        print(f"[inbox_consumer] routed-audit state write failed: {exc!r}",
+              file=sys.stderr)
+
+
 def _send_alert_via_recovery(msg: str, vocab: str) -> None:
     """Route an OPERATIONAL alert to Recovery's pane first; audit-Telegram on success,
     fallback-Telegram on recovery-pane failure.
@@ -2205,10 +2690,38 @@ def _send_alert_via_recovery(msg: str, vocab: str) -> None:
     digests, activity digests). Those keep going direct to the operator per the
     user-facing-message-vs-operational-alert distinction.
     """
-    if _send_to_recovery_pane(msg):
+    # T-2206: routing outcome + reason are recorded inside _send_to_recovery_pane
+    # (which stays the single mockable boundary, so existing tests that stub it
+    # keep suppressing both the injection AND the log).
+    if _send_to_recovery_pane(msg, vocab=vocab):
+        # T-2237 rev2 part 2: the AUDIT ping is throttled per vocab; the pane
+        # injection above is NOT. The audit says "Recovery has this, you are not on
+        # the decision path" — that is a standing fact about the routing, not a
+        # per-alert event, so N alerts of one class in a window are worth one
+        # ping, not N. On 2026-08-02 the operator got "a ton" of these: every
+        # mail_staleness alert (one per inbox, every 5 minutes) minted its own.
+        # Suppressing the audit costs nothing recoverable — Recovery already has the
+        # alert, and the fallback path below is deliberately untouched.
+        if _routed_audit_throttled(vocab):
+            return
+        _record_routed_audit(vocab)
+        # Lead the operator ping with the alert's OWN first line — it already names
+        # the affected channel/agent + symptom (e.g. "📵 [channel-liveness] specialist:
+        # inbound Telegram poller DOWN …"). The prior audit interpolated only {vocab}
+        # ("channel-liveness alert delivered to Recovery's pane"), so the operator couldn't tell
+        # WHICH channel was alerting (his feedback, Telegram msg 5380, 2026-08-07).
+        # Still the lightweight "Recovery's handling it, you're not on the decision path"
+        # note — just no longer detail-stripped. Cap the summary so a verbose first
+        # line can't blow up the ping; fall back to the {vocab} form if msg is empty.
+        summary = ""
+        if msg and msg.strip():
+            summary = msg.strip().splitlines()[0].strip()
+        if len(summary) > 240:
+            summary = summary[:237] + "..."
         audit = (
-            f"[recovery routed] {vocab} alert delivered to Recovery's pane."
-            f" See Recovery for action."
+            (f"{summary}\n" if summary else f"[{vocab}] alert\n")
+            + "[recovery routed] → Recovery is handling this; you're not on the decision path."
+            " See Recovery for action."
         )
         _send_telegram_info(audit)
     else:
@@ -2588,7 +3101,10 @@ def main(agent: str) -> int:
         # the auto-resolve send-keys path — detect+alert only until a
         # Layer-2 watcher-of-the-watcher backstop exists (no-backstop
         # safety constraint, T-0555 Layer 2 unbuilt).
-        for monitored in ("orchestrator", "specialist", "recovery"):
+        # T-1940: metis/atlas (ORG-043 seats) probed like specialist — auto-resolve
+        # allowed (no alert_only: that flag is Recovery's no-backstop special case;
+        # the seats have external recovery — Recovery holds sudo into both).
+        for monitored in ("orchestrator", "specialist", "recovery", "metis", "atlas"):
             try:
                 agent_vocab = check_agent_health(monitored)
                 if agent_vocab is not None:
@@ -2621,16 +3137,38 @@ def main(agent: str) -> int:
         tickets = list_eligible_tickets(agent)
         ticket = pick_ticket(tickets)
         prompt = format_prompt(ticket, agent)
-        # T-0717: stamp BEFORE inject. Two failure modes:
-        #   - Write failure (False) → fail-CLOSED: raise SkipCycle('stamp_write_failed');
-        #     do NOT inject. Without the stamp on disk, the mutex is absent next cycle
-        #     and a second injection could follow. Clean retry on the next cycle fire.
-        #   - Commit/push failure (True) → proceed: local write established the mutex
-        #     for this agent's own consumer. Inject happens; push failure is logged.
-        stamp_ok = _stamp_auto_delivered(ticket)
-        if not stamp_ok:
-            raise SkipCycle("stamp_write_failed")
-        inject(tmux_target, prompt)
+        # T-2152: DELIVER FIRST, THEN STAMP. This reverses T-0717's order, which
+        # stamped first to guarantee "never deliver twice" — but that traded a benign
+        # failure for a sticky one, and the sticky one fired on 2026-07-28 (mnemosyne,
+        # T-1825): delivery raised, the stamp survived, check_dispatch_locked then
+        # treated a poke that never arrived as in-flight and blocked her ENTIRE queue
+        # until the 8h AUTO_DELIVERED_STALE_SECONDS backstop.
+        #
+        # Both orders have a failure mode; they are not symmetric:
+        #   - stamp-then-deliver  → delivery fails ⇒ PHANTOM-DELIVERED. Queue blocked
+        #     8h. Silent (dispatch_locked is in NEVER_ALERT_SKIP_VOCABS, correctly, for
+        #     the genuinely-in-flight case). Not self-healing.
+        #   - deliver-then-stamp  → stamp fails ⇒ possible RE-DELIVERY next cycle.
+        #     Self-healing, and already defended in depth: the payload is a durable
+        #     state-pointer (T-1828 R2), mailbox.send()'s dedupe_pending collapses an
+        #     identical unconsumed resend (T-1935), and ticket.py's claim guard refuses
+        #     a second claim on a non-inbox ticket.
+        #
+        # So the surviving risk is idempotent and guarded, where the old one was neither.
+        # This is also what makes the one-cycle code-staleness window safe (a fresh
+        # process can re-run a failed delivery); with the old order, any transient
+        # delivery failure became a persistent block.
+        deliver(agent, tmux_target, prompt)
+        if not _stamp_auto_delivered(ticket):
+            # The agent HAS been poked — do not raise, that would log this as a skip
+            # and hide a delivery that happened. Loud, because an unstamped delivery
+            # means the next cycle may legitimately re-poke.
+            print(
+                f"[inbox_consumer] {agent}: WARNING delivered {ticket.id} but "
+                f"auto_delivered stamp FAILED — mutex not set; next cycle may re-deliver "
+                f"(safe: payload is a durable state-pointer)",
+                file=sys.stderr,
+            )
         outcome = f"pulled {ticket.id}"
         log_outcome(agent, outcome)
         print(f"[inbox_consumer] {agent}: {outcome}")
@@ -2674,6 +3212,15 @@ def main(agent: str) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Pantheon inbox auto-consumer.")
-    parser.add_argument("--agent", required=True, help="Agent name (orchestrator, specialist, recovery).")
+    parser.add_argument(
+        "--agent",
+        required=True,
+        # T-2144: this string is the surface that would have made the codex and
+        # mnemosyne gaps visible, and it was stale for as long as the gaps existed.
+        # Keep it in sync with DELIVERY_MODE — the coverage test enforces that.
+        help=("Agent name (orchestrator, specialist, recovery, metis, atlas, mnemosyne, codex). "
+              "mnemosyne and codex are mailbox-delivery (pure-ACP / own supervisor); "
+              "see DELIVERY_MODE."),
+    )
     args = parser.parse_args()
     sys.exit(main(args.agent))

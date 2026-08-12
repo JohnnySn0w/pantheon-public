@@ -47,9 +47,20 @@ setup_sandbox() {
   echo "0" > "$SBX/restart_exitcode"        # what `systemctl restart` returns
   echo "0" > "$SBX/lock_held"               # 1 = flock should fail
   echo "" > "$SBX/pane_text"                # what capture-pane will print
+  echo "0" > "$SBX/pane_in_mode"            # T-2268: #{pane_in_mode} for display-message
   echo "0" > "$SBX/sendkeys_calls"          # incremented by send-keys fake
   : > "$SBX/sendkeys_args"                  # one line per send-keys invocation
   : > "$SBX/restart_args"                   # arg string of restart invocation
+  # T-2658: control-plane branch state. session_live drives both `tmux has-
+  # session` and whether `kill-session` actually takes (see kill_session_
+  # survives below). tmux_server_pid/proc fixture back `-N list-sessions` +
+  # runtime_scope_owned_and_session_live's cgroup read. Bespoke-path tests
+  # never touch any of this.
+  echo "1" > "$SBX/session_live"            # 1 = has-session succeeds (session present)
+  echo "0" > "$SBX/kill_session_survives"   # 1 = session_live stays 1 even after kill-session
+  : > "$SBX/kill_session_calls"             # one line per kill-session invocation
+  mkdir -p "$SBX/proc"
+  export HANDOFF_RESTART_PROC_ROOT="$SBX/proc"
 
   # Fake stat: only handles `-c %Y <path>`.
   cat > "$FAKEBIN/stat" <<EOF
@@ -83,6 +94,16 @@ case "\${args[0]:-}" in
     ;;
   restart)
     echo "\${args[*]}" >> "$SBX/restart_args"
+    # T-2658: model the REAL blocking semantics of a Type=oneshot
+    # pantheon-persona-consume@<persona> restart — by the time the blocking
+    # systemctl-restart call returns, persona_bringup.py consume ->
+    # ensure_runtime already created the fresh session, so the
+    # control-plane readiness poll should normally find it live immediately.
+    # A test omits session_live_after_restart to model "still not live even
+    # after restart returned" (the scope-liveness timeout path).
+    if [[ -f "$SBX/session_live_after_restart" ]]; then
+      echo "\$(cat "$SBX/session_live_after_restart")" > "$SBX/session_live"
+    fi
     exit \$(cat "$SBX/restart_exitcode")
     ;;
   *)
@@ -93,11 +114,58 @@ esac
 EOF
   chmod +x "$FAKEBIN/systemctl"
 
-  # Fake tmux: handles `send-keys` and `capture-pane`.
+  # Fake tmux: handles the T-2259 delivery path plus `send-keys`/`capture-pane`.
+  #
+  # T-2319: this fake went stale the moment T-2259 changed HOW text is delivered.
+  # send_keys_submit no longer does `send-keys -l "$text"` — it now does
+  # `copy-mode -q`, then `load-buffer` (text on STDIN, as opaque bytes so
+  # semicolons cannot be re-parsed as tmux commands), then `paste-buffer`, and
+  # send-keys carries only the Enter. The fake handled none of those, so
+  # load-buffer hit the `*)` arm, exited 2, and every test that delivers a
+  # prompt failed — 29 of 33. The SUT was fine; the harness was measuring a
+  # mechanism that no longer existed.
+  #
+  # A delivery is recorded in the SAME place `send-keys -l` used to write, so
+  # the existing count and content assertions keep measuring the same property:
+  # one delivery + one Enter = 2 calls, exactly as before T-2259.
   cat > "$FAKEBIN/tmux" <<EOF
 #!/bin/bash
 # Sandbox state at: $SBX
 case "\${1:-}" in
+  display-message)
+    # T-2268: send_keys_submit asks #{pane_in_mode} BEFORE trusting capture-pane,
+    # and its fallback is \`|| echo 1\` — untrustworthy — precisely so an
+    # unreadable answer can never false-pass. So an unhandled display-message
+    # here does not merely skip a check, it makes every delivery decline to
+    # verify and fail. Driven by a sandbox file so a test can simulate a pane
+    # sitting in copy-mode at verify time.
+    cat "$SBX/pane_in_mode" 2>/dev/null || echo 0
+    exit 0
+    ;;
+  copy-mode)
+    # T-2259 precondition (cancel any mode before pasting). No-op here, but it
+    # MUST be accepted: it is the first tmux call of every delivery.
+    exit 0
+    ;;
+  load-buffer)
+    # The text arrives on STDIN now, not in argv.
+    cat > "$SBX/tmux_buffer"
+    exit 0
+    ;;
+  paste-buffer)
+    n=\$(cat "$SBX/sendkeys_calls")
+    echo "\$((n+1))" > "$SBX/sendkeys_calls"
+    text=\$(cat "$SBX/tmux_buffer" 2>/dev/null)
+    { echo "\$* -- pasted:"; echo "\$text"; } >> "$SBX/sendkeys_args"
+    # T-0721: the boot-dialog dismiss is send_keys_submit "\$pane" "1", so the
+    # "1" is now PASTED rather than sent as \`-l 1\`. Detect it here.
+    if [[ "\$text" == "1" ]]; then echo 1 > "$SBX/boot_dismissed"; fi
+    # T-0899: kick token likewise now arrives via the buffer.
+    if [[ -f "$SBX/kick_busy_token" ]] && grep -qF "\$(cat "$SBX/kick_busy_token")" <<<"\$text"; then
+      echo 1 > "$SBX/kick_sent"
+    fi
+    exit 0
+    ;;
   send-keys)
     n=\$(cat "$SBX/sendkeys_calls")
     echo "\$((n+1))" > "$SBX/sendkeys_calls"
@@ -126,6 +194,30 @@ case "\${1:-}" in
       cat "$SBX/pane_text"
     fi
     exit 0
+    ;;
+  kill-session)
+    # T-2658: control-plane step 5's pre-restart teardown. Records the call;
+    # flips session_live to 0 UNLESS kill_session_survives=1 (models the
+    # abort-if-survived path).
+    echo call >> "$SBX/kill_session_calls"
+    survives=\$(cat "$SBX/kill_session_survives" 2>/dev/null || echo 0)
+    [[ "\$survives" == 1 ]] || echo 0 > "$SBX/session_live"
+    exit 0
+    ;;
+  has-session)
+    # T-2658: control-plane step 5's abort-if-survived check.
+    live=\$(cat "$SBX/session_live" 2>/dev/null || echo 1)
+    [[ "\$live" == 1 ]] && exit 0 || exit 1
+    ;;
+  -N)
+    # T-2658: runtime_scope_owned_and_session_live's server-pid probe
+    # (-N list-sessions -F #{pid}, via t2590_cutover_verify_lib.sh, sourced
+    # by the SUT). Empty output (no pid file written) models "no server".
+    if [[ "\${2:-}" == list-sessions ]]; then
+      cat "$SBX/tmux_server_pid" 2>/dev/null || true
+      exit 0
+    fi
+    exit 2
     ;;
   *)
     echo "fake tmux: unhandled subcommand \${1:-}" >&2
@@ -493,6 +585,77 @@ postcheck_isactive_fail() {
   return 0
 }
 
+# ---------------------------------------------------------------------------
+# T-2658: control-plane branch (--supervisor control-plane). Step 5 kills the
+# target session before restarting the (caller-resolved) consume unit; step 6
+# polls runtime_scope_owned_and_session_live instead of `systemctl is-active`.
+# ---------------------------------------------------------------------------
+
+# write_scope_fixture <pid> — synthetic /proc/<pid>/cgroup line the control-
+# plane tests point HANDOFF_RESTART_PROC_ROOT at (set unconditionally in
+# setup_sandbox to $SBX/proc), matching runtime_scope_owned_and_session_live's
+# real cgroup-membership read.
+write_scope_fixture() {
+  local pid="$1"
+  echo "$pid" > "$SBX/tmux_server_pid"
+  mkdir -p "$SBX/proc/$pid"
+  echo "0::/user.slice/user-1002.slice/user@1002.service/app.slice/pantheon-runtime-tmux.scope" \
+    > "$SBX/proc/$pid/cgroup"
+}
+
+# --- 5cp: happy path — kill-session, consume-unit restart, scope-live poll. -
+preflight_control_plane_happy() {
+  preflight_happy
+  write_scope_fixture 777
+  # Models the real blocking-oneshot semantics: by the time `systemctl
+  # restart` returns, ensure_runtime() already created the fresh session.
+  echo "1" > "$SBX/session_live_after_restart"
+}
+postcheck_control_plane_happy() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  local n; n=$(wc -l < "$SBX/kill_session_calls")
+  [[ "$n" -ge 1 ]] || { echo "    expected kill-session >=1, got $n"; return 1; }
+  grep -q "pantheon-persona-consume@specialist.service" "$SBX/restart_args" \
+    || { echo "    expected consume unit in restart_args: $(cat "$SBX/restart_args")"; return 1; }
+  grep -q "control-plane: killed session" "$SBX/stdout" \
+    || { echo "    expected 'control-plane: killed session' log line"; return 1; }
+  grep -q "runtime scope/session live" "$SBX/stdout" \
+    || { echo "    expected 'runtime scope/session live' log line"; return 1; }
+  return 0
+}
+
+# --- 5cp-b: session survives kill-session -> abort (exit 5), no restart. ----
+preflight_control_plane_kill_survives() {
+  preflight_happy
+  echo "1" > "$SBX/kill_session_survives"
+}
+postcheck_control_plane_kill_survives() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  local n; n=$(wc -l < "$SBX/kill_session_calls")
+  [[ "$n" -ge 1 ]] || { echo "    expected kill-session >=1, got $n"; return 1; }
+  if [[ -s "$SBX/restart_args" ]]; then
+    echo "    must NOT restart when the session survived kill-session, but restart_args has: $(cat "$SBX/restart_args")"
+    return 1
+  fi
+  grep -q "survived kill-session" "$SBX/stdout" "$SBX/stderr" \
+    || { echo "    expected 'survived kill-session' in stdout/stderr"; return 1; }
+  return 0
+}
+
+# --- 5cp-c: scope/session never live after restart -> timeout (exit 6). ----
+preflight_control_plane_scope_timeout() {
+  preflight_happy
+  write_scope_fixture 777
+  # No session_live_after_restart write: session stays dead post-restart, so
+  # the readiness poll exhausts STEADY_TIMEOUT (2s per COMMON_ARGS).
+}
+postcheck_control_plane_scope_timeout() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  grep -q "runtime scope/session-live timeout" "$SBX/stdout" "$SBX/stderr" \
+    || { echo "    expected 'runtime scope/session-live timeout' in stdout/stderr"; return 1; }
+  return 0
+}
+
 # --- 6: Steady-state pane never shows sentinel. -----------------------------
 preflight_steady_timeout() {
   (
@@ -657,8 +820,12 @@ postcheck_boot_dialog_dismiss() {
     echo "  (expected inline boot-dialog dismiss, none logged)"
     return 1
   fi
-  if ! grep -q -- "-l 1" "$SBX/sendkeys_args"; then
-    echo "  (expected a '1' send-keys for the dismiss)"
+  # T-2319: the dismiss is send_keys_submit "$pane" "1", so since T-2259 the
+  # "1" is PASTED (load-buffer/paste-buffer), never sent as `-l 1`. Assert on
+  # the delivered TEXT — which is the property that always mattered — rather
+  # than on the tmux verb that happened to carry it in 2026.
+  if ! grep -qx -- "1" "$SBX/sendkeys_args"; then
+    echo "  (expected a '1' delivered to the pane for the dismiss)"
     return 1
   fi
   return 0
@@ -807,6 +974,104 @@ postcheck_skip_ack() {
   return 0
 }
 
+# --- T-2829a: --dismiss-modal sends Escape BEFORE the handoff prompt. --------
+# A session wedged on a permission modal ignores the handoff prompt (the modal
+# captures the input). --dismiss-modal presses Escape first (fail-closed: cancels
+# the modal, never approves) so the session can receive + act on the prompt. This
+# is the happy path (ack bumps), so exit 0; the assertions are that Escape fired
+# and that it fired BEFORE the prompt was pasted.
+preflight_dismiss_modal_sends_escape() {
+  (
+    wait_for_prompt_delivered "$SBX/stdout" || exit 0
+    echo "$(($(cat "$SBX/handoff_mtime") + 100))" > "$SBX/handoff_mtime"
+  ) &
+  echo $! > "$SBX/bumper_pid"
+  cat > "$SBX/pane_text" <<'EOF'
+╭─────────────────────────────────────╮
+│ ❯ Try "what's the weather"          │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF
+}
+postcheck_dismiss_modal_sends_escape() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  # The dismiss-modal log line fired.
+  grep -q "dismiss-modal: sending Escape" "$SBX/stdout" \
+    || { echo "    expected 'dismiss-modal: sending Escape' log line"; return 1; }
+  # An Escape send-keys was recorded.
+  grep -q "Escape" "$SBX/sendkeys_args" \
+    || { echo "    expected an Escape send in sendkeys_args"; return 1; }
+  # Ordering: Escape must precede the pasted handoff prompt (the "-- pasted:"
+  # marker the fake tmux writes on paste-buffer). The whole point is Escape
+  # BEFORE the graceful handoff.
+  local esc_line prompt_line
+  esc_line=$(grep -n "Escape" "$SBX/sendkeys_args" | head -1 | cut -d: -f1)
+  prompt_line=$(grep -n -- "-- pasted:" "$SBX/sendkeys_args" | head -1 | cut -d: -f1)
+  if [[ -z "$esc_line" || -z "$prompt_line" || "$esc_line" -ge "$prompt_line" ]]; then
+    echo "    Escape (line ${esc_line:-none}) must precede the pasted prompt (line ${prompt_line:-none})"
+    return 1
+  fi
+  return 0
+}
+
+# --- T-2829b: default (no --dismiss-modal) sends NO Escape. -----------------
+# Regression guard: the operator's attended manual restart must be byte-identical to
+# pre-T-2829 — no stray Escape into a healthy session.
+preflight_no_dismiss_modal_no_escape() {
+  (
+    wait_for_prompt_delivered "$SBX/stdout" || exit 0
+    echo "$(($(cat "$SBX/handoff_mtime") + 100))" > "$SBX/handoff_mtime"
+  ) &
+  echo $! > "$SBX/bumper_pid"
+  cat > "$SBX/pane_text" <<'EOF'
+╭─────────────────────────────────────╮
+│ ❯ Try "what's the weather"          │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF
+}
+postcheck_no_dismiss_modal_no_escape() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  if grep -q "Escape" "$SBX/sendkeys_args"; then
+    echo "    default run must NOT send Escape, but sendkeys_args has one"
+    return 1
+  fi
+  if grep -q "dismiss-modal" "$SBX/stdout"; then
+    echo "    default run must NOT log dismiss-modal"
+    return 1
+  fi
+  return 0
+}
+
+# --- T-2829c: --hard-restart-on-ack-timeout falls through to the restart. ----
+# No mtime bump → the ack times out. WITHOUT the flag this is exit 4 (see the
+# ack_timeout case). WITH the flag, the script must fall through to the restart
+# (steps 5-8) and exit 0 — recovering a session that cannot hand off instead of
+# leaving it wedged (the specialist modal-wedge hole).
+preflight_hard_restart_on_ack_timeout() {
+  : # No bumper — mtime never changes, so step 4 times out.
+  cat > "$SBX/pane_text" <<'EOF'
+╭─────────────────────────────────────╮
+│ ❯ prompt                            │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF
+}
+postcheck_hard_restart_on_ack_timeout() {
+  # The fallback log line fired.
+  grep -q "HARD-RESTART fallback" "$SBX/stdout" "$SBX/stderr" \
+    || { echo "    expected 'HARD-RESTART fallback' in stdout/stderr"; return 1; }
+  # The restart actually fired despite the ack timeout.
+  grep -q "restart claude.service" "$SBX/restart_args" \
+    || { echo "    expected 'restart claude.service' — fallback did not restart"; return 1; }
+  # No graveyard archive of a (nonexistent) fresh handoff on this path.
+  if grep -q "\[graveyard\] " "$SBX/stdout"; then
+    echo "    fallback path must NOT archive a handoff (none was written)"
+    return 1
+  fi
+  return 0
+}
+
 # --- 16: T-0543 — Claude Code 2.1.x idle pane reaches steady-state (TDD). ---
 # The NEW default IDLE_SENTINEL ('❯|\? for shortcuts|ctrl\+t to hide tasks')
 # must match a 2.1.x idle pane showing '❯'. The OLD default
@@ -933,10 +1198,27 @@ preflight_wall_clock_watchdog_fires() {
 #!/bin/bash
 # Sandbox state at: $SBX
 case "\${1:-}" in
-  send-keys)
-    # Record our PID so postcheck can verify we got reaped.
+  load-buffer)
+    # T-2319: the hang has to be on the call the SUT actually blocks in. Since
+    # T-2259 that is the DELIVERY path (load-buffer), not send-keys — this fake
+    # still hung on send-keys, so the SUT died on an unhandled load-buffer
+    # before ever reaching the hang, and the watchdog under test never armed.
+    # A fake that fails EARLIER than the thing it is simulating tests nothing.
     echo \$\$ > "$SBX/hung_tmux_pid"
-    # Hang past any watchdog budget.
+    sleep 60
+    exit 0
+    ;;
+  copy-mode)
+    exit 0
+    ;;
+  display-message)
+    echo 0
+    exit 0
+    ;;
+  send-keys)
+    # Kept hanging too: the Enter step is also a legitimate place to wedge, and
+    # a delivery that got past load-buffer must not then sail through.
+    echo \$\$ > "$SBX/hung_tmux_pid"
     sleep 60
     exit 0
     ;;
@@ -1176,6 +1458,79 @@ postcheck_wall_clock_watchdog_clean_exit() {
 }
 
 # ---------------------------------------------------------------------------
+# T-2617: wall-clock watchdog deterministic reap-ordering test.
+#
+# The clean_exit test above only catches a leak if the real watchdog sleep
+# happens to still be alive at the exact instant the postcheck runs — a race
+# that needs genuine CPU-contention luck to hit (unreproducible across 660
+# synthetic trials — CPU-spin load, fork/exec-churn load, and the real
+# fakebin-sandboxed test under live multi-agent VPS contention — during T-2617
+# investigation). This test makes the race DETERMINISTIC instead of
+# load-dependent: a fake `sleep` stands in for the watchdog's own timer and,
+# ONLY when invoked with the watchdog's distinctive budget, deliberately takes
+# 1s past receiving SIGTERM before it actually exits — modeling "signalled but
+# not yet scheduled to die," the real effect CPU contention has on
+# signal-to-exit latency. Every OTHER sleep call in the SUT's own run (poll
+# intervals, ack-wait, INJECT_ENTER_DELAY, kick settle, etc.) delegates
+# straight through to the real /usr/bin/sleep, unaffected.
+#
+# Pre-fix, this failed 20/20 in isolated testing: the outer EXIT trap only
+# `wait`s for the watchdog subshell, not the subshell's own sleep child, so
+# the subshell can be reaped (it has no trap of its own and dies on SIGTERM
+# regardless of its child's state) while the child is still mid-way through
+# dying — orphaning it under init for up to its full budget. Post-fix (the
+# subshell installs its own TERM trap that kills+reaps its sleep child before
+# the subshell itself exits), this passes deterministically every run.
+# ---------------------------------------------------------------------------
+WALL_CLOCK_SLOW_DIE_MARKER="182460"  # distinctive; no other sleep call in the SUT or harness uses this value
+preflight_wall_clock_watchdog_reaps_slow_child() {
+  # Same setup as the happy-path test (bumper + idle pane text).
+  preflight_happy
+  export HANDOFF_RESTART_WALL_CLOCK_SECS="$WALL_CLOCK_SLOW_DIE_MARKER"
+  cat > "$FAKEBIN/sleep" <<EOF
+#!/bin/bash
+# Fake sleep: only the watchdog's own timer (identified by the distinctive
+# WALL_CLOCK_SLOW_DIE_MARKER budget) gets the slow-die treatment. Every other
+# duration (poll intervals, ack-wait, INJECT_ENTER_DELAY, kick settle, etc.)
+# delegates straight through to the real binary, unaffected.
+if [[ "\$1" == "$WALL_CLOCK_SLOW_DIE_MARKER" ]]; then
+  echo \$\$ > "$SBX/slow_die_pid"
+  # On SIGTERM: kill the real inner sleep, then deliberately take 1s more
+  # before actually exiting — the deterministic stand-in for "signalled but
+  # not yet scheduled to die."
+  trap 'kill "\$REAL_SLEEP_PID" 2>/dev/null; sleep 1; exit 143' TERM
+  /usr/bin/sleep "\$1" &
+  REAL_SLEEP_PID=\$!
+  wait "\$REAL_SLEEP_PID"
+else
+  exec /usr/bin/sleep "\$@"
+fi
+EOF
+  chmod +x "$FAKEBIN/sleep"
+}
+postcheck_wall_clock_watchdog_reaps_slow_child() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  unset HANDOFF_RESTART_WALL_CLOCK_SECS
+  # The postcheck runs immediately after the SUT process exits. A correct
+  # cleanup must have already reaped the slow-dying fake-sleep child by then
+  # — if it hasn't (pre-fix), the recorded PID is still alive (it takes 1s
+  # past receiving SIGTERM to actually exit; the outer trap's `wait`
+  # returning before that is exactly the T-2617 defect).
+  if [[ ! -f "$SBX/slow_die_pid" ]]; then
+    echo "  (fake sleep never recorded a PID — the marker budget never ran; test fixture broken)"
+    return 1
+  fi
+  local pid
+  pid=$(cat "$SBX/slow_die_pid")
+  if kill -0 "$pid" 2>/dev/null; then
+    echo "  (T-2617 regression: watchdog's slow-dying child PID $pid still alive right after clean exit)"
+    kill -KILL "$pid" 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # Driver.
 # ---------------------------------------------------------------------------
 
@@ -1239,6 +1594,14 @@ run_test lock_held 1 "${COMMON_ARGS[@]}"
 run_test ack_timeout 4 "${COMMON_ARGS[@]}"
 run_test restart_fail 5 "${COMMON_ARGS[@]}"
 run_test isactive_fail 6 "${COMMON_ARGS[@]}"
+# T-2658: control-plane branch (--supervisor control-plane). Later --service
+# overrides COMMON_ARGS' claude.service (last-flag-wins arg parsing).
+run_test control_plane_happy 0 "${COMMON_ARGS[@]}" \
+  --service pantheon-persona-consume@specialist.service --supervisor control-plane
+run_test control_plane_kill_survives 5 "${COMMON_ARGS[@]}" \
+  --service pantheon-persona-consume@specialist.service --supervisor control-plane
+run_test control_plane_scope_timeout 6 "${COMMON_ARGS[@]}" \
+  --service pantheon-persona-consume@specialist.service --supervisor control-plane
 run_test steady_timeout 7 "${COMMON_ARGS[@]}"
 run_test custom_pattern 0 "${COMMON_ARGS[@]}" --verify-pattern "FRESH_HO_READY_TOKEN_42"
 run_test dry_run 0 "${COMMON_ARGS[@]}" --dry-run
@@ -1254,6 +1617,11 @@ run_test no_kick 0 "${COMMON_ARGS[@]}" --no-kick
 run_test custom_idle_sentinel 0 "${COMMON_ARGS[@]}" --idle-sentinel "CUSTOM_IDLE_TOKEN_99"
 # T-0510 force-restart mode:
 run_test skip_ack 0 "${COMMON_ARGS[@]}" --skip-ack
+
+# T-2829: modal-wedge recovery for the graceful restart path.
+run_test dismiss_modal_sends_escape 0 "${COMMON_ARGS[@]}" --dismiss-modal
+run_test no_dismiss_modal_no_escape 0 "${COMMON_ARGS[@]}"
+run_test hard_restart_on_ack_timeout 0 "${COMMON_ARGS[@]}" --ack-timeout 2 --hard-restart-on-ack-timeout
 # T-0543 — stale IDLE_SENTINEL fix (Claude Code 2.1.x):
 run_test idle_sentinel_default_v21x 0 "${COMMON_ARGS[@]}"
 run_test idle_sentinel_old_default_would_fail 7 "${COMMON_ARGS[@]}" \
@@ -1273,6 +1641,9 @@ run_test dialog_exclude_disabled 0 "${COMMON_ARGS[@]}" --dialog-exclude 'NEVER_M
 # run leaves no leaked sleep process.
 run_test wall_clock_watchdog_fires 3 "${COMMON_ARGS[@]}"
 run_test wall_clock_watchdog_clean_exit 0 "${COMMON_ARGS[@]}"
+# T-2617: deterministic (not load-dependent) regression guard for the
+# watchdog-child orphan race — see the preflight/postcheck above.
+run_test wall_clock_watchdog_reaps_slow_child 0 "${COMMON_ARGS[@]}"
 # T-0584 Layer 0 — PID-change assertion defends against the legacy out-of-
 # cgroup scenario where `systemctl restart` silently no-ops the inner claude.
 run_test pid_change_verified 0 "${COMMON_ARGS[@]}"

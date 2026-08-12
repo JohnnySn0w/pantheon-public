@@ -7,11 +7,21 @@ It is the post-reboot (or anytime) verification tool the "fleet health sweep"
 memory described as a manual procedure; `verify_startup.sh` is per-agent only and
 has a boot-dialog DE-WEDGE side-effect, so it is not a clean read-only sweep.
 
-STRICTLY READ-ONLY: every check is `is-active` / `has-session` / a throwaway
-bwrap probe. It NEVER restarts, injects, de-wedges, or mutates anything — it
-reports + sets an exit code. Remediation/orchestration (reboot ordering, who
-drives, auto-repair) is deliberately OUT of scope — that is the policy half of
-T-1049 (the operator's steer). This tool just tells you the truth about the fleet.
+STRICTLY READ-ONLY: every check is `is-active` / `is-enabled` / `has-session` /
+a throwaway bwrap probe. It NEVER restarts, injects, de-wedges, or mutates
+anything — it reports + sets an exit code. Remediation/orchestration (reboot
+ordering, who drives, auto-repair) is deliberately OUT of scope — that is the
+policy half of T-1049 (the operator's steer). This tool just tells you the truth
+about the fleet.
+
+A seat can also be DELIBERATELY PAUSED (T-2393 class, T-2706 here) — taken out
+of service on purpose (operator disable), not dead. `check_agent` probes
+`is-enabled` on the seat's session-owning unit first; `disabled`/`masked`
+short-circuits to a distinct PAUSED status instead of walking into a FAIL. See
+`_is_paused` — it mirrors channel_liveness_monitor._session_unit_is_disabled's
+discriminator (is-enabled, not is-active) exactly, so the two tools agree on
+what "paused" means. PAUSED is bucketed OUT of the FLEET DEGRADED trigger and
+OUT of the exit code (a paused seat is not an incident).
 
 Per agent it checks: each load-bearing service is `active`, the tmux session
 exists, and (codex only) the bwrap sandbox can create a userns — the exact gap
@@ -41,6 +51,50 @@ import json
 import subprocess
 import sys
 
+# Make `from tools.X import Y` work whether invoked as `python3 tools/foo.py`
+# or `python3 -m tools.foo` (same shim as restart_drain.py).
+from pathlib import Path as _Path
+_REPO_ROOT = _Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.agent_role_map import control_plane_consume_service as _control_plane_consume_service  # noqa: E402  (needs sys.path above)
+from tools.agent_role_map import instance_binding as _instance_binding  # noqa: E402  (needs sys.path above)
+
+
+def _consume_timer(persona: str) -> str:
+    """Derive the pantheon-persona-consume@<persona>.timer unit name from the
+    canonical .service name (agent_role_map.control_plane_consume_service is
+    the single source of truth for the template-unit naming fact), matching
+    the .service/.timer pair template (tools/systemd/pantheon-persona-
+    consume@.{service,timer})."""
+    return _control_plane_consume_service(persona).removesuffix(".service") + ".timer"
+
+
+def _liveness_services(persona: str, bespoke: list[str]) -> list[str]:
+    """Return the correct liveness-probe unit list for *persona* (T-2685).
+
+    A control-plane-supervised seat (T-2590/T-2633 cutover, recovery/specialist) is
+    NOT probed via its disabled bespoke unit (retired at cutover -> always
+    inactive -> false FAIL on a healthy seat) and NOT via the consume
+    SERVICE (Type=oneshot -- active only while firing; restart_drain.py's own
+    T-2658 comment: "a Type=oneshot consume unit is never is-active after it
+    exits" -- same false-FAIL shape). The consume TIMER stays is-active
+    ("active", waiting) continuously while armed, which is the correct
+    persistent-liveness signal and reuses check_agent's existing is-active
+    probe unchanged -- no new probe type needed.
+
+    Reads the same `supervisor` marker restart_drain.py / context_fill_monitor.py
+    already branch the restart mechanism on (T-2658/T-2684), so this can't
+    drift independently of a persona's actual control-plane status the way a
+    second, FLEET-local flag could. Returns *bespoke* unchanged for any seat
+    without supervisor == "control-plane" (orchestrator today; a future cutover
+    flips the persona to the timer automatically)."""
+    if _instance_binding(persona).get("supervisor") == "control-plane":
+        return [_consume_timer(persona)]
+    return bespoke
+
+
 # Load-bearing facts per agent. `services` = units whose inactivity means the
 # agent is DOWN. `session` = the tmux session the agent lives in. `bwrap` flags
 # the codex sandbox userns probe.
@@ -48,17 +102,17 @@ FLEET = {
     "recovery": {
         "user": "claude-fallback",
         "session": "claude-telegram-bot-fallback",
-        "services": ["claude-telegram-fallback.service"],
+        "services": _liveness_services("recovery", ["claude-telegram-fallback.service"]),
     },
     "orchestrator": {
         "user": "claude",
         "session": "claude-telegram-bot",
-        "services": ["claude-telegram.service"],
+        "services": _liveness_services("orchestrator", ["claude-telegram.service"]),
     },
     "specialist": {
         "user": "claude-research",
         "session": "claude-research-bot",
-        "services": ["claude-telegram-research.service"],
+        "services": _liveness_services("specialist", ["claude-telegram-research.service"]),
     },
     "codex": {
         "user": "codex",
@@ -66,9 +120,71 @@ FLEET = {
         "services": ["codex-daemon.service", "codex-telegram-poller.service"],
         "bwrap": True,
     },
+    # Sub-orchestrator seats (ORG-043), brought onto the consume control plane
+    # 2026-08-08 (T-2677). Mailbox-first — NO telegram channel, so no poller/
+    # bridge unit belongs here. _liveness_services would normally auto-derive
+    # the consume timer from instance.yaml's `supervisor: control-plane`
+    # marker (as it does for recovery/specialist below), but metis/atlas's `roles:`
+    # binding does not yet carry that field even though T-2677 moved them onto
+    # the control plane (T-2677 only filled the separate harness_runtime
+    # launch-profile stanza, not the roles: binding block agent_role_map.py
+    # reads — a manifest gap, flagged to HO, out of this ticket's scope to
+    # fix). So the bespoke list is supplied explicitly instead of relying on
+    # auto-derivation; the timer name is verified live-armed per T-2677's
+    # resolve note ("both timers armed... fires green").
+    "metis": {
+        "user": "suborch1",
+        "session": "suborch1-main",
+        "services": _liveness_services("metis", ["pantheon-persona-consume@metis.timer"]),
+    },
+    "atlas": {
+        "user": "suborch2",
+        "session": "suborch2-main",
+        "services": _liveness_services("atlas", ["pantheon-persona-consume@atlas.timer"]),
+    },
+    # Mnemosyne — the second head (ORG-042), resident on the `exocortex`
+    # account. Bespoke-telegram-service shape (T-2690 signal), NOT the consume
+    # control plane — her instance.yaml binding has no `supervisor:
+    # control-plane` marker (confirmed against agent_role_map.py), so
+    # _liveness_services resolves to the bespoke list unchanged, same as it
+    # does for orchestrator today; a later control-plane cutover flips it for free.
+    "mnemosyne": {
+        "user": "exocortex",
+        "session": "claude-telegram-bot-exocortex",
+        "services": _liveness_services("mnemosyne", ["claude-telegram-exocortex.service"]),
+    },
 }
 
-OK, WARN, FAIL = "OK", "WARN", "FAIL"
+OK, WARN, FAIL, PAUSED = "OK", "WARN", "FAIL", "PAUSED"
+
+
+# sudo, under -n, never prompts, and prefixes its OWN diagnostics with "sudo:".
+# When the caller lacks NOPASSWD to the target account (every non-Recovery seat — only
+# Recovery holds NOPASSWD to every agent user, per the module docstring), `sudo -n` exits
+# rc=1 with one of these markers on stderr and EMPTY stdout, WITHOUT running the inner
+# command — subprocess.run does not raise, so this must be recognised as "never ran"
+# (T-2718). Matching a specific marker (not merely rc!=0) is deliberate: the inner
+# command running and returning non-zero is a genuine FAIL and must NOT be softened to
+# WARN — silencing a real dead seat is the expensive direction this tool guards against.
+_SUDO_DENIAL_MARKERS = (
+    "a password is required",   # -n + caller lacks NOPASSWD to this account (the T-2718 repro)
+    "a terminal is required",   # -n + password needed but no tty
+    "no askpass",               # -n + no askpass helper
+    "unknown user",             # bad target account
+    "not allowed to execute",   # sudoers denies this command for the caller
+)
+
+
+def _sudo_denied(rc, stderr: str) -> bool:
+    """True iff `sudo` ITSELF refused to run the command (auth/setup denial), so the
+    inner command never executed. sudo prefixes its diagnostics with "sudo:" and does
+    not prompt under -n, so a "sudo:" line carrying a known denial marker means the
+    request never reached the inner command — distinct from the inner command running
+    and returning non-zero (a real FAIL)."""
+    if rc == 0:
+        return False
+    low = (stderr or "").lower()
+    return "sudo:" in low and any(mark in low for mark in _SUDO_DENIAL_MARKERS)
 
 
 def _run(user: str, inner: str, *, timeout: int = 15):
@@ -76,7 +192,8 @@ def _run(user: str, inner: str, *, timeout: int = 15):
     (rc, stdout, ran) — ran=False if the command couldn't even execute (sudo
     denied / timeout / OS error), which callers treat as WARN not FAIL."""
     import getpass
-    if user == getpass.getuser():
+    wrapped = user != getpass.getuser()
+    if not wrapped:
         argv = ["bash", "-lc", f"XDG_RUNTIME_DIR=/run/user/$(id -u) {inner}"]
     else:
         argv = ["sudo", "-n", "-u", user, "bash", "-lc",
@@ -85,14 +202,55 @@ def _run(user: str, inner: str, *, timeout: int = 15):
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
     except (subprocess.TimeoutExpired, OSError):
         return (None, "", False)
+    # A `sudo -n` auth/setup denial exits non-zero with empty stdout but does NOT raise;
+    # treat it as "never ran" (WARN), never as the inner command's verdict (FAIL) — T-2718.
+    if wrapped and _sudo_denied(r.returncode, r.stderr):
+        return (r.returncode, "", False)
     return (r.returncode, r.stdout.strip(), True)
+
+
+def _is_paused(user: str, svc: str, run) -> bool | None:
+    """Is *svc* (the seat's session-owning unit — `cfg["services"][0]`)
+    DISABLED, i.e. deliberately taken out of service (T-2393 discriminator,
+    mirrored from channel_liveness_monitor._session_unit_is_disabled — same
+    is-enabled probe, same state table, so the two tools agree on "paused").
+
+    Returns True (disabled/masked -> paused), False (enabled/static/... ->
+    judge normally), or None when we cannot tell (unqueryable, or an
+    unrecognized is-enabled state). None must NOT be read as paused: fail
+    toward judging the seat normally, because silencing a real dead seat is
+    the expensive direction (same posture the source probe documents)."""
+    rc, out, ran = run(user, f"systemctl --user is-enabled {svc}")
+    if not ran:
+        return None
+    state = out.strip().splitlines()[-1].strip() if out.strip() else ""
+    if not state:
+        return None
+    if state in ("disabled", "masked", "masked-runtime"):
+        return True
+    if state in ("enabled", "enabled-runtime", "static", "linked", "linked-runtime",
+                 "indirect", "generated", "transient", "alias"):
+        return False
+    return None
 
 
 def check_agent(name: str, cfg: dict, *, run=_run) -> dict:
     """Return {agent, status, checks:[{name,status,detail}]}. status is the worst
-    of its checks (FAIL > WARN > OK)."""
+    of its checks (FAIL > WARN > OK) — UNLESS the seat is deliberately PAUSED
+    (T-2706), in which case this short-circuits before running the normal
+    checks at all (a paused seat's is-active/session reads are moot noise, not
+    an incident) and returns PAUSED with a single explanatory check."""
     user = cfg["user"]
     checks: list[dict] = []
+
+    session_owning_svc = cfg["services"][0] if cfg.get("services") else None
+    if session_owning_svc is not None:
+        paused = _is_paused(user, session_owning_svc, run)
+        if paused:
+            checks.append({"name": f"paused:{session_owning_svc}", "status": PAUSED,
+                           "detail": f"{session_owning_svc} disabled — seat "
+                           "deliberately paused, not judging further"})
+            return {"agent": name, "status": PAUSED, "checks": checks}
 
     for svc in cfg["services"]:
         rc, out, ran = run(user, f"systemctl --user is-active {svc}")
@@ -206,7 +364,7 @@ def failed_units_sweep(agents: list[str], *, run=_run) -> list[dict]:
 
 
 def render(results: list[dict], failed: list[dict] | None = None) -> str:
-    glyph = {OK: "✓", WARN: "!", FAIL: "✗"}
+    glyph = {OK: "✓", WARN: "!", FAIL: "✗", PAUSED: "⏸"}
     lines = []
     for r in results:
         lines.append(f"[{glyph[r['status']]}] {r['agent']:6} {r['status']}")
@@ -224,6 +382,12 @@ def render(results: list[dict], failed: list[dict] | None = None) -> str:
 
     fails = [r["agent"] for r in results if r["status"] == FAIL]
     warns = [r["agent"] for r in results if r["status"] == WARN]
+    # PAUSED (T-2706) is bucketed separately from fails/warns on purpose: a
+    # deliberately-paused seat must never trip DEGRADED or the warnings line —
+    # it's surfaced for visibility only, appended to whichever summary line
+    # actually fires below.
+    paused = [r["agent"] for r in results if r["status"] == PAUSED]
+    paused_note = f" ({', '.join(paused)} paused)" if paused else ""
     lines.append("")
     if fails or failed_units_present:
         bits = []
@@ -231,11 +395,11 @@ def render(results: list[dict], failed: list[dict] | None = None) -> str:
             bits.append(f"FAIL on {', '.join(fails)}")
         if failed_units_present:
             bits.append(f"failed units in {', '.join(failed_units_present)}")
-        lines.append("FLEET: DEGRADED — " + "; ".join(bits))
+        lines.append("FLEET: DEGRADED — " + "; ".join(bits) + paused_note)
     elif warns:
-        lines.append(f"FLEET: healthy with warnings ({', '.join(warns)} unqueryable)")
+        lines.append(f"FLEET: healthy with warnings ({', '.join(warns)} unqueryable)" + paused_note)
     else:
-        lines.append("FLEET: all healthy ✓")
+        lines.append("FLEET: all healthy ✓" + paused_note)
     return "\n".join(lines)
 
 

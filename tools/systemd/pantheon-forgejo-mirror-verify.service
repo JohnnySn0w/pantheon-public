@@ -1,0 +1,31 @@
+[Unit]
+Description=Pantheon forgejo mirror verify — prove the github-mirror repos hold what they claim (T-2217)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-2217.md
+After=network-online.target
+Wants=network-online.target
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+# Load-bearing here specifically: this unit's whole job is detecting a silent failure,
+# so a silent failure OF THE DETECTOR is the one outcome that must not be quiet.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# Verifies by REFS + last-sync, never by "the repo exists" — a forge full of
+# created-but-never-pulled repos passes every cheap check and holds nothing.
+# --quiet-ok so a healthy fire is silent in the journal and only drift/staleness
+# is legible; the unit's own exit code carries the pass/fail signal.
+# Exit 1 => at least one mirror is DRIFT/STALE/HOLLOW, which trips OnFailure above.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/forgejo_mirror_verify.py --quiet-ok
+
+StandardOutput=journal
+StandardError=journal
+# One ls-remote per mirror against GitHub AND the forge; 27 mirrors today and the
+# private 40 still to land, so allow real headroom rather than half-verifying.
+TimeoutStartSec=25min
+
+[Install]
+WantedBy=default.target

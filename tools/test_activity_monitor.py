@@ -15,9 +15,11 @@ Covers:
 
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -1764,5 +1766,655 @@ class TestSendPoke(unittest.TestCase):
         self.assertEqual(mock_run.call_count, 1)
 
 
+class TestCapStateClassifier(unittest.TestCase):
+    """T-1369: the two measured cap strings classify OPPOSITELY, and discussing
+    a cap string must never read as being capped."""
+
+    def _turn(self, text, err=True):
+        return {"type": "assistant", "isApiErrorMessage": err,
+                "message": {"content": [{"type": "text", "text": text}]}}
+
+    def test_session_limit_verbatim_specimen(self):
+        # orchestrator, 38x, 2026-08-02. U+00B7 separator — a paraphrase regex misses it.
+        kind, hint = am.classify_cap_message(
+            self._turn("You've hit your session limit \u00b7 resets 9:40am (UTC)"))
+        self.assertEqual(kind, "session_limit")
+        self.assertEqual(hint, "9:40am (UTC)")
+
+    def test_spend_limit_verbatim_specimen(self):
+        # atlas, 59x, the 48h outage (T-2387).
+        kind, hint = am.classify_cap_message(self._turn(
+            "You've hit your monthly spend limit \u00b7 raise it at "
+            "claude.ai/settings/usage?from=cc_cli_limit_message"))
+        self.assertEqual(kind, "spend_limit")
+        self.assertIsNone(hint)
+
+    def test_discussing_a_cap_string_is_not_being_capped(self):
+        # Load-bearing: this fleet's tickets QUOTE both wire strings verbatim.
+        # Without the isApiErrorMessage guard, recovery reads as permanently capped.
+        self.assertIsNone(am.classify_cap_message(self._turn(
+            "the specimen is: You've hit your session limit \u00b7 resets 5pm (UTC)",
+            err=False)))
+
+    def test_non_assistant_and_malformed_are_none(self):
+        self.assertIsNone(am.classify_cap_message({"type": "user"}))
+        self.assertIsNone(am.classify_cap_message(
+            {"type": "assistant", "isApiErrorMessage": True, "message": {"content": None}}))
+
+    def test_ordinary_api_error_is_not_a_cap(self):
+        # -32603 entitlement, 500s, etc. — different class, different routing (T-2386).
+        self.assertIsNone(am.classify_cap_message(self._turn(
+            "Internal error: Your organization does not have access to Claude.")))
+
+
+class TestCapPrePokeGate(unittest.TestCase):
+    """T-1369 dispatch branches. MEASURED motivation: the waker kicked a
+    session-capped orchestrator 8x over 3.5h — every kick delivered, every turn an
+    error. Bounded, correct, useless."""
+
+    def _cfg(self):
+        return {"jsonl_dir": Path("/nonexistent"), "sudo_user": "claude",
+                "pane_target": "x:0"}
+
+    def _run(self, cap, sp):
+        with patch.object(am, "send_poke", return_value=True) as poke, \
+             patch.object(am, "_session_cap_state", return_value=cap), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=False) as cyber, \
+             patch.object(am, "_route_failure_alert") as alert, \
+             patch.object(am, "latest_jsonl_mtime", return_value=5000):
+            rc = am._dispatch_poke(self._cfg(), "orchestrator", "p1c", "P", sp,
+                                   bounded_enabled=True, max_ineffective=1)
+        return rc, poke, alert, cyber
+
+    def test_session_limit_suppresses_poke_AND_escalation(self):
+        # Self-clears at the printed time — paging a human for a state with an
+        # expiry is the alarm that teaches people to skip alarms.
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, poke, alert, _ = self._run(("session_limit", "9:40am (UTC)"),
+                                           Path(tmp) / "s.json")
+        self.assertEqual(rc, 0)
+        poke.assert_not_called()
+        alert.assert_not_called()
+
+    def test_spend_limit_suppresses_poke_and_escalates(self):
+        # Holds until a human raises it — alert + hold, exactly once.
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, poke, alert, _ = self._run(("spend_limit", None),
+                                           Path(tmp) / "s.json")
+        self.assertEqual(rc, 0)
+        poke.assert_not_called()
+        alert.assert_called_once()
+        self.assertIn("spend-cap", str(alert.call_args))
+
+    def test_no_cap_falls_through_to_cyber_gate(self):
+        # The gate must be a pass-through when healthy — the cyber check still runs.
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, poke, alert, cyber = self._run(None, Path(tmp) / "s.json")
+        self.assertEqual(rc, 0)
+        cyber.assert_called_once()
+        poke.assert_called_once()  # healthy path still pokes
+
+    def test_ship_dark_flag_off_bypasses_cap_gate(self):
+        # bounded_enabled=False must reproduce legacy behaviour exactly — the
+        # cap gate lives inside the bounded block.
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(am, "send_poke", return_value=True) as poke, \
+                 patch.object(am, "_session_cap_state") as capfn:
+                rc = am._dispatch_poke(self._cfg(), "orchestrator", "p1a", "P",
+                                       Path(tmp) / "s.json",
+                                       bounded_enabled=False, max_ineffective=1)
+            self.assertEqual(rc, 0)
+            capfn.assert_not_called()
+            poke.assert_called_once()
+
+
+class CapModalDetectorT1369(unittest.TestCase):
+    """T-1369 branch 4: the pane-only /rate-limit-options modal.
+
+    Fixture is the REAL pane captured off orchestrator 2026-08-02 while it sat wedged
+    ~50 min past its own printed reset — not a hand-typed approximation. That
+    distinction already paid: the real capture carries a second '❯' on the shell
+    prompt line ('❯ /rate-limit-options') above the options, which a first-match
+    cursor scan misreads as "cursor not on option 1".
+    """
+
+    SPECIMEN = REPO_ROOT / "tools" / "testdata" / "orchestrator_cap_modal_pane.txt"
+
+    def _specimen(self):
+        return self.SPECIMEN.read_text(encoding="utf-8")
+
+    def test_the_specimen_still_carries_what_the_test_relies_on(self):
+        """A fixture that quietly loses its distinguishing feature turns every
+        assertion below into a tautology."""
+        raw = self._specimen()
+        self.assertIn("\x1b", raw, "specimen should still be the -e capture")
+        self.assertEqual(raw.count("❯"), 2,
+                         "specimen must keep BOTH the prompt glyph and the "
+                         "menu cursor — that pair is the bug it encodes")
+
+    def test_real_specimen_is_safe_to_dismiss(self):
+        self.assertEqual(am.classify_cap_modal(self._specimen()), am.MODAL_SAFE)
+
+    def test_ansi_stripped_form_classifies_identically(self):
+        """Production capture_pane uses `-p` without `-e`, so the live text has
+        no escapes. Both forms must take the same path."""
+        stripped = am._strip_ansi(self._specimen())
+        self.assertNotIn("\x1b", stripped)
+        self.assertEqual(am.classify_cap_modal(stripped), am.MODAL_SAFE)
+
+    def test_cursor_on_option_2_is_UNSAFE(self):
+        """The money branch. Enter confirms whatever is highlighted, and option
+        2 buys a plan — the operator's lane."""
+        text = am._strip_ansi(self._specimen())
+        moved = (text.replace("❯ 1. Stop", "  1. Stop")
+                     .replace("  2. Upgrade", "❯ 2. Upgrade"))
+        self.assertEqual(am.classify_cap_modal(moved), am.MODAL_UNSAFE)
+
+    def test_no_cursor_on_any_option_is_UNSAFE(self):
+        text = am._strip_ansi(self._specimen()).replace("❯ 1. Stop", "  1. Stop")
+        self.assertEqual(am.classify_cap_modal(text), am.MODAL_UNSAFE)
+
+    def test_a_different_menu_is_NOT_this_modal(self):
+        """'What do you want to do?' alone is a generic TUI prompt; matching it
+        would make every future menu look like the cap modal."""
+        self.assertIsNone(am.classify_cap_modal(
+            "What do you want to do?\n❯ 1. Retry\n  2. Abort\n"))
+
+    def test_ordinary_pane_and_empty_input_are_None(self):
+        self.assertIsNone(am.classify_cap_modal("╭─────╮\n│ > │\n╰─────╯"))
+        self.assertIsNone(am.classify_cap_modal(""))
+        self.assertIsNone(am.classify_cap_modal(None))
+
+    def test_no_configured_pane_degrades_instead_of_shelling_out(self):
+        """This seam sits on the path EVERY poke takes. A cfg without a pane
+        (specialist-a2a has none by construction) must return None rather than raise
+        or run a live capture against a sibling's session."""
+        with patch("tools.activity_monitor.capture_pane") as cap:
+            self.assertIsNone(am._session_cap_modal({"sudo_user": "claude"}))
+            self.assertIsNone(am._session_cap_modal({"tmux_target_pane": ""}))
+            cap.assert_not_called()
+
+    def test_the_cap_ERROR_text_alone_is_not_the_modal(self):
+        """The jsonl branch owns that state. A session-limit line on the pane
+        without the menu must not trigger a keystroke."""
+        self.assertIsNone(am.classify_cap_modal(
+            "You've hit your session limit · resets 2:50pm (UTC)"))
+
+
+class CapModalDispatchT1369(unittest.TestCase):
+    """The dispatch branch: dismiss when safe, never touch the keyboard when not,
+    and bound the repeats."""
+
+    def setUp(self):
+        self.d = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.d, True)
+        self.state = self.d / "poke.json"
+        self.cfg = {
+            "tmux_target_pane": "claude-telegram-bot:0",
+            "sudo_user": "claude",
+            "jsonl_dir": str(self.d),
+            "pantheon_config_path": str(REPO_ROOT),
+        }
+
+    def _dispatch(self, modal, **patches):
+        stack = [
+            patch("tools.activity_monitor._session_cap_modal", return_value=modal),
+            patch("tools.activity_monitor.latest_jsonl_mtime", return_value=1),
+            patch("tools.activity_monitor._session_cap_state", return_value=None),
+            patch("tools.activity_monitor._session_cyber_blocked", return_value=False),
+        ]
+        with contextlib.ExitStack() as es:
+            for p in stack:
+                es.enter_context(p)
+            sender = es.enter_context(
+                patch("tools.activity_monitor.send_modal_confirm",
+                      return_value=patches.get("send_ok", True)))
+            poker = es.enter_context(patch("tools.activity_monitor.send_poke"))
+            alerter = es.enter_context(
+                patch("tools.activity_monitor._route_failure_alert"))
+            rc = am._dispatch_poke(
+                self.cfg, "orchestrator", "idle", "hello", self.state,
+                bounded_enabled=True, max_ineffective=3)
+        return rc, sender, poker, alerter
+
+    def test_safe_modal_sends_a_bare_enter_and_never_a_poke(self):
+        rc, sender, poker, _ = self._dispatch(am.MODAL_SAFE)
+        self.assertEqual(rc, 0)
+        sender.assert_called_once()
+        poker.assert_not_called()
+
+    def test_unsafe_modal_sends_NOTHING_and_escalates(self):
+        """The load-bearing one: option 2 spends money."""
+        rc, sender, poker, alerter = self._dispatch(am.MODAL_UNSAFE)
+        self.assertEqual(rc, 0)
+        sender.assert_not_called()
+        poker.assert_not_called()
+        alerter.assert_called_once()
+        self.assertIn("spends", alerter.call_args[0][1])
+
+    def test_dismissals_are_BOUNDED_then_escalate(self):
+        for i in range(am.MAX_MODAL_DISMISSALS):
+            _, sender, _, _ = self._dispatch(am.MODAL_SAFE)
+            sender.assert_called_once()
+            self.assertEqual(
+                json.loads(self.state.read_text())["modal_dismissals"], i + 1)
+        _, sender, _, alerter = self._dispatch(am.MODAL_SAFE)
+        sender.assert_not_called()
+        alerter.assert_called_once()
+
+    def test_no_modal_falls_through_to_the_existing_gates(self):
+        """The new branch must not swallow the jsonl cap / cyber / poke paths."""
+        rc, sender, poker, _ = self._dispatch(None)
+        sender.assert_not_called()
+        poker.assert_called_once()
+
+    def test_a_failed_send_reports_rc_1(self):
+        rc, sender, _, _ = self._dispatch(am.MODAL_SAFE, send_ok=False)
+        self.assertEqual(rc, 1)
+        sender.assert_called_once()
+
+
+class ProductiveLivenessT2387(unittest.TestCase):
+    """T-2387: a seat erroring every turn must stop reading as ALIVE.
+
+    atlas hit the monthly spend cap and produced 23 turns / 23 errors on 07-30
+    and 22 / 22 on 07-31 — 59 identical failures over two days — while every
+    check asking "did it produce a turn" answered YES throughout. jsonl mtime
+    advances on an error exactly as it does on real work.
+
+    The fix keys on the OUTCOME BOOLEAN `isApiErrorMessage`, not on a status
+    code or an error string, so it covers the spend cap (429), api-health (400),
+    model-outage (404) and classes nobody has met. The tree already carries four
+    detectors keyed to specific error identities — one of them a literal
+    substring match on "monthly spend limit" — and each new class arrived as a
+    new narrow detector. That is the pattern this breaks.
+    """
+
+    ERR = {"type": "assistant", "isApiErrorMessage": True, "apiErrorStatus": 429,
+           "timestamp": "2026-07-31T12:00:00.000Z"}
+    OK = {"type": "assistant", "timestamp": "2026-07-29T09:00:00.000Z"}
+    USER = {"type": "user", "timestamp": "2026-07-31T12:00:01.000Z"}
+
+    def _run(self, records):
+        """Drive latest_productive_jsonl_mtime over canned records, newest-first."""
+        with patch("tools.context_fill_monitor.find_latest_jsonl",
+                   return_value=Path("/fake/s.jsonl")), \
+             patch("tools.context_fill_monitor.read_recent_records",
+                   return_value=records):
+            return am.latest_productive_jsonl_mtime(Path("/fake"), "codex", "atlas")
+
+    def test_THE_REGRESSION_all_error_turns_report_no_productive_activity(self):
+        """59 error turns and nothing else → None, not a fresh timestamp."""
+        self.assertIsNone(self._run([dict(self.ERR) for _ in range(59)]))
+
+    def test_error_turns_do_not_mask_an_older_real_turn(self):
+        """Newest-first: errors on top, a real turn beneath → the REAL one wins."""
+        got = self._run([dict(self.ERR), dict(self.ERR), dict(self.OK)])
+        self.assertEqual(got, int(datetime(2026, 7, 29, 9, 0,
+                                           tzinfo=timezone.utc).timestamp()))
+
+    def test_non_assistant_records_are_skipped_not_counted(self):
+        """A user record is not the seat doing work."""
+        self.assertIsNone(self._run([dict(self.USER), dict(self.ERR)]))
+
+    def test_CONTROL_a_healthy_seat_still_reads_active(self):
+        """Without this, the guards above could pass by always returning None —
+        which would mark every seat idle and poke the whole fleet."""
+        got = self._run([dict(self.OK)])
+        self.assertIsNotNone(got)
+        self.assertEqual(got, int(datetime(2026, 7, 29, 9, 0,
+                                           tzinfo=timezone.utc).timestamp()))
+
+    def test_read_failure_returns_None_fail_open(self):
+        with patch("tools.context_fill_monitor.find_latest_jsonl", return_value=None):
+            self.assertIsNone(
+                am.latest_productive_jsonl_mtime(Path("/fake"), "codex", "atlas"))
+
+
+class ProductiveLivenessShipDarkT2387(unittest.TestCase):
+    """The switch is default-OFF and only the LIVENESS sites are switched.
+
+    Poke-effectiveness asks a DIFFERENT question — "did the session take a turn
+    at all" — for which an error turn legitimately COUNTS (the poke landed).
+    Those callers must keep the turn-counting signal. Conflating the two is the
+    defect; swapping both would be the same defect with the sign flipped.
+    """
+
+    def test_THE_DEFAULT_ITSELF_is_OFF_when_the_env_var_is_absent(self):
+        """The other switch tests PATCH the flag, so none of them exercise the
+        DEFAULT — flipping the module default to "1" passed all of them. Caught
+        by mutating the source during the non-vacuity pass, which is the whole
+        argument for running one. Re-derive the constant under a clean env.
+        """
+        import importlib
+        with patch.dict(os.environ, {}, clear=True):
+            reloaded = importlib.reload(am)
+            try:
+                self.assertFalse(
+                    reloaded.PRODUCTIVE_LIVENESS_ENABLED,
+                    "T-2387 must ship DARK — arming changes which seats look idle "
+                    "and therefore which get poked (T-1126 supervised first-fire)")
+            finally:
+                importlib.reload(am)  # restore for the rest of the suite
+
+    def test_arming_requires_exactly_1_not_any_truthy_string(self):
+        import importlib
+        for val, expected in (("1", True), ("0", False), ("true", False), ("", False)):
+            with patch.dict(os.environ,
+                            {"PANTHEON_PRODUCTIVE_LIVENESS_ENABLED": val}, clear=True):
+                reloaded = importlib.reload(am)
+                try:
+                    self.assertEqual(reloaded.PRODUCTIVE_LIVENESS_ENABLED, expected,
+                                     f"env value {val!r}")
+                finally:
+                    importlib.reload(am)
+
+    def test_default_is_OFF_and_delegates_to_the_unchanged_signal(self):
+        with patch.object(am, "PRODUCTIVE_LIVENESS_ENABLED", False), \
+             patch.object(am, "latest_jsonl_mtime", return_value=1234) as legacy, \
+             patch.object(am, "latest_productive_jsonl_mtime") as productive:
+            self.assertEqual(am.liveness_jsonl_mtime(Path("/d"), "u", "a"), 1234)
+        legacy.assert_called_once()
+        productive.assert_not_called()
+
+    def test_armed_uses_the_outcome_aware_signal(self):
+        with patch.object(am, "PRODUCTIVE_LIVENESS_ENABLED", True), \
+             patch.object(am, "latest_jsonl_mtime") as legacy, \
+             patch.object(am, "latest_productive_jsonl_mtime", return_value=99) as prod:
+            self.assertEqual(am.liveness_jsonl_mtime(Path("/d"), "u", "a"), 99)
+        prod.assert_called_once()
+        legacy.assert_not_called()
+
+    def test_poke_effectiveness_sites_still_use_the_turn_counting_signal(self):
+        """Guards the split itself, by reading the source: every remaining
+        bare `latest_jsonl_mtime(` CALL must be a poke-effectiveness site."""
+        import re
+        src = Path(am.__file__).read_text(encoding="utf-8")
+        body = src.split("def liveness_jsonl_mtime", 1)[1].split("\n\n\n", 1)[1]
+        calls = re.findall(r"^\s*(?:cur_mtime|pre_poke_jsonl_mtime)\s*=\s*latest_jsonl_mtime\(",
+                           body, re.M)
+        self.assertGreaterEqual(
+            len(calls), 6,
+            "expected the poke-effectiveness sites to keep latest_jsonl_mtime; "
+            "if they were switched to the productive signal, an error turn would "
+            "stop counting as 'the poke landed' and pokes would look ineffective")
+        # ...and the two LIVENESS sites must have been switched. Both halves of
+        # the split are asserted; checking only one would let a wholesale swap
+        # in either direction pass.
+        self.assertEqual(
+            body.count("liveness_jsonl_mtime("), 3,
+            "expected exactly the three liveness sites (check_p1a, Layer-3 "
+            "dormancy, check_tui_wedge) to use the switched signal — a wedge "
+            "measures a PRODUCTIVE-turn freeze, so an error turn must not reset "
+            "it (T-1369 adds the third; same T-2387 reason as the first two)")
+
+
+class TuiWedgeDetectorT1369(unittest.TestCase):
+    """T-1369 final branch — the TUI-alive-but-not-emitting wedge detector.
+
+    Threshold is MEASURED (tui_wedge_sampler, orchestrator n=110 max 779s); the tests
+    below drive the composition, not the number. The number is env-overridable
+    and exercised at a small value so the duration gate is testable."""
+
+    def _cfg(self) -> dict:
+        return {"tmux_target_pane": "x:0", "sudo_user": "claude",
+                "jsonl_dir": Path("/x"), "agent": "orchestrator"}
+
+    # ---- _pane_fp ----
+    def test_pane_fp_none_is_none(self) -> None:
+        self.assertIsNone(am._pane_fp(None))
+
+    def test_pane_fp_equal_for_same_text_differs_for_different(self) -> None:
+        self.assertEqual(am._pane_fp("abc"), am._pane_fp("abc"))
+        self.assertNotEqual(am._pane_fp("abc"), am._pane_fp("abd"))
+
+    # ---- pane_is_animating ----
+    def test_animating_true_when_pane_changes(self) -> None:
+        with patch.object(am, "capture_pane", side_effect=["screen-A", "screen-B"]), \
+             patch.object(am.time, "sleep"):
+            self.assertTrue(am.pane_is_animating(self._cfg(), 0))
+
+    def test_animating_false_when_pane_still(self) -> None:
+        with patch.object(am, "capture_pane", side_effect=["idle> ", "idle> "]), \
+             patch.object(am.time, "sleep"):
+            self.assertFalse(am.pane_is_animating(self._cfg(), 0))
+
+    def test_animating_none_when_capture_fails(self) -> None:
+        # A failed capture is NOT evidence of motion — must return None, never True.
+        with patch.object(am, "capture_pane", side_effect=["screen-A", None]), \
+             patch.object(am.time, "sleep"):
+            self.assertIsNone(am.pane_is_animating(self._cfg(), 0))
+
+    def test_animating_none_when_no_pane_configured(self) -> None:
+        self.assertIsNone(am.pane_is_animating({"sudo_user": "claude"}, 0))
+
+    # ---- check_tui_wedge composition ----
+    def _frozen(self, seconds_ago: int):
+        """Patch liveness so the seat looks frozen `seconds_ago` seconds."""
+        return patch.object(am, "liveness_jsonl_mtime",
+                            return_value=int(time.time()) - seconds_ago)
+
+    def test_fires_on_long_freeze_moving_pane_no_known_cause(self) -> None:
+        with self._frozen(3600), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "pane_is_animating", return_value=True):
+            fired, _ = am.check_tui_wedge(self._cfg(), 1800, 2)
+        self.assertTrue(fired)
+
+    def test_duration_gate_not_fired_when_recent(self) -> None:
+        with self._frozen(60), \
+             patch.object(am, "pane_is_animating", return_value=True) as anim:
+            fired, reason = am.check_tui_wedge(self._cfg(), 1800, 2)
+        self.assertFalse(fired)
+        anim.assert_not_called()  # cheap gate short-circuits before the probe
+
+    def test_fail_open_when_no_mtime(self) -> None:
+        with patch.object(am, "liveness_jsonl_mtime", return_value=0):
+            fired, _ = am.check_tui_wedge(self._cfg(), 1800, 2)
+        self.assertFalse(fired)
+
+    def test_defers_to_cap_modal(self) -> None:
+        with self._frozen(3600), \
+             patch.object(am, "_session_cap_modal", return_value=am.MODAL_SAFE), \
+             patch.object(am, "pane_is_animating", return_value=True) as anim:
+            fired, _ = am.check_tui_wedge(self._cfg(), 1800, 2)
+        self.assertFalse(fired)
+        anim.assert_not_called()  # a capped seat is not even probed for motion
+
+    def test_defers_to_cap_state(self) -> None:
+        with self._frozen(3600), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=("spend_limit", None)), \
+             patch.object(am, "pane_is_animating", return_value=True):
+            fired, _ = am.check_tui_wedge(self._cfg(), 1800, 2)
+        self.assertFalse(fired)
+
+    def test_defers_to_cyber_block(self) -> None:
+        with self._frozen(3600), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=True), \
+             patch.object(am, "pane_is_animating", return_value=True):
+            fired, _ = am.check_tui_wedge(self._cfg(), 1800, 2)
+        self.assertFalse(fired)
+
+    def test_still_pane_not_a_wedge(self) -> None:
+        # Long freeze, no known cause, but pane STILL → idle-at-prompt, p1a's job.
+        with self._frozen(3600), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "pane_is_animating", return_value=False):
+            fired, _ = am.check_tui_wedge(self._cfg(), 1800, 2)
+        self.assertFalse(fired)
+
+    def test_capture_failure_does_not_fire(self) -> None:
+        # animating is None (capture failed) → must NOT fire (fail-open).
+        with self._frozen(3600), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "pane_is_animating", return_value=None):
+            fired, reason = am.check_tui_wedge(self._cfg(), 1800, 2)
+        self.assertFalse(fired)
+        # Distinguish the fail-open (capture failed) reason from the "pane STILL"
+        # reason — gives the dedicated None branch teeth (else it is an
+        # equivalent-outcome mutant since `not None` also returns not-fired).
+        self.assertIn("capture", reason)
+
+
+class TuiWedgeMainT1369(unittest.TestCase):
+    """T-1369 — main() wiring for the wedge branch: ship-dark by default, and
+    when enabled it escalates a restart RECOMMENDATION (never auto-restarts) and
+    pre-empts the poke predicates."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        os.environ["PANTHEON_STATE_DIR"] = str(self.tmp / "state")
+
+    def tearDown(self) -> None:
+        for k in ("PANTHEON_STATE_DIR", "ACTIVITY_MONITOR_TUI_WEDGE_ENABLED"):
+            os.environ.pop(k, None)
+        self._tmp.cleanup()
+
+    def test_ship_dark_flag_off_never_calls_wedge(self) -> None:
+        os.environ.pop("ACTIVITY_MONITOR_TUI_WEDGE_ENABLED", None)
+        with patch.object(am, "in_cooldown", return_value=False), \
+             patch.object(am, "check_tui_wedge") as wedge, \
+             patch.object(am, "check_p1a", return_value=False), \
+             patch.object(am, "check_p1b", return_value=False), \
+             patch.object(am, "check_p1d", return_value=False):
+            rc = main(["--agent", "orchestrator"])
+        self.assertEqual(rc, 0)
+        wedge.assert_not_called()
+
+    def test_enabled_wedge_escalates_and_preempts_p1a(self) -> None:
+        os.environ["ACTIVITY_MONITOR_TUI_WEDGE_ENABLED"] = "1"
+        with patch.object(am, "in_cooldown", return_value=False), \
+             patch.object(am, "check_tui_wedge", return_value=(True, "wedged")), \
+             patch.object(am, "latest_jsonl_mtime", return_value=1000), \
+             patch.object(am, "_route_failure_alert") as alert, \
+             patch.object(am, "check_p1a") as p1a:
+            rc = main(["--agent", "orchestrator"])
+        self.assertEqual(rc, 0)
+        alert.assert_called_once()          # paged Recovery with the restart recommendation
+        p1a.assert_not_called()             # wedge pre-empts the poke predicates
+        state = self.tmp / "state" / "activity_monitor_orchestrator_last_poke.json"
+        self.assertTrue(json.loads(state.read_text())["escalated"])
+
+    def test_wedge_page_suppressed_when_quiet_attributable(self) -> None:
+        # T-2632 PART 2 wiring: a fired wedge whose quiet is ATTRIBUTABLE to a
+        # declared signal (e.g. an active context_fill_hold) must NOT page Recovery —
+        # the freeze is explained (a held session sitting in a long turn), not a
+        # wedge. Downgrades the ALERT only; this branch never restarts. This is the
+        # suppress-direction mutation guard (without the gate, alert WOULD fire).
+        os.environ["ACTIVITY_MONITOR_TUI_WEDGE_ENABLED"] = "1"
+        with patch.object(am, "in_cooldown", return_value=False), \
+             patch.object(am, "check_tui_wedge", return_value=(True, "wedged")), \
+             patch.object(am, "latest_jsonl_mtime", return_value=1000), \
+             patch.object(am, "quiet_is_attributable",
+                          return_value=(True, "context_fill_hold active")), \
+             patch.object(am, "_route_failure_alert") as alert, \
+             patch.object(am, "check_p1a") as p1a:
+            rc = main(["--agent", "orchestrator"])
+        self.assertEqual(rc, 0)
+        alert.assert_not_called()   # attributable quiet → page SUPPRESSED
+        p1a.assert_not_called()     # wedge branch still preempts the poke predicates
+        state = self.tmp / "state" / "activity_monitor_orchestrator_last_poke.json"
+        self.assertFalse(state.exists(), "no escalated state written on a suppressed page")
+
+    def test_enabled_wedge_pages_once_across_cycles(self) -> None:
+        os.environ["ACTIVITY_MONITOR_TUI_WEDGE_ENABLED"] = "1"
+        with patch.object(am, "in_cooldown", return_value=False), \
+             patch.object(am, "check_tui_wedge", return_value=(True, "wedged")), \
+             patch.object(am, "latest_jsonl_mtime", return_value=1000), \
+             patch.object(am, "_route_failure_alert") as alert:
+            for _ in range(3):
+                main(["--agent", "orchestrator"])
+        self.assertEqual(alert.call_count, 1, "one page per episode, then bounded-quiet")
+
+    def test_enabled_not_wedged_falls_through_to_predicates(self) -> None:
+        os.environ["ACTIVITY_MONITOR_TUI_WEDGE_ENABLED"] = "1"
+        with patch.object(am, "in_cooldown", return_value=False), \
+             patch.object(am, "check_tui_wedge", return_value=(False, "fresh")), \
+             patch.object(am, "check_p1a", return_value=False) as p1a, \
+             patch.object(am, "check_p1b", return_value=False), \
+             patch.object(am, "check_p1d", return_value=False):
+            rc = main(["--agent", "orchestrator"])
+        self.assertEqual(rc, 0)
+        p1a.assert_called_once()  # not wedged → normal predicate flow runs
+
+
+class QuietAttributionTests(unittest.TestCase):
+    """T-2632 PART 2 (asserted-only core): quiet_is_attributable — a fail-safe
+    query that reports whether a seat's quiet is explained by a DECLARED signal.
+    The load-bearing property is the fail-safe direction: any error/ambiguity must
+    return (False, ...) so the wedge signal proceeds — never masked."""
+
+    def test_attributable_when_hold_active(self) -> None:
+        with patch("tools.context_fill_hold.hold_status",
+                   return_value={"active": True, "reason": "operator soak"}):
+            ok, reason = am.quiet_is_attributable("orchestrator", now=1000)
+        self.assertTrue(ok)
+        self.assertIn("operator soak", reason)
+
+    def test_unattributed_when_no_hold_and_no_signals(self) -> None:
+        with patch("tools.context_fill_hold.hold_status", return_value={"active": False}):
+            ok, reason = am.quiet_is_attributable("orchestrator", now=1000)
+        self.assertFalse(ok)
+        self.assertIn("unattributed", reason)
+
+    def test_injected_signal_attributes(self) -> None:
+        # The wiring pass's unit-disabled probe plugs in here.
+        with patch("tools.context_fill_hold.hold_status", return_value={"active": False}):
+            ok, reason = am.quiet_is_attributable(
+                "specialist", now=1000,
+                signals=[lambda a, n: (True, "session unit disabled (TG-6694 pause)")],
+            )
+        self.assertTrue(ok)
+        self.assertIn("disabled", reason)
+
+    def test_injected_signal_none_falls_through_to_unattributed(self) -> None:
+        with patch("tools.context_fill_hold.hold_status", return_value={"active": False}):
+            ok, reason = am.quiet_is_attributable(
+                "specialist", now=1000, signals=[lambda a, n: None]
+            )
+        self.assertFalse(ok)
+
+    def test_failsafe_a_raising_signal_never_attributes(self) -> None:
+        # A broken signal must be swallowed and treated as 'no signal' — erring
+        # toward NOT attributable (wedge proceeds), never toward masking.
+        def boom(a, n):
+            raise RuntimeError("probe blew up")
+        with patch("tools.context_fill_hold.hold_status", return_value={"active": False}):
+            ok, _ = am.quiet_is_attributable("orchestrator", now=1000, signals=[boom])
+        self.assertFalse(ok)
+
+    def test_failsafe_hold_lookup_error_never_masks(self) -> None:
+        # If the hold lookup itself throws, quiet must read as UNATTRIBUTED so the
+        # wedge still escalates — the T-2615 'never mask a wedge' invariant.
+        with patch("tools.context_fill_hold.hold_status", side_effect=OSError("state dir gone")):
+            ok, _ = am.quiet_is_attributable("orchestrator", now=1000)
+        self.assertFalse(ok)
+
+    def test_first_truthy_signal_wins_hold_precedes_injected(self) -> None:
+        # Asserted hold is checked before injected signals; its reason is returned.
+        called = []
+        with patch("tools.context_fill_hold.hold_status",
+                   return_value={"active": True, "reason": "held"}):
+            ok, reason = am.quiet_is_attributable(
+                "orchestrator", now=1000,
+                signals=[lambda a, n: called.append(1) or (True, "should not reach")],
+            )
+        self.assertTrue(ok)
+        self.assertIn("held", reason)
+        self.assertEqual(called, [], "hold short-circuits before injected signals")
+
+
 if __name__ == "__main__":
     unittest.main()
+

@@ -1,8 +1,19 @@
 ---
 aliases: [ORG-003]
-title: Ticket system: format, lifecycle, and grooming
+title: "Ticket system: format, lifecycle, and grooming"
 status: Ratified 2026-05-02
 date: 2026-05-02
+# re_evaluate: machine-checkable mirror of this ADR's inline re-eval prose,
+# consumed by tools/adr_reeval_walk.py (T-2527) during the weekly-review walk.
+# type: calendar|metric|event ; fires: auto-ticket (deterministic only) | surface.
+# Backfilled per T-2530 (inline-only trigger was previously uncaught).
+re_evaluate:
+  - id: R1
+    type: event
+    when: "a second project comes online"
+    fires: surface
+    text: "v0 assumes a single shared ticket tree; revisit shared-vs-per-project ticket trees when a second project comes online"
+build_disposition: built
 ---
 # ORG-003 — Ticket system: format, lifecycle, and grooming
 

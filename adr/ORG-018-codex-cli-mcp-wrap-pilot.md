@@ -1,8 +1,9 @@
 ---
 aliases: [ORG-018]
-title: Codex CLI as MCP tool source: pilot (Option 2 from msg_1640+1641)
+title: "Codex CLI as MCP tool source: pilot (Option 2 from msg_1640+1641)"
 status: Ratified 2026-05-17
 date: 2026-05-17
+build_disposition: built
 ---
 # ORG-018 — Codex CLI as MCP tool source: pilot (Option 2 from msg_1640+1641)
 

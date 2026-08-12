@@ -23,6 +23,7 @@ related:
 addenda:
   - 2026-05-06 — Phase 1 implementation addendum (post-deploy as-built shape; Deviation 1 systemd subservices + kino-launcher.sh pre-spawn; Deviation 2 socat ACCEPT-FD:3 stdio↔socket bridge); HO-authored under autonomy-bar D3, ratified inline via DECISIONS-with-justifies-via on pantheon-pwa commits 0c0f071 + d42992d + b920068; ledger close_kino_phase_1b_cross_uid_architecture.
   - 2026-05-21 — Agent-chat sunset amendment (T-0508); headless claude -p agent backend removed because claude -p begins billing paid API 2026-06-13 (breaks the flat-sub cost model); Telegram remains the chat surface; PWA retains ticket-UI/stats; chat frontend kept inert for future revival. operator-decided msg_1834/1836; HO-authored. See §Amendment 2026-05-21.
+build_disposition: built
 ---
 
 # ORG-006 — kino PWA: Pantheon multi-agent web UI

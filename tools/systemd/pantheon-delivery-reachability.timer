@@ -1,0 +1,16 @@
+[Unit]
+Description=Pantheon delivery reachability — 6-hourly seat-receivability sweep (T-2232)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# SIX-HOURLY. What this watches changes only when someone provisions, pauses or retires a seat
+# — a human-timescale event. atlas went undelivered for its whole existence, so the cost of
+# noticing six hours late is nil against the cost of noticing never, and each fire spends a
+# sudo round-trip per agent.
+OnCalendar=*-*-* 03,09,15,21:23:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=pantheon-delivery-reachability.service
+
+[Install]
+WantedBy=timers.target

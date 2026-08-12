@@ -3,19 +3,39 @@
 
 Generalizes the single-purpose ledger_index_groom.py into an all-spine-indexes
 pass covering every directory README whose contents table can be mechanically
-regenerated from disk state. Minimizes work via mtime-cache: skips dirs whose
-tree hasn't changed since last groom.
+regenerated from disk state. Every registered dir is scanned every fire.
+
+NO MTIME CACHE — removed under T-2184, and the reason is worth keeping. This
+tool runs exclusively inside `with_worktree` (`run_all`, unconditional, no
+bypass), and `git worktree add` stamps every checked-out file at checkout time.
+So the mtime a fire caches is ~its own start time, and the next fire's freshly
+stamped files are always NEWER — `current <= cached` can never hold. Measured:
+a worktree's adr/*.md came out at checkout-time while the checkout's real
+mtimes were 21 days old. The cache's hit rate was structurally ZERO on every
+path the tool actually runs, however it was keyed, while it grew ~15
+permanently unreachable keys per fire into a state file nothing pruned.
+
+It was NOT replaced with a content hash. That would have turned caching ON for
+the first time here, and a groomer whose failure mode is "the index silently
+stops reflecting reality" has already paid for that twice (T-2103: a handler
+fix was inert because no watched dir changed; T-2182: --dry-run went blind by
+reading a cache written under different mtime semantics). What always-scanning
+costs, measured: 1.25s wall for a full 15-region pass INCLUDING interpreter
+startup, on a daily timer. That is not a trade worth a silent-staleness surface.
+
+Worth recording so the diagnosis is not re-litigated: at removal time the live
+cache held 15 correctly-keyed relative entries ("adr", "bugs", "incidents"),
+so T-2184's earlier keying fix had landed and worked. The cache still could not
+hit. Keying was never the blocker — the mtime SEMANTICS are, and no key repairs
+that.
 
 Per fire (single-shot, no subcommands):
 
 1. Pull repo (fail-open on transient errors per T-0118/T-0120 pattern).
 2. For each registered spine dir:
-   a. Compute max-mtime of relevant files in the dir.
-   b. Compare against cache. Skip if unchanged.
-   c. Call per-dir handler → list[str] of Markdown table rows.
-   d. Write rows between AUTOGEN-START/END sentinel comment regions in README.md.
-   e. If region changed: commit + push via _git_utils discipline (HERMES-guarded).
-3. Save updated cache.
+   a. Call per-dir handler → list[str] of Markdown table rows.
+   b. Write rows between AUTOGEN-START/END sentinel comment regions in README.md.
+   c. If region changed: commit + push via _git_utils discipline (HERMES-guarded).
 
 CLI:
     python3 tools/spine_index_groom.py                # normal fire
@@ -31,7 +51,6 @@ from __future__ import annotations
 import argparse
 import ast
 import json
-import os
 import re
 import sys
 from datetime import datetime, timezone
@@ -46,13 +65,12 @@ from tools._git_utils import (  # noqa: E402
     with_worktree,
 )
 from tools.ledger_shard import (  # noqa: E402
+    entry_ts,
     iter_ledger_entry_files,
     segment_for_ts,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-CACHE_PATH = Path.home() / ".local" / "state" / "pantheon" / "index_groom_cache.json"
-CACHE_SCHEMA_VERSION = 1
 
 SENTINEL_START = "<!-- AUTOGEN-START spine-index -->"
 SENTINEL_END = "<!-- AUTOGEN-END spine-index -->"
@@ -123,59 +141,27 @@ def write_sentinel_region(readme_path: Path, new_rows: list[str]) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Mtime aggregation helpers.
+# Markdown row emission — the single choke point (T-1929).
 # ---------------------------------------------------------------------------
-
-
-def _max_mtime_flat(d: Path, glob: str = "*") -> float:
-    """Max mtime of files in d matching glob (non-recursive). 0.0 if empty."""
-    mtimes = [p.stat().st_mtime for p in d.glob(glob) if p.is_file()]
-    return max(mtimes, default=0.0)
-
-
-def _max_mtime_subdirs(d: Path) -> float:
-    """Max mtime across d itself + immediate subdirs (one level deep). 0.0 if empty.
-
-    Dir-mtimes only — catches structural changes (subdir added/removed/renamed)
-    but NOT content edits to files inside a subdir. Correct for handlers that
-    only emit subdir names (watch_reports_handler); use _max_mtime_subdir_contents
-    for handlers that extract text from per-subdir files (T-1466).
-    """
-    candidates = [d] + [p for p in d.iterdir() if p.is_dir()]
-    mtimes = [p.stat().st_mtime for p in candidates]
-    return max(mtimes, default=0.0)
-
-
-def _max_mtime_subdir_contents(d: Path) -> float:
-    """Max mtime across d, its immediate subdirs, AND the files one level inside
-    each subdir. 0.0 if empty.
-
-    Editing content in `subdir/README.md` bumps that FILE's mtime but NOT the
-    subdir's own dir mtime (modifying a file doesn't touch its parent dir), so a
-    dir-only scan (_max_mtime_subdirs) misses content edits and the groomer's
-    cache never invalidates them (T-1466). This helper folds in the per-subdir
-    file mtimes so content edits are caught. Used by handlers that extract text
-    from per-subdir files (research/incidents/skills).
-    """
-    mtimes = [d.stat().st_mtime]
-    for sub in d.iterdir():
-        if not sub.is_dir():
-            continue
-        mtimes.append(sub.stat().st_mtime)
-        mtimes.extend(p.stat().st_mtime for p in sub.glob("*") if p.is_file())
-    return max(mtimes, default=0.0)
-
-
-def _max_mtime_ledger(d: Path) -> float:
-    """Max mtime relevant to the ledger handler's scope (T-0148).
-
-    Covers BOTH the flat legacy files at ledger/ root (pre-migration:
-    2026.jsonl, INDEX.md) AND the per-week subfolder shards (post-migration:
-    ledger/<seg>/<seg>.jsonl + SPINE.md). A flat-only or subdir-only mtime
-    would miss one layout. Appending to a subfolder shard bumps the
-    subfolder's own mtime, which is captured by the subdir scan.
-    """
-    return max(_max_mtime_flat(d), _max_mtime_subdirs(d))
+#
+# A literal `|` inside a generated value splits the markdown table cell, so the
+# row renders with more columns than its header and the value is truncated at
+# the first pipe. Found during T-1912: 7 frontmatter values across 5 bugs/ files
+# carried pipes, breaking 3 rows in bugs/README.md and 2 in
+# knowledge/episodic/README.md.
+#
+# Escaping CANNOT happen downstream in write_sentinel_region(): that receives
+# already-formatted row strings and cannot distinguish a structural delimiter
+# pipe from a value pipe. It therefore happens at cell level, before the
+# delimiters are added — and every handler routes through _md_row so a new
+# handler inherits escaping by construction rather than by remembering (P1).
+#
+# _md_cell / _md_row were re-homed to the leaf module tools/_md_table.py under
+# T-1936 so the four raw-f-string table emitters (ticket.py, weekly_ticket_summary,
+# watch_runner, s3star_audit_runner) share this ONE implementation rather than
+# each growing a copy that could drift. Imported below (not redefined) — the
+# single-implementation invariant is `grep -rn "def _md_cell" tools/` == 1.
+from tools._md_table import _UNESCAPED_PIPE, _md_cell, _md_row  # noqa: F401,E402
 
 
 # ---------------------------------------------------------------------------
@@ -189,18 +175,56 @@ def research_handler(d: Path) -> list[str]:
     for subdir in sorted(d.iterdir()):
         if not subdir.is_dir():
             continue
-        # Try README.md then notes.md for description.
+        # Try README.md, then notes.md, then ANY other .md in the subdir (T-2103).
+        # Without the third leg, a subdir holding only e.g. report.md or
+        # findings.md indexed as a bare "—": present in the index, correctly
+        # listed by FILENAME, and carrying ZERO searchable description. That
+        # defeats the prior-art grep the ORG-012 discipline depends on — it is
+        # how the T-1968 step-1 inventory was nearly rebuilt from scratch, and
+        # it affected 27 of 120 episodic subdirs when this landed. Falling back
+        # to the first other .md fixes every such case with no authoring effort
+        # and no retroactive make-work.
         desc = _first_paragraph_after_title(subdir / "README.md") or \
-               _first_paragraph_after_title(subdir / "notes.md") or "—"
-        rows.append(f"| [`{subdir.name}/`]({subdir.name}/) | {desc} |")
+               _first_paragraph_after_title(subdir / "notes.md") or \
+               _first_paragraph_of_any_md(subdir) or "—"
+        rows.append(_md_row(f"[`{subdir.name}/`]({subdir.name}/)", desc))
     return rows
 
 
+def _first_paragraph_of_any_md(subdir: Path) -> str:
+    """First usable paragraph from any .md in subdir, README/notes already tried.
+
+    T-2103 third fallback leg. Deterministic: sorted() so the row is stable
+    across runs (the groomer is idempotent and an unstable pick would produce
+    spurious diffs). Skips README.md / notes.md because the caller has already
+    tried them, and returns "" when the subdir holds no other .md at all — a
+    dir of only .txt/.json still falls through to "—", which is correct: there
+    is no prose to lift, and inventing one from filenames would be a different
+    (weaker) option than this one.
+    """
+    for md in sorted(subdir.glob("*.md")):
+        if md.name in ("README.md", "notes.md"):
+            continue
+        desc = _first_paragraph_after_title(md)
+        if desc:
+            return desc
+    return ""
+
+
 def _first_paragraph_after_title(path: Path) -> str:
-    """Extract first non-blank paragraph after the title from a Markdown file."""
+    """Extract first non-blank paragraph after the title from a Markdown file.
+
+    T-2182: falls back to the YAML frontmatter `title:` when no paragraph is
+    found. A note written frontmatter-first with NO `#` heading — a normal way to
+    write a research note — never sets past_title, so this returned "" and the
+    row indexed as a bare em-dash despite the file carrying a perfectly good
+    one-line description. Reading frontmatter here is not a new capability: the
+    bugs handler already does it (`fm.get("symptom", ...)`).
+    """
     if not path.exists():
         return ""
-    lines = path.read_text().splitlines()
+    text = path.read_text()
+    lines = text.splitlines()
     past_title = False
     para_lines: list[str] = []
     for line in lines:
@@ -213,7 +237,60 @@ def _first_paragraph_after_title(path: Path) -> str:
                 break
             continue
         para_lines.append(line.strip())
-    return " ".join(para_lines)
+    if para_lines:
+        return " ".join(para_lines)
+    # No `#` heading anywhere, so the loop above collected nothing. Take the
+    # first paragraph from the top instead, skipping any frontmatter block.
+    # T-2183: six episodic READMEs are exactly this shape — prose on line 1, no
+    # heading, no frontmatter — and render only because a sibling notes.md
+    # rescues them. Rename the sibling and they silently become em-dashes.
+    body = _first_paragraph_from_top(lines)
+    if body:
+        return body
+    return _frontmatter_title(lines)
+
+
+def _first_paragraph_from_top(lines: list[str]) -> str:
+    """First non-blank paragraph, skipping a leading YAML frontmatter block.
+
+    Only used when no `#` heading exists — with a heading present the caller's
+    after-the-title scan is the correct reading, and taking the top paragraph
+    would grab pre-title matter instead.
+    """
+    start = 0
+    if lines and lines[0].strip() == "---":
+        for i, line in enumerate(lines[1:], start=1):
+            if line.strip() == "---":
+                start = i + 1
+                break
+        else:
+            return ""  # unterminated frontmatter — treat the file as opaque
+    para: list[str] = []
+    for line in lines[start:]:
+        if not line.strip():
+            if para:
+                break
+            continue
+        para.append(line.strip())
+    return " ".join(para)
+
+
+def _frontmatter_title(lines: list[str]) -> str:
+    """`title:` value from a leading YAML frontmatter block, else "".
+
+    Deliberately a hand parse rather than a YAML dependency: this reads one
+    scalar from a block the groomer already treats as opaque, and the module has
+    no yaml import today. Only a frontmatter block that STARTS the file counts —
+    a stray `---` mid-document is a horizontal rule, not frontmatter.
+    """
+    if not lines or lines[0].strip() != "---":
+        return ""
+    for line in lines[1:]:
+        if line.strip() == "---":
+            break
+        if line.startswith("title:"):
+            return line.split(":", 1)[1].strip().strip("\"'")
+    return ""
 
 
 def tools_handler(d: Path) -> list[str]:
@@ -223,7 +300,7 @@ def tools_handler(d: Path) -> list[str]:
         if script.name.startswith("test_") or script.name.startswith("_"):
             continue
         purpose = _first_docstring_line(script)
-        rows.append(f"| [`{script.name}`]({script.name}) | {purpose} |")
+        rows.append(_md_row(f"[`{script.name}`]({script.name})", purpose))
     return rows
 
 
@@ -247,7 +324,7 @@ def notes_handler(d: Path) -> list[str]:
         if md.name == "README.md":
             continue
         purpose = _first_paragraph_after_title(md) or "—"
-        rows.append(f"| [`{md.name}`]({md.name}) | {purpose} |")
+        rows.append(_md_row(f"[`{md.name}`]({md.name})", purpose))
     return rows
 
 
@@ -260,7 +337,7 @@ def bugs_handler(d: Path) -> list[str]:
         fm = _parse_frontmatter(md)
         symptom = fm.get("symptom", "—")
         domain = fm.get("domain", "—")
-        rows.append(f"| `{md.name}` | {symptom} | {domain} |")
+        rows.append(_md_row(f"`{md.name}`", symptom, domain))
     return rows
 
 
@@ -287,7 +364,7 @@ def incidents_handler(d: Path) -> list[str]:
         if not subdir.is_dir():
             continue
         shape = _read_general_failure_shape(subdir / "README.md") or "—"
-        rows.append(f"| [{subdir.name}/]({subdir.name}/) | {shape} |")
+        rows.append(_md_row(f"[{subdir.name}/]({subdir.name}/)", shape))
     return rows
 
 
@@ -315,7 +392,7 @@ def watch_reports_handler(d: Path) -> list[str]:
     rows = []
     for subdir in sorted(d.iterdir()):
         if subdir.is_dir():
-            rows.append(f"| [{subdir.name}/]({subdir.name}/) |")
+            rows.append(_md_row(f"[{subdir.name}/]({subdir.name}/)"))
     return rows
 
 
@@ -331,7 +408,7 @@ def pinned_rules_handler(d: Path) -> list[str]:
         if md.name == "README.md":
             continue
         purpose = _first_paragraph_after_title(md) or "—"
-        rows.append(f"| [`{md.name}`]({md.name}) | {purpose} |")
+        rows.append(_md_row(f"[`{md.name}`]({md.name})", purpose))
     return rows
 
 
@@ -350,7 +427,7 @@ def skills_handler(d: Path) -> list[str]:
             continue
         fm = _parse_frontmatter(skill_md)
         desc = fm.get("description", "—")
-        rows.append(f"| [`{subdir.name}/`]({subdir.name}/) | {desc} |")
+        rows.append(_md_row(f"[`{subdir.name}/`]({subdir.name}/)", desc))
     return rows
 
 
@@ -365,7 +442,7 @@ def adr_handler(d: Path) -> list[str]:
         status = fm.get("status", "—")
         date = fm.get("date", "—")
         stem = md.name
-        rows.append(f"| [{stem}]({stem}) | {title} | {status} | {date} |")
+        rows.append(_md_row(f"[{stem}]({stem})", title, status, date))
     return rows
 
 
@@ -410,7 +487,7 @@ def _build_index_row(entry: dict) -> str:
     action = entry.get("action", "?")
     agent = entry.get("agent", "?")
     justifies = _format_justifies(entry)
-    return f"| `{eid}` | {action} | {agent} | {justifies} |"
+    return _md_row(f"`{eid}`", action, agent, justifies)
 
 
 # ---------------------------------------------------------------------------
@@ -427,11 +504,11 @@ SPINE_TABLE_HEADER = (
 
 def _build_spine_row(entry: dict) -> str:
     eid = entry["id"]
-    ts = entry.get("ts", "?")
+    ts = entry_ts(entry) or "?"
     action = entry.get("action", "?")
     agent = entry.get("agent", "?")
     justifies = _format_justifies(entry)
-    return f"| `{eid}` | {ts} | {action} | {agent} | {justifies} |"
+    return _md_row(f"`{eid}`", ts, action, agent, justifies)
 
 
 def _build_segment_spine(segment: str, entries: list[dict]) -> str:
@@ -574,7 +651,7 @@ def _sync_segment_spines(
     return changed
 
 
-def ledger_handler(ledger_dir: Path, *, push: bool = False, cwd: Path | None = None) -> None:
+def ledger_handler(ledger_dir: Path, *, push: bool = False, cwd: Path | None = None) -> bool:
     """Maintain ledger/INDEX.md (and post-migration per-segment SPINE.md files).
 
     Reads the ledger entry-file union (ledger_shard.iter_ledger_entry_files,
@@ -586,24 +663,29 @@ def ledger_handler(ledger_dir: Path, *, push: bool = False, cwd: Path | None = N
 
     `cwd` is passed through to the commit helper; worktree callers set this to
     the worktree path so git operations run in the isolated tree.
+
+    Returns True if a commit was made (INDEX.md and/or a segment SPINE.md
+    changed), False otherwise — including the early no-op returns below. The
+    caller (groom_dirs, T-1881) uses this to print a status line distinguishing
+    a genuine no-op from a real commit; previously both were silent.
     """
     index_path = ledger_dir / "INDEX.md"
     if not index_path.exists():
-        return
+        return False
 
     entry_files = iter_ledger_entry_files(ledger_dir)
     entries: list[dict] = []
     for f in entry_files:
         entries.extend(_read_jsonl_entries(f))
     if not entries:
-        return
+        return False
 
     # Group entries by their ISO-week segment (for SPINE.md) and by their
     # entry-ts calendar year (for the INDEX `## <year>` sections — the INDEX
     # remains year-grouped per its existing shape).
     entries_by_segment: dict[str, list[dict]] = {}
     for e in entries:
-        ts = e.get("ts")
+        ts = entry_ts(e)
         if not isinstance(ts, str):
             continue
         try:
@@ -625,7 +707,7 @@ def ledger_handler(ledger_dir: Path, *, push: bool = False, cwd: Path | None = N
     if missing:
         missing_by_year: dict[str, list[dict]] = {}
         for e in missing:
-            ts = e.get("ts") or ""
+            ts = entry_ts(e) or ""
             yr = ts[:4] if len(ts) >= 4 and ts[:4].isdigit() else datetime.now(timezone.utc).strftime("%Y")
             missing_by_year.setdefault(yr, []).append(e)
         for yr in sorted(missing_by_year):
@@ -637,11 +719,11 @@ def ledger_handler(ledger_dir: Path, *, push: bool = False, cwd: Path | None = N
         index_path.write_text(new_text)
 
     if not index_changed and not spine_changed:
-        return
+        return False
 
     # The commit message year header uses the newest entry's year for context.
     msg_year = max(
-        (e.get("ts", "")[:4] for e in entries if e.get("ts", "")[:4].isdigit()),
+        (yr for e in entries if (yr := (entry_ts(e) or "")[:4]).isdigit()),
         default=datetime.now(timezone.utc).strftime("%Y"),
     )
     _ledger_commit_and_push(
@@ -653,48 +735,7 @@ def ledger_handler(ledger_dir: Path, *, push: bool = False, cwd: Path | None = N
         cwd=cwd,
         extra_rel_paths=spine_changed,
     )
-
-
-# ---------------------------------------------------------------------------
-# Cache I/O.
-# ---------------------------------------------------------------------------
-
-
-def _load_cache(cache_path: Path = CACHE_PATH) -> dict:
-    if not cache_path.exists():
-        return {"schema_version": CACHE_SCHEMA_VERSION, "dirs": {}}
-    try:
-        data = json.loads(cache_path.read_text())
-    except (json.JSONDecodeError, OSError):
-        return {"schema_version": CACHE_SCHEMA_VERSION, "dirs": {}}
-    if data.get("schema_version") != CACHE_SCHEMA_VERSION:
-        return {"schema_version": CACHE_SCHEMA_VERSION, "dirs": {}}
-    return data
-
-
-def _save_cache(cache: dict, cache_path: Path = CACHE_PATH) -> None:
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cache_path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(cache, indent=2))
-    os.replace(tmp, cache_path)
-
-
-# ---------------------------------------------------------------------------
-# Per-dir mtime helpers.
-# ---------------------------------------------------------------------------
-
-
-def _dir_mtime(d: Path) -> float:
-    """Max mtime relevant to a dir's handler scope."""
-    handler = _HANDLER_MAP.get(d)
-    # Ledger handler: cover both flat legacy files + subfolder shards (T-0148).
-    if handler is ledger_handler:
-        return _max_mtime_ledger(d)
-    # Subdir-walk handlers: one-level deep.
-    if handler in (research_handler, incidents_handler, watch_reports_handler, skills_handler):
-        return _max_mtime_subdirs(d)
-    # Flat-file handlers.
-    return _max_mtime_flat(d)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -737,29 +778,30 @@ def groom_dirs(
     `cwd` is passed through to commit helpers; worktree callers set this to
     the worktree path so git operations run in the isolated working tree.
     """
-    cache = _load_cache()
-    cache_dirs: dict[str, float] = cache.get("dirs", {})
-
     for d, handler in sorted(handler_map.items(), key=lambda kv: str(kv[0])):
-        dir_key = str(d)
-
-        # Mtime cache check — skip if unchanged.
-        current_mtime = _dir_mtime_for_handler(d, handler)
-        cached_mtime = cache_dirs.get(dir_key, 0.0)
-        if current_mtime <= cached_mtime:
-            print(f"[spine_index_groom] cache-hit: {d.name}")
-            continue
-
         # Special-case: ledger handler manages its own README.
         if handler is ledger_handler:
             if not dry_run:
                 try:
-                    ledger_handler(d, push=push, cwd=cwd)
-                except Exception as exc:
+                    committed = ledger_handler(d, push=push, cwd=cwd)
+                # Catches SystemExit too (T-1881): _ledger_commit_and_push raises
+                # SystemExit on a commit_scoped failure, and SystemExit is a
+                # BaseException, not an Exception — an `except Exception`-only
+                # catch here would let it escape uncaught, silently aborting
+                # every dir that sorts after "ledger" in this loop for the rest
+                # of the fire. Never catches KeyboardInterrupt/GeneratorExit.
+                except (Exception, SystemExit) as exc:
                     print(f"[spine_index_groom] {d.name}: error in ledger handler: {exc}", file=sys.stderr)
+                else:
+                    # T-1881: the success path previously printed nothing at
+                    # all — a real no-op and a silent break were indistinguishable
+                    # from the log. Always report which one happened.
+                    if committed:
+                        print(f"[spine_index_groom] {d.name}: ledger handler committed changes")
+                    else:
+                        print(f"[spine_index_groom] {d.name}: ledger handler ran — noop (no changes)")
             else:
                 print(f"[spine_index_groom] {d.name}: dry-run ledger handler")
-            cache_dirs[dir_key] = current_mtime
             continue
 
         # Generic sentinel-region handlers.
@@ -778,13 +820,11 @@ def groom_dirs(
             print(f"[spine_index_groom] {d.name}: dry-run — would write {len(rows)} row(s)")
             for row in rows:
                 print(f"  {row}")
-            cache_dirs[dir_key] = current_mtime
             continue
 
         changed = write_sentinel_region(readme, rows)
         if not changed:
             print(f"[spine_index_groom] {d.name}: noop — region unchanged")
-            cache_dirs[dir_key] = current_mtime
             continue
 
         print(f"[spine_index_groom] {d.name}: wrote {len(rows)} row(s)")
@@ -792,24 +832,6 @@ def groom_dirs(
             _commit_dir_change(readme, d.name, push=push, cwd=cwd)
         except Exception as exc:
             print(f"[spine_index_groom] {d.name}: commit error: {exc}", file=sys.stderr)
-
-        cache_dirs[dir_key] = current_mtime
-
-    cache["dirs"] = cache_dirs
-    _save_cache(cache)
-
-
-def _dir_mtime_for_handler(d: Path, handler: object) -> float:
-    """Compute max-mtime appropriate to handler's file scope."""
-    if handler is ledger_handler:
-        return _max_mtime_ledger(d)
-    if handler in (research_handler, incidents_handler, skills_handler):
-        # These extract text from per-subdir files — must catch content edits.
-        return _max_mtime_subdir_contents(d)
-    if handler is watch_reports_handler:
-        # Emits only subdir names — structure-only mtime is correct (+cheaper).
-        return _max_mtime_subdirs(d)
-    return _max_mtime_flat(d)
 
 
 # ---------------------------------------------------------------------------

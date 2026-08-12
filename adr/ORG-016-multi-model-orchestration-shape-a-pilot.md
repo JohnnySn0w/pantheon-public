@@ -1,8 +1,22 @@
 ---
 aliases: [ORG-016]
-title: Multi-model orchestration: Shape A pilot (Claude-primary + Grok/GPT as MCP-wrapped tools)
+title: "Multi-model orchestration: Shape A pilot (Claude-primary + Grok/GPT as MCP-wrapped tools)"
 status: Ratified 2026-05-17
 date: 2026-05-17
+build_disposition: no-build-needed
+# re_evaluate: machine-checkable mirror of this ADR's inline re-eval prose,
+# consumed by tools/adr_reeval_walk.py (T-2527). Backfilled per T-2530.
+# fires:surface (NOT auto-ticket) DELIBERATELY despite the deterministic date:
+# the pilot's re-eval status is unconfirmed and the fleet's non-Claude path
+# evolved toward codex (ORG-018/ORG-031), a different shape than Shape A — so
+# this SURFACES for a human to confirm rather than auto-filing a possibly-moot
+# re-eval ticket.
+re_evaluate:
+  - id: R1
+    type: calendar
+    when: "2026-06-16"
+    fires: surface
+    text: "Shape A pilot 30-day re-eval (ratify Decision C / re-open Decision B / sunset Shape A if it showed no value) — PAST DUE from the 2026-05-17 ratification; confirm whether Shape A was decided (the fleet's actual non-Claude path became codex, a different shape) before acting"
 ---
 # ORG-016 — Multi-model orchestration: Shape A pilot (Claude-primary + Grok/GPT as MCP-wrapped tools)
 

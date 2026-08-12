@@ -22,6 +22,15 @@
 #  - `ci-gate` is the ONE required check and reports LAST; --admin is required
 #    (PAT author can't self-approve) but ci-gate is NOT admin-bypassable.
 #  - repo delete_branch_on_merge=false -> we delete the branch explicitly.
+#  - PROBLEM 2 fallback (T-2714): if the CI-poll background task itself gets
+#    killed (a long echo run can outlast the harness's background-task
+#    duration cap), don't re-run cold — watch the SAME run read-only via
+#    Monitor: `gh run view <run-id> --repo <repo> --json status,conclusion`.
+#    On ci-gate green, merge manually:
+#    `gh pr merge <pr#> --repo <repo> --admin --squash --delete-branch`, then
+#    refresh main + clean the worktree by hand. Or just re-run this script —
+#    it's already resumable (see AUTO-RESUME below): it reuses the open PR and
+#    relocates the CI run rather than re-pushing.
 #
 # Usage:
 #   tools/echo-merge.sh <ticket-id> [options]
@@ -31,10 +40,22 @@
 #   --body-file <path>      PR body file  (required only if no PR exists yet)
 #   --method squash|merge|rebase   merge method (default: squash)
 #   --no-push               branch already pushed; skip the push phase
+#   --no-verify-push        push with `git push --no-verify`, skipping the
+#                           pre-push hook (full `cargo test --workspace`),
+#                           which cold-builds gtk/tauri/webkit via
+#                           echo-demo-app and gets KILLED mid-build on
+#                           workspace-touching branches (T-2714). NOT a
+#                           verification skip: `ci-gate` is a required,
+#                           non-admin-bypassable check that re-runs the
+#                           identical smoke on the PR before merge, so
+#                           verification just moves to CI, the authoritative
+#                           gate. OPT-IN — omitting it is byte-identical to
+#                           the push behavior before this flag existed.
 #   --worktree <path>       override worktree (default /tmp/echo-<id>)
 #   --repo <owner/name>     override repo   (default example-org/echo-prismatic)
 #   --main-checkout <path>  override main clone (default /home/claude/echo-prismatic)
-#   --poll-timeout <secs>   CI poll ceiling (default 1500)
+#   --poll-timeout <secs>   CI poll ceiling (default 4500 — a busy single-runner cycle
+#                           is ~50min queued-behind-another; T-1670)
 #   -h|--help
 #
 # AUTO-RESUME (T-1631): re-running to catch a timed-out CI poll (the runner-queue
@@ -50,11 +71,15 @@ set -euo pipefail
 # ---- defaults ----------------------------------------------------------------
 REPO="example-org/echo-prismatic"
 MAIN_CHECKOUT="/home/claude/echo-prismatic"
-TOKEN_ENV="/home/claude/gh_token.env"
+# T-2714: env-overridable so a fixture path can drive this same script
+# hermetically in tests / on seats without /home/claude/gh_token.env (Recovery,
+# codex, CI). Unset TOKEN_ENV -> identical default to before.
+TOKEN_ENV="${TOKEN_ENV:-/home/claude/gh_token.env}"
 METHOD="squash"
 EXECUTE=0
 DO_PUSH=1
-POLL_TIMEOUT=1500
+DO_NO_VERIFY_PUSH=0
+POLL_TIMEOUT=4500
 POLL_INTERVAL=30
 TICKET=""
 WORKTREE=""
@@ -69,6 +94,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --execute) EXECUTE=1; shift ;;
     --no-push) DO_PUSH=0; shift ;;
+    --no-verify-push) DO_NO_VERIFY_PUSH=1; shift ;;
     --title) PR_TITLE="${2:-}"; shift 2 ;;
     --body-file) PR_BODY_FILE="${2:-}"; shift 2 ;;
     --method) METHOD="${2:-}"; shift 2 ;;
@@ -115,8 +141,14 @@ if [[ "$DO_PUSH" == "1" ]]; then
   if [[ -n "$origin_sha" && "$local_sha" == "$origin_sha" ]]; then
     log "[1/5] branch already on origin at ${local_sha:0:8} — nothing to push; skipping pre-push smoke (auto-resume)."
   else
-    log "[1/5] push $BRANCH (pre-push smoke runs; may take minutes) ..."
-    git -C "$WORKTREE" push -u origin "$BRANCH" 2>&1 | sed -E 's#https://[^@]*@#https://REDACTED@#g' >&2
+    push_args=(-C "$WORKTREE" push -u origin "$BRANCH")
+    if [[ "$DO_NO_VERIFY_PUSH" == "1" ]]; then
+      push_args+=(--no-verify)
+      log "[1/5] --no-verify-push: skipping the pre-push hook (ci-gate is the authoritative gate) ..."
+    else
+      log "[1/5] push $BRANCH (pre-push smoke runs; may take minutes) ..."
+    fi
+    git "${push_args[@]}" 2>&1 | sed -E 's#https://[^@]*@#https://REDACTED@#g' >&2
     log "[1/5] pushed."
   fi
 else
@@ -155,7 +187,15 @@ while (( elapsed < POLL_TIMEOUT )); do
   if [[ "$STATUS" == "completed" ]]; then break; fi
   sleep "$POLL_INTERVAL"; elapsed=$(( elapsed + POLL_INTERVAL ))
 done
-[[ "$STATUS" == "completed" ]] || die "CI did not complete within ${POLL_TIMEOUT}s (last status=$STATUS)"
+if [[ "$STATUS" != "completed" ]]; then
+  # T-1670: timeout is NOT failure — push+PR succeeded and CI is still running.
+  # Distinct exit code (3) + explicit resume guidance so orchestrators don't
+  # burn a diagnosis round conflating this with a red build.
+  log "TIMEOUT (not failure): PR #$PR_NUM is open and CI run $RUN_ID is still ${STATUS}."
+  log "Resume: re-run this same command (auto-resumes into polling), or poll manually:"
+  log "  gh run view $RUN_ID --repo $REPO --json status,conclusion"
+  exit 3
+fi
 
 # ci-gate is the ONE required check; confirm it (and overall) are green.
 CIGATE="$(gh run view "$RUN_ID" --repo "$REPO" --json jobs \

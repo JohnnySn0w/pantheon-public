@@ -245,7 +245,23 @@ def build_input_bundle(tickets: Iterable[TicketRecord], monday: dt.date, sunday:
         f"Total tickets resolved: {len(tickets)}\n"
     )
     blocks = [t.to_bundle_block() for t in tickets]
-    return header + "\n\n" + "\n\n".join(blocks) + "\n"
+    body = header + "\n\n" + "\n\n".join(blocks) + "\n"
+    return body + "\n" + _adr_reeval_watch(body, sunday)
+
+
+def _adr_reeval_watch(week_activity: str, sunday: dt.date) -> str:
+    """Surface-only 'ADR re-eval watch' section for the report bundle (T-2527).
+
+    Read-only (dry_run) — the deterministic auto-file runs separately at the
+    weekly --file-request. Best-effort: a walk failure must never break the
+    weekly report, so it degrades to a comment.
+    """
+    try:
+        from tools.adr_reeval_walk import run_walk
+        return run_walk(now=sunday, week_activity=week_activity,
+                        dry_run=True, push=False).watch_section
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"<!-- ADR re-eval watch unavailable: {exc} -->\n"
 
 
 def build_prompt(
@@ -410,6 +426,13 @@ def refresh_readme_index() -> bool:
 
     Returns True if the file changed, False if it was already current.
     """
+    # Mirror the module's bootstrap so `from tools._md_table` works under
+    # script-mode invocation (per cron). Local import per T-1936 — this is a
+    # script, not a package, so tools imports are lazy here (see commit path below).
+    if __package__ in (None, ""):
+        sys.path.insert(0, str(REPO_ROOT))
+    from tools._md_table import _md_row  # type: ignore
+
     readme = README_PATH.read_text(errors="replace")
     rows = []
     for f in sorted(REPORTS_DIR.glob("*.md"), reverse=True):
@@ -418,7 +441,7 @@ def refresh_readme_index() -> bool:
         text = f.read_text(errors="replace")
         heading = _extract_report_heading(text)
         status = _extract_report_status(text)
-        rows.append(f"| `{f.name}` | {heading} | {status} |")
+        rows.append(_md_row(f"`{f.name}`", heading, status))
     new_block = "\n".join(rows)
     pattern = re.compile(
         re.escape(SENTINEL_START) + r"\n(.*?)\n" + re.escape(SENTINEL_END),
@@ -558,6 +581,27 @@ def run(args: argparse.Namespace) -> int:
 
     print(f"[weekly_ticket_summary] --file-request for {label} ({monday} → {sunday})")
     tickets = walk_done_tickets(monday, sunday)
+
+    # ADR re-eval walk (T-2527): once-weekly, on the canonical account only (we
+    # are past the canonical-filer guard). Auto-files fired deterministic
+    # triggers, deduped against open re-eval tickets. Fail-safe — a walk error
+    # warns but never blocks the weekly report request.
+    if not args.dry_run:
+        try:
+            from tools.adr_reeval_walk import run_walk
+            wr = run_walk(now=dt.date.today(), dry_run=False, push=True)
+            if wr.filed:
+                print(f"[weekly_ticket_summary] ADR re-eval: filed {len(wr.filed)} "
+                      f"re-eval ticket(s): {', '.join(wr.filed)}")
+            if wr.deduped:
+                print(f"[weekly_ticket_summary] ADR re-eval: {len(wr.deduped)} "
+                      f"trigger(s) already have an open ticket (deduped)")
+            if not wr.filed and not wr.deduped:
+                print("[weekly_ticket_summary] ADR re-eval: no deterministic trigger fired")
+        except Exception as exc:
+            print(f"[weekly_ticket_summary] WARN: ADR re-eval walk failed: {exc}",
+                  file=sys.stderr)
+
     print(f"[weekly_ticket_summary] tickets resolved this week: {len(tickets)}")
     return file_request(
         label=label,

@@ -26,6 +26,16 @@ never sees the completion unless it polls or HO forwards.
   main session. HO ruled on the plan directly and forwarded the ruling +
   routing heads-up to echo-fixarc. Two sessions, same shape — recurring, not a
   one-off.
+- 2026-07-23 (session 342e5dbf): echo-addsource's T-1493/T-1494 implementer
+  (task a056144d495578a54) fired the SAME routing **twice in one arc** — first
+  its plan-first report, then its completion report (commit ca86f5b) — both
+  landed in HO main, neither reached the spawning orchestrator. HO forwarded
+  substance + a "read your worker directly, the wake isn't coming" heads-up each
+  time, leaving the plan-approval and reviewer-dispatch decisions at the
+  orchestrator tier. Strongest evidence yet that this is deterministic, not a
+  flaky wake-drop: a second fire on the *same task-id* to the *same wrong
+  destination* within one session. The two-sided compensation in `fix:` held
+  both times.
 
 ## Unknown: design or bug
 
@@ -49,6 +59,15 @@ orchestrator-side.
 
 ## Relation to existing entries
 
+- **One mechanism, four entries** (cross-linked 2026-07-14, T-1769):
+  `teammate-orchestrator-agent-dispatch-completion-routes-to-main.md` (June
+  original — status updated: structural, standing) ·
+  `team-subagent-async-worker-completions-notify-session-main.md` (07-12,
+  the proven lead-relay pattern) ·
+  `subagent-cannot-identify-dispatcher-messages-or-reply.md` (reverse
+  direction). The "Unknown: design or bug" section above is answered as far
+  as posture goes: 11+ occurrences across four arcs, 100% same direction —
+  treat as the topology's behavior.
 - `teammate-background-task-completion-wake-drop.md` — sibling: a worker's OWN
   background-task wake drops. Same family posture: every wake path is
   best-effort; liveness discipline is the guaranteed layer.

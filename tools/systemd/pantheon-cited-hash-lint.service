@@ -1,0 +1,29 @@
+# Weekly sweep for commit hashes cited in tickets that are not reachable from
+# origin/main (T-2272, from T-2201's hand audit).
+#
+# ⚠️ A SWEEP AND NOT A PRE-RESOLVE GATE, and the reason is structural rather than
+# scheduling. This repo's pre-push hook rebases onto origin/main before pushing,
+# and a rebase REWRITES commits — so a hash that was correct when the resolve note
+# was written becomes unreachable AFTERWARDS. A check running before the push
+# passes and can never see the defect it exists for. Only a later pass can.
+#
+# Read-only: it reports, commits nothing, and touches no ticket.
+[Unit]
+Description=Pantheon cited-hash lint — weekly unreachable-citation sweep
+Documentation=file:///home/%u/pantheon-config/tools/cited_hash_lint.py
+After=network-online.target
+Wants=network-online.target
+
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/cited_hash_lint.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,38 @@
+[Unit]
+Description=Pantheon local byte-sequence discipline audit — origin-side coverage while the pve2 runner is down (T-2392)
+Documentation=file:///home/%u/pantheon-config/tickets/inbox/T-2392.md
+
+# Silent-failure guard (T-1868), load-bearing rather than conventional. This unit
+# EXISTS because the origin-side workflow failed silently: jobs queued against a
+# registered-but-offline runner, `protect-main` declares no required checks, and a
+# queued run renders as "will run shortly" rather than "cannot run". A silent
+# failure of the replacement would reproduce exactly the defect it was built to
+# catch. Both nonzero exits route here and both want a human:
+#   1 = a violation was found      2 = the audit could not run at all
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# No `sg` wrapper: this touches only git and its own state file under
+# ~/.local/state/pantheon/. It does not read the mailbox hub, so it needs no
+# supplementary group. `git fetch` uses the file-based IdentityFile in
+# ~/.ssh/config (github-pantheon-config alias) and was verified to work with
+# SSH_AUTH_SOCK unset — a systemd user unit has no agent.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/hermes_local_audit.py
+
+StandardOutput=journal
+StandardError=journal
+
+# Measured: 1.4s for a 622-commit / 4.3MB cold backfill; noop runs are instant,
+# since a clean run advances the watermark and later scans cover only new commits.
+# The ceiling exists so a hung fetch cannot wedge the timer.
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=default.target

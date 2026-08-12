@@ -52,14 +52,26 @@ _BOT_API = re.compile(r"api\.telegram\.org/bot", re.IGNORECASE)
 
 # Writing/committing the orchestrator-owned shared records (ledger / ADRs / notes).
 # Matches redirection, tee, or git add/commit touching these pantheon-config paths.
+#
+# T-2655 (2026-08-09): the bare `ledger/<year>` alternative used to be a pure
+# `\bledger/\d{4}` word-boundary match — it fired on the substring ANYWHERE in the
+# command, including nested partway through an unrelated absolute path (e.g. a
+# throwaway `/tmp/scratch/ledger/2026-W30/x.jsonl` used for a hook wet-run, which
+# has nothing to do with pantheon-config). Anchored below to require the token be
+# the START of a path — preceded by start-of-string / whitespace / a quote char,
+# never by `/` — so a real cwd-relative reference (`git add ledger/2026-W26/...`,
+# `git -C ~/pantheon-config add ledger/...`, both space-preceded) still matches,
+# while a `.../unrelated-dir/ledger/2026-.../...` nested substring (`/`-preceded)
+# no longer does. Anchoring this required ALSO adding the worktree suffix
+# `(-[^/]*)?` (copied from `_PROTECTED_DOC` below) to the two explicit-prefix
+# alternatives: they previously lacked it and so never matched
+# `pantheon-config-<ticket>/ledger|adr|notes/...` directly — that worktree shape
+# was only being caught *accidentally* via the old unanchored bare token, which
+# the anchor above would otherwise have silently stopped catching.
 _HO_RECORDS = re.compile(
-    r"pantheon-config/(ledger|adr)/|"
-    r"pantheon-config/[^ ]*notes/|"
-    # `ledger/<year>` as a path token — word-boundary (not leading-slash) anchored so
-    # cwd-relative / `git -C <repo>` forms (e.g. `git add ledger/2026-W26/...`) are
-    # caught too, not just absolute `/ledger/2026` paths. `ledger/<year>` is a
-    # pantheon-config-specific shape (no false-positive on echo, which has no ledger/).
-    r"\bledger/\d{4}",
+    r"pantheon-config(-[^/]*)?/(ledger|adr)/|"
+    r"pantheon-config(-[^/]*)?/[^ ]*notes/|"
+    r"(?:^|[\s'\"])ledger/\d{4}",
 )
 
 # --- T-1600: shape-vs-substance refinement for the _HO_RECORDS match surface ---
@@ -296,6 +308,103 @@ _PROTECTED_DOC = re.compile(
 _PUSH = re.compile(r"\bgit\s+push\b|\bgh\s+pr\s+(create|merge)\b")
 
 
+# T-2716 (2026-08-09): `_PUSH.search(command)` used to run on the RAW command
+# string, so a `git commit` whose -m/--message text merely DISCUSSES push/PR/merge
+# (e.g. documenting a `--no-verify-push` flag) false-positived as a push attempt.
+# Same shape-vs-substance fix T-1600 already established for `_ho_records_match`:
+# for a recognized `git commit` (or `git -C <dir> commit`), drop the message value
+# before matching — message text is not a file operand or a real subcommand.
+# `_drop_commit_message` is a no-op for any shape that isn't a plain `git commit`,
+# so a real `git push` / `gh pr create` / `gh pr merge` invocation is untouched and
+# still matches normally. Falls back to the raw-string match on redirection,
+# compound shell structure, or unparseable quoting — fail-closed, identical
+# discipline to `_ho_records_match`.
+def _push_match(command: str) -> bool:
+    """True if `command`'s genuine argument surface attempts a push/PR/merge.
+    Excludes a `git commit`'s -m/--message text (T-2716 false positive)."""
+    if _REDIRECT_RE.search(command):
+        return bool(_PUSH.search(command))
+    tokens = _tokens_or_none(command)
+    if not tokens:
+        return bool(_PUSH.search(command))
+    tokens = _drop_commit_message(tokens)
+    return bool(_PUSH.search(" ".join(tokens)))
+
+# --- Git identity/config: blocked for ANY subagent (T-1687) ---
+# 2026-07-12: a worker ran `git config --global user.*` (on/before 07-06),
+# misattributing ~6 days of commits account-wide as `reviewer <reviewer@local>`
+# (bugs/subagent-git-config-global-identity-pollution.md). Workers never touch git
+# identity: any --global/--system config WRITE surface is blocked outright (workers
+# have no legitimate need even for the read form via Bash — over-block is harmless
+# under the drift model), and user.name/user.email config aimed at a SHARED main
+# checkout (cwd under /home/claude/<repo>, or an explicit `git -C /home/claude/...`)
+# is blocked too. Worktree-local identity under /tmp stays ALLOWED — a dispatch
+# environment may legitimately set per-worktree identity there.
+#
+# T-2323 — KNOWN OVER-BLOCK, deliberately not "fixed" by parsing: `cwd` is the
+# SESSION's directory as the harness reports it, not the command's effective
+# target. So a worker whose session sits in a shared checkout is blocked even for
+# `cd /tmp/scratch && git config user.email ...`, because the `cd` is invisible
+# here. Measured (T-2323): cwd=/home/claude/pantheon-config + a /tmp-targeted
+# command -> BLOCKED; the same command from a /tmp cwd -> allowed.
+#
+# Tightening this by parsing a leading `cd` was considered and REJECTED: `cd /tmp
+# && cd /home/claude/repo` defeats naive parsing, and a false NEGATIVE here
+# re-opens the exact account-wide misattribution T-1687 exists to prevent. An
+# over-block that names its own workaround is strictly safer than an under-block
+# that does not know it happened.
+#
+# The over-block is therefore made SURVIVABLE rather than removed: the denial text
+# names `git -c user.email=...` and the GIT_AUTHOR_*/GIT_COMMITTER_* env vars,
+# both of which pass this guard in every cwd and both of which set identity for a
+# single invocation WITHOUT writing it to any config file — which is the property
+# being protected, so they are the sanctioned route, not a loophole. Two workers
+# hit this on 2026-07-29 doing Amendment H falsification in throwaway repos; both
+# correctly surfaced the block instead of routing around it, and both then had to
+# rediscover the alternative themselves. The message now carries it.
+# `[^;|&]*` keeps each pattern inside one command segment so `git log; foo --global`
+# style compounds don't cross-match (drift model, not adversarial).
+_GIT_CONFIG_GLOBAL = re.compile(r"\bgit\b[^;|&]*\bconfig\b[^;|&]*--(?:global|system)\b")
+_GIT_CONFIG_IDENTITY = re.compile(r"\bgit\b[^;|&]*\bconfig\b[^;|&]*\buser\.(?:name|email)\b")
+_SHARED_CHECKOUT_C = re.compile(r"\bgit\s+-C\s+/home/claude/[^/\s]+")
+
+
+def _git_identity_match(command: str, cwd: str) -> str | None:
+    """Reason string if `command` touches worker-forbidden git config surface, else None.
+
+    Read-only single invocations (grep/cat/... mentioning these strings) stay allowed
+    via the same allowlist machinery `_ho_records_match` uses.
+    """
+    tokens = _tokens_or_none(command)
+    if tokens and _is_read_only_verb(tokens):
+        return None
+    if _GIT_CONFIG_GLOBAL.search(command):
+        return (
+            "to touch --global/--system git config (account-wide state; workers never "
+            "touch git identity — T-1687 after the 6-day misattribution incident)"
+        )
+    if _GIT_CONFIG_IDENTITY.search(command):
+        in_shared_cwd = cwd.startswith("/home/claude/")
+        targets_shared = bool(_SHARED_CHECKOUT_C.search(command))
+        if in_shared_cwd or targets_shared:
+            return (
+                "to set persistent git user identity (`git config user.name/user.email`)"
+                " — T-1687, after a worker's identity write misattributed ~6 days of "
+                "commits account-wide. "
+                "USE ONE OF THESE INSTEAD, both allowed here and both sufficient to "
+                "commit in a throwaway repo: `git -c user.email=you@example.com "
+                "-c user.name=you commit ...`, or export GIT_AUTHOR_EMAIL / "
+                "GIT_AUTHOR_NAME / GIT_COMMITTER_EMAIL / GIT_COMMITTER_NAME. Both set "
+                "identity for the single invocation without writing it to any config "
+                "file, which is the whole property this guard protects. "
+                "NOTE the cwd caveat: this fires on your SESSION's cwd, so it triggers "
+                "even when your command targets a scratch repo elsewhere (T-2323) — "
+                "that is a known over-block, and the two forms above are the sanctioned "
+                "route through it, not a workaround"
+            )
+    return None
+
+
 def _reason(what: str) -> dict:
     return {
         "hookSpecificOutput": {
@@ -336,8 +445,11 @@ def decide(data: dict) -> dict | None:
             return _reason("to contact the Telegram Bot API directly (use the reply tool via your dispatcher)")
         if _ho_records_match(command):
             return _reason("to write/commit orchestrator-owned records (ledger / ADR / notes)")
-        if _PUSH.search(command):
+        if _push_match(command):
             return _reason("to git push / open / merge a PR (push/PR/merge is HO-exclusive; every subagent — including project-orchestrators and named instances — commits on its branch only and reports to HO, who pushes after review)")
+        identity_what = _git_identity_match(command, data.get("cwd") or "")
+        if identity_what:
+            return _reason(identity_what)
         return None
 
     if tool_name in ("Edit", "Write", "MultiEdit", "NotebookEdit"):

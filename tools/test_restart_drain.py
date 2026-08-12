@@ -211,13 +211,21 @@ class TestTombstonePresent(unittest.TestCase):
         self.assertTrue(tombstone.exists(), "Tombstone should remain after failure")
 
     def test_fire_uses_correct_service_for_recovery(self) -> None:
-        """Recovery tombstone → invokes claude-telegram-fallback.service."""
+        """T-2684: recovery is control-plane-supervised (T-2590 cutover) — the
+        drain must invoke pantheon-persona-consume@recovery.service, NOT the
+        disabled bespoke claude-telegram-fallback.service, and must pass
+        --supervisor control-plane so handoff_and_restart.sh takes the
+        kill-session + scope-liveness branch instead of plain systemctl
+        restart / is-active. Mirrors test_fire_uses_correct_service_for_specialist
+        (T-2658)."""
         _write_tombstone(self.state_dir, "recovery")
         import tools.restart_drain as rd
         with patch("tools.restart_drain.subprocess.run", side_effect=_mock_subprocess_run_success) as mock_run:
             rd.main([])
         combined = " ".join(str(a) for a in mock_run.call_args_list)
-        self.assertIn("claude-telegram-fallback.service", combined)
+        self.assertIn("pantheon-persona-consume@recovery.service", combined)
+        self.assertNotIn("claude-telegram-fallback.service", combined)
+        self.assertIn("--supervisor control-plane", combined)
 
     def test_recovery_fire_does_not_pass_idle_sentinel(self) -> None:
         """Recovery tombstone → NO --idle-sentinel in subprocess args.
@@ -245,13 +253,33 @@ class TestTombstonePresent(unittest.TestCase):
         self.assertIn("claude-telegram.service", combined)
 
     def test_fire_uses_correct_service_for_specialist(self) -> None:
-        """Specialist tombstone → invokes claude-telegram-research.service."""
+        """T-2658: specialist is control-plane-supervised (T-2633 cutover) — the
+        drain must invoke pantheon-persona-consume@specialist.service, NOT the
+        disabled bespoke claude-telegram-research.service, and must pass
+        --supervisor control-plane so handoff_and_restart.sh takes the
+        kill-session + scope-liveness branch instead of plain systemctl
+        restart / is-active."""
         _write_tombstone(self.state_dir, "specialist")
         import tools.restart_drain as rd
         with patch("tools.restart_drain.subprocess.run", side_effect=_mock_subprocess_run_success) as mock_run:
             rd.main([])
         combined = " ".join(str(a) for a in mock_run.call_args_list)
-        self.assertIn("claude-telegram-research.service", combined)
+        self.assertIn("pantheon-persona-consume@specialist.service", combined)
+        self.assertNotIn("claude-telegram-research.service", combined)
+        self.assertIn("--supervisor control-plane", combined)
+
+    def test_fire_omits_supervisor_flag_for_bespoke_seats(self) -> None:
+        """T-2658 regression guard: orchestrator is NOT cut over (T-2684 flipped
+        recovery) — the drain must produce byte-identical argv to pre-T-2658 (no
+        --supervisor flag at all), so the bespoke restart path is provably
+        untouched."""
+        _write_tombstone(self.state_dir, "orchestrator")
+        import tools.restart_drain as rd
+        with patch("tools.restart_drain.subprocess.run", side_effect=_mock_subprocess_run_success) as mock_run:
+            rd.main([])
+        combined = " ".join(str(a) for a in mock_run.call_args_list)
+        self.assertNotIn("--supervisor", combined)
+        self.assertIn("claude-telegram.service", combined)
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +621,44 @@ class TestApiHealthForce(unittest.TestCase):
             rd._fire_restart(cfg, "recovery", skip_ack=False)
         combined_false = " ".join(a for row in all_calls for a in row)
         self.assertNotIn("--skip-ack", combined_false)
+
+    def test_fire_restart_graceful_adds_t2829_modal_flags(self) -> None:
+        """T-2829: the GRACEFUL path (skip_ack=False) carries --dismiss-modal +
+        --hard-restart-on-ack-timeout so a modal-wedged session is recovered
+        (Escape-dismiss, then hard-restart fallback) instead of stalling at the
+        ack-wait forever (the 2026-08-11 specialist settings.json-modal incident)."""
+        import tools.restart_drain as rd
+        cfg = rd.DRAIN_AGENT_CONFIG["recovery"]
+        all_calls = []
+
+        def capture(cmd, **kwargs):
+            all_calls.append(list(cmd) if isinstance(cmd, list) else [str(cmd)])
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("tools.restart_drain.subprocess.run", side_effect=capture):
+            rd._fire_restart(cfg, "recovery", skip_ack=False)
+        combined_false = " ".join(a for row in all_calls for a in row)
+        self.assertIn("--dismiss-modal", combined_false)
+        self.assertIn("--hard-restart-on-ack-timeout", combined_false)
+
+    def test_fire_restart_force_omits_t2829_modal_flags(self) -> None:
+        """T-2829: the FORCE path (skip_ack=True) skips steps 2-4 entirely (kills
+        the process, so the modal dies with it) — the modal flags are irrelevant
+        there and must NOT be appended (they only apply to the handoff beat)."""
+        import tools.restart_drain as rd
+        cfg = rd.DRAIN_AGENT_CONFIG["recovery"]
+        all_calls = []
+
+        def capture(cmd, **kwargs):
+            all_calls.append(list(cmd) if isinstance(cmd, list) else [str(cmd)])
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("tools.restart_drain.subprocess.run", side_effect=capture):
+            rd._fire_restart(cfg, "recovery", skip_ack=True)
+        combined_true = " ".join(a for row in all_calls for a in row)
+        self.assertIn("--skip-ack", combined_true)
+        self.assertNotIn("--dismiss-modal", combined_true)
+        self.assertNotIn("--hard-restart-on-ack-timeout", combined_true)
 
 
 # ---------------------------------------------------------------------------
@@ -1059,9 +1125,12 @@ class TestWedgeStaleness(unittest.TestCase):
 class TestValidateConfig(unittest.TestCase):
     def test_validate_passes_on_real_config(self) -> None:
         """The shipped DRAIN_AGENT_CONFIG is structurally valid (cross-account paths
-        are deferred, not failed) → rc 0."""
+        are deferred, not failed) → rc 0. Pin account_exists=True so the T-2071
+        account check doesn't make this host-dependent (a fork's CI box may lack the
+        reference accounts); account absence is covered by test_validate_fails_on_missing_account."""
         import tools.restart_drain as rd
-        self.assertEqual(rd.main(["--validate"]), 0)
+        with patch.object(rd, "account_exists", return_value=True):
+            self.assertEqual(rd.main(["--validate"]), 0)
 
     def test_validate_fails_on_unknown_persona(self) -> None:
         """A config keyed on a non-canonical persona (not in agent_role_map) → rc 1."""
@@ -1081,11 +1150,177 @@ class TestValidateConfig(unittest.TestCase):
             self.assertEqual(rd.main(["--validate"]), 1)
 
     def test_validate_runs_before_enabled_gate(self) -> None:
-        """--validate works even when the drain is disabled (it's a pre-arm check)."""
+        """--validate works even when the drain is disabled (it's a pre-arm check).
+
+        T-2249: pin account_exists=True for the same reason
+        test_validate_passes_on_real_config does. What this test asserts is the
+        ENABLED-GATE ordering (validate is reachable with the drain disabled);
+        whether this particular box happens to host the reference accounts is an
+        unrelated axis, and letting it leak in made the test fail on any CI host
+        without the fleet's account topology while passing on the VPS for a reason
+        that has nothing to do with the gate. Account absence is covered by
+        test_validate_fails_on_missing_account; live topology by
+        test_validate_on_live_fleet_topology below.
+        """
         import tools.restart_drain as rd
         os.environ.pop("PANTHEON_RESTART_DRAIN_ENABLED", None)
         self.addCleanup(lambda: os.environ.pop("PANTHEON_RESTART_DRAIN_ENABLED", None))
+        with patch.object(rd, "account_exists", return_value=True):
+            self.assertEqual(rd.main(["--validate"]), 0)
+
+    def test_validate_on_live_fleet_topology(self) -> None:
+        """T-2249: the host-coupled check, made EXPLICIT and skippable instead of
+        being an accident of where CI happens to run.
+
+        The other --validate tests pin account_exists so they are hermetic. That
+        deliberately gives up one real signal: that the SHIPPED config's accounts
+        actually exist on a box that is supposed to be an agent host. This test
+        keeps that signal — unpinned, so the T-2071 account check runs for real —
+        and SKIPS (never fails) where the topology is absent, e.g. a bare CI
+        container.
+
+        Skip-not-fail is the point: a red here on a CI box measures the box, not
+        the code. A skip says plainly that the check did not run.
+        """
+        import tools.restart_drain as rd
+        accounts = sorted({
+            a for cfg in rd.DRAIN_AGENT_CONFIG.values()
+            if (a := rd._account_from_home_path(
+                cfg.get("restart_bin"), cfg.get("handoff_file"))) is not None
+        })
+        self.assertTrue(accounts, "config yielded no /home/<acct>/-shaped paths")
+        missing = [a for a in accounts if not rd.account_exists(a)]
+        if missing:
+            self.skipTest(
+                f"not an agent host: accounts absent {missing} (expected {accounts})"
+            )
         self.assertEqual(rd.main(["--validate"]), 0)
+
+    def test_validate_fails_on_missing_account(self) -> None:
+        """T-2071: an agent whose account (inferred from /home/<acct>/ paths) does
+        not exist on the box → rc 1 (leftover reference-instance defaults)."""
+        import tools.restart_drain as rd
+        key = next(iter(rd.DRAIN_AGENT_CONFIG))
+        real_acct = rd._account_from_home_path(
+            rd.DRAIN_AGENT_CONFIG[key].get("restart_bin"),
+            rd.DRAIN_AGENT_CONFIG[key].get("handoff_file"),
+        )
+        with patch.object(rd, "DRAIN_AGENT_CONFIG", {key: dict(rd.DRAIN_AGENT_CONFIG[key])}), \
+             patch.object(rd, "account_exists", side_effect=lambda a: a != real_acct):
+            self.assertEqual(rd.main(["--validate"]), 1)
+
+    def test_account_from_home_path(self) -> None:
+        import tools.restart_drain as rd
+        self.assertEqual(rd._account_from_home_path("/home/claude/x/y.sh"), "claude")
+        self.assertEqual(rd._account_from_home_path(None, "/home/claude-fallback/HANDOFF.md"), "claude-fallback")
+        self.assertIsNone(rd._account_from_home_path("/opt/x", None))
+
+
+class TestBuildDrainConfig(unittest.TestCase):
+    """T-2076 SAFETY NET: DRAIN_AGENT_CONFIG built from instance.yaml is PROVABLY equal
+    to the former hardcoded literals for the reference instance — the instance-driven
+    refactor is a verified no-op. Update this snapshot + instance.yaml together on any
+    deliberate reference-instance change."""
+
+    REFERENCE_LITERALS = {
+        # T-2684: recovery is control-plane-supervised (T-2590 cutover) —
+        # restart_service is DERIVED to the consume unit (overriding the
+        # bespoke restart_service instance.yaml still carries for
+        # documentation), and "supervisor" is carried so handoff_and_restart.sh
+        # takes the kill-session + scope-liveness branch. Deliberate
+        # reference-instance change, updated together with instance.yaml, same
+        # shape as specialist's T-2658 change below.
+        "recovery": {
+            "restart_service": "pantheon-persona-consume@recovery.service", "restart_mode": "user",
+            "restart_target_pane": "claude-telegram-bot-fallback:0",
+            "handoff_file": "/home/claude-fallback/HANDOFF.md",
+            "restart_bin": "/home/claude-fallback/pantheon-config/tools/handoff_and_restart.sh",
+            "restart_lockfile": "/tmp/handoff_and_restart_recovery.lock",
+            "supervisor": "control-plane",
+        },
+        "orchestrator": {
+            "restart_service": "claude-telegram.service", "restart_mode": "user",
+            "restart_target_pane": "claude-telegram-bot:0",
+            "handoff_file": "/home/claude/HANDOFF.md",
+            "restart_bin": "/home/claude/pantheon-config/tools/handoff_and_restart.sh",
+            "restart_lockfile": "/tmp/handoff_and_restart_orchestrator.lock",
+        },
+        # T-2658: specialist is control-plane-supervised (T-2633 cutover) —
+        # restart_service is DERIVED to the consume unit (overriding the
+        # bespoke restart_service instance.yaml still carries for
+        # documentation), and "supervisor" is carried so handoff_and_restart.sh
+        # takes the kill-session + scope-liveness branch. Deliberate
+        # reference-instance change, updated together with instance.yaml.
+        "specialist": {
+            "restart_service": "pantheon-persona-consume@specialist.service", "restart_mode": "user",
+            "restart_target_pane": "claude-research-bot:0",
+            "handoff_file": "/home/claude-research/HANDOFF.md",
+            "restart_bin": "/home/claude-research/pantheon-config/tools/handoff_and_restart.sh",
+            "restart_lockfile": "/tmp/handoff_and_restart_specialist.lock",
+            "supervisor": "control-plane",
+        },
+        # mnemosyne — T-2370. NOT a reference-instance change: instance.yaml has
+        # granted second-head restart_service since ORG-042, and the drain's own
+        # `"restart_service" in binding` predicate always selected it. The former
+        # hand-carried `_DRAIN_PERSONAS` tuple was subtracting it back out, so this
+        # snapshot recorded the bug as the expectation. Deriving the persona set
+        # makes the manifest and the config agree; this entry is what that agreement
+        # looks like, not a widening of the reference instance.
+        "mnemosyne": {
+            "restart_service": "claude-telegram-exocortex.service", "restart_mode": "user",
+            "restart_target_pane": "claude-telegram-bot-exocortex:0",
+            "handoff_file": "/home/exocortex/HANDOFF.md",
+            "restart_bin": "/home/exocortex/pantheon-config/tools/handoff_and_restart.sh",
+            "restart_lockfile": "/tmp/handoff_and_restart_mnemosyne.lock",
+        },
+    }
+
+    def test_built_drain_config_matches_reference_literals(self) -> None:
+        import tools.restart_drain as rd
+        self.assertEqual(rd._build_drain_config(), self.REFERENCE_LITERALS)
+
+    def test_module_level_drain_config_is_the_built_config(self) -> None:
+        import tools.restart_drain as rd
+        self.assertEqual(rd.DRAIN_AGENT_CONFIG, self.REFERENCE_LITERALS)
+
+    def test_every_drain_persona_has_a_fallback_binding(self) -> None:
+        # T-2076 review #3: manifest-less completeness.
+        # T-2370: derived from the built config now that _DRAIN_PERSONAS is gone.
+        import tools.restart_drain as rd
+        from tools import agent_role_map as arm
+        missing = sorted(set(rd.DRAIN_AGENT_CONFIG) - set(arm._FALLBACK_PERSONA_TO_BINDING))
+        self.assertEqual(missing, [], f"drain persona(s) with no fallback binding: {missing}")
+
+    def test_drain_set_is_exactly_the_personas_granted_restart_service(self) -> None:
+        """T-2370 REGRESSION: the drain set is the manifest's restart_service grantees —
+        no more, and critically no LESS. This is the assertion the old hand-carried
+        `_DRAIN_PERSONAS = ("recovery", "orchestrator", "specialist")` tuple failed: instance.yaml
+        granted restart_service to a fourth role (second-head/mnemosyne) and the tuple
+        silently subtracted it, so its restart tombstones were quarantined as an
+        unknown agent. Re-introducing ANY hand-carried outer list fails here as soon as
+        it disagrees with the manifest — which is the only way this defect comes back.
+        """
+        import tools.restart_drain as rd
+        from tools import agent_role_map as arm
+        granted = {
+            p for p in set(arm.account_persona_map().values())
+            if "restart_service" in arm.instance_binding(p)
+        }
+        self.assertEqual(set(rd.DRAIN_AGENT_CONFIG), granted)
+        self.assertIn("mnemosyne", rd.DRAIN_AGENT_CONFIG)  # the measured casualty
+
+    def test_missing_restart_pane_omits_key_not_none(self) -> None:
+        # T-2076 review #4: a binding without restart_pane leaves the key ABSENT
+        # (so --validate fails loudly), never restart_target_pane=None.
+        # T-2370: the persona set is now narrowed by patching the derivation source
+        # rather than the removed _DRAIN_PERSONAS tuple.
+        import tools.restart_drain as rd
+        fake = {"account": "acct", "restart_service": "x.service"}  # no restart_pane
+        with patch.object(rd, "_account_persona_map", return_value={"acct": "recovery"}), \
+             patch.object(rd, "_instance_binding", return_value=fake):
+            built = rd._build_drain_config()
+        self.assertNotIn("restart_target_pane", built["recovery"])
+        self.assertEqual(built["recovery"]["restart_mode"], "user")
 
 
 class TestIsUnderHome(unittest.TestCase):
@@ -1124,7 +1359,15 @@ class TestValidateConfigCrossAccount(unittest.TestCase):
         # As if we are the claude account: only /home/claude/... is stattable.
         def fake_exists(p):
             return str(p).startswith("/home/claude/")
+        # T-2249: account_exists pinned for the same reason as the other --validate
+        # tests. This test is about PATH deferral across sibling homes (T-0892); the
+        # T-2071 account-existence check is a separate axis that was silently
+        # deciding the outcome on any box lacking the fleet accounts. Note the
+        # simulation is already synthetic — Path.home and os.path.exists are faked to
+        # impersonate the claude account — so leaving the real passwd DB in the loop
+        # was inconsistent as well as host-coupled.
         with patch.object(rd.Path, "home", staticmethod(lambda: Path("/home/claude"))), \
+             patch.object(rd, "account_exists", return_value=True), \
              patch("tools.restart_drain.os.path.exists", side_effect=fake_exists):
             self.assertEqual(rd.main(["--validate"]), 0)
 

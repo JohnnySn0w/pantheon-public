@@ -3,6 +3,7 @@ aliases: [ORG-019]
 title: Retire `tickets/blocked/` as a state; blocks expressed via `not_before` or `depends_on` only
 status: Ratified 2026-05-19
 date: 2026-05-18
+build_disposition: built
 ---
 # ORG-019 — Retire `tickets/blocked/` as a state; blocks expressed via `not_before` or `depends_on` only
 

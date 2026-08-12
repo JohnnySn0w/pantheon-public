@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily local snapshot of orchestrator's memory dir + HANDOFF.md (T-2424)
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+Unit=pantheon-agent-state-snapshot.service
+
+[Install]
+WantedBy=timers.target

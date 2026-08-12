@@ -1,0 +1,22 @@
+[Unit]
+Description=Pantheon delivery reachability — can each seat ACTUALLY receive a ticket? (T-2232)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# READ-ONLY by construction: it queries each account's own user manager and tmux, and never
+# injects, sends, enables or disables anything. Proving delivery would mean poking a live
+# agent's pane, which costs that agent a turn — so this verifies PRECONDITIONS and says so.
+#
+# Cross-account probes go through recovery's sudo grant; recovery's OWN seat is probed WITHOUT sudo,
+# because sudo-to-self is denied and its empty stdout is indistinguishable from "no such unit"
+# (that conflation made the first version report a fabricated MISSING for recovery).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/delivery_reachability.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

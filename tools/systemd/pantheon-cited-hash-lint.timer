@@ -1,0 +1,15 @@
+# Weekly, not daily: the corpus is ~2300 files and each hit needs 2-3 git calls,
+# so a run is minutes rather than seconds, and an unreachable citation is a
+# record-quality defect rather than an incident — nothing degrades while it waits.
+# Sunday 05:00 UTC keeps it clear of grooming (12:00) and the watch loop (08:00).
+[Unit]
+Description=Pantheon cited-hash lint — weekly fire (Sun 05:00 UTC)
+Documentation=file:///home/%u/pantheon-config/tools/cited_hash_lint.py
+
+[Timer]
+OnCalendar=Sun *-*-* 05:00:00 UTC
+Persistent=true
+Unit=pantheon-cited-hash-lint.service
+
+[Install]
+WantedBy=timers.target

@@ -2,6 +2,9 @@
 Description=Pantheon channel-liveness monitor — detect a comms-dark-but-session-healthy agent (T-0894)
 Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
 
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
 [Service]
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
@@ -11,10 +14,19 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # on the 409-death signature. Runs on recovery; cross-account reads via Recovery's sudo.
 # ARMED 2026-06-15 (T-1140-arming, supervised first-fire — the operator msg 3287 "sure shoot"):
 # auto-remediation now LIVE — a CONFIRMED bridge-down fires the graceful-restart path
-# (tombstone for recovery, fire_restart for orchestrator/specialist). Bounded by a 30min per-agent
-# cooldown + consecutive-tracking + escalation (no restart-loop); healthy bridges no-op.
+# (tombstone for recovery, fire_restart_detached for orchestrator/specialist). Bounded by a 30min
+# per-agent cooldown + consecutive-tracking + escalation (no restart-loop); healthy
+# bridges no-op.
 Environment=PANTHEON_CHANNEL_REMEDIATE_ENABLED=1
 ExecStart=/usr/bin/python3 %h/pantheon-config/tools/channel_liveness_monitor.py --all
 StandardOutput=journal
 StandardError=journal
-TimeoutStartSec=2min
+# INVARIANT (T-1795): nothing in this unit may block on a restart. The
+# remediation path MUST dispatch via a detached transient unit
+# (fire_restart_detached / systemd-run --user); on 2026-07-17 a synchronous
+# fire_restart was cgroup-SIGKILLed here at the 2min timeout, mid-handoff-ack,
+# orphaning the delivered prompt. Budget arithmetic for this timeout: worst
+# probe cost ≈ N_agents(3) × probes(≤5) × PROBE_TIMEOUT(15s) = 225s pathological
+# + 30s detached dispatch per down agent — 3min covers the realistic path;
+# raise here if agents or probe counts grow.
+TimeoutStartSec=3min

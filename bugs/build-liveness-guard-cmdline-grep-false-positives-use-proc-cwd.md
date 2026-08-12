@@ -50,3 +50,5 @@ double-delete races and split accounting of what was freed.
 - T-1669 — exact-version rust-toolchain pin (the cold-rebuild multiplier that
   turned five warm caches into five concurrent 16G cold rebuilds).
 - `feedback_active_team_worker_check` — the role-threshold clocks this guard refines.
+
+**Pattern lifted to lesson** (ORG-012 criterion 3): `lessons/2026-07-21-cmdline-substring-process-predicates-unsound.md` (build-liveness instance).

@@ -1,0 +1,15 @@
+[Unit]
+Description=Pantheon memory-snapshot coverage monitor — daily check that every seat's snapshot timer is still firing (T-2838 DR-rot guard)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# Daily at 06:20 UTC — well after the nightly agent-state snapshots fire (~00:05-00:15
+# staggered), so a snapshot that failed overnight is caught the same morning. A snapshot
+# rot is a DR-recoverability concern (not a live outage), so daily is the right cadence;
+# the per-(seat,class) 12h alert cooldown suppresses repeat pages between fires.
+OnCalendar=*-*-* 06:20:00
+Persistent=true
+Unit=pantheon-memory-snapshot-coverage.service
+
+[Install]
+WantedBy=timers.target

@@ -117,5 +117,66 @@ class CLITest(unittest.TestCase):
         self.assertEqual(rc, 8, "no dispatched turn after bounded re-fires → exit 8")
 
 
+class CaptureDeclinesOnAnUntrustworthySurface(unittest.TestCase):
+    """T-2277: the write and the read share a failure domain. We inject into a
+    pane and confirm by capturing THE SAME pane, and a pane in copy-mode returns a
+    FROZEN view — returncode 0, non-empty, stale. So during the one fault where
+    the keystroke was most likely eaten, the verifier reads a snapshot of a
+    previously-working pane and votes SUCCESS."""
+
+    def setUp(self):
+        self.calls = []
+
+    def _fake_run(self, in_mode: str, pane_text: str = "esc to interrupt"):
+        import types as _t
+
+        def run(cmd, **kw):
+            self.calls.append(cmd)
+            if "display-message" in cmd:
+                return _t.SimpleNamespace(returncode=0, stdout=in_mode + "\n", stderr="")
+            return _t.SimpleNamespace(returncode=0, stdout=pane_text, stderr="")
+        return run
+
+    def test_a_pane_in_copy_mode_yields_no_text_so_the_caller_retries(self):
+        import subprocess
+        real = subprocess.run
+        subprocess.run = self._fake_run("1")          # in a mode
+        try:
+            self.assertEqual(kv._capture("p:0"), "",
+                             "a frozen surface must produce NO verdict — voting "
+                             "on it is how a dropped kick reports as delivered")
+        finally:
+            subprocess.run = real
+        self.assertTrue(any("display-message" in c for c in self.calls),
+                        "trustworthiness must be checked BEFORE the capture")
+        self.assertFalse(any("capture-pane" in c for c in self.calls),
+                         "an untrusted surface must not even be read")
+
+    def test_a_normal_pane_is_captured(self):
+        import subprocess
+        real = subprocess.run
+        subprocess.run = self._fake_run("0", "esc to interrupt")
+        try:
+            self.assertIn("esc to interrupt", kv._capture("p:0"))
+        finally:
+            subprocess.run = real
+
+    def test_an_unreadable_mode_probe_is_treated_as_in_mode(self):
+        """Fail-SAFE: the only use of this is deciding whether to TRUST a capture,
+        so an answer we cannot vouch for must not license trusting one."""
+        import subprocess, types as _t
+        real = subprocess.run
+
+        def run(cmd, **kw):
+            if "display-message" in cmd:
+                return _t.SimpleNamespace(returncode=1, stdout="", stderr="boom")
+            return _t.SimpleNamespace(returncode=0, stdout="anything", stderr="")
+        subprocess.run = run
+        try:
+            self.assertEqual(kv._capture("p:0"), "")
+        finally:
+            subprocess.run = real
+
+
 if __name__ == "__main__":
     unittest.main()

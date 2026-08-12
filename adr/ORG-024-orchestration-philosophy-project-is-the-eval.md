@@ -1,8 +1,9 @@
 ---
 aliases: [ORG-024]
-title: ORG-024 — Orchestration philosophy: the project is the eval
+title: "ORG-024 — Orchestration philosophy: the project is the eval"
 status: Ratified 2026-05-29
 date: 2026-05-28
+build_disposition: no-build-needed
 ---
 
 # ORG-024 — Orchestration philosophy: the project is the eval

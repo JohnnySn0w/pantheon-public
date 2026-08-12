@@ -1,0 +1,27 @@
+[Unit]
+# T-2271: WIRED. Measured 0 failed-state transitions in 14 days across 19 start
+# events, so seat restarts (handoff, context-fill) demonstrably do NOT produce a
+# failed state and cannot trigger this. The feared storm — OnFailure firing
+# per-failure under Restart=always (metis) — is bounded here by the existing
+# StartLimitIntervalSec=600 / StartLimitBurst=20: a crash-loop hits the limit and
+# enters a terminal failed state instead of alerting forever.
+# Recovery has a direct interest in learning that this seat FAILED: it is the one it
+# is the recovery fallback for.
+OnFailure=pantheon-unit-failure-alert@%n.service
+Description=Claude Code Telegram bot bridge (prime)
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=5
+WorkingDirectory=/home/claude
+Environment=PATH=/home/claude/.bun/bin:/home/claude/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+Environment=HOME=/home/claude
+ExecStart=/home/claude/.local/bin/claude-bot-supervise.sh
+
+[Install]
+WantedBy=default.target

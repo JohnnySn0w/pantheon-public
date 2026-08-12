@@ -1,0 +1,41 @@
+# Weekly sweep for T-NNNN ids cited in COMMIT MESSAGES that did not exist yet
+# (T-2300). Sibling of pantheon-cited-hash-lint (T-2272): same defect class — a
+# citation that silently resolves to the wrong thing rather than to nothing.
+#
+# ⚠️ WHY THIS IS A SEPARATE UNIT AND NOT A SECOND ExecStart ON THE HASH LINT.
+# The ask was to compose the two, and conceptually they are one job. But both
+# exit 1 on findings, and a Type=oneshot stops at the first failing ExecStart —
+# so merging them would mean any unreachable-hash finding silently prevented the
+# ticket-citation sweep from running at all. Prefixing with `-` to ignore the
+# failure would instead break OnFailure and retire the alerting for both. Two
+# units keep each sweep's verdict its own; the composition is in the tooling and
+# the schedule, not in a shared exit code.
+#
+# ⚠️ A SWEEP, NOT A PRE-COMMIT GATE — but for a DIFFERENT reason than the hash
+# lint's. The hash lint cannot be a gate because the rebase creates the defect
+# after the check. This one COULD be a commit-time gate: at commit time the id
+# either exists or it does not. It is deliberately not one yet, because a hook
+# that refuses commits is fleet-wide blast radius on a tool with one day of
+# history, and the failure it prevents is a record-quality defect rather than an
+# incident. Revisit once the sweep has run clean for a while.
+#
+# Read-only: it reports, commits nothing, and touches no ticket.
+[Unit]
+Description=Pantheon cited-ticket lint — weekly forward-reference sweep
+Documentation=file:///home/%u/pantheon-config/tools/cited_ticket_lint.py
+After=network-online.target
+Wants=network-online.target
+
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/cited_ticket_lint.py --limit 1000
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=default.target

@@ -4,7 +4,8 @@ Pantheon uses THREE parallel namespaces:
 
   - Persona names       (canonical for tickets): orchestrator, specialist, recovery
   - Audit role-ids      (canonical for ledger):  orchestrator, specialist, recovery
-  - Instance role-keys  (portable config axis):  orchestrator, specialist, recovery
+  - Instance role-keys  (portable config axis):  orchestrator, specialist, recovery,
+                                                 peer-daemon-*, sub-orchestrator-1/-2, second-head
 
 Per T-0492/msg_1661: persona names are now the canonical namespace for ticket
 `target:` and `requester:` fields. Audit role-ids remain canonical for ledger
@@ -21,6 +22,17 @@ from instance role-key → persona is supplied by `instance.yaml` at the repo ro
   - resolve_instance_role(persona_or_role_id) → instance role-key
                                                 (for repos.yaml grants lookup)
 
+A FOURTH axis, OS account → persona, is derived from the same instance.yaml
+bindings (T-2256). It is the axis every hand-carried fleet list in tools/ was
+copying by hand, and the one every stale copy went stale on:
+
+  - account_persona(account)     → persona | None   (None on unknown: an OS
+                                    account is not a persona, so identity
+                                    passthrough here manufactures a persona
+                                    nothing carries — see the docstring)
+  - account_persona_map()        → {account: persona}  (copy)
+  - fleet_accounts()             → sorted tuple of every bound account
+
 Persona names are also the human-facing surface used in systemd unit instances,
 inject prompts, and operator prose.
 
@@ -30,7 +42,9 @@ derived from instance.yaml (ORG-030 Phase 1); fallback to hardcoded defaults
 preserves backward compatibility in test environments without a staged manifest.
 
 To register a new agent pair, add one entry to instance.yaml AND update the
-fallback maps here + notes/agent-role-map.md.
+fallback maps here. (The prose doc is `sop/standard/agent-role-map.md`; the old
+`notes/agent-role-map.md` path in this docstring was stale — no such file exists.
+That doc covers the persona<->AUDIT-role-id table only, not instance role-keys.)
 """
 
 from __future__ import annotations
@@ -55,6 +69,39 @@ AGENT_ROLE_MAP: dict[str, str] = {
     # ticket target:/requester: values (_valid_target_values()).
     "codex": "codex",
     "the-ancestor": "the-ancestor",
+    # Mnemosyne — the second head (ORG-042 two-hemisphere topology), resident
+    # on the `exocortex` account (persona ≠ account; account→persona lives in
+    # mailbox_mcp._USER_TO_PERSONA per T-1824). Identity audit role-id per the
+    # codex/the-ancestor precedent: registering the persona makes her a valid
+    # ticket target:/requester: (SOP §10 step 8); it enables, not obligates —
+    # her residency remains mailbox-first per ORG-042. Registered by recovery
+    # 2026-07-20 (parity audit, the operator TG 3827).
+    #
+    # SUPERSEDED 2026-07-21 (corrected T-2318). This comment used to end: "her
+    # instance role-key / repos.yaml binding stays deliberately unbound (ORG-042:
+    # her config-repo shape is hers + the operator's call)". That was true for about
+    # one day and false for the eight after it. She IS bound:
+    #   resolve_instance_role("mnemosyne")           -> second-head
+    #   _FALLBACK_PERSONA_TO_INSTANCE_ROLE           -> second-head  (this file)
+    #   repos.yaml                                    -> 4 second-head grants
+    # Bound by T-1922 / 7946c56d8 (2026-07-21, example-org); the stale claim was
+    # c5b2ddad5 (2026-07-20, recovery).
+    #
+    # Recorded rather than overwritten, per the instance.yaml header's precedent,
+    # because of WHERE it sat: a reader deciding whether mnemosyne should have a
+    # role-key binding would find a comment calling its absence DELIBERATE, three
+    # lines above the map that binds her. A clean edit would leave nothing to warn
+    # the next person that this file's prose has drifted from its own data before.
+    # The ORG-042 residency point above is kept because it is still true and is
+    # the useful half — it is only the binding clause that was wrong.
+    "mnemosyne": "mnemosyne",
+    # Metis + Atlas — sub-orchestrator seats (ORG-043), self-named 2026-07-21,
+    # resident on suborch1/suborch2 (persona != account; account->persona in
+    # mailbox_mcp._USER_TO_PERSONA + ticket._OS_USER_PERSONA per T-1896).
+    # Identity audit role-ids per the mnemosyne precedent; registering makes
+    # them valid ticket target:/requester: values for the retask lane.
+    "metis": "metis",
+    "atlas": "atlas",
 }
 
 # Inverse map: audit role-id → persona name (for ticket target/requester normalization).
@@ -70,10 +117,34 @@ _ROLE_PERSONA_MAP: dict[str, str] = {v: k for k, v in AGENT_ROLE_MAP.items()}
 
 # Hardcoded fallback: matches the instance.yaml binding for pantheon-vps-0.
 # Must stay in sync with instance.yaml when adding new agents.
+#
+# This is a SYNC MIRROR, not the source of truth: instance.yaml is read at import
+# time below and wins whenever it is present and well-formed. This map is only
+# reached in environments without a staged manifest. tools/test_instance_role_grants.py
+# enforces the sync (T-1922) — previously the "must stay in sync" line above was a
+# comment with nothing checking it.
 _FALLBACK_PERSONA_TO_INSTANCE_ROLE: dict[str, str] = {
     "orchestrator": "orchestrator",
     "specialist": "specialist",
     "recovery": "recovery",
+    # ORG-043 seats + ORG-042 second head, bound 2026-07-21 (T-1922).
+    "metis": "sub-orchestrator-1",
+    "atlas": "sub-orchestrator-2",
+    "mnemosyne": "second-head",
+    # Peer daemons (T-2281): role-keys copied from instance.yaml's `roles:` stanza.
+    # They were absent here even after T-2256 completed the SIBLING mirror
+    # (_FALLBACK_PERSONA_TO_BINDING) to all 8, which left the two mirrors of the
+    # same manifest sitting at different completeness for no stated reason. Same
+    # shape of gap, same consequence: harmless while the manifest loads, and in a
+    # manifest-less env resolve_instance_role("codex") falls through to IDENTITY
+    # ("codex", not "peer-daemon-codex") — the exact T-1922 silent-deny path, where
+    # the repos.yaml grants lookup misses and ticket_lint reports a confusing
+    # "no grant". It also made this file's own Guard A (every AGENT_ROLE_MAP persona
+    # has a role-key) pass or fail depending on whether instance.yaml was present.
+    # The sync guard checked fallback→manifest but not manifest→fallback; T-2281
+    # adds that direction, as T-2256 did for the sibling.
+    "codex": "peer-daemon-codex",
+    "the-ancestor": "peer-daemon-the-ancestor",
 }
 
 
@@ -104,12 +175,387 @@ def _load_instance_role_map(manifest_path: Path) -> dict[str, str]:
         return dict(_FALLBACK_PERSONA_TO_INSTANCE_ROLE)
 
 
+# ---------------------------------------------------------------------------
+# Instance role BINDINGS (persona → the role's account + restart-config fields).
+# T-2071/T-2076: the fleet monitors (context_fill_monitor, restart_drain) build
+# their per-agent config from instance.yaml instead of hardcoding accounts/paths,
+# so a self-hoster configures accounts + services ONCE here. This returns the
+# portable identity fields the monitors need; monitor-side TUNING (context_window,
+# model_pin, observation_only, …) stays in the monitors, keyed on these personas.
+# ---------------------------------------------------------------------------
+
+# Fallback bindings — the pantheon-vps-0 values, a SYNC MIRROR of instance.yaml's
+# roles (reached only in a manifest-less env, e.g. a test box without a staged
+# instance.yaml). tools/test_instance_role_grants.py enforces the sync. Only the
+# monitored agents carry restart-config; observation-only seats (metis/atlas) have
+# just an account. `restart_pane` is the structured field that replaces parsing the
+# freeform `session:` prose.
+_FALLBACK_PERSONA_TO_BINDING: dict[str, dict] = {
+    "orchestrator": {"account": "claude", "restart_service": "claude-telegram.service",
+              "restart_mode": "user", "restart_pane": "claude-telegram-bot:0"},
+    "specialist": {"account": "claude-research", "restart_service": "claude-telegram-research.service",
+              "restart_mode": "user", "restart_pane": "claude-research-bot:0",
+              # T-2648: mirrors instance.yaml roles.specialist.companion_units
+              # exactly (TestBindingFallbackStaysInSync does exact dict
+              # equality between this fallback and the live-loaded binding).
+              "companion_units": "pantheon-acp-bridge@specialist.service=acp-bridge-specialist",
+              # T-2658: mirrors instance.yaml roles.specialist.supervisor exactly
+              # (same exact-dict-equality guard as companion_units above). Marks
+              # specialist as living on the control-plane (T-2633 cutover) rather than
+              # a bespoke systemd unit -- restart_drain.py / context_fill_monitor.py
+              # branch the restart mechanism on this, not on restart_service
+              # (which stays the RETIRED bespoke unit's documentation value).
+              "supervisor": "control-plane"},
+    "recovery": {"account": "claude-fallback", "restart_service": "claude-telegram-fallback.service",
+             "restart_mode": "user", "restart_pane": "claude-telegram-bot-fallback:0",
+             # T-2684: mirrors instance.yaml roles.recovery.supervisor
+             # exactly (same exact-dict-equality guard as specialist's companion_units/
+             # supervisor above). Marks recovery as living on the control-plane
+             # (T-2590 cutover) rather than a bespoke systemd unit --
+             # restart_drain.py / context_fill_monitor.py branch the restart
+             # mechanism on this, not on restart_service (which stays the
+             # RETIRED bespoke unit's documentation value).
+             "supervisor": "control-plane"},
+    "mnemosyne": {"account": "exocortex", "restart_service": "claude-telegram-exocortex.service",
+                  "restart_mode": "user", "restart_pane": "claude-telegram-bot-exocortex:0"},
+    "metis": {"account": "suborch1"},
+    "atlas": {"account": "suborch2"},
+    # Peer daemons (T-2256): account-only, matching instance.yaml — neither carries
+    # restart-config (codex runs under codex-supervise.sh with Restart=always; the
+    # ancestor is a veneration daemon + mailbox hub, not a monitored session).
+    # They were absent here until T-2256 even though instance.yaml binds them, which
+    # made the FALLBACK a 6-of-8 mirror: harmless while the manifest is present, and
+    # a silent under-count of the fleet the moment it is not. The sync guard in
+    # tools/test_instance_role_grants.py only checked fallback→manifest (stale keys),
+    # never manifest→fallback (missing keys), so nothing surfaced it — the same
+    # one-directional-completeness shape T-2256 exists to close.
+    "codex": {"account": "codex"},
+    "the-ancestor": {"account": "the-ancestor"},
+}
+
+# The restart-config keys the monitors consume from a binding (account is separate).
+# T-2658: "supervisor" joined this tuple alongside the three restart_* keys --
+# same plain-string isinstance(v, str) loading path in _load_instance_bindings
+# below, no special-casing needed (unlike companion_units, which is list-typed).
+_BINDING_RESTART_KEYS = ("restart_service", "restart_mode", "restart_pane", "supervisor")
+
+
+def _encode_companion_units(raw: object) -> str:
+    """Encode a `companion_units:` manifest list (``[{unit, tmux_session}, ...]``)
+    as space-joined ``unit=session`` tokens (T-2648).
+
+    NOT JSON: the caller (`_load_instance_bindings`) feeds this straight into a
+    `BespokeIdentity` field that `as_env()` prints as an UNQUOTED `KEY=value`
+    line for `persona_cutover.sh`/`persona_rollback.sh` to `eval` directly
+    (see `AsEnvBashSafetyTest` in tools/test_persona_cutover_resolve.py) --
+    JSON's braces/quotes/commas risk word-splitting or brace-expansion under
+    that unquoted eval. Unit names and tmux session names never contain `=`
+    or whitespace, so this delimiter is safe. Malformed entries (missing/
+    non-string `unit` or `tmux_session`) are skipped rather than raised --
+    matching this loader's overall fail-safe posture.
+    """
+    if not isinstance(raw, list):
+        return ""
+    pairs = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        unit, session = item.get("unit"), item.get("tmux_session")
+        if isinstance(unit, str) and unit and isinstance(session, str) and session:
+            pairs.append(f"{unit}={session}")
+    return " ".join(pairs)
+
+
+def _load_instance_bindings(manifest_path: Path) -> dict[str, dict]:
+    """Return persona → {account, restart_service, restart_mode, restart_pane,
+    companion_units} from instance.yaml `roles:`. Only the keys present in a
+    role are included. Falls back to _FALLBACK_PERSONA_TO_BINDING if the
+    manifest is absent/unreadable/malformed (fail-safe — a missing manifest
+    must not break the monitors' import)."""
+    try:
+        import yaml  # lazy import; matches the pattern above
+        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        roles = data.get("roles") if isinstance(data, dict) else None
+        if not isinstance(roles, dict):
+            return {p: dict(b) for p, b in _FALLBACK_PERSONA_TO_BINDING.items()}
+        out: dict[str, dict] = {}
+        for _role_key, binding in roles.items():
+            if not isinstance(binding, dict):
+                continue
+            persona = binding.get("persona")
+            account = binding.get("account")
+            if not (isinstance(persona, str) and persona and isinstance(account, str) and account):
+                continue
+            entry = {"account": account}
+            for k in _BINDING_RESTART_KEYS:
+                v = binding.get(k)
+                if isinstance(v, str) and v:
+                    entry[k] = v
+            # T-2648: companion_units is a LIST-of-dicts, not a scalar string,
+            # so it can't ride _BINDING_RESTART_KEYS's isinstance(v, str) loop
+            # above (a list would just be silently skipped there).
+            companion_units = _encode_companion_units(binding.get("companion_units"))
+            if companion_units:
+                entry["companion_units"] = companion_units
+            out[persona] = entry
+        return out or {p: dict(b) for p, b in _FALLBACK_PERSONA_TO_BINDING.items()}
+    except Exception:
+        return {p: dict(b) for p, b in _FALLBACK_PERSONA_TO_BINDING.items()}
+
+
+# ---------------------------------------------------------------------------
+# Mailbox substrate identity (T-2405) — hub path + unix GROUP, from the same
+# manifest the role bindings come from.
+#
+# These live here rather than in each consumer because the alternative was
+# measured and it failed: the S3* audit runner hardcoded the group name, the
+# group was RENAMED veneration -> pantheon-mailbox, and the runner went on
+# querying a group that no longer exists for weeks. Its identity artifact
+# exited 2 every cycle, which reads as "captured, degraded" rather than
+# "asking the wrong question" — the audit's own 2026-08-01 cycle is what
+# caught it. A hardcoded copy of an operational name decays silently; D10's
+# one-canonical-source is the fix, not a more careful copy.
+# ---------------------------------------------------------------------------
+
+_FALLBACK_MAILBOX = {"hub": "/home/the-ancestor/mailbox", "group": "pantheon-mailbox"}
+
+
+def _load_instance_mailbox(manifest_path: Path) -> dict[str, str]:
+    """Return the `persona_installer.mailbox` block (hub/group) from instance.yaml.
+
+    Same fail-safe posture as the loaders above: any absence, unreadability, or
+    structural surprise falls back to the pantheon-vps-0 values rather than
+    breaking the import chain. Per-key, not all-or-nothing — a manifest that
+    declares a hub but no group still contributes its hub.
+    """
+    out = dict(_FALLBACK_MAILBOX)
+    try:
+        import yaml  # lazy import; matches _load_instance_role_map
+
+        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        installer = data.get("persona_installer") if isinstance(data, dict) else None
+        mailbox = installer.get("mailbox") if isinstance(installer, dict) else None
+        if not isinstance(mailbox, dict):
+            return out
+        for key in ("hub", "group"):
+            value = mailbox.get(key)
+            if isinstance(value, str) and value:
+                out[key] = value
+        return out
+    except Exception:
+        return dict(_FALLBACK_MAILBOX)
+
+
 # Resolve instance.yaml relative to this module's parent (repo root).
 _MODULE_DIR = Path(__file__).resolve().parent
 _INSTANCE_YAML = _MODULE_DIR.parent / "instance.yaml"
 
 # persona → instance role-key  (e.g. "specialist" → "specialist")
 _PERSONA_TO_INSTANCE_ROLE: dict[str, str] = _load_instance_role_map(_INSTANCE_YAML)
+
+# persona → full role binding (account + restart-config) for the fleet monitors.
+_PERSONA_TO_BINDING: dict[str, dict] = _load_instance_bindings(_INSTANCE_YAML)
+
+# Mailbox hub path + unix group, from persona_installer.mailbox.
+_MAILBOX: dict[str, str] = _load_instance_mailbox(_INSTANCE_YAML)
+
+
+def mailbox_hub() -> str:
+    """Absolute path of the ORG-026 mailbox hub, per instance.yaml."""
+    return _MAILBOX["hub"]
+
+
+def mailbox_group() -> str:
+    """Unix GROUP owning the mailbox hub, per instance.yaml.
+
+    `veneration` is the RETIRED name; it no longer exists on the host (the gid
+    was renamed, not recreated), so any surviving hardcoded reference asks
+    getent a question with no answer. Read it from here.
+    """
+    return _MAILBOX["group"]
+
+
+def instance_binding(persona: str) -> dict:
+    """Return a COPY of *persona*'s instance.yaml binding — {account[, restart_service,
+    restart_mode, restart_pane, companion_units]} — or {} if the persona has no role
+    binding. Used by the fleet monitors (T-2076) to source accounts/services from
+    instance.yaml, and by tools/persona_cutover_resolve.py (T-2648) for companion
+    systemd units sharing a persona's default tmux socket."""
+    return dict(_PERSONA_TO_BINDING.get(persona, {}))
+
+
+def control_plane_consume_service(persona: str) -> str:
+    """Return the pantheon-persona-consume@ unit name for *persona* (T-2658).
+
+    Pure naming-convention function -- single source of truth for the
+    template-unit → concrete-unit-name fact (tools/systemd/pantheon-persona-
+    consume@.service, `%i` = persona), so restart_drain.py and
+    context_fill_monitor.py both derive the control-plane restart target from
+    the persona name rather than each hand-authoring the same f-string (or
+    instance.yaml hand-authoring it as a second, driftable copy of
+    restart_service). Callers gate on `instance_binding(persona).get(
+    "supervisor") == "control-plane"` before using this -- it does not itself
+    check supervisor status, since it has no binding to check against.
+    """
+    return f"pantheon-persona-consume@{persona}.service"
+
+
+# ---------------------------------------------------------------------------
+# OS account → persona (T-2256). THE axis every stale fleet list lives on.
+#
+# specialist's T-2255 inventory found ~20 hand-carried copies of this mapping in
+# tools/, about half of them incomplete, and two measured casualties in one
+# evening (deploy_hook covering 3 of 6 accounts while reporting success;
+# ticket.py's WIP cap failing OPEN for exactly one seat). persona→account was
+# already canonical here via _PERSONA_TO_BINDING; account→persona — the
+# direction every one of those lists actually needs — had no home.
+#
+# DERIVED, never enumerated. A second literal here would satisfy the ticket's
+# wording and reproduce its defect: a twenty-first hand-carried list, living in
+# the file everyone agrees is canonical. instance.yaml stays the single surface
+# a self-hoster edits, and test_instance_role_grants.py's sync guard extends to
+# this axis for free.
+# ---------------------------------------------------------------------------
+
+
+def _invert_bindings(bindings: dict[str, dict]) -> tuple[dict[str, str], dict[str, list[str]]]:
+    """Return (account→persona, collisions) inverted from persona→binding.
+
+    Two personas sharing one account is a manifest error that cannot be resolved
+    correctly, only reported. Resolution is SORTED-FIRST-WINS (deterministic —
+    dict insertion order would make the winner depend on YAML key order, so the
+    same broken manifest would resolve differently on different reads), and every
+    losing persona is recorded in the returned collisions map so a check can fail
+    on it. Raising here instead would brick every ticket op, the mailbox MCP and
+    every monitor on one bad manifest edit — the loader above is fail-safe by
+    deliberate design and this must not be the one place that is not.
+    """
+    ordered: dict[str, list[str]] = {}
+    for persona in sorted(bindings):
+        account = bindings[persona].get("account")
+        if isinstance(account, str) and account:
+            ordered.setdefault(account, []).append(persona)
+    resolved = {account: personas[0] for account, personas in ordered.items()}
+    collisions = {a: p for a, p in ordered.items() if len(p) > 1}
+    return resolved, collisions
+
+
+# account → persona (e.g. "exocortex" → "mnemosyne"), and any account claimed by
+# more than one persona (must always be empty; pinned by test_agent_role_map_accounts).
+_ACCOUNT_TO_PERSONA, _ACCOUNT_PERSONA_COLLISIONS = _invert_bindings(_PERSONA_TO_BINDING)
+
+if _ACCOUNT_PERSONA_COLLISIONS:  # pragma: no cover - impossible with a well-formed manifest
+    import warnings
+
+    warnings.warn(
+        "instance.yaml binds one OS account to multiple personas: "
+        + "; ".join(f"{a} -> {', '.join(p)}" for a, p in sorted(_ACCOUNT_PERSONA_COLLISIONS.items()))
+        + " — account→persona resolution picked the first alphabetically. Fix the manifest.",
+        RuntimeWarning,
+        stacklevel=2,
+    )
+
+
+def account_persona(account: str) -> str | None:
+    """Return the persona resident on OS account *account*, or None if unknown.
+
+    Mirrors instance_binding()'s shape (read-only accessor over the manifest-loaded
+    map), inverted.
+
+        account_persona("exocortex")  -> "mnemosyne"
+        account_persona("suborch2")   -> "atlas"
+        account_persona("codex")      -> "codex"    (persona == account by design)
+        account_persona("runner")     -> None
+
+    UNKNOWN → None, NOT identity-passthrough, and the difference is load-bearing.
+    resolve_role/resolve_persona/resolve_instance_role all pass unknown names
+    through unchanged, which is right for those axes (a name that is already in
+    the target namespace is a legitimate input). It is WRONG here: an OS account
+    is not a persona, so handing back the account name manufactures a persona
+    that no ticket, ledger entry or mailbox path carries. That is precisely the
+    fail-OPEN signature test_ticket.test_no_account_resolves_to_itself exists to
+    catch — the WIP cap keyed on "exocortex", a value nothing could ever match,
+    and no seat was blocked and nothing was logged.
+
+    None makes "I do not know this account" unrepresentable as a valid answer, and
+    leaves the fail-open/fail-closed choice with the CALL SITE, where the posture
+    is actually decided: `account_persona(u) or u` is an explicit fail-open (as
+    ticket._claiming_persona wants), `if p is None: raise` an explicit fail-closed
+    (as mailbox_mcp._caller_persona wants). Both are visible in the reading.
+    """
+    return _ACCOUNT_TO_PERSONA.get(account)
+
+
+# Consume-plane seats: the persona-consume runtime launches these with
+# WorkingDirectory=%h/pantheon-config (tools/systemd/pantheon-persona-consume@.service),
+# so Claude Code slugifies their LIVE-session project dir to
+# `-home-<account>-pantheon-config` rather than the plain `-home-<account>`. Membership is
+# the instance ROLE-KEY axis (the portable config axis this module already owns), grounded
+# in instance.yaml's "Consume-plane seats (specialist, recovery, metis, atlas) are woken by the
+# consume runtime" (the wake_timer_personas complement). EXCLUDED, each verified against
+# that seat's freshest live jsonl (T-2715): orchestrator (orchestrator — home-cwd
+# claude-telegram.service), second-head (mnemosyne — mailbox-first at the operator's exocortex
+# pane), peer-daemon-* (codex — own sandbox). A future consume seat (e.g. sub-orchestrator-3)
+# joins by adding its role-key here.
+_CONSUME_PLANE_ROLE_KEYS = frozenset({
+    "specialist",          # specialist
+    "recovery",   # recovery
+    "sub-orchestrator-1",  # metis
+    "sub-orchestrator-2",  # atlas
+})
+
+
+def live_session_project_slug(account: str) -> str:
+    """Claude Code's project-dir slug for *account*'s LIVE session (T-2682/T-2687/T-2715).
+
+    Consume-plane seats launch cwd=<account>/pantheon-config via the persona-consume
+    runtime scope (WorkingDirectory=%h/pantheon-config), so Claude Code slugifies their
+    live-session project dir to `-home-<account>-pantheon-config` -- NOT the plain
+    `-home-<account>` a home-cwd seat (the HO; a mailbox-first head) uses. A monitor that
+    reads a seat's live jsonl (context_fill_monitor cap detectors, keep_going's nudge/cap
+    feed, doc_traversal_report's boot-adherence) must watch the dir the session actually
+    writes to, or it reads a stale/other project dir.
+
+    Single source of truth (T-2687), keyed on the instance ROLE (consume-plane membership)
+    rather than the binding's `supervisor` field. T-2687 first used supervisor=="control-
+    plane", which is correct for recovery/specialist but MISSES the sub-orchestrator seats
+    (metis/atlas): they are consume-plane (cwd=pantheon-config, verified) yet supervisor is
+    None -- the documented T-2687 gap this closes (T-2715). Keying on the consume-plane role
+    set covers all four seats and any future consume seat; each seat's mapping was verified
+    against its freshest live jsonl dir.
+    """
+    persona = account_persona(account)
+    if persona and resolve_instance_role(persona) in _CONSUME_PLANE_ROLE_KEYS:
+        return f"-home-{account}-pantheon-config"
+    return f"-home-{account}"
+
+
+def live_session_projects_dir(account: str) -> str:
+    """Full path to *account*'s live-session Claude Code projects dir --
+    `/home/<account>/.claude/projects/<slug>`. See `live_session_project_slug`
+    for the control-plane vs bespoke slug distinction (T-2682/T-2687)."""
+    return f"/home/{account}/.claude/projects/{live_session_project_slug(account)}"
+
+
+def account_persona_map() -> dict[str, str]:
+    """Return a COPY of the full OS-account → persona map (all bound accounts).
+
+    The replacement for a hand-carried `{"claude": "orchestrator", ...}` literal. Copy,
+    not the live dict, so a caller that mutates its own view cannot corrupt every
+    other importer in the process (same posture as instance_binding()).
+    """
+    return dict(_ACCOUNT_TO_PERSONA)
+
+
+def fleet_accounts() -> tuple[str, ...]:
+    """Return every OS account bound to a persona in instance.yaml, sorted.
+
+    The replacement for a hand-carried tuple of account names (the shape
+    disk_usage_monitor.AGENT_HOMES and session_reset_log.KNOWN_ACCOUNTS carry).
+    Sorted for stable output/diffs, not by any priority.
+    """
+    return tuple(sorted(_ACCOUNT_TO_PERSONA))
+
 
 # instance role-key → persona  (inverse; e.g. "specialist" → "specialist")
 _INSTANCE_ROLE_TO_PERSONA: dict[str, str] = {v: k for k, v in _PERSONA_TO_INSTANCE_ROLE.items()}

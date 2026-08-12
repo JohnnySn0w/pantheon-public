@@ -1,0 +1,52 @@
+[Unit]
+Description=Pantheon agent-monitor liveness watchdog — detect + restart the node event-loop wedge (T-1885)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Pure HTTP probe of http://127.0.0.1:4820/ (no LLM/API) — agent-monitor.service
+# runs SAME-ACCOUNT (claude), so the restart command needs no sudo. On a
+# confirmed N=3-consecutive-poll stall (the event-loop-wedge signature: listener
+# open, requests stall/time out — see bugs/agent-monitor-node-event-loop-wedge-
+# long-uptime.md), restarts the unit, cooldown-gated (30min) against a restart
+# storm. Alerts the operator DIRECTLY via the Telegram bot token (independent of
+# Claude OAuth) ONLY when a restart fails to clear the wedge within 2x the
+# cooldown (a single successful restart is routine and is not alerted).
+# SHIP-DARK (matches ancestor_liveness_monitor / channel_liveness_monitor):
+# detection runs live unconditionally; the live restart itself stays inert
+# until PANTHEON_AGENT_MONITOR_REMEDIATE_ENABLED is armed (deliberately no
+# Environment= line for it here — this unit installs UNARMED; arming is a
+# separate post-merge HO deploy step, supervised first-fire).
+# ARMED 2026-07-27 (T-1885/T-2070 reconciliation; HO supervised first-fire, the operator authorized TG 6493/6494).
+# The duplicate 07-20 bash agent-monitor-liveness watchdog was retired concurrently to avoid a double-restart race.
+# RE-DISARMED 2026-07-27T23:0x per the operator TG 6520 ("agent-monitor is crashing itself with the
+# newest update anyways. Let's not spend more time on it for now"). An armed watchdog against a
+# self-crashing app just restart-churns and re-notifies him, which is the noise he objected to.
+# Detection stays live (ship-dark); only remediation is off. The T-2084 escalation-wording fix is
+# already committed, so whenever this is re-armed the alerts are correct.
+# PRIOR (superseded) rationale — RE-ARMED per the operator's keep-vs-retire steer (TG 6511): he does not use the
+# dashboard directly, but it tracks things worth keeping (prompt cache hit/miss among them),
+# and the harness/agent-optimization arc that would consume those stats is gated behind
+# exocortex/echo/infra. Disposition: keep it running via restart rather than fix the node
+# event-loop wedge or retire the service. Stats-to-kino follow-up is T-2083.
+#
+# NOTE (T-2084): the rationale lives on its own comment lines deliberately. systemd does NOT
+# accept a trailing '# ...' comment on an Environment= line — it emits 'Invalid environment
+# assignment' / 'Invalid syntax' warnings and drops the trailing tokens. The prior DISARMED
+# line carried exactly that shape, so the disarm read as an UNSET var (default-off) rather
+# than an explicit 0. Same observable state, but by accident, not by value. Keep it clean.
+Environment=PANTHEON_AGENT_MONITOR_REMEDIATE_ENABLED=0
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/agent_monitor_healthcheck.py --check
+StandardOutput=journal
+StandardError=journal
+# Budget arithmetic (live-verified 2026-07-27, T-1885 wet-run): probe timeout
+# 5s + restart subprocess up to 120s (agent-monitor.service's TimeoutStopUSec
+# is systemd's 90s default — a genuinely wedged process can take that long to
+# die under SIGTERM before SIGKILL escalation, and a wet-run measured a real
+# 48s stop→start cycle) + startup margin. 3min covers the pathological path.
+TimeoutStartSec=3min

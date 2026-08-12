@@ -65,6 +65,7 @@ if str(_REPO_ROOT_DEFAULT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT_DEFAULT))
 
 from tools._git_utils import _git, commit_scoped, pull_or_rebase_strict  # noqa: E402
+from tools._lease import UNKNOWN  # noqa: E402  — tri-state sentinel (T-2307/T-2309)
 from tools.ticket import STATES  # noqa: E402
 from tools.watch_digest import read_telegram_token  # noqa: E402
 
@@ -310,10 +311,29 @@ def find_live_build_pids(workspace: Path, proc_root: Path = PROC_ROOT_DEFAULT) -
     just means one fewer positive match, not a crash; on this single-owner
     VPS a genuinely running build's own /proc entries are always readable by
     the user that started it.
+
+    ⚠️ RETURNS `UNKNOWN` WHEN THE SCAN COULD NOT HAPPEN AT ALL (T-2309). That is a
+    different answer from `[]`, and the difference is load-bearing: `[]` means "I
+    looked and nothing is building", while an unscannable proc_root means "I could
+    not look". The caller deletes a directory tree on the negative, so collapsing
+    the two makes total blindness authorise an rmtree of a `target/` that a live
+    cargo build may be writing into — and it does so SILENTLY, because a missing
+    proc_root makes `Path.is_dir()` return False rather than raise (an EACCES one
+    does raise, so only the absent case was ever silent).
+
+    That is the same shape as T-2305, where an unreadable /proc/locks stood in for
+    "unlocked" and forked a lease. Here it would have falsified this module's own
+    stated guarantee — "a `target/` is only ever removed when nothing could still
+    be writing into it" — which is precisely the sentence that makes the deletion
+    look safe to a reader.
+
+    UNKNOWN raises on truthiness by construction, so an `if live_pids:` caller
+    fails loudly instead of silently taking the delete branch. That is deliberate:
+    the defect being fixed WAS a truthiness test on a blind value.
     """
     pids: list[int] = []
     if not proc_root.is_dir():
-        return pids
+        return UNKNOWN
     workspace = workspace.resolve()
     for entry in proc_root.iterdir():
         if not entry.name.isdigit():
@@ -359,6 +379,17 @@ def classify_tmp(
     if not is_stale:
         return TmpDecision(candidate.workspace, candidate.target, candidate.ticket_id, "keep", reason)
     live_pids = find_live_build_pids(candidate.workspace, proc_root)
+    if live_pids is UNKNOWN:
+        # T-2309: could not scan procfs at all. Fail CLOSED — the asymmetry is
+        # not close. Keeping a stale target/ costs disk on a dir the module
+        # itself calls regenerable, and the next sweep retries; removing one
+        # out from under a live build corrupts work in progress. Checked before
+        # the truthiness test below because UNKNOWN refuses to be coerced.
+        return TmpDecision(
+            candidate.workspace, candidate.target, candidate.ticket_id, "keep",
+            f"build-liveness UNKNOWN (procfs at {proc_root} not scannable) — "
+            f"refusing to remove on an unverified negative",
+        )
     if live_pids:
         return TmpDecision(
             candidate.workspace, candidate.target, candidate.ticket_id, "keep",

@@ -1,0 +1,19 @@
+[Unit]
+Description=Pantheon fleet host health — off-site availability poll of the home cluster every 5 min (T-2454)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# Every 5 minutes. Reachability is the primary signal and an outage wants prompt news (the operator,
+# 2026-08-02: "without proper monitoring I have no idea"), so this is far tighter than the CI-audit
+# hourly probe. The 6h per-verdict cooldown (in the tool) is what prevents a sustained outage from
+# paging every 5 min; a CHANGED verdict still speaks immediately. Probes are cheap (~7s of pings +
+# netdata GETs) and off-site, so a home-uplink saturation just times them out — which IS the signal.
+OnCalendar=*-*-* *:00/5:00
+# Persistent so a poll missed across a recovery reboot runs once on the way back up — the case where
+# something was down is exactly when this has something to say.
+Persistent=true
+RandomizedDelaySec=30
+Unit=pantheon-fleet-host-health.service
+
+[Install]
+WantedBy=timers.target

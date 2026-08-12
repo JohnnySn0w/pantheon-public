@@ -4,6 +4,7 @@ id: ORG-028
 title: Portable config topology — per-harness config repos + role-keyed layout + per-instance manifest (no submodules)
 status: Ratified 2026-06-06 by the operator via T-0845. Drafted 2026-06-05 by Recovery (claude-fallback) per the operator directive ("draft it", Telegram 2026-06-05). Open questions resolved in ORG-030 (awaiting ratification).
 date: 2026-06-05
+build_disposition: built
 ---
 
 # ORG-028 — Portable config topology

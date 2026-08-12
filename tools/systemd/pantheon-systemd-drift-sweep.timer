@@ -1,0 +1,18 @@
+[Unit]
+Description=Pantheon cross-account systemd-drift sweep — daily fleet drift report from recovery (T-2444)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# DAILY, against no staleness threshold — the fault this watches (a repo unit edit
+# that never reached a seat's installed copy) develops over WEEKS, not hours. A
+# tighter period buys nothing and spends 8 cross-account sudo reads each fire; the
+# report only bounds how late the news is, and a day is soon enough for a 7-week gap.
+OnCalendar=*-*-* 05:23:00
+# Persistent so a fire missed across a reboot runs once on the way back up — the
+# case where something was down is exactly when the fleet is most likely to have drifted.
+Persistent=true
+RandomizedDelaySec=300
+Unit=pantheon-systemd-drift-sweep.service
+
+[Install]
+WantedBy=timers.target

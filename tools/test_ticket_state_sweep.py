@@ -412,7 +412,8 @@ class TestBriefNamedSweep(unittest.TestCase):
             # tools/ dir so subprocess invocation works.
             real_tools = REPO_ROOT / "tools"
             for fname in ("ticket.py", "_git_utils.py", "agent_role_map.py",
-                          "__init__.py"):
+                          "__init__.py",
+                          "_md_table.py"):  # T-1936: ticket.py's README-row emitter imports it
                 src = real_tools / fname
                 if src.is_file():
                     (clone / "tools" / fname).write_bytes(src.read_bytes())

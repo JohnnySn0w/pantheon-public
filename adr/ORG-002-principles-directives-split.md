@@ -1,8 +1,19 @@
 ---
 aliases: [ORG-002]
-title: Two-tier framework: Principles + Directives
+title: "Two-tier framework: Principles + Directives"
 status: Ratified 2026-04-28
 date: 2026-04-28
+# re_evaluate: machine-checkable mirror of this ADR's inline re-eval prose,
+# consumed by tools/adr_reeval_walk.py (T-2527) during the weekly-review walk.
+# type: calendar|metric|event ; fires: auto-ticket (deterministic only) | surface.
+# Backfilled per T-2530 (inline-only trigger was previously uncaught).
+re_evaluate:
+  - id: R1
+    type: event
+    when: "worker reliability metrics support broader write access"
+    fires: surface
+    text: "old-P7 (hand-curated docs immutable to workers) was demoted to directive D2 because worker reliability is not validated for hand-curated content; re-evaluate when worker-reliability metrics support broader write access"
+build_disposition: no-build-needed
 ---
 # ORG-002 — Two-tier framework: Principles + Directives
 

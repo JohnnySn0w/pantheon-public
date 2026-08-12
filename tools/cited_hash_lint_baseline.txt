@@ -1,0 +1,70 @@
+# cited_hash_lint baseline — UNREACHABLE citations accepted as standing.
+#
+# These are REAL defects, not false positives. They are listed here because
+# the surfaces carrying them are append-only: T-2347 audited this set and
+# REFUSED to rewrite transition logs to make a lint go green, and that
+# refusal stands. Without this file the weekly sweep pages URGENT on the
+# same unchanging number forever (T-2237(a) classifies unit-failure as
+# urgent), which teaches the reader to skip urgent pages.
+#
+# A row does NOT declare a citation correct. It records that the citation
+# is wrong and unfixable in place, and removes it from the EXIT CODE only —
+# every row still prints in full on every run.
+#
+# DO NOT add rows to silence a NEW finding. A new unreachable hash means a
+# citation was written without re-reading the landed sha after the push;
+# fix the citation. Since the T-2360 stamper fix these should be rare, and
+# rarity is the whole signal this file protects.
+#
+# Keyed on (token, path): an exemption names the exact citation it excuses,
+# so the same bad hash cited somewhere new still reports, and a moved file
+# loses its exemption and re-reports.
+#
+# format: <token> <path>
+
+1058350bd tickets/active/T-2124.md
+98d06b63 tickets/done/T-0670.md
+43434375 tickets/done/T-1056.md
+6b153c4e8 tickets/done/T-1056.md
+5772461b tickets/done/T-1084.md
+7d559d0f tickets/done/T-1099.md
+7d93e73a3 tickets/done/T-1099.md
+0a95a37a tickets/done/T-1491.md
+21a6264e tickets/done/T-1926.md
+09e83bd9c tickets/done/T-1987.md
+0904d1abc tickets/done/T-2128.md
+7a80f8840 tickets/done/T-2128.md
+1587114fb tickets/done/T-2204.md
+4e26eb000 tickets/done/T-2204.md
+c1be59796 tickets/done/T-2210.md
+db552b290 tickets/done/T-2210.md
+966a3c6ba tickets/done/T-2268.md
+55f2fa98a tickets/done/T-2271.md
+c54cc83c4 tickets/done/T-2271.md
+f789baaaa tickets/done/T-2271.md
+f789baaaa tickets/done/T-2272.md
+8f5d05da8 tickets/done/T-2274.md
+141c8fc80 tickets/done/T-2277.md
+66e0eba0c tickets/done/T-2277.md
+5453b926f tickets/done/T-2282.md
+ce5c7ef45 tickets/done/T-2282.md
+0e48916ba tickets/done/T-2286.md
+0ee957085 tickets/done/T-2286.md
+4374c1273 tickets/done/T-2300.md
+ea488e712 tickets/done/T-2326.md
+f789baaaa tickets/done/T-2347.md
+5f52a16a4 tickets/done/T-2348.md
+6f1da2bd3 tickets/done/T-2348.md
+8dc49fb1d tickets/done/T-2357.md
+4374c1273 tickets/done/T-2360.md
+21c2b4c8d tickets/done/T-2362.md
+
+# T-2382 (orchestrator 2026-08-06, flagged by recovery via mailbox, disposition orchestrator):
+# two pruned agent/T-2382-land intermediates cited in the ticket's own
+# append-only notes. 4aa5c58ba = the bugs#1-2 base (squashed to e175325, which
+# IS on origin/main via PR#189); 5ba964502 = codex's permission-pin bundle head.
+# The -land branch was pruned after the squash-merge, so both went unreachable.
+# Done ticket => append-only; T-2347 precedent refuses to rewrite the log to go
+# green. Baselined-with-audit-note (not silenced); the real landed sha is e175325.
+4aa5c58ba tickets/done/T-2382.md
+5ba964502 tickets/done/T-2382.md

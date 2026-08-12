@@ -77,3 +77,45 @@ wait for the role-threshold clock when the artifact-finished signal is already v
 - `feedback_active_team_worker_check.md` (memory pin) + CLAUDE.md worker-silence
   section — the role-threshold clocks there are the fallback; the detection recipe
   above fires earlier when the build-finished signal is directly observable.
+
+## 2026-07-15 evidence — 3-for-3 in one subagent session + foreground is UNFORCEABLE
+
+The T-1762 lane (named-teammate implementer) dropped ALL THREE of its own background-Bash
+completion wakes in one session (clippy x2, cargo test x1; each recovered only by an
+HO evidence-nudge). Two structural facts established:
+
+1. **A subagent cannot opt out of backgrounding.** The implementer retried with
+   `run_in_background` unset AND an explicit large `timeout` param — the harness
+   auto-backgrounded the long cargo run anyway. It also has no Monitor tool. So
+   "just run it foreground" is NOT an available mitigation at the worker tier;
+   the wake-drop exposure is structural for any long-running worker command.
+2. **Output-to-log is the load-bearing mitigation.** Both stranded runs were fully
+   recoverable because the worker redirected output to a scratchpad log file before
+   backgrounding; the nudged worker read the log and continued without re-running
+   14-minute builds. Standing worker-brief clause candidate: "redirect every long
+   build/test run to a persisted log file; on any wake gap, read the log, don't re-run."
+
+Dispatcher-side detection that worked: a Monitor loop alerting on (transcript stale
+>20 min) AND (no cargo/rustc processes) AND (no new commit) — caught drop #3 in
+~24 min vs the ~80 min the first one cost under poke-driven detection.
+
+**Pattern lifted to lesson** (ORG-012 criterion 3, T-1915): `lessons/2026-07-21-background-wake-drop-doctrine.md` + standing worker-brief clause in the org-discipline skill §8.
+
+## 2026-08-03 evidence — pattern durable, 3-for-3 re-occurred in one T-1619 subagent
+
+Same 3-drop shape re-observed today on the T-1619 implementer (single named subagent,
+one arc): clippy done → drop, `cargo test --workspace` done → drop, `cargo xwin check`
+done → drop. Each recovered via HO out-of-team SendMessage naming the observed idle
+state; each nudge landed cleanly ("was stopped; resumed from transcript"). No new
+mechanism vs 2026-07-15 T-1762; this is confirmation the wake-drop rate on long
+Rust build stages is durable, not a T-1762-session-specific artifact. Recovery
+cost per drop remained low (~15-30 min silence → nudge → immediate resume + report)
+because the implementer's smoke stages logged terminal markers HO could observe from
+outside its transcript (per the 2026-07-15 "output-to-log is load-bearing" finding —
+the T-1619 implementer had this discipline internalized).
+
+**Elevated frequency worth pinging in a lesson but NOT a policy change:** two full
+3-for-3 sessions two weeks apart, both on Rust build stages on echo. Not a rate
+increase over 2026-07-15 baseline; same rate confirmed at higher confidence.
+HO-side smell-test discipline (transcript mtime + build-activity check) caught
+all three drops in the T-1619 arc within their role-threshold windows.

@@ -1,0 +1,10 @@
+[Unit]
+Description=Pantheon OOM shield — pin agent session processes' oom_score_adj (T-1927)
+Documentation=file:///home/claude-fallback/pantheon-config/tools/pantheon_oom_shield.sh
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pantheon_oom_shield.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=60s

@@ -1,12 +1,14 @@
 ---
 aliases: [ORG-014]
 title: RequestSpawn primitive (Shape 2 / b33 followup)
-status: Ratified 2026-05-17
+status: Superseded 2026-08-10 by ORG-037 (per the operator, Telegram) — ORG-037 (team-coordination liveness, built) automates the same silent-dispatchee failure; the M2 manual RequestSpawn primitive was never built and is redundant. Was Ratified 2026-05-17.
 date: 2026-05-17
 ---
 # ORG-014 — RequestSpawn primitive (Shape 2 / b33 followup)
 
-**Status:** Authored + Ratified 2026-05-17 by the operator (Telegram msg_1615 "I do approve of the reasoning, convert and ratify"). Promoted from `notes/2026-05-17-request-spawn-primitive-design.md` (drafted earlier same day) per msg_1614 verdict — "notes should not be submitted as ratifiable documents; this should be an adr tbh." Documents the M2 mechanism choice as binding architectural direction; implementation gated on a downstream implementer dispatch (HO-direct or sub-ticket).
+**Status:** **SUPERSEDED 2026-08-10 by ORG-037** (per the operator, Telegram — on the supersede recommendation from the 2026-08-10 ratified-ADR audit). ORG-037 (team-coordination liveness, Ratified 2026-06-26, fully built) handles the same silent-dispatchee failure with a strictly-better AUTOMATIC mechanism (self-wakeup watchdog + bilateral self-checks); ORG-014's manual `tools/request_spawn.py` primitive was never built and is redundant (no consumer exists). Original ratification preserved for the record below.
+
+**Originally Authored + Ratified 2026-05-17** by the operator (Telegram msg_1615 "I do approve of the reasoning, convert and ratify"). Promoted from `notes/2026-05-17-request-spawn-primitive-design.md` (drafted earlier same day) per msg_1614 verdict — "notes should not be submitted as ratifiable documents; this should be an adr tbh." Documented the M2 mechanism choice as binding architectural direction; implementation was gated on a downstream implementer dispatch (HO-direct or sub-ticket) that was never filed (T-0398 resolve) — the gap the 2026-08-10 audit surfaced.
 
 **Date authored:** 2026-05-17
 

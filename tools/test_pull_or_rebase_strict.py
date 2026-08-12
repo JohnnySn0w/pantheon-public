@@ -30,7 +30,12 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools._git_utils import _abort_stale_rebase, pull_or_rebase_strict
+from tools._git_utils import (
+    PULL_NOT_AHEAD_PREFIX,
+    PULL_REBASE_CONFLICT_PREFIX,
+    _abort_stale_rebase,
+    pull_or_rebase_strict,
+)
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -134,6 +139,13 @@ class PullOrRebaseStrictRealGit(unittest.TestCase):
         ok, msg = pull_or_rebase_strict(cwd=self.local)
         self.assertFalse(ok)
         self.assertIn("conflict", msg.lower())
+        # T-2333: ticket.py's hint-selector discriminates on this exact
+        # prefix; pin it here so a wording drift in pull_or_rebase_strict
+        # gets caught at the source, not as a mysteriously-wrong hint later.
+        self.assertTrue(
+            msg.startswith(PULL_REBASE_CONFLICT_PREFIX),
+            f"rebase-conflict failure must start with the T-2333 prefix, got: {msg!r}",
+        )
         # Aborted -> clean state, no rebase in progress, local commit intact.
         self.assertFalse(self._rebase_in_progress())
         self.assertEqual((self.local / "shared.txt").read_text(), "LOCAL\n")
@@ -165,6 +177,11 @@ class PullOrRebaseStrictRealGit(unittest.TestCase):
         ok, msg = pull_or_rebase_strict(cwd=self.local)
         self.assertFalse(ok)
         self.assertIn("not ahead", msg.lower())
+        # T-2333: pin the exact prefix ticket.py's hint-selector matches on.
+        self.assertTrue(
+            msg.startswith(PULL_NOT_AHEAD_PREFIX),
+            f"not-ahead failure must start with the T-2333 prefix, got: {msg!r}",
+        )
         self.assertFalse(self._rebase_in_progress())
 
     # ----- T-1191: stale in-progress rebase self-heal -----

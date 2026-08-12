@@ -480,12 +480,25 @@ def main(argv: list[str] | None = None) -> int:
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(digest, encoding="utf-8")
+    # T-2336: pathspec-scoped commit + git_mutation_lock — the bare commit here
+    # could swallow a concurrent writer's staged files under this message on the
+    # shared checkout. Lock is repo-anchored (not root-derived), so a non-prod
+    # `root` over-locks harmlessly.
     try:
-        _git(root, "add", DIGEST_REL)
-        _git(root, "commit", "-m",
-             "chore(policy-outflow): refresh recent-policy-changes digest (T-0834)")
+        from tools._git_utils import GitMutationLockTimeout, git_mutation_lock
+    except ImportError:  # bare run with cwd=tools/
+        from _git_utils import GitMutationLockTimeout, git_mutation_lock  # type: ignore
+    try:
+        with git_mutation_lock(label="policy-outflow digest refresh"):
+            _git(root, "add", DIGEST_REL)
+            _git(root, "commit", "-m",
+                 "chore(policy-outflow): refresh recent-policy-changes digest (T-0834)",
+                 "--", DIGEST_REL)
     except subprocess.CalledProcessError as exc:
         print(f"policy_outflow_sync: git step failed: {exc.stderr or exc}", file=sys.stderr)
+        return 1
+    except GitMutationLockTimeout as exc:
+        print(f"policy_outflow_sync: git mutation lock timeout: {exc}", file=sys.stderr)
         return 1
     if not args.no_push:
         # T-1207: bounded retry on non-fast-forward. This shared repo has a

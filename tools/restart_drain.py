@@ -57,6 +57,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import re
 import subprocess
 import sys
@@ -68,6 +69,10 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.agent_role_map import account_persona_map as _account_persona_map  # noqa: E402  (needs sys.path above)
+from tools.agent_role_map import instance_binding as _instance_binding  # noqa: E402  (needs sys.path above)
+from tools.agent_role_map import control_plane_consume_service as _control_plane_consume_service  # noqa: E402  (needs sys.path above)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -125,40 +130,73 @@ DETACHED_LAUNCH_TIMEOUT_SECONDS = 15
 # For Orchestrator/Specialist tombstones that Recovery's context_fill_monitor writes (via sudo),
 # Orchestrator's/Specialist's own drain timers handle those locally — no cross-account drain.
 
-DRAIN_AGENT_CONFIG: dict[str, dict] = {
-    "recovery": {
-        "restart_service": "claude-telegram-fallback.service",
-        "restart_mode": "user",
-        # Real session is `claude-telegram-bot-fallback:0` (per the service
-        # unit's ExecStart); `claude-fallback-bot:0` was a wrong guess that would
-        # break the restart's handoff/capture steps. Corrected 2026-05-21.
-        "restart_target_pane": "claude-telegram-bot-fallback:0",
-        # T-0543: no idle_sentinel override — the shared default in
-        # handoff_and_restart.sh now includes '❯' for Claude Code 2.1.x idle
-        # panes (fixes the class for all agents). Per-agent override removed;
-        # if_cfg.get("idle_sentinel") branch in _fire_restart stays for future
-        # legitimate per-agent overrides.
-        "handoff_file": "/home/claude-fallback/HANDOFF.md",
-        "restart_bin": "/home/claude-fallback/pantheon-config/tools/handoff_and_restart.sh",
-        "restart_lockfile": "/tmp/handoff_and_restart_recovery.lock",
-    },
-    "orchestrator": {
-        "restart_service": "claude-telegram.service",
-        "restart_mode": "user",
-        "restart_target_pane": "claude-telegram-bot:0",
-        "handoff_file": "/home/claude/HANDOFF.md",
-        "restart_bin": "/home/claude/pantheon-config/tools/handoff_and_restart.sh",
-        "restart_lockfile": "/tmp/handoff_and_restart_orchestrator.lock",
-    },
-    "specialist": {
-        "restart_service": "claude-telegram-research.service",
-        "restart_mode": "user",
-        "restart_target_pane": "claude-research-bot:0",
-        "handoff_file": "/home/claude-research/HANDOFF.md",
-        "restart_bin": "/home/claude-research/pantheon-config/tools/handoff_and_restart.sh",
-        "restart_lockfile": "/tmp/handoff_and_restart_specialist.lock",
-    },
-}
+# DRAIN_AGENT_CONFIG — built from instance.yaml (T-2076), not a hardcoded dict.
+# Fully account/persona-derived (no monitor-side tuning): a self-hoster configures
+# accounts + services ONCE in instance.yaml. Derivation:
+#   restart_service / restart_mode / restart_target_pane  <- instance.yaml (restart_service/restart_mode/restart_pane)
+#   handoff_file     = /home/<account>/HANDOFF.md
+#   restart_bin      = /home/<account>/pantheon-config/tools/handoff_and_restart.sh
+#   restart_lockfile = /tmp/handoff_and_restart_<persona>.lock
+# Provably == the former literals for the reference instance
+# (test_restart_drain.TestBuildDrainConfig). Only the fire-path agents that run a
+# drain timer are built; each account runs the drain for its own agent.
+#
+# T-2370: the persona set is DERIVED, not enumerated. This used to open with a
+# hand-carried `_DRAIN_PERSONAS = ("recovery", "orchestrator", "specialist")` — the pre-ORG-042
+# three — which CONTRADICTED the manifest it claims to be built from. The inner
+# `"restart_service" not in b` gate below is already the correct predicate and was
+# already doing the real work; the outer tuple only ever subtracted from it. The
+# measured casualty: instance.yaml grants restart_service to FOUR roles (adding
+# second-head/mnemosyne), so a restart tombstone written for mnemosyne hit the
+# `agent not in DRAIN_AGENT_CONFIG` branch and was quarantined as an unknown
+# agent — the drain silently did not cover a seat the manifest says is
+# restartable. Deriving deletes the list rather than extending it, so the next
+# instance.yaml role to gain restart_service is covered without a code edit.
+#
+# Scope is unchanged for the reference instance's existing three and stays
+# same-account by construction: a drain only ever sees tombstones in its OWN
+# account's PANTHEON_STATE_DIR (~/.local/state/pantheon, home-rooted), so
+# widening this map cannot let one account fire another's restart — it only lets
+# mnemosyne's own drain act on mnemosyne's own tombstone.
+
+
+def _build_drain_config() -> dict:
+    cfg: dict = {}
+    for persona in sorted(set(_account_persona_map().values())):
+        b = _instance_binding(persona)
+        account = b.get("account")
+        if not account or "restart_service" not in b:
+            continue
+        entry = {
+            "restart_service": b["restart_service"],
+            "restart_mode": b.get("restart_mode", "user"),
+            "handoff_file": f"/home/{account}/HANDOFF.md",
+            "restart_bin": f"/home/{account}/pantheon-config/tools/handoff_and_restart.sh",
+            "restart_lockfile": f"/tmp/handoff_and_restart_{persona}.lock",
+        }
+        # restart_target_pane gated on presence (T-2076 review #4): a fork role that
+        # omits restart_pane leaves the key ABSENT → --validate (which requires it)
+        # fails loudly, rather than passing `--target-pane None` to handoff_and_restart.sh.
+        if "restart_pane" in b:
+            entry["restart_target_pane"] = b["restart_pane"]
+        # T-2658: a control-plane-supervised persona (T-2633 cutover, e.g. specialist)
+        # is NOT restarted via its (disabled) bespoke restart_service set above
+        # -- OVERRIDE it here to the derived pantheon-persona-consume@<persona>
+        # unit, and carry "supervisor" so handoff_and_restart.sh knows to
+        # kill-session first and use the scope/session-liveness readiness gate
+        # instead of `systemctl is-active` (a Type=oneshot consume unit is
+        # never is-active after it exits). The bespoke value stays intact in
+        # instance.yaml itself (and in agent_role_map.instance_binding()'s
+        # return) for an operator reading the manifest directly -- only this
+        # BUILT entry, the one the drain actually fires against, changes.
+        if b.get("supervisor") == "control-plane":
+            entry["restart_service"] = _control_plane_consume_service(persona)
+            entry["supervisor"] = "control-plane"
+        cfg[persona] = entry
+    return cfg
+
+
+DRAIN_AGENT_CONFIG: dict[str, dict] = _build_drain_config()
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +292,36 @@ def _is_under_home(path: str, home: str) -> bool:
     return path == home or path.startswith(home.rstrip(os.sep) + os.sep)
 
 
+def account_exists(account: str) -> bool:
+    """T-2071: is `account` a real Unix account on this box? (globally-visible
+    passwd DB — checkable regardless of which account runs the drain). KeyError is
+    the definitive-absence signal; any OTHER exception fails OPEN (returns True) so
+    a passwd-DB error never false-alarms. Sibling of
+    context_fill_monitor.account_exists."""
+    try:
+        pwd.getpwnam(account)
+        return True
+    except KeyError:
+        return False
+    except Exception as exc:  # pragma: no cover - passwd DB pathology
+        _log(f"account_exists({account!r}): unexpected {exc!r}; fail-open")
+        return True
+
+
+def _account_from_home_path(*paths: str | None) -> str | None:
+    """Extract the `<account>` from the first `/home/<account>/…` path given.
+    DRAIN_AGENT_CONFIG has no explicit account field (the drain runs same-account),
+    so the account is inferred from the home-rooted paths for the T-2071 existence
+    check. Returns None if no path is /home/<account>/-shaped."""
+    for p in paths:
+        if not p:
+            continue
+        m = re.match(r"/home/([^/]+)/", str(p))
+        if m:
+            return m.group(1)
+    return None
+
+
 def _validate_config() -> int:
     """T-0824: pre-arm validation. Check every DRAIN_AGENT_CONFIG persona key
     against the canonical persona set (agent_role_map.py, the runtime mirror of
@@ -284,6 +352,19 @@ def _validate_config() -> int:
         for field in ("restart_service", "restart_target_pane", "restart_bin"):
             if not cfg.get(field):
                 problems.append(f"agent '{agent}': no {field} configured")
+        # T-2071 seeder footgun: the agent's account (inferred from its /home/<acct>/
+        # paths, since drain has no explicit sudo_user) must exist on this box. A
+        # cross-account path is soft-skipped below, so leftover reference-instance
+        # defaults on a fork's box would otherwise pass --validate silently. Account
+        # existence is globally visible, so hard-check it for every agent.
+        acct = _account_from_home_path(cfg.get("restart_bin"), cfg.get("handoff_file"))
+        if acct and not account_exists(acct):
+            problems.append(
+                f"agent '{agent}': account '{acct}' (from its home paths) does not "
+                f"exist on this box — its drain timer cannot run and no restart will "
+                f"apply (likely leftover reference-instance defaults; set "
+                f"DRAIN_AGENT_CONFIG to your real accounts)"
+            )
         restart_bin = cfg.get("restart_bin")
         if restart_bin:
             if _is_under_home(str(restart_bin), home):
@@ -406,6 +487,26 @@ def _fire_restart(cfg: dict, agent: str, *, skip_ack: bool = False) -> tuple[boo
         inner += f" --idle-sentinel '{cfg['idle_sentinel']}'"
     if skip_ack:
         inner += " --skip-ack"
+    else:
+        # T-2829: a GRACEFUL restart (context_fill_threshold, operator, …) runs the
+        # handoff beat (steps 2-4), which STALLS if the session is wedged behind a
+        # permission modal — the modal captures the input the handoff prompt needs,
+        # so the session never hands off and the restart used to exit 4 leaving it
+        # wedged (the 2026-08-11 specialist settings.json-modal incident, ~3.3d stuck).
+        #   --dismiss-modal              : Escape first (fail-closed — cancels the
+        #                                  modal, never approves) so a modal-wedged
+        #                                  session can still write its handoff.
+        #   --hard-restart-on-ack-timeout: if it STILL can't hand off within the
+        #                                  timeout, fall through to the restart
+        #                                  rather than abandon it wedged.
+        # Force restarts (--skip-ack) skip steps 2-4 entirely and kill the process
+        # (the modal dies with it), so neither flag applies there.
+        inner += " --dismiss-modal --hard-restart-on-ack-timeout"
+    # T-2658: control-plane seats (specialist, T-2633 cutover) need the kill-
+    # session + scope/session-liveness branch inside handoff_and_restart.sh
+    # instead of a plain `systemctl restart` of a bespoke unit.
+    if cfg.get("supervisor") == "control-plane":
+        inner += " --supervisor control-plane"
 
     # Derive collision-free unit name from the service stem (mirrors self_restart.sh:81).
     # e.g. claude-telegram-fallback.service → drain-restart-claude-telegram-fallback

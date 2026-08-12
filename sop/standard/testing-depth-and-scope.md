@@ -3,6 +3,7 @@
 **Status:** **Ratified 2026-05-20 by the operator (Telegram msg_1742, via T-0488).** Base drafted 2026-05-13 (T-0305 per the operator msg_1212 + msg_1214 + msg_1215; ratified via T-0307). Amended 2026-05-19 (T-0437 per the operator msg_1526 + msg_1528) with: External-API adapter row + Schema-source check column (Amendments A+B), CI-portability requirements section (Amendment C), command-output-content discipline (Amendment D) — these amendments ratified by msg_1742. The msg_1215 **Echo-resumption gate is now LIFTED** — Echo work may resume. Amendment E (TDD cross-ref) deferred pending T-0401.
 **Amendment F (§Test-tier ladder) Ratified 2026-06-02 (the operator, T-0699; ORG-024 gap-3):** added §Test-tier ladder (depth axis) — the existence→property→behavioural→adversarial reviewer checklist.
 **Amendment G (§Tests must exercise the real failure condition) Ratified 2026-06-26 by the operator (T-1326); drafted by Orchestrator (HO).** Folds the three Echo Phase-3 "green-but-hollow" lessons into a new section + reviewer-checklist additions: G1 concurrency/restart tests trigger AFTER steady-state + assert effect-propagation; G2 completeness-checklist gate (smoke-green ≠ done); G3 control-surface wiring scope-match + not-wired guard.
+**Amendment H (§Falsification must be RUN, not reasoned about) Adopted 2026-07-28 by Orchestrator (HO)** under D3/msg-3733 (below-goal-level — adopted + ledgered, not filed for ratification; see §Adoption note, which records the deliberate divergence from the matrix's Ratification-REQUIRED row). Origin: the 2026-07-28 mailbox/monitoring arc. Where G asks *did the test reach the failure condition*, H asks *can this test fail at all* — H1 a recorded red observation is not substitutable by argument; H2 a check that cannot tell healthy from broken is not an assertion; H3 a predicate validated as a moment and deployed as a standing rule; H4 the pin pair.
 
 This is the authoritative org-level discipline for *how much testing each cycle should land*, indexed by ticket type and test tier. Per-domain expansion lives in sibling SOPs ([visual-verification-for-ui-tickets.md](visual-verification-for-ui-tickets.md), [auto-commit-cron-default-safe-contract.md](auto-commit-cron-default-safe-contract.md), [team-orchestrator-dispatch-checklist.md](team-orchestrator-dispatch-checklist.md)); this SOP is the rollup that says *which ticket types must clear which tiers before close*.
 
@@ -168,6 +169,85 @@ Before wiring any control affordance (GUI button, CLI command, settings banner) 
 
 **Reviewer checklist additions (Amendment G):** for concurrency/restart surfaces → G1 (trigger-after-park + effect-not-construction); at every close → G2 (enumerated required-test checklist, not bare smoke-green); for control surfaces wired to apply/effect ops → G3 (scope-matches-binding + not-wired guard). Like the rest of this SOP, scope-proportionate — G1/G3 fire only on their respective surfaces; G2 applies to any ticket with a brief-named REQUIRED test set.
 
+## Falsification must be RUN, not reasoned about (Amendment H)
+
+**Adopted 2026-07-28 by Orchestrator (HO) under D3/msg-3733 — below-goal-level, so no ratification ticket; see §Adoption note.** Origin: the 2026-07-28 mailbox/monitoring arc, where multiple guards were green, correct-looking, and structurally incapable of failing.
+
+**THE RULE. A test you have not watched FAIL is not evidence that it works.** Before reporting a test as coverage: break the thing it guards, watch it go red, restore, watch it go green — and report **both** observations, not just the green one.
+
+This is a distinct rung from Amendment G, and the distinction is what makes it worth its own section:
+
+| | what is wrong | why green is misleading |
+|---|---|---|
+| **G1** | the test exists and runs, but its *timing* dodges the precondition | the bug's precondition never occurs |
+| **G2** | the test was never **written** | an absent test cannot fail |
+| **H** | the test exists, runs, and is green — and **cannot go red** | the assertion is unreachable, vacuous, or true by construction |
+
+G2 asks *did you write it*. H asks *can it fail*. A suite can be complete by G2's enumeration and entirely hollow by H's.
+
+### H1 — Reasoning about a falsification is not performing one
+
+"If X were broken this test would catch it" is a hypothesis about your own code, produced by the same understanding that wrote the code. It fails exactly where the code fails. The check costs seconds and is not substitutable by argument.
+
+- **Mechanic:** revert the fix (or corrupt the config, or delete the call site), run, capture the failure line, restore, run, capture the pass line. Both lines go in the report.
+- **Counterfactual upgrade (for a test guarding a specific fix):** a mutation going red proves the test CAN fail — not that it fails *for the reason claimed*. The stronger form: revert the fix while KEEPING the mutation and confirm the test passes again — direct proof the fix is what the test detects, not something incidental. (Metis's T-2245 reviewer ran this unbriefed, 2026-07-29; adopted as the default ask for fix-guarding tests.)
+- **Sabotage the THREAT, not the assertion:** the red run must break the guarded thing the way you FEAR it will break, not a way your assertion happens to detect. Worked instance (atlas's T-2256 reviewer, 2026-07-29): an anti-flattening guard's substring assertions went red under the implementer's *replacement*-shaped sabotage — honest record, hollow coverage — while the feared mutation class (*widening by prepending* to the case-arm) passed both assertions green. The guard would have shipped carrying a docstring asserting protection it did not provide, which is worse than no guard. Enumerate the feared mutation classes first; each one is a falsification to run.
+- **The threat enumeration must be adversarially generated — a checklist can carry the author's blind spot with a tick next to it.** Same cluster, second cycle (T-2256): the rebound brief DID enumerate three shapes (prepend/append/replace); the implementer covered the enumeration exactly; the rebuilt guard was still hollow — and a *strict regression* — because all three were ways to *edit the existing arm*, and nobody enumerated *adding a new one*, which is how a person actually widens a shell case. Three people passed the substitution within hours of the rule above being written, two having just read it. The structural form that survived: (1) enumerate threat shapes BEFORE implementation; (2) justify the enumeration against **how the artifact is actually edited in practice** ("how would a person make this change to this file?"), never against "what shapes does my assertion handle?" — the second question feels like diligence and produces the tick; (3) the reviewer **attacks past the enumeration** (construct something that fools the guard), not merely audits coverage of it — coverage-auditing the flawed checklist would have approved the hollow guard. For unrecoverable-class guards, have someone who is not writing the fix generate the enumeration.
+- **Tell (REBOUND):** a report asserting a test "would fail if the bug returned", with no recorded red observation. Also: "verified" applied to an inference rather than a run.
+- **Worked instance — the one that names the shape.** T-2249: a test was made to `skipTest` on hosts lacking fleet topology. The skip was correct. Recovery then broke the config deliberately *with* topology present, to check the test still screamed — *"a skipping test that can no longer fail is decoration, and I would not have known without breaking the config and watching it scream."* A skip is the cheapest way to make a green test unfalsifiable, and it looks like diligence.
+
+### H2 — A check that cannot distinguish the healthy state from the failure state is not an assertion
+
+The most common hollow guard is not a wrong assertion but an **inert** one: an operation performed in the belief that performing it constitutes checking.
+
+- **Worked instance.** T-2227: `canonical_is_pushed()` read `origin/main`, a *local cached ref*, with nothing fetching — precondition and verification derived from one snapshot and could not disagree. Adding the fetch alone would still not have been an assertion: *it cannot distinguish the failure state from the healthy one.* The fix asserts the post-fetch ref equals `git ls-remote`, and refuses on failure rather than falling back to cache. Specialist's framing — **a reminder wearing a mechanism's clothes** — is the reusable name for it.
+- **Reviewer question:** "what input makes this check fail?" If nobody can answer with a concrete input, it is not a check.
+
+### H3 — A predicate validated as a MOMENT and deployed as a STANDING RULE
+
+A guard evaluated repeatedly over time must be falsified **across samples**, not at one instant. A single-snapshot test cannot tell a bounded predicate from an unbounded one — it agrees with both.
+
+- **Worked instance.** T-2257/T-2258: the mail-staleness suppressor asked "is this queue draining?" via `recency < oldest`, where both terms are `now - (a fixed timestamp)`. They grow at the same rate, so their difference is constant and **the sign can never flip** — one partial drain immunizes an inbox against alerting permanently. Both validation cases recorded in the docstring were correct and both were instantaneous. The predicate was validated as a moment and shipped as a standing rule, and no single-sample test could have caught it. Live cost: two agents were invisible to the detector for hours, one of them for over three.
+- **Mechanic:** sample, advance the clock (inject `now`; do not sleep), sample again, assert the alert **fires**. Then break it and watch the test fail.
+- **Reviewer question:** on any predicate that runs on a timer — "does the test observe more than one instant?"
+
+### H4 — The pin pair: two individually-correct constraints that are jointly unsatisfiable
+
+Two assertions, each defensible when read alone, that no state can satisfy simultaneously — so the test is dead regardless of the code under it. Reasoning about either constraint separately looks fine, which is why H1's argument-instead-of-a-run reliably misses it. Running it once surfaces it immediately.
+
+*Provenance note: this shape was reported by the T-2245 orchestrator during the 2026-07-28 arc; that worker was lost to a session restart and I have not recovered the specific artifact. The shape is recorded because it is instructive and cheap to check for; it is **not** backed by a ticket I have read. Replace this note with the citation if the instance is recovered.*
+
+### Known-gap markers (expected-failure) — mechanics that determine whether the flip works
+
+When a real gap is documented as a test (per an HO ruling of the T-2245 shape: green while the gap is real, suite-breaking the moment the gap closes, forcing promotion to a real assertion), the marker implementation decides whether that mechanism exists at all:
+
+- **Use `unittest.expectedFailure`** (or `pytest.mark.xfail(strict=True)` explicitly). Measured 2026-07-28 (metis, T-2245): `unittest.expectedFailure` yields a FAILING run (exit 1) on unexpected success under both `python3 -m unittest` and `python3 -m pytest`.
+- **Never bare `pytest.mark.xfail`** — it defaults `strict=False`, under which an XPASS does **not** fail the suite. In a repo with no `xfail_strict` ini (this one), the bare marker silently destroys the flip: the gap closes, the marker passes quietly, nobody is forced to promote it. The silent-green disease one level up, one import away.
+- **The marker itself is H1-subject:** demonstrate the flip both ways before landing — fake the gap-closing surface (an env seam is fine), observe unexpected-success break the run, remove it, observe expected-failure. A marker never watched flipping is a hollow guard one level up.
+
+### Reporting format
+
+An implementer's report claiming a test as coverage carries, per test or per coherent group:
+
+```
+falsification: <what I broke>  ->  FAILED at <assertion/line>   (red observed)
+restored                       ->  PASSED                        (green observed)
+```
+
+Absent the red line, the reviewer treats the test as **unverified coverage** — not as a failure, but not as evidence either. This is a REBOUND on any REQUIRED-tier cell.
+
+**The pair must land in a durable artifact** — the commit message or a ticket annotation, not only the agent's report. An agent report is a transcript: it dies with the agent that produced it, so a reviewer (or any later reader) cannot check the recorded red against anything. Found live 2026-07-29 (atlas's T-2261 cycle): the reviewer could not read the implementer's ten-falsification record at all and had to rebuild the evidence as an independent sabotage superset — which worked, but only because the reviewer was strong; the rule must not depend on that. The durable copy may be the summary form (what was broken → what fired), not full logs.
+
+### Boundary — where H does not apply
+
+Scope-proportionate, like the rest of this SOP. H is not a demand to mutation-test every assertion in a suite. It fires on: any test landed as the guard for a **specific named defect**; any test whose green is being offered as the reason to close a ticket; any **skip** added to a previously-running test; any predicate on a timer (H3). It does not fire on incidental assertions inside a larger behavioural test, or on tests whose failure was already observed naturally during development — if you watched it go red while writing it, that counts; say so.
+
+### Adoption note
+
+The matrix above marks Ratification REQUIRED for SOP/docs work. That row predates the operator's msg-3733 ruling retiring below-goal-level ratification asks (D3, amended 2026-06-11), under which HO adopts and records in the ledger. This amendment is below goal level — it tightens an existing reviewer checklist and creates no new obligation on the operator — so it is **adopted, not filed for ratification**, and this note exists so the divergence from the matrix row is visible rather than silent. Goal-level SOP changes still route to him.
+
+**Reviewer checklist additions (Amendment H):** for any test offered as coverage for a named defect → H1 (recorded red observation, not an argument); for any guard that performs an operation → H2 ("what input makes this fail?"); for any predicate evaluated on a timer → H3 (multi-sample test); for any newly-added skip → H1's mutation check specifically (the skip must not have made the test unfalsifiable).
+
 ## Boundary
 
 This SOP does NOT cover:
@@ -189,6 +269,7 @@ This SOP does NOT cover:
   - [`tools/_test_fixtures.py`](../../tools/_test_fixtures.py) — T-0259 Layer-3 fixture. Required for cron-script Integ-same-process tests.
   - [`web/tests/visual/visual-mobile.spec.ts`](https://github.com/example-org/pantheon-pwa) (pantheon-pwa) — Playwright mobile-viewport infrastructure for UI Visual REQUIRED. Per T-0288 visual-regression infra.
 - **Remediation SOPs:** [`../remediation/plan-first-violation.md`](../remediation/plan-first-violation.md) (worker skips plan-tier test enumeration); [`../remediation/jumps-ahead-without-brief.md`](../remediation/jumps-ahead-without-brief.md) (worker emits code before brief's REQUIRED tier list lands).
+- **Tickets (Amendment H origin cases):** T-2249 (the skip that could no longer fail — H1's worked instance); T-2227 (`origin/main` read from a local cached ref; "a reminder wearing a mechanism's clothes" — H2); T-2257 / T-2258 (the staleness suppressor whose sign can never flip — H3); T-2255 (a falsification run and reported in the prescribed red-then-green form); T-2245 (the arc that surfaced the class).
 - **Tickets:** T-0305 (this SOP's authoring); T-0437 (the 2026-05-19 amendment cycle: Amendments A+B+C+D); T-0259 (Layer-3 fixture genesis); T-0288 (visual-regression infra genesis); T-0157 (per-SOP ratification gate framework); T-0160 (standard-bucket SOP framework extension); T-0238 (Playwright e2e conventions); T-0381 (Speechmatics schema-drift case study; Amendment B origin); T-0379 (silero CI-env-drift case study; Amendment C origin); T-0391 (success-path-silent-on-content case study; Amendment D origin); T-0401 (TDD eval — pending; Amendment E will cross-reference once T-0401 ratifies adoption).
 - **Telegram refs:** msg_1212 (the operator's originating ask — "have we done a sop on how extensive testing should be in projects?"); msg_1214 (HO-authors-not-Recovery ratification); msg_1215 (priority elevation — blocks Echo resumption); msg_1526 (the operator's amendment-driving observation — "what's the pattern for designing + agreeing on tests for our current system? bc they often seem to have a lot of holes"); msg_1528 (the operator confirms file-consolidating-ticket framing for the amendments).
 - **Lessons:** [`lessons/orchestrator-tier-substrate-verification.md`](../../lessons/orchestrator-tier-substrate-verification.md) — adjacent class (orchestrator verifies substrate; this SOP verifies test-tier coverage; both are at brief-construction tier).

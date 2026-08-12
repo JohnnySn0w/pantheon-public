@@ -19,6 +19,7 @@ of `tools/_git_utils.py`'s docstring).
 from __future__ import annotations
 
 import io
+import os
 import subprocess
 import tempfile
 import unittest
@@ -29,6 +30,16 @@ from unittest.mock import MagicMock, patch
 
 from tools import ticket_grooming
 from tools.ticket import TicketError
+
+# T-1774: env-override for git_mutation_lock's lockfile path — see the
+# matching module-level comment in tools/test_watch_runner.py. Any test that
+# fully mocks tools._git_utils.subprocess.run and drives the real
+# git_commit_and_push/commit_scoped pipeline MUST set this in setUp/tearDown,
+# else `_git_utils._git_common_dir()`'s `git rev-parse --git-common-dir` call
+# never gets a real answer from the mock and falls back to `REPO_ROOT /
+# ".git"` — a FILE (not a directory) in a linked worktree checkout, which
+# crashes `_open_lockfile_world_writable`'s `mkdir()` (T-1816).
+_GIT_MUTATION_LOCK_ENV = "PANTHEON_GIT_MUTATION_LOCKFILE"
 
 
 # ---------------------------------------------------------------------------
@@ -51,12 +62,15 @@ def _make_ticket_file(
     transition_lines: list[str] | None = None,
     stale_after: str | None = None,
     extra_body: str = "",
+    labels: list[str] | None = None,
 ) -> None:
     """Write a ticket file with the given transition log entries.
 
     `transition_lines` is a list of pre-formatted bullet lines (each starting
     with "- "), inserted verbatim into the ## Transition log section. If None,
-    a single freshly-filed entry is generated.
+    a single freshly-filed entry is generated. `labels`, if given, is written
+    as the frontmatter flow-list `labels: [a, b, c]` (T-1814: needed for the
+    ratified-unbuilt-ADR join tests).
     """
     fm_lines = [
         "---",
@@ -70,6 +84,8 @@ def _make_ticket_file(
     ]
     if stale_after:
         fm_lines.append(f"stale_after: {stale_after}")
+    if labels is not None:
+        fm_lines.append(f"labels: [{', '.join(labels)}]")
     fm_lines.append("---")
 
     if transition_lines is None:
@@ -965,6 +981,47 @@ class TestDigestRendering(unittest.TestCase):
         self.assertIn("Dependency-graph defects (2)", msg)  # dep section alongside
         self.assertNotIn("**", msg)                    # still plain text
 
+    # T-2833: unanchored/bad date-gate section in the daily grooming digest.
+    def _gate_findings(self):
+        from tools.ticket_lint import UnanchoredGateFinding
+        return [
+            UnanchoredGateFinding("T-0005", "unanchored", "T-0005: not_before ... has no anchor"),
+            UnanchoredGateFinding("T-0006", "malformed", "T-0006: anchor 'event:x' is not operator:..."),
+        ]
+
+    def test_unanchored_gates_section_omitted_when_clean(self) -> None:
+        clean = ticket_grooming.build_digest(
+            now_iso="2026-08-11 12:00 UTC", flagged=[], counts={"active": 3},
+            unanchored_gate_findings=[],
+        )
+        self.assertNotIn("Unanchored/bad date gates", clean)
+        stale = ticket_grooming.build_digest(
+            now_iso="2026-08-11 12:00 UTC",
+            flagged=[self._flagged("T-0007", "active", timedelta(hours=8))],
+            counts={"active": 1}, unanchored_gate_findings=[],
+        )
+        self.assertNotIn("Unanchored/bad date gates", stale)
+
+    def test_unanchored_gates_section_in_zero_stale_digest(self) -> None:
+        msg = ticket_grooming.build_digest(
+            now_iso="2026-08-11 12:00 UTC", flagged=[], counts={"active": 3},
+            unanchored_gate_findings=self._gate_findings(),
+        )
+        self.assertIn("No stale tickets found", msg)
+        self.assertIn("Unanchored/bad date gates (2)", msg)
+        self.assertIn("[unanchored]", msg)
+        self.assertIn("[malformed]", msg)
+
+    def test_unanchored_gates_section_in_stale_digest(self) -> None:
+        msg = ticket_grooming.build_digest(
+            now_iso="2026-08-11 12:00 UTC",
+            flagged=[self._flagged("T-0007", "active", timedelta(hours=8))],
+            counts={"active": 1}, unanchored_gate_findings=self._gate_findings(),
+        )
+        self.assertIn("1 stale ticket(s)", msg)
+        self.assertIn("Unanchored/bad date gates (2)", msg)
+        self.assertNotIn("**", msg)
+
     def _stale_draft_findings(self):
         return [
             ticket_grooming.StaleDraftTicket(
@@ -1253,10 +1310,16 @@ class TestFullFireIntegration(unittest.TestCase):
         ]
         for p in self._patches:
             p.start()
+        # T-1816 / T-1774: isolate the git_mutation_lock lockfile — see the
+        # module-level comment on _GIT_MUTATION_LOCK_ENV above.
+        os.environ[_GIT_MUTATION_LOCK_ENV] = os.path.join(
+            self._tmp.name, "gitlock", "ops.lock"
+        )
 
     def tearDown(self) -> None:
         for p in self._patches:
             p.stop()
+        os.environ.pop(_GIT_MUTATION_LOCK_ENV, None)
         self._tmp.cleanup()
 
     def test_two_stale_tickets_full_flow(self) -> None:
@@ -1317,7 +1380,31 @@ class TestFullFireIntegration(unittest.TestCase):
             for c in mock_run.call_args_list
             if c.args[0][0] == "git"
         ]
-        self.assertEqual(kinds, ["rev-parse", "rev-parse", "fetch", "merge", "add", "diff", "commit", "push"])
+        # T-2280: assert the MUTATING pipeline exactly; do NOT pin the number of
+        # read-only probes. `rev-parse` is a probe whose count is an
+        # implementation detail that scales with INPUT — T-2203 stamps the repo
+        # HEAD on each transition-log entry, so N stale tickets now means N
+        # extra probes on top of _abort_stale_rebase's pair (T-1191). Pinning
+        # the exact count coupled this assertion to the fixture size, so adding
+        # a third stale ticket to the fixture would have broken it just as
+        # surely as adding a feature did — and any future read-only probe
+        # breaks it again. What the test actually exists to protect is the
+        # order and completeness of the WRITE pipeline.
+        # T-2360: the read-only set, not a single verb. The comment above
+        # predicted "any future read-only probe breaks it again", and that is
+        # exactly what happened — the transition stamp moved from
+        # `rev-parse --short HEAD` to `merge-base HEAD origin/main`, because
+        # HEAD is rewritten by the pre-push rebase and made 22 of 33 citations
+        # unreachable. Keeping this as a SET so the next read-only probe is a
+        # one-word change rather than a red suite.
+        READ_ONLY_PROBES = {"rev-parse", "merge-base"}
+        probes = [k for k in kinds if k in READ_ONLY_PROBES]
+        mutating = [k for k in kinds if k not in READ_ONLY_PROBES]
+        self.assertEqual(mutating, ["fetch", "merge", "add", "diff", "commit", "push"])
+        self.assertGreaterEqual(
+            len(probes), 2,
+            "the stale-rebase probe (T-1191, rev-parse x2 at pull entry) must still run",
+        )
 
         # Digest send invoked once with a message containing both stale ids.
         mock_send.assert_called_once()
@@ -1777,6 +1864,28 @@ class T0697AcceptanceFalsePositiveRegression(unittest.TestCase):
         body = self._resolved("landed at commit " + self.real_sha + " (init)")
         self.assertIsNone(self._acc(body))
 
+    # --- class: negated-landing mention (T-1709 / T-1737) ---
+    def test_t1709_negated_landing_artifact_not_reopened(self):
+        # A resolution that transparently says an artifact did NOT land must not
+        # be mined as a claim (the T-1709 false-reopen: a referenced source
+        # report that never landed on disk).
+        body = self._resolved(
+            "VERIFIED. Referenced report knowledge/watch/reports/2026-07-13/"
+            "mcp-supply-chain.md hadn't landed on disk yet; ask was self-contained")
+        self.assertIsNone(self._acc(body))
+
+    def test_negated_landing_forms_not_reopened(self):
+        for phrase in ("was never created", "did not land", "wasn't added yet",
+                       "has not shipped"):
+            body = self._resolved(f"note: doc notes/some-report.md {phrase}")
+            self.assertIsNone(self._acc(body), f"reopened on: {phrase}")
+
+    def test_positive_landing_still_flags_missing(self):
+        # The negated-landing guard must NOT suppress a genuine landed-but-missing
+        # claim (real mis-close detection stays live).
+        body = self._resolved("created tools/definitely_missing_xyz.py (new tool)")
+        self.assertIsNotNone(self._acc(body))
+
     # --- class 2: repo-name-prefixed path (T-0667) ---
     def test_t0667_repo_name_prefixed_path_not_reopened(self):
         body = self._resolved("created " + self.root.name + "/README.md")
@@ -1804,6 +1913,59 @@ class T0697AcceptanceFalsePositiveRegression(unittest.TestCase):
         # tools/ exists here, but the line names echo-prismatic -> not ours.
         body = self._resolved(
             "install-hooks.sh landed at tools/install-hooks.sh in echo-prismatic")
+        self.assertIsNone(self._acc(body))
+
+    # --- class 5: extension prefix-truncation (T-2361) ---
+    def test_t2361_tsv_artifact_present_not_truncated_to_ts(self):
+        """T-2361: `.tsv` must not be matched as its `.ts` prefix.
+
+        `_KNOWN_PATH_EXTS` contained `ts` but not `tsv` and the alternation had
+        no trailing boundary, so `data/x.tsv` matched as `data/x.ts` — a path
+        NOBODY claimed. `_artifact_exists` then failed on it and refiled a
+        correctly-done ticket done -> inbox. The module's own header says "when
+        in doubt, DON'T flag"; this path flagged with certainty on a string
+        that appears in no ticket and on no disk.
+        """
+        (self.root / "data").mkdir()
+        (self.root / "data" / "x.tsv").write_text("a\tb\n")
+        body = self._resolved("wrote data/x.tsv (the FP corpus)")
+        self.assertIsNone(self._acc(body))
+
+    def test_t2361_genuinely_missing_tsv_still_flags_the_real_path(self):
+        # tsv is now a KNOWN extension, so a truly absent .tsv artifact must
+        # flag — and must name the FULL path, not a truncated one. This is the
+        # known-positive proving the boundary didn't just stop `.tsv` matching.
+        # data/ must exist or the cross-repo top-dir guard suppresses the
+        # finding before the extension logic is ever exercised.
+        (self.root / "data").mkdir(exist_ok=True)
+        body = self._resolved("wrote data/absent_xyz.tsv (the FP corpus)")
+        self.assertEqual(self._acc(body), ("data/absent_xyz.tsv", "path"))
+
+    def test_t2361_jsonl_artifact_present_not_truncated(self):
+        # Same class via `json` ⊂ `jsonl` — the ledger's own format, so this
+        # prefix pair appears in real resolve notes constantly. The path needs a
+        # slash (the regex requires one) and its top dir must exist (else the
+        # cross-repo guard suppresses the finding VACUOUSLY — measured, not
+        # guessed: a bare `ledgerish.jsonl` was never mined at all).
+        (self.root / "data").mkdir(exist_ok=True)
+        (self.root / "data" / "ledgerish.jsonl").write_text("{}\n")
+        body = self._resolved("created data/ledgerish.jsonl for the corpus")
+        self.assertIsNone(self._acc(body))
+
+    def test_t2361_unlisted_extension_simply_does_not_match(self):
+        # The boundary makes an UNLISTED extension (.sqlite: `sql` is listed and
+        # is a prefix of it) stop matching entirely rather than truncate to a
+        # phantom `.sql` claim. Landing on "don't flag" is the module's stated
+        # side of doubt — silence here is deliberate, not a miss.
+        #
+        # data/ MUST exist in the fixture: without it the cross-repo top-dir
+        # guard suppresses the truncated `data/dashboard.sql` finding anyway and
+        # this test passes VACUOUSLY against the unfixed regex (measured — the
+        # first draft did exactly that). With data/ present, the pre-fix regex
+        # flags the phantom `.sql` path and this test goes red, which is what
+        # makes its green after the fix mean something.
+        (self.root / "data").mkdir(exist_ok=True)
+        body = self._resolved("created data/dashboard.sqlite for run state")
         self.assertIsNone(self._acc(body))
 
     # --- guardrail: a genuine mis-close must still flag ---
@@ -1873,6 +2035,843 @@ class ManifestFreshnessTest(unittest.TestCase):
         self._touch("instance.yaml", 1)
         line = ticket_grooming.check_manifest_freshness(self.root, self.now)
         self.assertIn("repos.yaml MISSING/unreadable", line)
+
+
+# ---------------------------------------------------------------------------
+# T-1814: ratified-but-unbuilt ADR surfacing.
+#
+# Real-corpus fixture strings below are copied VERBATIM (D11 fixture
+# provenance) from:
+#   - echo-prismatic adr/ADR-239 (line 3) and adr/ADR-232 (line 3) — the
+#     "**Status:** **Ratified ...** Proposed (...)" mixed-status-line shape.
+#   - pantheon-config adr/ORG-028-portable-config-topology.md (line 11) —
+#     the "**Status: RATIFIED ...** (trailing prose)" bold-wrapping variant
+#     that motivated the plan amendment (originator re-confirmation, D6).
+#   - tickets/inbox/T-1602.md and tickets/inbox/T-1528.md `labels:` lists —
+#     the real adr-NNN+build join fixtures.
+# ---------------------------------------------------------------------------
+
+_REAL_ADR_239_STATUS_LINE = (
+    "**Status:** **Ratified 2026-07-05 by the operator.** Proposed (drafted "
+    "2026-07-05 by Orchestrator/HO from Specialist research T-1511 + the operator's "
+    "volume-guard lead 2026-07-04, codex bounds encoded). **Date:** "
+    "2026-07-05 **Author:** Orchestrator (HO) **HITL:** **Related:** T-1511 "
+    "(design input), ADR-229 (barge-in loop), ADR-230 (consumer terminal "
+    "ownership), ADR-232 (the AEC fix this composes with), T-1503 (harness "
+    "= acceptance rig), T-1523-1528 build wave"
+)
+
+_REAL_ADR_232_STATUS_LINE = (
+    "**Status:** **Ratified 2026-07-05 by the operator.** Proposed (drafted "
+    "2026-07-04 by Orchestrator/HO from Specialist research T-1508 + codex verdict "
+    "SOUND-WITH-CORRECTIONS + T-1504 bench data + the operator's 2026-07-04 "
+    "volume-sweep). **Date:** 2026-07-04 **Author:** Orchestrator (HO) **HITL:** "
+    "**Related:** T-1373 (arc), T-1508 (design input), T-1504 (bench "
+    "evidence), PR #173 (superseded lever, do-not-merge), ADR-229 "
+    "(barge-in/AEC), knowledge/episodic/2026-07-04-ai-voice-systems-"
+    "landscape/ameliorations.md"
+)
+
+# ORG-028 line 11 (form-b bold-wrapping variant): the whole
+# "Status: RATIFIED ... [[T-0845]]" span is inside ONE bold marker, unlike
+# ADR-239/232's "**Status:**" (label-only bold) + separate "**Ratified...**".
+_REAL_ORG_028_STATUS_LINE = (
+    "**Status: RATIFIED 2026-06-06 by the operator via [[T-0845]]** (the file's "
+    "status line lagged the ratification; corrected 2026-06-06). Drafted "
+    "2026-06-05 by Recovery (`claude-fallback`) per the operator's \"draft it\" "
+    "(Telegram 2026-06-05). Per ORG-015, `adr/` is the ratifiable "
+    "substrate. The 4 deferred open questions are resolved in "
+    "**[[ORG-030]]** (awaiting ratification); irreversible execution stays "
+    "gated per the sequencing note below."
+)
+
+_REAL_T1602_LABELS = ["echo", "barge-in", "adr-239", "build", "interactive-required"]
+_REAL_T1528_LABELS = ["echo", "build", "adr-232", "aec", "windows", "interactive-required"]
+
+# T-2825 fixtures, pulled verbatim (D11) from the live `**Status:**` lines
+# via `grep -n '^\*\*Status:' adr/ORG-065*.md adr/ORG-019*.md` during plan
+# approval.
+_REAL_ORG_065_STATUS_LINE = (
+    "**Status:** Proposed (agent-authored, unratified) — DRAFT awaiting "
+    "the operator's ratification. The operator directed this ADR on 2026-08-08 "
+    "(relayed via the codex mailbox, confirmed directly on Telegram, "
+    "TG7326) at the same time he ratified T-2169 — the prose "
+    "closure-discipline this ADR is the structural version of. "
+    "**HITL: Proposed.** Design-first: this ADR fixes the model and the "
+    "migration shape; it deliberately does **not** commit to tooling "
+    "implementation (that is a build ticket gated on ratification)."
+)
+
+_REAL_ORG_019_STATUS_LINE = (
+    "**Status:** Drafted 2026-05-18 by Orchestrator (Orchestrator). "
+    "**Ratified 2026-05-19T00:58Z by the operator via T-0454 (msg_1575 "
+    "\"ratify ORG-019\").** Replaces the soft-block discipline accreted "
+    "across T-0383, T-0439, T-0440, T-0452. Phase 2-4 execution "
+    "authorized to HO."
+)
+
+
+def _write_adr_file(
+    adr_dir: Path, filename: str, status_line: str, frontmatter: dict | None = None
+) -> Path:
+    """Write a minimal ADR file whose `## `-less body contains `status_line`
+    verbatim (the line the T-1814 status-line regex parses). `frontmatter`,
+    if given, is written as a real `---`-delimited YAML block ahead of the
+    body (T-2806: `build_disposition`/`scoping_ticket` live here, matching
+    the real ORG-069..072 shape)."""
+    adr_dir.mkdir(parents=True, exist_ok=True)
+    path = adr_dir / filename
+    fm_block = ""
+    if frontmatter:
+        fm_lines = ["---"] + [f"{k}: {v}" for k, v in frontmatter.items()] + ["---"]
+        fm_block = "\n".join(fm_lines) + "\n\n"
+    path.write_text(
+        f"{fm_block}# {filename}\n\n{status_line}\n\n## Decision\n\ncontent.\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+class TestRatifiedADRStatusDetection(unittest.TestCase):
+    """T-1814 design point 1: status-line parsing + Ratified/exclusion logic."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.adr_dir = Path(self._tmp.name) / "adr"
+        self.tickets_dir = Path(self._tmp.name) / "tickets"
+        (self.tickets_dir / "inbox").mkdir(parents=True)
+        (self.tickets_dir / "active").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_status_line_ratified_and_proposed_mixed_flags_as_ratified(self) -> None:
+        """Real ADR-239 line carries BOTH 'Ratified' and 'Proposed'; the
+        locked design says Ratified-anywhere-in-line wins."""
+        _write_adr_file(self.adr_dir, "ADR-239 — barge-in.md", _REAL_ADR_239_STATUS_LINE)
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-1602.md",
+            tid="T-1602", state="inbox", labels=_REAL_T1602_LABELS,
+        )
+        flagged, gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(gaps, [])
+        self.assertEqual([f.adr_id for f in flagged], ["ADR-239"])
+
+    def test_status_line_form_b_bold_wrapping_flags_as_ratified(self) -> None:
+        """Amendment test: the ORG-028 'Status: RATIFIED ...**' bold-wrapping
+        variant (whole span in one bold marker) must ALSO flag — this is the
+        format the plan amendment explicitly requires, not a blind spot."""
+        _write_adr_file(self.adr_dir, "ORG-028-topology.md", _REAL_ORG_028_STATUS_LINE)
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9001.md",
+            tid="T-9001", state="inbox", labels=["adr-028", "build"],
+        )
+        flagged, gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(gaps, [])
+        self.assertEqual([f.adr_id for f in flagged], ["ORG-028"])
+
+    def test_exclusion_scoped_to_first_sentence_not_whole_line(self) -> None:
+        """Regression pin: the real ADR-232 status line is genuinely Ratified
+        but its LATER **Related:** metadata mentions an unrelated "PR #173
+        (superseded lever, do-not-merge)" — the word 'superseded' there must
+        NOT false-exclude a ratified ADR (whole-line exclusion scanning was
+        the original bug; fix scopes exclusion to the first sentence)."""
+        self.assertTrue(
+            ticket_grooming._is_ratified_status(
+                _REAL_ADR_232_STATUS_LINE.split("**Status:** ", 1)[1]
+            )
+        )
+
+    def test_superseded_excludes_even_with_ratified_word(self) -> None:
+        status = "**Status:** Superseded 2026-05-29 by [[ORG-025]]. Was Ratified 2026-05-17 originally."
+        _write_adr_file(self.adr_dir, "ORG-023-superseded.md", status)
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9002.md",
+            tid="T-9002", state="inbox", labels=["adr-023", "build"],
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(flagged, [])
+
+    def test_retired_and_rejected_also_exclude(self) -> None:
+        for word, num in (("Retired", "050"), ("Rejected", "051")):
+            with self.subTest(word=word):
+                status = f"**Status:** {word} 2026-05-29. Was Ratified previously."
+                _write_adr_file(self.adr_dir, f"ORG-{num}-x.md", status)
+                _make_ticket_file(
+                    self.tickets_dir / "inbox" / f"T-90{num}.md",
+                    tid=f"T-90{num}", state="inbox", labels=[f"adr-{num}", "build"],
+                )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(flagged, [])
+
+    def test_non_ratified_status_not_flagged(self) -> None:
+        _write_adr_file(self.adr_dir, "ORG-060-draft.md", "**Status:** Proposed, awaiting ratification.")
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9003.md",
+            tid="T-9003", state="inbox", labels=["adr-060", "build"],
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(flagged, [])
+
+    def test_missing_status_line_not_flagged(self) -> None:
+        (self.adr_dir).mkdir(parents=True)
+        (self.adr_dir / "ORG-070-nostatus.md").write_text("# no status field\n\nbody.\n")
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9004.md",
+            tid="T-9004", state="inbox", labels=["adr-070", "build"],
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(flagged, [])
+
+    def test_adr_and_org_prefixed_filenames_both_recognized(self) -> None:
+        _write_adr_file(self.adr_dir, "ADR-101 — echo thing.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        _write_adr_file(self.adr_dir, "ORG-102-pantheon-thing.md", "**Status:** Ratified 2026-01-02 by the operator.")
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9101.md",
+            tid="T-9101", state="inbox", labels=["adr-101", "build"],
+        )
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9102.md",
+            tid="T-9102", state="inbox", labels=["adr-102", "build"],
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(sorted(f.adr_id for f in flagged), ["ADR-101", "ORG-102"])
+
+    def test_org065_real_shape_unratified_not_flagged(self) -> None:
+        """T-2825 regression pin: the real ORG-065 status line's first
+        sentence is genuinely unratified ('unratified ... DRAFT awaiting
+        the operator's ratification') but a LATER clause mentions the operator
+        ratifying an unrelated ticket ('at the same time he ratified
+        T-2169') -- the whole-line Ratified-anywhere-in-line scan must not
+        treat this as ratified. This is the false positive T-2825 fixes."""
+        _write_adr_file(self.adr_dir, "ORG-065-x.md", _REAL_ORG_065_STATUS_LINE)
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(flagged, [])
+
+    def test_org019_real_shape_drafted_then_ratified_stays_flagged(self) -> None:
+        """T-2825 regression-trap guard: ORG-019's real shape is 'Drafted
+        2026-05-18 ... **Ratified 2026-05-19T00:58Z by the operator...**' -- a
+        bare-leading-word ('Drafted') exclusion would misclassify this (and
+        every Drafted-then-Ratified ADR) as unratified, silently hiding a
+        real gap. Must stay flagged here (no build_disposition/scoping_ticket
+        marker in this fixture, so it's a genuine zero-ticket gap)."""
+        _write_adr_file(self.adr_dir, "ORG-019-x.md", _REAL_ORG_019_STATUS_LINE)
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual([f.adr_id for f in flagged], ["ORG-019"])
+
+
+class TestRatifiedADRJoin(unittest.TestCase):
+    """T-1814 design point 2: join against open adr-NNN+build tickets."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.adr_dir = Path(self._tmp.name) / "adr"
+        self.tickets_dir = Path(self._tmp.name) / "tickets"
+        (self.tickets_dir / "inbox").mkdir(parents=True)
+        (self.tickets_dir / "active").mkdir()
+        (self.tickets_dir / "done").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_t1602_adr239_real_shape_flags_open_build_ticket(self) -> None:
+        _write_adr_file(self.adr_dir, "ADR-239 — barge-in.md", _REAL_ADR_239_STATUS_LINE)
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-1602.md",
+            tid="T-1602", state="inbox", labels=_REAL_T1602_LABELS,
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0].adr_id, "ADR-239")
+        self.assertEqual(flagged[0].open_tickets, [("T-1602", "inbox")])
+
+    def test_t1528_adr232_real_shape_flags_open_build_ticket(self) -> None:
+        _write_adr_file(self.adr_dir, "ADR-232 — aec.md", _REAL_ADR_232_STATUS_LINE)
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-1528.md",
+            tid="T-1528", state="inbox", labels=_REAL_T1528_LABELS,
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0].adr_id, "ADR-232")
+        self.assertEqual(flagged[0].open_tickets, [("T-1528", "inbox")])
+
+    def test_near_miss_label_missing_build_counts_as_zero_ticket_gap(self) -> None:
+        """T-2806 amendment: a ticket carrying the adr-NNN label but NOT
+        `build` does not satisfy the join -- so this ratified ADR has ZERO
+        real build tickets and must be flagged as a zero-ticket gap (the
+        ORG-014 class), not silently skipped as the pre-fix behavior did.
+        (Was test_missing_build_label_not_flagged, asserting the opposite --
+        that assertion encoded the exact bug T-2806 fixes.)"""
+        _write_adr_file(self.adr_dir, "ADR-300 — x.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9200.md",
+            tid="T-9200", state="inbox", labels=["adr-300", "echo"],  # no "build"
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0].adr_id, "ADR-300")
+        self.assertEqual(flagged[0].open_tickets, [])
+
+    def test_near_miss_label_missing_adr_id_counts_as_zero_ticket_gap(self) -> None:
+        """Mirror of the above: `build` present but no adr-NNN/org-NNN label
+        -> still zero real build tickets -> flagged as a zero-ticket gap.
+        (Was test_missing_adr_label_not_flagged.)"""
+        _write_adr_file(self.adr_dir, "ADR-301 — x.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9201.md",
+            tid="T-9201", state="inbox", labels=["build", "echo"],  # no "adr-301"
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0].adr_id, "ADR-301")
+        self.assertEqual(flagged[0].open_tickets, [])
+
+    def test_done_state_ticket_not_joined(self) -> None:
+        _write_adr_file(self.adr_dir, "ADR-302 — x.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        _make_ticket_file(
+            self.tickets_dir / "done" / "T-9202.md",
+            tid="T-9202", state="done", labels=["adr-302", "build"],
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(flagged, [])
+
+    def test_mixed_done_and_open_tickets_only_open_ones_displayed(self) -> None:
+        """T-2806: a done-state build ticket counts toward 'already has a
+        ticket' (not a zero-ticket gap) but must not appear in the rendered
+        open_tickets list -- only inbox/active are 'open'."""
+        _write_adr_file(self.adr_dir, "ADR-306 — x.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        _make_ticket_file(
+            self.tickets_dir / "done" / "T-9206.md",
+            tid="T-9206", state="done", labels=["adr-306", "build"],
+        )
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9207.md",
+            tid="T-9207", state="inbox", labels=["adr-306", "build"],
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0].open_tickets, [("T-9207", "inbox")])
+
+    def test_multiple_open_tickets_for_same_adr_all_listed(self) -> None:
+        _write_adr_file(self.adr_dir, "ADR-303 — x.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9203.md",
+            tid="T-9203", state="inbox", labels=["adr-303", "build"],
+        )
+        _make_ticket_file(
+            self.tickets_dir / "active" / "T-9204.md",
+            tid="T-9204", state="active", labels=["adr-303", "build"],
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(
+            sorted(flagged[0].open_tickets), [("T-9203", "inbox"), ("T-9204", "active")]
+        )
+
+    def test_ratified_adr_with_zero_tickets_anywhere_flagged_as_gap(self) -> None:
+        """T-2806 core regression pin: the ORG-014 class. A ratified ADR with
+        NO build ticket at all (not even a stalled one) must be FLAGGED, not
+        silently skipped -- this is the exact bug T-2806 exists to fix.
+        (Was test_ratified_adr_with_no_open_ticket_not_flagged, asserting
+        the opposite -- that was the bug.)"""
+        _write_adr_file(self.adr_dir, "ADR-304 — x.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0].adr_id, "ADR-304")
+        self.assertEqual(flagged[0].open_tickets, [])
+
+
+class TestRatifiedADRDirsCoverage(unittest.TestCase):
+    """T-1814 design point 3: configurable ADR dirs + coverage-gap surfacing."""
+
+    def test_default_adr_dirs_include_repo_and_echo_prismatic(self) -> None:
+        fake_root = Path("/fake/pantheon-config")
+        with patch.object(ticket_grooming, "REPO_ROOT", fake_root):
+            dirs = ticket_grooming._default_adr_dirs()
+        self.assertEqual(
+            dirs,
+            [fake_root / "adr", Path("/home/claude/echo-prismatic/adr")],
+        )
+
+    def test_missing_configured_dir_produces_coverage_gap_line(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_dir = Path(tmp) / "tickets"
+            (tickets_dir / "inbox").mkdir(parents=True)
+            (tickets_dir / "active").mkdir()
+            absent = Path(tmp) / "does-not-exist" / "adr"
+            flagged, gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+                [absent], tickets_dir
+            )
+            self.assertEqual(flagged, [])
+            self.assertEqual(gaps, [str(absent)])
+            section = ticket_grooming._render_ratified_unbuilt_adr_section(flagged, gaps)
+            self.assertIn(f"coverage gap: {absent} absent on this host", section)
+
+    def test_unreadable_configured_dir_produces_coverage_gap_not_crash(self) -> None:
+        """T-1867 regression: Path.exists() re-raises EACCES (pathlib swallows
+        only ENOENT-class), so a configured dir under a non-traversable parent
+        (the live case: /home/claude is 750 and grooming runs as recovery) crashed
+        the whole run. Unreadable must surface as a coverage gap like absent."""
+        if os.geteuid() == 0:
+            self.skipTest("root ignores directory modes; EACCES unreproducible")
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_dir = Path(tmp) / "tickets"
+            (tickets_dir / "inbox").mkdir(parents=True)
+            (tickets_dir / "active").mkdir()
+            locked_parent = Path(tmp) / "locked"
+            unreadable = locked_parent / "adr"
+            unreadable.mkdir(parents=True)
+            locked_parent.chmod(0o000)
+            try:
+                flagged, gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+                    [unreadable], tickets_dir
+                )
+            finally:
+                locked_parent.chmod(0o700)
+            self.assertEqual(flagged, [])
+            self.assertEqual(gaps, [f"{unreadable} (unreadable: Permission denied)"])
+            section = ticket_grooming._render_ratified_unbuilt_adr_section(flagged, gaps)
+            self.assertIn(
+                f"coverage gap: {unreadable} (unreadable: Permission denied) "
+                "unavailable on this host",
+                section,
+            )
+
+    def test_adr_dirs_cli_flag_comma_separated_override(self) -> None:
+        args = ticket_grooming._parse_args(
+            ["--dry-run", "--adr-dirs", "/tmp/a,/tmp/b, /tmp/c"]
+        )
+        self.assertEqual(args.adr_dirs, "/tmp/a,/tmp/b, /tmp/c")
+
+
+class TestRatifiedADRBuildDisposition(unittest.TestCase):
+    """T-2806: `build_disposition` frontmatter marker exempts an ADR from the
+    zero-ticket backstop. `no-build-needed` and `built` both exempt (HO Q1
+    ruling 2026-08-10 -- both mean 'not an open build gap'); absent or
+    `needs-build` does not."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.adr_dir = Path(self._tmp.name) / "adr"
+        self.tickets_dir = Path(self._tmp.name) / "tickets"
+        (self.tickets_dir / "inbox").mkdir(parents=True)
+        (self.tickets_dir / "active").mkdir()
+        (self.tickets_dir / "done").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_no_build_needed_disposition_exempts_zero_ticket_adr(self) -> None:
+        _write_adr_file(
+            self.adr_dir, "ORG-400-policy.md",
+            "**Status:** Ratified 2026-01-01 by the operator.",
+            frontmatter={"id": "ORG-400", "build_disposition": "no-build-needed"},
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(flagged, [])
+
+    def test_built_disposition_exempts_zero_ticket_adr(self) -> None:
+        _write_adr_file(
+            self.adr_dir, "ORG-401-shipped.md",
+            "**Status:** Ratified 2026-01-01 by the operator.",
+            frontmatter={"id": "ORG-401", "build_disposition": "built"},
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(flagged, [])
+
+    def test_needs_build_disposition_still_flags_zero_ticket_adr(self) -> None:
+        _write_adr_file(
+            self.adr_dir, "ORG-402-gap.md",
+            "**Status:** Ratified 2026-01-01 by the operator.",
+            frontmatter={"id": "ORG-402", "build_disposition": "needs-build"},
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual([f.adr_id for f in flagged], ["ORG-402"])
+
+    def test_absent_disposition_defaults_to_flag_candidate(self) -> None:
+        """Absence handling: unmarked (pending backfill) is NOT exempt -- it
+        flags until a human backfills a marker or a build ticket."""
+        _write_adr_file(
+            self.adr_dir, "ORG-403-unmarked.md",
+            "**Status:** Ratified 2026-01-01 by the operator.",
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual([f.adr_id for f in flagged], ["ORG-403"])
+
+    def test_real_org069_frontmatter_shape_parses_and_flags(self) -> None:
+        """D11 fixture provenance: frontmatter keys copied from the real
+        adr/ORG-069-passport-content-tool-authorization.md (read during
+        T-2806 plan approval). Status line is a hypothetical POST-ratification
+        shape (ORG-069 itself is still unratified as of T-2825/T-2826) --
+        unambiguously 'Ratified', no lingering 'awaiting ratification'
+        phrasing. T-2825 note: an earlier draft of this fixture put 'DRAFT
+        awaiting the operator ratification' ahead of the Ratified clause; that
+        shape now correctly excludes under the T-2825 negation-phrase fix
+        (and, separately, tripped a pre-existing first-sentence-split quirk
+        where a period immediately followed by `**` doesn't split, widening
+        "first sentence" to the whole line) -- corrected here since neither
+        was this test's concern, which is frontmatter parsing, not status-line
+        edge cases."""
+        _write_adr_file(
+            self.adr_dir, "ORG-069-passport.md",
+            "**Status:** Ratified 2026-08-10 by the operator.",
+            frontmatter={
+                "id": "ORG-069",
+                "build_disposition": "needs-build",
+                "scoping_ticket": "T-2814",
+            },
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual([f.adr_id for f in flagged], ["ORG-069"])
+
+    def test_open_scoping_ticket_exempts_zero_ticket_adr(self) -> None:
+        """T-2826: an OPEN scoping_ticket (still in inbox/active) honors the
+        same tracked edge `adr_scoping_lint.check_adr_frontmatter` already
+        accepts at creation time -- this exempts the zero-ticket backstop
+        symmetrically, since the creation gate was already satisfied."""
+        _write_adr_file(
+            self.adr_dir, "ORG-410-scoped.md",
+            "**Status:** Ratified 2026-01-01 by the operator.",
+            frontmatter={
+                "id": "ORG-410",
+                "build_disposition": "needs-build",
+                "scoping_ticket": "T-9410",
+            },
+        )
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9410.md",
+            tid="T-9410", state="inbox",
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual(flagged, [])
+
+    def test_done_scoping_ticket_does_not_exempt_reflags_gap(self) -> None:
+        """T-2826: once the scoping ticket resolves WITHOUT having produced a
+        build ticket, the flag must re-arm -- an any-state exemption would
+        permanently mask a scoping ticket that died without filing build
+        work. This is the self-healing property, not a regression."""
+        _write_adr_file(
+            self.adr_dir, "ORG-411-scoped-done.md",
+            "**Status:** Ratified 2026-01-01 by the operator.",
+            frontmatter={
+                "id": "ORG-411",
+                "build_disposition": "needs-build",
+                "scoping_ticket": "T-9411",
+            },
+        )
+        _make_ticket_file(
+            self.tickets_dir / "done" / "T-9411.md",
+            tid="T-9411", state="done",
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual([f.adr_id for f in flagged], ["ORG-411"])
+
+    def test_absent_scoping_ticket_still_flags_needs_build_gap(self) -> None:
+        """Regression guard: needs-build with no scoping_ticket at all must
+        keep flagging (unchanged pre-T-2826 behavior) -- proves the new
+        exemption didn't over-broaden."""
+        _write_adr_file(
+            self.adr_dir, "ORG-412-unscoped.md",
+            "**Status:** Ratified 2026-01-01 by the operator.",
+            frontmatter={"id": "ORG-412", "build_disposition": "needs-build"},
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual([f.adr_id for f in flagged], ["ORG-412"])
+
+    def test_malformed_frontmatter_yaml_does_not_crash_treated_as_absent(self) -> None:
+        """T-2591 regression: malformed YAML frontmatter must not crash the
+        whole grooming run -- treated as absent (flag-candidate), matching
+        _load_yaml's existing warn-not-swallow behavior."""
+        self.adr_dir.mkdir(parents=True)
+        (self.adr_dir / "ORG-404-badyaml.md").write_text(
+            "---\nbuild_disposition: [unterminated\n---\n\n"
+            "**Status:** Ratified 2026-01-01 by the operator.\n",
+            encoding="utf-8",
+        )
+        flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+            [self.adr_dir], self.tickets_dir
+        )
+        self.assertEqual([f.adr_id for f in flagged], ["ORG-404"])
+
+
+class TestRatifiedADRNamespaceConfig(unittest.TestCase):
+    """T-2806 design point 2: adr-namespaces.yaml drives the join-label
+    template per ADR prefix; org-NNN/adr-NNN stay cross-accepted as a
+    migration shim regardless of config (the operator TG 7593)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo_root = Path(self._tmp.name)
+        self.adr_dir = self.repo_root / "adr"
+        self.tickets_dir = self.repo_root / "tickets"
+        (self.tickets_dir / "inbox").mkdir(parents=True)
+        (self.tickets_dir / "active").mkdir()
+        (self.tickets_dir / "done").mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def test_config_driven_label_template_is_used(self) -> None:
+        """Prove config-drivenness (not just the migration shim): override
+        ORG's template to a novel label and confirm a ticket carrying ONLY
+        that novel label (not org-NNN/adr-NNN) satisfies the join."""
+        (self.repo_root / "adr-namespaces.yaml").write_text(
+            "namespaces:\n  ORG:\n    label_template: \"orgz-{num}\"\n"
+            "  ADR:\n    label_template: \"adr-{num}\"\n",
+            encoding="utf-8",
+        )
+        _write_adr_file(self.adr_dir, "ORG-500-x.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9500.md",
+            tid="T-9500", state="inbox", labels=["orgz-500", "build"],
+        )
+        with patch.object(ticket_grooming, "REPO_ROOT", self.repo_root):
+            flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+                [self.adr_dir], self.tickets_dir
+            )
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0].open_tickets, [("T-9500", "inbox")])
+
+    def test_missing_config_falls_back_to_builtin_org_adr_map(self) -> None:
+        _write_adr_file(self.adr_dir, "ORG-501-x.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9501.md",
+            tid="T-9501", state="inbox", labels=["org-501", "build"],
+        )
+        with patch.object(ticket_grooming, "REPO_ROOT", self.repo_root):
+            flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+                [self.adr_dir], self.tickets_dir
+            )
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0].open_tickets, [("T-9501", "inbox")])
+
+    def test_malformed_config_does_not_crash_falls_back(self) -> None:
+        (self.repo_root / "adr-namespaces.yaml").write_text(
+            "namespaces: [unterminated\n", encoding="utf-8",
+        )
+        _write_adr_file(self.adr_dir, "ORG-502-x.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9502.md",
+            tid="T-9502", state="inbox", labels=["org-502", "build"],
+        )
+        with patch.object(ticket_grooming, "REPO_ROOT", self.repo_root):
+            flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+                [self.adr_dir], self.tickets_dir
+            )
+        self.assertEqual(len(flagged), 1)
+
+    def test_org_and_adr_labels_cross_accepted_migration_shim(self) -> None:
+        """An ORG-prefixed ADR's build ticket labeled the OLD adr-NNN way
+        still joins (accept-both migration shim, the operator TG 7593)."""
+        _write_adr_file(self.adr_dir, "ORG-503-x.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        _make_ticket_file(
+            self.tickets_dir / "inbox" / "T-9503.md",
+            tid="T-9503", state="inbox", labels=["adr-503", "build"],
+        )
+        with patch.object(ticket_grooming, "REPO_ROOT", self.repo_root):
+            flagged, _gaps = ticket_grooming.find_ratified_unbuilt_adrs(
+                [self.adr_dir], self.tickets_dir
+            )
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0].open_tickets, [("T-9503", "inbox")])
+
+
+class TestRatifiedADRDigestOutput(unittest.TestCase):
+    """T-1814 design point 4: digest rendering + wiring into build_digest."""
+
+    def test_digest_line_compact_format_includes_id_snippet_tickets(self) -> None:
+        findings = [
+            ticket_grooming.RatifiedUnbuiltADR(
+                adr_id="ADR-239",
+                status_snippet="Ratified 2026-07-05 by the operator.",
+                open_tickets=[("T-1602", "inbox")],
+            )
+        ]
+        section = ticket_grooming._render_ratified_unbuilt_adr_section(findings, [])
+        self.assertIn("ADR-239", section)
+        self.assertIn("Ratified 2026-07-05 by the operator.", section)
+        self.assertIn("T-1602 (inbox)", section)
+
+    def test_section_omitted_when_nothing_flagged_and_no_gaps(self) -> None:
+        section = ticket_grooming._render_ratified_unbuilt_adr_section([], [])
+        self.assertEqual(section, "")
+
+    def test_digest_renders_no_build_ticket_found_for_zero_ticket_gap(self) -> None:
+        """T-2806: the zero-ticket case (open_tickets == []) must render an
+        explicit 'no build ticket at all' message, not a misleading blank
+        'open: ' (which would look like a formatting bug, not a real gap)."""
+        findings = [
+            ticket_grooming.RatifiedUnbuiltADR(
+                adr_id="ORG-014", status_snippet="Ratified 2026-05-17.", open_tickets=[],
+            )
+        ]
+        section = ticket_grooming._render_ratified_unbuilt_adr_section(findings, [])
+        self.assertIn("ORG-014", section)
+        self.assertIn("NO BUILD TICKET FOUND", section)
+
+    def test_form_b_status_line_flags_and_renders_without_error(self) -> None:
+        """Amendment's second required test: the form-b ORG-028-shaped status
+        line must both flag AND render into a compact digest line without
+        raising (stray `**` noise in the captured snippet is acceptable)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            adr_dir = Path(tmp) / "adr"
+            tickets_dir = Path(tmp) / "tickets"
+            (tickets_dir / "inbox").mkdir(parents=True)
+            _write_adr_file(adr_dir, "ORG-028-topology.md", _REAL_ORG_028_STATUS_LINE)
+            _make_ticket_file(
+                tickets_dir / "inbox" / "T-9301.md",
+                tid="T-9301", state="inbox", labels=["adr-028", "build"],
+            )
+            flagged, gaps = ticket_grooming.find_ratified_unbuilt_adrs([adr_dir], tickets_dir)
+            self.assertEqual([f.adr_id for f in flagged], ["ORG-028"])
+            section = ticket_grooming._render_ratified_unbuilt_adr_section(flagged, gaps)
+            self.assertIn("ORG-028", section)
+            self.assertIn("T-9301 (inbox)", section)
+
+    def test_build_digest_includes_ratified_unbuilt_section(self) -> None:
+        findings = [
+            ticket_grooming.RatifiedUnbuiltADR(
+                adr_id="ADR-239",
+                status_snippet="Ratified 2026-07-05 by the operator.",
+                open_tickets=[("T-1602", "inbox")],
+            )
+        ]
+        result = ticket_grooming.build_digest(
+            "2026-07-19 12:00 UTC", [], {"active": 0},
+            ratified_unbuilt_findings=findings,
+        )
+        self.assertIn("ADR-239", result)
+        self.assertIn("T-1602 (inbox)", result)
+
+    def test_build_digest_backward_compatible_without_ratified_unbuilt_kwargs(self) -> None:
+        result = ticket_grooming.build_digest("2026-07-19 12:00 UTC", [], {"active": 0})
+        self.assertNotIn("Ratified ADRs", result)
+
+
+class TestDryRunRatifiedUnbuiltADR(unittest.TestCase):
+    """Integration: --dry-run prints the ratified-but-unbuilt-ADR section."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "active").mkdir()
+        (self.root / "inbox").mkdir()
+        self._tmp_adr = tempfile.TemporaryDirectory()
+        self.adr_dir = Path(self._tmp_adr.name)
+        self._patches = [
+            patch.object(ticket_grooming, "TICKETS_ROOT", self.root),
+            patch.object(
+                ticket_grooming, "_now_utc",
+                return_value=datetime(2026, 7, 19, 12, 0, 0, tzinfo=timezone.utc),
+            ),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self) -> None:
+        for p in self._patches:
+            p.stop()
+        self._tmp.cleanup()
+        self._tmp_adr.cleanup()
+
+    def test_dry_run_prints_ratified_unbuilt_section(self) -> None:
+        _write_adr_file(self.adr_dir, "ADR-239 — barge-in.md", _REAL_ADR_239_STATUS_LINE)
+        _make_ticket_file(
+            self.root / "inbox" / "T-1602.md",
+            tid="T-1602", state="inbox", labels=_REAL_T1602_LABELS,
+        )
+        with patch.object(ticket_grooming, "git_commit_and_push") as mock_git, \
+             patch.object(ticket_grooming, "_send_digest") as mock_send:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = ticket_grooming.main(["--dry-run", "--adr-dirs", str(self.adr_dir)])
+            self.assertEqual(rc, 0)
+            mock_git.assert_not_called()
+            mock_send.assert_not_called()
+        out = buf.getvalue()
+        self.assertIn("ADR-UNBUILT", out)
+        self.assertIn("ADR-239", out)
+        self.assertIn("T-1602", out)
+
+    def test_dry_run_prints_zero_ticket_gap_for_adr_with_no_build_ticket(self) -> None:
+        """T-2806: the --dry-run CLI rendering path (main(), separate code
+        from _render_ratified_unbuilt_adr_section) must also handle the
+        zero-ticket case without printing a misleading blank 'open: '."""
+        _write_adr_file(self.adr_dir, "ORG-405 — gap.md", "**Status:** Ratified 2026-01-01 by the operator.")
+        with patch.object(ticket_grooming, "git_commit_and_push") as mock_git, \
+             patch.object(ticket_grooming, "_send_digest") as mock_send:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = ticket_grooming.main(["--dry-run", "--adr-dirs", str(self.adr_dir)])
+            self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("ADR-UNBUILT", out)
+        self.assertIn("ORG-405", out)
+        self.assertIn("NO BUILD TICKET FOUND", out)
+
+    def test_dry_run_reports_no_ratified_unbuilt_adrs_when_none(self) -> None:
+        with patch.object(ticket_grooming, "git_commit_and_push") as mock_git, \
+             patch.object(ticket_grooming, "_send_digest") as mock_send:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = ticket_grooming.main(["--dry-run", "--adr-dirs", str(self.adr_dir)])
+            self.assertEqual(rc, 0)
+        self.assertIn("no ratified-but-unbuilt ADRs found.", buf.getvalue())
+
+    def test_dry_run_missing_adr_dir_prints_coverage_gap(self) -> None:
+        absent = self.adr_dir / "does-not-exist"
+        with patch.object(ticket_grooming, "git_commit_and_push") as mock_git, \
+             patch.object(ticket_grooming, "_send_digest") as mock_send:
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = ticket_grooming.main(["--dry-run", "--adr-dirs", str(absent)])
+            self.assertEqual(rc, 0)
+        out = buf.getvalue()
+        self.assertIn("COVERAGE-GAP", out)
+        self.assertIn(str(absent), out)
 
 
 if __name__ == "__main__":

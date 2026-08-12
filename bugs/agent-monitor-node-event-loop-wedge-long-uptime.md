@@ -4,6 +4,18 @@ fix: "restart the user-mode systemd unit: `XDG_RUNTIME_DIR=/run/user/$(id -u) sy
 domain: "pantheon, agent-monitor, node, third-party, systemd-user"
 ---
 
+> ⛔ **DORMANT SINCE 2026-08-02 — this bug is not currently reachable, and the Fix below is not a live
+> procedure.** The operator retired the dashboard (TG 6746/6747: *"are we pulling any stats from it? if not,
+> just shut it off"* → *"dormant, leave it around just off"*), closing the TG 6507 fix-vs-retire steer.
+> Both `agent-monitor.service` and `pantheon-agent-monitor-healthcheck.timer` are **stopped and
+> disabled**; port 4820 is closed. Nothing consumed it — there is no `tailscale serve` config any more
+> (so the §Symptom URL below is also stale), and the only repo references were the watchdog's liveness
+> probe and documentation.
+> **Do not run the Fix to "clear a wedge" — nothing is running to wedge.** Kept because it is the
+> reference if the dashboard is ever re-armed (`systemctl --user enable --now agent-monitor.service`,
+> plus the timer if the watchdog is wanted), and because T-2346 reattributed the failure history it
+> feeds. **Delete this block on re-arm.**
+
 ## Symptom
 
 `tailscale serve` config intact (`svc:dashboard` → `dashboard.tail26cadd.ts.net` → `http://127.0.0.1:4820`), but the dashboard is unreachable:
@@ -35,6 +47,10 @@ curl -fsS -o /dev/null -w "HTTP %{http_code} (%{time_total}s)\n" -m 10 http://12
 ```
 
 If the wedge recurs frequently, consider a periodic restart timer or pin the root cause in the upstream code (Claude-Code-Agent-Monitor by Son Nguyen Hoang, `/home/claude/GitHub/Claude-Code-Agent-Monitor`, fork upstream `origin/master`).
+
+## Structural guard (T-1885, 2026-07-27)
+
+A timer-driven watchdog now detects this automatically: `tools/agent_monitor_healthcheck.py`, fired every 2 min by `pantheon-agent-monitor-healthcheck.timer`. On 3 consecutive stalled HTTP probes it logs a confirmed wedge. Auto-restart is SHIP-DARK (`PANTHEON_AGENT_MONITOR_REMEDIATE_ENABLED`, default OFF) pending a supervised first-fire — until armed, the manual restart above remains the only remediation path; the watchdog only detects + logs. Once armed, it self-heals (cooldown-gated, escalates to the operator only if a restart doesn't clear it) and this manual procedure becomes the fallback for between-poll gaps.
 
 ## Discovered
 

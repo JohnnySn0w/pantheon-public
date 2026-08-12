@@ -23,11 +23,14 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 import unittest
+import uuid
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -136,13 +139,112 @@ class TestHoAlreadyRunning(unittest.TestCase):
             mock_run.return_value = MagicMock(returncode=1, stdout="")
             self.assertFalse(_ho_already_running())
             args = mock_run.call_args[0][0]
-            self.assertEqual(args[:2], ["pgrep", "-f"])
-            self.assertIn("--resume", args[2])
+            # T-1956: scoped by uid — pgrep -u <uid> -f <pattern>.
+            self.assertEqual(args[0], "pgrep")
+            self.assertEqual(args[1], "-u")
+            self.assertEqual(args[2], str(os.getuid()))
+            self.assertEqual(args[3], "-f")
+            self.assertIn("--resume", args[4])
 
     def test_running_when_pgrep_returns_pid(self) -> None:
         with patch("subprocess.run") as mock_run:
             mock_run.return_value = MagicMock(returncode=0, stdout="12345\n")
             self.assertTrue(_ho_already_running())
+
+
+# ---------------------------------------------------------------------------
+# _ho_already_running — cross-account false positive (T-1956), live regression
+# ---------------------------------------------------------------------------
+
+
+class TestHoAlreadyRunningCrossAccountRegression(unittest.TestCase):
+    """Live regression against REAL pgrep (no subprocess mock) proving
+    uid-scoping is what fixes the cross-account false positive. Per D11,
+    pgrep's matching semantics are the third-party surface under test here,
+    not something to assume from a mock.
+
+    Fixture note: `sleep 600 --resume <marker>` does NOT work — GNU sleep
+    rejects `--resume` as an unrecognized option and exits before pgrep can
+    ever observe it. `bash -c "sleep 600" claude --resume-fixture-<unique>`
+    ALSO does not work: when a `-c` script is a single simple external
+    command, bash tail-call-execs it in place, replacing its own process
+    image (and its own argv — including our trailing $0/$1 marker tokens)
+    with `sleep`'s. Verified empirically (a standalone probe showed
+    /proc/<pid>/cmdline collapsing to just `sleep 600`). Using a compound
+    script (`sleep 600; :`) forces bash to fork a child for `sleep` and run
+    the builtin `:` after, so bash itself never image-replaces and stays
+    alive with its ORIGINAL argv — marker tokens intact — for the fixture's
+    lifetime, without needing the actual `claude` binary.
+    """
+
+    def setUp(self) -> None:
+        self.marker = f"resume-fixture-{uuid.uuid4().hex}"
+        self.proc = subprocess.Popen(
+            ["bash", "-c", "sleep 600; :", "claude", f"--{self.marker}"],
+            start_new_session=True,
+        )
+        deadline = time.time() + 2
+        while time.time() < deadline:
+            probe = subprocess.run(
+                ["pgrep", "-f", self.marker], capture_output=True, text=True
+            )
+            if probe.stdout.strip():
+                return
+            time.sleep(0.05)
+        os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+        self.proc.wait(timeout=5)
+        self.fail("fixture process never became visible to pgrep")
+
+    def tearDown(self) -> None:
+        try:
+            os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self.proc.wait(timeout=5)
+
+    def test_own_uid_matches_via_real_pgrep(self) -> None:
+        """Positive control: the fixture's real pid must appear among the
+        matches for our OWN uid against the real _PGREP_PATTERN. Assert
+        membership, not exclusivity — this account may legitimately have an
+        unrelated `claude --resume` live at test time, and that is not a
+        false positive to guard against here."""
+        result = subprocess.run(
+            ["pgrep", "-u", str(os.getuid()), "-f", resumer._PGREP_PATTERN],
+            capture_output=True, text=True,
+        )
+        matched_pids = {int(p) for p in result.stdout.split()}
+        self.assertIn(self.proc.pid, matched_pids)
+        self.assertTrue(_ho_already_running())
+
+    def test_foreign_uid_does_not_match_via_real_pgrep(self) -> None:
+        """T-1956 regression: the SAME live argv, queried under a different
+        uid (`nobody` — real, valid, runs no claude processes), must NOT
+        match. This is the cross-account false-positive shape: a sibling
+        account's `claude --resume` has a different uid than the HO
+        account's own, so uid-scoping excludes it.
+
+        `nobody`'s uid is resolved via pwd, not hardcoded — and NOT
+        os.getuid()+1, since account uids on this box are adjacent and +1
+        could be a real sibling agent account legitimately running
+        `claude --resume` at test time (a flaky false failure)."""
+        foreign_uid = pwd.getpwnam("nobody").pw_uid
+
+        # Pin "pgrep accepted the uid and found nothing" (returncode 1) apart
+        # from "pgrep choked on the uid" (returncode 2+) — _ho_already_running
+        # treats any non-zero exit the same way, so a silently-erroring pgrep
+        # would pass a naive negative assertion vacuously.
+        direct = subprocess.run(
+            ["pgrep", "-u", str(foreign_uid), "-f", resumer._PGREP_PATTERN],
+            capture_output=True, text=True,
+        )
+        self.assertIn(
+            direct.returncode, (0, 1),
+            f"pgrep usage error under foreign uid: {direct.stderr!r}",
+        )
+        self.assertEqual(direct.returncode, 1, "must find no match under the foreign uid")
+
+        with patch("tools.ho_resumer.os.getuid", return_value=foreign_uid):
+            self.assertFalse(_ho_already_running())
 
 
 # ---------------------------------------------------------------------------

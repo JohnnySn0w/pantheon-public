@@ -35,7 +35,14 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import tempfile
 from pathlib import Path
+
+# Repo root on sys.path so `from tools.agent_role_map import ...` resolves whether
+# this file is run as a script (handoff_and_restart.sh) or imported top-level as
+# `graveyard` (test_graveyard.py). Standard guard, same as tools/links.py.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 _PANTHEON_STATE_DIR_DEFAULT = ".local/state/pantheon"
 
@@ -51,14 +58,40 @@ def _graveyard_root() -> Path:
 GRAVEYARD_ROOT = _graveyard_root()
 _INDEX_NAME = "index.md"
 
-# Unix-account → agent-name map (mirrors the per-agent config; lets the CLI derive
-# the agent from a /home/<user>/HANDOFF.md path so the restart hook needn't know it).
-_USER_TO_AGENT = {
-    "claude": "orchestrator",
-    "claude-research": "specialist",
-    "claude-fallback": "recovery",
-    "the-ancestor": "ancestor",
-}
+
+class GraveyardDurabilityError(RuntimeError):
+    """Raised when a strict graveyard archive cannot be proven durable."""
+
+# Unix-account → agent-name map: lets the CLI derive the agent from a
+# /home/<user>/HANDOFF.md path so the restart hook needn't know it.
+#
+# DERIVED from instance.yaml (T-2256) — it used to be a hand-carried four that
+# stopped at the pre-ORG-042 accounts, so a handoff dying on exocortex/suborch1/
+# suborch2 resolved to None and `graveyard archive` refused the archive with
+# "cannot resolve agent" rather than mis-filing it. Loud, but still three seats'
+# handoffs never reaching the graveyard.
+#
+# THE ONE OVERRIDE, and it is deliberate: the-ancestor's agent-name here is
+# "ancestor", not the "the-ancestor" persona the registry carries. That string is
+# a DIRECTORY NAME under ~/.local/state/pantheon/graveyard/ with archived
+# snapshots and an index.md already filed under it. Deriving it would re-home
+# future archives to a sibling dir and orphan everything written before this
+# commit, in a tool whose entire job is not losing dying context — a behaviour
+# change smuggled into a refactor. Renaming it is a data-migration ticket, not
+# this one. Kept verbatim, with the reason attached so it reads as a decision.
+_AGENT_NAME_OVERRIDES = {"the-ancestor": "ancestor"}
+
+
+def _build_user_to_agent() -> dict[str, str]:
+    from tools.agent_role_map import account_persona_map
+
+    return {
+        account: _AGENT_NAME_OVERRIDES.get(account, persona)
+        for account, persona in account_persona_map().items()
+    }
+
+
+_USER_TO_AGENT = _build_user_to_agent()
 
 
 def _log(msg: str) -> None:
@@ -79,6 +112,118 @@ def _one_line_summary(handoff_text: str, limit: int = 100) -> str:
             line = " ".join(line.split())  # collapse internal whitespace
             return line[:limit]
     return ""
+
+
+def _fsync_dir(path: Path) -> None:
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        if written == 0:
+            raise OSError("short write")
+        view = view[written:]
+
+
+def _cleanup_file(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
+
+
+def _truncate_file(path: Path, size: int) -> None:
+    fd = os.open(path, os.O_RDWR)
+    try:
+        os.ftruncate(fd, size)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _write_snapshot_required(snap: Path, handoff_text: str) -> Path:
+    fd = -1
+    tmp_path: Path | None = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            dir=snap.parent,
+            prefix=f".{snap.name}.",
+            suffix=".tmp",
+            text=True,
+        )
+        tmp_path = Path(tmp_name)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(handoff_text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, snap)
+        tmp_path = None
+        _fsync_dir(snap.parent)
+        return snap
+    except Exception as exc:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        _cleanup_file(tmp_path)
+        raise GraveyardDurabilityError("snapshot write/fsync/rename failed") from exc
+
+
+def _append_index_required(index: Path, index_line: str) -> None:
+    data = index_line.encode("utf-8")
+    start_size = 0
+    try:
+        start_size = index.stat().st_size
+    except FileNotFoundError:
+        start_size = 0
+    fd = -1
+    try:
+        fd = os.open(index, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o666)
+        _write_all(fd, data)
+        os.fsync(fd)
+    except Exception as exc:
+        if fd != -1:
+            try:
+                os.ftruncate(fd, start_size)
+            except OSError:
+                pass
+        raise GraveyardDurabilityError("index append/fsync failed") from exc
+    finally:
+        if fd != -1:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        _fsync_dir(index.parent)
+    except Exception as exc:
+        try:
+            _truncate_file(index, start_size)
+        except OSError:
+            pass
+        raise GraveyardDurabilityError("index directory fsync failed") from exc
+
+
+def _verify_snapshot_readable(snap: Path, expected_text: str) -> None:
+    try:
+        if snap.read_text(encoding="utf-8") != expected_text:
+            raise GraveyardDurabilityError("snapshot verification mismatch")
+    except GraveyardDurabilityError:
+        raise
+    except Exception as exc:
+        raise GraveyardDurabilityError("snapshot readability verification failed") from exc
 
 
 def detect_session_uuid(projects_dir: "str | os.PathLike | None") -> str:
@@ -131,6 +276,92 @@ def archive(agent: str, handoff_text: str, *, jsonl_uuid: str, reason: str, ts: 
         return None
 
 
+def archive_required(agent: str, handoff_text: str, *, jsonl_uuid: str, reason: str,
+                     ts: str, root: Path | None = None) -> Path:
+    """Strict graveyard archive for controller-mediated runtime transfer.
+
+    Unlike archive(), every durability failure raises GraveyardDurabilityError so
+    the caller can fail closed before starting or submitting to a replacement
+    harness.
+    """
+    base = Path(root) if root is not None else GRAVEYARD_ROOT
+    day = ts[:10]
+    agent_dir = base / agent
+    day_dir = agent_dir / day
+    snap = day_dir / f"{_fs_safe_ts(ts)}-{jsonl_uuid}.md"
+    try:
+        day_dir.mkdir(parents=True, exist_ok=True)
+        snap = _write_snapshot_required(snap, handoff_text)
+        _verify_snapshot_readable(snap, handoff_text)
+
+        summary = _one_line_summary(handoff_text)
+        index_line = f"- {ts} | {reason} | {jsonl_uuid} | {summary}\n"
+        try:
+            _append_index_required(agent_dir / _INDEX_NAME, index_line)
+        except Exception:
+            _cleanup_file(snap)
+            raise
+        return snap
+    except GraveyardDurabilityError:
+        _cleanup_file(snap)
+        raise
+    except Exception as exc:
+        _cleanup_file(snap)
+        raise GraveyardDurabilityError("strict archive failed") from exc
+
+
+# Credential-scrub for pane-log archival (T-1683): an archival sink must never
+# persist plaintext credentials, no matter how careless the upstream scrollback
+# is. Best-effort defense-in-depth — patterns cover the OBVIOUS inline forms
+# (the 2026-07-11 finding was `sshpass -p '<pw>'` in contract-debugging
+# scrollback); it is NOT a guarantee that nothing leaks, so the real fix stays
+# "don't put creds in argv/scrollback". Ordered, applied per line.
+import re as _re  # noqa: E402
+
+# Strip terminal escape/control sequences FIRST (T-1683 follow-up): a raw tmux
+# pane capture interleaves cursor-positioning codes (e.g. `sshpass\x1b[16G-p`),
+# which split credential tokens so a line-based cred regex never matches. It
+# also makes the timestamped side-log far more readable (its whole purpose).
+# Covers CSI (ESC [ … final-byte), OSC (ESC ] … BEL/ST), and stray single-char
+# escapes; plus lone control chars except tab.
+_ANSI_RE = _re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[@-Z\\-_]")
+_CTRL_RE = _re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+_SECRET = r"['\"]?([^'\"\s|]+)['\"]?"
+_CRED_PATTERNS = [
+    # sshpass -p SECRET  /  sshpass -p'SECRET'  /  sshpass --password=SECRET
+    (_re.compile(r"(sshpass\s+(?:-p\s*|--password[= ]))" + _SECRET), r"\1<redacted-cred>"),
+    # echo SECRET | sudo -S   (piping a password to sudo's stdin — the form the
+    # regex-only pass missed on the 2026-07-11 archive)
+    (_re.compile(r"(echo\s+)(\S+)(\s*\|\s*sudo\s+-S)"), r"\1<redacted-cred>\3"),
+    # key=value / key: value for secret-ish keys (bare or quoted). \w* around the
+    # stem catches SENTHOME_PW, DB_PASSWORD, api_key, etc.
+    (_re.compile(r"(?i)(\b\w*(?:password|passwd|pwd|secret|token|api[_-]?key|"
+                 r"access[_-]?key|auth[_-]?token|client[_-]?secret|_pw|_pass)\w*|pw|pass)"
+                 r"(\s*[=:]\s*)" + _SECRET), r"\1\2<redacted-cred>"),
+    # bare `pw <secret>` / `pass <secret>` (space-separated; short stems only,
+    # accepted FP risk on a human side-log)
+    (_re.compile(r"(?i)\b(pw|pass)(\s+)" + _SECRET), r"\1\2<redacted-cred>"),
+    # Authorization: Bearer/Basic <jwt/opaque>
+    (_re.compile(r"(?i)(authorization:\s*(?:bearer|basic)\s+)(\S+)"), r"\1<redacted-cred>"),
+    # Anthropic-style key shapes anywhere (sk-ant-…, sk-…)
+    (_re.compile(r"\bsk-(?:ant-)?[A-Za-z0-9_-]{12,}"), "<redacted-cred>"),
+]
+
+
+def scrub_credentials(text: str) -> str:
+    """Strip terminal escapes then redact obvious inline credential forms
+    (T-1683). Never raises — a scrub error must not lose the archive (the
+    caller falls through to raw copy). ANSI-stripping is deliberate: pane logs
+    are human-forensics side-logs, and the escapes both defeat token matching
+    and hurt readability."""
+    text = _ANSI_RE.sub("", text)
+    text = _CTRL_RE.sub("", text)
+    for pat, repl in _CRED_PATTERNS:
+        text = pat.sub(repl, text)
+    return text
+
+
 def archive_companion(agent: str, source: "str | os.PathLike", *, jsonl_uuid: str,
                       ts: str, suffix: str = "pane.log",
                       root: Path | None = None) -> Path | None:
@@ -168,8 +399,21 @@ def archive_companion(agent: str, source: "str | os.PathLike", *, jsonl_uuid: st
         while dest.exists():  # never overwrite a prior companion (stray retries)
             dest = day_dir / f"{stem}.{n}.gz"
             n += 1
-        with src.open("rb") as fin, gzip.open(dest, "wb") as fout:
-            _shutil.copyfileobj(fin, fout)
+        # T-1683: scrub obvious plaintext credentials line-by-line on the way
+        # into the archive (bounded memory for large logs). If the scrub path
+        # errors for any reason, fall through to a raw byte copy — losing the
+        # log is worse than a possible surviving cred, and a scrub failure
+        # should be rare. Text decode is errors='replace' so a binary/garbled
+        # line can't abort the archive.
+        try:
+            with src.open("r", encoding="utf-8", errors="replace") as fin, \
+                    gzip.open(dest, "wt", encoding="utf-8") as fout:
+                for line in fin:
+                    fout.write(scrub_credentials(line))
+        except Exception as scrub_exc:  # never lose the archive over a scrub fault
+            _log(f"companion scrub path failed for {agent} ({scrub_exc!r}); raw-copy fallback")
+            with src.open("rb") as fin, gzip.open(dest, "wb") as fout:
+                _shutil.copyfileobj(fin, fout)
         try:
             src.unlink()
         except OSError as exc:

@@ -6,6 +6,7 @@ date: 2026-06-25
 author: Orchestrator (Orchestrator)
 ticket: T-1315
 supersedes-partial: ORG-011 P1.c (backed out T-0228) — reopens a NARROWER form with new evidence
+build_disposition: built
 ---
 # ORG-037 — Team-coordination liveness
 

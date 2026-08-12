@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -207,6 +208,113 @@ class LedgerTest(unittest.TestCase):
             with self.assertRaises(ValueError):
                 pl.record_ledger(Path(t) / "l.json", [self._cand()], "bogus")
 
+    # --- T-2827 defect 1: decision timestamps ------------------------------
+
+    def test_filed_at_stamped_on_new_filed_entry(self):
+        with TemporaryDirectory() as t:
+            led = Path(t) / "l.json"
+            c = self._cand(source="a.md")
+            fixed = datetime(2026, 8, 11, 12, 0, 0, tzinfo=timezone.utc)
+            pl.record_ledger(led, [c], "filed", now=fixed)
+            entry = pl.load_ledger(led)[c.fingerprint]
+            self.assertEqual(entry["filed_at"], "2026-08-11T12:00:00Z")
+
+    def test_filed_at_not_stamped_for_non_filed_status(self):
+        """filed_at means 'first recorded as filed' — a record_ledger call
+        under a different status (e.g. a direct 'declined' record, exercised
+        by test_record_does_not_downgrade_existing_status-style callers) must
+        not stamp it, or the field would lie about what happened (P4)."""
+        with TemporaryDirectory() as t:
+            led = Path(t) / "l.json"
+            c = self._cand(source="a.md")
+            fixed = datetime(2026, 8, 11, 12, 0, 0, tzinfo=timezone.utc)
+            pl.record_ledger(led, [c], "declined", now=fixed)
+            entry = pl.load_ledger(led)[c.fingerprint]
+            self.assertNotIn("filed_at", entry)
+
+    def test_decided_at_stamped_on_land_and_decline(self):
+        with TemporaryDirectory() as t:
+            led = Path(t) / "l.json"
+            fixed = datetime(2026, 8, 11, 13, 0, 0, tzinfo=timezone.utc)
+
+            c1 = self._cand(source="a.md")
+            pl.record_ledger(led, [c1], "filed")
+            pl.set_status(led, c1.fingerprint, "landed", now=fixed)
+            entry1 = pl.load_ledger(led)[c1.fingerprint]
+            self.assertEqual(entry1["decided_at"], "2026-08-11T13:00:00Z")
+            self.assertEqual(entry1["status"], "landed")
+
+            c2 = self._cand(source="b.md")
+            pl.record_ledger(led, [c2], "filed")
+            pl.set_status(led, c2.fingerprint, "declined", now=fixed)
+            entry2 = pl.load_ledger(led)[c2.fingerprint]
+            self.assertEqual(entry2["decided_at"], "2026-08-11T13:00:00Z")
+            self.assertEqual(entry2["status"], "declined")
+
+    def test_decided_at_not_bumped_by_redundant_identical_call(self):
+        with TemporaryDirectory() as t:
+            led = Path(t) / "l.json"
+            c = self._cand(source="a.md")
+            pl.record_ledger(led, [c], "filed")
+            first = datetime(2026, 8, 11, 13, 0, 0, tzinfo=timezone.utc)
+            later = datetime(2026, 8, 12, 9, 0, 0, tzinfo=timezone.utc)
+            pl.set_status(led, c.fingerprint, "declined", now=first)
+            pl.set_status(led, c.fingerprint, "declined", now=later)  # no-op re-call
+            entry = pl.load_ledger(led)[c.fingerprint]
+            self.assertEqual(entry["decided_at"], "2026-08-11T13:00:00Z")
+
+    def test_decided_at_not_fabricated_for_legacy_terminal_entry_on_noop_recall(self):
+        """A pre-existing (T-2827-predating) terminal entry has NO decided_at —
+        10 of 18 live ledger entries are exactly this shape. A redundant
+        identical set_status re-call (the module's own documented idempotent
+        no-op — e.g. a recovery double-run) must NOT invent a decision timestamp
+        for a decision that happened at an unknown earlier time (P4:
+        backward-compat means tolerate absence, never fabricate)."""
+        with TemporaryDirectory() as t:
+            led = Path(t) / "l.json"
+            led.write_text(json.dumps({
+                "legacy.md:deadbeef0000": {
+                    "status": "declined", "source": "x", "title": "t",
+                    "check_kind": "pre-commit",
+                    # no filed_at, no decided_at — legacy shape.
+                },
+            }), encoding="utf-8")
+            later = datetime(2026, 8, 12, 9, 0, 0, tzinfo=timezone.utc)
+            pl.set_status(led, "legacy.md:deadbeef0000", "declined", now=later)
+            entry = pl.load_ledger(led)["legacy.md:deadbeef0000"]
+            self.assertNotIn("decided_at", entry)
+            self.assertEqual(entry["status"], "declined")
+
+    def test_decided_at_re_stamps_on_genuine_status_change(self):
+        with TemporaryDirectory() as t:
+            led = Path(t) / "l.json"
+            c = self._cand(source="a.md")
+            pl.record_ledger(led, [c], "filed")
+            first = datetime(2026, 8, 11, 13, 0, 0, tzinfo=timezone.utc)
+            later = datetime(2026, 8, 12, 9, 0, 0, tzinfo=timezone.utc)
+            pl.set_status(led, c.fingerprint, "landed", now=first)
+            pl.set_status(led, c.fingerprint, "declined", now=later)  # a real correction
+            entry = pl.load_ledger(led)[c.fingerprint]
+            self.assertEqual(entry["decided_at"], "2026-08-12T09:00:00Z")
+            self.assertEqual(entry["status"], "declined")
+
+    def test_pre_existing_timestampless_entries_still_load(self):
+        """Entries written before T-2827 lack filed_at/decided_at — the ledger
+        must tolerate absence, never fabricate the missing timestamps (P4)."""
+        with TemporaryDirectory() as t:
+            led = Path(t) / "l.json"
+            led.write_text(json.dumps({
+                "old.md:abcd1234": {
+                    "status": "filed", "source": "x", "title": "t",
+                    "check_kind": "pre-commit",
+                },
+            }), encoding="utf-8")
+            ledger = pl.load_ledger(led)
+            entry = ledger["old.md:abcd1234"]
+            self.assertNotIn("filed_at", entry)
+            self.assertNotIn("decided_at", entry)
+            self.assertEqual(entry["status"], "filed")
+
 
 class FileCandidatesTest(unittest.TestCase):
     """inc 3b: filing candidates to the review surface (no tickets, no git)."""
@@ -338,6 +446,69 @@ class ReviewTest(unittest.TestCase):
     def test_main_decline_requires_ledger(self):
         with self.assertRaises(SystemExit):
             pl.main(["--decline", "feedback_x.md:abc", "--candidates-dir", "/tmp/x"])
+
+    # --- T-2827 defect 2: preserve decided candidates, never delete --------
+
+    def test_review_land_moves_to_decided_not_deletes(self):
+        with TemporaryDirectory() as t:
+            surface, led = Path(t) / "cands", Path(t) / "l.json"
+            c = self._cand()
+            pl.file_candidates([c], surface, led)
+            fpath = pl.find_candidate_file(surface, c.fingerprint)
+            self.assertIsNotNone(fpath)
+            fixed = datetime(2026, 8, 11, 14, 0, 0, tzinfo=timezone.utc)
+            removed = pl.review_candidate(surface, led, c.fingerprint, "land", now=fixed)
+            self.assertTrue(removed)
+            self.assertFalse(fpath.exists())  # gone from the top-level surface
+            decided_path = surface / "decided" / fpath.name
+            self.assertTrue(decided_path.exists())  # NOT deleted — moved
+            text = decided_path.read_text(encoding="utf-8")
+            self.assertIn("status: landed", text)
+            self.assertIn("decided_at: 2026-08-11T14:00:00Z", text)
+            # ledger's decided_at matches the archived file's stamp exactly.
+            self.assertEqual(
+                pl.load_ledger(led)[c.fingerprint]["decided_at"],
+                "2026-08-11T14:00:00Z",
+            )
+
+    def test_review_decline_moves_to_decided_and_preserves_body(self):
+        with TemporaryDirectory() as t:
+            surface, led = Path(t) / "cands", Path(t) / "l.json"
+            c = self._cand()
+            pl.file_candidates([c], surface, led)
+            pl.review_candidate(surface, led, c.fingerprint, "decline")
+            decided_files = list((surface / "decided").glob("*.md"))
+            self.assertEqual(len(decided_files), 1)
+            text = decided_files[0].read_text(encoding="utf-8")
+            self.assertIn("status: declined", text)
+            self.assertIn(c.invariant, text)  # candidate body preserved
+            self.assertIn("bit twice", text)  # rationale preserved
+
+    def test_list_pending_excludes_decided_subdir(self):
+        with TemporaryDirectory() as t:
+            surface, led = Path(t) / "cands", Path(t) / "l.json"
+            c = self._cand()
+            pl.file_candidates([c], surface, led)
+            pl.review_candidate(surface, led, c.fingerprint, "decline")
+            self.assertEqual(pl.list_pending(surface), [])
+            # a re-sweep still must not re-file the declined candidate.
+            self.assertEqual(pl.file_candidates([c], surface, led), [])
+
+    def test_archive_overwrites_idempotently_if_decided_name_pre_exists(self):
+        with TemporaryDirectory() as t:
+            surface, led = Path(t) / "cands", Path(t) / "l.json"
+            c = self._cand()
+            pl.file_candidates([c], surface, led)
+            fpath = pl.find_candidate_file(surface, c.fingerprint)
+            decided_dir = surface / "decided"
+            decided_dir.mkdir(parents=True)
+            (decided_dir / fpath.name).write_text("stale pre-existing content",
+                                                   encoding="utf-8")
+            removed = pl.review_candidate(surface, led, c.fingerprint, "land")
+            self.assertTrue(removed)
+            text = (decided_dir / fpath.name).read_text(encoding="utf-8")
+            self.assertIn("status: landed", text)
+            self.assertNotIn("stale pre-existing content", text)
 
 
 if __name__ == "__main__":

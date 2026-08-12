@@ -1,0 +1,24 @@
+[100m  [97m'label or f"mailbox-consume:{inbox}"' — the default names the INBOX, not the [39m
+  [97mconsumer, so on the surface agents actually use, the actor field says 'the [39m
+  [97mconsumer of mailbox X is mailbox-consume:X'. Anonymous by default, [39m
+  [97midentifiable only for callers who opted in, and ftruncated on release so it [39m
+  [97mis readable only while the drain is still running. Three properties, all [39m
+  [97minverted from what provenance needs. THE ASK IS THE SWEEP PLUS A GUARD: [39m
+  [97mforward the full signature in both handlers, and add whatever structural [39m
+  [97mcheck keeps the adapter from silently narrowing mailbox.py again (a [39m
+  [97msignature-parity test is the obvious shape — this is the THIRD instance of [39m
+  [97mthe same drop in one file, so a one-off fix will not hold)..[39m
+[37m[49m  ⎿  [91mYou've hit your session limit · resets 2:50pm (UTC)[39m
+
+[37m✻[39m [37mSautéed[39m [37mfor[39m [37m6m 46s[39m
+
+[37m[100m❯ [97m/rate-limit-options[39m
+
+[94m[49m────────────────────────────────────────────────────────────────────────────────
+[39m  [1m[94mWhat do you want to do?[0m
+
+  [94m❯[39m [37m1.[39m [94mStop[39m [94mand[39m [94mwait[39m [94mfor[39m [94mlimit[39m [94mto[39m [94mreset[39m
+    [37m2.[39m Upgrade your plan
+
+  [3m[37mEnter[0m [3m[37mto[0m [3m[37mconfirm[0m [3m[37m·[0m [3m[37mEsc[0m [3m[37mto[0m [3m[37mcancel[0m
+

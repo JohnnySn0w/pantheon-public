@@ -1,3 +1,8 @@
+---
+symptom: "A CI-gate poll loop built on 'gh pr checks' emits nothing forever - the 403 Resource not accessible by personal access token is swallowed and looks like checks-still-pending"
+fix: "Gate CI via the Actions API the PAT can read: gh run list --json status,conclusion, poll until completed then check conclusion"
+domain: github, gh-cli, pat, ci, silent-failure
+---
 # `gh pr checks` 403 under the fine-grained PAT → CI-gate watcher hangs silently
 
 **Symptom.** A CI-gate poll loop built on `gh pr checks <n>` (or REST `repos/<o>/<r>/commits/<sha>/check-runs`) emits nothing forever. Both surfaces return 403 `Resource not accessible by personal access token` under the claude-user fine-grained PAT — it lacks Checks read permission. If the loop swallows the error (`|| { sleep; continue; }`), a persistently-failing poll is indistinguishable from "checks still pending": no events, no exit, no merge. Cost >1h on T-1095 / echo PR 125 (2026-06-11) before the activity-monitor poke surfaced it.

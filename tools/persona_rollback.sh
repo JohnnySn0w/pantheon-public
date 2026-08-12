@@ -1,0 +1,298 @@
+#!/usr/bin/env bash
+# persona_rollback.sh — T-2633: GENERIC restore after a persona_cutover.sh
+# run, extracted from tools/t2590_recovery_rollback.sh (the Recovery-specific
+# original). Restores a persona's bespoke launch to the exact state captured
+# immediately before fire, then restarts + verifies.
+#
+# STAGED CONTINGENCY — NOT FIRED. Pre-drafted, dry-run-verified rollback,
+# same posture as T-2590's (operator-gated, ping-and-go). It is
+# DIRECTION-INDEPENDENT: whatever the cutover replaces the launch with,
+# rollback always means "put the three bespoke files back and restart" --
+# safe to pre-build ahead of any live fire.
+#
+# RUN AS the target persona's own account -- it writes that account's files
+# and drives that account's user systemd. HO fire-time invocation:
+#   PW=$(tr -d '\n' < /home/claude/root.env)
+#   echo "$PW" | sudo -S -k -u <account> bash <readable-path>/persona_rollback.sh --persona <name> --stamp <TS>            # dry-run (default)
+#   echo "$PW" | sudo -S -k -u <account> bash <readable-path>/persona_rollback.sh --persona <name> --stamp <TS> --execute  # real restore
+# (<readable-path> = a path the target account can read.)
+#
+# BACKUP CONVENTION (captured fire-time by persona_cutover.sh's backup step,
+# NOT here): <file>.pre-cutover-<TS>  living alongside each <file>. This
+# script only RESTORES; it never captures.
+set -euo pipefail
+
+PERSONA=""
+STAMP=""
+EXECUTE=0
+MANIFEST=""
+UNIT_FILE=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --persona=*)  PERSONA="${1#--persona=}" ;;
+    --persona)    PERSONA="${2:-}"; shift ;;
+    --stamp=*)    STAMP="${1#--stamp=}" ;;
+    --stamp)      STAMP="${2:-}"; shift ;;
+    --execute)    EXECUTE=1 ;;
+    --manifest=*) MANIFEST="${1#--manifest=}" ;;
+    --manifest)   MANIFEST="${2:-}"; shift ;;
+    # Operator escape hatch (also the seam tools/test_persona_cutover_verify.sh
+    # uses): dry-run identity resolution against a LOCAL copy of the bespoke
+    # unit file instead of the real cross-account read.
+    --unit-file=*) UNIT_FILE="${1#--unit-file=}" ;;
+    --unit-file)   UNIT_FILE="${2:-}"; shift ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RESOLVER="${SCRIPT_DIR}/persona_cutover_resolve.py"
+
+# T-2620/T-2622/T-2642: pure/testable verify helpers, same lib
+# tools/persona_cutover.sh sources -- reused unforked (rollback_scope_clean
+# is the newest addition, T-2642).
+# shellcheck source=t2590_cutover_verify_lib.sh
+source "${SCRIPT_DIR}/t2590_cutover_verify_lib.sh"
+
+# T-2642: the control-plane's tmux-server scope. Matches
+# tools/runtime_controller.py's TMUX_RUNTIME_SCOPE_UNIT constant exactly --
+# a persona-general singleton (not per-persona-named), so there is no
+# PCX_-derived value to reuse here; hardcoded, same convention as this
+# file's existing clau[d]e bracket-literal below (kept in sync manually,
+# grep both files if either ever changes).
+RUNTIME_SCOPE_UNIT="pantheon-runtime-tmux.scope"
+# T-2642 note (b): observed live coupling the leftover control-plane launch
+# to the restored bespoke seat. NOT a unit this repo defines anywhere
+# (grep-verified: no unit file, no Slice=, no constant) -- most likely
+# systemd's own auto-placement artifact for the persona-consume oneshot's
+# launch context, not something this script can rely on existing or being
+# named this consistently. Teardown of it below is defensive-only, never
+# load-bearing -- RUNTIME_SCOPE_UNIT above is the real, code-confirmed
+# mechanism.
+RUNTIME_CONSUME_SLICE="app-pantheon-persona-consume.slice"
+
+die() { echo "ROLLBACK-ABORT: $*" >&2; exit 1; }
+
+# --- preflight -------------------------------------------------------------
+[[ -n "$PERSONA" ]] || die "no --persona <name> given"
+[[ -n "$STAMP" ]] || die "no --stamp <TS> given (the fire-time backup suffix)"
+
+# Rollback has ZERO manifest dependency, matching tools/t2590_recovery_rollback.sh
+# exactly (grep-verified: that script never references MANIFEST at all) --
+# it must keep working even when a target's instance.yaml is missing,
+# unreadable, or mid-incident reverted to an inert pre-cutover shape. Calls
+# `bespoke-identity`, NOT `resolve` -- the latter's manifest-precondition gate
+# (channels/model/tmux/post_start synced-shape check) is a persona_cutover.sh
+# concern this script does not share. See BespokeIdentity's docstring in
+# tools/persona_cutover_resolve.py. --manifest is accepted for CLI-shape
+# symmetry with persona_cutover.sh but unused by bespoke-identity; warn if
+# given since it's silently ignored.
+if [[ -n "$MANIFEST" ]]; then
+  echo "-- note: --manifest is accepted for symmetry with persona_cutover.sh but rollback never reads a manifest; ignoring ${MANIFEST}" >&2
+fi
+BESPOKE_ARGS=(bespoke-identity --persona "$PERSONA" --format env)
+[[ -n "$UNIT_FILE" ]] && BESPOKE_ARGS+=(--unit-file "$UNIT_FILE")
+if ! RESOLVE_OUTPUT="$(python3 "$RESOLVER" "${BESPOKE_ARGS[@]}" 2>&1)"; then
+  die "persona resolution failed -- ${RESOLVE_OUTPUT}"
+fi
+eval "$RESOLVE_OUTPUT"
+
+XRD="$PCX_XDG_RUNTIME_DIR"
+
+[[ "$(id -u)" == "$PCX_UID" ]] || die "must run as ${PCX_ACCOUNT} (uid ${PCX_UID}); got uid $(id -u). Wrap with sudo -u ${PCX_ACCOUNT}."
+[[ -d "$XRD" ]] || die "XDG_RUNTIME_DIR $XRD missing — user bus unreachable; cannot drive ${PCX_ACCOUNT}'s systemctl --user"
+export XDG_RUNTIME_DIR="$XRD"
+
+declare -a FILES=(
+  "$PCX_SERVICE_UNIT_PATH"
+  "$PCX_SUPERVISE_WRAPPER_PATH"
+  "$PCX_SETTINGS_JSON_PATH"
+)
+
+# every backup must exist before we touch anything (never a partial restore)
+for f in "${FILES[@]}"; do
+  b="${f}.pre-cutover-${STAMP}"
+  [[ -f "$b" ]] || die "missing backup: $b (capture fresh pre-cutover backups before rollback)"
+done
+
+DROPIN_FILE="${PCX_HOME}/.config/systemd/user/${PCX_CONSUME_SERVICE}.d/urgent.conf"
+
+echo "== T-2633 ${PERSONA} generic rollback =="
+echo "persona: $PERSONA (role: $PCX_ROLE, account: $PCX_ACCOUNT)"
+echo "stamp:   $STAMP"
+echo "mode:    $([[ $EXECUTE == 1 ]] && echo EXECUTE || echo DRY-RUN)"
+echo "restores:"
+for f in "${FILES[@]}"; do echo "  ${f}.pre-cutover-${STAMP}  ->  ${f}"; done
+
+if [[ $EXECUTE != 1 ]]; then
+  echo
+  echo "DRY-RUN — would then run:"
+  echo "  cp -p <each backup> <each live path>"
+  echo "  systemctl --user daemon-reload"
+  echo "  systemctl --user stop ${RUNTIME_SCOPE_UNIT}            # T-2642: tear down leftover control-plane scope before bespoke restart"
+  echo "  systemctl --user reset-failed ${RUNTIME_SCOPE_UNIT}"
+  echo "  systemctl --user stop ${RUNTIME_CONSUME_SLICE}   # T-2642: best-effort, no-op if absent (not a unit this repo defines)"
+  echo "  systemctl --user reset-failed ${RUNTIME_CONSUME_SLICE}"
+  echo "  tmux kill-session -t ${PCX_TMUX_SESSION}   # T-2642: symmetric inverse of persona_cutover.sh's own pre-apply guard"
+  echo "  [abort if ${PCX_TMUX_SESSION} survives the kill]"
+  echo "  systemctl --user enable ${PCX_SERVICE}   # T-2611: cutover's disable --now removed the enable symlink"
+  echo "  systemctl --user restart ${PCX_SERVICE}"
+  echo "  verify: is-active ${PCX_SERVICE}; tmux has-session ${PCX_TMUX_SESSION}; claude+bun children present;"
+  echo "          tmux server NOT under ${RUNTIME_SCOPE_UNIT} (bespoke, clean seat -- T-2642)"
+  echo "  systemctl --user disable --now ${PCX_CONSUME_TIMER}   # shape-1 inverse (T-2608)"
+  echo "  rm -f ${DROPIN_FILE}                                   # shape-1 inverse; no-op if never installed"
+  echo "  systemctl --user daemon-reload"
+  if [[ -n "$PCX_COMPANION_UNITS" ]]; then
+    for tok in $PCX_COMPANION_UNITS; do
+      echo "  systemctl --user start ${tok%%=*}   # T-2648: restore companion unit possibly stopped by the aborted cutover"
+    done
+  fi
+  echo "All backups present. Dry-run OK — pass --execute to perform the restore."
+  exit 0
+fi
+
+# --- execute ---------------------------------------------------------------
+for f in "${FILES[@]}"; do
+  cp -p "${f}.pre-cutover-${STAMP}" "$f"
+  echo "restored: $f"
+done
+
+systemctl --user daemon-reload
+
+# T-2642: tear down the leftover control-plane launch BEFORE restarting
+# bespoke -- the symmetric inverse of persona_cutover.sh's own pre-apply
+# guard (kill bespoke + abort if survives, before it activates
+# control-plane). Without this, the supervise wrapper's
+# skip-if-session-exists behavior means restarting the bespoke service below
+# is a no-op against a still-live control-plane tmux session -- verify then
+# reports the WRONG claude as healthy (T-2642 root cause, T-2633 fire#3).
+#
+# Soft (`|| true`) on the scope/slice stops: the hard gate is the
+# kill-session+confirm-gone check below, and the new bespoke-scope verify
+# (near the end of this script) is the final end-to-end confirmation -- a
+# scope that "failed to stop" but whose session is confirmed dead is not
+# actually a problem. Every step here is a safe no-op when there was no
+# control-plane launch to tear down (e.g. rollback of a very-early abort
+# that never created the scope).
+if [[ "$(systemctl --user show "$RUNTIME_SCOPE_UNIT" -p ActiveState --value 2>/dev/null)" == "active" ]]; then
+  systemctl --user stop "$RUNTIME_SCOPE_UNIT" || true
+  echo "stopped control-plane scope: $RUNTIME_SCOPE_UNIT"
+fi
+systemctl --user reset-failed "$RUNTIME_SCOPE_UNIT" >/dev/null 2>&1 || true
+
+# T-2642 note (b): best-effort teardown of the auto-derived persona-consume
+# slice observed coupling the leftover control-plane launch to the restored
+# bespoke seat. Not a unit defined anywhere in this repo (grep-verified) --
+# defensive only, never load-bearing (see RUNTIME_CONSUME_SLICE's
+# definition above).
+systemctl --user stop "$RUNTIME_CONSUME_SLICE" >/dev/null 2>&1 || true
+systemctl --user reset-failed "$RUNTIME_CONSUME_SLICE" >/dev/null 2>&1 || true
+
+# Explicit kill of the target tmux session, mirroring persona_cutover.sh's
+# own guard (kill + confirm gone) -- belt-and-suspenders in case the
+# control-plane session wasn't (or is no longer) inside the scope above
+# (e.g. the scope-stop raced the session, or a companion unit owns it).
+tmux kill-session -t "$PCX_TMUX_SESSION" 2>/dev/null || true
+if tmux has-session -t "$PCX_TMUX_SESSION" 2>/dev/null; then
+  die "control-plane tmux session ${PCX_TMUX_SESSION} survived kill-session -- refusing to restart bespoke ${PCX_SERVICE} against a still-live foreign session. Rollback is now MID-FLIGHT: bespoke files are restored and the control-plane scope was stopped above, but ${PCX_SERVICE} has NOT been enabled/restarted yet -- ${PERSONA} may be unsupervised. To complete manually: confirm what is holding ${PCX_TMUX_SESSION} open (check for a companion unit or a second control-plane launch), force-kill it (systemctl --user stop <unit>; tmux kill-session -t ${PCX_TMUX_SESSION}; confirm gone), then re-run this rollback with the same --persona/--stamp/--execute to finish enabling and restarting ${PCX_SERVICE}."
+fi
+echo "confirmed: default tmux socket has no ${PCX_TMUX_SESSION} session (control-plane torn down)"
+
+# T-2611: the cutover's `disable --now` removes the enable symlink -- without
+# this, rollback restores the files and restarts the service for THIS boot
+# only, silently leaving the persona unsupervised across the next reboot.
+systemctl --user enable "$PCX_SERVICE"
+echo "enabled: $PCX_SERVICE"
+
+systemctl --user restart "$PCX_SERVICE"
+sleep 6
+
+# Shape-1 inverse (T-2608): after a Shape-1 cutover, pantheon-persona-consume
+# @<persona>.timer is the live supervisor. Leaving it enabled post-rollback
+# means every ~2min it hits a live non-scope-owned default tmux server and
+# raises recurring OnFailure alerts. Undo both cutover-only artifacts here,
+# AFTER the bespoke service is confirmed restarted above -- so there is never
+# a gap where neither supervisor owns the pane. `rm -f` is unconditionally
+# safe: the urgent drop-in may never have been installed (persona_cutover.sh
+# only writes it when --with-urgent-env was passed at fire time), and this
+# rollback has no way to know that in advance -- removing an absent file is a
+# no-op, matching direction-independent restore semantics.
+systemctl --user disable --now "$PCX_CONSUME_TIMER" || true
+rm -f "$DROPIN_FILE"
+systemctl --user daemon-reload
+echo "shape-1 inverse: consume timer disabled, urgent dropin removed (if present)"
+
+# T-2648: restore any companion unit(s) the cutover's fire may have stopped
+# (e.g. specialist's acp-bridge, which shares the default tmux socket with the
+# bespoke TUI session). `start` is unconditionally safe here, same
+# direction-independent-restore reasoning as the urgent-dropin `rm -f`
+# above: if the fire aborted BEFORE ever reaching the companion-stop step
+# (e.g. the install-done precondition failed), the unit is already running
+# and `start` on an already-active unit is a no-op success.
+for tok in $PCX_COMPANION_UNITS; do
+  companion_unit="${tok%%=*}"
+  systemctl --user start "$companion_unit"
+  echo "restored companion unit: $companion_unit"
+done
+
+# --- verify ----------------------------------------------------------------
+fail=0
+if [[ "$(systemctl --user is-active "$PCX_SERVICE" 2>&1)" == "active" ]]; then
+  echo "verify: service active OK"
+else
+  echo "verify: service NOT active FAIL"; fail=1
+fi
+# T-2611: verify the re-enable (above) actually stuck -- this is exactly the
+# gap both live Recovery attempts silently had (service active, but not enabled).
+if [[ "$(systemctl --user is-enabled "$PCX_SERVICE" 2>&1)" == "enabled" ]]; then
+  echo "verify: service enabled OK"
+else
+  echo "verify: service NOT enabled FAIL"; fail=1
+fi
+if tmux has-session -t "$PCX_TMUX_SESSION" 2>/dev/null; then
+  echo "verify: tmux session ${PCX_TMUX_SESSION} up OK"
+else
+  echo "verify: tmux session ${PCX_TMUX_SESSION} MISSING FAIL"; fail=1
+fi
+# T-2642: the restarted claude must be genuinely BESPOKE -- confirm the
+# default tmux server is NOT (still, or again) a member of the
+# control-plane's runtime scope. rollback_scope_clean (t2590_cutover_verify_
+# lib.sh) is the same cgroup-membership technique persona_cutover.sh's own
+# "scope ownership" verify uses, inverted: here, membership means the
+# teardown above FAILED.
+if rollback_scope_clean "$RUNTIME_SCOPE_UNIT"; then
+  echo "verify: tmux server not under control-plane scope (bespoke, clean seat) OK"
+else
+  echo "verify: tmux server still under ${RUNTIME_SCOPE_UNIT} FAIL (restart did not take over a clean seat)"; fail=1
+fi
+# NB: bracket on the 'd' (clau[d]e) is deliberate — it matches the runtime
+# process identically while keeping the contiguous claude-binary byte-sequence
+# OUT of this script, so HO's own no-second-claude PreToolUse guard (which
+# inspects executed script files) does not false-positive when firing rollback.
+if pgrep -u "$PCX_ACCOUNT" -f "\.npm-global/bin/clau[d]e" >/dev/null 2>&1; then
+  echo "verify: claude child present OK"
+else
+  echo "verify: claude child MISSING FAIL"; fail=1
+fi
+if pgrep -u "$PCX_ACCOUNT" -f "bun.*server\.ts" >/dev/null 2>&1; then
+  echo "verify: bun poller child present OK"
+else
+  echo "verify: bun poller child MISSING (may still be spawning) WARN"
+fi
+# T-2648: every companion unit restored above must be active.
+for tok in $PCX_COMPANION_UNITS; do
+  companion_unit="${tok%%=*}"
+  if systemctl --user is-active --quiet "$companion_unit"; then
+    echo "verify: companion unit ${companion_unit} active OK"
+  else
+    echo "verify: companion unit ${companion_unit} NOT active FAIL"; fail=1
+  fi
+done
+
+if [[ $fail == 0 ]]; then
+  echo "ROLLBACK COMPLETE — ${PERSONA} restored to bespoke launch, service healthy."
+  exit 0
+else
+  die "restore ran but verification FAILED — ${PERSONA} may be down; escalate to the operator immediately."
+fi

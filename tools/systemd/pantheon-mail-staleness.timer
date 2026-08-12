@@ -1,0 +1,23 @@
+[Unit]
+Description=Pantheon mail-staleness detector — every 5 min, matching SAMPLE_INTERVAL_SECONDS (T-2200)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-2200.md
+
+[Timer]
+# 5min is NOT a free parameter. mail_staleness_monitor.py counts SAMPLES, not
+# elapsed time: WARN_SAMPLES=3 and COARSE_SAMPLES=12 mean 15min and 60min ONLY
+# while the fire interval equals SAMPLE_INTERVAL_SECONDS=300. Change one and both
+# thresholds silently become something else — the alert text would still say
+# "15 min" while meaning whatever the new cadence multiplies out to.
+# If this ever needs to change, change SAMPLE_INTERVAL_SECONDS in lockstep.
+OnUnitActiveSec=5min
+OnBootSec=3min
+OnActiveSec=1min
+
+# Deliberately NOT Persistent=true, unlike the mirror-verify timer. A missed
+# window here is a GAP IN A SAMPLE SEQUENCE, not a missed job: replaying one on
+# boot would advance the consecutive-sample counters using a sample taken at the
+# wrong time, which is worse than the gap. The sequence should simply resume.
+Unit=pantheon-mail-staleness.service
+
+[Install]
+WantedBy=timers.target

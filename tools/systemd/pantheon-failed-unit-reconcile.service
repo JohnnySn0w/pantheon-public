@@ -1,0 +1,32 @@
+# Daily reconciliation of every seat's LATCHED failed units against the unit-failure
+# alerts Recovery actually received (T-2362, from T-2358's decision).
+#
+# ⚠️ THIS IS THE INDEPENDENT-SURFACE HALF and its independence is the whole point.
+# pantheon-unit-failure-alert@ shares a failure domain with the units it reports on
+# — same host, filesystem, interpreter, hub — so it is down in exactly the
+# correlated outage it exists to report (measured: 9 alerts lost on 2026-07-28,
+# every unit on that seat timing out at ~60s). This unit runs on RECOVERY's account and
+# asks each seat directly, so a stall on the reporting seat cannot silence it.
+#
+# It works after the fact because systemd LATCHES the failed state: the latch
+# outlives the outage that suppressed the alert. That is also why this unit must
+# never reset-failed — clearing the latch destroys the only remaining evidence.
+#
+# Read-only. Reports; changes nothing; touches no peer's state.
+[Unit]
+Description=Pantheon failed-unit reconcile — find failures whose alert never arrived
+Documentation=file:///home/%u/pantheon-config/tools/failed_unit_reconcile.py
+
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/failed_unit_reconcile.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=default.target

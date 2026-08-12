@@ -19,6 +19,7 @@ status: Drafted 2026-06-09 by T-1031 (implementer, dispatched by Orchestrator / 
 
 Do NOT use for:
 - Adding a new **Claude Code agent** — use `adding-restart-capability-to-a-new-agent.md` directly.
+- Migrating an **existing claude persona** off its bespoke telegram-bot supervisor onto the control plane (there is something to migrate FROM, not a fresh bringup) — use `migrating-an-existing-persona-onto-the-control-plane.md` (generic tool `tools/persona_cutover.sh`).
 - One-off manual invocations or headless `exec` calls — those are not daemons.
 - Recovering a wedged daemon — see `handoff-restart-runbook.md` + `../remediation/recovery-service-recovery.md`.
 

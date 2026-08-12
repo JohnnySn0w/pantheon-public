@@ -37,10 +37,29 @@ set -uo pipefail
 # (VERIFY_PATTERN/IDLE_SENTINEL/DIALOG_EXCLUDE :57-59, BOOT_DIALOG_SENTINEL :66,
 # BOOT_DISMISS_DENYLIST :72). test_verify_startup.sh asserts equality to catch
 # drift. (Follow-up: extract to a shared lib both source — T-0728 design note.)
-VERIFY_PATTERN='(╭─+╮|─{20,})'
+# Grouped quantifiers are load-bearing, not style — see the long note on the same
+# constant in handoff_and_restart.sh. A bare `─+`/`─{20,}` binds the quantifier to
+# the last BYTE of a 3-byte character, so under a non-UTF-8 locale this pattern can
+# never match a real frame. That matters here specifically because this script runs
+# from the SessionStart hook, where the environment is whatever systemd hands us.
+# Byte-identical to handoff_and_restart.sh's constant by design; change both together.
+VERIFY_PATTERN='(╭(─)+╮|(─){20,})'
 IDLE_SENTINEL='❯'
 DIALOG_EXCLUDE='Enter to confirm|Esc to cancel'
 BOOT_DIALOG_SENTINEL='I am using this for local development'
+# T-2210: a SECOND boot modal exists (Claude Code v2.1.220) — 'Try the new
+# fullscreen renderer?' with options '1. Yes, try it' / '2. Not now'. It wedged
+# exocortex/mnemosyne after the operator's droplet restart on 2026-07-28.
+#
+# ⚠️ IT IS DISMISSED WITH 2, NOT 1, AND THAT IS THE WHOLE REASON IT IS A SEPARATE
+# CONSTANT. For the dev-channels dialog option 1 is the benign acknowledgement.
+# For this one option 1 is "Yes, try it" — accepting a RENDERER CHANGE on a peer's
+# live session, which nobody asked for and which this fleet's recovery tooling
+# reads the pane of (a renderer swap has already caused one false 'recovery
+# tooling is broken' alarm here). Declining is the only safe automatic answer: a
+# de-wedger exists to restore comms, not to opt a peer into a UI change. That is
+# what I did by hand on 2026-07-28 and it is now encoded.
+BOOT_RENDERER_SENTINEL='Try the new fullscreen renderer'
 BOOT_DISMISS_DENYLIST='Do you want to (proceed|make this edit|overwrite|create|delete)|Bypass Permissions|Managed settings|don.?t ask again|Tab to amend|Exit plan mode|Ready to code|Use skill'
 # Liveness tokens (T-0716 _bottom_region_shows_live_input): if the live bottom
 # region shows these and no dialog footer, the loop is working/idle and a
@@ -50,10 +69,31 @@ BOTTOM_REGION_LINES=6
 
 # --- per-agent facts (single explicit source; mirrors _AGENT_HEALTH_CONFIG +
 # DRAIN_AGENT_CONFIG). NO silent auto-detect beyond the $USER->agent table. ---
-declare -A AGENT_USER=( [recovery]=claude-fallback [orchestrator]=claude [specialist]=claude-research )
-declare -A AGENT_PANE=( [recovery]=claude-telegram-bot-fallback:0 [orchestrator]=claude-telegram-bot:0 [specialist]=claude-research-bot:0 )
-declare -A AGENT_SERVICE=( [recovery]=claude-telegram-fallback.service [orchestrator]=claude-telegram.service [specialist]=claude-telegram-research.service )
-declare -A AGENT_HOME=( [recovery]=/home/claude-fallback [orchestrator]=/home/claude [specialist]=/home/claude-research )
+# T-2210: was recovery|orchestrator|specialist only, so the canonical de-wedger could not target
+# four of the seven seats — including the one that was actually wedged after the
+# 2026-07-28 droplet restart, which had to be cleared by hand. Values taken from
+# mailbox_wake.AGENT_PANE (the fullest existing source) rather than re-derived,
+# and the services MEASURED per account rather than assumed.
+declare -A AGENT_USER=( [recovery]=claude-fallback [orchestrator]=claude [specialist]=claude-research \
+                        [mnemosyne]=exocortex [metis]=suborch1 [atlas]=suborch2 [codex]=codex )
+declare -A AGENT_PANE=( [recovery]=claude-telegram-bot-fallback:0 [orchestrator]=claude-telegram-bot:0 [specialist]=claude-research-bot:0 \
+                        [mnemosyne]=claude-telegram-bot-exocortex:0 [metis]=suborch1-main:0 [atlas]=suborch2-main:0 [codex]=codex-session )
+# ⚠️ metis and atlas have NO session-owning unit — measured: their tmux sessions
+# are created directly, and `systemctl --user list-units` shows only per-task
+# units (inbox-consumer@, keep-going@), nothing that owns the session. The entry
+# is deliberately EMPTY and service_check SKIPS with a stated reason. Inventing a
+# plausible name here would produce a permanent "not active (got 'unknown')"
+# warning about a unit that was never supposed to exist.
+declare -A AGENT_SERVICE=( [recovery]=claude-telegram-fallback.service [orchestrator]=claude-telegram.service [specialist]=claude-telegram-research.service \
+                           [mnemosyne]=claude-telegram-exocortex.service [metis]= [atlas]= [codex]=codex-daemon.service )
+declare -A AGENT_HOME=( [recovery]=/home/claude-fallback [orchestrator]=/home/claude [specialist]=/home/claude-research \
+                        [mnemosyne]=/home/exocortex [metis]=/home/suborch1 [atlas]=/home/suborch2 [codex]=/home/codex )
+# ⚠️ HARNESS. Every pane sentinel in this file — the idle '❯', the boot dialogs,
+# the liveness tokens — describes CLAUDE CODE's TUI. codex runs a different
+# harness with a different screen, so matching those patterns against its pane is
+# meaningless and DISMISSING against it would be pressing unknown keys into a live
+# session. It is listed so it can be named and identified; the de-wedge refuses.
+declare -A AGENT_HARNESS=( [codex]=codex )
 
 AGENT=""
 SELF_MODE="auto"     # auto: decide from whether --agent's user == current user
@@ -62,6 +102,10 @@ PANE_OVERRIDE=""
 CAPTURE_TIMEOUT=15
 JSON=0
 AT_BOOT=0            # --at-boot: SessionStart-hook mode (T-1099)
+# Test seam only: production reads the real procfs. The smoke suite points this
+# at a synthetic process tree so PRESENT / ABSENT / UNKNOWN do not inherit the
+# process state of whichever account happens to run the suite (T-2322).
+PROC_ROOT="${PANTHEON_VERIFY_PROC_ROOT:-/proc}"
 
 usage() { sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit "${1:-0}"; }
 
@@ -135,6 +179,113 @@ pane_is_idle() {
     && ! printf '%s' "$pane" | grep -Eq "$DIALOG_EXCLUDE"
 }
 
+# --- T-2345: an idle pane is NOT a reachable agent. ---
+#
+# MEASURED 2026-07-28 recovering mnemosyne: a session blocked on a boot modal never
+# initialises the telegram plugin, AND THE PLUGIN DOES NOT RETRY once the modal
+# clears. After the dialog was dismissed the pane went idle and looked perfectly
+# healthy — with no `bun ... telegram/<ver> start` child and no `bun server.ts`
+# grandchild. Still comms-dark, behind a prompt every pane-based check reads as fine.
+# Only a full session cycle respawned them.
+#
+# So the de-wedge's own success condition was the false green: it proved the pane
+# recovered, which is the visible surface, and said nothing about the poller child,
+# which is what makes the agent contactable. Presence-vs-activation again.
+#
+# ⚠️ THE PROCESS TREE IS THE EVIDENCE, NEVER bot.pid. During that incident bot.pid
+# was stale from Jul 20 — eight days wrong, unnoticed — and the alert that surfaced
+# the problem cited that stale pid as its proof, which is why the whole thing first
+# read as a pre-reboot artifact. A pid file is a proxy; the running process is the fact.
+#
+# Tri-state on purpose (T-2307 rule): "could not ask" is not "absent". ABSENT is
+# actionable and fails the check; UNKNOWN must not claim health and must not cry wolf.
+POLLER_PRESENT="PRESENT"; POLLER_ABSENT="ABSENT"; POLLER_UNKNOWN="UNKNOWN"
+POLLER_NA="NOT_APPLICABLE"   # seat has no telegram plugin by design (metis/atlas)
+
+poller_child_state() {
+  # Seats with no telegram plugin have no poller BY DESIGN — metis and atlas launch
+  # bare (verified: runner=0 server=0 on both, against runner=1 server=1 on orchestrator,
+  # specialist and mnemosyne). Reporting them ABSENT would be a permanent false alarm on
+  # a correct configuration, which is how a check gets muted. The telegram seats are
+  # exactly the ones with a telegram session unit; codex never reaches here (the
+  # harness guard refuses before the de-wedge).
+  if [[ -z "${AGENT_SERVICE[$AGENT]:-}" ]]; then echo "$POLLER_NA"; return; fi
+  # Both halves must be present: the plugin runner and its bun server child. The
+  # 2026-07-28 case had NEITHER, but a half-started pair is equally not-reachable.
+  #
+  # Post-close T-2345 follow-up: do NOT rediscover these children with
+  # `pgrep -f`. Even uid-scoped,
+  # that asks whether argv text exists anywhere on the account, not whether the
+  # target pane owns the poller. Ground the probe at tmux's kernel-backed pane_pid,
+  # walk only that pid's kernel PPID tree (`pgrep -P`, not argv matching), then
+  # identify each role by the account's ABSOLUTE Bun executable plus its exact
+  # argv/cwd shape. This also
+  # preserves T-2345's defining rule: the live process tree is evidence; bot.pid
+  # is not (it was eight days stale in the founding incident).
+  local probe='pane=$1; home=$2; proc=$3
+    root=$(tmux display-message -p -t "$pane" "#{pane_pid}" 2>/dev/null) || exit 2
+    [[ "$root" =~ ^[0-9]+$ && -r "$proc/$root/status" ]] || exit 2
+    bun="$home/.bun/bin/bun"
+    plugin="$home/.claude/plugins/cache/claude-plugins-official/telegram/"
+    queue=("$root"); seen=0; runner=0; server=0
+    while (( ${#queue[@]} )); do
+      parent=${queue[0]}; queue=("${queue[@]:1}")
+      children=$(pgrep -P "$parent" 2>/dev/null || true)
+      for pid in $children; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        queue+=("$pid"); seen=$((seen + 1)); (( seen <= 256 )) || exit 2
+        exe=$(readlink "$proc/$pid/exe" 2>/dev/null) || continue
+        [[ "$exe" == "$bun" ]] || continue
+        cwd=$(readlink "$proc/$pid/cwd" 2>/dev/null) || continue
+        argv=()
+        while IFS= read -r -d "" arg; do argv+=("$arg"); done < "$proc/$pid/cmdline"
+        if (( ${#argv[@]} >= 5 )) && [[ "${argv[1]}" == run && "${argv[2]}" == --cwd \
+             && "${argv[3]}" == "$plugin"* && -n "${argv[3]#"$plugin"}" \
+             && "${argv[3]#"$plugin"}" != */* \
+             && "$cwd" == "${argv[3]}" ]]; then
+          for arg in "${argv[@]:4}"; do [[ "$arg" == start ]] && runner=1; done
+        fi
+        if (( ${#argv[@]} == 2 )) && [[ "${argv[1]}" == server.ts \
+             && "$cwd" == "$plugin"* && -n "${cwd#"$plugin"}" \
+             && "${cwd#"$plugin"}" != */* ]]; then
+          server=1
+        fi
+      done
+    done
+    echo "$runner $server"'
+  local out
+  if [[ "$SELF_MODE" == "1" ]]; then
+    out="$(timeout 8 bash -c "$probe" _ "$PANE_TARGET" "${AGENT_HOME[$AGENT]}" "$PROC_ROOT" 2>/dev/null)" \
+      || { echo "$POLLER_UNKNOWN"; return; }
+  else
+    out="$(timeout 8 sudo -n -u "$AGENT_UNIX_USER" bash -c "$probe" _ \
+      "$PANE_TARGET" "${AGENT_HOME[$AGENT]}" "$PROC_ROOT" 2>/dev/null)" \
+      || { echo "$POLLER_UNKNOWN"; return; }
+  fi
+  [[ "$out" =~ ^[0-9]+\ [0-9]+$ ]] || { echo "$POLLER_UNKNOWN"; return; }
+  local runner="${out% *}" server="${out#* }"
+  if (( runner > 0 && server > 0 )); then echo "$POLLER_PRESENT"
+  else echo "$POLLER_ABSENT"; fi
+}
+
+# Escalation for a confirmed-absent poller: only a session cycle respawns it.
+# Returns 0 if a cycle was performed, 1 if it was unavailable (and says why).
+poller_escalate() {
+  if [[ "$SELF_MODE" == "1" ]]; then
+    warn "poller absent but escalation UNAVAILABLE in self-mode — cycling our own session mid-check is the T-0559 no-self-act rule; a peer or the operator must do it"
+    return 1
+  fi
+  if [[ -z "${AGENT_SERVICE[$AGENT]:-}" ]]; then
+    warn "poller absent and $AGENT has NO session-owning unit (T-2210) — escalation UNAVAILABLE, reporting rather than attempting"
+    return 1
+  fi
+  note "poller child absent after de-wedge — cycling ${AGENT_SERVICE[$AGENT]} (the only thing that respawns it) [T-2345]"
+  timeout 30 sudo -n -u "$AGENT_UNIX_USER" bash -c \
+    "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user restart '${AGENT_SERVICE[$AGENT]}'" 2>/dev/null || {
+      warn "session cycle of ${AGENT_SERVICE[$AGENT]} failed"; return 1; }
+  return 0
+}
+
 # --- C1/C2/C3 + de-wedge: the only HARD-fail surface. ---
 PANE_VERDICT="ok"   # ok | wedged | uncheckable
 pane_check() {
@@ -148,20 +299,54 @@ pane_check() {
     PANE_VERDICT="ok"; return
   fi
   # Not idle: is this the dismissable boot dialog (and nothing dangerous co-present)?
-  if (( DEWEDGE )) \
-     && printf '%s' "$pane" | grep -qF "$BOOT_DIALOG_SENTINEL" \
+  if [[ -n "${AGENT_HARNESS[$AGENT]:-}" ]]; then
+    # T-2210: the sentinels below are Claude Code's. Refuse rather than press keys
+    # into a screen this file cannot read.
+    PANE_VERDICT="wedged"
+    warn "pane not idle, and $AGENT runs the '${AGENT_HARNESS[$AGENT]}' harness — this checker's \
+sentinels describe Claude Code only, so it will not guess at a dismissal (fail-closed)"
+    return
+  fi
+  local opt; opt="$(boot_dismiss_option "$pane")"
+  if (( DEWEDGE )) && [[ -n "$opt" ]] \
      && ! printf '%s' "$pane" | grep -Eq "$BOOT_DISMISS_DENYLIST"; then
-    note "dev-channels boot dialog detected — dismissing inline (option 1) [T-0728]"
+    note "known boot dialog detected — dismissing inline (option $opt) [T-0728/T-2210]"
     if [[ "$SELF_MODE" == "1" ]]; then
-      timeout "$CAPTURE_TIMEOUT" bash -c "tmux send-keys -t '$PANE_TARGET' -l 1 && sleep 0.7 && tmux send-keys -t '$PANE_TARGET' Enter" 2>/dev/null || true
+      timeout "$CAPTURE_TIMEOUT" bash -c "tmux send-keys -t '$PANE_TARGET' -l '$opt' && sleep 0.7 && tmux send-keys -t '$PANE_TARGET' Enter" 2>/dev/null || true
     else
-      timeout "$CAPTURE_TIMEOUT" sudo -n -u "$AGENT_UNIX_USER" bash -c "XDG_RUNTIME_DIR=/run/user/\$(id -u) tmux send-keys -t '$PANE_TARGET' -l 1 && sleep 0.7 && tmux send-keys -t '$PANE_TARGET' Enter" 2>/dev/null || true
+      timeout "$CAPTURE_TIMEOUT" sudo -n -u "$AGENT_UNIX_USER" bash -c "XDG_RUNTIME_DIR=/run/user/\$(id -u) tmux send-keys -t '$PANE_TARGET' -l '$opt' && sleep 0.7 && tmux send-keys -t '$PANE_TARGET' Enter" 2>/dev/null || true
     fi
     sleep 1
     local after
     if after="$(capture_pane)" && { pane_is_idle "$after" || bottom_shows_live_input "$after"; }; then
       note "boot dialog dismissed; pane now idle"
-      PANE_VERDICT="ok"; return
+      # T-2345: the pane recovering is NOT the agent being reachable. The plugin
+      # does not retry after a modal clears, so this is exactly where a comms-dark
+      # seat used to be reported healthy.
+      case "$(poller_child_state)" in
+        "$POLLER_PRESENT")
+          note "telegram poller child present — agent is actually reachable"
+          PANE_VERDICT="ok"; return ;;
+        "$POLLER_NA")
+          note "no telegram poller expected for $AGENT (no session unit) — pane recovery is the whole check here"
+          PANE_VERDICT="ok"; return ;;
+        "$POLLER_ABSENT")
+          warn "pane is idle but the telegram poller child is ABSENT — agent is COMMS-DARK behind a healthy-looking prompt (T-2345)"
+          if poller_escalate; then
+            sleep 3
+            # Confirmed by the SUCCESSOR, not by the act: a restart that came up
+            # without the poller is the same false green one layer down.
+            if [[ "$(poller_child_state)" == "$POLLER_PRESENT" ]]; then
+              note "session cycled and the poller child is now present — comms restored"
+              PANE_VERDICT="ok"; return
+            fi
+            warn "session cycled but the poller child is STILL absent — needs a human"
+          fi
+          PANE_VERDICT="wedged"; return ;;
+        *)
+          warn "pane is idle but the poller child could not be determined — NOT claiming healthy (unknown is not present)"
+          PANE_VERDICT="uncheckable"; return ;;
+      esac
     fi
     warn "boot dialog dismiss did not clear the pane"
     PANE_VERDICT="wedged"; return
@@ -194,10 +379,29 @@ telegram_check() {
 
 # --- C5: service active (SOFT; skipped in self-mode). ---
 service_check() {
-  [[ "$SELF_MODE" == "1" ]] && return
+  # T-2210: the "this agent has no session-owning unit" fact is true regardless of
+  # who is asking, so it is reported BEFORE the self-mode early return. Otherwise a
+  # seat checking itself is told nothing and a reader cannot distinguish "no unit"
+  # from "not checked".
   local st
+  if [[ -z "${AGENT_SERVICE[$AGENT]:-}" ]]; then
+    note "no session-owning service for $AGENT — skipping (its tmux session is not unit-managed)"
+    return
+  fi
+  [[ "$SELF_MODE" == "1" ]] && return
   st="$(timeout 5 sudo -n -u "$AGENT_UNIX_USER" bash -c "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user is-active '${AGENT_SERVICE[$AGENT]}'" 2>/dev/null || true)"
   [[ "$st" == "active" ]] || warn "service ${AGENT_SERVICE[$AGENT]} not active (got '${st:-unknown}') (SOFT)"
+}
+
+# T-2210: which key dismisses the modal currently on screen, or "" if none of the
+# known ones is. Returns 1 for the dev-channels confirm and 2 ("Not now") for the
+# fullscreen-renderer offer — see BOOT_RENDERER_SENTINEL for why the difference is
+# load-bearing rather than cosmetic.
+boot_dismiss_option() {
+  local pane="$1"
+  if printf '%s' "$pane" | grep -qF "$BOOT_DIALOG_SENTINEL"; then echo 1; return 0; fi
+  if printf '%s' "$pane" | grep -qF "$BOOT_RENDERER_SENTINEL"; then echo 2; return 0; fi
+  echo ""; return 1
 }
 
 # --- C6: HANDOFF present & fresh (SOFT, informational). ---

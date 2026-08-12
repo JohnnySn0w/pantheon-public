@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 import time
@@ -62,7 +63,8 @@ import time
 #   pending_strategy : which predicate branch decides "still pending?"
 #   settle_delay_s   : paste-mode settle wait before each Enter
 #   submit_retries   : extra Enter attempts if submit stays unconfirmed
-#   + strategy-specific fields (paste_sentinel | composer_glyph/needle_len)
+#   + strategy-specific fields (paste_sentinel/paste_sentinel_scope |
+#     composer_glyph/needle_len)
 #
 # The data lives here (pantheon-config); codex-config converges its poller onto
 # this same algorithm at its supervised deploy. Keeping the canonical codex
@@ -73,11 +75,19 @@ DEFAULT_SETTLE_DELAY_S = 0.7
 DEFAULT_SUBMIT_RETRIES = 2
 
 PROFILES: dict[str, dict] = {
-    # Claude Code TUI: a not-yet-submitted paste shows the "[Pasted text" marker
-    # in the input box; once submitted the marker is gone. Pending == marker present.
+    # Claude Code TUI: large pastes collapse to the "[Pasted text" marker, but
+    # short/uncollapsed pastes remain as literal text on the U+276F composer
+    # line. The first Enter on a fresh TUI can be eaten before input readiness;
+    # sentinel-only verification then false-passes because no marker exists and
+    # suppresses the retry that would converge. Mirror the T-2408 codex shape:
+    # pending == scoped paste sentinel OR the live composer still holds the
+    # beginning of the injected text.
     "claude-code": {
-        "pending_strategy": "paste_sentinel",
+        "pending_strategy": "composer_holds_text",
+        "composer_glyph": "❯",  # U+276F
+        "needle_len": 48,
         "paste_sentinel": "[Pasted text",
+        "paste_sentinel_scope": "whole_pane",
         "settle_delay_s": DEFAULT_SETTLE_DELAY_S,
         "submit_retries": DEFAULT_SUBMIT_RETRIES,
     },
@@ -91,6 +101,19 @@ PROFILES: dict[str, dict] = {
         "pending_strategy": "composer_holds_text",
         "composer_glyph": "›",  # ›
         "needle_len": 48,
+        # T-2408: codex DOES have a paste sentinel after all — for LARGE pastes
+        # the TUI collapses the composer into "[Pasted Content N chars]" + a
+        # reflowed tail, which hides exactly the needle the composer check
+        # searches for (the BEGINNING of the injected text). The old "codex TUI:
+        # no paste sentinel" note was true only of the short injections T-1046
+        # was written against; wake prompts exceed the collapse threshold by
+        # construction (T-2266 subject lists), so EVERY wake kick false-greened.
+        # MEASURED 2026-08-02: two collapsed pastes sat at an idle codex prompt
+        # for hours while submit-verify had reported both submitted — a 4.5h
+        # comms gap ended by one manual Enter. The two checks OR together:
+        # needle for short injections, sentinel for collapsed ones.
+        "paste_sentinel": "[Pasted Content",
+        "paste_sentinel_scope": "composer_region",
         "settle_delay_s": DEFAULT_SETTLE_DELAY_S,
         "submit_retries": DEFAULT_SUBMIT_RETRIES,
     },
@@ -157,11 +180,105 @@ def submit_pending(profile: dict, pane_text: str, injected_text: str) -> bool:
     if strategy == "paste_sentinel":
         return profile["paste_sentinel"] in pane_text
     if strategy == "composer_holds_text":
+        # T-2408: a composer strategy may ALSO carry a paste sentinel, covering
+        # exactly the case where the needle check goes blind — a collapsed
+        # "[Pasted Content N chars]" block renders everything EXCEPT the
+        # beginning of the injected text, and in the measured pane it also
+        # REPLACES the '›' composer line entirely, so the needle loop fell
+        # through to "no composer visible -> not pending". The two checks cover
+        # each other's gap: sentinel for collapsed pastes, needle for short
+        # injections (which never collapse and show no sentinel).
+        #
+        # SCOPED BELOW THE LAST COMPOSER LINE, not whole-pane, for the same
+        # reason the needle check takes only the LAST glyph line (T-1054):
+        # submitted content scrolls UP into history, and if the marker ever
+        # lingers there a whole-pane scan would read "still pending" and fire
+        # spurious Enters — into a composer whose placeholder suggestion an
+        # Enter might RUN. Observed post-submit the marker vanishes, but one
+        # observation is provenance, not a guarantee. A pending collapsed paste
+        # sits AT the composer (measured: with no glyph line at all), so:
+        # sentinel counts iff it appears after the last glyph line, or anywhere
+        # when no glyph line exists.
+        sentinel = profile.get("paste_sentinel")
+        if sentinel:
+            sentinel_scope = profile.get(
+                "paste_sentinel_scope", "composer_region")
+            if sentinel_scope == "whole_pane":
+                # Claude's pending collapsed-paste marker is measured above a
+                # trailing U+276F composer line. Whole-pane preserves its
+                # historical predicate and fails closed if a stale marker ever
+                # lingers: retry/unconfirmed, never false-pass.
+                if sentinel in pane_text:
+                    return True
+            elif sentinel_scope == "composer_region":
+                lines = pane_text.splitlines()
+                last_glyph = -1
+                for i, line in enumerate(lines):
+                    if line.lstrip().startswith(profile["composer_glyph"]):
+                        last_glyph = i
+                # Region INCLUDES the last glyph line (T-2408 second specimen,
+                # measured ~1h after the first fix landed): a pending collapsed
+                # paste can render ON the composer line itself —
+                #   "› [Pasted Content 1020 chars], the hub must be…"
+                # A submitted marker sits above the live composer, so this
+                # retains Codex's scrollback-history safety.
+                region = lines[last_glyph:] if last_glyph >= 0 else lines
+                if any(sentinel in line for line in region):
+                    return True
+            else:
+                raise ValueError(
+                    f"unknown paste_sentinel_scope {sentinel_scope!r}")
         return _composer_holds_text(
             pane_text, injected_text,
             profile["composer_glyph"], profile["needle_len"],
         )
     raise ValueError(f"unknown pending_strategy {strategy!r}")
+
+
+# --------------------------------------------------------------------------- #
+# Runtime input readiness predicate (T-2382).                                 #
+# --------------------------------------------------------------------------- #
+#
+# A freshly-started TUI can sit alive-but-not-yet-interactive: the process is
+# up and the tmux pane exists, but the harness hasn't finished drawing its
+# composer, so an unattended first-fire kick lands on dead pixels and is
+# silently swallowed instead of submitting. ``ready_for_submission`` answers
+# "would a submit into this pane right now actually be accepted?" — distinct
+# from ``submit_pending`` above, which answers "did the text I ALREADY
+# injected go through?". runtime_controller.py polls this BEFORE publishing a
+# fresh or replaced runtime as ready, mirroring the proven idle-confirm
+# conjunction in recovery_boot_kick.sh (lines 48-56, 88-107): prompt-frame +
+# idle/composer glyph + not-a-modal, generalized to accept either harness's
+# composer glyph so one predicate covers claude and codex.
+
+# The `─` quantifiers MUST stay grouped exactly like this: `─` is 3 UTF-8
+# bytes, and in a byte locale a bare `─+`/`─{20,}` binds the quantifier to
+# the LAST byte only and silently never matches — the documented CI-red trap
+# from recovery_boot_kick.sh:48-51. Grouping is identical under UTF-8 here.
+_READY_FRAME_PATTERN = re.compile(r"(╭(─)+╮|(─){20,})")
+_READY_DIALOG_PATTERN = re.compile(r"Enter to confirm|Esc to cancel")
+_READY_COMPOSER_GLYPHS = ("❯", "›")  # claude U+276F, codex U+203A
+
+
+def ready_for_submission(pane_text: str) -> bool:
+    """True iff a submit into ``pane_text`` right now would actually land.
+
+    Full conjunction — every condition must hold:
+      1. ``pane_text`` is non-empty.
+      2. A prompt-frame edge is visible (the TUI has finished drawing its box).
+      3. A composer/idle glyph is visible — claude's ``❯`` OR codex's ``›``.
+      4. No focused confirm modal is blocking input ("Enter to confirm" /
+         "Esc to cancel" absent).
+    """
+    if not pane_text:
+        return False
+    if not _READY_FRAME_PATTERN.search(pane_text):
+        return False
+    if not any(glyph in pane_text for glyph in _READY_COMPOSER_GLYPHS):
+        return False
+    if _READY_DIALOG_PATTERN.search(pane_text):
+        return False
+    return True
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,18 @@
+# Daily at 06:15 UTC — after the overnight window where correlated failures have
+# actually happened, and clear of grooming (12:00), the watch loop (08:00) and the
+# citation lints (Sun 05:00/05:30).
+#
+# Daily rather than weekly: a latched failure persists, so a later run still SEES
+# it, but the point of the tool is to shorten the interval in which a lost alert is
+# indistinguishable from silence. Weekly would leave that window a week wide.
+[Unit]
+Description=Pantheon failed-unit reconcile — daily fire (06:15 UTC)
+Documentation=file:///home/%u/pantheon-config/tools/failed_unit_reconcile.py
+
+[Timer]
+OnCalendar=*-*-* 06:15:00 UTC
+Persistent=true
+Unit=pantheon-failed-unit-reconcile.service
+
+[Install]
+WantedBy=timers.target

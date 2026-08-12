@@ -72,6 +72,11 @@ SUBMIT_RETRIES="${SUBMIT_RETRIES:-2}"              # extra Enter attempts if sub
 # "[Pasted text" sentinel, so the absence-check always passed (same class as T-1054).
 HARNESS="${HARNESS:-claude-code}"                  # submit_verify.py harness profile
 
+# T-2589: optional named-socket targeting (off-prod disposable-scope testing).
+# Defaults to the bare default socket for every existing caller -- unchanged.
+# Forwarded to `tmux` as `-L <name>` ahead of every tmux subcommand below.
+TMUX_SOCKET_NAME="${TMUX_SOCKET_NAME:-}"
+
 # ---------------------------------------------------------------------------
 # send_keys_submit <pane> <text>
 #
@@ -95,22 +100,76 @@ HARNESS="${HARNESS:-claude-code}"                  # submit_verify.py harness pr
 # ---------------------------------------------------------------------------
 
 send_keys_submit() {
-  local pane="$1" text="$2" harness="${3:-$HARNESS}" attempt pane_text verdict
+  local pane="$1" text="$2" harness="${3:-$HARNESS}" socket="${4:-$TMUX_SOCKET_NAME}"
+  local attempt pane_text verdict
+  # T-2589: every tmux invocation below is prefixed with this (possibly
+  # empty) array. Unset/empty socket -> unchanged default-socket behavior.
+  local -a tmux_socket_args=()
+  [[ -n "$socket" ]] && tmux_socket_args=(-L "$socket")
   if [[ ! -f "$SUBMIT_VERIFY_PY" ]]; then
     echo "[send_keys_submit] ERROR: submit verifier not found at $SUBMIT_VERIFY_PY" >&2
     return 1
   fi
-  if ! tmux send-keys -t "$pane" -l "$text"; then
-    echo "[send_keys_submit] ERROR: tmux send-keys (text) failed for pane $pane" >&2
+  # T-2259 (second fault, found live on mnemosyne's seat 2026-07-28): a pane
+  # sitting in tmux copy-mode SILENTLY EATS THE SUBMIT. paste-buffer still
+  # lands the text in the composer, but the follow-up `send-keys Enter` is
+  # consumed by copy-mode's key table instead of reaching the TUI — so the
+  # prompt is typed and never submitted. That is the exact T-0284 signature
+  # (text visible in the pane, nothing in any jsonl) which cost 9 days once.
+  # capture-pane also returns the FROZEN copy-mode view, so the submit-verify
+  # predicate reads a stale pane and can vote either way for the wrong reason.
+  # `copy-mode -q` cancels copy mode (and any other mode) if the pane is in
+  # one, and is a verified no-op when it is not — checked both directions
+  # against a live tmux before this was written, because getting it backwards
+  # would put every HEALTHY pane into copy-mode. Non-fatal by construction:
+  # clearing the mode is a precondition we try to establish, never a reason to
+  # abort an injection that might otherwise have worked.
+  tmux "${tmux_socket_args[@]}" copy-mode -q -t "$pane" 2>/dev/null || true
+  # T-2259: deliver the text via load-buffer + paste-buffer, NOT send-keys -l.
+  # tmux re-parses client argv and splits on words ending in an unescaped ';'
+  # — so any text carrying semicolons (every mailbox_wake kick does: the drain
+  # command is `python3 -c "import sys; ..."`) shatters into bogus tmux
+  # commands and the injection fails ("no current client", observed live on
+  # mnemosyne's pane while the same text pasted fine). Buffers carry the text
+  # as opaque bytes; nothing is parsed. -d frees the buffer after pasting.
+  if ! printf '%s' "$text" | tmux "${tmux_socket_args[@]}" load-buffer -b send_keys_submit -; then
+    echo "[send_keys_submit] ERROR: tmux load-buffer failed" >&2
+    return 1
+  fi
+  if ! tmux "${tmux_socket_args[@]}" paste-buffer -d -b send_keys_submit -t "$pane"; then
+    echo "[send_keys_submit] ERROR: tmux paste-buffer failed for pane $pane" >&2
     return 1
   fi
   for (( attempt=0; attempt<=SUBMIT_RETRIES; attempt++ )); do
     sleep "$INJECT_ENTER_DELAY"
-    if ! tmux send-keys -t "$pane" Enter; then
+    if ! tmux "${tmux_socket_args[@]}" send-keys -t "$pane" Enter; then
       echo "[send_keys_submit] ERROR: tmux send-keys (Enter) failed for pane $pane" >&2
       return 1
     fi
-    pane_text="$(tmux capture-pane -t "$pane" -p 2>/dev/null || true)"
+    # T-2268: REFUSE TO VOTE ON AN UNTRUSTWORTHY SURFACE.
+    # capture-pane returns the FROZEN mode view when the pane is in copy-mode,
+    # so during the exact fault this predicate exists to catch, it reads a
+    # stale snapshot of a previously-working pane and reports SUCCESS —
+    # indefinitely. That is strictly worse than having no verifier: a missing
+    # check is visibly missing, this one emits positive confirmation while
+    # nothing is submitted. It is why T-2259 read as unsolvable for a night.
+    #
+    # T-2259's `copy-mode -q` before delivery removes the known TRIGGER; it
+    # does not make the verifier independent of the fault. This does the part
+    # that generalises: ask whether the surface is trustworthy BEFORE reading
+    # it, and when it is not, decline to return a verdict rather than return a
+    # false one. An unreadable mode query counts as untrusted (`|| echo 1`) —
+    # fail-safe, matching this helper's documented "NEVER false-pass" contract.
+    # Self-heals: cancel the mode and retry, so a pane that re-entered
+    # copy-mode mid-sequence still converges instead of hard-failing.
+    in_mode="$(tmux "${tmux_socket_args[@]}" display-message -p -t "$pane" '#{pane_in_mode}' 2>/dev/null || echo 1)"
+    if [[ "$in_mode" != "0" ]]; then
+      echo "[send_keys_submit] WARNING: pane $pane is in a tmux mode (pane_in_mode=$in_mode);" \
+           "capture-pane would return the FROZEN view — declining to verify, cancelling and retrying" >&2
+      tmux "${tmux_socket_args[@]}" copy-mode -q -t "$pane" 2>/dev/null || true
+      continue
+    fi
+    pane_text="$(tmux "${tmux_socket_args[@]}" capture-pane -t "$pane" -p 2>/dev/null || true)"
     verdict="$(printf '%s' "$pane_text" \
       | python3 "$SUBMIT_VERIFY_PY" --harness "$harness" --pending-check --text "$text")"
     if [[ "$verdict" == "submitted" ]]; then
@@ -129,19 +188,29 @@ send_keys_submit() {
 # ---------------------------------------------------------------------------
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-  # Optional leading --harness <h> (default claude-code); then <pane> <text>.
+  # Optional leading --harness <h> (default claude-code) and/or --socket <s>
+  # (T-2589, default the bare default socket), in either order; then
+  # <pane> <text>.
   cli_harness="$HARNESS"
-  if [[ "${1:-}" == "--harness" ]]; then
-    if [[ $# -lt 3 ]]; then
-      echo "Usage: $(basename "$0") [--harness <h>] <pane> <text>" >&2
+  cli_socket="$TMUX_SOCKET_NAME"
+  usage() {
+    echo "Usage: $(basename "$0") [--harness <h>] [--socket <s>] <pane> <text>" >&2
+  }
+  while [[ "${1:-}" == "--harness" || "${1:-}" == "--socket" ]]; do
+    if [[ $# -lt 2 ]]; then
+      usage
       exit 1
     fi
-    cli_harness="$2"; shift 2
-  fi
+    case "$1" in
+      --harness) cli_harness="$2" ;;
+      --socket) cli_socket="$2" ;;
+    esac
+    shift 2
+  done
   if [[ $# -ne 2 ]]; then
-    echo "Usage: $(basename "$0") [--harness <h>] <pane> <text>" >&2
+    usage
     exit 1
   fi
-  send_keys_submit "$1" "$2" "$cli_harness"
+  send_keys_submit "$1" "$2" "$cli_harness" "$cli_socket"
   exit $?
 fi

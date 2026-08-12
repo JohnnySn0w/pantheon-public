@@ -1,0 +1,19 @@
+[Unit]
+Description=Pantheon local byte-sequence audit — every 15 min while origin-side enforcement is down (T-2392)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# Every 15 minutes. Cheap by construction: only the first run scans the whole
+# backfill (1.4s), and each clean run advances the watermark so later runs cover
+# only new commits. Frequency is chosen to bound the window in which a bypassing
+# push (--no-verify, hookless clone) sits unaudited.
+OnCalendar=*:0/15
+# Catch up after a reboot or a suspended VPS rather than silently skipping —
+# an audit that quietly misses its window is the failure mode this replaces.
+Persistent=true
+# Avoid every Pantheon timer firing on the same second.
+RandomizedDelaySec=30s
+Unit=pantheon-hermes-local-audit.service
+
+[Install]
+WantedBy=timers.target

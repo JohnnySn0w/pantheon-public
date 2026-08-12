@@ -1,0 +1,13 @@
+[Unit]
+Description=Pantheon agent-state snapshot — local git history for orchestrator's memory dir + HANDOFF.md (T-2424)
+# Deliberately NO OnFailure: this is an evidence recorder, and making the
+# mailbox a dependency of recording is the exclusion pantheon-resource-sampler
+# already carries for the same reason. A missed snapshot is visible in the log
+# and in `git log` gaps; it is not an operational incident.
+
+[Service]
+Type=oneshot
+ExecStart=%h/pantheon-config/tools/systemd/pantheon-agent-state-snapshot.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=120s

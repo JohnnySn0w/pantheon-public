@@ -34,8 +34,26 @@ References:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
+
+from tools.harness_adapter.types import (
+    AuthDescriptor,
+    CommandSpec,
+    DeliveryReceipt,
+    DiagnosticObservation,
+    ExecutionRequest,
+    ExecutionResult,
+    HarnessLaunchConfig,
+    HarnessCapabilities,
+    HarnessEvent,
+    HarnessSurfaceDescriptors,
+    InboundRequest,
+    SessionHandle,
+    TmuxTarget,
+)
+from tools.harness_adapter.quota import QuotaObserver
 
 
 class PantheonHarnessAdapter(ABC):
@@ -54,9 +72,112 @@ class PantheonHarnessAdapter(ABC):
     #: Harness identifier string; set on each concrete subclass.
     HARNESS_NAME: str = ""
 
-    def __init__(self, role_domain: str) -> None:
+    def __init__(
+        self,
+        role_domain: str,
+        *,
+        launch: HarnessLaunchConfig | None = None,
+    ) -> None:
         """Initialise the adapter with the target agent's role/domain axis key."""
         self.role_domain = role_domain
+        self.launch = launch
+
+    @property
+    def executable(self) -> Path:
+        """Return the executable this adapter will use as argv[0].
+
+        Runtime-profile callers receive an immutable absolute path. Legacy
+        callers without a launch config keep the historical bare command name.
+        """
+        if self.launch is not None:
+            return self.launch.executable
+        return Path(self.HARNESS_NAME)
+
+    # -------------------------------------------------------------------------
+    # Typed lifecycle contract (T-2372).
+    #
+    # This coexists with the original ORG-031 inventory below.  The inventory
+    # describes configuration surfaces; these methods carry runtime evidence.
+    # -------------------------------------------------------------------------
+
+    @abstractmethod
+    def capabilities(self) -> HarnessCapabilities:
+        """Return verified native capabilities without claiming policy parity."""
+        ...
+
+    @abstractmethod
+    def build_exec(self, request: ExecutionRequest) -> CommandSpec:
+        """Build a shell-free headless invocation with prompt text on stdin."""
+        ...
+
+    @abstractmethod
+    def build_resume(
+        self,
+        session: SessionHandle,
+        prompt: str | None = None,
+    ) -> CommandSpec:
+        """Build a shell-free resume invocation for an explicit session."""
+        ...
+
+    @abstractmethod
+    def parse_event(self, line: str) -> HarnessEvent | None:
+        """Decode one native structured-output line."""
+        ...
+
+    @abstractmethod
+    def finalize(
+        self,
+        events: Iterable[HarnessEvent],
+        *,
+        returncode: int,
+        stderr: str,
+    ) -> ExecutionResult:
+        """Derive terminal outcome from events plus the process result."""
+        ...
+
+    @abstractmethod
+    def deliver_inbound(self, request: InboundRequest) -> DeliveryReceipt:
+        """Durably deliver an inbound request using this binding's bridge."""
+        ...
+
+    def session_handle(self, session_id: str, cwd: Path) -> SessionHandle:
+        """Construct the explicit handle used by the generic runner."""
+        return SessionHandle(
+            session_id=session_id,
+            name=None,
+            cwd=cwd,
+            resumable=True,
+        )
+
+    @abstractmethod
+    def spawn_error_event(self, exc: OSError) -> HarnessEvent:
+        """Map a process-spawn failure into a native-independent error event."""
+        ...
+
+    @abstractmethod
+    def validate_launch_config(self) -> tuple[DiagnosticObservation, ...]:
+        """Validate profile fields owned by the concrete harness binding."""
+        ...
+
+    @abstractmethod
+    def describe_surfaces(self, cwd: Path) -> HarnessSurfaceDescriptors:
+        """Return truthful descriptors for native config/auth/memory surfaces."""
+        ...
+
+    @abstractmethod
+    def auth_descriptor(self) -> AuthDescriptor:
+        """Return descriptor-only auth information without claiming a live probe."""
+        ...
+
+    @abstractmethod
+    def build_interactive_launch(self, target: TmuxTarget) -> CommandSpec:
+        """Build the persistent interactive launch for the operator tmux plane."""
+        ...
+
+    @abstractmethod
+    def quota_observer(self, state_dir: Path) -> QuotaObserver:
+        """Return the provider-native quota evidence reader for this profile."""
+        ...
 
     # -------------------------------------------------------------------------
     # Partition 1 — Generalized surfaces (7).
@@ -79,8 +200,8 @@ class PantheonHarnessAdapter(ABC):
     def mcp_server_config_path(self) -> Path:
         """Return the path to the harness-native MCP server configuration file.
 
-        claude-code: ~/.claude/settings.json  (mcpServers key)
-        codex:       ~/.codex/config.toml     ([mcp_servers.<id>] TOML table)
+        claude-code: ~/.claude.json (user/local) or project .mcp.json
+        codex:       ~/.codex/config.toml ([mcp_servers.<id>] TOML table)
 
         Note (codex): transport is streamable-HTTP only — legacy SSE requires a
         stdio shim (T-0714 FINDING 1).  Cross-user permissions apply: the config
@@ -95,9 +216,9 @@ class PantheonHarnessAdapter(ABC):
         claude-code: ~/.claude/settings.json  (hooks key inside settings)
         codex:       ~/.codex/hooks.json      (standalone file; also inline [[hooks.*]])
 
-        Both harnesses use JSON/stdin/stdout + permissionDecision model and support
-        exit-2 block semantics (~80% event-name overlap; codex adds SubagentStart +
-        Compact pair).
+        Both harnesses provide command hooks, but their current event catalogs,
+        matcher rules, and continuation semantics are described by
+        ``capabilities()`` rather than assumed equivalent here.
         """
         ...
 
@@ -130,14 +251,15 @@ class PantheonHarnessAdapter(ABC):
 
         claude-code: ``claude --resume <session_id>`` flag; sessions stored as JSONL
                      in ~/.claude/projects/; full recovery-monitor integration.
-        codex:       DEFERRED — see CodexHarnessAdapter.resume_session docstring.
-                     (T-0822; SQLite storage, ``codex resume --last`` subcommand,
-                     no JSONL / no message.usage; claude recovery primitives do not port.)
+        codex:       ``codex exec resume <id>`` for headless continuation or
+                     ``codex resume <id>`` for the interactive TUI. Storage and
+                     recovery monitors remain harness-specific.
 
         Returns:
             A harness-specific session resume descriptor dict.
             Claude binding: {"harness": "claude", "cli_args": ["--resume", session_id]}
-            Codex binding:  raises NotImplementedError (deferred per T-0822).
+            Codex binding: {"harness": "codex",
+                            "cli_args": ["exec", "resume", "--json", session_id]}
         """
         ...
 
@@ -195,10 +317,9 @@ class PantheonHarnessAdapter(ABC):
 
         claude-code: ``claude/channel`` EXPERIMENTAL MCP capability; server pushes
                      the turn directly into the active session.
-        codex:       poll-and-inject via ``tmux send-keys`` or ``codex exec``.
-                     The ``claude/channel`` MCP capability is NOT implemented by codex;
-                     live-verified: Telegram messages reached the bridge SSE session
-                     but never appeared as a turn in the codex pane (T-0714).
+        codex:       durable maildir delivery followed by a Codex-specific wake
+                     or headless-resume step. A durable queue receipt is not an
+                     acknowledgment that a turn ran.
 
         Args:
             message: the inbound message string to inject.
@@ -213,8 +334,9 @@ class PantheonHarnessAdapter(ABC):
         THIS IS A BRIDGE SURFACE — the two harnesses use orthogonal approval
         mechanisms; the returned dict shapes are harness-specific.
 
-        claude-code: {"trust": "bypass-permissions",
-                      "flag": "--dangerously-skip-permissions"}
+        claude-code: {"permission_mode": "default",
+                      "flag": "--permission-mode default",
+                      "tool_approval": "scoped-permissions.allow"}
         codex:       {"approval_policy": "never",
                       "sandbox_mode": "workspace-write",
                       "sandbox_workspace_write": {"network_access": True},
@@ -248,8 +370,7 @@ class PantheonHarnessAdapter(ABC):
         """Per-harness sandbox and approval policy configuration.
 
         NOT ABSTRACTED — forcing a common call would hide load-bearing semantics:
-          claude-code: handled at org-policy tier (Unix asymmetry + autonomy bar);
-                       no native sandbox-mode knob.
+          claude-code: native sandboxing plus permission modes/settings.
           codex:       approval_policy × sandbox_mode (2 orthogonal axes) +
                        sandbox_workspace_write.{writable_roots, network_access}.
                        ORG-031 §ii ratified: never + workspace-write + network_access=true.
@@ -280,8 +401,8 @@ class PantheonHarnessAdapter(ABC):
         """Per-harness app-server / remote-control / exec-server configuration.
 
         NOT ABSTRACTED:
-          claude-code: no native analog.
-          codex:       experimental JSON-RPC daemon; exec-server; remote-control.
+          claude-code: remote-control surface.
+          codex:       app-server / exec-server / remote-control surfaces.
         """
         raise NotImplementedError(
             f"{self.__class__.__name__}.app_server_config is not abstracted "
@@ -306,10 +427,8 @@ class PantheonHarnessAdapter(ABC):
         """Per-harness doctor / health-check configuration.
 
         NOT ABSTRACTED:
-          claude-code: no native ``doctor`` command; Pantheon parses JSONL session logs.
-          codex:       ``codex doctor`` provides structured env/runtime/install/search
-                       health output. A Pantheon-level org-tier health equiv is an
-                       open follow-up (Recovery harvest §D5).
+          claude-code: ``/doctor`` and safe-mode/config diagnostics.
+          codex:       ``codex doctor --json`` structured checks.
         """
         raise NotImplementedError(
             f"{self.__class__.__name__}.doctor_config is not abstracted "

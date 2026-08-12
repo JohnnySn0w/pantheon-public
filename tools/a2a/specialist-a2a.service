@@ -1,0 +1,22 @@
+[Unit]
+Description=Pantheon specialist seat — A2A rung-1 loopback server (T-1886)
+After=network.target
+
+[Service]
+Type=simple
+# %h expands to the running (specialist) account's home directory. Adjust these
+# two paths if the repo checkout or venv aren't at these defaults — see
+# tools/a2a/PROVISION.md for install steps.
+WorkingDirectory=%h/pantheon-config
+Environment=SPECIALIST_A2A_HOST=127.0.0.1
+Environment=SPECIALIST_A2A_PORT=41100
+ExecStart=%h/.venv-a2a/bin/python %h/pantheon-config/tools/a2a/specialist_seat_server.py
+Restart=on-failure
+RestartSec=5
+
+# In-memory task store (rung 1, design notes §2.1) — state does not
+# survive a restart; this is expected, not a bug. sqlite durability is the
+# named rung-2 upgrade.
+
+[Install]
+WantedBy=default.target

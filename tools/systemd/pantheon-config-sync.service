@@ -3,6 +3,9 @@ Description=Pantheon-config bidirectional sync — fetch + push-or-pull (T-0211 
 Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
 After=network-online.target
 
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
 [Service]
 Type=oneshot
 WorkingDirectory=%h/pantheon-config

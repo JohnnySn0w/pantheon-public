@@ -1,0 +1,30 @@
+[Unit]
+Description=Pantheon TUI-wedge sampler — every 60s while measuring (T-1369)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-1369.md
+
+[Timer]
+# 60s is a RESOLUTION choice, not a cadence preference. The sampler measures how
+# long the ambiguous state (pane moving, jsonl frozen) persists during healthy
+# operation, and a run can only be resolved to the sample interval — every run
+# is quantised to a multiple of this, and the boundary is uncertain by one
+# interval either way. The threshold that comes out of this measurement gates a
+# RESTART, so the error bar has to be small next to the number being estimated:
+# at 60s a several-minute healthy turn is measured to within a few percent,
+# where a 5min interval would report it as "somewhere between 5 and 15 minutes".
+#
+# This is the sampling cost of a temporary measurement, not a standing service.
+# When the ceiling is known and the detector is built, STOP AND DISABLE this
+# timer — leaving an instrument running after it has answered its question is
+# how a fleet accretes load nobody can account for.
+OnUnitActiveSec=60s
+OnBootSec=2min
+OnActiveSec=30s
+
+# NOT Persistent=true, for the same reason as mail-staleness: a missed window is
+# a GAP IN A SAMPLE SEQUENCE, not a missed job. Replaying one on boot would
+# insert a sample taken at the wrong time into a series whose whole content is
+# the timing between samples.
+Unit=pantheon-tui-wedge-sampler.service
+
+[Install]
+WantedBy=timers.target

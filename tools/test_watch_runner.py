@@ -18,6 +18,7 @@ worktree flows. The live surface is the four in-session modes above.
 
 from __future__ import annotations
 
+import fcntl
 import io
 import json
 import os
@@ -25,13 +26,30 @@ import subprocess
 import sys
 import tempfile
 import time
+import pathlib
+import tempfile
+import shutil
 import unittest
+import tools.watch_runner as wr
 from datetime import date
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools import _git_utils, ticket, watch_runner
 from tools.watch_runner import Finding, Topic
+
+# T-1774: env-override for git_mutation_lock's lockfile path (same pattern as
+# tools/test_git_mutation_lock.py). Any test that exercises the real
+# git_commit_and_push pipeline with subprocess mocked MUST set this to an
+# isolated tempfile path — never let it fall through to the repo-anchored
+# default. Without it, the fallback resolution in `_git_utils._git_common_dir`
+# (triggered when `git rev-parse --git-common-dir` is mocked to empty stdout)
+# caches `REPO_ROOT / ".git"` process-globally; `REPO_ROOT / ".git"` is a FILE
+# (not a directory) in a linked worktree checkout, so a later real (unmocked)
+# git_mutation_lock caller in the same test process — e.g.
+# TestWatchTicketArgvAcceptedByRealTicketPy's real `ticket.main` — inherits
+# the poisoned cache and crashes on `path.parent.mkdir()`.
+_GIT_MUTATION_LOCK_ENV = "PANTHEON_GIT_MUTATION_LOCKFILE"
 
 
 def _topic(slug: str) -> Topic:
@@ -236,10 +254,16 @@ class TestCommitAndPushScopeFilter(unittest.TestCase):
         # find real files (T-0662: guard checks filesystem, not staged index).
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp_cwd = Path(self._tmp.name)
+        # T-1774: isolate the git_mutation_lock lockfile — see module-level
+        # comment on _GIT_MUTATION_LOCK_ENV.
+        os.environ[_GIT_MUTATION_LOCK_ENV] = os.path.join(
+            self._tmp.name, "gitlock", "ops.lock"
+        )
 
     def tearDown(self) -> None:
         self._patcher.stop()
         self._scan_patcher.stop()
+        os.environ.pop(_GIT_MUTATION_LOCK_ENV, None)
         self._tmp.cleanup()
 
     def _git_calls(self) -> list[list[str]]:
@@ -379,10 +403,16 @@ class TestEmptyFireShortCircuit(unittest.TestCase):
         # in a prior run and is present in the working tree.
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp_cwd = Path(self._tmp.name)
+        # T-1774: isolate the git_mutation_lock lockfile — see module-level
+        # comment on _GIT_MUTATION_LOCK_ENV.
+        os.environ[_GIT_MUTATION_LOCK_ENV] = os.path.join(
+            self._tmp.name, "gitlock", "ops.lock"
+        )
 
     def tearDown(self) -> None:
         self._patcher.stop()
         self._scan_patcher.stop()
+        os.environ.pop(_GIT_MUTATION_LOCK_ENV, None)
         self._tmp.cleanup()
 
     def test_empty_staged_short_circuits(self) -> None:
@@ -410,6 +440,127 @@ class TestEmptyFireShortCircuit(unittest.TestCase):
         argvs = [call.args[0] for call in self.mock_run.call_args_list]
         self.assertFalse(any(a[:2] == ["git", "commit"] for a in argvs))
         self.assertFalse(any(a[:2] == ["git", "push"] for a in argvs))
+
+
+class TestGitCommitAndPushHoldsMutationLock(unittest.TestCase):
+    """T-1774: git_commit_and_push's pull->push span now runs inside
+    `git_mutation_lock()` — the same critical-section primitive
+    `commit_scoped` and `git_commit_ledger_entry` already serialize on
+    (T-1770 Part b), closing the residual unlocked-writer gap flagged off
+    T-1770 (`bugs/ticket-py-shared-checkout-interleaved-writer-race.md`).
+
+    Reuses the env-override + tempfile pattern from
+    `tools/test_git_mutation_lock.py` (`PANTHEON_GIT_MUTATION_LOCKFILE`) —
+    never exercises the live checkout's real lockfile.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp_cwd = Path(self._tmp.name)
+        self._lockfile = os.path.join(self._tmp.name, "gitlock", "ops.lock")
+        os.environ[_GIT_MUTATION_LOCK_ENV] = self._lockfile
+
+        self._patcher = patch("tools._git_utils.subprocess.run")
+        self.mock_run = self._patcher.start()
+        self._scan_patcher = patch(
+            "tools.watch_runner._hermes_scan_dir", return_value=(True, None)
+        )
+        self._scan_patcher.start()
+
+    def tearDown(self) -> None:
+        self._patcher.stop()
+        self._scan_patcher.stop()
+        os.environ.pop(_GIT_MUTATION_LOCK_ENV, None)
+        self._tmp.cleanup()
+
+    def test_lock_is_genuinely_held_across_the_add_through_push_span(self) -> None:
+        """Prove the lock is actually HELD (not merely invoked-and-released
+        before the pipeline runs): intercept `git add` mid-pipeline and, from
+        this same test process, attempt an independent non-blocking flock on
+        the SAME lockfile — it must be refused (EAGAIN/EACCES/EWOULDBLOCK),
+        proving git_commit_and_push's own hold is still in effect at that
+        point. Then, after the call returns, prove the lock was released: the
+        same independent acquire must now succeed immediately.
+        """
+        date_iso = "2026-07-14"
+        reports_dir = self.tmp_cwd / "knowledge" / "watch" / "reports" / date_iso
+        reports_dir.mkdir(parents=True)
+        _write_landed_report(reports_dir / "foo.md")
+
+        checked = {"during_add": False}
+
+        def fake_run(argv, **kwargs):
+            if argv[:2] == ["git", "add"]:
+                self.assertTrue(
+                    os.path.exists(self._lockfile),
+                    "lockfile must already exist once git_mutation_lock is held",
+                )
+                fd = os.open(self._lockfile, os.O_WRONLY)
+                try:
+                    with self.assertRaises(OSError):
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                finally:
+                    os.close(fd)
+                # The holder record (written by git_mutation_lock on acquire)
+                # must name this call's label.
+                content = Path(self._lockfile).read_text(encoding="utf-8")
+                self.assertIn(f"watch_runner land {date_iso}", content)
+                checked["during_add"] = True
+            if argv[:2] == ["git", "diff"]:
+                return MagicMock(
+                    returncode=0,
+                    stdout=f"knowledge/watch/reports/{date_iso}/foo.md\n",
+                    stderr="",
+                )
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        self.mock_run.side_effect = fake_run
+
+        ok, msg = watch_runner.git_commit_and_push(
+            date_iso, [_topic("foo")], {"foo": "ok"}, cwd=self.tmp_cwd
+        )
+
+        self.assertTrue(ok, f"expected success; got msg={msg!r}")
+        self.assertTrue(
+            checked["during_add"],
+            "the `git add` call was never intercepted — the in-band lock-hold "
+            "assertion never ran",
+        )
+
+        # Released after return: an independent acquire must now succeed.
+        fd = os.open(self._lockfile, os.O_WRONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+    def test_lock_released_on_refusal_path_too(self) -> None:
+        """A non-success return (scope-guard refusal here) must still release
+        the lock — the `with` block's cleanup runs on early `return`, not
+        only on the success fallthrough."""
+        date_iso = "2026-07-14"
+
+        def fake_run(argv, **kwargs):
+            if argv[:2] == ["git", "diff"]:
+                return MagicMock(returncode=0, stdout="ledger/leaked.md\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        self.mock_run.side_effect = fake_run
+
+        ok, msg = watch_runner.git_commit_and_push(
+            date_iso, [_topic("foo")], {"foo": "ok"}, cwd=self.tmp_cwd
+        )
+
+        self.assertFalse(ok)
+        self.assertIn("scope", msg.lower())
+
+        fd = os.open(self._lockfile, os.O_WRONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 # ---------------------------------------------------------------------------
@@ -930,6 +1081,32 @@ class TestComputeDueBriefs(unittest.TestCase):
         payload = json.loads(out.getvalue())
         self.assertEqual([r["slug"] for r in payload], ["due-weekly"])
 
+    def test_uncleared_corrections_thread_into_brief(self) -> None:
+        """T-2614: un-cleared state corrections for a due topic must appear
+        in the emitted brief; the record's key-set stays unchanged.
+        """
+        with patch.object(watch_runner, "load_state", return_value={
+            "schema_version": 1,
+            "topics": {},
+            "brief_corrections": {
+                "due-weekly": [{"id": "c1", "text": "seed URL is 404",
+                                 "source_date": "2026-06-01",
+                                 "source_report": "knowledge/watch/reports/2026-06-01/due-weekly.md"}],
+            },
+        }):
+            recs = watch_runner.compute_due_briefs(date(2026, 6, 5))
+        self.assertEqual([r["slug"] for r in recs], ["due-weekly"])
+        r = recs[0]
+        self.assertEqual(set(r), {"slug", "cadence", "output_path", "brief"})
+        self.assertIn("seed URL is 404", r["brief"])
+        self.assertIn("c1", r["brief"])
+
+    def test_no_corrections_key_in_state_does_not_error(self) -> None:
+        # Baseline setUp's state has no "brief_corrections" key at all —
+        # .get()-defensive read must not KeyError.
+        recs = watch_runner.compute_due_briefs(date(2026, 6, 5))
+        self.assertNotIn("Known brief corrections", recs[0]["brief"])
+
 
 class TestReportHeadlineAndIndexRow(unittest.TestCase):
     """Helpers for the in-session land path (ORG-025 / T-0855)."""
@@ -1016,6 +1193,250 @@ class TestReportLandedOk(unittest.TestCase):
         rp = self.tmp / "real.md"
         _write_landed_report(rp)
         self.assertTrue(watch_runner.report_landed_ok(rp))
+
+
+class TestBuildBrief(unittest.TestCase):
+    """T-1739 GAP 2: build_brief must carry the HERMES byte-discipline
+    instruction so researchers escape the trigger phrase instead of emitting
+    it bare (which then trips the --land-commit guard and orphans reports).
+    """
+
+    def test_brief_carries_escape_instruction(self) -> None:
+        topic = _topic("anthropic-policy-and-billing")
+        brief = watch_runner.build_brief(topic, Path("/tmp/out.md"))
+        self.assertIn("HERMES\\.md", brief)
+
+    def test_brief_escape_instruction_does_not_trip_the_guard(self) -> None:
+        # Verify against the ACTUAL guard regex (not an assumed shape) that the
+        # escaped form we instruct researchers to use is genuinely safe.
+        topic = _topic("anthropic-policy-and-billing")
+        brief = watch_runner.build_brief(topic, Path("/tmp/out.md"))
+        self.assertIsNone(_git_utils._HERMES_PATTERN.search(brief.encode("utf-8")))
+
+    def test_no_corrections_is_byte_identical_to_baseline(self) -> None:
+        """T-2614: the `corrections` kwarg must be a pure no-op when absent
+        or empty — every pre-T-2614 call site (and every existing test in
+        this class) depends on build_brief's output being unchanged.
+        """
+        topic = _topic("due-weekly")
+        baseline = watch_runner.build_brief(topic, Path("/tmp/out.md"))
+        self.assertEqual(
+            watch_runner.build_brief(topic, Path("/tmp/out.md"), corrections=None),
+            baseline,
+        )
+        self.assertEqual(
+            watch_runner.build_brief(topic, Path("/tmp/out.md"), corrections=[]),
+            baseline,
+        )
+
+    def test_corrections_appended_as_operator_context_section(self) -> None:
+        topic = _topic("due-weekly")
+        corrections = [{
+            "id": "abc123def456",
+            "text": "seed source X is 404; correct URL is Y",
+            "source_date": "2026-08-01",
+            "source_report": "knowledge/watch/reports/2026-08-01/due-weekly.md",
+        }]
+        brief = watch_runner.build_brief(topic, Path("/tmp/out.md"), corrections=corrections)
+        self.assertIn("Known brief corrections", brief)
+        self.assertIn("abc123def456", brief)
+        self.assertIn("seed source X is 404; correct URL is Y", brief)
+        self.assertIn("2026-08-01", brief)
+        self.assertIn("knowledge/watch/reports/2026-08-01/due-weekly.md", brief)
+        # Existing sections must survive untouched.
+        self.assertIn("## Operator-side notes", brief)
+        self.assertIn("## Output", brief)
+        # Instructs the researcher not to self-edit topics.md.
+        self.assertIn("do NOT edit `knowledge/watch/topics.md`", brief)
+
+
+class TestParseReportBriefCorrections(unittest.TestCase):
+    """T-2614: extract the `brief_corrections:` frontmatter list — the
+    researcher-authored half of the back-propagation convention.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_wellformed_list_parses(self) -> None:
+        rp = self.tmp / "r.md"
+        rp.write_text(
+            "---\nheadline: x\nbrief_corrections:\n"
+            "  - seed source X is 404; correct URL is Y\n"
+            '  - "the scope paragraph cites a nonexistent study"\n'
+            "---\n\n# Body\n",
+            encoding="utf-8",
+        )
+        self.assertEqual(
+            watch_runner.parse_report_brief_corrections(rp),
+            [
+                "seed source X is 404; correct URL is Y",
+                "the scope paragraph cites a nonexistent study",
+            ],
+        )
+
+    def test_missing_key_returns_empty_no_warning(self) -> None:
+        rp = self.tmp / "r.md"
+        rp.write_text("---\nheadline: x\n---\n\n# Body\n", encoding="utf-8")
+        warnings: list[str] = []
+        self.assertEqual(watch_runner.parse_report_brief_corrections(rp, warnings=warnings), [])
+        self.assertEqual(warnings, [])
+
+    def test_missing_file_returns_empty(self) -> None:
+        self.assertEqual(watch_runner.parse_report_brief_corrections(self.tmp / "nope.md"), [])
+
+    def test_no_frontmatter_returns_empty(self) -> None:
+        rp = self.tmp / "r.md"
+        rp.write_text("# No frontmatter\n\nbody\n", encoding="utf-8")
+        self.assertEqual(watch_runner.parse_report_brief_corrections(rp), [])
+
+    def test_inline_scalar_value_is_malformed_and_warns(self) -> None:
+        rp = self.tmp / "r.md"
+        rp.write_text(
+            "---\nheadline: x\nbrief_corrections: oops not a list\n---\n\n# Body\n",
+            encoding="utf-8",
+        )
+        warnings: list[str] = []
+        self.assertEqual(watch_runner.parse_report_brief_corrections(rp, warnings=warnings), [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("inline value", warnings[0])
+
+    def test_key_with_zero_items_warns_once(self) -> None:
+        rp = self.tmp / "r.md"
+        rp.write_text(
+            "---\nheadline: x\nbrief_corrections:\nsurface: routine\n---\n\n# Body\n",
+            encoding="utf-8",
+        )
+        warnings: list[str] = []
+        self.assertEqual(watch_runner.parse_report_brief_corrections(rp, warnings=warnings), [])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("no items parsed", warnings[0])
+
+    def test_never_raises_on_garbage_frontmatter(self) -> None:
+        rp = self.tmp / "r.md"
+        rp.write_text("---\n:::not valid: [[\nbrief_corrections\n---\n", encoding="utf-8")
+        # Must not raise.
+        watch_runner.parse_report_brief_corrections(rp)
+
+
+class TestAccumulateBriefCorrections(unittest.TestCase):
+    """T-2614: the land-path accumulation half — a correction enters state
+    exactly when the report that found it lands.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self._rr = patch.object(watch_runner, "REPO_ROOT", self.tmp)
+        self._rr.start()
+        self._log = patch.object(watch_runner, "_append_runner_log")
+        self._log.start()
+
+    def tearDown(self) -> None:
+        self._log.stop()
+        self._rr.stop()
+        self._tmp.cleanup()
+
+    def _report(self, slug: str, corrections_yaml: str) -> Path:
+        rp = self.tmp / f"{slug}.md"
+        rp.write_text(
+            f"---\nheadline: x\nbrief_corrections:\n{corrections_yaml}\n---\n\n# Body\n",
+            encoding="utf-8",
+        )
+        return rp
+
+    def test_new_correction_is_appended_with_stable_id(self) -> None:
+        rp = self._report("alpha", "  - the scope is stale")
+        state: dict = {"schema_version": 1, "topics": {}}
+        added = watch_runner.accumulate_brief_corrections(state, "alpha", rp, date(2026, 8, 6))
+        self.assertEqual(len(added), 1)
+        bucket = state["brief_corrections"]["alpha"]
+        self.assertEqual(len(bucket), 1)
+        self.assertEqual(bucket[0]["id"], added[0])
+        self.assertEqual(bucket[0]["text"], "the scope is stale")
+        self.assertEqual(bucket[0]["source_date"], "2026-08-06")
+        self.assertEqual(bucket[0]["source_report"], "alpha.md")
+
+    def test_reaccumulating_identical_text_is_deduped(self) -> None:
+        rp = self._report("alpha", "  - the scope is stale")
+        state: dict = {"schema_version": 1, "topics": {}}
+        watch_runner.accumulate_brief_corrections(state, "alpha", rp, date(2026, 8, 6))
+        added_again = watch_runner.accumulate_brief_corrections(
+            state, "alpha", rp, date(2026, 8, 7)
+        )
+        self.assertEqual(added_again, [])
+        self.assertEqual(len(state["brief_corrections"]["alpha"]), 1)
+
+    def test_separate_topics_get_separate_buckets(self) -> None:
+        rp_a = self._report("alpha", "  - alpha defect")
+        rp_b = self._report("beta", "  - beta defect")
+        state: dict = {"schema_version": 1, "topics": {}}
+        watch_runner.accumulate_brief_corrections(state, "alpha", rp_a, date(2026, 8, 6))
+        watch_runner.accumulate_brief_corrections(state, "beta", rp_b, date(2026, 8, 6))
+        self.assertEqual(len(state["brief_corrections"]["alpha"]), 1)
+        self.assertEqual(len(state["brief_corrections"]["beta"]), 1)
+        self.assertNotEqual(
+            state["brief_corrections"]["alpha"][0]["id"],
+            state["brief_corrections"]["beta"][0]["id"],
+        )
+
+    def test_no_corrections_leaves_state_untouched(self) -> None:
+        rp = self.tmp / "alpha.md"
+        rp.write_text("---\nheadline: x\n---\n\n# Body\n", encoding="utf-8")
+        state: dict = {"schema_version": 1, "topics": {}}
+        added = watch_runner.accumulate_brief_corrections(state, "alpha", rp, date(2026, 8, 6))
+        self.assertEqual(added, [])
+        self.assertNotIn("brief_corrections", state)
+
+
+class TestClearCorrection(unittest.TestCase):
+    """T-2614: the operator ack/clear path — run after folding a correction
+    into knowledge/watch/topics.md by hand.
+    """
+
+    def test_clears_existing_id_and_pops_empty_bucket(self) -> None:
+        state = {
+            "schema_version": 1,
+            "topics": {},
+            "brief_corrections": {"alpha": [{"id": "abc123", "text": "x",
+                                              "source_date": "2026-08-06",
+                                              "source_report": "r.md"}]},
+        }
+        found = watch_runner.clear_correction(state, "alpha", "abc123")
+        self.assertTrue(found)
+        self.assertNotIn("alpha", state["brief_corrections"])
+
+    def test_clears_one_of_several_leaves_bucket(self) -> None:
+        state = {
+            "schema_version": 1,
+            "topics": {},
+            "brief_corrections": {"alpha": [
+                {"id": "a1", "text": "x", "source_date": "d", "source_report": "r"},
+                {"id": "a2", "text": "y", "source_date": "d", "source_report": "r"},
+            ]},
+        }
+        found = watch_runner.clear_correction(state, "alpha", "a1")
+        self.assertTrue(found)
+        self.assertEqual([c["id"] for c in state["brief_corrections"]["alpha"]], ["a2"])
+
+    def test_unknown_id_returns_false_state_untouched(self) -> None:
+        state = {
+            "schema_version": 1,
+            "topics": {},
+            "brief_corrections": {"alpha": [{"id": "abc123", "text": "x",
+                                              "source_date": "d", "source_report": "r"}]},
+        }
+        found = watch_runner.clear_correction(state, "alpha", "ghost")
+        self.assertFalse(found)
+        self.assertEqual(len(state["brief_corrections"]["alpha"]), 1)
+
+    def test_unknown_topic_returns_false(self) -> None:
+        state = {"schema_version": 1, "topics": {}}
+        self.assertFalse(watch_runner.clear_correction(state, "nope", "id"))
 
 
 class TestLandReports(unittest.TestCase):
@@ -1105,11 +1526,17 @@ class TestLandReports(unittest.TestCase):
 
     def test_commit_failure_yields_nonzero_exit(self) -> None:
         self._write_report("alpha", "Alpha line.")
+        stderr = io.StringIO()
         with patch.object(watch_runner, "git_commit_and_push",
                           return_value=(False, "HERMES guard refused: x")), \
-             patch.object(watch_runner, "actuate_phase"):
+             patch.object(watch_runner, "actuate_phase") as mock_act, \
+             patch("sys.stderr", stderr):
             rc = watch_runner.land_reports(date(2026, 6, 5), force=True)
         self.assertEqual(rc, 1)
+        # T-1739 GAP 1: a failed land (reports uncommitted/unpushed) must not
+        # actuate — that's what filed 37 tickets off orphaned reports.
+        self.assertFalse(mock_act.called)
+        self.assertIn("--actuate-only", stderr.getvalue())
 
     def test_no_actuate_skips_actuation(self) -> None:
         self._write_report("alpha", "Alpha line.")
@@ -1123,6 +1550,42 @@ class TestLandReports(unittest.TestCase):
         with patch("sys.stderr", new_callable=io.StringIO):
             rc = watch_runner.land_reports(date(2026, 6, 5), topic_filter="ghost")
         self.assertEqual(rc, 2)
+
+    def test_landed_report_with_corrections_accumulates_into_state(self) -> None:
+        rp = self.date_dir / "alpha.md"
+        rp.write_text(
+            "---\nsurface: routine\nheadline: Alpha line.\nbrief_corrections:\n"
+            "  - seed source is 404; correct URL is Y\n"
+            "---\n\n# Test report\n\n## Findings\n\n"
+            + ("Filler body text to cross the substantive-report size floor. " * 10)
+            + "\n\n## Sources\n\n- (test)\n",
+            encoding="utf-8",
+        )
+        with patch.object(watch_runner, "git_commit_and_push",
+                          return_value=(True, "ok")), \
+             patch.object(watch_runner, "actuate_phase"):
+            watch_runner.land_reports(date(2026, 6, 5), force=True)
+        bucket = self._saved_state["brief_corrections"]["alpha"]
+        self.assertEqual(len(bucket), 1)
+        self.assertEqual(bucket[0]["text"], "seed source is 404; correct URL is Y")
+        self.assertEqual(bucket[0]["source_date"], "2026-06-05")
+
+    def test_rerun_does_not_duplicate_accumulated_correction(self) -> None:
+        rp = self.date_dir / "alpha.md"
+        rp.write_text(
+            "---\nsurface: routine\nheadline: Alpha line.\nbrief_corrections:\n"
+            "  - seed source is 404\n"
+            "---\n\n# Test report\n\n## Findings\n\n"
+            + ("Filler body text to cross the substantive-report size floor. " * 10)
+            + "\n\n## Sources\n\n- (test)\n",
+            encoding="utf-8",
+        )
+        with patch.object(watch_runner, "git_commit_and_push",
+                          return_value=(True, "ok")), \
+             patch.object(watch_runner, "actuate_phase"):
+            watch_runner.land_reports(date(2026, 6, 5), force=True)
+            watch_runner.land_reports(date(2026, 6, 5), force=True)
+        self.assertEqual(len(self._saved_state["brief_corrections"]["alpha"]), 1)
 
     def test_degenerate_report_is_fail(self) -> None:
         """A report file that EXISTS but fails the structural/size check
@@ -1342,6 +1805,7 @@ class TestLandCommitGate(unittest.TestCase):
         base = dict(
             land_commit=False, file_watch_ticket=False,
             actuate_only=False, emit_due_briefs=False,
+            clear_correction=False, topic=None, id=None,
         )
         base.update(over)
         return MagicMock(**base)
@@ -1435,6 +1899,75 @@ class TestDefaultSafeContractT0261(unittest.TestCase):
             rc = watch_runner.main(["--actuate-only"])
         self.assertEqual(rc, 0)
 
+    def test_clear_correction_requires_topic_and_id(self) -> None:
+        from contextlib import redirect_stderr
+        buf = io.StringIO()
+        with redirect_stderr(buf):
+            rc = watch_runner.main(["--clear-correction"])
+        self.assertEqual(rc, 64)
+        self.assertIn("--topic", buf.getvalue())
+        self.assertIn("--id", buf.getvalue())
+
+    def test_clear_correction_requires_id_even_with_topic(self) -> None:
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()):
+            rc = watch_runner.main(["--clear-correction", "--topic", "alpha"])
+        self.assertEqual(rc, 64)
+
+    def test_clear_correction_plus_land_commit_is_ambiguous(self) -> None:
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()):
+            rc = watch_runner.main([
+                "--clear-correction", "--topic", "alpha", "--id", "x",
+                "--land-commit",
+            ])
+        self.assertEqual(rc, 64)
+
+    def test_clear_correction_plus_emit_due_briefs_is_ambiguous(self) -> None:
+        from contextlib import redirect_stderr
+        with redirect_stderr(io.StringIO()):
+            rc = watch_runner.main([
+                "--clear-correction", "--topic", "alpha", "--id", "x",
+                "--emit-due-briefs",
+            ])
+        self.assertEqual(rc, 64)
+
+
+class TestClearCorrectionCLI(unittest.TestCase):
+    """T-2614: `--clear-correction` end-to-end through main()."""
+
+    def test_found_clears_and_saves_returns_0(self) -> None:
+        state = {
+            "schema_version": 1,
+            "topics": {},
+            "brief_corrections": {"alpha": [{"id": "abc123", "text": "x",
+                                              "source_date": "d", "source_report": "r"}]},
+        }
+        saved: dict = {}
+        with patch.object(watch_runner, "load_state", return_value=state), \
+             patch.object(watch_runner, "save_state", side_effect=lambda s: saved.update(s)), \
+             patch.object(watch_runner, "_append_runner_log") as mock_log, \
+             patch("sys.stdout", new_callable=io.StringIO):
+            rc = watch_runner.main([
+                "--clear-correction", "--topic", "alpha", "--id", "abc123",
+                "--note", "folded into topics.md",
+            ])
+        self.assertEqual(rc, 0)
+        self.assertNotIn("alpha", saved["brief_corrections"])
+        self.assertTrue(mock_log.called)
+        self.assertIn("folded into topics.md", mock_log.call_args.args[0])
+
+    def test_not_found_returns_1_no_save(self) -> None:
+        state = {"schema_version": 1, "topics": {}}
+        with patch.object(watch_runner, "load_state", return_value=state), \
+             patch.object(watch_runner, "save_state") as mock_save, \
+             patch("sys.stderr", new_callable=io.StringIO):
+            rc = watch_runner.main([
+                "--clear-correction", "--topic", "alpha", "--id", "ghost",
+            ])
+        self.assertEqual(rc, 1)
+        self.assertFalse(mock_save.called)
+
 
 class TestT0261Layer3Integration(unittest.TestCase):
     """T-0261 Layer-3 integration: spawn the real script as a subprocess against
@@ -1510,6 +2043,12 @@ class TestPartialStageGuard(unittest.TestCase):
         )
         self._hermes_patcher.start()
 
+        # T-1774: isolate the git_mutation_lock lockfile — see module-level
+        # comment on _GIT_MUTATION_LOCK_ENV.
+        os.environ[_GIT_MUTATION_LOCK_ENV] = os.path.join(
+            self._tmp.name, "gitlock", "ops.lock"
+        )
+
         # git diff --cached --name-only: only topic-b staged (topic-a file
         # never landed in the worktree, so git add found nothing for it).
         def fake_git_run(argv, **kwargs):
@@ -1527,6 +2066,7 @@ class TestPartialStageGuard(unittest.TestCase):
     def tearDown(self) -> None:
         self._git_patcher.stop()
         self._hermes_patcher.stop()
+        os.environ.pop(_GIT_MUTATION_LOCK_ENV, None)
         self._tmp.cleanup()
 
     def _git_calls(self) -> list[list[str]]:
@@ -1640,6 +2180,50 @@ class TestParseFollowups(unittest.TestCase):
             ],
         )
 
+    def test_t2505_exact_dropped_specimens_are_lossless(self) -> None:
+        """The observed sentinel is ignored and both actionable colon forms parse."""
+        trigger_name = "HERME" + "S.md"
+        body = (
+            "## Follow-ups\n"
+            "None. Routine monitoring sufficient.\n"
+            "- **Entitlement error remediation:** ...file a ticket to HO with full "
+            "JSON-RPC error log...\n"
+            f"- **{trigger_name} classifier verification:** Monitor for public "
+            "changelog or incident report confirming classifier fix...\n"
+        )
+        result = watch_runner.parse_followups_detailed(body)
+        self.assertEqual(
+            result.parsed,
+            (
+                (
+                    "Entitlement error remediation",
+                    "...file a ticket to HO with full JSON-RPC error log...",
+                ),
+                (
+                    f"{trigger_name} classifier verification",
+                    "Monitor for public changelog or incident report confirming "
+                    "classifier fix...",
+                ),
+            ),
+        )
+        self.assertEqual(result.rejected, ())
+
+    def test_accepts_ascii_hyphen_plain_colon_and_bold_outside_colon(self) -> None:
+        body = (
+            "## Follow-ups\n"
+            "ASCII title - ASCII ask\n"
+            "Plain title: plain ask\n"
+            "**Bold title**: bold ask\n"
+        )
+        self.assertEqual(
+            watch_runner.parse_followups(body),
+            [
+                ("ASCII title", "ASCII ask"),
+                ("Plain title", "plain ask"),
+                ("Bold title", "bold ask"),
+            ],
+        )
+
     def test_bolded_title_with_inner_em_dash(self) -> None:
         """`- **Title — sub** — ask` keeps the whole bold span as the title (T-0859 shape).
 
@@ -1681,7 +2265,7 @@ class TestParseFollowups(unittest.TestCase):
         self.assertEqual(result, [("title-a", "ask-a"), ("title-b", "ask-b")])
 
     def test_malformed_line_skipped(self) -> None:
-        """Line without em-dash is skipped; valid lines are still returned."""
+        """The compatibility wrapper omits rejected lines but reports preservation."""
         body = (
             "## Follow-ups\n"
             "no-dash-here\n"
@@ -1692,7 +2276,10 @@ class TestParseFollowups(unittest.TestCase):
         with patch("sys.stderr", buf):
             result = watch_runner.parse_followups(body)
         self.assertEqual(result, [("good-title", "good-ask")])
-        self.assertIn("skip malformed", buf.getvalue())
+        self.assertIn("preserving malformed", buf.getvalue())
+
+        detailed = watch_runner.parse_followups_detailed(body)
+        self.assertEqual(detailed.rejected, ("no-dash-here",))
 
     def test_section_ends_at_next_heading(self) -> None:
         body = (
@@ -1723,15 +2310,17 @@ class TestParseFollowups(unittest.TestCase):
         self.assertEqual(watch_runner.parse_followups(body), [])
 
     def test_soft_cap_truncates_and_warns(self) -> None:
-        """More than _FOLLOWUP_SOFT_CAP items → only first N filed, warning emitted."""
+        """More than the cap preserves overflow for a single recovery ticket."""
         cap = watch_runner._FOLLOWUP_SOFT_CAP
         lines = "\n".join(f"title-{i} — ask-{i}" for i in range(cap + 5))
         body = f"## Follow-ups\n{lines}\n"
         import io
         buf = io.StringIO()
         with patch("sys.stderr", buf):
-            result = watch_runner.parse_followups(body)
-        self.assertEqual(len(result), cap)
+            result = watch_runner.parse_followups_detailed(body)
+        self.assertEqual(len(result.parsed), cap)
+        self.assertEqual(len(result.rejected), 5)
+        self.assertEqual(result.rejected[0], f"title-{cap} — ask-{cap}")
         self.assertIn("follow-up cap", buf.getvalue())
 
 
@@ -1851,6 +2440,55 @@ class TestActuatePhaseFollowups(unittest.TestCase):
         self.assertEqual(len(file_finding_calls), 0, "file_finding must not be called on second run")
         self.assertEqual(len(file_followup_calls), 0, "file_followup must not be called on second run")
 
+    def test_rejected_catchall_files_exactly_once_across_two_actuations(self) -> None:
+        """The recovery ticket alone carries the report-level dedup key."""
+        report_body = "## Follow-ups\nunstructured actionable prose\n"
+        tmp_path, _ = self._make_tmp(report_body)
+        recovery_calls = []
+
+        def fake_recovery(lines, finding, *, parent_id, **kwargs):
+            recovery_calls.append((tuple(lines), finding.report_relpath, parent_id))
+            (tmp_path / "tickets" / "inbox" / "T-2001.md").write_text(
+                f"Source: {finding.report_relpath}\n",
+                encoding="utf-8",
+            )
+            return ("filed", "T-2001", "retries=0")
+
+        patches = (
+            patch("tools.watch_runner.REPO_ROOT", tmp_path),
+            patch(
+                "tools.watch_runner.REPORTS_ROOT",
+                tmp_path / "watch" / "reports",
+            ),
+            patch(
+                "tools.watch_runner.file_finding",
+                return_value=("errored", None, "synthetic headline failure"),
+            ),
+            patch(
+                "tools.watch_runner.file_unparsed_followups",
+                side_effect=fake_recovery,
+            ),
+            patch("tools.watch_runner.log_actuation_summary"),
+            patch("tools.watch_runner.write_actuation_ledger"),
+            patch(
+                "tools.watch_runner.git_commit_ledger_entry",
+                return_value=(True, "ok"),
+            ),
+        )
+        with patches[0], patches[1], patches[2], patches[3], patches[4], \
+                patches[5], patches[6]:
+            watch_runner.actuate_phase(date(2026, 5, 4), [], {})
+            watch_runner.actuate_phase(date(2026, 5, 4), [], {})
+
+        self.assertEqual(
+            recovery_calls,
+            [(
+                ("unstructured actionable prose",),
+                "watch/reports/2026-05-04/mcp-supply-chain.md",
+                None,
+            )],
+        )
+
     def test_followups_filed_when_headline_id_none(self) -> None:
         """Headline filing returns id=None (push success but no T-NNNN in stdout)
         → follow-ups still filed with parent_id=None (no --parent-ticket flag)."""
@@ -1942,6 +2580,506 @@ class TestFileFollowupArgv(unittest.TestCase):
         self.assertEqual(outcome, "filed")
         argv = mock_run.call_args.args[0]
         self.assertNotIn("--parent-ticket", argv)
+
+    def test_unparsed_catchall_escapes_classifier_trigger_at_commit_surface(self) -> None:
+        """Every ticket.py argument is safe before the auto-commit boundary."""
+        trigger_name = "HERME" + "S.md"
+        escaped_name = "HERME" + r"S\.md"
+        raw_line = (
+            f"- **{trigger_name} classifier verification** malformed but actionable"
+        )
+        with patch("tools.watch_runner.subprocess.run") as mock_run:
+            mock_run.return_value = MagicMock(
+                returncode=0,
+                stdout="filed T-0202 → tickets/inbox/T-0202.md\n",
+                stderr="",
+            )
+            outcome, ticket_id, _ = watch_runner.file_unparsed_followups(
+                [raw_line],
+                self.finding,
+                parent_id="T-0100",
+            )
+
+        self.assertEqual((outcome, ticket_id), ("filed", "T-0202"))
+        argv = mock_run.call_args.args[0]
+        commit_surface = "\n".join(argv)
+        self.assertNotIn(trigger_name, commit_surface)
+        self.assertIn(escaped_name, commit_surface)
+        self.assertIn(self.finding.report_relpath, commit_surface)
+
+
+class TestIndexUnindexedReports(unittest.TestCase):
+    """T-2148 finding 1: reports that reach disk outside topics.md were invisible
+    to the day index forever, because the index was driven by the DISPATCH LIST
+    rather than by what is actually on disk."""
+
+    def setUp(self):
+        self.d = pathlib.Path(tempfile.mkdtemp(prefix="t2148-")) / "2026-07-27"
+        self.d.mkdir(parents=True)
+
+    def tearDown(self):
+        shutil.rmtree(self.d.parent, ignore_errors=True)
+
+    def _report(self, slug, *, ok=True):
+        p = self.d / f"{slug}.md"
+        if ok:
+            p.write_text("---\nheadline: 'a real finding'\n---\n\n## Section\n\n"
+                         + ("body text. " * 200), encoding="utf-8")
+        else:
+            p.write_text("stub", encoding="utf-8")
+        return p
+
+    def test_indexes_a_report_absent_from_topics(self):
+        """The actual 2026-07-27 case: an ad-hoc dispatch with no topics.md entry."""
+        self._report("semantic-search-graph-db-stack")
+        added = wr.index_unindexed_reports(self.d)
+        self.assertEqual(added, ["semantic-search-graph-db-stack"])
+        self.assertTrue(wr.day_index_has_row(self.d, "semantic-search-graph-db-stack"))
+
+    def test_is_idempotent(self):
+        self._report("topic-a")
+        wr.index_unindexed_reports(self.d)
+        again = wr.index_unindexed_reports(self.d)
+        self.assertEqual(again, [], "a second sweep must not duplicate rows")
+        body = (self.d / "README.md").read_text()
+        self.assertEqual(body.count("[topic-a]"), 1)
+
+    def test_never_indexes_the_index_itself(self):
+        """The README skip must be exercised by the NAME check, not incidentally.
+
+        First version of this test passed even with the name check deleted: a real
+        README fails report_landed_ok anyway, so the skip was never reached. Caught
+        by mutation. Here the README is deliberately given valid report structure,
+        so the name check is the ONLY thing that can prevent it being indexed.
+        """
+        (self.d / "README.md").write_text(
+            "---\nheadline: 'looks exactly like a report'\n---\n\n## Section\n\n"
+            + ("body text. " * 200), encoding="utf-8")
+        self.assertTrue(wr.report_landed_ok(self.d / "README.md"),
+                        "fixture must be structurally valid or the test is vacuous")
+        added = wr.index_unindexed_reports(self.d)
+        self.assertNotIn("README", added)
+        self.assertFalse(wr.day_index_has_row(self.d, "README"))
+
+    def test_skips_a_stub_that_did_not_land(self):
+        """Indexing a stub would assert a landing that did not happen — the same
+        'created is not delivered' shape this sweep exists to fix."""
+        self._report("half-written", ok=False)
+        self.assertEqual(wr.index_unindexed_reports(self.d), [])
+        self.assertFalse(wr.day_index_has_row(self.d, "half-written"))
+
+    def test_carries_the_headline_into_the_summary(self):
+        self._report("with-headline")
+        wr.index_unindexed_reports(self.d)
+        self.assertIn("a real finding", (self.d / "README.md").read_text())
+
+    def test_missing_directory_is_not_an_error(self):
+        self.assertEqual(wr.index_unindexed_reports(self.d.parent / "2099-01-01"), [])
+
+
+class TopicParseWarningsTest(unittest.TestCase):
+    """T-2353: an ordinary topics.md edit must not SILENTLY retire a topic.
+
+    Three paths, all previously indistinguishable from a deliberate `paused`:
+    missing cadence (defaulted to paused), typo'd cadence (is_due returns False
+    forever), and missing scope (stanza dropped from parse output entirely).
+    The third is overloaded: `return None` also legitimately filters prose
+    sections, so the fix distinguishes "no recognized field bullets at all"
+    (prose — silent) from "looks like a topic but fails to parse" (warn).
+    """
+
+    def _topic(self, slug, cadence_line="- **cadence:** weekly", scope_line="- **scope:** watch things"):
+        lines = ["", f"## {slug}"]
+        if cadence_line:
+            lines.append(cadence_line)
+        if scope_line:
+            lines.append(scope_line)
+        return "\n".join(lines) + "\n"
+
+    def _parse(self, body_md):
+        import tempfile as _tf, os as _os
+        w: list[str] = []
+        fd, path = _tf.mkstemp(suffix=".md")
+        self.addCleanup(_os.unlink, path)
+        _os.write(fd, ("# topics\n" + body_md).encode()); _os.close(fd)
+        topics = watch_runner.parse_topics(pathlib.Path(path), warnings=w)
+        return topics, w
+
+    def test_missing_cadence_warns_and_stays_fail_safe(self):
+        topics, w = self._parse(self._topic("t-a", cadence_line=None))
+        self.assertEqual(len(w), 1)
+        self.assertIn("t-a", w[0]); self.assertIn("cadence", w[0].lower())
+        # fail-safe preserved: the topic exists but does not fire
+        self.assertEqual([t.slug for t in topics], ["t-a"])
+        self.assertEqual(topics[0].cadence, "paused")
+
+    def test_typod_cadence_warns_and_never_fires(self):
+        topics, w = self._parse(self._topic("t-b", cadence_line="- **cadence:** wekly"))
+        self.assertEqual(len(w), 1)
+        self.assertIn("wekly", w[0])
+        self.assertFalse(topics[0].is_due(None, watch_runner.date(2026, 8, 2)))
+
+    def test_missing_scope_with_fields_warns_and_drops(self):
+        topics, w = self._parse(self._topic("t-c", scope_line=None))
+        self.assertEqual(topics, [])
+        self.assertEqual(len(w), 1)
+        self.assertIn("t-c", w[0]); self.assertIn("scope", w[0].lower())
+
+    def test_prose_section_stays_silent(self):
+        # The load-bearing existing behavior: an H2 with no recognized field
+        # bullets is prose (e.g. "Report output convention"), not a failed topic.
+        topics, w = self._parse("\n## Report output convention\nJust prose, no field bullets.\n")
+        self.assertEqual(topics, [])
+        self.assertEqual(w, [])
+
+    def test_clean_topic_produces_no_warnings(self):
+        # T-2433: slug must be one that IS in TOPIC_POLICY. "Clean" now means
+        # both well-formed AND registered — an active topic missing a policy
+        # entry is itself a warnable condition (see UnregisteredTopicPolicyTest).
+        # Asserted here rather than hard-coded so the test cannot silently go
+        # vacuous if the topic is ever renamed or de-registered.
+        slug = "context-management"
+        self.assertIn(slug, watch_runner.TOPIC_POLICY)
+        topics, w = self._parse(self._topic(slug))
+        self.assertEqual([t.slug for t in topics], [slug])
+        self.assertEqual(w, [])
+
+    def test_warnings_param_is_optional(self):
+        # The four existing mocks return bare lists; real callers may omit the
+        # accumulator. Signature must tolerate both.
+        import tempfile as _tf, os as _os
+        fd, path = _tf.mkstemp(suffix=".md")
+        self.addCleanup(_os.unlink, path)
+        _os.write(fd, b"# topics\n\n## t-d\n- **cadence:** weekly\n- **scope:** s\n"); _os.close(fd)
+        topics = watch_runner.parse_topics(pathlib.Path(path))
+        self.assertEqual(len(topics), 1)
+
+
+class UnregisteredTopicPolicyTest(unittest.TestCase):
+    """T-2433: an ACTIVE topic with no TOPIC_POLICY entry must warn LOUDLY.
+
+    The failure it prevents is silent by construction: such a topic falls
+    through to _DEFAULT_POLICY, so its findings are filed `unknown-topic` +
+    `interactive-required`, and inbox_consumer skips interactive-required —
+    the dispatch succeeds, the report lands, the ticket exists, and only
+    DELIVERY is disabled. Nine tickets across five topics accumulated for 6-13
+    days before a hand sweep found them.
+    """
+
+    def _parse(self, body_md):
+        import tempfile as _tf, os as _os
+        w: list[str] = []
+        fd, path = _tf.mkstemp(suffix=".md")
+        self.addCleanup(_os.unlink, path)
+        _os.write(fd, ("# topics\n" + body_md).encode()); _os.close(fd)
+        topics = watch_runner.parse_topics(pathlib.Path(path), warnings=w)
+        return topics, w
+
+    @staticmethod
+    def _stanza(slug, cadence):
+        return f"\n## {slug}\n- **cadence:** {cadence}\n- **scope:** watch things\n"
+
+    def test_active_unregistered_topic_warns(self):
+        slug = "totally-unregistered-topic"
+        self.assertNotIn(slug, watch_runner.TOPIC_POLICY)
+        topics, w = self._parse(self._stanza(slug, "weekly"))
+        self.assertEqual([t.slug for t in topics], [slug])
+        self.assertEqual(len(w), 1)
+        self.assertIn(slug, w[0])
+        # The warning must name the CONSEQUENCE, not just the condition — an
+        # operator reading the digest needs to know delivery is off.
+        self.assertIn("TOPIC_POLICY", w[0])
+        self.assertIn("interactive-required", w[0])
+
+    def test_paused_unregistered_topic_does_not_warn(self):
+        # Paused topics do not dispatch, so they need no policy entry. Warning
+        # on them would make the digest noisy forever for five paused stanzas.
+        slug = "paused-unregistered-topic"
+        self.assertNotIn(slug, watch_runner.TOPIC_POLICY)
+        _, w = self._parse(self._stanza(slug, "paused"))
+        self.assertEqual(w, [])
+
+    def test_unpausing_without_registering_warns(self):
+        # The gate is CADENCE, not presence: the moment a paused topic is made
+        # active without a policy entry, it must fail loudly — not a fortnight
+        # later when someone notices the silence.
+        slug = "paused-unregistered-topic"
+        _, w_paused = self._parse(self._stanza(slug, "paused"))
+        _, w_active = self._parse(self._stanza(slug, "weekly"))
+        self.assertEqual(w_paused, [])
+        self.assertEqual(len(w_active), 1)
+
+    def test_invalid_cadence_does_not_stack_a_second_warning(self):
+        # An out-of-vocab cadence already warns and can never fire; telling the
+        # operator to also register it is noise on a louder problem.
+        slug = "bad-cadence-unregistered"
+        _, w = self._parse(self._stanza(slug, "wekly"))
+        self.assertEqual(len(w), 1)
+        self.assertIn("wekly", w[0])
+
+    def test_registered_active_topic_does_not_warn(self):
+        slug = "voice-as-interface"
+        self.assertIn(slug, watch_runner.TOPIC_POLICY)
+        _, w = self._parse(self._stanza(slug, "weekly"))
+        self.assertEqual(w, [])
+
+    def test_warning_survives_missing_accumulator(self):
+        import tempfile as _tf, os as _os
+        fd, path = _tf.mkstemp(suffix=".md")
+        self.addCleanup(_os.unlink, path)
+        _os.write(fd, ("# topics\n" + self._stanza("x-unregistered", "weekly")).encode())
+        _os.close(fd)
+        # Must not raise when callers omit the accumulator.
+        topics = watch_runner.parse_topics(pathlib.Path(path))
+        self.assertEqual([t.slug for t in topics], ["x-unregistered"])
+
+    def test_every_active_topic_in_the_real_topics_file_is_registered(self):
+        """The regression this ticket exists to close, asserted on REAL config.
+
+        Non-vacuity: the file must actually contain active topics, or an empty
+        topics.md would make this pass while proving nothing.
+        """
+        w: list[str] = []
+        topics = watch_runner.parse_topics(watch_runner.TOPICS_FILE, warnings=w)
+        active = [t for t in topics if t.cadence != "paused"]
+        self.assertTrue(active, "topics.md has no active topics — test is vacuous")
+        unregistered = [t.slug for t in active if t.slug not in watch_runner.TOPIC_POLICY]
+        self.assertEqual(
+            unregistered, [],
+            f"active topics missing a TOPIC_POLICY entry: {unregistered}",
+        )
+
+
+class TopicWarningsReportFileTest(unittest.TestCase):
+    """The warning must reach a channel the DIGEST carries — a report-convention
+    file in the day's dir. Chosen surface: the digest globs *.md (non-README)
+    and reads surface/headline frontmatter, while ACTUATION reads only the
+    README index rows — so this file is digest-visible without feeding the
+    auto-filing path (bugs/actuator-followup-ticket-explosion-no-dedup)."""
+
+    def test_writes_warning_report_when_warnings_exist(self):
+        with tempfile.TemporaryDirectory() as td:
+            date_dir = pathlib.Path(td) / "2026-08-02"
+            watch_runner.write_topic_warnings(date_dir, ["topic 'x': missing scope — dropped"])
+            f = date_dir / "_topic-warnings.md"
+            self.assertTrue(f.exists())
+            text = f.read_text()
+            self.assertIn("surface: above-bar", text)
+            self.assertIn("headline:", text)
+            self.assertIn("missing scope", text)
+
+    def test_no_file_when_no_warnings(self):
+        with tempfile.TemporaryDirectory() as td:
+            date_dir = pathlib.Path(td) / "2026-08-02"
+            watch_runner.write_topic_warnings(date_dir, [])
+            self.assertFalse((date_dir / "_topic-warnings.md").exists())
+            self.assertFalse(date_dir.exists(), "no warnings must not even create the dir")
+
+
+
+class TestParseReportFrontmatter(unittest.TestCase):
+    """T-2523: the line-oriented `--- ... ---` frontmatter reader that carries
+    the cross-topic-ownership declaration into extract_findings."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _write(self, text: str) -> Path:
+        p = self.tmp / "r.md"
+        p.write_text(text, encoding="utf-8")
+        return p
+
+    def test_reads_flat_keys(self) -> None:
+        p = self._write(
+            "---\nsurface: above-bar\n"
+            "belongs_to_topic: echo-stack-vendor-changes\n---\n\n# body\n"
+        )
+        fm = watch_runner._parse_report_frontmatter(p)
+        self.assertEqual(fm["surface"], "above-bar")
+        self.assertEqual(fm["belongs_to_topic"], "echo-stack-vendor-changes")
+
+    def test_no_frontmatter_returns_empty(self) -> None:
+        p = self._write("# just a heading\n\nno frontmatter here\n")
+        self.assertEqual(watch_runner._parse_report_frontmatter(p), {})
+
+    def test_missing_file_returns_empty(self) -> None:
+        self.assertEqual(
+            watch_runner._parse_report_frontmatter(self.tmp / "nope.md"), {}
+        )
+
+
+class TestExtractFindingsBelongsToTopic(unittest.TestCase):
+    """T-2523: extract_findings lifts `belongs_to_topic` (and its alias
+    `duplicate_of_topic`) from the report frontmatter, and drops a
+    self-referential declaration so a stray self-tag cannot suppress a report's
+    own actuation."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.date_dir = self.tmp / "2026-08-03"
+        self.date_dir.mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _readme(self, rows: str) -> None:
+        (self.date_dir / "README.md").write_text(
+            "# Watch reports — 2026-08-03\n\n"
+            "| Topic | Status | One-line summary |\n"
+            "|---|---|---|\n" + rows,
+            encoding="utf-8",
+        )
+
+    def test_declaration_is_lifted(self) -> None:
+        (self.date_dir / "voice-as-interface.md").write_text(
+            "---\nsurface: above-bar\n"
+            "belongs_to_topic: echo-stack-vendor-changes\n---\n\n"
+            "# Voice\n\nSpeechmatics billing body.\n",
+            encoding="utf-8",
+        )
+        self._readme(
+            "| [voice-as-interface](voice-as-interface.md) | ok | "
+            "TL;DR: Speechmatics credit billing |\n"
+        )
+        with patch("sys.stderr", io.StringIO()):
+            findings = watch_runner.extract_findings(self.date_dir, {})
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].belongs_to_topic, "echo-stack-vendor-changes")
+
+    def test_alias_duplicate_of_topic_is_lifted(self) -> None:
+        (self.date_dir / "voice-as-interface.md").write_text(
+            "---\nduplicate_of_topic: echo-stack-vendor-changes\n---\n\n"
+            "# Voice\n\nbody.\n",
+            encoding="utf-8",
+        )
+        self._readme(
+            "| [voice-as-interface](voice-as-interface.md) | ok | "
+            "TL;DR: x |\n"
+        )
+        with patch("sys.stderr", io.StringIO()):
+            findings = watch_runner.extract_findings(self.date_dir, {})
+        self.assertEqual(findings[0].belongs_to_topic, "echo-stack-vendor-changes")
+
+    def test_self_reference_is_dropped(self) -> None:
+        (self.date_dir / "voice-as-interface.md").write_text(
+            "---\nbelongs_to_topic: voice-as-interface\n---\n\n# Voice\n\nbody.\n",
+            encoding="utf-8",
+        )
+        self._readme(
+            "| [voice-as-interface](voice-as-interface.md) | ok | TL;DR: x |\n"
+        )
+        with patch("sys.stderr", io.StringIO()):
+            findings = watch_runner.extract_findings(self.date_dir, {})
+        self.assertIsNone(findings[0].belongs_to_topic)
+
+    def test_no_declaration_is_none(self) -> None:
+        # The different-asks / ordinary case: no frontmatter declaration → the
+        # finding files as a normal peer (belongs_to_topic stays None).
+        (self.date_dir / "voice-as-interface.md").write_text(
+            "---\nsurface: routine\n---\n\n# Voice\n\nbody.\n", encoding="utf-8"
+        )
+        self._readme(
+            "| [voice-as-interface](voice-as-interface.md) | ok | TL;DR: x |\n"
+        )
+        with patch("sys.stderr", io.StringIO()):
+            findings = watch_runner.extract_findings(self.date_dir, {})
+        self.assertIsNone(findings[0].belongs_to_topic)
+
+
+class TestActuatePhaseCrossReference(unittest.TestCase):
+    """T-2523: the routing decision in actuate_phase.
+
+    The Context caveat this class defends verbatim from the ticket: distinguish
+    genuine duplicates (same event, same ask — a declared cross-ref) from the
+    same event legitimately raising DIFFERENT asks in different topics (no
+    declaration — both file as peers). A naive same-entity dedupe would destroy
+    the second; only an EXPLICIT researcher declaration routes to the cross-ref
+    path, so the un-declared different-asks shape is never touched.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        (self.tmp / "tickets" / "inbox").mkdir(parents=True)
+        for sub in ("active", "done"):
+            (self.tmp / "tickets" / sub).mkdir(parents=True)
+        self.date_dir = self.tmp / "watch" / "reports" / "2026-08-03"
+        self.date_dir.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _run_with(self, findings, calls):
+        def fake_finding(finding, policy, **kw):
+            calls.append(("finding", finding.slug))
+            return ("filed", "T-1000", "retries=0")
+
+        def fake_xref(finding, primary, policy, **kw):
+            calls.append(("xref", finding.slug, primary.slug))
+            return ("filed", "T-1001", "retries=0")
+
+        with patch("tools.watch_runner.REPO_ROOT", self.tmp), \
+             patch("tools.watch_runner.REPORTS_ROOT", self.tmp / "watch" / "reports"), \
+             patch("tools.watch_runner.extract_findings", return_value=findings), \
+             patch("tools.watch_runner.file_finding", side_effect=fake_finding), \
+             patch("tools.watch_runner.file_cross_reference", side_effect=fake_xref), \
+             patch("tools.watch_runner._read_report_body", return_value=""), \
+             patch("tools.watch_runner.log_actuation_summary"), \
+             patch("tools.watch_runner.write_actuation_ledger"), \
+             patch("tools.watch_runner.git_commit_ledger_entry", return_value=(True, "ok")):
+            watch_runner.actuate_phase(date(2026, 8, 3), [], {})
+
+    def _finding(self, slug, belongs=None):
+        return Finding(
+            slug=slug,
+            tldr=f"{slug} tldr",
+            report_relpath=f"knowledge/watch/reports/2026-08-03/{slug}.md",
+            headline_excerpt="excerpt",
+            belongs_to_topic=belongs,
+        )
+
+    def test_genuine_dup_files_cross_reference(self) -> None:
+        # T-2488/T-2502 shape: echo-stack primary present + voice declares it.
+        primary = self._finding("echo-stack-vendor-changes")
+        secondary = self._finding(
+            "voice-as-interface", belongs="echo-stack-vendor-changes"
+        )
+        calls: list = []
+        self._run_with([primary, secondary], calls)
+        self.assertIn(("finding", "echo-stack-vendor-changes"), calls)
+        self.assertIn(
+            ("xref", "voice-as-interface", "echo-stack-vendor-changes"), calls
+        )
+        # The secondary must NOT also have filed a peer finding.
+        self.assertNotIn(("finding", "voice-as-interface"), calls)
+
+    def test_different_asks_both_file_peers(self) -> None:
+        # Same underlying event, but NO declaration → both are peers. This is
+        # the shape a naive dedupe would wrongly collapse.
+        a = self._finding("echo-stack-vendor-changes")
+        b = self._finding("voice-as-interface")  # no belongs_to_topic
+        calls: list = []
+        self._run_with([a, b], calls)
+        self.assertIn(("finding", "echo-stack-vendor-changes"), calls)
+        self.assertIn(("finding", "voice-as-interface"), calls)
+        self.assertFalse([c for c in calls if c[0] == "xref"])
+
+    def test_declaration_with_absent_primary_files_peer(self) -> None:
+        # Declares a topic that did NOT produce a finding this run (paused /
+        # not-due / errored). We must NOT suppress against a primary that never
+        # filed — the secondary files as a normal peer so the event is not lost.
+        secondary = self._finding(
+            "voice-as-interface", belongs="echo-stack-vendor-changes"
+        )
+        calls: list = []
+        self._run_with([secondary], calls)  # primary absent from the run
+        self.assertIn(("finding", "voice-as-interface"), calls)
+        self.assertFalse([c for c in calls if c[0] == "xref"])
 
 
 if __name__ == "__main__":

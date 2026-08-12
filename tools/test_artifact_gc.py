@@ -404,9 +404,25 @@ class TestFindLiveBuildPids(unittest.TestCase):
         pids = gc.find_live_build_pids(self.workspace, proc_root=self.proc_root)
         self.assertEqual(pids, [])
 
-    def test_missing_proc_root_is_not_busy(self) -> None:
+    def test_missing_proc_root_is_UNKNOWN_not_an_empty_scan(self) -> None:
+        """REPLACES test_missing_proc_root_is_not_busy, which asserted
+        `pids == []` — i.e. it ENCODED the T-2309 conflation and certified it as
+        intended behaviour. Its name carried the whole bug: "missing proc root IS
+        NOT BUSY". A missing proc root is not "not busy", it is "not asked".
+
+        Worth keeping the provenance visible, because the old test is why this was
+        never going to be caught by running the suite: 50/50 green meant the
+        conflation was ASSERTED, not that the branch was safe. Tests are callers
+        too, and a caller that expects the wrong value will defend the defect
+        against anyone who fixes it (specialist, T-2311, on the same shape in
+        test_lease.py:198).
+
+        The distinction that matters to the only caller: [] authorises an rmtree,
+        UNKNOWN must not."""
         pids = gc.find_live_build_pids(self.workspace, proc_root=self.root / "no-proc")
-        self.assertEqual(pids, [])
+        self.assertIs(pids, gc.UNKNOWN)
+        self.assertNotEqual(pids, [], "UNKNOWN must not compare equal to a real "
+                                      "empty scan — that equality is the defect")
 
 
 class TestClassifyTmp(unittest.TestCase):
@@ -458,6 +474,48 @@ class TestClassifyTmp(unittest.TestCase):
         c = self._candidate("T-0006")
         d = gc.classify_tmp(c, self.repo, timedelta(hours=48), NOW, proc_root=self.proc_root)
         self.assertEqual(d.action, "keep")
+
+    def test_unscannable_procfs_is_UNKNOWN_and_must_not_authorise_removal(self) -> None:
+        """T-2309. THE DEFECT: an absent proc_root made `Path.is_dir()` return
+        False *silently*, so the scan returned [] — indistinguishable from "I
+        looked and nothing is building" — and the caller rmtree'd a target/ that a
+        live cargo build could be writing into. Total blindness must fail CLOSED.
+
+        This is the T-2305 shape (unreadable /proc/locks stood in for "unlocked"),
+        with a recursive delete as the consequence instead of a forked lease."""
+        _write_ticket(self.repo, "done", "T-0007", "2026-05-01T00:00:00Z")  # stale
+        c = self._candidate("T-0007")
+        missing_proc = self.repo / "no-such-proc"      # ENOENT -> is_dir() False
+        self.assertFalse(missing_proc.exists(), "fixture precondition")
+
+        self.assertIs(gc.find_live_build_pids(c.workspace, missing_proc), gc.UNKNOWN,
+                      "an unscannable procfs must report UNKNOWN, not an empty list")
+
+        d = gc.classify_tmp(c, self.repo, timedelta(hours=48), NOW,
+                            proc_root=missing_proc)
+        self.assertEqual(d.action, "keep",
+                         "a stale target/ was removed on an UNVERIFIED negative — "
+                         "the module's guarantee is that it only removes when "
+                         "nothing could still be writing into it")
+        self.assertIn("UNKNOWN", d.reason)
+
+    def test_CONTROL_same_ticket_is_removed_when_procfs_IS_scannable(self) -> None:
+        """The control the rest of this ticket family established as mandatory: it
+        proves the fixture can still produce a REMOVE, so the assertion above is
+        discriminating between scannable/unscannable rather than passing because
+        the ticket happened to be un-removable for some unrelated reason."""
+        _write_ticket(self.repo, "done", "T-0007", "2026-05-01T00:00:00Z")
+        c = self._candidate("T-0007")
+        d = gc.classify_tmp(c, self.repo, timedelta(hours=48), NOW,
+                            proc_root=self.proc_root)   # empty but SCANNABLE
+        self.assertEqual(d.action, "remove")
+
+    def test_UNKNOWN_refuses_to_be_coerced_to_a_boolean(self) -> None:
+        """The sentinel raises on truthiness on purpose: the bug was an
+        `if live_pids:` test on a blind value, so a future caller that reintroduces
+        one fails loudly rather than silently taking the delete branch."""
+        with self.assertRaises(TypeError):
+            bool(gc.find_live_build_pids(self.repo, self.repo / "nope"))
 
     def test_done_old_but_live_build_process_is_kept(self) -> None:
         _write_ticket(self.repo, "done", "T-0005", "2026-05-01T00:00:00Z")  # old
