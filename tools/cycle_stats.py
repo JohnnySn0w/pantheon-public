@@ -138,7 +138,7 @@ def extract_ticket_id(entry: dict) -> str | None:
     action = entry.get("action")
     if not isinstance(action, str):
         return None
-    m = re.match(r"^t(\d{4,5})_", action, re.IGNORECASE)
+    m = re.match(r"^t(\d{4,})_", action, re.IGNORECASE)  # T-3215: was capped at 5
     if not m:
         return None
     return f"T-{m.group(1).zfill(4)}"

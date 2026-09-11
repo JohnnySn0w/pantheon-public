@@ -53,6 +53,14 @@ MEMORY_PREFIXES = (
 # parent-folder multi-repo vault, once that repo adopts the convention.
 CROSS_REPO_RE = re.compile(r"^(ADR-\d+$|adr/ADR-|Supplementary Material/)")
 
+# Files that seed another agent's private vault — wikilinks inside them point
+# INTO that agent's namespace (their memory + their vault sections), which live
+# outside this repo. Treated as cross-agent-vault references, not dead. Example:
+# pinned-rules/mnemosyne.md is Orchestrator's seed for mnemosyne (ORG-042); its
+# [[feedback-*]], [[project-*]], [[rulebook-*]] links target mnemosyne's own
+# vault under /home/exocortex/, unreachable from this repo.
+AGENT_VAULT_SEED_PREFIXES = ("pinned-rules/",)
+
 # Code-identifier shape (T-1597 follow-up 2026-07-12): `[[tool_executor.source]]`,
 # `[[hooks.<Event>]]` etc. are code refs written in prose, not vault links — a
 # dotted identifier (a.b) with no path separator and not a real note filename.
@@ -140,7 +148,7 @@ def run(repo_root: Path, list_memory_pointers: bool = False) -> int:
     dead_fail: list[tuple[str, str]] = []
     dead_warn: list[tuple[str, str]] = []
     memory_ptrs: list[tuple[str, str]] = []
-    counts = {"resolved": 0, "cross-repo": 0, "citation": 0, "annotation": 0, "code-ref": 0}
+    counts = {"resolved": 0, "cross-repo": 0, "citation": 0, "annotation": 0, "code-ref": 0, "agent-vault": 0}
     n_links = 0
     for p, text in texts.items():
         rel = str(p.relative_to(repo_root))
@@ -158,6 +166,8 @@ def run(repo_root: Path, list_memory_pointers: bool = False) -> int:
                 counts["annotation"] += 1
             elif "/" not in target and CODE_REF_RE.match(target):
                 counts["code-ref"] += 1
+            elif rel.startswith(AGENT_VAULT_SEED_PREFIXES):
+                counts["agent-vault"] += 1
             elif rel.startswith(HISTORICAL_PREFIXES):
                 dead_warn.append((rel, target))
             else:
@@ -166,8 +176,9 @@ def run(repo_root: Path, list_memory_pointers: bool = False) -> int:
     print(
         f"[vault-link-check] {n_links} wikilinks in {len(files)} files: "
         f"{counts['resolved']} resolved, {len(memory_ptrs)} agent-memory pointers, "
-        f"{counts['cross-repo']} cross-repo, {counts['citation']} citation, "
-        f"{counts['annotation']} annotation, {counts['code-ref']} code-ref, "
+        f"{counts['cross-repo']} cross-repo, {counts['agent-vault']} agent-vault, "
+        f"{counts['citation']} citation, {counts['annotation']} annotation, "
+        f"{counts['code-ref']} code-ref, "
         f"{len(dead_warn)} dead-historical (warn), "
         f"{len(dead_fail)} dead-curated (FAIL)"
     )

@@ -100,6 +100,6 @@ cataloged separately.
 - [`visual-verification-for-ui-tickets.md`](visual-verification-for-ui-tickets.md) §3–5 — the
   deploy-carrier pattern this SOP instantiates (merge ≠ deploy; build + ship + restart + verify-live).
 - `pantheon-pwa/README.md` §"PWA build + serve" — `build:web` / `smoke:build` pipeline, `KINO_WEB_BUILD_DIR`.
-- `adr/ORG-006-kino-pwa.md` — kino-pwa architecture (kino-launcher, kino-agent@ instances, agent registry).
+- `architecture/adr/ORG-006-kino-pwa.md` — kino-pwa architecture (kino-launcher, kino-agent@ instances, agent registry).
 - Precedent carriers: T-0265 (ratification UI), T-0285 (stats panel), T-0287 (chat-bubble width) —
   resolve logs record the build→rsync→restart→verify sequence this SOP formalizes.

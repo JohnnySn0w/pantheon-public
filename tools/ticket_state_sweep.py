@@ -64,14 +64,16 @@ OPERATOR_MOOT_RECENCY_DAYS = 30
 # Resolution-tag regex — case-insensitive, matched against the JSON
 # `action` field ONLY (not rationale, not links). Five patterns per
 # T-0149 §Auto-fix-policy locked-answer.
+# T-3215: digit-width relaxed to 4+ (widening only — the five-pattern SHAPE
+# locked by T-0149 is unchanged).
 _RESOLUTION_RE = re.compile(
-    r"(?:_resolved_|complete_t\d{4}_|t\d{4}_resolved_|resolve_t\d{4}_|t\d{4}_complete_)",
+    r"(?:_resolved_|complete_t\d{4,}_|t\d{4,}_resolved_|resolve_t\d{4,}_|t\d{4,}_complete_)",
     re.IGNORECASE,
 )
 
 # Ticket-id pattern — case-insensitive; first-match-wins; 2+ distinct
 # normalized ids in a single action = ambiguous.
-_TICKET_ID_RE = re.compile(r"t(\d{4})", re.IGNORECASE)
+_TICKET_ID_RE = re.compile(r"t(\d{4,})", re.IGNORECASE)  # T-3215
 
 
 # ---------------------------------------------------------------------------

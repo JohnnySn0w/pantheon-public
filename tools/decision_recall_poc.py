@@ -46,7 +46,7 @@ from collections import Counter
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ADR_DIR = REPO_ROOT / "adr"
+ADR_DIR = REPO_ROOT / "architecture" / "adr"
 TRIGGERS_PATH = Path(__file__).resolve().parent / "decision_recall_triggers.json"
 EVAL_SET_PATH = Path(__file__).resolve().parent / "decision_recall_eval_set.json"
 
@@ -138,7 +138,7 @@ class BM25:
 
 
 # ---------------------------------------------------------------------------
-# ADR corpus loading — READ-ONLY. Never writes to adr/*.md (D2-protected
+# ADR corpus loading — READ-ONLY. Never writes to architecture/adr/*.md (D2-protected
 # source-of-truth); a malformed file is skipped, never fatal to the rest.
 # ---------------------------------------------------------------------------
 
@@ -177,7 +177,7 @@ def _parse_adr_frontmatter(text: str, filename: str) -> tuple[str | None, str | 
 
 
 def load_adrs(adr_dir: Path = ADR_DIR) -> dict[str, dict]:
-    """Parse `adr/*.md` frontmatter -> {org_id: {"title", "date", "path"}}.
+    """Parse `architecture/adr/*.md` frontmatter -> {org_id: {"title", "date", "path"}}.
 
     A file with no parseable id (no `aliases:` and no ORG-NNN filename prefix)
     is skipped — fail-open, since one malformed ADR must not take down

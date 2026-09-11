@@ -61,6 +61,15 @@ _CLEANUP_SIGNAL_RE = re.compile(r"rmtree|\.cleanup\b")
 # today; add an entry only with a real reason a flagged creation is actually safe.
 KNOWN_EXCEPTIONS: dict[str, str] = {}
 
+# T-3097 (Cat E): unittest's module-level fixture idiom. A ClassDef already
+# unifies setUp/tearDown/addCleanup for free — get_source_segment on the class
+# covers every method in it. setUpModule/tearDownModule are two SEPARATE
+# top-level FunctionDefs with no enclosing node to unify them, so a creation in
+# setUpModule with its cleanup in tearDownModule (test_activity_monitor.py's
+# shape) was scope-invisible to the sibling. This is the module-level analogue
+# of the class case, not a new exemption class.
+_MODULE_FIXTURE_PAIR = {"setUpModule": "tearDownModule", "tearDownModule": "setUpModule"}
+
 
 @dataclass
 class Finding:
@@ -119,9 +128,31 @@ def lint_source(src: str, filename: str) -> list[Finding]:
         if f"{filename}::{scope_name}" in KNOWN_EXCEPTIONS:
             continue
         scope_src = ast.get_source_segment(src, scope) if scope is not tree else src
+        sibling_src = _module_fixture_sibling_source(tree, src, scope)
+        if sibling_src:
+            scope_src = f"{scope_src}\n{sibling_src}"
         if not _CLEANUP_SIGNAL_RE.search(scope_src or ""):
             findings.append(Finding(filename, scope_name, factory, node.lineno))
     return findings
+
+
+def _module_fixture_sibling_source(tree: ast.Module, src: str, scope) -> str | None:
+    """setUpModule/tearDownModule's sibling source, else None.
+
+    Only true top-level (`scope in tree.body`) functions qualify — a nested
+    function that happens to be named setUpModule is not the unittest hook.
+    """
+    if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        return None
+    if scope not in tree.body:
+        return None
+    sibling_name = _MODULE_FIXTURE_PAIR.get(scope.name)
+    if sibling_name is None:
+        return None
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == sibling_name:
+            return ast.get_source_segment(src, node)
+    return None
 
 
 def _enclosing_scope(node: ast.AST):

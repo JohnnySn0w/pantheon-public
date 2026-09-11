@@ -838,6 +838,26 @@ class InboxSeatIsOnDemandParkedTest(unittest.TestCase):
             self.assertIn(inbox, panes,
                           f"{inbox!r} in ON_DEMAND_PERSONAS is not a known persona pane")
 
+    def test_parked_within_ceiling_still_parked(self):
+        # T-3454: idle on-demand seat, mail younger than the ceiling = legit park.
+        young = msm.ON_DEMAND_PARK_CEILING_SEC - 1
+        self.assertTrue(msm._inbox_seat_is_on_demand_parked("metis", True, young))
+
+    def test_parked_past_ceiling_is_not_suppressed(self):
+        # T-3454 REGRESSION: an idle on-demand seat whose mail aged PAST the ceiling
+        # is NOT attributed as parked — the broken-wake signature (T-3427 metis/atlas
+        # rot: up, idle, never woken) that park-suppression must stop hiding. Pre-T-3454
+        # this returned True (suppressed) regardless of age.
+        old = msm.ON_DEMAND_PARK_CEILING_SEC + 1
+        self.assertFalse(msm._inbox_seat_is_on_demand_parked("metis", True, old))
+        self.assertFalse(msm._inbox_seat_is_on_demand_parked("atlas", True, old))
+
+    def test_ceiling_none_age_preserves_pre_t3454_behavior(self):
+        # An unsupplied age (None) must not trip the ceiling — pre-T-3454 two-arg
+        # callers keep the pure (allowlist AND idle) behavior.
+        self.assertTrue(msm._inbox_seat_is_on_demand_parked("metis", True, None))
+        self.assertTrue(msm._inbox_seat_is_on_demand_parked("metis", True))
+
 
 class OnDemandParkedWiringTest(unittest.TestCase):
     """T-2665 WIRING (the load-bearing half): deliver() must suppress an allowlisted

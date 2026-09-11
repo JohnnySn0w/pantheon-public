@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, Mapping, Protocol
 
 from tools.harness_adapter.base import PantheonHarnessAdapter
+from tools.harness_adapter import integration as harness_integration
 from tools.harness_adapter.types import (
     DiagnosticObservation,
     DiagnosticReport,
@@ -18,6 +19,11 @@ from tools.harness_adapter.types import (
     RuntimeControllerConfig,
     TmuxTarget,
 )
+from tools.harness_permission_posture import (
+    PermissionPostureError,
+    compile_codex_permission_native,
+)
+from tools.mailbox_writable_roots import MailboxWritableRootError, resolve_mailbox_writable_roots
 
 
 class HarnessDiagnosticProbe(Protocol):
@@ -28,11 +34,6 @@ class RuntimeProfileError(ValueError):
     """Manifest runtime profile validation failed before any harness spawn."""
 
 
-_HARNESS_ALIASES = {
-    "claude": "claude",
-    "claude-code": "claude",
-    "codex": "codex",
-}
 _MODES = {"interactive", "batch"}
 _METERS = {"subscription", "sdk-credit", "api", "enterprise"}
 _QUOTA_SOURCES = {"app-server", "statusline", "provider-api", "unavailable"}
@@ -46,15 +47,15 @@ _METER_QUOTA_PAIRS = {
     ("codex", "enterprise", "provider-api"),
 }
 _NATIVE_KEYS = {
-    "claude": {"permission_mode", "channels"},
-    "codex": {"sandbox", "config_overrides"},
+    "claude": {"permission_mode", "channels", "effort"},
+    "codex": {"sandbox", "config_overrides", "permission_posture", "execution_boundary"},
 }
 
 
 def normalize_harness(value: str) -> HarnessName:
     try:
-        return _HARNESS_ALIASES[value.strip().lower()]  # type: ignore[return-value]
-    except KeyError as exc:
+        return harness_integration.normalize_harness(value)
+    except ValueError as exc:
         raise RuntimeProfileError(f"unsupported harness {value!r}") from exc
 
 
@@ -67,6 +68,10 @@ def resolve_launch_config(
     executable_override: Path | None = None,
     model_override: str | None = None,
     profile_override: str | None = None,
+    bound_persona: str | None = None,
+    bound_mailbox: Path | None = None,
+    mailbox_hub: Path | None = None,
+    root: Path = Path("/"),
 ) -> HarnessLaunchConfig:
     """Resolve the immutable runtime profile selected by role+harness.
 
@@ -107,6 +112,16 @@ def resolve_launch_config(
     )
     sources = [f"harness_runtime.harnesses.{harness}.profiles.{profile_name}"]
     role_block = _role_harness(runtime, role, harness)
+    if harness != "codex":
+        forbidden_posture_keys = {
+            key for key in ("permission_posture", "execution_boundary")
+            if key in role_block
+        }
+        if forbidden_posture_keys:
+            raise RuntimeProfileError(
+                f"{role}.{harness} contains Codex-only permission posture keys: "
+                + ", ".join(sorted(forbidden_posture_keys))
+            )
     if role_block:
         sources.append(f"harness_runtime.roles.{role}.{harness}")
     if executable_override is not None:
@@ -118,7 +133,8 @@ def resolve_launch_config(
     mode = _literal(profile, "mode", _MODES)
     meter = _literal(profile, "meter", _METERS)
     quota_source = _literal(profile, "quota_source", _QUOTA_SOURCES)
-    if (harness, meter, quota_source) not in _METER_QUOTA_PAIRS:
+    known_meter_pair = harness in _NATIVE_KEYS
+    if known_meter_pair and (harness, meter, quota_source) not in _METER_QUOTA_PAIRS:
         raise RuntimeProfileError(
             f"{harness}/{profile_name} incompatible meter/quota_source "
             f"{meter}/{quota_source}"
@@ -140,7 +156,36 @@ def resolve_launch_config(
         native = {}
     if not isinstance(native, Mapping):
         raise RuntimeProfileError(f"{role}.{harness}.native must be a mapping")
+    if harness == "codex":
+        try:
+            native = compile_codex_permission_native(
+                native,
+                role_block=role_block,
+                role=role,
+            )
+        except PermissionPostureError as exc:
+            raise RuntimeProfileError(str(exc)) from exc
     _validate_native_keys(harness, native)
+    writable_roots: tuple[Path, ...] = ()
+    if bound_persona is not None or bound_mailbox is not None or mailbox_hub is not None:
+        if bound_persona is None or bound_mailbox is None or mailbox_hub is None:
+            raise RuntimeProfileError("mailbox writable root resolution requires persona, mailbox, and hub")
+        try:
+            writable_roots = tuple(
+                item.path
+                for item in resolve_mailbox_writable_roots(
+                    manifest,
+                    role=role,
+                    harness=harness,
+                    bound_persona=bound_persona,
+                    bound_mailbox=bound_mailbox,
+                    mailbox_hub=mailbox_hub,
+                    root=root,
+                )
+            )
+        except MailboxWritableRootError as exc:
+            raise RuntimeProfileError(str(exc)) from exc
+
     launch = HarnessLaunchConfig(
         harness=harness,
         profile=profile_name,
@@ -151,7 +196,12 @@ def resolve_launch_config(
         quota_source=quota_source,  # type: ignore[arg-type]
         native=dict(native),
         sources=tuple(sources),
+        writable_roots=writable_roots,
     )
+    try:
+        harness_integration.integration_for(harness).validate_launch_config(launch)
+    except ValueError as exc:
+        raise RuntimeProfileError(str(exc)) from exc
     _validate_fallbacks(manifest, role=role, launch=launch)
     return launch
 
@@ -441,7 +491,8 @@ def _resolve_executable(template: str, *, account_home: Path) -> Path:
 
 
 def _validate_native_keys(harness: HarnessName, native: Mapping[str, Any]) -> None:
-    unknown = sorted(set(native) - _NATIVE_KEYS[harness])
+    allowed = _NATIVE_KEYS.get(harness, set())
+    unknown = sorted(set(native) - allowed)
     if unknown:
         raise RuntimeProfileError(
             f"{harness} native keys are not recognized: {', '.join(unknown)}"
@@ -457,6 +508,12 @@ def _validate_native_keys(harness: HarnessName, native: Mapping[str, Any]) -> No
         if not isinstance(channels, str) or not channels.strip():
             raise RuntimeProfileError(
                 "claude native channels must be a non-empty string"
+            )
+    if harness == "claude" and "effort" in native:
+        effort = native["effort"]
+        if not isinstance(effort, str) or not effort.strip():
+            raise RuntimeProfileError(
+                "claude native.effort must be a non-empty string"
             )
 
 

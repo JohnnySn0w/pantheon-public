@@ -8,7 +8,17 @@ A forge full of repos that were created and never pulled passes every cheap chec
 nothing — the same shape as T-2216 (mailbox.send provisions an empty maildir at any path and
 reports success).
 
-TWO TIERS, because the second is not always available:
+THREE TIERS (tier 0 added T-2881; tiers 1–2 are the original T-2217 checks):
+
+  VISIBILITY-PARITY (tier 0, T-2881 — only meaningful for PUBLIC mirrors). Forgejo
+  pull-mirrors sync CONTENT, not VISIBILITY. A repo flipped private on GitHub leaves
+  its mirror PUBLIC = a silent, anon-viewable exposure the ref/sync checks cannot
+  see. Compare the mirror's `private` flag to the upstream GitHub `private` and flag
+  ONLY the exposure direction (public-on-forge + private-on-github). Defense-in-depth
+  alongside T-2009's REQUIRE_SIGNIN_VIEW=TRUE, not a replacement; fail-safe (never
+  flags when upstream visibility is unreadable).
+
+The original two tiers, because the second is not always available:
 
   SYNC-LIVENESS (always checkable, no GitHub credential needed). Forgejo exposes
   `mirror_updated` — when the pull ACTUALLY RAN, not when it was configured. Stale beyond a
@@ -29,6 +39,23 @@ DESIGN NOTES EARNED THE HARD WAY TODAY:
     ls-remote them. Reporting DRIFT there would be a false alarm on 40 repos at once.
   - The staleness threshold is DERIVED from each repo's own `mirror_interval`, not hardcoded,
     so changing the interval cannot silently invalidate the check.
+  - TRANSIENT NEW-REF LAG IS A WARN, NOT AN ALERT (T-2879). A repo under active dev pushes a
+    ref between the mirror's scheduled pulls; for one cycle the mirror is missing it. That is
+    benign lag the next sync fixes, but the tool exits 1 on ANY missing ref, so a fast-churning
+    repo daily-alerted on it. So: a mirror syncing ON SCHEDULE (age <= its own interval) that
+    shows active churn (retained upstream-deleted refs) and is missing only a SMALL number of
+    refs → WARN (printed, not exit-1). A QUIET repo (no churn), a STALE mirror, or a large drift
+    still DRIFTs. Verified self-resolving: echo-prismatic's 2026-08-11 drift was OK by 2026-08-24.
+  - PURE-ADDITION LAG NEEDS STATE, NOT A CHURN PROXY (T-3114). T-2879's grace is stateless and
+    keys off retained upstream-deleted refs — a repo that only ADDS branches (never deletes) has
+    no such signal, so transient new-ref lag still DRIFTed (the codex-config case, 2026-08-24).
+    The general fix persists per-repo {mirror_updated, missing-refs} across runs (main(), not
+    classify() — which stays pure): a missing ref that SURVIVED a sync (mirror_updated advanced
+    yet the ref is still absent) is a real gap → DRIFT; one not yet through a sync is transient →
+    WARN. Handles addition + deletion churn uniformly. COST (ticket-sanctioned): a quiet repo's
+    real gap is delayed ONE sync — first seen as WARN, escalated to DRIFT once a sync leaves it
+    still missing. State fail-opens: a lost/corrupt state file just resets everyone to a fresh
+    1-cycle grace, never crashes the run.
 """
 from __future__ import annotations
 
@@ -49,9 +76,22 @@ TOKEN_FILE = "~/.forgejo-mirror.token"
 # to ls-remote PRIVATE upstreams so the private mirrors get ref-parity, not just
 # sync-liveness. Absent → private repos stay sync-liveness-only (graceful).
 GITHUB_PAT_FILE = "~/forgejo.tok"
+# T-2881: the upstream owner + REST endpoint for the visibility cross-check. Same
+# owner the mirrors pull from (UPSTREAM above); the metadata GET reuses read_github_pat.
+GITHUB_OWNER = "example-org"
+GITHUB_API_REPO = "https://api.github.com/repos/{owner}/{repo}"
 STALE_MULTIPLE = 2.5   # allow 2.5 intervals before calling a mirror dead
+# T-2879: a mirror that IS syncing on-schedule but is MISSING a small number of
+# upstream refs, on a repo showing active branch churn, is almost always transient
+# new-ref lag (the upstream pushed a ref after the mirror's last pull; the next
+# sync gets it) — not a real gap. That ONE case is downgraded DRIFT→WARN so a
+# fast-churning repo mid-dev stops crying wolf daily. A quiet repo (no churn), a
+# stale mirror, or a large drift still alerts. This is the tunable ceiling on
+# "small" — a drift larger than this always DRIFTs even under active churn.
+TRANSIENT_LAG_MAX_MISSING = 2
 
-OK, DRIFT, STALE, HOLLOW, UNKNOWN = "OK", "DRIFT", "STALE", "HOLLOW", "UNKNOWN"
+OK, DRIFT, STALE, HOLLOW, UNKNOWN, EXPOSED, WARN = (
+    "OK", "DRIFT", "STALE", "HOLLOW", "UNKNOWN", "EXPOSED", "WARN")
 
 
 def read_github_pat(path: str = GITHUB_PAT_FILE) -> str | None:
@@ -80,6 +120,39 @@ def _api(path: str, token: str, *, opener=urllib.request.urlopen):
                  "User-Agent": "pantheon-recovery-mirror-verify/1.0"})
     with opener(req, timeout=30) as r:
         return json.loads(r.read().decode())
+
+
+def github_repo_private(name: str, pat: str | None,
+                        *, opener=urllib.request.urlopen) -> bool | None:
+    """Return the upstream GitHub repo's `private` flag, or None if UNREADABLE.
+
+    T-2881 visibility cross-check. None (no PAT / 404 / network / parse error) is a
+    GRACEFUL 'unknown' the caller must NOT treat as a finding — never flag on an
+    unknown (fail-safe, same posture as the UNKNOWN ref fallback). Read-only GET,
+    reusing the T-2089 answer's cross-check shape: Bearer PAT + `Accept:
+    application/vnd.github+json` against api.github.com/repos/<owner>/<name>.
+
+    KNOWN LIMITATION (why this is defense-in-depth, not a sole guard — per the
+    ticket + the operator's T-2009 REQUIRE_SIGNIN_VIEW ruling): a repo the PAT cannot
+    see returns 404 → None → not flagged. In practice the read_github_pat PAT DOES
+    see the private upstreams (it already ls-remotes them for ref-parity, T-2694),
+    so a flip-to-private is visible here; but a PAT that lost access would silently
+    downgrade this check to no-op rather than false-alarm."""
+    if not pat:
+        return None
+    req = urllib.request.Request(
+        GITHUB_API_REPO.format(owner=GITHUB_OWNER, repo=name),
+        headers={"Authorization": f"Bearer {pat}",
+                 "Accept": "application/vnd.github+json",
+                 "User-Agent": "pantheon-recovery-mirror-verify/1.0",
+                 "X-GitHub-Api-Version": "2022-11-28"})
+    try:
+        with opener(req, timeout=30) as r:
+            data = json.loads(r.read().decode())
+    except (urllib.error.URLError, OSError, ValueError):
+        return None
+    val = data.get("private")
+    return val if isinstance(val, bool) else None
 
 
 def parse_interval(text: str) -> int:
@@ -142,15 +215,31 @@ def ref_set(url: str, *, token: str | None = None, pat: str | None = None,
 
 
 def classify(repo: dict, upstream: set[str] | None, mirrored: set[str] | None,
-             *, now: datetime) -> tuple[str, str]:
-    """Return (verdict, detail). Pure — all I/O is done by the caller, so this is testable."""
+             *, now: datetime, upstream_private: bool | None = None) -> tuple[str, str]:
+    """Return (verdict, detail). Pure — all I/O is done by the caller, so this is testable.
+
+    `upstream_private` (T-2881) is the GitHub `private` flag from github_repo_private(),
+    or None when unreadable. It powers the tier-0 visibility-parity check below."""
     name = repo.get("name", "?")
     if not repo.get("mirror"):
         return UNKNOWN, f"{name}: not a mirror"
 
+    # --- tier 0: visibility parity (T-2881) — the EXPOSURE direction only ---
+    # Forgejo pull-mirrors sync CONTENT, not VISIBILITY: a repo flipped private on
+    # GitHub leaves an anon-viewable PUBLIC mirror behind. That is the one drift
+    # direction that is a security exposure, so it outranks ref/sync health for the
+    # same repo (fix the exposure first; the ref checks resume next run). The reverse
+    # — a PRIVATE mirror of a PUBLIC upstream — is benign over-privacy and is NOT
+    # flagged. upstream_private is None when GitHub visibility is unreadable (no PAT /
+    # API error) → do NOT flag (fail-safe, never cry wolf on an unknown).
+    if upstream_private is True and not repo.get("private"):
+        return EXPOSED, (f"{name}: PUBLIC on forge but PRIVATE on github — visibility "
+                         f"drift = anon-viewable exposure; make the mirror private")
+
     # --- tier 1: did the pull actually RUN? ---
     stamp = repo.get("mirror_updated")
     interval = parse_interval(repo.get("mirror_interval", ""))
+    age = None  # seconds since the pull last RAN; stays None when unparseable
     if stamp and interval:
         try:
             last = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
@@ -159,7 +248,7 @@ def classify(repo: dict, upstream: set[str] | None, mirrored: set[str] | None,
                 return STALE, (f"{name}: last sync {int(age//3600)}h ago, interval "
                                f"{interval//3600}h — configured but not syncing")
         except ValueError:
-            pass
+            age = None
 
     # --- tier 2: ref parity, only when the upstream is readable ---
     if upstream is None:
@@ -183,9 +272,99 @@ def classify(repo: dict, upstream: set[str] | None, mirrored: set[str] | None,
         # would DRIFT every repo as branches churn — the cry-wolf failure this tool
         # exists to avoid. So this is OK, with the retained count noted.
         return OK, f"{name}: all {len(upstream)} upstream refs present (+{len(extra)} retained upstream-deleted)"
-    # Real divergence: the mirror is MISSING refs the upstream has.
     tail = f" (+{len(extra)} extra retained)" if extra else ""
+    # T-2879: transient new-ref lag vs a real gap. When the mirror is syncing ON
+    # SCHEDULE (age <= its OWN interval — a STRICTER bar than the tier-1 2.5x STALE
+    # threshold), the repo shows active branch churn (extra upstream-deleted refs
+    # retained = branches being created/deleted), and only a SMALL number of refs
+    # are missing, this is almost certainly the upstream having pushed a ref since
+    # the mirror's last pull — the next sync resolves it. Downgrade THAT case to
+    # WARN (surfaced in the output, but not a bad/exit-1 alert) so a fast-churning
+    # repo mid-dev stops crying wolf daily. Everything else still DRIFTs: a STALE
+    # mirror (caught at tier 1, untouched), a QUIET repo with no churn (extra is
+    # empty), or a drift larger than the ceiling. The extra-ref-retention accounting
+    # (the +N tail) and the sync-staleness check are unchanged.
+    sync_on_schedule = bool(interval) and age is not None and age <= interval
+    if sync_on_schedule and extra and len(missing) <= TRANSIENT_LAG_MAX_MISSING:
+        return WARN, (f"{name}: {len(missing)} upstream ref(s) not yet mirrored{tail} "
+                      f"— likely transient new-ref lag (synced {int(age//3600)}h ago "
+                      f"< {interval//3600}h interval, active churn); self-resolves next sync")
+    # Real divergence: the mirror is MISSING refs the upstream has.
     return DRIFT, f"{name}: {len(missing)} upstream ref(s) MISSING from mirror{tail}"
+
+
+# --- T-3114: state-based 1-cycle grace for PURE-ADDITION transient new-ref lag ---
+# T-2879's grace is STATELESS: it needs a churn signal (retained upstream-deleted
+# refs) to tell transient lag from a real gap. A PURE-ADDITION repo — one that only
+# pushes NEW branches and never deletes — has NO retained-extra signal, so a ref
+# pushed since the mirror's last pull conservatively reads as DRIFT (the live
+# codex-config case, 2026-08-24). The complete, churn-shape-independent fix persists
+# per-repo state across runs: a missing ref that SURVIVED a sync (mirror_updated
+# advanced yet the ref is STILL absent) is a real gap → DRIFT; a missing ref not yet
+# through a sync is transient → WARN (a 1-cycle grace). This handles pure-addition AND
+# deletion churn uniformly with no fragile activity proxy. DOCUMENTED COST (ticket-
+# sanctioned): a QUIET repo's real gap is delayed one sync — its first observation is
+# WARN, and it escalates to DRIFT once a sync runs with the ref still missing.
+
+STATE_FILE = "forgejo_mirror_verify_state.json"
+
+
+def _state_path() -> str:
+    """Per-run state file: $PANTHEON_STATE_DIR else ~/.local/state/pantheon/."""
+    base = os.environ.get("PANTHEON_STATE_DIR") or os.path.expanduser(
+        "~/.local/state/pantheon")
+    return os.path.join(base, STATE_FILE)
+
+
+def load_state(path: str) -> dict:
+    """{repo: {"mirror_updated": <stamp|None>, "missing": [refs]}}. Fail-open to {}
+    on ANY fault (missing/unreadable/malformed) — a lost state file must degrade to
+    'no grace history' (everything gets a fresh 1-cycle grace), never crash the run."""
+    try:
+        data = json.loads(open(path, encoding="utf-8").read())
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_state(path: str, state: dict) -> None:
+    """Atomically persist state (tmp + os.replace). Best-effort: a write failure is
+    logged to stderr but never fails the verify run (the grace just resets next run)."""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(state, fh, indent=1, sort_keys=True)
+        os.replace(tmp, path)
+    except OSError as e:
+        print(f"warning: could not persist mirror-verify state to {path}: {e}", file=sys.stderr)
+
+
+def apply_transient_grace(name: str, verdict: str, detail: str, *, missing: set[str],
+                          mirror_updated: str | None, prev: dict | None) -> tuple[str, str, dict]:
+    """Wrap a classify() result with the T-3114 state-based 1-cycle grace and return
+    (verdict, detail, new_state_entry). Only DRIFT is reconsidered — every other verdict
+    passes through unchanged (its current missing-set is still recorded for next run).
+
+    A missing ref is a REAL gap iff it was ALSO missing last run AND a sync has run since
+    (mirror_updated advanced) — i.e. it SURVIVED a sync while still absent. Otherwise it is
+    within its grace cycle (newly missing, or no sync yet) → WARN. Without a mirror_updated
+    stamp we cannot reason about 'survived a sync', so we do NOT grant grace (keep DRIFT) —
+    the safe direction for a backup mirror is to alert, never to silence indefinitely."""
+    new_entry = {"mirror_updated": mirror_updated, "missing": sorted(missing)}
+    if verdict != DRIFT:
+        return verdict, detail, new_entry
+    if not mirror_updated:
+        return verdict, detail, new_entry  # no sync stamp → cannot confirm grace; keep DRIFT
+    prev_missing = set(prev.get("missing", [])) if isinstance(prev, dict) else set()
+    prev_stamp = prev.get("mirror_updated") if isinstance(prev, dict) else None
+    synced_since = mirror_updated != prev_stamp
+    real = (missing & prev_missing) if synced_since else set()
+    if real:
+        return DRIFT, (f"{name}: {len(real)} upstream ref(s) MISSING from mirror — "
+                       f"survived a sync (real gap)"), new_entry
+    return WARN, (f"{name}: {len(missing)} upstream ref(s) not yet mirrored — within the "
+                  f"1-cycle grace (not yet through a sync); self-resolves or escalates next run"), new_entry
 
 
 def main(argv=None) -> int:
@@ -213,6 +392,11 @@ def main(argv=None) -> int:
     # ref-parity. Absent → private repos degrade to sync-liveness-only (graceful).
     gh_pat = read_github_pat()
 
+    # T-3114: load the per-repo grace state (missing-ref sets + last mirror_updated).
+    state_path = _state_path()
+    prev_state = load_state(state_path)
+    new_state: dict = {}
+
     now = datetime.now(timezone.utc)
     results, bad = [], 0
     for repo in repos:
@@ -221,12 +405,29 @@ def main(argv=None) -> int:
         up = ref_set(UPSTREAM.format(repo=name),
                      pat=gh_pat if repo.get("private") else None)
         mir = ref_set(f"{FORGE}/{ORG}/{name}.git", token=cred)
-        verdict, detail = classify(repo, up, mir, now=now)
+        # T-2881: only a PUBLIC mirror can be an exposure — skip the GitHub
+        # metadata GET for private mirrors (a private mirror is safe regardless of
+        # upstream visibility, and it saves an API call per private repo).
+        upstream_private = github_repo_private(name, gh_pat) if not repo.get("private") else None
+        verdict, detail = classify(repo, up, mir, now=now, upstream_private=upstream_private)
+        # T-3114: state-based 1-cycle grace — only when we have a real ref comparison
+        # (both sides readable). On an UNREADABLE run, carry the prior grace state
+        # forward untouched so a transient outage doesn't reset the grace history.
+        if up is not None and mir is not None:
+            verdict, detail, entry = apply_transient_grace(
+                name, verdict, detail, missing=up - mir,
+                mirror_updated=repo.get("mirror_updated"), prev=prev_state.get(name))
+            new_state[name] = entry
+        elif name in prev_state:
+            new_state[name] = prev_state[name]
         results.append({"repo": name, "verdict": verdict, "detail": detail})
-        if verdict in (DRIFT, STALE, HOLLOW):
+        if verdict in (DRIFT, STALE, HOLLOW, EXPOSED):
             bad += 1
         if not (args.quiet_ok and verdict == OK):
             print(f"  {verdict:<7} {detail}")
+
+    # Persist the refreshed grace state (repos absent this run are pruned).
+    save_state(state_path, new_state)
 
     if args.json:
         print(json.dumps(results, indent=1))

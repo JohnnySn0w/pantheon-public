@@ -62,7 +62,7 @@ This SOP is the *post-violation* remediation. The *pre-violation* discipline is 
 
 - **Principles + directives:** P3 (decisions justify upward — the substrate that framing-collapse undermines); P5 (roles don't hop — implementer doesn't ratify); D6 (plan-first protocol + locked-answer-deviation handling — the violated rule + the literal-quote-demand requirement); D8 (HO self-discipline — framing-language scan codified as standing pre-commit discipline); D3 (autonomy bar — Path C placement).
 - **Policies:** `rulebook/policies/trust-posture.md` (auto-approve scope for REBOUND + revert); `rulebook/policies/autonomy.md`.
-- **ADRs:** `adr/ORG-002` (principles/directives split — this SOP slots at the policy-tier).
+- **ADRs:** `architecture/adr/ORG-002` (principles/directives split — this SOP slots at the policy-tier).
 - **Incidents:** `incidents/2026-05-09-b33-ticket-state-sweep-multi-violation/` (founding multi-violation case; DECISIONS-inversion variant).
 - **Lessons:** [`lessons/instruction-fidelity-collapse-discipline-vs-architecture.md`](../../lessons/instruction-fidelity-collapse-discipline-vs-architecture.md) (broader corpus framing).
 - **Sibling SOPs:** [`implementer-self-merge-to-main.md`](implementer-self-merge-to-main.md) (often co-occurs with framing-collapse; revert mechanics shared); `plan-first-violation.md` (sibling — pending T-0196 #3 authoring); `locked-answer-deviation-doubled-down.md` (sibling — pending T-0196 #5 authoring; deepest-overlap with this SOP).

@@ -23,9 +23,15 @@ NOW = 1_000_000_000.0
 HOUR = 3600.0
 
 
-def _cred(refresh="rt-valid", exp_offset_h=5.0):
-    """Build an oauth dict expiring exp_offset_h hours from NOW."""
-    return {"accessToken": "at", "refreshToken": refresh, "expiresAt": int((NOW + exp_offset_h * HOUR) * 1000)}
+def _cred(refresh="rt-valid", exp_offset_h=5.0, rte_offset_h=None):
+    """Build an oauth dict; access token expires exp_offset_h hours from NOW.
+
+    rte_offset_h: if set, add refreshTokenExpiresAt that many hours from NOW (the
+    ~30-day refresh cliff). Default None = field absent (pre-cliff-detection creds)."""
+    c = {"accessToken": "at", "refreshToken": refresh, "expiresAt": int((NOW + exp_offset_h * HOUR) * 1000)}
+    if rte_offset_h is not None:
+        c["refreshTokenExpiresAt"] = int((NOW + rte_offset_h * HOUR) * 1000)
+    return c
 
 
 class Classify(unittest.TestCase):
@@ -52,6 +58,27 @@ class Classify(unittest.TestCase):
         cls, detail = self._classify_with("ok", _cred(refresh="rt", exp_offset_h=-3))
         self.assertEqual(cls, "OK")
         self.assertIn("auto-renew", detail)
+
+    def test_refresh_cliff_within_window_is_near_cliff(self):
+        # refresh token expires in 2 days — inside the 3-day warn window (T-2973 cascade)
+        cls, detail = self._classify_with("ok", _cred(refresh="rt", rte_offset_h=48))
+        self.assertEqual(cls, "NEAR_CLIFF")
+        self.assertIn("cliff", detail.lower())
+
+    def test_refresh_cliff_already_passed_is_near_cliff(self):
+        # refresh token already expired — the atlas/orchestrator cascade state
+        cls, _ = self._classify_with("ok", _cred(refresh="rt", rte_offset_h=-5))
+        self.assertEqual(cls, "NEAR_CLIFF")
+
+    def test_refresh_cliff_far_out_is_ok(self):
+        # refresh token expires in 10 days — well outside the window
+        cls, _ = self._classify_with("ok", _cred(refresh="rt", rte_offset_h=240))
+        self.assertEqual(cls, "OK")
+
+    def test_absent_refreshTokenExpiresAt_is_ok(self):
+        # pre-cliff-detection creds (no field) must still classify OK — no false cliff
+        cls, _ = self._classify_with("ok", _cred(refresh="rt", exp_offset_h=5))
+        self.assertEqual(cls, "OK")
 
     def test_unreadable_is_malformed(self):
         cls, _ = self._classify_with("unreadable (rc=1)", None)
@@ -124,6 +151,71 @@ class CheckLoop(unittest.TestCase):
             cem.check(["specialist", "orchestrator"], dry_run=False, now=NOW)
         malert.assert_not_called()
         mwake.assert_not_called()
+
+    def test_skip_list_suppresses_alert_for_offline_seat(self):
+        # T-2973: an intentionally offline/retired seat (in PANTHEON_CRED_ALERT_SKIP)
+        # must NOT alert/wake even with a bad credential, and must not count as a problem.
+        with self._patched_classify(), \
+             mock.patch.object(cem, "CREDENTIAL_ALERT_SKIP", {"specialist"}), \
+             mock.patch.object(cem, "_load_state", return_value={}), \
+             mock.patch.object(cem, "_save_state"), \
+             mock.patch.object(cem, "_track_login_event"), \
+             mock.patch.object(cem, "_wake_recovery") as mwake, \
+             mock.patch.object(cem, "_alert") as malert:
+            problems = cem.check(["specialist", "orchestrator"], dry_run=False, now=NOW)
+        malert.assert_not_called()
+        mwake.assert_not_called()
+        self.assertEqual(problems, 0)  # skipped agent is not a counted problem
+
+    def test_registry_mute_suppresses_alert(self):
+        # T-2978: a persona muted via the unified registry (is_muted) is suppressed
+        # even with the legacy env skip EMPTY — the registry is the go-forward path.
+        with self._patched_classify(), \
+             mock.patch.object(cem, "CREDENTIAL_ALERT_SKIP", set()), \
+             mock.patch.object(cem, "_persona_is_muted", side_effect=lambda a: a == "specialist"), \
+             mock.patch.object(cem, "_load_state", return_value={}), \
+             mock.patch.object(cem, "_save_state"), \
+             mock.patch.object(cem, "_track_login_event"), \
+             mock.patch.object(cem, "_wake_recovery") as mwake, \
+             mock.patch.object(cem, "_alert") as malert:
+            problems = cem.check(["specialist", "orchestrator"], dry_run=False, now=NOW)
+        malert.assert_not_called()
+        mwake.assert_not_called()
+        self.assertEqual(problems, 0)
+
+    def test_registry_mute_does_not_suppress_other_agents(self):
+        # Muting specialist via the registry must leave a different bad agent still alerting.
+        def fake(agent, cfg, now=None):
+            return ("MALFORMED", "no accessToken")
+        with mock.patch.object(cem, "classify", side_effect=fake), \
+             mock.patch.object(cem, "CREDENTIAL_ALERT_SKIP", set()), \
+             mock.patch.object(cem, "_persona_is_muted", side_effect=lambda a: a == "specialist"), \
+             mock.patch.object(cem, "_load_state", return_value={}), \
+             mock.patch.object(cem, "_save_state"), \
+             mock.patch.object(cem, "_track_login_event"), \
+             mock.patch.object(cem, "_wake_recovery"), \
+             mock.patch.object(cem, "_alert") as malert:
+            problems = cem.check(["specialist", "orchestrator"], dry_run=False, now=NOW)
+        self.assertEqual(malert.call_count, 1)
+        self.assertIn("orchestrator", malert.call_args[0][0])
+        self.assertEqual(problems, 1)
+
+    def test_skip_list_does_not_suppress_other_agents(self):
+        # Skipping specialist must leave a DIFFERENT bad agent still alerting.
+        def fake(agent, cfg, now=None):
+            return ("MALFORMED", "no accessToken")  # both bad
+        with mock.patch.object(cem, "classify", side_effect=fake), \
+             mock.patch.object(cem, "CREDENTIAL_ALERT_SKIP", {"specialist"}), \
+             mock.patch.object(cem, "_load_state", return_value={}), \
+             mock.patch.object(cem, "_save_state"), \
+             mock.patch.object(cem, "_track_login_event"), \
+             mock.patch.object(cem, "_wake_recovery") as mwake, \
+             mock.patch.object(cem, "_alert") as malert:
+            problems = cem.check(["specialist", "orchestrator"], dry_run=False, now=NOW)
+        # only orchestrator alerts; specialist is skipped
+        self.assertEqual(malert.call_count, 1)
+        self.assertIn("orchestrator", malert.call_args[0][0])
+        self.assertEqual(problems, 1)
 
 
 class WardWake(unittest.TestCase):

@@ -209,6 +209,14 @@ class DowngradeStore(Protocol):
         """Fold this handshake's advertised set into the endpoint's memory."""
         ...
 
+    def reset(self, endpoint_id: str) -> None:
+        """Clear an endpoint's downgrade memory — the deliberate operator escape
+        hatch for a legitimately retired scheme. Contracted in the Protocol
+        (T-2867 HANDSHAKE-2) so a persistent-store swap cannot silently drop it
+        and leave a high-water mark permanently un-clearable, which (with
+        HANDSHAKE-1) is the only way out of a poisoned/legit-downgrade state."""
+        ...
+
 
 class InMemoryDowngradeStore:
     """Default DowngradeStore: a high-water mark (union of every advertised set
@@ -292,7 +300,7 @@ class Outcome(Enum):
     ABORTED = "aborted"
 
 
-@dataclass
+@dataclass(frozen=True)
 class HandshakeResult:
     """The terminal record of one handshake.
 
@@ -302,6 +310,17 @@ class HandshakeResult:
     `content_trusted` is ALWAYS False — the D4 invariant (lines 61-62): a
     verified identity gates who may speak, never whether what they say is
     trusted. It is intentionally not settable to True anywhere in this module.
+
+    Frozen (T-2867 HANDSHAKE-3): a caller cannot reassign `content_trusted = True`
+    (or any field) post-construction, closing the D4 mutation-by-caller gap and
+    matching the frozen TxtResolution / AllowlistEntry. Both construction sites
+    (`_abort`, the admit path) build the whole record at once, so freezing needs
+    no construction refactor. NB the `log` list itself stays mutable (frozen
+    blocks attribute REASSIGNMENT, not deep-freeze); no invariant depends on log
+    immutability. `log` is `compare=False` so it is excluded from the generated
+    __eq__/__hash__ — the result's identity is its verdict (outcome/scheme/
+    principal/reason), not the diagnostic narration, and this keeps the frozen
+    record cleanly hashable rather than hashable-in-name-but-raising on the list.
     """
 
     outcome: Outcome
@@ -310,7 +329,7 @@ class HandshakeResult:
     principal: str | None = None
     abort_reason: AbortReason | None = None
     content_trusted: bool = False  # D4 invariant — never True.
-    log: list[str] = field(default_factory=list)
+    log: list[str] = field(default_factory=list, compare=False)
 
     @property
     def admitted(self) -> bool:
@@ -352,6 +371,22 @@ class PassportHandshake:
         self._resolve = txt_resolver
         self._fetch = card_fetcher
         self._allowlist = allowlist
+        # T-2867 HANDSHAKE-4: validate the adapter map at WIRING time. Step 3 does
+        # `self._adapters[selected].verify(...)`, trusting that the adapter stored
+        # under scheme key K actually presents scheme K. A mis-wired map (e.g.
+        # {MTLS: BearerAdapter()}) would run the WRONG scheme's verifier against a
+        # selection made for K. That is an operator PROGRAMMING error, so it fails
+        # fast HERE (raising at construction, the one place run()'s "never raises
+        # for a policy failure" contract allows) rather than as a bare `assert`
+        # (stripped under -O) or a silent mis-verification at handshake time.
+        for _key, _adapter in adapters.items():
+            if _adapter.scheme != _key:
+                raise ValueError(
+                    f"adapter map mis-wired: key {_key.name} holds an adapter "
+                    f"presenting {_adapter.scheme.name}; the key must equal "
+                    "adapter.scheme (a selection for one scheme would otherwise "
+                    "run another scheme's verifier)"
+                )
         self._adapters = adapters
         self._downgrade = downgrade_store or InMemoryDowngradeStore()
 

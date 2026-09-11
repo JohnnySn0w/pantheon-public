@@ -488,6 +488,75 @@ class TestCanonicalDocEditBlocked(unittest.TestCase):
         self.assertFalse(_edit_blocked("/home/claude/pantheon-config/adr/ORG-040.md"))
 
 
+class TestSelfDeclaredD2KnowledgeFileBlocked(unittest.TestCase):
+    """T-3089: knowledge/watch/topics.md self-declares 'Workers do not edit this
+    file (D2)' in its own header, but the structural guard silently permitted
+    worker Edit/Write anyway (T-3039 reviewer finding). knowledge/ is otherwise
+    legitimately worker-writable (research reports, watch-dispatch artifacts) so
+    this is an exact-path exception, not a blanket knowledge/ block — the sibling
+    class below locks that non-coverage in.
+    """
+
+    def test_edit_watch_topics_blocked(self):
+        self.assertTrue(
+            _edit_blocked("/home/claude/pantheon-config/knowledge/watch/topics.md", agent_type="implementer")
+        )
+
+    def test_write_watch_topics_blocked(self):
+        self.assertTrue(
+            _edit_blocked(
+                "/home/claude/pantheon-config/knowledge/watch/topics.md", tool="Write", agent_type="researcher"
+            )
+        )
+
+    def test_worktree_watch_topics_blocked(self):
+        self.assertTrue(
+            _edit_blocked("/tmp/pantheon-config-T-3089/knowledge/watch/topics.md", agent_type="implementer")
+        )
+
+    def test_ho_may_edit_watch_topics(self):
+        # agent_type absent → HO → never restricted, even on a self-declared-D2 file.
+        self.assertFalse(_edit_blocked("/home/claude/pantheon-config/knowledge/watch/topics.md"))
+
+
+class TestOtherKnowledgeFilesRemainWorkerWritable(unittest.TestCase):
+    """Guard against over-broadening: knowledge/ is legitimately worker-writable
+    (research reports, watch-dispatch artifacts) except for the one exact-path
+    exception above. These must stay ALLOWED for a subagent.
+    """
+
+    def test_edit_watch_report_allowed(self):
+        self.assertFalse(
+            _edit_blocked(
+                "/home/claude/pantheon-config/knowledge/watch/reports/2026-08-23/topic.md",
+                agent_type="researcher",
+            )
+        )
+
+    def test_edit_episodic_notes_allowed(self):
+        self.assertFalse(
+            _edit_blocked(
+                "/home/claude/pantheon-config/knowledge/episodic/2026-08-23-slug/notes.md",
+                agent_type="implementer",
+            )
+        )
+
+    def test_write_episodic_readme_still_protected_by_readme_rule(self):
+        # Not a knowledge/-specific carve-out: README.md stays blocked everywhere,
+        # including under knowledge/ — via the pre-existing README rule, not the
+        # new exact-path exception.
+        self.assertTrue(
+            _edit_blocked(
+                "/home/claude/pantheon-config/knowledge/episodic/README.md", tool="Write", agent_type="implementer"
+            )
+        )
+
+    def test_edit_watch_readme_still_protected_by_readme_rule(self):
+        self.assertTrue(
+            _edit_blocked("/home/claude/pantheon-config/knowledge/watch/README.md", agent_type="implementer")
+        )
+
+
 class TestWorkerCodeEditsAllowed(unittest.TestCase):
     """No false-positives: writing code + sibling-repo docs stays ALLOWED."""
 

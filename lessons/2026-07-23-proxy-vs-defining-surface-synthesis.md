@@ -949,7 +949,7 @@ common one in this org: a shared surface, several writers, one cached view per r
   **33.61** — insensitive to the glyph-ink assumption (0.55→0.65 moves it 0.07 ch). ⛔ **The prior
   text of this bullet said "this seat has no raster decoder." THAT WAS FALSE — `ffmpeg` was
   installed the whole time; I had checked for PIL/numpy/cv2 and generalised four failed imports into
-  a capability claim.** See [[tooling-no-binary-read]]: **a capability claim is a measurement and
+  a capability claim.** See `tooling-no-binary-read`: **a capability claim is a measurement and
   decays like any other — "I can't do X" needs re-testing at the moment of use, not citing from
   memory.** The single-source caveat was **real when written** and the correct call at the time; what
   was wrong was the reason I couldn't lift it. **Gap ~3.5

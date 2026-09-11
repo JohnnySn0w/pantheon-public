@@ -2,7 +2,7 @@
 """Pantheon ticket-grooming staleness scanner.
 
 Implements the cron'd grooming agent specified in
-`adr/ORG-003-ticket-system.md` §"Grooming agent (Recovery)".
+`architecture/adr/ORG-003-ticket-system.md` §"Grooming agent (Recovery)".
 
 Per fire (single-shot, no subcommands):
 
@@ -33,6 +33,7 @@ Designed for daily cron at 12:00 UTC on `claude-fallback` (Recovery).
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -245,6 +246,481 @@ def _parse_log_entry(line: str) -> tuple[datetime, str] | None:
     if ts is None:
         return None
     return ts, m.group("actor")
+
+
+# ---------------------------------------------------------------------------
+# T-3440 / ORG-089 §Decision.4: active-spend state machine over the transition
+# log. v1 spend unit = time-in-active (§Decision.4). A closed two-state machine
+# (interval open / closed); every recognized verb is a deterministic transition,
+# every UNRECOGNIZED token is a NO-OP (fail-safe: an unknown verb can never
+# corrupt the accounting or crash the breaker).
+# ---------------------------------------------------------------------------
+
+# The two re-decision verbs that RESTART the overrun clock (§Decision.4: re-earn
+# and reopen "restart the overrun clock"; adjust-appetite does NOT — DECISION-6).
+_SPEND_RESET_VERBS = frozenset({"re-earn", "reopen"})
+
+
+def _extract_log_verb(rest: str) -> str:
+    """From a bullet's post-`[actor]` remainder, extract the leading verb token —
+    up to the first `@` (sha stamp), `;` (detail separator), or whitespace. A
+    trailing `:` (hand-built `reopened:`-style bullets) is stripped by the caller."""
+    m = re.match(r"\s*([^@;\s]+)", rest or "")
+    return m.group(1) if m else ""
+
+
+def _classify_spend_verb(actor: str, verb: str) -> str:
+    """Classify one transition entry for the interval machine:
+    'open' | 'close' | 'reset' | 'noop'.
+
+    Handles BOTH the present-tense tokens the falsifier uses
+    (claim/block/unblock/resolve) and the past-tense forms real logs carry via
+    `_LOG_VERB` (claimed/blocked/resolved/unclaimed), plus the cascade's
+    `actor='auto-unblock'` resume and the manual block-gate-cleared resume notes
+    ('not_before gate cleared', 'depends_on gate(s) cleared'). Anything else —
+    annotate/addendum/note/labels/stale/overrun-flag/adjust-appetite/filed — is a
+    NO-OP. This heterogeneity is why v1 is time-in-active and honestly imperfect
+    (ADR §Deferred: truer spend units replace it later); the fail-safe direction
+    is absolute, so ambiguity resolves to NO-OP, never to a spurious interval."""
+    a = (actor or "").strip().lower()
+    v = (verb or "").strip().lower().rstrip(":")
+    if v in _SPEND_RESET_VERBS:
+        return "reset"
+    # OPEN / resume active work.
+    if v.startswith("claim"):                       # claim / claimed
+        return "open"
+    if "unblock" in v or a == "auto-unblock":       # unblock / unblocked / cascade
+        return "open"
+    if "cleared" in v and ("gate" in v or "depends_on" in v or "not_before" in v):
+        return "open"                               # a block gate was cleared → resume
+    # CLOSE / pause or terminate.
+    if v.startswith("block"):                       # blocked (gate set → pause)
+        return "close"
+    if v.startswith("unclaim"):                     # unclaimed (back to inbox)
+        return "close"
+    if v.startswith("resolve"):                     # resolved (terminal)
+        return "close"
+    if v.startswith("drop"):                        # drop / dropped (terminal)
+        return "close"
+    return "noop"
+
+
+def _active_spend_impl(body: str, now: datetime) -> tuple[int, bool]:
+    """Return (active_spend_seconds, malformed_flag). Never raises.
+
+    malformed_flag is set (and the offending transition SKIPPED) on an open verb
+    while already open, a close verb while not open, a non-monotonic timestamp,
+    or an unparseable ts — the overrun check reads the flag to DIGEST-FLAG the
+    ticket and DECLINE to fire the breaker on it (fail-safe)."""
+    open_since: datetime | None = None
+    accum = 0.0
+    malformed = False
+    for line in _iter_transition_log_lines(body):
+        m = _LOG_BULLET_RE.match(line)
+        if not m:
+            continue
+        ts = _parse_iso(m.group("ts"))
+        if ts is None:
+            malformed = True
+            continue
+        cls = _classify_spend_verb(m.group("actor"), _extract_log_verb(m.group("rest")))
+        if cls == "noop":
+            continue
+        if cls == "reset":
+            accum = 0.0
+            open_since = ts
+        elif cls == "open":
+            if open_since is not None:
+                malformed = True          # open while already open
+            open_since = ts
+        elif cls == "close":
+            if open_since is None:
+                malformed = True          # close while not open
+            else:
+                delta = (ts - open_since).total_seconds()
+                if delta >= 0:
+                    accum += delta
+                else:
+                    malformed = True      # non-monotonic timestamps
+                open_since = None
+    # An in-flight (still-open) interval accrues to `now` — the whole point of
+    # detecting overrun on a live ticket.
+    if open_since is not None:
+        delta = (now - open_since).total_seconds()
+        if delta > 0:
+            accum += delta
+    return int(accum), malformed
+
+
+def active_spend_from_transition_log(ticket, now: datetime | None = None) -> int:
+    """Active-spend seconds for a ticket, over its transition-log verbs
+    (ORG-089 §Decision.4, T-3440 Scope C). Closed state machine: intervals open
+    on claim/unblock and reset on re-earn/reopen, close on block/unclaim/resolve/
+    drop; annotations are no-ops; an in-flight interval accrues to `now`.
+    Malformed order is skipped, never raised (fail-safe).
+
+    `ticket` may be a parsed Ticket (has `.body`) or a raw body string."""
+    if now is None:
+        now = datetime.now(timezone.utc)
+    body = getattr(ticket, "body", ticket)
+    seconds, _malformed = _active_spend_impl(body, now)
+    return seconds
+
+
+# ---------------------------------------------------------------------------
+# T-3440 / ORG-089 §Decision.4 + §Surface 4a: appetite calibration store,
+# calibration policy, completeness check, and overrun check.
+# ---------------------------------------------------------------------------
+
+# The ORG-089 landing date — completeness grandfather boundary (D-H / DECISION-10)
+# and the file-time legacy boundary. ADRs ratified before this are exempt.
+_ORG089_LANDING = datetime(2026, 9, 6, tzinfo=timezone.utc)
+
+
+def _appetite_ledger_root() -> Path:
+    """The warm-up calibration store root (fleet-git-synced by construction,
+    §Build plan). Evaluated at call time so a patched REPO_ROOT (tests) is
+    honored, mirroring _default_adr_dirs."""
+    return REPO_ROOT / "ledger" / "appetite"
+
+
+def _iso_week_shard_name(now: datetime) -> str:
+    """`<ISO-year>-W<NN>.jsonl` for `now` (zero-padded 2-digit ISO week, matching
+    the sibling ledger/<year>-W<NN>/ dir convention; T-3440 Q6-confirmed the
+    appetite sub-tree uses .jsonl FILES, not dirs)."""
+    y, w, _ = now.isocalendar()
+    return f"{y}-W{w:02d}.jsonl"
+
+
+def _appetite_outcome_log(
+    *,
+    tid: str,
+    appetite,
+    outcome: str,
+    now: datetime,
+    active_spend_s: int | None = None,
+    budget_s: int | None = None,
+    ledger_root: Path | None = None,
+) -> Path | None:
+    """Append one terminal-transition event to the weekly appetite shard
+    (ledger/appetite/<year>-W<NN>.jsonl). Fires on resolve->shipped /
+    drop->dropped / reopen->reopened (T-3440 Scope C). Fail-safe: NEVER raises
+    (calibration data, not a gate — §Build plan).
+
+    Returns the shard Path on a successful write, None on any failure. T-3451:
+    the caller (ticket.py's `_do_transition`) folds a non-None return into the
+    SAME commit as the transition it fired from, so the event ships atomically
+    instead of landing on disk uncommitted."""
+    try:
+        root = ledger_root or _appetite_ledger_root()
+        root.mkdir(parents=True, exist_ok=True)
+        shard = root / _iso_week_shard_name(now)
+        event = {
+            "ts": _now_iso(now),
+            "tid": tid,
+            "appetite": appetite,
+            "outcome": outcome,
+            "active_spend_s": active_spend_s,
+            "budget_s": budget_s,
+        }
+        with shard.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(event, sort_keys=True) + "\n")
+        return shard
+    except Exception:  # noqa: BLE001 — outcome logging must never break a caller
+        return None
+
+
+@dataclass(frozen=True)
+class AppetitePolicy:
+    mode: str
+    calibration_version: int
+    bands: dict
+
+
+def load_appetite_policy(policy_path: Path) -> "AppetitePolicy | None":
+    """Load rulebook/policies/appetite-time-budget.yaml.
+
+    Returns None — meaning the overrun check stays SILENT — when the file is
+    absent OR unparseable OR mode != 'active' OR calibration_version == 0 (the
+    warm-up generate-only state, §Decision.4 / D-D). Only a calibrated,
+    active-mode policy yields a non-None AppetitePolicy. Fail-safe throughout.
+    T-3430 is the writer that flips mode:active + calibration_version>0."""
+    try:
+        text = policy_path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    data = _load_yaml(text, source=str(policy_path))
+    if not isinstance(data, dict):
+        return None
+    mode = str(data.get("mode") or "").strip()
+    try:
+        cver = int(data.get("calibration_version") or 0)
+    except (TypeError, ValueError):
+        cver = 0
+    bands = data.get("bands") if isinstance(data.get("bands"), dict) else {}
+    if mode != "active" or cver == 0:
+        return None
+    return AppetitePolicy(mode=mode, calibration_version=cver, bands=bands)
+
+
+@dataclass
+class AppetiteCompletenessFinding:
+    adr_id: str
+    reason: str  # 'appetite-field' | 'appetite-section' | 'riskiest-section'
+
+
+# Boilerplate/placeholder markers that mean a section body is not substantive.
+_BOILERPLATE_MARKERS = ("TODO", "TBD", "FIXME", "<...>", "XXX", "PLACEHOLDER")
+# The two required RECORD-mode section headers (case-insensitive prefix match).
+_APPETITE_HEADER = "appetite"
+_RISKIEST_HEADER = "riskiest assumption"
+
+
+def _adr_ratify_date(status_text: str | None, fm: dict) -> datetime | None:
+    """Best-effort ratify date for the grandfather test: a `Ratified YYYY-MM-DD`
+    (or `Ratified YYYY-MM-DDTHH:MM...`) token in the status line, else the
+    frontmatter `date:` field. None when neither parses."""
+    for source in (status_text or "", str(fm.get("date") or "") if isinstance(fm, dict) else ""):
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", source)
+        if m:
+            dt = _parse_iso(m.group(1))
+            if dt is not None:
+                return dt
+    return None
+
+
+def _adr_section_substantive(body: str, header_prefix: str) -> bool:
+    """True iff the ADR body has a `## <header_prefix>...` section whose content
+    is present and not boilerplate. False-negative-biased (a thin-but-real
+    section is accepted) — the check is digest-only and must not false-flag a
+    populated ADR."""
+    lines = body.splitlines()
+    collecting = False
+    content: list[str] = []
+    for ln in lines:
+        stripped = ln.strip()
+        if stripped.startswith("#"):
+            heading = stripped.lstrip("#").strip().lower()
+            if collecting:
+                break  # next heading ends the section
+            if heading.startswith(header_prefix):
+                collecting = True
+            continue
+        if collecting:
+            content.append(ln)
+    if not collecting:
+        return False  # section header absent
+    text = "\n".join(content).strip()
+    if len(text) < 12:
+        return False  # empty / trivially short
+    upper = text.upper()
+    if any(marker in upper for marker in _BOILERPLATE_MARKERS):
+        return False
+    return True
+
+
+def _appetite_completeness_check(
+    adr_dirs: list[Path], tickets_root: Path, now: datetime
+) -> list[AppetiteCompletenessFinding]:
+    """ALWAYS-ON, DIGEST-ONLY (§Surface 4a-completeness). Flags each ratified
+    NON-VAULT ADR ratified on/after the ORG-089 landing (grandfathered before)
+    whose `appetite:` frontmatter is absent/non-int OR §Appetite body is
+    missing/boilerplate OR §Riskiest assumption body is missing/boilerplate.
+    Never mutates, never blocks, never raises on a single malformed ADR."""
+    from tools.ticket_purpose import normalize_appetite, AppetiteError, is_vault_adr
+
+    findings: list[AppetiteCompletenessFinding] = []
+    for adr_dir in adr_dirs:
+        try:
+            if not adr_dir.exists():
+                continue
+        except OSError:
+            continue
+        for path in _iter_adr_files(adr_dir):
+            m = _ADR_ID_RE.match(path.name)
+            if not m:
+                continue
+            adr_id = f"{m.group(1)}-{m.group(2)}"
+            if is_vault_adr(adr_id):
+                continue  # operator-authored vault ADR — exempt
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            status_text = _adr_status_snippet(text)
+            if status_text is None or not _is_ratified_status(status_text):
+                continue
+            fm = _adr_frontmatter(text, source=path.name)
+            ratify_dt = _adr_ratify_date(status_text, fm)
+            if ratify_dt is not None and ratify_dt < _ORG089_LANDING:
+                continue  # legacy grandfathering by ratify-date (D-H)
+            body = text.split("\n---", 1)[-1] if text.startswith("---") else text
+            # appetite frontmatter present + int?
+            try:
+                appetite_ok = normalize_appetite(
+                    fm.get("appetite") if isinstance(fm, dict) else None
+                ) is not None
+            except AppetiteError:
+                appetite_ok = False
+            if not appetite_ok:
+                findings.append(AppetiteCompletenessFinding(adr_id, "appetite-field"))
+            if not _adr_section_substantive(body, _APPETITE_HEADER):
+                findings.append(AppetiteCompletenessFinding(adr_id, "appetite-section"))
+            if not _adr_section_substantive(body, _RISKIEST_HEADER):
+                findings.append(AppetiteCompletenessFinding(adr_id, "riskiest-section"))
+    return findings
+
+
+@dataclass
+class AppetiteOverrunFinding:
+    tid: str
+    appetite: int
+    spend_s: int
+    budget_s: int
+    claimant: str
+    malformed: bool = False
+
+
+def _claimant_of(ticket) -> str:
+    """The claimant for the overrun advisory: the actor of the most recent
+    `claim` transition, else the ticket `target` (DECISION-7)."""
+    for line in reversed(_iter_transition_log_lines(ticket.body)):
+        m = _LOG_BULLET_RE.match(line)
+        if not m:
+            continue
+        verb = _extract_log_verb(m.group("rest")).lower().rstrip(":")
+        if verb.startswith("claim"):
+            return m.group("actor")
+    return str(ticket.fields.get("target") or "")
+
+
+def _appetite_band_budget(policy: "AppetitePolicy", appetite: int) -> int | None:
+    """Look up the calibrated time-budget (seconds) for an appetite score, or
+    None if the band is unmapped. Accepts either a direct per-score map or a
+    band-keyed map; unmapped → None (fail-safe: no budget, no fire)."""
+    bands = policy.bands or {}
+    for key in (appetite, str(appetite)):
+        if key in bands:
+            try:
+                return int(bands[key])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _appetite_overrun_check(
+    policy_path: Path,
+    tickets_root: Path,
+    now: datetime,
+    *,
+    apply: bool = True,
+    send_fn=None,
+) -> list[AppetiteOverrunFinding]:
+    """§Decision.4 circuit breaker. CALIBRATION-GATED: returns [] (SILENT) when
+    load_appetite_policy is None (file absent / generate-only / calibration_version
+    0). In active mode: for each active/ ticket, compares active-spend to the
+    calibrated band budget; on overrun (and not already flagged) writes
+    `substate: appetite-overrun` in-place (when apply) + appends an overrun-flag
+    transition + sends a best-effort mailbox advisory to claimant + orchestrator.
+
+    Fail-safe: a malformed transition log / missing appetite / unmapped band /
+    parse error DIGEST-FLAGS the ticket and DECLINES to fire — never blocks
+    legitimate work, never raises."""
+    policy = load_appetite_policy(policy_path)
+    if policy is None:
+        return []  # silent in warm-up / generate-only
+    from tools.ticket_purpose import normalize_appetite, AppetiteError
+
+    findings: list[AppetiteOverrunFinding] = []
+    active_dir = tickets_root / "active"
+    if not active_dir.exists():
+        return findings
+    for path in sorted(active_dir.iterdir()):
+        if not path.is_file() or not TICKET_FILENAME_RE.fullmatch(path.name):
+            continue
+        try:
+            ticket = parse_ticket(path)
+        except TicketError:
+            continue
+        if ticket.fields.get("substate") == "appetite-overrun":
+            continue  # already flagged — idempotent
+        try:
+            appetite = normalize_appetite(ticket.fields.get("appetite"))
+        except AppetiteError:
+            appetite = None
+        if appetite is None:
+            continue  # missing/corrupt appetite → fail-safe skip (never fire)
+        budget_s = _appetite_band_budget(policy, appetite)
+        if budget_s is None:
+            continue  # unmapped band → no fire
+        spend_s, malformed = _active_spend_impl(ticket.body, now)
+        if malformed:
+            # Data-corruption fail-safe: surface for the digest, never fire.
+            findings.append(AppetiteOverrunFinding(
+                tid=str(ticket.fields.get("id") or path.stem),
+                appetite=appetite, spend_s=spend_s, budget_s=budget_s,
+                claimant=_claimant_of(ticket), malformed=True,
+            ))
+            continue
+        if spend_s <= budget_s:
+            continue
+        tid = str(ticket.fields.get("id") or path.stem)
+        claimant = _claimant_of(ticket)
+        finding = AppetiteOverrunFinding(
+            tid=tid, appetite=appetite, spend_s=spend_s, budget_s=budget_s,
+            claimant=claimant,
+        )
+        if apply:
+            _apply_overrun_flag(path, ticket, now)
+            _send_overrun_advisory(finding, send_fn=send_fn)
+        findings.append(finding)
+    return findings
+
+
+def _apply_overrun_flag(path: Path, ticket, now: datetime) -> None:
+    """Write `substate: appetite-overrun` in-place + append an overrun-flag
+    transition. Best-effort; a write failure is swallowed (the breaker must not
+    crash grooming). No git commit here — the grooming commit pass stages it, in
+    keeping with the other in-place grooming mutations."""
+    try:
+        from tools.ticket import _build_ticket_text
+        fields = dict(ticket.fields)
+        fields["substate"] = "appetite-overrun"
+        body = ticket.body
+        if not body.endswith("\n"):
+            body += "\n"
+        entry = (f"- {_now_iso(now)} [{GROOMING_ACTOR}] overrun-flag: appetite "
+                 f"budget exceeded; substate -> appetite-overrun (ORG-089 §Decision.4)")
+        new_body = body + entry + "\n"
+        path.write_text(_build_ticket_text(fields, new_body), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — surfacing is the goal, not crashing grooming
+        pass
+
+
+def _send_overrun_advisory(finding: "AppetiteOverrunFinding", *, send_fn=None) -> None:
+    """Best-effort mailbox advisory to the claimant + orchestrator (soft-signal per
+    D-M). Never raises. `send_fn` is injectable for tests; production resolves
+    the mailbox hub + tools.mailbox.send."""
+    try:
+        from tools.keep_going import mailbox_inbox_for
+        from tools import mailbox as _mailbox
+        send = send_fn or _mailbox.send
+        recipients = {finding.claimant, "orchestrator"} - {""}
+        payload = (
+            f"ORG-089 appetite circuit breaker: {finding.tid} has overrun its "
+            f"appetite budget (appetite {finding.appetite}; active-spend "
+            f"{finding.spend_s}s > budget {finding.budget_s}s). It is now "
+            f"substate: appetite-overrun — claim/delivery/resolve are refused "
+            f"until you re-earn / adjust-appetite / drop it (soft-signal advisory)."
+        )
+        for r in recipients:
+            try:
+                send(str(mailbox_inbox_for(r)), payload, sender="grooming",
+                     subject=f"appetite-overrun {finding.tid}")
+            except Exception:  # noqa: BLE001 — one bad recipient must not stop others
+                pass
+    except Exception:  # noqa: BLE001 — advisory is best-effort
+        pass
 
 
 def find_last_non_grooming_entry(body: str) -> tuple[datetime | None, str | None]:
@@ -617,7 +1093,7 @@ _DONE_VERBS = ("resolved", "done")
 
 # Path extraction: a repo-relative-looking path with a known source/doc/config
 # extension. Anchored loosely; we post-filter illustrative/glob forms below.
-# Examples matched: tools/foo.py, path/to/x.sh, adr/ORG-001-foo.md, a/b/c.yaml.
+# Examples matched: tools/foo.py, path/to/x.sh, architecture/adr/ORG-001-foo.md, a/b/c.yaml.
 _KNOWN_PATH_EXTS = r"py|sh|md|yaml|yml|json|jsonl|toml|txt|tsv|cfg|ini|service|sql|js|ts|html|css"
 # T-2361: the trailing (?![\w-]) boundary is the structural half of the fix and
 # matters more than which extensions are listed. Without it, a listed extension
@@ -812,7 +1288,7 @@ _OTHER_REPO_MARKERS = (
 # later (T-0667 dry-run: claimed `tickets/inbox/T-0678.md`, since moved out of
 # inbox). These are managed by the ticket system, not deliverable artifacts in
 # the acceptance sense — never treat them as claimed-created files.
-_TICKET_PATH_RE = re.compile(r"^tickets/[a-z]+/T-\d{4}\.md$")
+_TICKET_PATH_RE = re.compile(r"^tickets/[a-z]+/T-\d{4,}\.md$")  # T-3215
 
 
 def find_done_transition(body: str) -> datetime | None:
@@ -1428,6 +1904,13 @@ def _scan_done_for_acceptance(
         if _has_acceptance_unmet_label(ticket.fields):
             continue
 
+        # 1b. T-3440 / ORG-089: a DROPPED bet is a terminal disposition, not a
+        # completed deliverable — its acceptance surface must NOT be re-opened
+        # (a dropped ticket was abandoned, not shipped; reopening it as
+        # acceptance-unmet would falsely resurrect an intentionally-closed bet).
+        if ticket.fields.get("substate") == "dropped":
+            continue
+
         # 2. Closed within the lookback window?
         done_ts = find_done_transition(ticket.body)
         if done_ts is None:
@@ -1631,12 +2114,15 @@ def _render_dep_graph_section(findings: list) -> str:
         return ""
     cycles = [f for f in findings if getattr(f, "kind", None) == "cycle"]
     stale = [f for f in findings if getattr(f, "kind", None) == "stale_done_dep"]
+    dropped = [f for f in findings if getattr(f, "kind", None) == "dropped_dep"]
     lines: list[str] = [
         f"⚠️ Dependency-graph defects ({len(findings)}) — run "
         "`ticket_lint --dry-run` for detail:"
     ]
     for f in cycles:
         lines.append(f"  - [CYCLE/deadlock] {f.detail}")
+    for f in dropped:
+        lines.append(f"  - [dropped-dep] {f.detail}")
     for f in stale:
         lines.append(f"  - [stale-done-dep] {f.detail}")
     return "\n".join(lines)
@@ -1700,7 +2186,7 @@ def check_manifest_freshness(repo_root: Path, now: datetime,
 
 # Filename recognition: this repo's own ADRs use `ORG-NNN-slug.md`; sibling
 # repos (echo-prismatic) use `ADR-NNN — slug.md`. Both are "ADRs" in this
-# org's convention (CLAUDE.md itself cites `adr/ORG-019-...md` as an ADR), so
+# org's convention (CLAUDE.md itself cites `architecture/adr/ORG-019-...md` as an ADR), so
 # both prefixes are scanned uniformly.
 _ADR_ID_RE = re.compile(r"^(ADR|ORG)-(\d+)")
 
@@ -1731,7 +2217,7 @@ _ADR_RATIFIED_RE = re.compile(r"\bRatified\b", re.IGNORECASE)
 # "Drafted 2026-05-18 ... **Ratified 2026-05-19T00:58Z by the operator...**" and
 # IS genuinely ratified; a leading-word exclusion would misclassify it (and
 # every Drafted-then-Ratified ADR), silently hiding a real ORG-014-class gap.
-# Corpus-verified against all 70 status-line-bearing adr/ files (T-2825): the
+# Corpus-verified against all 70 status-line-bearing architecture/adr/ files (T-2825): the
 # only flip is ORG-065 True->False; ORG-019/020/021 (all "Drafted..." shape)
 # and the other unratified drafts (ORG-062/063/064/067/069/070/071/072) are
 # unchanged.
@@ -1745,12 +2231,12 @@ _ADR_SNIPPET_MAX = 100
 
 
 def _default_adr_dirs() -> list[Path]:
-    """Default ADR directories: this repo's `adr/` + echo-prismatic's.
+    """Default ADR directories: this repo's `architecture/adr/` + echo-prismatic's.
 
     Evaluated at call time (not module load) so a `--repo-root` override
     (main()'s global REPO_ROOT reassignment) is reflected.
     """
-    return [REPO_ROOT / "adr", Path("/home/claude/echo-prismatic/adr")]
+    return [REPO_ROOT / "architecture" / "adr", Path("/home/claude/echo-prismatic/adr")]
 
 
 def _iter_adr_files(adr_dir: Path) -> list[Path]:
@@ -1827,7 +2313,7 @@ _ADR_MIGRATION_SHIM_PREFIXES = frozenset({"ORG", "ADR"})
 
 def _adr_namespaces_config_path() -> Path:
     """adr-namespaces.yaml lives at repo root (T-2806) -- sibling of
-    repos.yaml/instance.yaml, deliberately NOT under adr/ (D2-protected).
+    repos.yaml/instance.yaml, deliberately NOT under architecture/adr/ (D2-protected).
     Evaluated at call time (not module load), mirroring _default_adr_dirs,
     so a patched REPO_ROOT in tests is honored."""
     return REPO_ROOT / _ADR_NAMESPACES_CONFIG_FILENAME
@@ -2091,6 +2577,165 @@ def _render_ratified_unbuilt_adr_section(
     return "\n".join(lines)
 
 
+def find_ticket_integrity_issues(tickets_root: Path) -> list[str]:
+    """T-2982: read-only integrity scan for the daily digest. Surfaces two
+    addressing/notification hazards that are otherwise only found by accident:
+
+      (a) DUPLICATE IDs — the same T-NNNN in >1 state dir (a concurrent
+          cross-agent allocation collision, T-2972 class). A dup id breaks the
+          system's addressing: lookups, cross-refs, the auto-consumer.
+      (b) SAME-not_before CLUSTERS — >=3 inbox tickets sharing an EXACT
+          not_before. They all come due the instant that timestamp passes and
+          THUNDER (the 2026-08-20 burst: 12 tickets at one timestamp -> ~9 notifs
+          at once). Stagger them before they fire.
+
+    Returns human-readable finding strings; empty list when clean. Fail-open:
+    unreadable dirs/files are skipped, never raises (the digest must always send)."""
+    import collections
+    issues: list[str] = []
+    # (a) duplicate IDs across all state dirs
+    locs: dict[str, list[str]] = collections.defaultdict(list)
+    for state in ("inbox", "active", "done", "blocked"):
+        d = tickets_root / state
+        if not d.is_dir():
+            continue
+        try:
+            entries = sorted(d.iterdir())
+        except OSError:
+            continue
+        for f in entries:
+            m = re.match(r"(T-\d+)\.md$", f.name)
+            if m:
+                locs[m.group(1)].append(state)
+    for tid, states in sorted(locs.items()):
+        if len(states) > 1:
+            issues.append(
+                f"[DUP-ID] {tid} appears in {len(states)} dirs ({', '.join(states)}) "
+                f"— breaks ticket addressing; re-file one copy under a fresh id"
+            )
+    # (b) same-not_before clusters in inbox (>=3)
+    by_nb: dict[str, list[str]] = collections.defaultdict(list)
+    inbox = tickets_root / "inbox"
+    if inbox.is_dir():
+        try:
+            entries = sorted(inbox.iterdir())
+        except OSError:
+            entries = []
+        for f in entries:
+            if not f.name.endswith(".md"):
+                continue
+            try:
+                for ln in f.read_text(encoding="utf-8").splitlines():
+                    if ln.startswith("not_before:"):
+                        by_nb[ln.split(":", 1)[1].strip()].append(f.stem)
+                        break
+            except OSError:
+                continue
+    for nb, tids in sorted(by_nb.items()):
+        if len(tids) >= 3:
+            issues.append(
+                f"[GATE-CLUSTER] {len(tids)} tickets share not_before={nb} — they all "
+                f"come due at once (thundering-herd); stagger: {', '.join(sorted(tids))}"
+            )
+    return issues
+
+
+def _render_integrity_section(issues: list[str]) -> str:
+    """Render the T-2982 ticket-integrity section (dup-IDs + gate clusters).
+    Empty list -> empty string (section omitted, per the sibling-section convention)."""
+    if not issues:
+        return ""
+    lines = [f"🧮 Ticket-integrity issues ({len(issues)}):"]
+    for issue in issues:
+        lines.append(f"  - {issue}")
+    return "\n".join(lines)
+
+
+@dataclass
+class DroppedTicket:
+    tid: str
+    title: str
+    dropped_reason: str
+    dropped_ts: datetime
+
+
+def find_dropped_this_week(
+    tickets_root: Path, now: datetime, window_days: int = 7
+) -> list["DroppedTicket"]:
+    """T-3440 / ORG-089 §4b: the distinct 'dropped this week' digest surface — a
+    calibration signal, not noise. Scans tickets/done/ for `substate: dropped`
+    tickets whose drop transition is within `window_days`. Read-only, fail-safe
+    (a malformed ticket is skipped, never raised)."""
+    out: list[DroppedTicket] = []
+    done_dir = tickets_root / "done"
+    if not done_dir.exists():
+        return out
+    for path in sorted(done_dir.iterdir()):
+        if not path.is_file() or not TICKET_FILENAME_RE.fullmatch(path.name):
+            continue
+        try:
+            t = parse_ticket(path)
+        except TicketError:
+            continue
+        if t.fields.get("substate") != "dropped":
+            continue
+        drop_ts = None
+        for line in reversed(_iter_transition_log_lines(t.body)):
+            m = _LOG_BULLET_RE.match(line)
+            if not m:
+                continue
+            if _extract_log_verb(m.group("rest")).lower().rstrip(":").startswith("drop"):
+                drop_ts = _parse_iso(m.group("ts"))
+                break
+        if drop_ts is None or (now - drop_ts) > timedelta(days=window_days):
+            continue
+        out.append(DroppedTicket(
+            tid=str(t.fields.get("id") or path.stem),
+            title=t.title or "(no title)",
+            dropped_reason=str(t.fields.get("dropped_reason") or ""),
+            dropped_ts=drop_ts,
+        ))
+    return out
+
+
+def _render_appetite_completeness_section(findings: list) -> str:
+    """T-3440 / ORG-089 §4a-completeness digest section. Empty -> ''."""
+    if not findings:
+        return ""
+    by_adr: dict[str, list[str]] = {}
+    for f in findings:
+        by_adr.setdefault(f.adr_id, []).append(f.reason)
+    lines = [f"📐 ADRs missing appetite/riskiest fields ({len(by_adr)}) — ORG-089 RECORD-mode:"]
+    for adr_id in sorted(by_adr):
+        lines.append(f"  - {adr_id}: {', '.join(sorted(set(by_adr[adr_id])))}")
+    return "\n".join(lines)
+
+
+def _render_appetite_overrun_section(findings: list) -> str:
+    """T-3440 / ORG-089 §4a-overrun digest section. Empty -> '' (and the whole
+    section is absent in the generate-only warm-up, when the check returns [])."""
+    if not findings:
+        return ""
+    lines = [f"⏱️ Appetite-budget overruns ({len(findings)}) — ORG-089 circuit breaker:"]
+    for f in findings:
+        flag = " (DATA-FLAG: malformed log, not fired)" if getattr(f, "malformed", False) else ""
+        lines.append(
+            f"  - {f.tid}: spend {f.spend_s}s > budget {f.budget_s}s "
+            f"(appetite {f.appetite}, claimant {f.claimant}){flag}"
+        )
+    return "\n".join(lines)
+
+
+def _render_dropped_this_week_section(findings: list) -> str:
+    """T-3440 / ORG-089 §4b 'dropped this week' digest surface. Empty -> ''."""
+    if not findings:
+        return ""
+    lines = [f"🗑️ Dropped this week ({len(findings)}) — ORG-089 calibration signal:"]
+    for f in findings:
+        lines.append(f"  - {f.tid} \"{f.title}\" — {f.dropped_reason}")
+    return "\n".join(lines)
+
+
 def build_digest(
     now_iso: str,
     flagged: list[FlaggedTicket],
@@ -2104,6 +2749,10 @@ def build_digest(
     manifest_line: str | None = None,
     ratified_unbuilt_findings: list["RatifiedUnbuiltADR"] | None = None,
     adr_coverage_gaps: list[str] | None = None,
+    integrity_findings: list[str] | None = None,
+    appetite_completeness_findings: list | None = None,
+    appetite_overrun_findings: list | None = None,
+    dropped_this_week: list | None = None,
 ) -> str:
     """Render the digest as plain text (no Markdown).
 
@@ -2129,6 +2778,17 @@ def build_digest(
     ratified_unbuilt_section = _render_ratified_unbuilt_adr_section(
         ratified_unbuilt_findings or [], adr_coverage_gaps or []
     )
+    integrity_section = _render_integrity_section(integrity_findings or [])
+    appetite_completeness_section = _render_appetite_completeness_section(
+        appetite_completeness_findings or [])
+    appetite_overrun_section = _render_appetite_overrun_section(
+        appetite_overrun_findings or [])
+    dropped_this_week_section = _render_dropped_this_week_section(dropped_this_week or [])
+    _appetite_sections = "".join(
+        "\n" + s + "\n" for s in (
+            appetite_overrun_section, appetite_completeness_section, dropped_this_week_section
+        ) if s
+    )
 
     if not flagged:
         body = (
@@ -2147,6 +2807,9 @@ def build_digest(
             body += "\n" + reopened_section + "\n"
         if ratified_unbuilt_section:
             body += "\n" + ratified_unbuilt_section + "\n"
+        if integrity_section:
+            body += "\n" + integrity_section + "\n"
+        body += _appetite_sections
         if active_queue_section:
             body += "\n" + active_queue_section + "\n"
         if manifest_line:
@@ -2185,6 +2848,9 @@ def build_digest(
         result += "\n" + reopened_section + "\n"
     if ratified_unbuilt_section:
         result += "\n" + ratified_unbuilt_section + "\n"
+    if integrity_section:
+        result += "\n" + integrity_section + "\n"
+    result += _appetite_sections
     if active_queue_section:
         result += "\n" + active_queue_section + "\n"
     if manifest_line:
@@ -2405,7 +3071,7 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
         default=None,
         help=(
             "comma-separated ADR directories to scan for ratified-but-unbuilt "
-            "ADRs (T-1814); default: <repo>/adr, /home/claude/echo-prismatic/adr"
+            "ADRs (T-1814); default: <repo>/architecture/adr, /home/claude/echo-prismatic/adr"
         ),
     )
     return p.parse_args(argv)
@@ -2555,6 +3221,13 @@ def main(argv: list[str] | None = None) -> int:
                     f"    [COVERAGE-GAP] {gap} "
                     f"{_coverage_gap_suffix(gap)} on this host"
                 )
+        integrity_dry = find_ticket_integrity_issues(TICKETS_ROOT)  # T-2982
+        if not integrity_dry:
+            print("  no ticket-integrity issues (dup-id / gate-cluster).")
+        else:
+            print(f"  ticket-integrity issue(s) ({len(integrity_dry)}):")
+            for issue in integrity_dry:
+                print(f"    {issue}")
         return 0
 
     # T-0471: per-cron git worktree isolation.
@@ -2692,6 +3365,22 @@ def main(argv: list[str] | None = None) -> int:
     ratified_unbuilt_findings, adr_coverage_gaps = find_ratified_unbuilt_adrs(
         adr_dirs, TICKETS_ROOT
     )
+    integrity_findings = find_ticket_integrity_issues(TICKETS_ROOT)  # T-2982
+
+    # T-3440 / ORG-089 §4a-completeness: always-on, digest-only. Flags ratified
+    # non-vault ADRs (post-landing) missing appetite fields / boilerplate sections.
+    appetite_completeness_findings = _appetite_completeness_check(adr_dirs, TICKETS_ROOT, now)
+    # T-3440 / ORG-089 §4a-overrun: calibration-gated — returns [] (SILENT) while
+    # the policy file is absent / generate-only / calibration_version 0. Surfaced
+    # report-only here (apply=False); the in-place substate write + mailbox
+    # advisory (apply=True) are implemented + tested and get routed through the
+    # commit pass by T-3430, the flip-writer that turns the breaker ON (DECISION-13).
+    _appetite_policy_path = REPO_ROOT / "rulebook" / "policies" / "appetite-time-budget.yaml"
+    appetite_overrun_findings = _appetite_overrun_check(
+        _appetite_policy_path, TICKETS_ROOT, now, apply=False
+    )
+    # T-3440 / ORG-089 §4b: distinct 'dropped this week' calibration surface.
+    dropped_this_week = find_dropped_this_week(TICKETS_ROOT, now)
 
     # Digest: always send (proof-of-life), unless --no-digest.
     if not args.no_digest:
@@ -2706,6 +3395,10 @@ def main(argv: list[str] | None = None) -> int:
             manifest_line=check_manifest_freshness(REPO_ROOT, now),
             ratified_unbuilt_findings=ratified_unbuilt_findings,
             adr_coverage_gaps=adr_coverage_gaps,
+            integrity_findings=integrity_findings,
+            appetite_completeness_findings=appetite_completeness_findings,
+            appetite_overrun_findings=appetite_overrun_findings,
+            dropped_this_week=dropped_this_week,
         )
         if failures > 0:
             digest = digest + f"\nWARNING: ticket_grooming auto-commit reported {failures} failure(s); see stderr.\n"

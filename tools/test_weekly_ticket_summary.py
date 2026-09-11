@@ -370,8 +370,9 @@ class TestFileRequest(unittest.TestCase):
             self.assertFalse((reports / ".pending").exists(), "no orphan .pending/ should be created")
 
     def test_print_prompt_regenerates_to_stdout(self):
-        """--print-prompt <week> regenerates the prompt deterministically, no writes,
-        no ticket subprocess — the fulfiller's self-sufficient prompt source."""
+        """--print-prompt <week> regenerates the prompt deterministically, writes
+        nothing, and files NO ticket — the fulfiller's self-sufficient prompt source.
+        It MAY do read-only git reads (the T-2939 scale-metrics block)."""
         import io
         from contextlib import redirect_stdout
         with tempfile.TemporaryDirectory() as tmpd:
@@ -387,7 +388,12 @@ class TestFileRequest(unittest.TestCase):
                  redirect_stdout(buf):
                 rc = wts.main(["--print-prompt", "2026-W23"])
             self.assertEqual(rc, 0)
-            mock_run.assert_not_called()  # read-only: no ticket filing
+            # print-prompt may do read-only git reads (scale metrics) but must file
+            # NO ticket — assert the real invariant, not "no subprocess at all".
+            for c in mock_run.call_args_list:
+                cmd = c.args[0] if c.args else ""
+                cmd_str = " ".join(map(str, cmd)) if isinstance(cmd, (list, tuple)) else str(cmd)
+                self.assertNotIn("ticket.py", cmd_str, "print-prompt must not file a ticket")
             out = buf.getvalue()
             self.assertIn("SOP text.", out)       # prompt embeds the SOP
             self.assertIn("2026-W23", out)        # and the target week
@@ -529,6 +535,45 @@ class TestCanonicalFilerGuard(unittest.TestCase):
         self.assertEqual(rc, 0)
         mock_run.assert_not_called()
         self.assertFalse(pending_written)
+
+
+class TestScaleMetrics(unittest.TestCase):
+    """T-2939 scale-metrics block (the operator req 2026-08-12): exact, verbatim, never breaks."""
+
+    def test_build_prompt_includes_scale_metrics_verbatim(self):
+        prompt = wts.build_prompt(
+            sop_text="SOP", exemplar_text="EX", bundle="B",
+            target_path_rel="reports/2026-W23.md", week_label_str="2026-W23",
+            monday=dt.date(2026, 6, 1), sunday=dt.date(2026, 6, 7), ticket_count=3,
+            scale_metrics="### Pantheon at scale\n\n- SENTINEL 1,234 commits\n",
+        )
+        self.assertIn("SENTINEL 1,234 commits", prompt)          # embedded verbatim
+        self.assertIn("reproduce VERBATIM", prompt)              # with the instruction
+        self.assertIn("do NOT recompute", prompt)
+
+    def test_build_prompt_scale_metrics_defaults_empty(self):
+        # Back-compat: the param is optional; omitting it must not crash.
+        prompt = wts.build_prompt(
+            sop_text="S", exemplar_text="E", bundle="B", target_path_rel="r",
+            week_label_str="2026-W23", monday=dt.date(2026, 6, 1),
+            sunday=dt.date(2026, 6, 7), ticket_count=0,
+        )
+        self.assertIn("PRECOMPUTED SCALE METRICS", prompt)
+
+    def test_compute_scale_metrics_degrades_gracefully(self):
+        # A git/FS failure must NEVER break the weekly report — degrade to a comment.
+        with mock.patch("subprocess.run", side_effect=OSError("boom")):
+            block = wts.compute_scale_metrics()
+        self.assertTrue(block.strip().startswith("<!--"), block)
+        self.assertIn("unavailable", block)
+
+    def test_compute_scale_metrics_real_repo_smoke(self):
+        # Read-only integration against the real repo: exact, comma-formatted numbers.
+        block = wts.compute_scale_metrics()
+        self.assertIn("Pantheon at scale", block)
+        self.assertIn("commits", block)
+        self.assertIn("tickets filed", block)
+        self.assertRegex(block, r"\d{1,3},\d{3}")  # thousands-separated numbers present
 
 
 if __name__ == "__main__":

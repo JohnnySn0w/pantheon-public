@@ -396,7 +396,7 @@ Out of scope: Max-window cap-hit auto-resume (`ho_resumer.py`, claude-only), the
 - `sop/standard/pantheon-bringup.md` §12 — codex daemon variant (full §12 delta doc).
 - `tools/wedge_bypass.sh` — the wedge-bypass automation script.
 - `tools/harness_adapter/` — the `PantheonHarnessAdapter` implementation (T-1032).
-- `adr/ORG-031-harness-abstraction-and-daemon-onboarding.md` — the ADR that ratifies this approach.
+- `architecture/adr/ORG-031-harness-abstraction-and-daemon-onboarding.md` — the ADR that ratifies this approach.
 - `knowledge/episodic/2026-06-04-codex-harness-abstraction-synthesis/recovery-bringup-gap-harvest-2026-06-09.md` — the ground-truth harvest this SOP is derived from.
 - `sop/standard/handoff-restart-runbook.md` — how to fire a restart (operator surface).
 - `sop/standard/cross-account-ops-discipline.md` — Recovery repair-sudo + cross-account patterns.

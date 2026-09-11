@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, Mapping, Sequence
 
 import yaml
 
@@ -47,6 +47,7 @@ from tools.harness_adapter import (
     ExecutionRequest,
     HarnessRunner,
 )
+from tools.harness_adapter import integration as harness_integration
 from tools.harness_adapter.types import HarnessLaunchConfig, RuntimeControllerConfig
 from tools.harness_adapter.diagnostics import (
     BasicHarnessDiagnosticProbe,
@@ -62,8 +63,10 @@ from tools.harness_adapter.quota import (
     decide_failover,
     decide_fallback_recovery,
 )
+from tools import codex_telegram_bridge
 from tools import mailbox as pantheon_mailbox
 from tools import mailbox_wake
+from tools.persona_brief import PersonaBriefError, resolve_persona_brief_path
 from tools import runtime_controller
 from tools.claude_quota_probe import (
     ClaudeQuotaProbeError,
@@ -80,6 +83,8 @@ from tools.claude_quota_probe import (
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = REPO_ROOT / "instance.yaml"
 DEFAULT_MAILBOX_HUB = Path("/home/the-ancestor/mailbox")
+DEFAULT_QUOTA_CHECK_PERSONAS = frozenset({"specialist", "recovery"})
+QUOTA_CHECK_LOCK_TIMEOUT_SECONDS = 0.0
 BACKOFF_DELAYS_SECONDS = (120, 300, 900, 3600, 14400, 21600)
 
 # Cry-wolf discriminator for the consume timer's soft exits 3/4/5 (T-2586).
@@ -93,6 +98,24 @@ BACKOFF_DELAYS_SECONDS = (120, 300, 900, 3600, 14400, 21600)
 # never reaching the threshold) does not page. Deliberately a separate state
 # file from the backoff record so exit-3 (diagnostic fail, which never touches
 # backoff) does not gain a spurious consume retry-delay.
+#
+# T-3209 split: the streak above is now tracked as TWO independent counters
+# because a single shared streak leaks across an unrelated skip class. A seat
+# stuck in a policy-skip loop (RuntimeViabilityBlocked / RuntimeTransitionPending
+# / ProviderQuotaExhausted at the wake/consume call — none of which bump or
+# clear) never reaches the full-success clear below, so on such a seat any
+# isolated exit-3 diagnostic blip (e.g. a ~7s dangling-symlink window during a
+# claude auto-update) is permanent: it can never be undone by a later success
+# that never comes, and the NEXT unrelated blip pages on top of it. The gate
+# stage (diagnostics, run unconditionally every fire before command dispatch)
+# and the attempt stage (the actual consume/wake call) are therefore split:
+#   - gate-stage streak (`*_diag_streak`, exit-3 class): cleared the moment
+#     diagnostics next pass, regardless of what the attempt stage does next --
+#     "the stage that failed has recovered" is answerable independent of
+#     downstream outcome.
+#   - attempt-stage streak (`*_soft_streak`, exit-4/5 class): unchanged --
+#     cleared only by a genuine consume/wake success, since a policy-skip is
+#     not evidence the attempt stage would have succeeded.
 SOFT_FAILURE_ALERT_STREAK = 3
 EXIT_SOFT_PERSISTENT = 6
 
@@ -113,21 +136,99 @@ class PersonaBinding:
     account_home: Path
     pinned_rules: Path
     mailbox: Path
+    launch_cwd: Path
     launch: HarnessLaunchConfig
     controller: RuntimeControllerConfig
+    communications: Mapping[str, Any] | None = None
+    standing_instructions: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class QuotaCheckResult:
+    persona: str
+    supported: bool
+    decision: Literal[
+        "unsupported",
+        "unknown",
+        "stay",
+        "planned-transition-started",
+        "transition-active-noop",
+        "fallback-active-noop",
+    ]
+    acted: bool
+    reason: str
+    quota_freshness: str | None = None
+    weekly_remaining_percent: float | None = None
+    transition_phase: str | None = None
+    evidence: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
 
 def normalize_harness(value: str) -> str:
-    normalized = value.strip().lower()
-    aliases = {
-        "claude": "claude",
-        "claude-code": "claude",
-        "codex": "codex",
-    }
     try:
-        return aliases[normalized]
-    except KeyError as exc:
+        return harness_integration.normalize_harness(value)
+    except ValueError as exc:
         raise ValueError(f"unsupported harness {value!r}") from exc
+
+
+def _communications_binding(data: Mapping[str, Any], *, persona: str, account: str) -> Mapping[str, Any] | None:
+    installer = data.get("persona_installer")
+    bridge = installer.get("codex_telegram_bridge") if isinstance(installer, Mapping) else None
+    personas = bridge.get("personas") if isinstance(bridge, Mapping) else None
+    raw = personas.get(persona) if isinstance(personas, Mapping) else None
+    if not isinstance(raw, Mapping):
+        return None
+    if raw.get("account") != account:
+        raise ValueError("communications account guard mismatch")
+    topology = raw.get("claude_receiver_topology")
+    if topology not in {"runtime-owned", "systemd-user"}:
+        raise ValueError("communications claude_receiver_topology must be runtime-owned or systemd-user")
+    predecessor_topology = raw.get("predecessor_claude_receiver_topology", topology)
+    if predecessor_topology not in {"runtime-owned", "systemd-user"}:
+        raise ValueError("communications predecessor_claude_receiver_topology must be runtime-owned or systemd-user")
+    tmux_pane = raw.get("tmux_pane")
+    if not isinstance(tmux_pane, str) or not codex_telegram_bridge.TMUX_PANE_RE.fullmatch(tmux_pane):
+        raise ValueError("communications tmux_pane must be an explicit window.pane target")
+    return {
+        "kind": "telegram",
+        "claude_receiver_topology": topology,
+        "predecessor_claude_receiver_topology": predecessor_topology,
+        "claude_receiver_unit": str(raw["claude_receiver_unit"]),
+        "codex_receiver_unit": str(raw["codex_receiver_unit"]),
+        "tmux_session": str(raw["tmux_session"]),
+        "tmux_pane": tmux_pane,
+        "watchdog_units": tuple(str(item) for item in raw.get("watchdog_units", ())),
+    }
+
+
+def _standing_instruction_reference(
+    data: Mapping[str, Any],
+    *,
+    role: str,
+    persona: str,
+    selected_harness: str,
+    account_home: Path,
+) -> Mapping[str, str] | None:
+    del role, selected_harness
+    installer = data.get("persona_installer")
+    raw = installer.get("codex_standing_instructions") if isinstance(installer, Mapping) else None
+    personas = raw.get("personas") if isinstance(raw, Mapping) else None
+    item = personas.get(persona) if isinstance(personas, Mapping) else None
+    if not isinstance(item, Mapping):
+        return None
+    target = item.get("target")
+    override = item.get("override_target")
+    source = item.get("source")
+    source_sha = item.get("source_sha256")
+    if not all(isinstance(value, str) and value for value in (target, override, source, source_sha)):
+        raise ValueError("codex standing instruction source/target fields must be non-empty strings")
+    return {
+        "schema": str(raw.get("schema", "")),
+        "source": source,
+        "source_sha256": source_sha,
+        "target": str(account_home / target),
+        "override_target": str(account_home / override),
+        "override_must_be_absent": str(item.get("override_must_be_absent") is True).lower(),
+    }
 
 
 def load_binding(
@@ -167,12 +268,24 @@ def load_binding(
             executable_override=executable_override,
             model_override=model_override,
             profile_override=profile_override,
+            bound_persona=persona,
+            bound_mailbox=mailbox_hub / persona,
+            mailbox_hub=mailbox_hub,
         )
         controller = resolve_controller_config(
             data,
             persona=persona,
             role=str(role),
         )
+        try:
+            pinned_rules = resolve_persona_brief_path(
+                repo_root=REPO_ROOT,
+                account_home=account_home,
+                persona=persona,
+                persona_brief_ref=raw_binding.get("persona_brief_ref"),
+            )
+        except PersonaBriefError as exc:
+            raise ValueError(f"{manifest_path}: {role}.persona_brief_ref invalid: {exc}") from exc
         return PersonaBinding(
             role=str(role),
             persona=persona,
@@ -180,12 +293,48 @@ def load_binding(
             configured_harness=normalize_harness(configured_harness),
             selected_harness=selected,
             account_home=account_home,
-            pinned_rules=REPO_ROOT / "pinned-rules" / f"{persona}.md",
+            pinned_rules=pinned_rules,
             mailbox=mailbox_hub / persona,
+            launch_cwd=manifest_path.parent.resolve(),
             launch=launch,
             controller=controller,
+            communications=_communications_binding(data, persona=persona, account=account),
+            standing_instructions=_standing_instruction_reference(
+                data,
+                role=str(role),
+                persona=persona,
+                selected_harness=selected,
+                account_home=account_home,
+            ),
         )
     raise ValueError(f"{manifest_path}: persona {persona!r} is not bound")
+
+
+def quota_check_personas(manifest_path: Path) -> frozenset[str]:
+    data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    installer = data.get("persona_installer") if isinstance(data, dict) else None
+    quota = installer.get("quota_check") if isinstance(installer, dict) else None
+    personas = quota.get("personas") if isinstance(quota, dict) else None
+    if personas is None:
+        return DEFAULT_QUOTA_CHECK_PERSONAS
+    if not (
+        isinstance(personas, list)
+        and all(isinstance(item, str) and item for item in personas)
+    ):
+        raise ValueError("persona_installer.quota_check.personas must be a list of persona strings")
+    return frozenset(personas)
+
+
+def quota_check_supported(
+    binding: PersonaBinding,
+    *,
+    manifest_path: Path = DEFAULT_MANIFEST,
+) -> tuple[bool, str]:
+    if binding.persona not in quota_check_personas(manifest_path):
+        return False, "persona-not-allowlisted"
+    if not binding.controller.policy.fallbacks:
+        return False, "no-manifest-fallback"
+    return True, "supported"
 
 
 def build_adapter(
@@ -193,18 +342,9 @@ def build_adapter(
     *,
     harness_home: Path,
 ):
-    if binding.selected_harness == "claude":
-        return ClaudeHarnessAdapter(
-            binding.role,
-            claude_home=harness_home,
-            mailbox_path=binding.mailbox,
-            launch=binding.launch,
-        )
-    return CodexHarnessAdapter(
-        binding.role,
-        codex_home=harness_home,
-        mailbox_path=binding.mailbox,
-        launch=binding.launch,
+    return harness_integration.integration_for(binding.selected_harness).build_adapter(
+        binding,
+        harness_home=harness_home,
     )
 
 
@@ -246,6 +386,287 @@ def first_fallback_binding(
     return None
 
 
+def configured_runtime_bindings(
+    manifest_path: Path,
+    binding: PersonaBinding,
+) -> tuple[PersonaBinding, ...]:
+    """Return the primary plus declared fallbacks in manifest order."""
+
+    result: list[PersonaBinding] = [binding]
+    seen = {runtime_reference(binding)}
+    for reference in binding.controller.policy.fallbacks:
+        target = load_runtime_reference(manifest_path, binding, reference)
+        resolved = runtime_reference(target)
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        result.append(target)
+    return tuple(result)
+
+
+def configured_runtime_targets(manifest_path: Path, persona: str) -> tuple[str, ...]:
+    binding = load_binding(manifest_path, persona)
+    return tuple(runtime_reference(item) for item in configured_runtime_bindings(manifest_path, binding))
+
+
+def resolve_configured_runtime_target(
+    manifest_path: Path,
+    *,
+    persona: str,
+    destination: str,
+    state_root: Path | None = None,
+    mailbox_hub: Path = DEFAULT_MAILBOX_HUB,
+) -> tuple[PersonaBinding, PersonaBinding]:
+    primary = load_binding(manifest_path, persona, mailbox_hub=mailbox_hub)
+    configured = (runtime_reference(primary), *primary.controller.policy.fallbacks)
+    if destination not in configured:
+        raise ValueError(f"destination {destination!r} is not configured for {persona}")
+    current = select_recorded_runtime_binding(manifest_path, primary, state_dir=runtime_controller._state_root(state_root))
+    if destination == runtime_reference(primary):
+        target = primary
+    else:
+        target = load_runtime_reference(manifest_path, primary, destination)
+    return current, target
+
+
+def operator_target_swap(
+    *,
+    manifest_path: Path,
+    persona: str,
+    destination: str,
+    trigger: Literal["operator"],
+    correlation_id: str,
+    state_root: Path,
+    mailbox_hub: Path = DEFAULT_MAILBOX_HUB,
+    context: runtime_controller.TmuxRuntimeContext | None = None,
+    backend: Any | None = None,
+) -> runtime_controller.OperatorSwapReceipt:
+    current, target = resolve_configured_runtime_target(
+        manifest_path,
+        persona=persona,
+        destination=destination,
+        state_root=state_root,
+        mailbox_hub=mailbox_hub,
+    )
+    actor = pwd.getpwuid(os.geteuid()).pw_name
+    if actor != current.account:
+        raise ValueError("operator target principal does not match manifest account")
+    existing = runtime_controller.transition_state(persona, state_root=state_root)
+    if existing.get("phase") == "compensation-failed":
+        raise runtime_controller.RuntimeTransitionPending(
+            f"{persona} runtime transition compensation failed; manual recovery required"
+        )
+    matching_existing = (
+        existing.get("trigger") == trigger
+        and existing.get("correlation_id") == correlation_id
+        and existing.get("destination") == destination
+        and existing.get("phase") in {"preparing", "awaiting-successor-read", "completed"}
+    )
+    if destination == runtime_reference(current) and not matching_existing:
+        runtime_controller._validate_operator_active_noop(
+            current,
+            existing,
+            state_root=state_root,
+            context=context,
+            backend=backend,
+        )
+        runtime_controller._append_controller_evidence(
+            persona,
+            "operator_target_already_active",
+            {
+                "correlation_id": correlation_id,
+                "destination": destination,
+                "active_runtime": runtime_reference(current),
+            },
+            state_root=state_root,
+        )
+        return runtime_controller.OperatorSwapReceipt(
+            schema="pantheon-runtime-operator-target-swap/v1",
+            persona=persona,
+            trigger=trigger,
+            correlation_id=correlation_id,
+            destination=destination,
+            status="already-active",
+            phase=str(existing.get("phase", "")),
+            source_runtime=runtime_reference(current),
+            source_transition_id=str(existing.get("transition_id", "")),
+            outgoing_harness=current.launch.harness,
+            outgoing_profile=current.launch.profile,
+            incoming_harness=current.launch.harness,
+            incoming_profile=current.launch.profile,
+            receiver_transferred=False,
+        )
+    handle = None if matching_existing else runtime_controller.recorded_runtime_handle(current, state_root=state_root)
+    try:
+        return runtime_controller._operator_target_swap_resolved(
+            current,
+            target,
+            trigger=trigger,
+            correlation_id=correlation_id,
+            state_root=state_root,
+            context=context,
+            current_handle=handle,
+            backend=backend,
+        )
+    except runtime_controller.RuntimeTransitionPending:
+        state = runtime_controller.transition_state(persona, state_root=state_root)
+        if (
+            state.get("phase") == "awaiting-successor-read"
+            and state.get("trigger") == trigger
+            and state.get("correlation_id") == correlation_id
+            and state.get("destination") == destination
+        ):
+            return runtime_controller._operator_receipt(target, state, status="pending")
+        raise
+
+
+def operator_compensation_recovery(
+    *,
+    manifest_path: Path,
+    persona: str,
+    source: str,
+    destination: str,
+    recovery_id: str,
+    expected_transition_id: str,
+    expected_transition_sha256: str,
+    reason: str,
+    state_root: Path,
+    mailbox_hub: Path = DEFAULT_MAILBOX_HUB,
+    context: runtime_controller.TmuxRuntimeContext | None = None,
+    backend: Any | None = None,
+) -> runtime_controller.OperatorCompensationRecoveryReceipt:
+    primary = load_binding(manifest_path, persona, mailbox_hub=mailbox_hub)
+    configured = (runtime_reference(primary), *primary.controller.policy.fallbacks)
+    if source not in configured:
+        raise ValueError(f"source {source!r} is not configured for {persona}")
+    if destination not in configured:
+        raise ValueError(f"destination {destination!r} is not configured for {persona}")
+    source_binding = (
+        primary
+        if source == runtime_reference(primary)
+        else load_runtime_reference(manifest_path, primary, source)
+    )
+    target_binding = (
+        primary
+        if destination == runtime_reference(primary)
+        else load_runtime_reference(manifest_path, primary, destination)
+    )
+    actor = pwd.getpwuid(os.geteuid()).pw_name
+    if actor != source_binding.account:
+        raise ValueError("operator recovery principal does not match manifest account")
+    return runtime_controller.recover_operator_compensation_failed(
+        source_binding,
+        target_binding,
+        recovery_id=recovery_id,
+        expected_transition_id=expected_transition_id,
+        expected_transition_sha256=expected_transition_sha256,
+        state_root=state_root,
+        reason=reason,
+        context=context,
+        backend=backend,
+    )
+
+
+def operator_compensation_failed_target_live_recovery(
+    *,
+    manifest_path: Path,
+    persona: str,
+    source: str,
+    destination: str,
+    recovery_id: str,
+    expected_transition_id: str,
+    expected_transition_sha256: str,
+    expected_predecessor_sha256: str,
+    correlation_id: str,
+    reason: str,
+    state_root: Path,
+    mailbox_hub: Path = DEFAULT_MAILBOX_HUB,
+    context: runtime_controller.TmuxRuntimeContext | None = None,
+    backend: Any | None = None,
+) -> runtime_controller.OperatorCompensationTargetLiveRecoveryReceipt:
+    primary = load_binding(manifest_path, persona, mailbox_hub=mailbox_hub)
+    configured = (runtime_reference(primary), *primary.controller.policy.fallbacks)
+    if source not in configured:
+        raise ValueError(f"source {source!r} is not configured for {persona}")
+    if destination not in configured:
+        raise ValueError(f"destination {destination!r} is not configured for {persona}")
+    source_binding = (
+        primary
+        if source == runtime_reference(primary)
+        else load_runtime_reference(manifest_path, primary, source)
+    )
+    target_binding = (
+        primary
+        if destination == runtime_reference(primary)
+        else load_runtime_reference(manifest_path, primary, destination)
+    )
+    actor = pwd.getpwuid(os.geteuid()).pw_name
+    if actor != source_binding.account:
+        raise ValueError("operator recovery principal does not match manifest account")
+    return runtime_controller.recover_operator_compensation_failed_target_live(
+        source_binding,
+        target_binding,
+        recovery_id=recovery_id,
+        expected_transition_id=expected_transition_id,
+        expected_transition_sha256=expected_transition_sha256,
+        expected_predecessor_sha256=expected_predecessor_sha256,
+        correlation_id=correlation_id,
+        state_root=state_root,
+        reason=reason,
+        context=context,
+        backend=backend,
+    )
+
+
+def operator_started_unverified_recovery(
+    *,
+    manifest_path: Path,
+    persona: str,
+    source: str,
+    destination: str,
+    recovery_id: str,
+    expected_transition_id: str,
+    expected_transition_sha256: str,
+    correlation_id: str,
+    reason: str,
+    state_root: Path,
+    mailbox_hub: Path = DEFAULT_MAILBOX_HUB,
+    context: runtime_controller.TmuxRuntimeContext | None = None,
+    backend: Any | None = None,
+) -> runtime_controller.OperatorStartedUnverifiedRecoveryReceipt:
+    primary = load_binding(manifest_path, persona, mailbox_hub=mailbox_hub)
+    configured = (runtime_reference(primary), *primary.controller.policy.fallbacks)
+    if source not in configured:
+        raise ValueError(f"source {source!r} is not configured for {persona}")
+    if destination not in configured:
+        raise ValueError(f"destination {destination!r} is not configured for {persona}")
+    source_binding = (
+        primary
+        if source == runtime_reference(primary)
+        else load_runtime_reference(manifest_path, primary, source)
+    )
+    target_binding = (
+        primary
+        if destination == runtime_reference(primary)
+        else load_runtime_reference(manifest_path, primary, destination)
+    )
+    actor = pwd.getpwuid(os.geteuid()).pw_name
+    if actor != source_binding.account:
+        raise ValueError("operator recovery principal does not match manifest account")
+    return runtime_controller.recover_operator_started_unverified(
+        source_binding,
+        target_binding,
+        recovery_id=recovery_id,
+        expected_transition_id=expected_transition_id,
+        expected_transition_sha256=expected_transition_sha256,
+        correlation_id=correlation_id,
+        state_root=state_root,
+        reason=reason,
+        context=context,
+        backend=backend,
+    )
+
+
 def select_recorded_runtime_binding(
     manifest_path: Path,
     binding: PersonaBinding,
@@ -259,7 +680,7 @@ def select_recorded_runtime_binding(
         state_root=state_dir,
     )
     phase = state.get("phase")
-    if phase == "preparing":
+    if phase in {"preparing", "recovered"}:
         harness = state.get("outgoing_harness")
         profile = state.get("outgoing_profile")
     elif phase in {"awaiting-successor-read", "completed"} and state.get(
@@ -466,6 +887,290 @@ def _weekly_remaining_percent(snapshot: QuotaSnapshot) -> float | None:
         } and isfinite(float(window.remaining_percent)):
             return float(window.remaining_percent)
     return None
+
+
+def _weekly_reset_at(snapshot: QuotaSnapshot) -> str | None:
+    for window in snapshot.windows:
+        if window.name.strip().lower().replace(" ", "-") in {
+            "week",
+            "weekly",
+            "weekly-quota",
+            "weekly_remaining",
+            "weekly-remaining",
+            "7d",
+            "7-day",
+            "seven-day",
+        }:
+            return window.resets_at.isoformat().replace("+00:00", "Z")
+    return None
+
+
+def refresh_primary_quota(
+    binding: PersonaBinding,
+    *,
+    state_dir: Path,
+    now: datetime | None = None,
+    claude_probe_runner=run_claude_quota_probe,
+    adapter=None,
+) -> QuotaSnapshot | None:
+    observed_now = now or datetime.now(timezone.utc)
+    if observed_now.tzinfo is None:
+        observed_now = observed_now.replace(tzinfo=timezone.utc)
+    observed_now = observed_now.astimezone(timezone.utc)
+    probe_result: ClaudeQuotaProbeResult | None = None
+    if binding.selected_harness == "claude":
+        bucket = observed_now.replace(
+            minute=(observed_now.minute // 30) * 30,
+            second=0,
+            microsecond=0,
+        )
+        probe_run_id = bucket.strftime("%Y%m%dT%H%M%SZ")
+        result_path = claude_probe_result_path(state_dir, binding.persona, probe_run_id)
+        failure_path = result_path.with_name("failure.json")
+        probe_result = read_claude_probe_result(result_path)
+        if probe_result is None and failure_path.exists():
+            return None
+        if probe_result is None:
+            try:
+                probe_result = claude_probe_runner(
+                    account=binding.account,
+                    persona=binding.persona,
+                    executable=binding.launch.executable,
+                    repo_root=REPO_ROOT,
+                    state_root=state_dir,
+                    run_id=probe_run_id,
+                )
+            except ClaudeQuotaProbeError as exc:
+                _atomic_write_json(
+                    failure_path,
+                    {
+                        "schema": "pantheon-claude-quota-probe-failure/v1",
+                        "run_id": probe_run_id,
+                        "account": binding.account,
+                        "persona": binding.persona,
+                        "attempted_at": observed_now.isoformat().replace("+00:00", "Z"),
+                        "error": str(exc)[:1000],
+                    },
+                )
+                return None
+        if (
+            probe_result.status != "observed"
+            or probe_result.account != binding.account
+            or probe_result.persona != binding.persona
+            or probe_result.tmux_target
+            != claude_probe_tmux_target(binding.persona, probe_run_id)
+            or probe_result.session_id
+            != claude_probe_session_id(binding.account, binding.persona, probe_run_id)
+            or probe_result.prompt_sha256
+            != hashlib.sha256(CLAUDE_QUOTA_PROBE_PROMPT.encode("utf-8")).hexdigest()
+            or probe_result.pong_observed is not True
+            or probe_result.cap_sentinel is not None
+        ):
+            return None
+    quota_adapter = adapter or build_adapter(binding, harness_home=binding.account_home)
+    fresh = quota_adapter.quota_observer(state_dir / binding.persona).read()
+    if probe_result is not None:
+        observed_session = fresh.evidence.get("session_id")
+        if (
+            fresh.evidence.get("path") != probe_result.statusline_path
+            or fresh.evidence.get("sha256") != probe_result.statusline_sha256
+            or observed_session != probe_result.session_id
+        ):
+            return None
+    return fresh
+
+
+def evaluate_planned_quota_swap(
+    binding: PersonaBinding,
+    quota_snapshot: QuotaSnapshot,
+    *,
+    fallback_binding: PersonaBinding | None,
+    state_dir: Path,
+) -> tuple[str, float | None, str | None]:
+    del state_dir
+    decision = decide_failover(
+        quota_snapshot,
+        FailoverPolicy(
+            weekly_remaining_percent=binding.controller.policy.weekly_remaining_percent,
+            fallbacks=binding.controller.policy.fallbacks,
+        ),
+    )
+    weekly_remaining = _weekly_remaining_percent(quota_snapshot)
+    if decision == "planned-failover" and fallback_binding is None:
+        return "unknown", weekly_remaining, None
+    return decision, weekly_remaining, _weekly_reset_at(quota_snapshot)
+
+
+def quota_check(
+    binding: PersonaBinding,
+    *,
+    adapter,
+    fallback_binding: PersonaBinding | None,
+    primary_binding: PersonaBinding,
+    state_dir: Path,
+    cwd: Path,
+    now: datetime | None = None,
+    claude_probe_runner=run_claude_quota_probe,
+    manifest_path: Path = DEFAULT_MANIFEST,
+) -> QuotaCheckResult:
+    del cwd
+    supported, support_reason = quota_check_supported(binding, manifest_path=manifest_path)
+    if not supported:
+        return QuotaCheckResult(
+            persona=binding.persona,
+            supported=False,
+            decision="unsupported",
+            acted=False,
+            reason=support_reason,
+        )
+    try:
+        with runtime_controller.persona_operation_lock(
+            binding.persona,
+            state_root=state_dir,
+            blocking=False,
+            timeout_seconds=QUOTA_CHECK_LOCK_TIMEOUT_SECONDS,
+        ):
+            transition = runtime_controller.transition_state(
+                binding.persona,
+                state_root=state_dir,
+            )
+            phase = transition.get("phase")
+            if phase in {"preparing", "awaiting-successor-read"}:
+                return QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=True,
+                    decision="transition-active-noop",
+                    acted=False,
+                    reason="transition-active",
+                    transition_phase=str(phase),
+                )
+            if phase == "completed" and transition.get("fallback_active") is True:
+                return QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=True,
+                    decision="fallback-active-noop",
+                    acted=False,
+                    reason="fallback-active",
+                    transition_phase="completed",
+                )
+            if runtime_reference(binding) != runtime_reference(primary_binding):
+                return QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=True,
+                    decision="fallback-active-noop",
+                    acted=False,
+                    reason="selected-runtime-is-fallback",
+                    transition_phase=str(phase) if phase else None,
+                )
+            fresh = refresh_primary_quota(
+                primary_binding,
+                state_dir=state_dir,
+                now=now,
+                claude_probe_runner=claude_probe_runner,
+                adapter=adapter,
+            )
+            if fresh is None:
+                return QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=True,
+                    decision="unknown",
+                    acted=False,
+                    reason="probe-unavailable",
+                )
+            decision, weekly_remaining, weekly_reset = evaluate_planned_quota_swap(
+                binding,
+                fresh,
+                fallback_binding=fallback_binding,
+                state_dir=state_dir,
+            )
+            if decision == "unknown":
+                return QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=True,
+                    decision="unknown",
+                    acted=False,
+                    reason="unknown-quota-evidence",
+                    quota_freshness=fresh.freshness,
+                    weekly_remaining_percent=weekly_remaining,
+                    evidence=dict(fresh.evidence),
+                )
+            if decision == "stay":
+                return QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=True,
+                    decision="stay",
+                    acted=False,
+                    reason="above-reserve",
+                    quota_freshness=fresh.freshness,
+                    weekly_remaining_percent=weekly_remaining,
+                    evidence=dict(fresh.evidence),
+                )
+            if fallback_binding is None:
+                return QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=True,
+                    decision="unknown",
+                    acted=False,
+                    reason="no-fallback",
+                    quota_freshness=fresh.freshness,
+                    weekly_remaining_percent=weekly_remaining,
+                    evidence=dict(fresh.evidence),
+                )
+            message_id, _ = _oldest_pending_identity(binding.mailbox)
+            barrier = runtime_controller.begin_planned_transition(
+                binding.persona,
+                outgoing_harness=binding.launch.harness,
+                outgoing_profile=binding.launch.profile,
+                incoming_harness=fallback_binding.launch.harness,
+                incoming_profile=fallback_binding.launch.profile,
+                message_id=message_id,
+                primary_resets_at=weekly_reset,
+                quota_evidence=dict(fresh.evidence),
+                state_root=state_dir,
+            )
+            if barrier.status == "started":
+                return QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=True,
+                    decision="planned-transition-started",
+                    acted=True,
+                    reason="reserve-threshold",
+                    quota_freshness=fresh.freshness,
+                    weekly_remaining_percent=weekly_remaining,
+                    transition_phase=barrier.phase,
+                    evidence=dict(fresh.evidence),
+                )
+            if barrier.status in {"already-active", "already-completed"}:
+                return QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=True,
+                    decision="transition-active-noop",
+                    acted=False,
+                    reason=barrier.status,
+                    quota_freshness=fresh.freshness,
+                    weekly_remaining_percent=weekly_remaining,
+                    transition_phase=barrier.phase,
+                    evidence=dict(fresh.evidence),
+                )
+            return QuotaCheckResult(
+                persona=binding.persona,
+                supported=True,
+                decision="unknown",
+                acted=False,
+                reason="transition-conflict",
+                quota_freshness=fresh.freshness,
+                weekly_remaining_percent=weekly_remaining,
+                transition_phase=barrier.phase,
+                evidence=dict(fresh.evidence),
+            )
+    except runtime_controller.OperationLockBusy:
+        return QuotaCheckResult(
+            persona=binding.persona,
+            supported=True,
+            decision="unknown",
+            acted=False,
+            reason="operation-busy",
+        )
 
 
 def diagnose_persona(
@@ -727,11 +1432,16 @@ def load_soft_streak(state_dir: Path, persona: str) -> int:
 
 
 def bump_soft_streak(state_dir: Path, persona: str) -> int:
-    """Increment and persist the consecutive soft-failure streak; return the new count.
+    """Increment and persist the consecutive attempt-stage soft-failure streak;
+    return the new count.
 
-    Counts consecutive consume fires that ended in a soft failure (exit 3/4/5),
-    regardless of failure kind — a sustained run of *any* soft failures is what
-    warrants a page. Cleared by clear_soft_streak on a genuine consume success.
+    Counts consecutive consume fires that ended in an attempt-stage soft
+    failure (exit 4/5: an OSError transport failure or consume finishing with
+    errors) — the diagnostic gate stage (exit 3) is tracked separately by
+    bump_diag_streak (T-3209), since a policy-skip (RuntimeViabilityBlocked /
+    RuntimeTransitionPending / ProviderQuotaExhausted) is not evidence this
+    stage would have succeeded and must not clear it. Cleared by
+    clear_soft_streak only on a genuine consume/wake success.
     """
     count = load_soft_streak(state_dir, persona) + 1
     _atomic_write_json(_soft_streak_path(state_dir, persona), {"count": count})
@@ -741,6 +1451,94 @@ def bump_soft_streak(state_dir: Path, persona: str) -> int:
 def clear_soft_streak(state_dir: Path, persona: str) -> None:
     try:
         _soft_streak_path(state_dir, persona).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _diag_streak_path(state_dir: Path, persona: str) -> Path:
+    return state_dir / f"{persona}.diagstreak.json"
+
+
+def load_diag_streak(state_dir: Path, persona: str) -> int:
+    try:
+        raw = json.loads(_diag_streak_path(state_dir, persona).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return 0
+    count = raw.get("count") if isinstance(raw, dict) else None
+    return count if isinstance(count, int) and count >= 0 else 0
+
+
+def bump_diag_streak(state_dir: Path, persona: str) -> int:
+    """Increment and persist the consecutive gate-stage (diagnostic, exit-3)
+    soft-failure streak; return the new count.
+
+    Independent of bump_soft_streak's attempt-stage counter (T-3209): the
+    diagnostics stage runs unconditionally every consume fire, before command
+    dispatch, so whether it passed THIS fire is answerable regardless of what
+    the attempt stage does next. Cleared by clear_diag_streak the moment
+    diagnostics next pass, not only on a full consume/wake success.
+    """
+    count = load_diag_streak(state_dir, persona) + 1
+    _atomic_write_json(_diag_streak_path(state_dir, persona), {"count": count})
+    return count
+
+
+def clear_diag_streak(state_dir: Path, persona: str) -> None:
+    try:
+        _diag_streak_path(state_dir, persona).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _policy_skip_path(state_dir: Path, persona: str) -> Path:
+    return state_dir / f"{persona}.policyskip.json"
+
+
+def load_policy_skip(state_dir: Path, persona: str) -> dict[str, Any]:
+    """Read the consecutive policy-skip streak for *persona* -- {reason,
+    count, since} -- or {} if absent/corrupt (T-3210: the visibility gap
+    T-3209 left unaddressed). A "policy skip" is an attempt-stage fire that
+    never actually ran a wake/consume attempt: backoff, or one of the
+    runtime-controller policy exceptions (RuntimeTransitionPending /
+    ProviderQuotaExhausted / RuntimeViabilityBlocked). This is a THIRD,
+    independent axis from bump_diag_streak (gate-stage/exit-3) and
+    bump_soft_streak (attempt-stage genuine failure/exit-4/5): a policy skip
+    is neither a diagnostic failure nor a transport failure, it is the
+    attempt stage never being reached at all -- structurally invisible to
+    both of the other two counters, which is exactly the gap this makes
+    visible."""
+    try:
+        raw = json.loads(_policy_skip_path(state_dir, persona).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def bump_policy_skip(state_dir: Path, persona: str, reason: str) -> dict[str, Any]:
+    """Increment and persist *persona*'s consecutive policy-skip streak,
+    keyed by *reason*; return the new state ({"reason", "count", "since"}).
+
+    A reason CHANGE resets the streak to 1 with a fresh `since`: the count
+    answers "how long has THIS specific skip reason been firing", not "how
+    long has SOME skip reason been firing" -- a seat that flips between
+    runtime_transition and runtime_viability_blocked is telling two
+    different stories, not a continuous one."""
+    previous = load_policy_skip(state_dir, persona)
+    now = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    if previous.get("reason") == reason and isinstance(previous.get("count"), int):
+        count = previous["count"] + 1
+        since = previous.get("since") or now
+    else:
+        count = 1
+        since = now
+    state = {"reason": reason, "count": count, "since": since}
+    _atomic_write_json(_policy_skip_path(state_dir, persona), state)
+    return state
+
+
+def clear_policy_skip(state_dir: Path, persona: str) -> None:
+    try:
+        _policy_skip_path(state_dir, persona).unlink()
     except FileNotFoundError:
         pass
 
@@ -935,22 +1733,27 @@ def consume_persona_mailbox(
     drain_id = runtime_controller.new_drain_id()
 
     def _handler(record: dict[str, Any]) -> None:
-        runtime_controller.assert_drain_allowed(
+        with runtime_controller.persona_operation_lock(
             binding.persona,
-            drain_id,
             state_root=state_dir,
-        )
-        outcomes.append(
-            process_mail_record(
-                record,
-                binding,
-                adapter=adapter,
-                runner=runner,
-                state_dir=state_dir,
-                cwd=cwd,
-                reply_hub=reply_hub,
+            blocking=True,
+        ):
+            runtime_controller.assert_drain_allowed(
+                binding.persona,
+                drain_id,
+                state_root=state_dir,
             )
-        )
+            outcomes.append(
+                process_mail_record(
+                    record,
+                    binding,
+                    adapter=adapter,
+                    runner=runner,
+                    state_dir=state_dir,
+                    cwd=cwd,
+                    reply_hub=reply_hub,
+                )
+            )
 
     stats = pantheon_mailbox.consume(str(binding.mailbox), _handler)
     return stats, outcomes
@@ -962,6 +1765,40 @@ def wake_persistent_runtime(
     adapter,
     fallback_binding: PersonaBinding | None = None,
     primary_binding: PersonaBinding | None = None,
+    runtime_candidates: Sequence[PersonaBinding] | None = None,
+    receiver_backend: Any | None = None,
+    recovery_evidence: dict[str, str] | None = None,
+    state_dir: Path,
+    cwd: Path,
+    now: float | None = None,
+) -> dict[str, Any]:
+    with runtime_controller.persona_operation_lock(
+        binding.persona,
+        state_root=state_dir,
+        blocking=True,
+    ):
+        return _wake_persistent_runtime_locked(
+            binding,
+            adapter=adapter,
+            fallback_binding=fallback_binding,
+            primary_binding=primary_binding,
+            runtime_candidates=runtime_candidates,
+            receiver_backend=receiver_backend,
+            recovery_evidence=recovery_evidence,
+            state_dir=state_dir,
+            cwd=cwd,
+            now=now,
+        )
+
+
+def _wake_persistent_runtime_locked(
+    binding: PersonaBinding,
+    *,
+    adapter,
+    fallback_binding: PersonaBinding | None = None,
+    primary_binding: PersonaBinding | None = None,
+    runtime_candidates: Sequence[PersonaBinding] | None = None,
+    receiver_backend: Any | None = None,
     recovery_evidence: dict[str, str] | None = None,
     state_dir: Path,
     cwd: Path,
@@ -1005,49 +1842,27 @@ def wake_persistent_runtime(
             state_root=state_dir,
         )
 
-    quota_snapshot = adapter.quota_observer(state_dir / binding.persona).read()
-    authoritative_cap = (
-        str(quota_snapshot.evidence.get("authoritative_limit", "false")).lower()
-        == "true"
+    candidates = tuple(runtime_candidates or (binding, *(item for item in (fallback_binding,) if item is not None)))
+
+    def _adapter_for(candidate: PersonaBinding):
+        if runtime_reference(candidate) == runtime_reference(binding):
+            return adapter
+        return build_adapter(candidate, harness_home=candidate.account_home)
+
+    selection = runtime_controller.ensure_viable_runtime(
+        candidates,
+        adapter_factory=_adapter_for,
+        state_root=state_dir,
+        backend=receiver_backend,
     )
-    if authoritative_cap:
-        cap_target = fallback_binding or (
-            primary_binding if recovery_evidence is not None else None
-        )
-        if cap_target is None:
-            raise runtime_controller.ProviderQuotaExhausted(
-                "provider returned an authoritative cap and no fallback is configured",
-                profile=binding.launch.profile,
-                provider_error=json.dumps(dict(quota_snapshot.evidence), sort_keys=True),
-            )
-        message_id, correlation_id = _oldest_pending_identity(binding.mailbox)
-        current = runtime_controller.recorded_runtime_handle(
-            binding,
-            state_root=state_dir,
-        )
-        error = runtime_controller.ProviderQuotaExhausted(
-            "provider returned an authoritative quota limit",
-            profile=binding.launch.profile,
-            provider_error=json.dumps(dict(quota_snapshot.evidence), sort_keys=True),
-        )
-        runtime_controller.forced_swap(
-            current,
-            cap_target,
-            error=error,
-            message_id=message_id or "no-pending-message",
-            correlation_id=correlation_id or message_id or "no-pending-message",
-            drain_id=drain_id,
-            state_root=state_dir,
-        )
+    binding = selection.binding
+    adapter = selection.adapter
+    handle = selection.handle
+    quota_snapshot = adapter.quota_observer(state_dir / binding.persona).read()
 
     runtime_controller.assert_drain_allowed(
         binding.persona,
         drain_id,
-        state_root=state_dir,
-    )
-    handle = runtime_controller.ensure_runtime(
-        binding,
-        adapter,
         state_root=state_dir,
     )
     if primary_binding is not None and recovery_evidence is not None:
@@ -1068,26 +1883,6 @@ def wake_persistent_runtime(
             fallbacks=binding.controller.policy.fallbacks,
         ),
     )
-    if quota_decision == "planned-failover" and fallback_binding is not None:
-        message_id, _ = _oldest_pending_identity(binding.mailbox)
-        weekly_reset = next(
-            (
-                window.resets_at.isoformat().replace("+00:00", "Z")
-                for window in quota_snapshot.windows
-                if window.name.strip().lower().replace(" ", "-")
-                in {"week", "weekly", "weekly-quota", "weekly_remaining", "weekly-remaining", "7d", "7-day", "seven-day"}
-            ),
-            None,
-        )
-        runtime_controller.planned_swap(
-            handle,
-            fallback_binding,
-            message_id=message_id,
-            drain_id=drain_id,
-            primary_resets_at=weekly_reset,
-            quota_evidence=dict(quota_snapshot.evidence),
-            state_root=state_dir,
-        )
     target = runtime_controller.runtime_target_text(handle.tmux)
     box = binding.mailbox
     new_dir = box / "new"
@@ -1109,6 +1904,7 @@ def wake_persistent_runtime(
         "tmux_target": target,
         "profile": binding.launch.profile,
         "harness": binding.launch.harness,
+        "runtime_viability": selection.receipt,
         "mailbox_claimed": False,
         "acked": False,
         "quota_decision": quota_decision,
@@ -1299,6 +2095,19 @@ def main(argv: list[str] | None = None) -> int:
         default=Path(os.environ.get("PANTHEON_MAILBOX_HUB", DEFAULT_MAILBOX_HUB)),
     )
 
+    quota_parser = subparsers.add_parser("quota-check")
+    _common_parser(quota_parser)
+    quota_parser.add_argument(
+        "--state-dir",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "PANTHEON_PERSONA_STATE_DIR",
+                Path.home() / ".local" / "state" / "pantheon" / "personas",
+            )
+        ),
+    )
+
     args = parser.parse_args(argv)
     try:
         binding = load_binding(
@@ -1328,6 +2137,33 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, ValueError, yaml.YAMLError) as exc:
             parser.error(str(exc))
 
+    if args.command == "quota-check":
+        supported, reason = quota_check_supported(binding, manifest_path=args.manifest)
+        if not supported:
+            _print_json(
+                QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=False,
+                    decision="unsupported",
+                    acted=False,
+                    reason=reason,
+                )
+            )
+            return 0
+        adapter = build_adapter(binding, harness_home=args.harness_home)
+        fallback = first_fallback_binding(args.manifest, binding)
+        result = quota_check(
+            binding,
+            adapter=adapter,
+            fallback_binding=fallback,
+            primary_binding=primary_binding,
+            state_dir=args.state_dir,
+            cwd=args.cwd,
+            manifest_path=args.manifest,
+        )
+        _print_json(result)
+        return 0
+
     report = diagnose_persona(
         binding,
         harness_home=args.harness_home,
@@ -1341,11 +2177,15 @@ def main(argv: list[str] | None = None) -> int:
     if any(item.status == "fail" for item in report.observations):
         _print_json(report)
         if args.command == "consume":
-            streak = bump_soft_streak(args.state_dir, binding.persona)
+            streak = bump_diag_streak(args.state_dir, binding.persona)
             if streak >= SOFT_FAILURE_ALERT_STREAK:
                 return EXIT_SOFT_PERSISTENT
         return 3
     if args.command == "consume":
+        # Diagnostics passed this fire (T-3209): the gate stage has recovered,
+        # regardless of what the attempt stage below does next (backoff-skip,
+        # policy-skip, transport failure, or success) -- clear its streak now.
+        clear_diag_streak(args.state_dir, binding.persona)
         adapter = build_adapter(binding, harness_home=args.harness_home)
         fallback = first_fallback_binding(args.manifest, binding)
         recovery = (
@@ -1355,6 +2195,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         remaining = backoff_remaining(args.state_dir, binding.persona)
         if remaining > 0:
+            policy_skip = bump_policy_skip(args.state_dir, binding.persona, "backoff")
             _print_json(
                 {
                     "binding": binding,
@@ -1363,6 +2204,7 @@ def main(argv: list[str] | None = None) -> int:
                         "skipped": "backoff",
                         "remaining_seconds": int(remaining),
                         "state": load_backoff(args.state_dir, binding.persona),
+                        "policy_skip_streak": policy_skip,
                     },
                     "outcomes": [],
                 }
@@ -1370,11 +2212,13 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         try:
             if binding.launch.mode == "interactive":
+                runtime_candidates = configured_runtime_bindings(args.manifest, primary_binding)
                 wake = wake_persistent_runtime(
                     binding,
                     adapter=adapter,
                     fallback_binding=fallback,
                     primary_binding=primary_binding,
+                    runtime_candidates=runtime_candidates,
                     recovery_evidence=recovery,
                     state_dir=args.state_dir,
                     cwd=args.cwd,
@@ -1394,6 +2238,7 @@ def main(argv: list[str] | None = None) -> int:
                     reply_hub=args.reply_hub,
                 )
         except runtime_controller.RuntimeTransitionPending as exc:
+            policy_skip = bump_policy_skip(args.state_dir, binding.persona, "runtime_transition")
             _print_json(
                 {
                     "binding": binding,
@@ -1402,12 +2247,14 @@ def main(argv: list[str] | None = None) -> int:
                         "mode": "interactive-wake",
                         "skipped": "runtime_transition",
                         "reason": str(exc),
+                        "policy_skip_streak": policy_skip,
                     },
                     "outcomes": [],
                 }
             )
             return 0
         except runtime_controller.ProviderQuotaExhausted as exc:
+            policy_skip = bump_policy_skip(args.state_dir, binding.persona, "quota_breaker_open")
             _print_json(
                 {
                     "binding": binding,
@@ -1416,11 +2263,31 @@ def main(argv: list[str] | None = None) -> int:
                         "mode": "interactive-wake",
                         "skipped": "quota_breaker_open",
                         "profile": exc.profile,
+                        "policy_skip_streak": policy_skip,
                     },
                     "outcomes": [],
                 }
             )
             return 0
+        except runtime_controller.RuntimeViabilityBlocked as exc:
+            policy_skip = bump_policy_skip(
+                args.state_dir, binding.persona, "runtime_viability_blocked"
+            )
+            _print_json(
+                {
+                    "binding": binding,
+                    "diagnostics": report,
+                    "consume": {
+                        "mode": "interactive-wake",
+                        "skipped": "runtime_viability_blocked",
+                        "reason": exc.reason,
+                        "block": exc.evidence,
+                        "policy_skip_streak": policy_skip,
+                    },
+                    "outcomes": [],
+                }
+            )
+            return 5
         except OSError as exc:
             error = f"{type(exc).__name__}: {exc}"
             state = record_backoff_failure(
@@ -1429,6 +2296,11 @@ def main(argv: list[str] | None = None) -> int:
                 error,
             )
             streak = bump_soft_streak(args.state_dir, binding.persona)
+            # A transport-level failure is a genuine (non-policy) outcome --
+            # the attempt stage was reached and reached past any policy gate,
+            # so the policy-skip streak (T-3210) no longer describes this
+            # seat's state and must clear, same posture as the success tail.
+            clear_policy_skip(args.state_dir, binding.persona)
             _print_json(
                 {
                     "binding": binding,
@@ -1458,9 +2330,13 @@ def main(argv: list[str] | None = None) -> int:
                 json.dumps(stats["errors"], sort_keys=True),
             )
             streak = bump_soft_streak(args.state_dir, binding.persona)
+            # Same genuine-non-policy-outcome reasoning as the OSError branch
+            # above (T-3210).
+            clear_policy_skip(args.state_dir, binding.persona)
             return EXIT_SOFT_PERSISTENT if streak >= SOFT_FAILURE_ALERT_STREAK else 4
         clear_backoff(args.state_dir, binding.persona)
         clear_soft_streak(args.state_dir, binding.persona)
+        clear_policy_skip(args.state_dir, binding.persona)
         return 0
     if args.prompt is not None and args.prompt_file is not None:
         parser.error("--prompt and --prompt-file are mutually exclusive")

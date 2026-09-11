@@ -452,6 +452,8 @@ def build_brief(
 Write your report to: `{output_path}`
 Length budget: ~{topic.budget} lines (do not exceed by 2× without escalating).
 
+**House discipline (load-bearing — read before you write a single line): if your report references the Anthropic billing-classifier trigger phrase (the harness-detection filename discussed in the anthropic-policy-and-billing / agentic-harness-landscape topics), write it ONLY in the escaped form `HERMES\\.md` (uppercase, backslash before the period) — never the bare contiguous sequence. The bare form in a committed file refuses the land-commit (your report gets orphaned off origin); the escaped form reads identically in prose and is safe.**
+
 **Begin the report with a frontmatter block — this is how the end-of-day digest decides what to surface to the operator (the digest reads this; it does NOT re-read your whole report). Be honest: most weekly checks ARE routine.**
 ```
 ---
@@ -466,9 +468,7 @@ Set `surface: above-bar` ONLY for genuinely operator-noteworthy findings — a n
 
 Structure (after the frontmatter): section headers, inline citations, distinguish primary from secondary, tag `[weak]` / `[single-source]` where appropriate. End with a `## Sources` section listing every URL/citation with one-line characterization.
 
-Honor your persona's hard rules: one topic, cite everything non-synthesis, mark weak claims, no code, no editing hand-curated docs outside the assigned output path, stay under budget, surface what couldn't be determined.
-
-House discipline: if your report references the Anthropic billing-classifier trigger phrase (the harness-detection filename discussed in the anthropic-policy-and-billing / agentic-harness-landscape topics), write it ONLY in the escaped form `HERMES\\.md` (uppercase, backslash before the period) — never the bare contiguous sequence. The bare form in a committed file refuses the land-commit (your report gets orphaned off origin); the escaped form reads identically in prose and is safe.
+Honor your persona's hard rules: one topic, cite everything non-synthesis, mark weak claims, no code, no editing hand-curated docs outside the assigned output path, stay under budget, surface what couldn't be determined. (The `HERMES\\.md` escaping rule at the top of this section is load-bearing — re-check it before committing.)
 
 ## Instruments — try a second one before you record a negative
 
@@ -1244,6 +1244,22 @@ def _invoke_ticket_file(
 # report spamming the ticket queue in the unattended cron path.
 _FOLLOWUP_SOFT_CAP = 20
 
+# T-3172: distinct from _FOLLOWUP_SOFT_CAP above (which caps per-REPORT parsed
+# lines before parsing even runs). This caps per-FIRE unique follow-up
+# TICKETS filed across one actuate_phase() call, after parsing and
+# cross-report dedup — the guard against the ~35-46-ticket explosion class.
+_FOLLOWUP_FIRE_CEILING = int(
+    os.environ.get("PANTHEON_WATCH_ACTUATION_CEILING", "20")
+)
+
+# T-3172: noise words dropped before the dedup key is built, so filler-word
+# variance ("Verify the permission mode" vs "Verify permission mode") doesn't
+# defeat the match. Deliberately small and conservative.
+_TITLE_NOISE_WORDS = frozenset(
+    {"a", "an", "the", "of", "for", "to", "and", "in", "on"}
+)
+_TITLE_TOKEN_RE = re.compile(r"[^a-z0-9]+")
+
 # Leading markdown list marker on a follow-up bullet (`- `, `* `, `+ `, `1. `,
 # `2) `). Stripped BEFORE title derivation so it never leaks into the ticket H1
 # — the "# - **Title" broken-heading class the operator hand-fixed on T-0859/T-0946.
@@ -1290,6 +1306,21 @@ class FollowupParseResult:
 def _clean_followup_title(title: str) -> str:
     """Trim stray edge emphasis markers from a derived follow-up title. Idempotent."""
     return _EDGE_EMPHASIS_RE.sub("", title).strip()
+
+
+def _normalize_followup_title(title: str) -> str:
+    """Order-invariant per-fire dedup key for a follow-up title (T-3172).
+
+    Lowercases, splits on any non-alphanumeric run, drops a small noise-word
+    set, then sorts the remaining tokens. Sorting makes the key insensitive
+    to word order (`MCP supply chain audit` vs `Audit MCP supply chain`),
+    which a plain lowercase-and-punctuation-strip key would miss — that
+    reordered-title shape is exactly what recurs across overlapping reports
+    in the same fire.
+    """
+    tokens = _TITLE_TOKEN_RE.split(title.lower())
+    significant = sorted(t for t in tokens if t and t not in _TITLE_NOISE_WORDS)
+    return " ".join(significant)
 
 
 def _split_followup_line(line: str) -> tuple[str, str] | None:
@@ -1350,6 +1381,15 @@ def parse_followups_detailed(body: str) -> FollowupParseResult:
                 file=sys.stderr,
             )
             rejected.append(raw)
+            continue
+        # T-3069: post-split sentinel guard — a `- None — <explanation>` line
+        # parses as (title='None', ask='<explanation>') but is still a no-follow-up
+        # declaration with prose after the separator. The pre-split sentinel-check
+        # only catches bare `- None` / `- No follow-ups` etc. Extend the guard to
+        # the split TITLE so declared no-ops with trailing explanation don't file
+        # as a "None"-titled ticket (observed 2026-08-21 T-3057 specialist watch fire).
+        title, _ask = item
+        if _NO_FOLLOWUP_SENTINEL_RE.fullmatch(title.strip()):
             continue
         if len(parsed) >= _FOLLOWUP_SOFT_CAP:
             overflow += 1
@@ -1445,6 +1485,11 @@ def file_followup(
     ask = _escape_classifier_trigger(ask)
     ask_body, context_body = build_followup_ticket_bodies(title, ask, finding, parent_id)
     merged_labels = ["low-pri", "triage", "from-watch", f"source-topic-{finding.slug}"]
+    intent_ref = (
+        f"ticket:{parent_id}"
+        if parent_id is not None
+        else f"maintenance:watch/topics/{finding.slug}"
+    )
     argv = [
         sys.executable,
         str(ticket_bin),
@@ -1453,11 +1498,22 @@ def file_followup(
         "--target", "specialist",
         "--title", title[:120],
         "--labels", ",".join(merged_labels),
+        "--project-id", "null",
+        "--nearest-intent-ref", intent_ref,
         "--ask", ask_body,
         "--context", context_body,
     ]
     if parent_id is not None:
         argv += ["--parent-ticket", parent_id]
+    else:
+        # T-3328: no established parent — still connect via the goal/arc-
+        # intent edge (--serves) rather than filing an orphan. Derived from
+        # data already in this call's context (finding.slug), no new lookup.
+        argv += [
+            "--serves",
+            f"the {finding.slug} watch topic's continuous coverage "
+            "(from-watch follow-up, no established parent ticket)",
+        ]
 
     return _invoke_ticket_file(argv, f"file_followup {finding.slug}:{title[:40]}", env)
 
@@ -1489,6 +1545,73 @@ def file_unparsed_followups(
         parent_id=parent_id,
         ticket_bin=ticket_bin,
         env=env,
+    )
+
+
+def build_followup_overflow_body(
+    overflow: list[tuple[str, str, Finding]],
+    today: date,
+    ceiling: int,
+) -> tuple[str, str]:
+    """Render (ask_body, context_body) for the per-fire overflow-summary ticket (T-3172)."""
+    lines = [
+        f"- {title} — {ask} (from watch report: {finding.report_relpath})"
+        for title, ask, finding in overflow
+    ]
+    ask_body = (
+        f"Watch fire {today.isoformat()} produced {len(overflow)} follow-up(s) "
+        f"beyond the per-fire ceiling ({ceiling}). Triage each line below "
+        f"individually; file a separate ticket per item that still needs one:\n\n"
+        + "\n".join(lines)
+    )
+    context_body = (
+        "Machine-generated overflow summary (T-3172 per-fire ceiling).\n"
+        f"Fire date: {today.isoformat()}\n"
+        f"Ceiling: {ceiling}\n"
+        f"Overflow count: {len(overflow)}"
+    )
+    return ask_body, context_body
+
+
+def file_followup_overflow_summary(
+    overflow: list[tuple[str, str, Finding]],
+    today: date,
+    ceiling: int,
+    *,
+    ticket_bin: Path = TICKET_BIN,
+    env: dict | None = None,
+) -> tuple[str, str | None, str]:
+    """File one summary ticket enumerating follow-ups beyond the per-fire ceiling.
+
+    Calls `_invoke_ticket_file` directly rather than delegating to
+    `file_followup`: the overflow set spans multiple reports/findings, so
+    there is no single `Finding` to key off, and the classifier escape needs
+    to run over the concatenated body rather than one title/ask pair.
+    """
+    if env is None:
+        env = os.environ.copy() | {"PANTHEON_ACTOR": "specialist"}
+
+    ask_body, context_body = build_followup_overflow_body(overflow, today, ceiling)
+    ask_body = _escape_classifier_trigger(ask_body)
+    context_body = _escape_classifier_trigger(context_body)
+    title = _escape_classifier_trigger(
+        f"Watch fire {today.isoformat()}: {len(overflow)} follow-up(s) over ceiling ({ceiling})"
+    )
+    argv = [
+        sys.executable,
+        str(ticket_bin),
+        "file",
+        "--requester", "specialist",
+        "--target", "specialist",
+        "--title", title[:120],
+        "--labels", "low-pri,triage,from-watch,actuation-overflow",
+        "--project-id", "null",
+        "--nearest-intent-ref", "maintenance:watch/actuation-overflow",
+        "--ask", ask_body,
+        "--context", context_body,
+    ]
+    return _invoke_ticket_file(
+        argv, f"file_followup_overflow_summary {today.isoformat()}", env
     )
 
 
@@ -1526,6 +1649,8 @@ def file_finding(
         "--target", policy["target"],
         "--title", title,
         "--labels", ",".join(merged_labels),
+        "--project-id", "null",
+        "--nearest-intent-ref", f"maintenance:watch/topics/{finding.slug}",
         "--ask", ask,
         "--context", context,
     ]
@@ -1591,6 +1716,8 @@ def file_cross_reference(
         "--target", policy["target"],
         "--title", title,
         "--labels", ",".join(merged_labels),
+        "--project-id", "null",
+        "--nearest-intent-ref", f"maintenance:watch/topics/{finding.slug}",
         "--ask", ask,
         "--context", context,
     ]
@@ -1719,6 +1846,12 @@ def actuate_phase(today: date, fires: list[Topic], statuses: dict[str, str]) -> 
         filed_ids: list[str] = []
         retried = 0
         errored = 0
+        # T-3172: per-fire dedup/ceiling state. Function-local (not module
+        # state) so it resets every actuate_phase() call — scope is exactly
+        # "within a single fire", never across fires, by construction.
+        followup_seen_keys: dict[str, str] = {}
+        followup_overflow: list[tuple[str, str, Finding]] = []
+        followup_fire_count = 0
         tickets_root = REPO_ROOT / "tickets"
         # T-2523: index this run's findings by slug so a secondary report's
         # declared `belongs_to_topic` can be checked against topics that
@@ -1763,6 +1896,23 @@ def actuate_phase(today: date, fires: list[Topic], statuses: dict[str, str]) -> 
             report_body = _read_report_body(finding)
             followups = parse_followups_detailed(report_body)
             for fu_title, fu_ask in followups.parsed:
+                # T-3172: cross-report dedup within this fire, then a soft
+                # per-fire ceiling over the deduped count.
+                dedup_key = _normalize_followup_title(fu_title)
+                canonical = followup_seen_keys.get(dedup_key)
+                if canonical is not None:
+                    print(
+                        f"[actuation] followup: skipping duplicate {fu_title!r} "
+                        f"(collapses onto {canonical!r})",
+                        file=sys.stderr,
+                    )
+                    continue
+                followup_seen_keys[dedup_key] = fu_title
+                followup_fire_count += 1
+                if followup_fire_count > _FOLLOWUP_FIRE_CEILING:
+                    followup_overflow.append((fu_title, fu_ask, finding))
+                    continue
+
                 fu_outcome, fu_id, _fu_detail = file_followup(
                     fu_title,
                     fu_ask,
@@ -1792,6 +1942,24 @@ def actuate_phase(today: date, fires: list[Topic], statuses: dict[str, str]) -> 
                         filed_ids.append(recovery_id)
                 elif recovery_outcome == "errored":
                     errored += 1
+
+        if followup_overflow:
+            print(
+                f"[actuation] followup: fire ceiling ({_FOLLOWUP_FIRE_CEILING}) "
+                f"exceeded; filing 1 summary ticket for "
+                f"{len(followup_overflow)} overflow item(s)",
+                file=sys.stderr,
+            )
+            overflow_outcome, overflow_id, _overflow_detail = (
+                file_followup_overflow_summary(
+                    followup_overflow, today, _FOLLOWUP_FIRE_CEILING
+                )
+            )
+            if overflow_outcome == "filed":
+                if overflow_id is not None:
+                    filed_ids.append(overflow_id)
+            elif overflow_outcome == "errored":
+                errored += 1
 
         log_actuation_summary(len(filed_ids), surfaced, retried, errored)
 
@@ -2008,7 +2176,7 @@ def file_watch_ticket(
         f"entrypoint (ORG-025 / T-0855). The timer no longer fires researchers "
         f"itself via headless `claude -p`; it hands the due-topic list to Specialist's "
         f"interactive session, which dispatches via the Agent tool. See "
-        f"adr/ORG-025-specialist-orchestration-model.md."
+        f"architecture/adr/ORG-025-specialist-orchestration-model.md."
     )
     if env is None:
         env = os.environ.copy() | {"PANTHEON_ACTOR": "specialist"}
@@ -2020,8 +2188,14 @@ def file_watch_ticket(
         "--target", "specialist",
         "--title", title,
         "--labels", "watch,watch-dispatch,ORG-025",
+        "--project-id", "null",
+        "--nearest-intent-ref", "maintenance:watch-loop",
         "--ask", ask,
         "--context", context,
+        # T-3328: connect via the goal/arc-intent edge rather than filing an
+        # orphan — the weekly watch loop's due-topic dispatch is infra work.
+        "--serves", "the watch loop's due-topic dispatch reaches Specialist's "
+                    "session without silently stalling (ORG-025)",
     ]
     outcome, tid, detail = _invoke_ticket_file(
         argv, f"file_watch_ticket {today.isoformat()}", env

@@ -126,11 +126,14 @@ eval "$RESOLVE_OUTPUT"
 note "manifest precondition OK (${PCX_MANIFEST_PATH} carries the synced control-plane launch shape for persona ${PERSONA}, role ${PCX_ROLE})"
 
 XRD="$PCX_XDG_RUNTIME_DIR"
+DBUS="$PCX_DBUS_SESSION_BUS_ADDRESS"
 
 # --- preflight continued: uid + XDG runtime dir -------------------------
 [[ "$(id -u)" == "$PCX_UID" ]] || die "must run as ${PCX_ACCOUNT} (uid ${PCX_UID}); got uid $(id -u). Wrap with sudo -u ${PCX_ACCOUNT}."
 [[ -d "$XRD" ]] || die "XDG_RUNTIME_DIR $XRD missing — user bus unreachable; cannot drive ${PCX_ACCOUNT}'s systemctl --user"
+[[ -n "$DBUS" ]] || die "DBUS_SESSION_BUS_ADDRESS missing — user bus unreachable; cannot drive ${PCX_ACCOUNT}'s systemctl --user"
 export XDG_RUNTIME_DIR="$XRD"
+export DBUS_SESSION_BUS_ADDRESS="$DBUS"
 
 # --- precondition: persona is install-done / harness-findable (T-2611) -----
 # Read-only (runs installer.plan() + a read-only preflight pass; never
@@ -145,6 +148,13 @@ if ! INSTALL_PRECONDITION_OUTPUT="$(PATH="$PCX_APPLY_PATH" python3 "$PERSONA_APP
   die "install-done precondition failed (${PERSONA} is not control-plane-ready) -- ${INSTALL_PRECONDITION_OUTPUT}"
 fi
 note "install-done precondition OK -- ${INSTALL_PRECONDITION_OUTPUT}"
+
+if [[ $EXECUTE == 1 ]]; then
+  if ! STAGED_CHECK_OUTPUT="$(PATH="$PCX_APPLY_PATH" python3 "$PERSONA_APPLY_HELPER" check-staged --manifest "$PCX_MANIFEST_PATH" --persona "$PERSONA" --harness claude --repo-root "$PCX_REPO_ROOT" --stamp "$STAMP" 2>&1)"; then
+    die "staged checkpoint precondition failed -- ${STAGED_CHECK_OUTPUT}"
+  fi
+  note "staged checkpoint OK -- ${STAGED_CHECK_OUTPUT}"
+fi
 
 echo "== T-2633 ${PERSONA} generic forward-cutover =="
 echo "persona:  $PERSONA (role: $PCX_ROLE, account: $PCX_ACCOUNT)"
@@ -183,8 +193,9 @@ if [[ $EXECUTE != 1 ]]; then
       echo "  [abort if ${tok#*=} survives the stop]"
     done
   fi
-  echo "  PATH=${PCX_APPLY_PATH} python3 ${PERSONA_APPLY_HELPER} apply --manifest ${PCX_MANIFEST_PATH} --persona ${PERSONA} --harness claude --repo-root ${PCX_REPO_ROOT}"
-  echo "                        # persona_installer real-apply: installs/converges + fires ${PCX_CONSUME_TIMER} / ${PCX_CONSUME_SERVICE} (T-2611)"
+  echo "  require staged checkpoint: PATH=${PCX_APPLY_PATH} python3 ${PERSONA_APPLY_HELPER} check-staged --manifest ${PCX_MANIFEST_PATH} --persona ${PERSONA} --harness claude --repo-root ${PCX_REPO_ROOT} --stamp ${STAMP}"
+  echo "  PATH=${PCX_APPLY_PATH} python3 ${PERSONA_APPLY_HELPER} activate-staged --manifest ${PCX_MANIFEST_PATH} --persona ${PERSONA} --harness claude --repo-root ${PCX_REPO_ROOT} --stamp ${STAMP}"
+  echo "                        # persona_installer activation suffix: fires ${PCX_CONSUME_TIMER} / ${PCX_CONSUME_SERVICE} from staged checkpoint (T-2953 R5)"
   if [[ -n "$PCX_COMPANION_UNITS" ]]; then
     for tok in $PCX_COMPANION_UNITS; do
       echo "  systemctl --user start ${tok%%=*}   # T-2648: rejoin the now-scope-owned default tmux server"
@@ -254,12 +265,12 @@ for tok in $PCX_COMPANION_UNITS; do
   echo "confirmed: default tmux socket has no ${companion_session} session"
 done
 
-if ! PERSONA_APPLY_OUTPUT="$(PATH="$PCX_APPLY_PATH" python3 "$PERSONA_APPLY_HELPER" apply --manifest "$PCX_MANIFEST_PATH" --persona "$PERSONA" --harness claude --repo-root "$PCX_REPO_ROOT" 2>&1)"; then
+if ! PERSONA_APPLY_OUTPUT="$(PATH="$PCX_APPLY_PATH" python3 "$PERSONA_APPLY_HELPER" activate-staged --manifest "$PCX_MANIFEST_PATH" --persona "$PERSONA" --harness claude --repo-root "$PCX_REPO_ROOT" --stamp "$STAMP" 2>&1)"; then
   echo "$PERSONA_APPLY_OUTPUT" >&2
   die "persona_installer apply failed -- ${PERSONA} has no active supervisor now. Roll back immediately: tools/persona_rollback.sh --persona ${PERSONA} --stamp ${STAMP} --execute"
 fi
 echo "$PERSONA_APPLY_OUTPUT"
-echo "activated: persona_installer installed/converged + fired ${PCX_CONSUME_TIMER} / ${PCX_CONSUME_SERVICE}"
+echo "activated: persona_installer staged checkpoint validated + activation suffix fired ${PCX_CONSUME_TIMER} / ${PCX_CONSUME_SERVICE}"
 
 # T-2648: rejoin now that the control plane owns the default tmux server --
 # the companion's own join-existing-server behavior (T-1689, e.g. acp-
@@ -330,6 +341,25 @@ else
   echo "verify: scope ownership MISSING/UNVERIFIABLE FAIL"; fail=1
 fi
 
+SELECTED_HARNESS=""
+SELECTED_PROFILE=""
+if [[ -f "$RUNTIME_JSON" ]]; then
+  SELECTED_HARNESS="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('harness',''))" "$RUNTIME_JSON" 2>/dev/null || true)"
+  SELECTED_PROFILE="$(python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(d.get('profile',''))" "$RUNTIME_JSON" 2>/dev/null || true)"
+fi
+
+if [[ "$SELECTED_HARNESS" == "codex" ]]; then
+  if [[ "$SELECTED_PROFILE" == "interactive-chatgpt" ]]; then
+    echo "verify: selected runtime codex/${SELECTED_PROFILE} OK"
+  else
+    echo "verify: selected codex profile ${SELECTED_PROFILE:-missing} FAIL"; fail=1
+  fi
+  if (cd "$PCX_REPO_ROOT" && PATH="$PCX_APPLY_PATH" python3 -m tools.runtime_controller initial-viability --persona "$PERSONA" --state-root "$STATE_ROOT" --expect-selected "codex/interactive-chatgpt" --expect-failed "claude/interactive-subscription" --expect-failure-class subscription-cap --expect-failure-class operational-launch --expect-failure-class operational-readiness --require-source-provenance --require-receiver-receipt) >/dev/null; then
+    echo "verify: initial viability selected Codex with allowed failure and receiver evidence OK"
+  else
+    echo "verify: initial viability selected Codex evidence MISSING/MISMATCH FAIL"; fail=1
+  fi
+elif [[ "$SELECTED_HARNESS" == "claude" ]]; then
 # Exact launch flags. The `clau[d]e` bracket idiom (see NB above) is load-
 # bearing here too. Path-anchored on the npm-global claude binary -- a bare
 # "clau[d]e" substring would false-positive-match any other process whose
@@ -428,6 +458,9 @@ else
     pgrep -u "$PCX_ACCOUNT" -af 'bun' 2>&1 | head
   } > "$DIAG" 2>&1 || true
   echo "verify: telegram inbound poller MISSING after bounded wait -- ${PERSONA} would be comms-dark FAIL (diag: ${DIAG})"; fail=1
+fi
+else
+  echo "verify: selected runtime harness ${SELECTED_HARNESS:-missing} is not declared for post-activation verification FAIL"; fail=1
 fi
 
 if [[ $fail == 0 ]]; then

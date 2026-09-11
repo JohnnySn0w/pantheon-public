@@ -1,0 +1,29 @@
+# Appetite -> time-in-active budget calibration (ORG-089 §Decision.4).
+#
+# WARM-UP STATE (current): generate-only. The appetite-overrun circuit breaker is
+# SILENT while `mode` != active OR `calibration_version` == 0 -- grooming logs
+# appetite/actual/outcome per bet to ledger/appetite/ but fires no breaker and
+# mutates no ticket. This is the deliberate warm-up (ORG-089 §Decision.4:
+# "generate-only until T-3430 calibration").
+#
+# THE SWITCH: T-3430 (not_before 2026-12-05, plus a >=20-bet-outcome precondition)
+# is the WRITER that fits the band->budget mapping from the real warm-up data and
+# flips `mode: active` + `calibration_version: >0`. That single write is what turns
+# the breaker on. T-3430 also owns wiring the grooming overrun check to apply-mode
+# (the mutation + advisory path is built and unit-tested under ORG-089/T-3440 but
+# routed report-only until activation).
+#
+# FAIL-SAFE (ORG-089 §Decision.4): the breaker never blocks legitimate work on
+# missing/corrupt data -- its job is surfacing overrun for judgment. An absent or
+# malformed file reads as silent (generate-only), not as an error.
+mode: generate-only
+calibration_version: 0
+
+# bands: appetite-score -> max active-spend budget (seconds). Filled by T-3430 from
+# ledger/appetite warm-up data. Empty during warm-up (illustrative shape only, NOT
+# active):
+#   bands:
+#     "1-3": 3600      # low appetite -> tight budget
+#     "4-6": 21600
+#     "7-10": 86400    # high appetite -> generous budget
+bands: {}

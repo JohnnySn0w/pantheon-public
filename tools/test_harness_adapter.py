@@ -23,12 +23,15 @@ Coverage:
 from __future__ import annotations
 
 import contextlib
+import dataclasses
+import hashlib
 import inspect
 import io
 import json
 import tempfile
 import tomllib  # stdlib ≥3.11 — the declared floor (T-2733: production harness_adapter needs it)
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 from tools.harness_adapter import (
@@ -48,7 +51,7 @@ from tools.harness_adapter.codex import (
     gc_stale_project_trust_entries,
     gc_trust_entries_cli,
 )
-from tools.harness_adapter.types import HarnessLaunchConfig, TmuxTarget
+from tools.harness_adapter.types import HarnessLaunchConfig, PostStartPaneSample, TmuxTarget
 from tools import mailbox
 
 
@@ -68,6 +71,15 @@ def _claude_launch_config(native: dict) -> HarnessLaunchConfig:
         quota_source="statusline",
         native=native,
         sources=("test",),
+    )
+
+
+def _post_start_sample(text: str, index: int) -> PostStartPaneSample:
+    return PostStartPaneSample(
+        capture_index=index,
+        sha256=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+        snippet_sha256=hashlib.sha256(text[:512].encode("utf-8")).hexdigest() if text else None,
+        text=text,
     )
 
 
@@ -199,7 +211,8 @@ def _make_minimal_concrete() -> type:
         def auth_descriptor(self):
             return None
 
-        def build_interactive_launch(self, target):
+        def build_interactive_launch(self, target, *, cwd):
+            del cwd
             return None
 
         def quota_observer(self, state_dir):
@@ -338,10 +351,242 @@ class TestClaudeTranslations(unittest.TestCase):
 
     def test_legacy_interactive_launch_still_pins_default_permission_mode(self) -> None:
         command = self.adapter.build_interactive_launch(
-            TmuxTarget(session="recovery", window="harness", pane="0")
+            TmuxTarget(session="recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
         )
         self.assertEqual(command.argv.count("--permission-mode"), 1)
         self.assertEqual(command.argv[-2:], ("--permission-mode", "default"))
+
+    def test_claude_post_start_weekly_limit_is_subscription_cap_not_runtime_started(self) -> None:
+        adapter = ClaudeHarnessAdapter(
+            "orchestrator",
+            claude_home=Path("/tmp/fake-claude-home"),
+            launch=_claude_launch_config({}),
+        )
+        cap_text = (Path(__file__).resolve().parent / "testdata" / "orchestrator_cap_modal_pane.txt").read_text(encoding="utf-8")
+        baseline = _post_start_sample("❯ \n", 0)
+        assessment = adapter.assess_post_start_readiness(
+            harness="claude",
+            profile="interactive-subscription",
+            baseline=baseline,
+            samples=(_post_start_sample(cap_text, 1),),
+        )
+        payload = dataclasses.asdict(assessment)
+        self.assertEqual(assessment.status, "subscription-cap")
+        self.assertEqual(assessment.cause, "post-start-subscription-cap")
+        self.assertEqual(assessment.pattern_id, "claude-rate-limit-options-modal")
+        self.assertEqual(assessment.baseline_sha256, baseline.sha256)
+        self.assertNotIn("You've hit your", json.dumps(payload, sort_keys=True))
+        self.assertNotIn("What do you want to do?", json.dumps(payload, sort_keys=True))
+
+    def test_claude_post_start_cap_classifier_rejects_prompt_history_and_broad_limit_text(self) -> None:
+        adapter = ClaudeHarnessAdapter(
+            "orchestrator",
+            claude_home=Path("/tmp/fake-claude-home"),
+            launch=_claude_launch_config({}),
+        )
+        cap_text = (Path(__file__).resolve().parent / "testdata" / "orchestrator_cap_modal_pane.txt").read_text(encoding="utf-8")
+        cases = (
+            ("prompt-echo", "❯ \n", "User prompt: You've hit your weekly limit · resets 2:50pm (UTC)\n"),
+            ("broad", "❯ \n", "weekly limit reached somewhere in docs\n"),
+            ("old-provider-baseline", cap_text, cap_text),
+            ("exact-sentence-without-modal", "❯ \n", "You've hit your session limit · resets 2:50pm (UTC)\n"),
+        )
+        for label, baseline_text, sample_text in cases:
+            with self.subTest(label=label):
+                assessment = adapter.assess_post_start_readiness(
+                    harness="claude",
+                    profile="interactive-subscription",
+                    baseline=_post_start_sample(baseline_text, 0),
+                    samples=(_post_start_sample(sample_text, 1),),
+                )
+                self.assertNotEqual(assessment.status, "subscription-cap")
+                self.assertIsNone(assessment.pattern_id)
+
+    def test_claude_interactive_completion_observer_uses_fresh_statusline_boundary_without_raw_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / "account"
+            state_dir = root / "state" / "recovery" / "runtime-controller"
+            transcript = account_home / ".claude" / "projects" / "project-a" / "session.jsonl"
+            transcript.parent.mkdir(parents=True)
+            statusline = state_dir / "quota" / "claude-statusline.json"
+            statusline.parent.mkdir(parents=True)
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "message": {"role": "assistant", "content": [{"type": "text", "text": "old turn"}]},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            statusline.write_text(
+                json.dumps(
+                    {
+                        "schema": "pantheon-claude-statusline-quota/v1",
+                        "observed_at": "2026-08-14T00:00:00Z",
+                        "session_id": "old",
+                        "transcript_path": str(transcript),
+                        "rate_limits": {"ok": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            adapter = ClaudeHarnessAdapter("orchestrator", claude_home=account_home)
+            marker = "PANTHEON_PROVIDER_COMPLETION_fixture"
+            probe = adapter.prepare_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                persona="recovery",
+                account_home=account_home,
+                state_dir=state_dir,
+                pane_baseline=_post_start_sample("ready\n❯ \n", 0),
+                submitted_at=datetime(2026, 8, 14, 0, 0, 1, tzinfo=timezone.utc),
+                nonce_marker=marker,
+                nonce_sha256=hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+            )
+            self.assertIsNotNone(probe)
+            assert probe is not None
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps({"type": "user", "message": {"role": "user", "content": marker}}) + "\n")
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {"role": "assistant", "content": [{"type": "text", "text": marker}]},
+                        }
+                    )
+                    + "\n"
+                )
+            statusline.write_text(
+                json.dumps(
+                    {
+                        "schema": "pantheon-claude-statusline-quota/v1",
+                        "observed_at": "2026-08-14T00:00:02Z",
+                        "session_id": "new",
+                        "transcript_path": str(transcript),
+                        "rate_limits": {"ok": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            assessment = adapter.assess_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                probe=probe,
+                samples=(_post_start_sample("ready changed\n❯ \n", 1),),
+            )
+        self.assertEqual(assessment.status, "provider-completed")
+        payload = json.dumps(dataclasses.asdict(assessment), sort_keys=True)
+        self.assertNotIn(marker, payload)
+        self.assertNotIn("old turn", payload)
+        self.assertNotIn("ready changed", payload)
+        self.assertNotIn(str(transcript), payload)
+
+    def test_claude_interactive_completion_rejects_nonce_with_non_whitespace_prefix_suffix(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / "account"
+            state_dir = root / "state" / "recovery" / "runtime-controller"
+            transcript = account_home / ".claude" / "projects" / "project-a" / "session.jsonl"
+            transcript.parent.mkdir(parents=True)
+            statusline = state_dir / "quota" / "claude-statusline.json"
+            statusline.parent.mkdir(parents=True)
+            transcript.write_text("", encoding="utf-8")
+            statusline.write_text(
+                json.dumps(
+                    {
+                        "schema": "pantheon-claude-statusline-quota/v1",
+                        "observed_at": "2026-08-14T00:00:00Z",
+                        "session_id": "old",
+                        "transcript_path": str(transcript),
+                        "rate_limits": {"ok": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            adapter = ClaudeHarnessAdapter("orchestrator", claude_home=account_home)
+            marker = "PANTHEON_PROVIDER_COMPLETION_fixture"
+            probe = adapter.prepare_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                persona="recovery",
+                account_home=account_home,
+                state_dir=state_dir,
+                pane_baseline=_post_start_sample("ready\n❯ \n", 0),
+                submitted_at=datetime(2026, 8, 14, 0, 0, 1, tzinfo=timezone.utc),
+                nonce_marker=marker,
+                nonce_sha256=hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+            )
+            self.assertIsNotNone(probe)
+            assert probe is not None
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": f"not exact: {marker} extra"}],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            statusline.write_text(
+                json.dumps(
+                    {
+                        "schema": "pantheon-claude-statusline-quota/v1",
+                        "observed_at": "2026-08-14T00:00:02Z",
+                        "session_id": "prefixed",
+                        "transcript_path": str(transcript),
+                        "rate_limits": {"ok": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            prefixed = adapter.assess_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                probe=probe,
+                samples=(_post_start_sample("ready changed\n❯ \n", 1),),
+            )
+            self.assertNotEqual(prefixed.status, "provider-completed")
+
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    json.dumps(
+                        {
+                            "type": "assistant",
+                            "message": {
+                                "role": "assistant",
+                                "content": [{"type": "text", "text": f" \n{marker}\t "}],
+                            },
+                        }
+                    )
+                    + "\n"
+                )
+            statusline.write_text(
+                json.dumps(
+                    {
+                        "schema": "pantheon-claude-statusline-quota/v1",
+                        "observed_at": "2026-08-14T00:00:03Z",
+                        "session_id": "exact",
+                        "transcript_path": str(transcript),
+                        "rate_limits": {"ok": True},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            exact = adapter.assess_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                probe=probe,
+                samples=(_post_start_sample("ready changed again\n❯ \n", 2),),
+            )
+        self.assertEqual(exact.status, "provider-completed")
 
     def test_build_interactive_launch_emits_channels_flag_when_native_channels_set(
         self,
@@ -354,7 +599,8 @@ class TestClaudeTranslations(unittest.TestCase):
             ),
         )
         command = adapter.build_interactive_launch(
-            TmuxTarget(session="recovery", window="harness", pane="0")
+            TmuxTarget(session="recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
         )
         self.assertEqual(command.argv.count("--channels"), 1)
         idx = command.argv.index("--channels")
@@ -371,9 +617,48 @@ class TestClaudeTranslations(unittest.TestCase):
             launch=_claude_launch_config({}),
         )
         command = adapter.build_interactive_launch(
-            TmuxTarget(session="recovery", window="harness", pane="0")
+            TmuxTarget(session="recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
         )
         self.assertNotIn("--channels", command.argv)
+
+    def test_build_interactive_launch_emits_effort_flag_when_native_effort_set(
+        self,
+    ) -> None:
+        # T-3084: fleet policy (opus-4.8 @ xhigh) must survive the HC adapter --
+        # specialist silently dropped to CLI-default effort at HC cutover because the
+        # adapter never wired native.effort into argv. Mirrors the channels-flag
+        # test shape above.
+        adapter = ClaudeHarnessAdapter(
+            "recovery",
+            claude_home=Path("/tmp/fake-claude-home"),
+            launch=_claude_launch_config({"effort": "xhigh"}),
+        )
+        command = adapter.build_interactive_launch(
+            TmuxTarget(session="recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
+        )
+        self.assertEqual(command.argv.count("--effort"), 1)
+        idx = command.argv.index("--effort")
+        self.assertEqual(command.argv[idx + 1], "xhigh")
+        # Composition check: --permission-mode must stay the trailing pair --
+        # test_legacy_interactive_launch_still_pins_default_permission_mode and
+        # the T-2382 fixture both pin argv[-2:] to it.
+        self.assertEqual(command.argv[-2:], ("--permission-mode", "default"))
+
+    def test_build_interactive_launch_omits_effort_flag_when_native_empty(
+        self,
+    ) -> None:
+        adapter = ClaudeHarnessAdapter(
+            "recovery",
+            claude_home=Path("/tmp/fake-claude-home"),
+            launch=_claude_launch_config({}),
+        )
+        command = adapter.build_interactive_launch(
+            TmuxTarget(session="recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
+        )
+        self.assertNotIn("--effort", command.argv)
 
     def test_approval_defaults_uses_explicit_default_and_scoped_allowlist(self) -> None:
         result = self.adapter.approval_defaults()
@@ -500,7 +785,8 @@ class TestCodexTranslations(unittest.TestCase):
         # config.toml key), so it must be appended on every interactive
         # launch rather than pre-seeded.
         command = self.adapter.build_interactive_launch(
-            TmuxTarget(session="pantheon-test", window="harness", pane="0")
+            TmuxTarget(session="pantheon-test", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
         )
         self.assertIn("--dangerously-bypass-hook-trust", command.argv)
 

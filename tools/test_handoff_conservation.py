@@ -16,7 +16,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import graveyard as gy  # noqa: E402
+import chronicle as cy  # noqa: E402
 import handoff_conservation as hc  # noqa: E402
 
 
@@ -70,7 +70,7 @@ def _synthetic_old() -> str:
         "are next in priority order for the arc once it resumes.\n\n"
         "## Durable pointers\n"
         "```bash\ncat /home/claude/root.env\n```\n"
-        "See tools/graveyard.py for the archive format and "
+        "See tools/chronicle.py for the archive format and "
         "tools/handoff_and_restart.sh for the restart pipeline. Also "
         "T-1005 and T-1006 are tracked here, along with T-1007 and T-1008.\n\n"
         "requester: specialist\n"
@@ -91,7 +91,7 @@ class ConservationCheckTest(unittest.TestCase):
             "Pick up T-1003 and T-1004, then T-1010.\n\n"
             "## Durable pointers\n"
             "```bash\ncat /home/claude/root.env\n```\n"
-            "See tools/graveyard.py for the archive format. T-1006, T-1007, "
+            "See tools/chronicle.py for the archive format. T-1006, T-1007, "
             "T-1008 still tracked.\n\n"
             "requester: specialist\n"
         )
@@ -149,7 +149,7 @@ class ConservationCheckTest(unittest.TestCase):
             "T-1006 and T-1007 are gated on ratification; T-1008 is long-tail.\n\n"
             "## GOTCHAS (durable)\n"
             "```bash\ngit push origin main\n```\n"
-            "Direct push succeeds via admin bypass. See tools/graveyard.py.\n\n"
+            "Direct push succeeds via admin bypass. See tools/chronicle.py.\n\n"
             "requester: specialist\n"
         )
         # Same four sections; only the trailing parentheticals + the title date
@@ -164,7 +164,7 @@ class ConservationCheckTest(unittest.TestCase):
             "T-1006 T-1007 still gated on ratification; T-1008 long-tail.\n\n"
             "## GOTCHAS (durable + this-session additions)\n"
             "```bash\ngit push origin main\n```\n"
-            "Direct push succeeds via admin bypass. See tools/graveyard.py.\n\n"
+            "Direct push succeeds via admin bypass. See tools/chronicle.py.\n\n"
             "requester: specialist\n"
         )
         self.assertEqual(hc.check_conservation(old, new), [])
@@ -185,7 +185,7 @@ class ConservationCheckTest(unittest.TestCase):
 class CliCheckTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name) / "graveyard"
+        self.root = Path(self._tmp.name) / "chronicle"
         self.handoff_dir = Path(self._tmp.name) / "handoff"
         self.handoff_dir.mkdir()
         self.handoff_file = self.handoff_dir / "HANDOFF.md"
@@ -213,7 +213,7 @@ class CliCheckTest(unittest.TestCase):
         self.assertNotIn("ALERT", err)
 
     def test_alerting_pair_exits_1_and_prints_reasons(self):
-        gy.archive("orchestrator", _synthetic_old(), jsonl_uuid="uuid-old",
+        cy.archive("orchestrator", _synthetic_old(), jsonl_uuid="uuid-old",
                    reason="graceful_restart", ts="2026-08-01T00:00:00Z", root=self.root)
         self.handoff_file.write_text("# HANDOFF\nDone for now.\n")
         rc, err = self._run_check()
@@ -222,7 +222,7 @@ class CliCheckTest(unittest.TestCase):
         self.assertIn("size-cliff", err)
 
     def test_quiet_pair_exits_0_no_alerts(self):
-        gy.archive("orchestrator", _synthetic_old(), jsonl_uuid="uuid-old",
+        cy.archive("orchestrator", _synthetic_old(), jsonl_uuid="uuid-old",
                    reason="graceful_restart", ts="2026-08-01T00:00:00Z", root=self.root)
         self.handoff_file.write_text(_synthetic_old())  # unchanged -> quiet
         rc, err = self._run_check()

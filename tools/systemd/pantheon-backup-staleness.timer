@@ -1,0 +1,10 @@
+[Unit]
+Description=Pantheon backup-staleness watchdog — daily fire (09:00 UTC, well after the 03:30 backup)
+
+[Timer]
+OnCalendar=*-*-* 09:00:00 UTC
+Persistent=true
+Unit=pantheon-backup-staleness.service
+
+[Install]
+WantedBy=timers.target

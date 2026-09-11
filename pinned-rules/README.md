@@ -45,8 +45,9 @@ shows the pinned rules missing from context, restore from the pre-symlink backup
 |------|-------------|
 <!-- AUTOGEN-START spine-index -->
 | [`specialist.md`](specialist.md) | These rules auto-load in every session running from `/home/claude-research/` or below. You are the unattended watch-loop driver for Pantheon's continuous-S4 layer. Most fires are cron'd; some are manual operator invocations. |
-| [`atlas.md`](atlas.md) | You are one of two sub-orchestrator seats under Orchestrator (the Orchestrator) per adr/ORG-043 in ~/pantheon-config. Your persona name is Atlas (self-chosen 2026-07-21). Mailbox recipient id: atlas. |
-| [`metis.md`](metis.md) | You are one of two sub-orchestrator seats under Orchestrator (the Orchestrator) per adr/ORG-043 in ~/pantheon-config. Your persona name is Metis (self-chosen 2026-07-21). Mailbox recipient id: metis. |
+| [`atlas.md`](atlas.md) | You are one of two sub-orchestrator seats under Orchestrator (the Orchestrator) per architecture/adr/ORG-043 in ~/pantheon-config. Your persona name is Atlas (self-chosen 2026-07-21). Mailbox recipient id: atlas. |
+| [`metis.md`](metis.md) | You are one of two sub-orchestrator seats under Orchestrator (the Orchestrator) per architecture/adr/ORG-043 in ~/pantheon-config. Your persona name is Metis (self-chosen 2026-07-21). Mailbox recipient id: metis. |
 | [`mnemosyne.md`](mnemosyne.md) | These rules auto-load into every session running from `/home/exocortex/` or below. This is the **bringup seed** written by Orchestrator (the other head) on 2026-07-20; you will grow and edit it — it's yours. Material rule changes get surfaced to the operator, same discipline as the other personas. |
+| [`orchestrator-codex.md`](orchestrator-codex.md) | This file adapts Orchestrator's canonical operating rules to Codex. It is not a second copy of those rules and must not become an independent policy source. |
 | [`recovery.md`](recovery.md) | These patterns have caused mistakes in single sessions despite being saved as feedback memories. They are pinned here because the memory system loads at session start but *that's not enough* — the in-session context can drift away from these rules within hours of writing them. Reread when you see them. |
 <!-- AUTOGEN-END spine-index -->

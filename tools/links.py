@@ -4,7 +4,7 @@
 Realizes the `tools/links.py` design locked in `notes/dei-foundational-wip/links.md`
 (Link Type taxonomy, T-0669; build ticket T-1087). It is a thin READ-ONLY CLI/lib
 over data that already lives in ticket frontmatter, transition logs, commit messages,
-and `adr/`. It stores NO new authoritative state: every answer is derived live from
+and `architecture/adr/`. It stores NO new authoritative state: every answer is derived live from
 those sources (grep + frontmatter reads + `git log --grep`). A materialized index
 (`rebuild-index`) is an optional regeneratable snapshot for external tooling — reads
 never depend on it, so it can never go silently stale (grep is always the source of
@@ -25,7 +25,7 @@ Link Types realized (links.md taxonomy):
   ratifies       Ticket→File    KEEP      frontmatter            ratifies
   fixes/touches  Commit→Ticket  PROMOTE   git log --grep         commits
   actor          Agent→Ticket   PROMOTE   transition-log [actor] actors / touched-by
-  governed_by    Ticket→ADR     PROMOTE   ORG-NNN label↔adr/     adr
+  governed_by    Ticket→ADR     PROMOTE   ORG-NNN label↔architecture/adr/     adr
   cites          Ticket→Message PROMOTE-LITE  msg_NNNN token     cites
 
 CLI:
@@ -62,7 +62,7 @@ if __package__ in (None, ""):
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TICKETS_ROOT = REPO_ROOT / "tickets"
-ADR_ROOT = REPO_ROOT / "adr"
+ADR_ROOT = REPO_ROOT / "architecture" / "adr"
 NOTES_ROOT = REPO_ROOT / "notes"
 TICKET_STATES = ("inbox", "active", "blocked", "done")
 
@@ -382,7 +382,7 @@ def get_adr_tickets(org_id: str, tickets_root: Path = TICKETS_ROOT) -> list[str]
 
 
 def find_adr_file(org_id: str, adr_root: Path = ADR_ROOT, repo_root: Path = REPO_ROOT) -> str | None:
-    """Reverse: the `adr/ORG-NNN-*.md` file for an ADR id, if present."""
+    """Reverse: the `architecture/adr/ORG-NNN-*.md` file for an ADR id, if present."""
     if not adr_root.is_dir():
         return None
 

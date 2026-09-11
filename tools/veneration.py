@@ -6,8 +6,8 @@ jsonl on disk, and `claude --resume` reloads the entire context even though the 
 dead. Veneration resurrects that dead session UNDER the-ancestor (channel-less), prompts it
 to write a fresh HANDOFF, harvests it, and buries the resumed session.
 
-This is the FALLBACK tier: most recovery is just reading the latest graveyard handoff
-(tools/graveyard.py). Veneration is for the deaths the graveyard can't cover — a handoff
+This is the FALLBACK tier: most recovery is just reading the latest Chronicle handoff
+(tools/chronicle.py). Veneration is for the deaths the Chronicle can't cover — a handoff
 that was never written or cut off.
 
 SAFETY — why it runs under the-ancestor with channels DISABLED: the resume subprocess is a

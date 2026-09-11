@@ -1,0 +1,20 @@
+[Unit]
+Description=Echo-corpus obligation lint — companion to recovery's pantheon-ticket-lint (T-3495/T-3477/ORG-065 Call 2), runs on the claude account which can read echo-prismatic
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Read-only detect + mailbox-alert recovery on findings-present; never writes to
+# tickets/ or adr/ (recovery remains the sole writer for any fix — see
+# tools/echo_corpus_lint.py's module docstring for the full rationale).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/echo_corpus_lint.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

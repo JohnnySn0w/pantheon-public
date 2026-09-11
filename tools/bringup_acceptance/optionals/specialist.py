@@ -232,7 +232,6 @@ class ArgusWatchRunnerModule:
     def prove(self, ctx: RunContext) -> ModuleEvidence:
         recorder = TraceRecorder(ctx.evidence_root, module_id=self.id, run_id=ctx.run_id)
         paths = RunPaths(root=ctx.evidence_root, run_id=ctx.run_id)
-        self._scratch_root = Path(tempfile.mkdtemp(prefix=f"bringup-{self.id}-"))
 
         # 1. Static wiring proof -- read-only, no live systemctl.
         service_path = watch_runner.REPO_ROOT / "tools" / "systemd" / "pantheon-watch.service"
@@ -252,6 +251,11 @@ class ArgusWatchRunnerModule:
 
         # 2. compute_due_briefs()/build_brief() contract, against a DISPOSABLE
         #    fixture topics.md (never the real one -- see module docstring).
+        #    Scratch is allocated HERE (not at prove() entry) so an early
+        #    HardStop in the wiring proof above cannot leak an unused tmpdir --
+        #    restore() only runs on the success path, and callers that test the
+        #    hard-stop path (no restore) would otherwise strand the mkdtemp.
+        self._scratch_root = Path(tempfile.mkdtemp(prefix=f"bringup-{self.id}-"))
         nonce = f"t2565-{uuid.uuid4().hex[:8]}"
         fixture_root = self._scratch_root / "fixture"
         fixture_root.mkdir(parents=True)

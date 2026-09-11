@@ -1,0 +1,48 @@
+[Unit]
+Description=Pantheon harness-neutral runtime supervisor for persona %i (T-2953/ORG-068 SS87)
+OnFailure=pantheon-unit-failure-alert@%n.service
+StartLimitIntervalSec=600
+StartLimitBurst=20
+
+# Coexists with, does NOT replace, pantheon-persona-consume@%i.timer: this
+# unit owns runtime supervision (blocks as MainPID while the selected
+# runtime's tmux session lives); the consume timer keeps its own orthogonal
+# quota/mailbox-drain duty. Two units, two duties (T-2953 Phase 1 spec SS
+# Open questions item 1).
+
+[Service]
+# Supervised loop, NOT Type=oneshot: `controller-main` runs one
+# select->start->block->record cycle of BT1's stateless controller_main and
+# returns/exits. Because this is Type=simple, the process itself blocks as
+# MainPID for the lifetime of that cycle (i.e. for as long as the selected
+# runtime's tmux session lives). On tmux-death the process exits and
+# Restart=always respawns it into a fresh process -- a fresh call re-reads
+# durable state from scratch (no in-process memory of the prior cycle,
+# ORG-068 SS88), which is exactly the mid-life swap-on-death behaviour this
+# unit exists to provide.
+Type=simple
+WorkingDirectory=%h/pantheon-config
+# T-2970 BT5 fix: was a bare-script ExecStart
+# (`.../tools/runtime_controller.py controller-main ...`), which crashes
+# on the module's own `from tools import codex_modal` (line 34) --
+# `python3 <script>` only puts the script's OWN directory (`tools/`) on
+# sys.path[0], never its parent (`pantheon-config/`, which the
+# self-referential `tools.*` imports need). `-m tools.runtime_controller`
+# runs it as a package module instead, which puts the CWD
+# (`WorkingDirectory`, already correct above) on sys.path -- matching the
+# only shape BT1-4's pytest suites ever actually exercised
+# (`from tools import runtime_controller`, repo-root pre-on-path via
+# pytest's own rootdir insertion). Live-fired 2026-08-19, crash-looped
+# immediately; verified this fix with `python3 -m tools.runtime_controller
+# --help` / `controller-main --help` before re-enabling.
+ExecStart=/usr/bin/python3 -m tools.runtime_controller controller-main --persona %i
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+# No ANTHROPIC_*/CLAUDE_CODE_* Environment= lines -- the API-key-shadow
+# money-trap (a leak silently flips subscription billing to metered API
+# billing).
+
+[Install]
+WantedBy=default.target

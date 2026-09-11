@@ -5,7 +5,7 @@ Each standing Claude agent calls this from a Stop-hook to record that it just
 took a turn. ORG-048's out-of-band Codex watcher polls these files to detect
 the correlated-cap signature — a whole-subscription Claude cap freezes every
 standing agent's heartbeat at once, which is the positive, Claude-independent
-tell the watcher needs (see adr/ORG-048-codex-out-of-band-fleet-watcher.md D2).
+tell the watcher needs (see architecture/adr/ORG-048-codex-out-of-band-fleet-watcher.md D2).
 
 Stdlib-only by design: this runs inside a Stop-hook on every turn, so it must
 stay cheap, dependency-free, and reliable.

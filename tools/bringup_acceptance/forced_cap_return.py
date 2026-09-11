@@ -10,7 +10,7 @@ sibling: an AUTHORITATIVE provider cap arrives with no advance warning ->
 ``runtime_controller.forced_swap()`` fails closed, archives a factual
 handoff, and swaps -> the still-pending mailbox message survives the whole
 cycle untouched (the "requeue" contract) -> the swap is idempotent against
-a replay of the SAME message identity (the "graveyard-receipt bootstrap")
+a replay of the SAME message identity (the "chronicle-receipt bootstrap")
 -> and, once the primary's quota resets, the SAME cooperative machine that
 proves a planned swap also proves the return leg.
 
@@ -35,12 +35,12 @@ session auto-returns.
 Five independently-gap-able legs:
 
 1. ``forced_cap_transition_state_machine`` -- the real ``forced_swap()``
-   end-to-end: breaker_opened -> factual graveyard archive (credentials
-   scrubbed via the real ``graveyard.scrub_credentials``) -> durable
+   end-to-end: breaker_opened -> factual Chronicle archive (credentials
+   scrubbed via the real ``chronicle.scrub_credentials``) -> durable
    ``forced-failover.json`` receipt -> ``_replace_runtime`` (real function,
    only its OS leaves mocked) -> awaiting-successor-read, runtime_swapped
    -> ack -> completed. Then an identical-identity replay proves the
-   graveyard-receipt-bootstrap fast path (``_completed_forced_transition_
+   chronicle-receipt-bootstrap fast path (``_completed_forced_transition_
    matches``) reuses the receipt without re-opening the breaker or
    re-invoking any OS leaf; a differing-identity replay (this module's own
    second test, not a leg of its own) proves that fast path is identity-
@@ -284,7 +284,7 @@ def _forced_cap_transition_state_machine_leg(
         if completed_state.get("phase") != "completed":
             raise HardStop(f"expected phase=completed after ack, got {completed_state.get('phase')!r}")
 
-        # Graveyard-receipt-bootstrap: replay the SAME still-pending identity
+        # Chronicle-receipt-bootstrap: replay the SAME still-pending identity
         # -- the fast path must reuse the receipt, not re-open the breaker,
         # not re-archive, not re-invoke any OS leaf.
         pre_replay_capture_calls = capture.call_count
@@ -298,21 +298,21 @@ def _forced_cap_transition_state_machine_leg(
             or submit.call_count != pre_replay_submit_calls
         )
 
-    handoff_or_graveyard = str(completed_state.get("handoff_or_graveyard"))
-    if str(replay_receipt.handoff_or_graveyard) != handoff_or_graveyard:
-        raise HardStop("idempotent replay did not reuse the original graveyard evidence")
+    chronicle_evidence = str(completed_state.get("chronicle_evidence"))
+    if str(replay_receipt.chronicle_evidence) != chronicle_evidence:
+        raise HardStop("idempotent replay did not reuse the original chronicle evidence")
     if os_leaf_reinvoked:
         raise HardStop("idempotent replay re-invoked an OS-touching leaf -- fast path did not short-circuit")
 
     return {
         "receipt_path": str(receipt_path),
         "completed_transition": completed_state,
-        "handoff_or_graveyard": handoff_or_graveyard,
+        "chronicle_evidence": chronicle_evidence,
         "expected_successor_read_evidence": expected_evidence,
         "idempotent_replay": {
             "reused": True,
             "os_leaf_reinvoked": os_leaf_reinvoked,
-            "handoff_or_graveyard": str(replay_receipt.handoff_or_graveyard),
+            "chronicle_evidence": str(replay_receipt.chronicle_evidence),
             "trigger": replay_receipt.trigger,
         },
     }
@@ -619,8 +619,8 @@ class _EnvOverride:
                 os.environ[key] = saved
 
 
-def _disposable_graveyard_env(root: Path) -> _EnvOverride:
-    return _EnvOverride({"PANTHEON_GRAVEYARD_ROOT": str(root)})
+def _disposable_chronicle_env(root: Path) -> _EnvOverride:
+    return _EnvOverride({"PANTHEON_CHRONICLE_ROOT": str(root)})
 
 
 # ---------------------------------------------------------------------------
@@ -668,11 +668,11 @@ class ForcedCapReturnModule:
         self._module_dirs = {
             "manifest": module_dir / "instance.yaml",
             "state_root": module_dir / "state",
-            "graveyard_root": module_dir / "graveyard",
+            "chronicle_root": module_dir / "chronicle",
         }
         manifest_path = self._module_dirs["manifest"]
         state_root = self._module_dirs["state_root"]
-        graveyard_root = self._module_dirs["graveyard_root"]
+        chronicle_root = self._module_dirs["chronicle_root"]
 
         if ctx.hub_path.resolve() == _REAL_HUB_DEFAULT.resolve():
             raise HardStop(f"{self.id}: refusing to prove against the REAL mailbox hub {ctx.hub_path}")
@@ -698,7 +698,7 @@ class ForcedCapReturnModule:
         legs: dict[str, Any] = {}
         evidence_paths: list[Path] = []
 
-        with _disposable_graveyard_env(graveyard_root):
+        with _disposable_chronicle_env(chronicle_root):
             state_machine_detail = _forced_cap_transition_state_machine_leg(
                 ctx, state_root=state_root, primary=primary, target=target,
                 message_id="prove-msg-1", correlation_id="prove-corr-1",
@@ -727,7 +727,7 @@ class ForcedCapReturnModule:
             write_module_evidence(paths, self.id, "primary_recovery_gate_finding", gate_detail)
         )
 
-        with _disposable_graveyard_env(graveyard_root):
+        with _disposable_chronicle_env(chronicle_root):
             return_detail = _quota_reset_return_continuation_leg(
                 ctx, state_root=state_root, primary=primary, target=target,
             )
@@ -737,7 +737,7 @@ class ForcedCapReturnModule:
             write_module_evidence(paths, self.id, "quota_reset_return_continuation", return_detail)
         )
 
-        with _disposable_graveyard_env(graveyard_root):
+        with _disposable_chronicle_env(chronicle_root):
             mailbox_detail = _mailbox_requeue_and_reclaim_leg(
                 hub_path=ctx.hub_path, state_root=module_dir / "mailbox-state",
                 primary=primary, target=target,
@@ -810,9 +810,9 @@ class ForcedCapReturnModule:
     def report(self, evidence: ModuleEvidence) -> MatrixRow:
         gaps = tuple(evidence.detail.get("gaps", ()))
         legs_summary = (
-            "real forced_swap() breaker-open -> factual graveyard archive (credentials "
+            "real forced_swap() breaker-open -> factual Chronicle archive (credentials "
             "scrubbed) -> awaiting-successor-read -> ack -> completed, with an identity-"
-            "scoped graveyard-receipt-bootstrap replay + a real transport-level mailbox "
+            "scoped chronicle-receipt-bootstrap replay + a real transport-level mailbox "
             "requeue-and-reclaim + persona/tmux-preserving selection + the real quota-"
             "reset return-to-primary machine (directly-constructed recovery evidence) "
             + ("proven" if not gaps else "gapped: " + "; ".join(gaps))

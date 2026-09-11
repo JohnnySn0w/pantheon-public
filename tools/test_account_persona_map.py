@@ -44,6 +44,7 @@ INSTANCE_YAML = REPO_ROOT / "instance.yaml"
 sys.path.insert(0, str(REPO_ROOT))
 
 from tools import agent_role_map  # noqa: E402
+from tools._snapshot_site_scan import SnapshotSiteScanner  # noqa: E402
 from tools.agent_role_map import (  # noqa: E402
     AGENT_ROLE_MAP,
     account_persona,
@@ -95,7 +96,7 @@ ALL_ACCOUNTS: dict[str, str] = {**FLEET_ACCOUNTS, **PEER_DAEMON_ACCOUNTS}
 # stops reaching the site.
 #
 # THE EXPECTED VALUES BELOW ARE PER-SITE ON PURPOSE. The six look alike and are not alike:
-# graveyard maps accounts to AGENT NAMES with a documented non-persona override, links carries
+# chronicle maps accounts to AGENT NAMES with a documented non-persona override, links carries
 # non-derivable aliases and one group that has no account at all, two sites are plain sorted
 # account tuples, two are account->persona dicts. One shared expectation applied six times
 # would be satisfiable by the five it fits, with the sixth passing for the wrong reason — the
@@ -115,16 +116,16 @@ def _probe_account(account: str) -> str:
 # answers with UNSUFFIXED account names and fails every equality below.
 PROBE_ACCOUNT_PERSONA: dict[str, str] = {_probe_account(a): p for a, p in ALL_ACCOUNTS.items()}
 
-# graveyard maps account -> AGENT NAME. That is the persona for seven of eight, and for
-# the-ancestor it is the documented override "ancestor" (its graveyard dir is already named
+# chronicle maps account -> AGENT NAME. That is the persona for seven of eight, and for
+# the-ancestor it is the documented override "ancestor" (its chronicle dir is already named
 # that on disk; deriving the string would orphan the archives filed under it).
 #
 # THE OVERRIDE IS KEYED ON THE LIVE ACCOUNT STRING, so against probe accounts it does not
 # fire and the correct expected value here is the persona for all eight. This test therefore
 # does NOT exercise the override branch; the override is asserted live, in
-# TestRepointedSitesStillDerive.test_graveyard_user_to_agent.
-GRAVEYARD_NAME_OVERRIDES: dict[str, str] = {"the-ancestor": "ancestor"}
-GRAVEYARD_PROBE_EXPECTED: dict[str, str] = {
+# TestRepointedSitesStillDerive.test_chronicle_user_to_agent.
+CHRONICLE_NAME_OVERRIDES: dict[str, str] = {"the-ancestor": "ancestor"}
+CHRONICLE_PROBE_EXPECTED: dict[str, str] = {
     _probe_account("claude"): "orchestrator",
     _probe_account("claude-research"): "specialist",
     _probe_account("claude-fallback"): "recovery",
@@ -165,8 +166,8 @@ LINKS_PROBE_GROUPS: list[set[str]] = [
 PER_SITE_GUARDS: dict[tuple[str, str], str] = {
     ("disk_usage_monitor", "AGENT_HOMES"):
         "test_disk_usage_monitor_agent_homes_follows_the_manifest",
-    ("graveyard", "_USER_TO_AGENT"):
-        "test_graveyard_user_to_agent_follows_the_manifest",
+    ("chronicle", "_USER_TO_AGENT"):
+        "test_chronicle_user_to_agent_follows_the_manifest",
     ("links", "_ALIAS_GROUPS"):
         "test_links_alias_groups_follow_the_manifest",
     ("mailbox_mcp", "_USER_TO_PERSONA"):
@@ -447,9 +448,9 @@ class TestRepointedSitesStillDerive(unittest.TestCase):
 
         self.assertIs(session_reset_reconcile.KNOWN_ACCOUNTS, session_reset_log.KNOWN_ACCOUNTS)
 
-    def test_graveyard_user_to_agent(self) -> None:
+    def test_chronicle_user_to_agent(self) -> None:
         """Keys derive; ONE value is a documented override. the-ancestor's
-        graveyard dir is named "ancestor" and has archived snapshots + an
+        chronicle dir is named "ancestor" and has archived snapshots + an
         index.md already filed under it, so deriving that string would re-home
         future archives and orphan the existing ones — in the tool whose job is
         not losing dying context.
@@ -457,16 +458,16 @@ class TestRepointedSitesStillDerive(unittest.TestCase):
         This is the ONLY test that exercises the override branch: it is keyed on the live
         account string, so the perturbed-manifest guard below cannot reach it.
         """
-        from tools import graveyard
+        from tools import chronicle
 
         live = account_persona_map()
-        expected = {a: GRAVEYARD_NAME_OVERRIDES.get(a, p) for a, p in live.items()}
-        self.assertEqual(set(graveyard._USER_TO_AGENT), set(live))
-        self.assertEqual(graveyard._USER_TO_AGENT, expected)
-        self.assertEqual(graveyard._USER_TO_AGENT["the-ancestor"], "ancestor")
-        self.assertEqual(graveyard.agent_from_handoff_path("/home/exocortex/HANDOFF.md"), "mnemosyne")
-        self.assertEqual(graveyard.agent_from_handoff_path("/home/suborch2/HANDOFF.md"), "atlas")
-        self.assertIsNone(graveyard.agent_from_handoff_path("/home/nobody/HANDOFF.md"))
+        expected = {a: CHRONICLE_NAME_OVERRIDES.get(a, p) for a, p in live.items()}
+        self.assertEqual(set(chronicle._USER_TO_AGENT), set(live))
+        self.assertEqual(chronicle._USER_TO_AGENT, expected)
+        self.assertEqual(chronicle._USER_TO_AGENT["the-ancestor"], "ancestor")
+        self.assertEqual(chronicle.agent_from_handoff_path("/home/exocortex/HANDOFF.md"), "mnemosyne")
+        self.assertEqual(chronicle.agent_from_handoff_path("/home/suborch2/HANDOFF.md"), "atlas")
+        self.assertIsNone(chronicle.agent_from_handoff_path("/home/nobody/HANDOFF.md"))
 
     def test_links_alias_groups_cover_every_account(self) -> None:
         """The live defect T-2256 opened with: `touched-by mnemosyne` matched
@@ -563,9 +564,9 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
         consumers walk /home/<account> and per-account state dirs, which a tmp tree does not
         have; a rewiring that leaves the constant derived and reads a literal in the loop is
         NOT detected. The four sites that do have a cheap pure entry point get one, below.
-      - graveyard's the-ancestor -> "ancestor" override, which is keyed on the LIVE account
+      - chronicle's the-ancestor -> "ancestor" override, which is keyed on the LIVE account
         string and therefore cannot fire against probe accounts. Asserted live, in
-        TestRepointedSitesStillDerive.test_graveyard_user_to_agent.
+        TestRepointedSitesStillDerive.test_chronicle_user_to_agent.
       - Anything outside tools/*.py.
     """
 
@@ -768,17 +769,17 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
                 )
                 self.assertEqual(value, sorted(PROBE_ACCOUNT_PERSONA))
 
-    def test_graveyard_user_to_agent_follows_the_manifest(self) -> None:
-        """graveyard._USER_TO_AGENT maps account -> AGENT NAME, which is the persona except
-        for the one documented override. GRAVEYARD_PROBE_EXPECTED is written out in full, and
+    def test_chronicle_user_to_agent_follows_the_manifest(self) -> None:
+        """chronicle._USER_TO_AGENT maps account -> AGENT NAME, which is the persona except
+        for the one documented override. CHRONICLE_PROBE_EXPECTED is written out in full, and
         deliberately expects the PERSONA for the-ancestor: the override is keyed on the live
         account string and does not fire here. Fitting this site to the account -> persona
         template would have been right by accident and wrong the moment the override key
         changed."""
         for mode in _PROBE_MODES:
             with self.subTest(mode=mode):
-                value = self._constant("graveyard", "_USER_TO_AGENT", mode, "dict")
-                self.assertEqual(value, GRAVEYARD_PROBE_EXPECTED)
+                value = self._constant("chronicle", "_USER_TO_AGENT", mode, "dict")
+                self.assertEqual(value, CHRONICLE_PROBE_EXPECTED)
 
     def test_links_alias_groups_follow_the_manifest(self) -> None:
         """links._ALIAS_GROUPS is NOT the account map. It is NINE groups against EIGHT
@@ -815,17 +816,17 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
         probe_exocortex = _probe_account("exocortex")
         probe_suborch2 = _probe_account("suborch2")
 
-        with self.subTest(site="graveyard.agent_from_handoff_path"):
+        with self.subTest(site="chronicle.agent_from_handoff_path"):
             body = (
                 "out = {'probe': m.agent_from_handoff_path('/home/%s/HANDOFF.md'),\n"
                 "       'live': m.agent_from_handoff_path('/home/exocortex/HANDOFF.md')}\n"
                 "print('@@' + json.dumps(dict(kind='calls', value=out), sort_keys=True))\n"
             ) % probe_exocortex
-            out = self._run("graveyard", body, "package")["value"]
+            out = self._run("chronicle", body, "package")["value"]
             self.assertEqual(out["probe"], "mnemosyne")
             self.assertIsNone(
                 out["live"],
-                "graveyard resolved an agent for an account the manifest it loaded does not "
+                "chronicle resolved an agent for an account the manifest it loaded does not "
                 "contain — the user->agent map is enumerated somewhere, not derived",
             )
 
@@ -1003,90 +1004,19 @@ class TestEverySnapshotSiteIsGuarded(unittest.TestCase):
         ("5 bare walrus", "(X := account_persona_map())\n"),
     )
 
-    @staticmethod
-    def _callee(call: ast.Call) -> str:
-        func = call.func
-        if isinstance(func, ast.Name):
-            return func.id
-        if isinstance(func, ast.Attribute):
-            return func.attr
-        return ""
-
-    @classmethod
-    def _module_scope(cls, body):
-        """Yield every statement that RUNS AT IMPORT, descending into module-level compound
-        statements but never into a def or class body."""
-        for stmt in body or []:
-            yield stmt
-            if isinstance(stmt, cls._NOT_IMPORT_TIME):
-                continue
-            for field in ("body", "orelse", "finalbody"):
-                yield from cls._module_scope(getattr(stmt, field, None))
-            for handler in getattr(stmt, "handlers", None) or []:
-                yield from cls._module_scope(handler.body)
-
-    @staticmethod
-    def _assigned_names(stmt) -> list[str]:
-        """Every name *stmt* binds, tuple-unpack targets included."""
-        if isinstance(stmt, ast.Assign):
-            targets = stmt.targets
-        elif isinstance(stmt, ast.AnnAssign):
-            targets = [stmt.target]
-        else:
-            return []
-        return [
-            node.id
-            for target in targets
-            for node in ast.walk(target)
-            if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store)
-        ]
+    # The scan CORE (contains-anywhere-to-depth-2 detection, module-compound
+    # descent, tuple-unpack + re-export handling) is axis-agnostic and lives in
+    # tools/_snapshot_site_scan.py so this ACCOUNT axis and the SIBLING axis
+    # (test_instance_role_grants) run ONE copy, not two that can drift (T-3573).
+    # Parameterised by this axis's _ACCESSORS, its GUARDED_SNAPSHOTS (for the
+    # re-export rule) and _PLANT_HEADER. The control planting below is unchanged.
+    _scanner = SnapshotSiteScanner(_ACCESSORS, GUARDED_SNAPSHOTS, _PLANT_HEADER)
 
     def _scan_module(self, path: Path) -> set[tuple[str, str]]:
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        module = path.stem
-        statements = list(self._module_scope(tree.body))
-
-        aliases = set(self._ACCESSORS)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.ImportFrom):
-                for name in node.names:
-                    if name.name in self._ACCESSORS and name.asname:
-                        aliases.add(name.asname)
-        defs = {s.name: s for s in statements if isinstance(s, ast.FunctionDef)}
-
-        def reaches(name: str, depth: int = 0) -> bool:
-            if name in aliases:
-                return True
-            if depth >= 2 or name not in defs:
-                return False
-            return any(
-                isinstance(node, ast.Call) and reaches(self._callee(node), depth + 1)
-                for node in ast.walk(defs[name])
-            )
-
-        found: set[tuple[str, str]] = set()
-        for stmt in statements:
-            names = self._assigned_names(stmt)
-            value = getattr(stmt, "value", None)
-            # WALK the right-hand side. Inspecting only its head is what made `dict(...)` the
-            # line between covered and silent — see the class docstring.
-            if names and value is not None and any(
-                isinstance(node, ast.Call) and reaches(self._callee(node))
-                for node in ast.walk(value)
-            ):
-                found.update((module, name) for name in names)
-            if isinstance(stmt, ast.ImportFrom):
-                source = (stmt.module or "").split(".")[-1]
-                for name in stmt.names:
-                    if not name.asname and (source, name.name) in GUARDED_SNAPSHOTS:
-                        found.add((module, name.name))
-        return found
+        return self._scanner.scan_module(path)
 
     def _scan_source(self, source: str, name: str) -> set[tuple[str, str]]:
-        planted = Path(tempfile.mkdtemp(prefix="t2334-scan-")) / f"{name}.py"
-        self.addCleanup(shutil.rmtree, planted.parent, True)
-        planted.write_text(self._PLANT_HEADER + source, encoding="utf-8")
-        return self._scan_module(planted)
+        return self._scanner.scan_source(source, name, self.addCleanup)
 
     def test_the_scan_finds_every_shape_a_snapshot_can_take(self) -> None:
         """The control, re-pointed. A scan that matched nothing would report a clean sweep
@@ -1171,7 +1101,7 @@ class TestScriptInvocationKeepsTheDerivation(unittest.TestCase):
     CASES = (
         ("tools/session_reset_log.py", "session_reset_log", "KNOWN_ACCOUNTS"),
         ("tools/disk_usage_monitor.py", "disk_usage_monitor", "AGENT_HOMES"),
-        ("tools/graveyard.py", "graveyard", "_USER_TO_AGENT"),
+        ("tools/chronicle.py", "chronicle", "_USER_TO_AGENT"),
         ("tools/links.py", "links", "_ALIAS_GROUPS"),
         ("tools/ticket.py", "ticket", "_OS_USER_PERSONA"),
         # mailbox_mcp is the one repointed module that runs ONLY this way. It is

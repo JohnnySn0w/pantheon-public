@@ -109,13 +109,6 @@ MAX_INEFFECTIVE_POKES_DEFAULT = 1
 # Bridge /health endpoint (used for P1.b operator-inbound state).
 DEFAULT_BRIDGE_HEALTH_URL = "http://127.0.0.1:8765/health"
 
-# Await-state regex (P1.b heuristic; Recovery-discretion may override at runtime
-# but the script-level signal is regex-only). Patterns chosen per ORG-011 §P1.b.
-AWAIT_STATE_REGEX = re.compile(
-    r"(waiting on|pausing on|ready when you|no further chain-dispatch until|deferring to you|awaiting your)",
-    re.IGNORECASE,
-)
-
 # P1.d — rate-limit error pattern. Matches both Claude Code's synthetic
 # "API Error: Server is temporarily limiting requests..." and any variant
 # that surfaces "rate limit" / "rate limited" in the assistant text.
@@ -125,8 +118,9 @@ RATE_LIMIT_REGEX = re.compile(
 
 # P1.b extension (T-0297) — tool_use names that block Claude Code's loop on
 # user input. When the latest assistant turn is one of these, the agent is
-# in await-state regardless of whether its text content matches the await
-# regex (these tool_use turns typically have NO text content alongside).
+# in await-state regardless of the structural Signal-1 check (T-3071) —
+# these tool_use turns typically have NO text content alongside, so their
+# final block IS the tool_use itself.
 USER_BLOCKING_TOOL_NAMES = frozenset({
     "AskUserQuestion",   # standard interactive menu — exact match Orchestrator used in msg_1181 incident
     "EnterPlanMode",     # plan-mode entry; blocks for user ratification on exit
@@ -166,6 +160,43 @@ AGENT_CONFIG: dict[str, dict] = {
         # is signalled by `<teams_dir>/*/inboxes` existing. Only agents with a
         # teams_dir configured are eligible for the Layer-3 backstop.
         "teams_dir": Path("/home/claude/.claude/teams"),
+    },
+    # T-3555 (the operator directive TG 9289, 2026-09-07): extend activity-monitor
+    # coverage to the two ORG-043 sub-orchestrator seats so Recovery auto-catches their
+    # wedges (recurring Claude Code permission-modal stalls) without HO involvement.
+    # NARROW scope by design — the await/cap-modal/rate-limit predicates (P1.a/P1.b/
+    # P1.d), NOT the P1.c Layer-3 worker-silence witness apparatus (msg_1326 veto is
+    # reversed only for these two, not fleet-wide): no teams_dir, so P1.c bails
+    # safely (cfg.get + no active-team inboxes). Substrate = scope-managed
+    # (pantheon-runtime-tmux.scope), NOT service-managed — activity_monitor POKES,
+    # never restarts, so the scope-vs-service split is moot here; the pane target is
+    # the live pre-existing session per instance.yaml. jsonl_dir is the ACTIVE
+    # -pantheon-config project (consume-runtime launches cwd=<account>/pantheon-config;
+    # the plain -home-<account> dir is month-stale — verified 2026-09-07).
+    "atlas": {
+        "tmux_target_pane": "suborch2-main:0",
+        "sudo_user": "suborch2",
+        "jsonl_dir": Path("/home/suborch2/.claude/projects/-home-suborch2-pantheon-config"),
+        "ledger_agent_id": "atlas",
+        "ticket_targets": frozenset({"atlas"}),
+        "pantheon_config_path": Path("/home/suborch2/pantheon-config"),
+        "bridge_inbound_key": "atlas",
+        # T-3557(e): sub-orch seats count ACTIVE tickets only. An unclaimed
+        # inbox ticket is undispatched/pending for a scope-managed seat, not
+        # work it could be stuck on — counting it false-fired p1a/p1b on
+        # legitimately-idle seats. orchestrator (no key → inbox+active) is unchanged.
+        "queue_states": ("active",),
+    },
+    "metis": {
+        "tmux_target_pane": "suborch1-main:0",
+        "sudo_user": "suborch1",
+        "jsonl_dir": Path("/home/suborch1/.claude/projects/-home-suborch1-pantheon-config"),
+        "ledger_agent_id": "metis",
+        "ticket_targets": frozenset({"metis"}),
+        "pantheon_config_path": Path("/home/suborch1/pantheon-config"),
+        "bridge_inbound_key": "metis",
+        # T-3557(e): sub-orch seats count ACTIVE tickets only (see atlas note).
+        "queue_states": ("active",),
     },
 }
 
@@ -312,6 +343,46 @@ def poke_effectiveness_decision(
             "session stuck not idle → suppress + escalate",
         )
     return (False, consecutive, f"poke (consecutive_ineffective={consecutive})")
+
+
+# ---------------------------------------------------------------------------
+# Fire-tracking (T-3072 activity_monitor meta-drift alarm)
+# ---------------------------------------------------------------------------
+
+
+def _fires_log_path() -> Path:
+    """Recovery-local JSONL fire-log path — mirrors `_state_path_for_agent`'s
+    PANTHEON_STATE_DIR override convention (same env var, same call-time
+    read) so tests can redirect it the same way they already redirect the
+    cooldown state file."""
+    state_dir_env = os.environ.get("PANTHEON_STATE_DIR")
+    state_dir = Path(state_dir_env) if state_dir_env else _DEFAULT_STATE_DIR
+    return state_dir / "activity_monitor" / "fires.jsonl"
+
+
+def _record_fire(agent: str, predicate: str) -> None:
+    """Append one fire-event record to the Recovery-local drift-tracking JSONL
+    (T-3072 meta-drift alarm — `tools/activity_monitor_drift_check.py` reads
+    this to alert when a predicate has gone silently stale, the T-3070 class
+    problem). Best-effort: broad catch, log-only on failure — a broken
+    fire-log must NEVER wedge the primary poke path (D12), the same posture
+    as `_escalate_stuck`'s alert-routing catch and the P1.d
+    session_reset_log append below.
+    """
+    try:
+        path = _fires_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        now = int(time.time())
+        record = {
+            "ts": now,
+            "ts_iso": datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "agent": agent,
+            "predicate": predicate,
+        }
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record) + "\n")
+    except Exception as exc:  # noqa: BLE001 — fire-tracking must never wedge the monitor
+        _log(agent, f"_record_fire({predicate!r}) failed (non-fatal): {exc!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -665,13 +736,42 @@ def latest_ledger_entry_ts_for_agent(repo_path: Path, sudo_user: str, ledger_age
 # ---------------------------------------------------------------------------
 
 
-def count_actionable_tickets(repo_path: Path, targets: frozenset[str], sudo_user: str) -> int:
-    """Count tickets in inbox/ + active/ where target is in `targets`, no
+def _scan_actionable_tickets(
+    repo_path: Path,
+    targets: frozenset[str],
+    sudo_user: str,
+    queue_states: tuple[str, ...] = ("inbox", "active"),
+) -> int | None:
+    """Count tickets in the `queue_states` dirs where target is in `targets`, no
     unmet depends_on, not_before (if set) is in the past, the labels field
     does not contain interactive-required, AND blocked_by is not "event"
     (T-0644: event-driven holds wait on a structural witness — pane state,
     cap-hit cycle, calendar tick — not on HO-availability, so they must
     not count toward the autonomous-actionable queue).
+
+    Returns the count, or **None** when the cross-account probe could not be
+    completed (sudo timeout / OSError / non-zero rc). The None vs 0 distinction
+    matters for callers that must not let a *failed* probe stand in for a
+    *confirmed-empty* queue (T-3570: the drift-check suppresses a never-fired
+    predicate only on a CONFIRMED-empty queue, never on an unknown one). The
+    always-on poke path does not care — it fails open via
+    `count_actionable_tickets`, the thin wrapper below.
+
+    T-3557(e): `queue_states` selects which lifecycle dirs count as the
+    actionable queue. The default ("inbox", "active") is the always-on
+    HEAD-ORCHESTRATOR reading — orchestrator is meant to continuously DRAIN its
+    inbox, so an inbox ticket sitting while it idles IS a "why aren't you
+    working" signal. Scope-managed SUB-ORCHESTRATOR seats (atlas/metis) are
+    dispatched work by the HO and are legitimately idle between dispatches;
+    their inbox is a pending/undispatched bucket (persona-consume is a wake
+    controller, not a ticket-mover — inbox tickets wait for dispatch, they
+    do not auto-become active work). So sub-orchs pass ("active",): only a
+    CLAIMED, in-progress ticket counts as work the seat could be stuck on.
+    This kills the idle-with-unclaimed-inbox false-fire (metis sat idle with
+    T-3457 unclaimed in inbox → p1a/p1b false-fired) WITHOUT hiding a genuine
+    wedge: a seat wedged mid-work holds an ACTIVE ticket → still fires; a
+    wedge-before-claim (wake Enter eaten by a modal) is caught by
+    mail_staleness + the modal detector, not by this queue predicate.
 
     Reads via sudo-as-<sudo_user> shell pipeline since the agent's
     pantheon-config tree (e.g., /home/claude/pantheon-config) is owned by
@@ -679,10 +779,6 @@ def count_actionable_tickets(repo_path: Path, targets: frozenset[str], sudo_user
     home directory above it. Single sudo call walks both state dirs +
     extracts the relevant frontmatter fields via awk; Python parses the
     structured output.
-
-    Best-effort: any sudo / shell / parse failure returns 0 (no actionable
-    work detected). Fail-open keeps the predicate from firing on flaky
-    cross-account state reads.
     """
     inbox_dir = repo_path / "tickets" / "inbox"
     active_dir = repo_path / "tickets" / "active"
@@ -710,9 +806,9 @@ def count_actionable_tickets(repo_path: Path, targets: frozenset[str], sudo_user
             cmd, capture_output=True, text=True, check=False, timeout=_JSONL_PROBE_TIMEOUT_SECONDS
         )
     except (subprocess.TimeoutExpired, OSError):
-        return 0
+        return None
     if result.returncode != 0:
-        return 0
+        return None
     count = 0
     targets_lower = {t.lower() for t in targets}
     now = datetime.now(timezone.utc)
@@ -723,6 +819,11 @@ def count_actionable_tickets(repo_path: Path, targets: frozenset[str], sudo_user
         if len(parts) < 5:
             continue
         _path = parts[0]
+        # T-3557(e): honor the per-agent queue-source. A ticket's lifecycle
+        # state is its containing dir (inbox/ vs active/); skip any state not
+        # in queue_states so sub-orch seats count active-only (see docstring).
+        if Path(_path).parent.name not in queue_states:
+            continue
         target = parts[1]
         deps = parts[2]
         nb = parts[3]
@@ -741,6 +842,21 @@ def count_actionable_tickets(repo_path: Path, targets: frozenset[str], sudo_user
             continue
         count += 1
     return count
+
+
+def count_actionable_tickets(
+    repo_path: Path,
+    targets: frozenset[str],
+    sudo_user: str,
+    queue_states: tuple[str, ...] = ("inbox", "active"),
+) -> int:
+    """Fail-open wrapper over `_scan_actionable_tickets` (unchanged contract):
+    any sudo / shell / parse failure returns 0 (no actionable work detected),
+    keeping the poke predicates from firing on flaky cross-account state reads.
+    Callers that need to tell a failed probe from a confirmed-empty queue call
+    `_scan_actionable_tickets` directly (it returns None on failure)."""
+    n = _scan_actionable_tickets(repo_path, targets, sudo_user, queue_states)
+    return n if n is not None else 0
 
 
 def _parse_not_before(value: str) -> datetime | None:
@@ -824,11 +940,21 @@ def find_latest_jsonl(jsonl_dir: Path, sudo_user: str) -> Path | None:
         return None
 
 
-def latest_assistant_message_body(jsonl_path: Path, sudo_user: str) -> str | None:
-    """Read the most-recent assistant-message text content from the jsonl.
+def latest_assistant_ends_without_tool_use(jsonl_path: Path, sudo_user: str) -> bool:
+    """Structural Signal-1 (T-3071): True iff the latest assistant turn's
+    final content-block has type=='text' — the model stopped speaking and is
+    awaiting external input, by construction. A turn ending in tool_use is
+    mid-action (expects a tool_result to continue the loop), so that's False.
 
-    Iterates tac'd lines, returns the first line where type=='assistant' and
-    message.content has a 'text' block. Concatenates text blocks if multiple.
+    Language-agnostic, brevity-agnostic, prompt-drift-agnostic: replaces the
+    T-3070 AWAIT_STATE_REGEX language-regex approach, which treated
+    stochastic model text as a load-bearing signal (the operator TG 8225).
+
+    Fail-CLOSED: returns False (no await) on subprocess/probe error, no
+    assistant turn found in the scanned window, empty/non-list content, or a
+    final block whose type isn't 'text' (tool_use, thinking-only, or any
+    other non-text terminal block). Never manufactures an await-fire from
+    missing or ambiguous data.
     """
     cmd = _sudo(sudo_user) + [
         "bash",
@@ -844,9 +970,9 @@ def latest_assistant_message_body(jsonl_path: Path, sudo_user: str) -> str | Non
             timeout=_JSONL_PROBE_TIMEOUT_SECONDS,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return None
+        return False
     if result.returncode != 0:
-        return None
+        return False
     for line in result.stdout.splitlines():
         line = line.strip()
         if not line:
@@ -863,21 +989,81 @@ def latest_assistant_message_body(jsonl_path: Path, sudo_user: str) -> str | Non
         if not isinstance(msg, dict):
             continue
         content = msg.get("content")
-        if not isinstance(content, list):
+        if not isinstance(content, list) or not content:
+            return False
+        last_block = content[-1]
+        return isinstance(last_block, dict) and last_block.get("type") == "text"
+    return False
+
+
+# T-3075: parse the `<channel source="plugin:telegram:telegram" ... ts="<iso>">`
+# marker Claude Code writes to `queue-operation` jsonl entries for every
+# plugin-delivered inbound. Applied to the *parsed* JSON content string, so
+# the raw JSONL's `\"`-escaping is already resolved by json.loads.
+_TELEGRAM_INBOUND_TS_RE = re.compile(r'ts="([^"]+)"')
+
+
+def latest_telegram_inbound_ts(jsonl_path: Path, sudo_user: str) -> int | None:
+    """Read the most-recent operator-inbound Telegram timestamp from HO's jsonl.
+
+    Replaces the T-0223 `fetch_bridge_health` Gate-1 source, retired when
+    pantheon-bridge was decommissioned (T-0767, 2026-06-04). Scans back
+    through the last 500 lines of the jsonl for `queue-operation` entries
+    of `enqueue` operation whose `content` field mentions
+    `plugin:telegram:telegram`, and returns the max marker-ts (unix seconds)
+    across matches — or None on no-matches / probe error.
+
+    ISO-8601 UTC strings compare lexicographically = time-order, so max()
+    over strings works without parsing until we need to convert the winner.
+    """
+    cmd = _sudo(sudo_user) + [
+        "bash",
+        "-c",
+        f"tac {jsonl_path} | head -n 500",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_JSONL_PROBE_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if result.returncode != 0:
+        return None
+    latest_iso: str | None = None
+    for line in result.stdout.splitlines():
+        # Cheap prefilter — parse JSON only on lines that mention the marker.
+        if "plugin:telegram:telegram" not in line:
             continue
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "text":
-                t = block.get("text")
-                if isinstance(t, str):
-                    parts.append(t)
-        if parts:
-            return "\n".join(parts)
-    return None
-
-
-def detect_await_state(body: str) -> bool:
-    return bool(AWAIT_STATE_REGEX.search(body))
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict):
+            continue
+        if obj.get("type") != "queue-operation" or obj.get("operation") != "enqueue":
+            continue
+        content = obj.get("content")
+        if not isinstance(content, str) or "plugin:telegram:telegram" not in content:
+            continue
+        for match in _TELEGRAM_INBOUND_TS_RE.finditer(content):
+            iso = match.group(1)
+            if latest_iso is None or iso > latest_iso:
+                latest_iso = iso
+    if latest_iso is None:
+        return None
+    try:
+        # Handle both `...Z` and `+00:00` shapes.
+        s = latest_iso.replace("Z", "+00:00")
+        return int(datetime.fromisoformat(s).timestamp())
+    except (ValueError, TypeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1040,6 +1226,61 @@ def classify_cap_modal(pane_text: str | None) -> str | None:
     if opt1_selected and not opt2_selected:
         return MODAL_SAFE
     return MODAL_UNSAFE
+
+
+# ---------------------------------------------------------------------------
+# T-3558(b2): the Claude Code TOOL-PERMISSION modal — a DISTINCT wedge class
+# from the cap modal above.
+#
+# Specimen: tools/testdata/atlas_permission_modal_pane.txt — a REAL capture (modal
+# region) off atlas/suborch2 2026-09-07, the Read(//tmp/**) push-gate variant that
+# wedged atlas (it read /tmp push-logs via the Read TOOL in manual mode; the prompt
+# sat unanswered -> mail staled -> caught by mail_staleness, cleared by Recovery).
+#
+# DIAGNOSTIC / DETECTION ONLY. A permission prompt is a SAFETY BOUNDARY and must
+# NEVER be auto-answered (T-3557c trust surface; operator-flagged). This classifier
+# exists so a STUCK escalation can NAME the wedge ("wedged on a permission modal for
+# Read(//tmp/**)") -> Recovery's playbook is to suggest the behavioural fix (Bash cat/tail
+# for /tmp logs, pre-permitted) rather than grant a permission. There is deliberately
+# no _session-gate / send-keys counterpart (unlike send_modal_confirm for the cap
+# modal): nothing in this module presses a key on a permission prompt.
+#
+# Require BOTH the "Do you want to proceed?" question AND the "Tab to amend" footer
+# (mirrors classify_cap_modal's require-multiple-tokens discipline). "Tab to amend"
+# is what cleanly separates this from the cap modal, whose footer is
+# "Enter to confirm · Esc to cancel" (no amend) — so the two classifiers never
+# collide on each other's real specimens (asserted in tests).
+_PERMISSION_MODAL_QUESTION = "Do you want to proceed?"
+_PERMISSION_MODAL_FOOTER = "Tab to amend"
+# The requested permission is echoed in the "don't ask again for <Tool>(<pattern>)"
+# option line — the most useful diagnostic token (names the exact tool+scope).
+_PERMISSION_DONT_ASK_RE = re.compile(r"don't ask again for\s+(\S.*\S|\S)\s*$")
+
+PERMISSION_MODAL = "permission_modal"
+
+
+def classify_permission_modal(pane_text: str | None) -> str | None:
+    """Pure: detect a Claude Code tool-permission prompt in a pane capture.
+
+    Returns the requested-permission descriptor (e.g. "Read(//tmp/**)") when the
+    modal is up and its "don't ask again for <X>" line is parseable; the generic
+    PERMISSION_MODAL label when the modal is up but that line is absent/unparseable;
+    None for anything unrecognised (so an unparseable pane is never mistaken for a
+    permission wedge). DIAGNOSTIC ONLY — never used to answer the prompt.
+
+    Requires BOTH the question and the "Tab to amend" footer so it does not
+    false-match the cap modal or a bare "proceed?" prompt.
+    """
+    if not pane_text:
+        return None
+    text = _strip_ansi(pane_text)
+    if _PERMISSION_MODAL_QUESTION not in text or _PERMISSION_MODAL_FOOTER not in text:
+        return None
+    for line in text.splitlines():
+        m = _PERMISSION_DONT_ASK_RE.search(line)
+        if m:
+            return m.group(1).strip()
+    return PERMISSION_MODAL
 
 
 def _session_cap_modal(cfg: dict) -> str | None:
@@ -1391,7 +1632,9 @@ def check_p1a(cfg: dict, idle_threshold_seconds: int) -> bool:
     idle_seconds = int(time.time()) - latest_activity
     if idle_seconds < threshold:
         return False
-    queue_count = count_actionable_tickets(cfg["pantheon_config_path"], cfg["ticket_targets"], cfg["sudo_user"])
+    queue_count = count_actionable_tickets(
+        cfg["pantheon_config_path"], cfg["ticket_targets"], cfg["sudo_user"],
+        queue_states=cfg.get("queue_states", ("inbox", "active")))
     return queue_count >= 1
 
 
@@ -1402,29 +1645,72 @@ def check_p1b(
 ) -> bool:
     """P1.b: the operator absent + HO in await-state + queue.
 
-    Await-state has two sources (T-0297 extension):
-      1. Text-content regex (AWAIT_STATE_REGEX) on the latest assistant turn.
-      2. Latest assistant turn is a user-blocking tool_use (AskUserQuestion etc.).
+    Await-state has two sources:
+      1. Structural (T-3071): latest assistant turn's final content-block is
+         text, not tool_use — see latest_assistant_ends_without_tool_use.
+      2. Latest assistant turn is a user-blocking tool_use (AskUserQuestion
+         etc., T-0297).
+
+    operator-absent detection (Gate-1) reads HO's own jsonl for the most-recent
+    `plugin:telegram:telegram` inbound marker (T-3075 rewire, 2026-08-22 —
+    replaces the T-0223 bridge-health path retired 10wk earlier by the T-0767
+    pantheon-bridge decom, which had silently fail-open'd the whole gate).
+    The `bridge_url` param is accepted for signature-compat with the fire
+    site + legacy env-override but no longer consulted.
     """
-    health = fetch_bridge_health(bridge_url)
-    if health is None:
-        return False  # fail-open
-    absent_seconds = operator_last_inbound_age_seconds(health, cfg["bridge_inbound_key"])
-    if absent_seconds is None or absent_seconds < operator_absent_threshold_seconds:
-        return False
+    del bridge_url  # signature-preserved; no longer consulted (T-3075)
     jsonl = find_latest_jsonl(cfg["jsonl_dir"], cfg["sudo_user"])
     if jsonl is None:
         return False
-    # Signal 1: text-regex await
-    body = latest_assistant_message_body(jsonl, cfg["sudo_user"])
-    text_await = body is not None and detect_await_state(body)
+    latest_inbound_ts = latest_telegram_inbound_ts(jsonl, cfg["sudo_user"])
+    if latest_inbound_ts is None:
+        # Fail-CLOSED (T-3075): no verifiable operator-inbound = TREAT as absent.
+        # Bias toward safety-net-fires-when-uncertain rather than the prior
+        # silent bail. Signals 1-2 + queue-count still gate the actual poke —
+        # this only says "don't bail on Gate-1 alone."
+        absent_seconds = operator_absent_threshold_seconds  # exactly at threshold
+    else:
+        absent_seconds = int(time.time()) - latest_inbound_ts
+    if absent_seconds < operator_absent_threshold_seconds:
+        return False
+    # Signal 1: structural await (T-3071)
+    structural_await = latest_assistant_ends_without_tool_use(jsonl, cfg["sudo_user"])
     # Signal 2: interactive tool_use await (T-0297)
     interactive_tool = latest_assistant_interactive_tool_use(jsonl, cfg["sudo_user"])
     tool_await = interactive_tool is not None
-    if not (text_await or tool_await):
+    if not (structural_await or tool_await):
         return False
-    queue_count = count_actionable_tickets(cfg["pantheon_config_path"], cfg["ticket_targets"], cfg["sudo_user"])
-    return queue_count >= 1
+    queue_count = count_actionable_tickets(
+        cfg["pantheon_config_path"], cfg["ticket_targets"], cfg["sudo_user"],
+        queue_states=cfg.get("queue_states", ("inbox", "active")))
+    if queue_count < 1:
+        return False
+    # T-3404: honor the T-0644 terminal-state ack for P1.b too (was P1.a-only).
+    # If the HO's latest LEDGER activity is a terminal-state/queue_audit ack and
+    # it's within the suppression window, suppress — the HO has structurally
+    # acknowledged the queue is terminal (everything gated / on the operator's desk).
+    # LEDGER-gated, deliberately NOT jsonl-gated: the intervening "hold stable"
+    # text turns that a P1.b poke provokes don't write the ledger, so they can't
+    # lift the suppression — that is exactly what stops the ~15min
+    # poke→ack→poke churn (T-3404). It is superseded by: (a) the operator's return
+    # (the absent-gate above already suppresses then), (b) the 4hr window expiry
+    # (a fresh "still holding?" re-check), or (c) real new ledger work by the HO
+    # (a non-terminal ledger entry → terminal_ts < ledger_ts). New inbound work
+    # still reaches the HO via the inbox-consumer regardless of this poke.
+    terminal_ts = latest_terminal_state_ledger_ts_for_agent(
+        cfg["pantheon_config_path"], cfg["sudo_user"], cfg["ledger_agent_id"]
+    )
+    if terminal_ts is not None:
+        ledger_ts = latest_ledger_entry_ts_for_agent(
+            cfg["pantheon_config_path"], cfg["sudo_user"], cfg["ledger_agent_id"]
+        ) or 0
+        window = int(os.environ.get(
+            "ACTIVITY_MONITOR_P1A_TERMINAL_STATE_IDLE_SECONDS",
+            ACTIVITY_MONITOR_P1A_TERMINAL_STATE_IDLE_SECONDS,
+        ))
+        if terminal_ts >= ledger_ts and (int(time.time()) - terminal_ts) < window:
+            return False
+    return True
 
 
 def check_p1d(cfg: dict, age_threshold_seconds: int) -> bool:
@@ -1525,10 +1811,16 @@ P1A_POKE_PROMPT = (
 P1B_POKE_PROMPT = (
     "[activity-monitor P1.b] You appear to be in self-imposed wait-state while"
     " the operator is away (>15min since his last inbound). Per"
-    " sop/standard/ho-absent-operator-keep-working.md: record progress on the"
-    " awaited item, shelve it (ticket.py block <id> --not-before/--depends-on"
-    " — ORG-019; the old --reason flag was retired with blocked/), and swap to"
-    " the next actionable. Pull queue now."
+    " sop/standard/ho-absent-operator-keep-working.md: (1) if you have an active"
+    " team (`ls ~/.claude/teams/*/inboxes/`), check each teammate's inbox mtime"
+    " against role-thresholds (orch 30min / impl 15min / rev 5min) and status-"
+    " check any that exceeded — grandparent-routing / wake-hook drops are the"
+    " top cause of this fire firing while you feel legitimately-awaiting; (2)"
+    " record progress on the awaited item, shelve it (ticket.py block <id>"
+    " --not-before/--depends-on — ORG-019; the old --reason flag was retired"
+    " with blocked/), and swap to the next actionable; (3) any operator-blocked"
+    " asks become target=operator tickets, never idle-wait-on-chat. Pull queue"
+    " now."
 )
 
 P1D_RETRY_PROMPT = (
@@ -1576,6 +1868,58 @@ def send_poke(cfg: dict, prompt: str) -> bool:
         return False
 
 
+def _pane_idle_probe(cfg: dict) -> bool | None:
+    """THREE-state probe of the agent's pane for the poke busy-guard (T-3599):
+    True = idle at a prompt, False = BUSY (generating, OR the T-3579 manage-view
+    where a background agent holds the seat and Claude Code QUEUES injected input
+    instead of running it), None = UNKNOWN.
+
+    Classification is DELEGATED to inbox_consumer.pane_idle_state — the same
+    single-owner the mailbox_wake busy-defer consults (T-2681/T-3554) — so the two
+    poke/wake consumers cannot drift apart on the sentinel set (the exact drift
+    T-2171 had to fix in keep_going). Part A (merged @ad76818457) taught that
+    classifier to read the manage-view footer as BUSY; this probe is how
+    activity_monitor finally CONSULTS it.
+
+    Fail-open to None on any capture/import/classify failure: a flaky probe must
+    never, by itself, skip a needed poke or swallow a real send-failure — each
+    caller picks the safe direction for None (guard-1 pokes on None, guard-2 keeps
+    exit-1 on None). Same contract inbox_consumer.pane_idle_state documents.
+    """
+    pane = cfg.get("tmux_target_pane")
+    if not pane:
+        return None
+    pane_text = capture_pane(pane, cfg["sudo_user"])
+    if pane_text is None:
+        return None
+    try:
+        try:
+            from tools.inbox_consumer import pane_idle_state  # run-as-package / tests
+        except ImportError:
+            from inbox_consumer import pane_idle_state  # run-as-script (prod)
+        return pane_idle_state(pane_text)
+    except Exception:  # noqa: BLE001 — best-effort signal; UNKNOWN on any error
+        return None
+
+
+def _soft_defer_or_fail(cfg: dict, agent: str, predicate: str) -> int:
+    """T-3599 send-fail soft-defer: called only after send_poke() has FAILED.
+    Re-probe the pane and return 0 (soft-defer) IFF it is now DEFINITIVELY busy
+    (False) — a busy pane queues-not-submits, so the send lost nothing (the mail
+    it re-injects stays queued), the state self-clears, and a return-1 there just
+    mislabels a benign busy pane as a unit-failure (OnFailure -> recovery).
+
+    A genuinely IDLE pane that rejected the submit (True) is the real T-2245
+    send-liveness anomaly, and an UNKNOWN re-probe (None) is NOT proof-of-busy:
+    both keep exit-1 so a real wedge still alarms. ("Cannot tell" must not stand in
+    for "not a problem" — feedback_unknown_must_not_stand_in_for_no.)"""
+    if _pane_idle_probe(cfg) is False:
+        _log(agent, f"{predicate}: send failed but pane BUSY "
+                    f"(generating/manage-view) — soft-defer, not exit-1 (T-3599)")
+        return 0
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # Escalation (T-1363 inc.3): when a poke is SUPPRESSED because the session is
 # stuck (cyber-blocked, or N ineffective pokes with a frozen jsonl), don't just
@@ -1595,6 +1939,73 @@ def _route_failure_alert(agent: str, msg: str, vocab: str) -> None:
     route_failure_alert(agent, msg, vocab)
 
 
+# ---------------------------------------------------------------------------
+# T-3558(b1): wedge-specimen capture.
+#
+# With auto-poke armed (T-3557c), _escalate_stuck fires only when a poke was
+# INEFFECTIVE — i.e. exactly at a live wedge. That is the one moment we can grab
+# a REAL pane capture of the wedge class (preview-chip / permission-modal / ...),
+# which the T-3558(b2) classifiers need as a specimen (the classify_cap_modal
+# design forbids hand-typed fixtures). SHIP-DARK, flag-gated (default off) so it
+# is a deliberate, reversible arming and so existing escalation tests do not shell
+# out to live tmux. STATE-DIR, never the repo tree (no git noise); a captured
+# specimen is PROMOTED to tools/testdata/ by hand when (b2) is built. Fail-open in
+# every limb — a capture failure must never perturb the escalation.
+# ---------------------------------------------------------------------------
+_WEDGE_SPECIMEN_KEEP = int(os.environ.get("ACTIVITY_MONITOR_WEDGE_SPECIMEN_KEEP", "20"))
+
+
+def _wedge_specimen_dir() -> Path:
+    """State-dir specimens path — mirrors `_fires_log_path`'s PANTHEON_STATE_DIR
+    convention so tests redirect it the same way."""
+    state_dir_env = os.environ.get("PANTHEON_STATE_DIR")
+    state_dir = Path(state_dir_env) if state_dir_env else _DEFAULT_STATE_DIR
+    return state_dir / "activity_monitor" / "specimens"
+
+
+def _capture_wedge_specimen(cfg: dict, agent: str, vocab: str) -> tuple[Path | None, str | None]:
+    """Best-effort: save the current pane capture as a wedge specimen. Returns
+    (path, wedge_class) — the saved file's path and the detected wedge class
+    (classify_permission_modal), either of which may be None. Fail-open — any
+    capture/write/prune error is swallowed (logged) so it can never perturb the
+    escalation it rides on. Only runs when ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE
+    is truthy (checked by the caller). The wedge_class lets the caller name the
+    class in the Recovery-facing alert (T-3558b2) off this SAME capture — no second
+    capture_pane on the escalation path."""
+    try:
+        pane = cfg.get("tmux_target_pane")
+        if not pane:
+            return (None, None)
+        text = capture_pane(pane, cfg.get("sudo_user"))
+        if not text:
+            return (None, None)  # nothing to preserve (capture failed / empty)
+        # T-3558(b2): name the wedge class in the specimen if we recognise it, so
+        # the saved file + log line carry the diagnostic (which permission was
+        # blocking). DETECTION ONLY — nothing here answers the prompt.
+        wedge_class = classify_permission_modal(text)
+        d = _wedge_specimen_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        # Microsecond stamp: readable AND collision-free even for two wedges in
+        # the same second (a 1s stamp would overwrite the earlier one).
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+        path = d / f"{agent}_{vocab}_{stamp}.txt"
+        header = f"# detected-class: {wedge_class}\n" if wedge_class else ""
+        path.write_text(header + text)
+        # Bounded: keep only the newest _WEDGE_SPECIMEN_KEEP files (wedges are
+        # rare, but a diagnostic sidecar must not grow without limit).
+        specimens = sorted(d.glob("*.txt"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for stale in specimens[_WEDGE_SPECIMEN_KEEP:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        _log(agent, f"wedge-specimen saved (class={wedge_class or 'unclassified'}): {path}")
+        return (path, wedge_class)
+    except Exception as exc:  # noqa: BLE001 — specimen capture must never wedge escalation
+        _log(agent, f"wedge-specimen capture failed (ignored): {exc!r}")
+        return (None, None)
+
+
 def _escalate_stuck(cfg: dict, agent: str, predicate: str, msg: str, vocab: str,
                     state_path: Path, cur_mtime: int, consecutive: int) -> None:
     """Suppress-and-escalate: record the escalated state and, ONLY on the
@@ -1602,10 +2013,33 @@ def _escalate_stuck(cfg: dict, agent: str, predicate: str, msg: str, vocab: str,
     Recovery. Alert-routing failure never raises (must not wedge the monitor)."""
     prior = read_poke_state(state_path) or {}
     already = bool(prior.get("escalated")) and prior.get("predicate") == predicate
+    # T-3072: fire-tracking is keyed on VOCAB, not the triggering `predicate`
+    # param — cap-modal / spend-cap / cyber-refusal / stuck-poke / tui-wedge
+    # each track drift independently rather than being smeared under
+    # whichever predicate happened to trigger this dispatch. Recorded on
+    # EVERY call (not gated by `already`) — the underlying condition is still
+    # observably firing each cycle even while the alert itself stays quiet.
+    _record_fire(agent, vocab)
     if not already:
+        # T-3558(b1): grab a real pane specimen of the wedge at onset (flag-gated,
+        # fail-open). BEFORE alert-routing so a specimen is captured even if
+        # routing later raises; its own try/except means it can never itself wedge.
+        # T-3558(b2): reuse that same capture's classification to NAME the wedge
+        # class in the Recovery-facing alert (e.g. "permission modal for Read(//tmp/**)")
+        # so the escalation is actionable on sight — no second capture_pane, and
+        # gated by the same flag so unarmed seats (orchestrator) never shell out here.
+        detected_class = None
+        if os.environ.get(
+            "ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE", ""
+        ).strip().lower() in ("1", "true", "yes", "on"):
+            _, detected_class = _capture_wedge_specimen(cfg, agent, vocab)
+        alert_msg = msg if not detected_class else (
+            f"{msg}\n[activity_monitor T-3558: detected wedge class → {detected_class} "
+            f"— DIAGNOSTIC ONLY, verify the pane; do not auto-answer a permission prompt]"
+        )
         try:
-            _route_failure_alert(agent, msg, vocab)
-            _log(agent, f"{predicate}: ESCALATED to Recovery (route_failure_alert) — {msg[:80]}")
+            _route_failure_alert(agent, alert_msg, vocab)
+            _log(agent, f"{predicate}: ESCALATED to Recovery (route_failure_alert) — {alert_msg[:80]}")
         except Exception as exc:  # noqa: BLE001 — escalation must never wedge the monitor
             _log(agent, f"{predicate}: escalation alert routing failed {exc!r}")
     else:
@@ -1717,8 +2151,26 @@ def _dispatch_poke(
     poke send failed).
 
     Ship-dark: bounded_enabled=False reproduces the legacy send_poke +
-    write_poke_state behavior exactly — so with the flag off, nothing changes.
+    write_poke_state behavior exactly — so with the flag off, nothing changes
+    EXCEPT the T-3599 busy-guard below, which only ever DEFERS (never injects), so
+    it is safe-direction in both paths (mirrors the T-3579 part-A safe inversion).
     """
+    # T-3599 decide-time busy-guard (part B of the T-3579 fix). A pane that is
+    # generating, or in the manage-view where a background agent holds the seat,
+    # QUEUES an injected submit rather than running it (T-3579) — so a poke there is
+    # doomed and its send-failure would fire OnFailure -> a false unit-failure alert
+    # to recovery (confirmed live pantheon-activity-monitor@atlas 2026-09-08T19:15Z).
+    # Mirror the mailbox_wake busy-defer (T-2681/T-3554): DEFER instead of poking.
+    # Only a DEFINITIVELY-busy pane (False) skips; None (UNKNOWN) and True (idle)
+    # fall through and poke exactly as before — a flaky/foreign pane must not skip a
+    # needed poke. SAFE-DIRECTION: this branch only ever returns-0-without-poking;
+    # it never injects, so the T-2729 shell-inject hazard is structurally
+    # impossible and the sole failure mode is over-defer (poke retained; the
+    # effectiveness/TUI-wedge/mail_staleness backstops still catch a real wedge).
+    if _pane_idle_probe(cfg) is False:
+        _log(agent, f"{predicate}: pane BUSY (generating/manage-view) — "
+                    f"deferring poke, not exit-1 (T-3599)")
+        return 0
     if bounded_enabled:
         # Pre-poke state-gate (T-1363 inc.3): a CYBER-BLOCKED session keeps emitting
         # refusals, so its jsonl ADVANCES after a poke — which would fool the
@@ -1758,6 +2210,8 @@ def _dispatch_poke(
                     escalated=bool(prior.get("escalated")),
                     modal_dismissals=attempts + 1,
                 )
+                if sent:
+                    _record_fire(agent, predicate)
                 return 0 if sent else 1
             # Bound reached: the menu is still up after N confirms, so pressing
             # Enter is not the remedy and repeating it is just noise on someone
@@ -1867,16 +2321,20 @@ def _dispatch_poke(
                 state_path, agent, predicate,
                 pre_poke_jsonl_mtime=cur_mtime, consecutive_ineffective=consecutive,
             )
+            _record_fire(agent, predicate)
             return 0
         _log(agent, f"{predicate} poke send failed")
-        return 1
-    # Legacy / ship-dark path — byte-for-byte the prior behavior.
+        return _soft_defer_or_fail(cfg, agent, predicate)  # T-3599 send-fail busy-guard
+    # Legacy / ship-dark path — byte-for-byte the prior poke/state behavior
+    # (the _record_fire call is a new, best-effort, non-wedging side-write —
+    # T-3072 — it does not change what this branch pokes or persists).
     if send_poke(cfg, prompt):
         _log(agent, f"{predicate} poke sent")
         write_poke_state(state_path, agent, predicate)
+        _record_fire(agent, predicate)
         return 0
     _log(agent, f"{predicate} poke send failed")
-    return 1
+    return _soft_defer_or_fail(cfg, agent, predicate)  # T-3599 send-fail busy-guard
 
 
 # ---------------------------------------------------------------------------
@@ -2150,6 +2608,7 @@ def main(argv: list[str] | None = None) -> int:
         if send_poke(cfg, P1D_RETRY_PROMPT):
             _log(agent, "P1.d retry-inject sent")
             write_poke_state(state_path, agent, "p1d")
+            _record_fire(agent, "p1d")  # T-3072 — doesn't route through _dispatch_poke
             # T-0256: append session-reset stats entry. Best-effort; failure
             # must not block the fire (which has already succeeded).
             try:

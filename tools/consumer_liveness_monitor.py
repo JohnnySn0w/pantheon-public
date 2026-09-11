@@ -330,6 +330,20 @@ def classify_agent(agent: str, *, account: str | None, enablement: str | None,
                           f"be read — unmeasurable, NOT green."}
     exit_epoch = service.get("exit_epoch")
     if not isinstance(exit_epoch, int):
+        # T-3099: exit_epoch is ALSO None during the oneshot's ~3s activation window —
+        # systemd clears the prior ExecMainExitTimestamp when a new run activates. If the
+        # unit is CURRENTLY running (a cycle in progress), this is a mid-fire sample, NOT a
+        # never-fired consumer. Return LIVE: it is demonstrably alive right now. (A genuinely
+        # hung activation times out to 'failed' and then falls through to the UNKNOWN branch
+        # below, so this cannot mask a real stall.) Without this, the consumer-liveness timer
+        # phase-aligning with the inbox-consumer timer samples it mid-run for 3 polls and
+        # false-pages "never fired" — a windowed instrument sampling at the wrong moment.
+        active_state = (service.get("active_state") or "").strip()
+        if active_state in ("activating", "active", "reloading"):
+            return {"agent": agent, "verdict": LIVE,
+                    "detail": f"{agent}: consumer is mid-cycle (ActiveState={active_state}); "
+                              f"exit-timestamp transiently cleared during activation — alive, "
+                              f"not never-fired (T-3099)."}
         return {"agent": agent, "verdict": UNKNOWN,
                 "detail": f"{agent}: timer enabled but the consumer has no completed-run "
                           f"timestamp yet (never fired / just enabled). verify_startup C8 owns "

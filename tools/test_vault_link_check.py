@@ -107,6 +107,14 @@ class RunEndToEnd(unittest.TestCase):
         _write(self.root, "notes/x.md", "clean")
         self.assertEqual(vlc.run(self.root), 0)
 
+    def test_pinned_rules_seed_file_unresolved_links_are_agent_vault(self):
+        # pinned-rules/<agent>.md seeds another agent's private vault; its
+        # wikilinks target that agent's namespace (outside this repo). They
+        # must not fail the curated-dir gate.
+        _write(self.root, "pinned-rules/mnemosyne.md",
+               "see [[feedback-always-reply-via-telegram]] and [[rulebook-my-obligations]]")
+        self.assertEqual(vlc.run(self.root), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

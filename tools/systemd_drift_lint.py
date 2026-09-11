@@ -119,6 +119,16 @@ _UNIT_EXPECTED_DRIFT: dict[str, frozenset[str]] = {
     # Description, with a byte-identical ExecStart. An ExecStart/logic drift on
     # this unit still classifies substantive and pages.
     "pantheon-agent-state-snapshot.service": frozenset({"Environment"}),
+    # T-3097 (Cat D): the repo copy of this timer is a TEMPLATE, not a unit —
+    # OnUnitInactiveSec/RandomizedDelaySec carry Python .format() placeholder
+    # tokens ({quota_cadence_minutes}, {quota_randomized_delay_seconds}) that
+    # persona_installer.py's _render_quota_timer_template substitutes at
+    # install time. Repo bytes can never be byte-identical to an installed
+    # copy on those two directives BY DESIGN — that is not staleness, it is
+    # the template doing its job. Scoped to exactly these two keys, not the
+    # whole unit: any other directive (OnBootSec, Unit=, a new/removed line)
+    # still classifies substantive, same guarantee as the T-2846 precedent.
+    "pantheon-persona-quota@.timer": frozenset({"OnUnitInactiveSec", "RandomizedDelaySec"}),
 }
 
 

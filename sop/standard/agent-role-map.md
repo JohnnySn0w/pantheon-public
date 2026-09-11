@@ -39,5 +39,5 @@ This doc covers the **persona ↔ audit-role-id** mapping only. There is a SEPAR
 ## See also
 
 - `tools/agent_role_map.py` — module + `resolve_role()` (audit-role-id) and `resolve_instance_role()` (instance role-key) helpers.
-- `adr/ORG-003-ticket-system.md` §Front-matter field semantics — controlled vocabulary for `target` / `requester`.
+- `architecture/adr/ORG-003-ticket-system.md` §Front-matter field semantics — controlled vocabulary for `target` / `requester`.
 - `/home/claude/CLAUDE.md` §Identity (HO-pinned, auto-loaded — home dir, not a repo file) — audit-chain continuity rule for actor IDs.

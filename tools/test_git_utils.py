@@ -37,7 +37,13 @@ from unittest.mock import MagicMock, call, patch
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools._git_utils import WorktreeError, with_worktree
+from tools._git_utils import (
+    WorktreeError,
+    with_worktree,
+    push_with_retry,
+    _refspec_targets_main,
+    _warn_if_branch_carries_nonticket_commits,
+)
 
 
 def _make_cp(returncode: int = 0, stdout: str = "", stderr: str = "") -> MagicMock:
@@ -456,6 +462,222 @@ class CommonDirMockedStdoutTest(unittest.TestCase):
                           "the fallback must stay uncached (T-1816)")
         self.assertFalse((_git_utils.REPO_ROOT / "MagicMock").exists(),
                          "no fabricated path may be materialized")
+
+
+class TestWithWorktreeFetchRefLockRetry(unittest.TestCase):
+    """T-3207: the concurrent-fetch ref-lock race is retried; non-ref-lock fails fast."""
+
+    def test_ref_lock_race_retried_then_succeeds(self) -> None:
+        sentinel = object()
+        fetch_calls = []
+
+        def _run(cmd, **kwargs):
+            if "fetch" in cmd:
+                fetch_calls.append(cmd)
+                if len(fetch_calls) == 1:
+                    # First fetch loses the concurrent ref-lock race.
+                    return _make_cp(
+                        1,
+                        stderr=(
+                            "error: cannot lock ref 'refs/remotes/origin/main': "
+                            "is at 45e9a728d but expected 581da79f2"
+                        ),
+                    )
+                return _make_cp(0)  # retry sees the settled ref
+            return _make_cp(0)  # worktree add / remove
+
+        with (
+            patch("tools._git_utils.os.getpid", return_value=77777),
+            patch("tools._git_utils.subprocess.run", side_effect=_run),
+            patch("tools._git_utils.Path.exists", return_value=False),
+            patch("tools._git_utils.time.sleep") as mock_sleep,
+        ):
+            result = with_worktree(lambda _wt: sentinel)
+
+        self.assertIs(result, sentinel)
+        self.assertEqual(
+            len(fetch_calls), 2, "fetch should retry exactly once on the ref-lock race"
+        )
+        self.assertTrue(mock_sleep.called, "should back off between ref-lock retries")
+
+    def test_non_ref_lock_fetch_failure_not_retried(self) -> None:
+        # A network/auth error must still fail fast (no retry) — regression guard
+        # that the ref-lock retry does not over-match.
+        fetch_calls = []
+
+        def _run(cmd, **kwargs):
+            if "fetch" in cmd:
+                fetch_calls.append(cmd)
+                return _make_cp(1, stderr="fatal: could not resolve host github.com")
+            return _make_cp(0)
+
+        with (
+            patch("tools._git_utils.os.getpid", return_value=66666),
+            patch("tools._git_utils.subprocess.run", side_effect=_run),
+            patch("tools._git_utils.Path.exists", return_value=False),
+            patch("tools._git_utils.time.sleep"),
+        ):
+            with self.assertRaises(WorktreeError) as ctx:
+                with_worktree(lambda _wt: "unused")
+
+        self.assertEqual(
+            len(fetch_calls), 1, "a non-ref-lock fetch error must NOT be retried"
+        )
+        self.assertIn("could not resolve host", str(ctx.exception))
+
+    def test_ref_lock_exhausted_raises(self) -> None:
+        # Ref-lock on every attempt → exhausts retries → raises (fail-loud), same
+        # WorktreeError shape as before.
+        fetch_calls = []
+
+        def _run(cmd, **kwargs):
+            if "fetch" in cmd:
+                fetch_calls.append(cmd)
+                return _make_cp(
+                    1, stderr="error: cannot lock ref 'refs/remotes/origin/main'"
+                )
+            return _make_cp(0)
+
+        with (
+            patch("tools._git_utils.os.getpid", return_value=55555),
+            patch("tools._git_utils.subprocess.run", side_effect=_run),
+            patch("tools._git_utils.Path.exists", return_value=False),
+            patch("tools._git_utils.time.sleep"),
+        ):
+            with self.assertRaises(WorktreeError) as ctx:
+                with_worktree(lambda _wt: "unused")
+
+        self.assertGreaterEqual(
+            len(fetch_calls), 2, "should have retried before exhausting"
+        )
+        self.assertIn("cannot lock ref", str(ctx.exception))
+
+
+class TestPushGuardT3600(unittest.TestCase):
+    """T-3600 — WARN (never block) before a HEAD:main push from a named non-main
+    branch that would carry non-ticket commits onto origin/main. Fail-open in
+    every limb."""
+
+    @staticmethod
+    def _git_side_effect(*, branch_cp, log_cp):
+        """Build a side_effect for _git that dispatches on the git subcommand:
+        `symbolic-ref` -> branch_cp, `log` -> log_cp. Any other subcommand -> ok."""
+        def _se(*args, **kwargs):
+            sub = args[0] if args else ""
+            if sub == "symbolic-ref":
+                return branch_cp
+            if sub == "log":
+                return log_cp
+            return _make_cp(0)
+        return _se
+
+    def _run_guard(self, *, branch_cp, log_cp, refspec="HEAD:main", env=None):
+        buf = io.StringIO()
+        patches = [
+            patch("tools._git_utils._git",
+                  side_effect=self._git_side_effect(branch_cp=branch_cp, log_cp=log_cp)),
+            patch.dict("tools._git_utils.os.environ", env or {}, clear=False),
+            contextlib.redirect_stderr(buf),
+        ]
+        with contextlib.ExitStack() as stack:
+            for p in patches:
+                stack.enter_context(p)
+            _warn_if_branch_carries_nonticket_commits(Path("/x"), refspec)
+        return buf.getvalue()
+
+    # --- refspec parsing ---------------------------------------------------
+    def test_refspec_targets_main_true_forms(self) -> None:
+        for spec in ("HEAD:main", "main", "main:main",
+                     "refs/heads/x:refs/heads/main"):
+            self.assertTrue(_refspec_targets_main(spec), spec)
+
+    def test_refspec_targets_main_false_forms(self) -> None:
+        for spec in ("HEAD:feature", "HEAD:release", "main:topic", "x:develop"):
+            self.assertFalse(_refspec_targets_main(spec), spec)
+
+    # --- WARN path ---------------------------------------------------------
+    def test_warns_on_named_branch_with_nonticket_commits(self) -> None:
+        out = self._run_guard(
+            branch_cp=_make_cp(0, stdout="feature-x\n"),
+            log_cp=_make_cp(0, stdout="tools/foo.py\ntickets/T-1.md\n"),
+        )
+        self.assertIn("push guard T-3600", out)
+        self.assertIn("feature-x", out)
+        self.assertIn("tools/foo.py", out)  # the offending non-ticket path is named
+
+    # --- silent (safe) paths ----------------------------------------------
+    def test_no_warn_when_only_ticket_paths(self) -> None:
+        out = self._run_guard(
+            branch_cp=_make_cp(0, stdout="feature-x\n"),
+            log_cp=_make_cp(0, stdout="tickets/T-1.md\ntickets/active/T-2.md\n"),
+        )
+        self.assertEqual(out, "")
+
+    def test_no_warn_on_main_branch(self) -> None:
+        out = self._run_guard(
+            branch_cp=_make_cp(0, stdout="main\n"),
+            log_cp=_make_cp(0, stdout="tools/foo.py\n"),  # would warn if consulted
+        )
+        self.assertEqual(out, "")
+
+    def test_no_warn_on_detached_head_worktree_case(self) -> None:
+        # symbolic-ref exits non-zero on detached HEAD -> guard must skip (this is
+        # the legitimate worktree case the HEAD:main default exists for).
+        out = self._run_guard(
+            branch_cp=_make_cp(1, stdout="", stderr="fatal: ref HEAD is not a symbolic ref"),
+            log_cp=_make_cp(0, stdout="tools/foo.py\n"),
+        )
+        self.assertEqual(out, "")
+
+    def test_no_warn_when_refspec_not_main(self) -> None:
+        out = self._run_guard(
+            branch_cp=_make_cp(0, stdout="feature-x\n"),
+            log_cp=_make_cp(0, stdout="tools/foo.py\n"),
+            refspec="HEAD:feature-x",
+        )
+        self.assertEqual(out, "")
+
+    def test_no_warn_when_opt_out_env_set(self) -> None:
+        out = self._run_guard(
+            branch_cp=_make_cp(0, stdout="feature-x\n"),
+            log_cp=_make_cp(0, stdout="tools/foo.py\n"),
+            env={"PANTHEON_TICKET_PUSH_GUARD_OFF": "1"},
+        )
+        self.assertEqual(out, "")
+
+    def test_no_warn_when_origin_main_ref_absent(self) -> None:
+        # `git log origin/main..HEAD` fails (no remote-tracking ref) -> skip.
+        out = self._run_guard(
+            branch_cp=_make_cp(0, stdout="feature-x\n"),
+            log_cp=_make_cp(128, stderr="fatal: bad revision 'origin/main..HEAD'"),
+        )
+        self.assertEqual(out, "")
+
+    # --- fail-open ---------------------------------------------------------
+    def test_fail_open_when_git_raises(self) -> None:
+        buf = io.StringIO()
+        with patch("tools._git_utils._git", side_effect=OSError("boom")), \
+             contextlib.redirect_stderr(buf):
+            # Must not raise.
+            _warn_if_branch_carries_nonticket_commits(Path("/x"), "HEAD:main")
+        self.assertEqual(buf.getvalue(), "")
+
+    # --- wiring: push_with_retry invokes the guard and still pushes --------
+    def test_push_with_retry_invokes_guard_and_succeeds(self) -> None:
+        with patch("tools._git_utils._warn_if_branch_carries_nonticket_commits") as guard, \
+             patch("tools._git_utils._git", return_value=_make_cp(0)):
+            ok, msg = push_with_retry(Path("/x"), refspec="HEAD:main")
+        self.assertTrue(ok)
+        guard.assert_called_once_with(Path("/x"), "HEAD:main")
+
+    def test_push_with_retry_succeeds_even_if_guard_raises(self) -> None:
+        # Defense in depth: even a BUG in the guard that raised must not break the
+        # push on this fleet-shared path — push_with_retry wraps the guard call.
+        with patch("tools._git_utils._warn_if_branch_carries_nonticket_commits",
+                   side_effect=RuntimeError("guard bug")), \
+             patch("tools._git_utils._git", return_value=_make_cp(0)):
+            ok, _msg = push_with_retry(Path("/x"), refspec="HEAD:main")
+        self.assertTrue(ok)
 
 
 if __name__ == "__main__":

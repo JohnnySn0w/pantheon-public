@@ -31,8 +31,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from tools import codex_telegram_bridge as bridge
 from tools import persona_bringup
 from tools import runtime_controller as rc
+from tools import t2611_recovery_persona_apply as persona_apply
 from tools.bringup_acceptance import harness_runtime
 from tools.bringup_acceptance.harness_runtime import (
     COMPOSITE_ID,
@@ -47,7 +49,9 @@ from tools.bringup_acceptance.types import (
     RunContext,
     TargetInventory,
 )
-from tools.harness_adapter.types import DiagnosticObservation, DiagnosticReport
+from tools.harness_adapter.types import DeliveryReceipt, DiagnosticObservation, DiagnosticReport
+from tools.harness_adapter.types import ReceiverStateProof
+from tools.persona_installer import Manifest, PersonaInstaller, SimulatedHostBackend
 
 
 def _fixture_source_provenance(**kwargs: object) -> rc.RuntimeSourceProvenance:
@@ -79,6 +83,20 @@ def _run_context(root: Path) -> RunContext:
         account="claude-fallback",
         harness="claude",
         profile="interactive",
+        hub_path=root / "hub",
+        state_path=root / "state",
+        evidence_root=root / "evidence",
+        baseline_ref="deadbeef" * 5,
+    )
+
+
+def _orchestrator_context(root: Path) -> RunContext:
+    return RunContext(
+        run_id="20260814T120000Z",
+        persona="orchestrator",
+        account="claude",
+        harness="claude",
+        profile="interactive-subscription",
         hub_path=root / "hub",
         state_path=root / "state",
         evidence_root=root / "evidence",
@@ -178,6 +196,308 @@ class DiagnoseVerdictTest(unittest.TestCase):
         with self.assertRaises(HardStop):
             _diagnose_verdict(report)
 
+
+class ThothCodexBootstrapTest(unittest.TestCase):
+    def test_orchestrator_controller_bootstrap_preserves_mailbox_wake_and_pane_logging(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            proof = harness_runtime.run_codex_controller_bootstrap_leg(
+                _orchestrator_context(root),
+                manifest_path=Path("instance.yaml"),
+                mailbox_hub=root / "mail",
+                codex_executable=Path("/usr/bin/codex"),
+            )
+        self.assertEqual(proof["status"], "configured")
+        self.assertEqual(proof["mode"], "configured-executable")
+        self.assertEqual(proof["mailbox_wake"], "preserved-from-manifest")
+        self.assertEqual(proof["pane_logging"], "preserved-from-post-start")
+        self.assertEqual(proof["restart_route"], "runtime-controller")
+
+    def test_orchestrator_runtime_returns_codex_ready_after_bootstrap_from_clean_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = Path("instance.yaml")
+            manifest = Manifest.load(manifest_path)
+            plan = PersonaInstaller(Path(__file__).resolve().parent.parent).plan(
+                manifest,
+                "orchestrator",
+                harness_override="claude",
+                root=root / "projection",
+            )
+            operation_ids = [operation.operation_id for operation in plan.operations]
+            self.assertIn("codex-standing-instructions.install", operation_ids)
+            self.assertIn("codex-telegram.unit-install", operation_ids)
+            self.assertIn("codex-telegram.disabled-first", operation_ids)
+
+            primary = persona_bringup.load_binding(
+                manifest_path,
+                "orchestrator",
+                mailbox_hub=root / "mail",
+            )
+            fallback = persona_bringup.first_fallback_binding(manifest_path, primary)
+            self.assertIsNotNone(fallback)
+            assert fallback is not None
+            self.assertEqual(primary.launch.harness, "claude")
+            self.assertEqual(fallback.launch.harness, "codex")
+
+            state_root = root / "personas"
+
+            with mock.patch.object(rc, "pane_exists", return_value=False), mock.patch.object(
+                rc, "_start_runtime", return_value=rc.RuntimeStart(rc.TMUX_RUNTIME_SCOPE_UNIT, False)
+            ), mock.patch.object(rc, "_verify_started_runtime"), mock.patch.object(
+                rc, "_verify_runtime_input_ready"
+            ), mock.patch.object(rc, "_run_post_start_commands"), _provenance_patch():
+                current_handle = rc.ensure_runtime(
+                    primary,
+                    adapter=mock.Mock(),
+                    state_root=state_root,
+                )
+
+            class ReceiverBackend:
+                def __init__(self) -> None:
+                    self.events: list[str] = []
+
+                def execute(self, action: str, binding) -> dict:
+                    self.events.append(action)
+                    return {"ok": True, "action": action, "persona": binding.persona}
+
+                def prove_receiver_state(self, binding, expected: str) -> ReceiverStateProof:
+                    harness = binding.launch.harness
+                    self.events.append(f"proof:{harness}:{expected}")
+                    return ReceiverStateProof(expected, {"expected": expected, "harness": harness})
+
+            backend = ReceiverBackend()
+
+            def replace_runtime(binding, *, state_root: Path | None, context=None, on_started=None):
+                del context
+                if on_started is not None:
+                    on_started(
+                        rc._RuntimeStartEvent(
+                            started=rc.RuntimeStart(rc.TMUX_RUNTIME_SCOPE_UNIT, False),
+                            boundary=rc._utc_now(),
+                        )
+                    )
+                rc._atomic_json(
+                    Path(state_root) / binding.persona / "runtime-controller" / "runtime.json",
+                    rc._runtime_payload(binding, session_id="replacement", started_at=rc._utc_now()),
+                )
+                return rc.RuntimeHandle(binding.launch, binding.controller.tmux, "replacement", rc._utc_now())
+
+            with mock.patch.object(rc, "pane_exists", return_value=True), mock.patch.object(
+                rc, "_replace_runtime", side_effect=replace_runtime
+            ), mock.patch.object(rc, "_prompt_successor"):
+                with self.assertRaises(rc.RuntimeTransitionPending):
+                    rc._operator_target_swap_resolved(
+                        primary,
+                        fallback,
+                        trigger="operator",
+                        correlation_id="t2953-test-orchestrator-to-codex",
+                        state_root=state_root,
+                        backend=backend,
+                        current_handle=current_handle,
+                    )
+            events = backend.events
+            transition = rc.transition_state("orchestrator", state_root=state_root)
+            self.assertTrue(transition["runtime_swapped"])
+            self.assertTrue(transition["receiver_transferred"])
+            self.assertEqual(transition["phase"], "awaiting-successor-read")
+            self.assertEqual(transition["receiver_post_receipt"]["operations"], [
+                "probe-claude-absent",
+                "start-codex-poller",
+                "probe-codex-present",
+                "health-codex-no-409",
+            ])
+            old_absent_positions = [
+                index for index, action in enumerate(events) if action == "probe-claude-absent"
+            ]
+            self.assertTrue(old_absent_positions)
+            self.assertIn("stop-dormant-claude-receiver", events)
+            self.assertLess(old_absent_positions[-1], events.index("start-codex-poller"))
+            self.assertLess(events.index("start-codex-poller"), events.index("probe-codex-present"))
+
+            # T-2966: rc.recorded_active_runtime()/ActiveRuntimeIdentity dissolved
+            # (self-referential controller state, R31->R38). Read the same
+            # runtime.json the old helper wrapped, directly -- this preserves the
+            # assertion (codex became the recorded active runtime) without the
+            # dissolved dataclass.
+            runtime_state = rc._read_json(rc._persona_state("orchestrator", state_root) / "runtime.json")
+            self.assertEqual(runtime_state.get("schema"), "pantheon-runtime-state/v1")
+            self.assertEqual(runtime_state.get("harness"), "codex")
+            self.assertEqual(runtime_state.get("profile"), "interactive-chatgpt")
+
+            proof = harness_runtime.run_codex_controller_bootstrap_leg(
+                _orchestrator_context(root),
+                manifest_path=manifest_path,
+                mailbox_hub=root / "mail",
+                codex_executable=Path("/usr/bin/codex"),
+            )
+        self.assertEqual(proof["status"], "configured")
+        self.assertEqual(proof["mode"], "configured-executable")
+        self.assertEqual(proof["primary"], "claude/interactive-subscription")
+        self.assertEqual(proof["fallback"], "codex/interactive-chatgpt")
+        self.assertEqual(proof["tmux_target"], "claude-telegram-bot:harness.0")
+
+    def test_orchestrator_clean_bootstrap_falls_back_to_codex_and_hands_off_single_receiver(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            manifest_path = Path("instance.yaml")
+            manifest = Manifest.load(manifest_path)
+            plan = PersonaInstaller(Path(__file__).resolve().parent.parent).plan(
+                manifest,
+                "orchestrator",
+                harness_override="claude",
+                root=root / "projection",
+            )
+            operation_ids = [operation.operation_id for operation in plan.operations]
+            self.assertIn("codex-standing-instructions.install", operation_ids)
+            self.assertIn("codex-telegram.disabled-first", operation_ids)
+            stage_backend = SimulatedHostBackend()
+            stage_code, stage_summary = persona_apply.stage_disabled(
+                manifest_path,
+                "orchestrator",
+                "claude",
+                Path(__file__).resolve().parent.parent,
+                "r5-integration",
+                backend=stage_backend,
+                root=root / "projection",
+            )
+            self.assertEqual(stage_code, 0, stage_summary)
+            self.assertIn("codex-standing-instructions.install", stage_backend.events)
+            self.assertNotIn("connective.unit-fire", stage_backend.events)
+            activate_code, activate_summary = persona_apply.activate_staged(
+                manifest_path,
+                "orchestrator",
+                "claude",
+                Path(__file__).resolve().parent.parent,
+                "r5-integration",
+                backend=stage_backend,
+                root=root / "projection",
+            )
+            self.assertEqual(activate_code, 0, activate_summary)
+            self.assertIn("connective.unit-fire", stage_backend.events)
+            sheet = bridge.command_sheet("orchestrator", expected_pantheon_revision="4" * 40)
+            sheet_ids = [step["step_id"] for step in sheet["steps"]]
+            self.assertLess(
+                sheet_ids.index("08-stage-disabled-instructions-and-bridge"),
+                sheet_ids.index("10-codex-instruction-discovery"),
+            )
+            self.assertLess(
+                sheet_ids.index("10-codex-instruction-discovery"),
+                sheet_ids.index("14-stage1-cutover-execute"),
+            )
+            self.assertNotIn("11-start-controller-consume-viability", sheet_ids)
+
+            primary = persona_bringup.load_binding(manifest_path, "orchestrator", mailbox_hub=root / "mail")
+            candidates = persona_bringup.configured_runtime_bindings(manifest_path, primary)
+            fallback = candidates[1]
+            self.assertEqual(
+                [persona_bringup.runtime_reference(item) for item in candidates],
+                ["claude/interactive-subscription", "codex/interactive-chatgpt"],
+            )
+            from tools import mailbox
+
+            mailbox.provision(primary.mailbox)
+            mailbox.send(primary.mailbox, {"body": "wake"}, "specialist", subject="viability")
+            state_root = root / "personas"
+            events: list[str] = []
+
+            class Adapter:
+                def __init__(self, binding) -> None:
+                    self.binding = binding
+
+                def quota_observer(self, state_dir: Path):
+                    del state_dir
+                    return mock.Mock(
+                        read=lambda: mock.Mock(
+                            profile=f"{self.binding.launch.harness}/{self.binding.launch.profile}",
+                            windows=(),
+                            freshness="unavailable",
+                            evidence={"authoritative_limit": "false"},
+                        )
+                    )
+
+            adapters = {item.launch.harness: Adapter(item) for item in candidates}
+
+            class ReceiverBackend:
+                def execute(self, action: str, binding) -> dict[str, object]:
+                    events.append(f"{binding.launch.harness}:{action}")
+                    return {"ok": True, "action": action}
+
+                def prove_receiver_state(self, binding, expected: str) -> ReceiverStateProof:
+                    events.append(f"{binding.launch.harness}:proof-{expected}")
+                    return ReceiverStateProof(expected, {"expected": expected, "harness": binding.launch.harness})
+
+            def start_runtime(binding, adapter, *, replace=False, context=None):
+                del adapter, replace, context
+                events.append(f"{binding.launch.harness}:start")
+                return rc.RuntimeStart(rc.TMUX_RUNTIME_SCOPE_UNIT, True)
+
+            def verify_input(binding, started, *, state_root=None, adapter=None, context=None):
+                del state_root, adapter, context
+                if binding.launch.harness == "claude":
+                    raise rc.RuntimeOperationalFailure(
+                        "input not ready",
+                        failure_class="operational-readiness",
+                        cause="runtime_input_not_ready",
+                        binding_runtime=persona_bringup.runtime_reference(binding),
+                        runtime_start=started,
+                        created_scope=started.created_scope,
+                        pane_may_be_mutated=True,
+                        readiness_evidence={"event": "runtime_input_not_ready"},
+                    )
+
+            submitted: dict[str, object] = {}
+
+            def submit(handle, request, **kwargs):
+                submitted["handle"] = handle
+                submitted["request"] = request
+                submitted["kwargs"] = kwargs
+                return DeliveryReceipt(
+                    harness="codex",
+                    correlation_id=kwargs["correlation_id"],
+                    state="submitted",
+                    mechanism="tmux-send-keys",
+                    retryable=False,
+                    evidence={"profile": handle.profile.profile},
+                )
+
+            with mock.patch.object(persona_bringup, "build_adapter", side_effect=lambda binding, *, harness_home: adapters[binding.launch.harness]), mock.patch.object(
+                rc, "pane_exists", return_value=False
+            ), mock.patch.object(rc, "_start_runtime", side_effect=start_runtime), mock.patch.object(
+                rc, "_verify_started_runtime"
+            ), mock.patch.object(rc, "_verify_runtime_input_ready", side_effect=verify_input), mock.patch.object(
+                rc, "_run_post_start_commands"
+            ), mock.patch.object(rc, "_stop_created_scope", side_effect=lambda scope: events.append(f"stop:{scope}")), mock.patch.object(
+                rc, "submit_to_runtime", side_effect=submit
+            ), mock.patch("tools.mailbox_wake.session_key", return_value="session-key"), mock.patch(
+                "tools.mailbox_wake.pane_is_idle", return_value=True
+            ), _provenance_patch():
+                result = persona_bringup.wake_persistent_runtime(
+                    primary,
+                    adapter=adapters["claude"],
+                    fallback_binding=fallback,
+                    primary_binding=primary,
+                    runtime_candidates=candidates,
+                    receiver_backend=ReceiverBackend(),
+                    state_dir=state_root,
+                    cwd=root,
+                    now=1.0,
+                )
+
+            self.assertEqual(result["action"], "wake")
+            self.assertEqual(result["harness"], "codex")
+            self.assertEqual(result["profile"], "interactive-chatgpt")
+            self.assertEqual(result["runtime_viability"].selected_runtime, "codex/interactive-chatgpt")
+            self.assertEqual(submitted["handle"].profile.harness, "codex")
+            self.assertIn("Run it bare", submitted["request"].prompt)
+            self.assertIn(str(primary.mailbox), submitted["request"].prompt)
+            state = rc.initial_viability_state("orchestrator", state_root=state_root)
+            self.assertEqual(state["attempts"][0]["failure_class"], "operational-readiness")
+            self.assertLess(events.index(f"stop:{rc.TMUX_RUNTIME_SCOPE_UNIT}"), events.index("claude:proof-absent"))
+            self.assertLess(events.index("claude:proof-absent"), events.index("codex:start"))
+            self.assertLess(events.index("codex:proof-absent"), events.index("codex:start-codex-poller"))
+            self.assertLess(events.index("codex:start-codex-poller"), events.index("codex:probe-codex-present"))
+
     def test_hard_stops_on_unexpected_auth_material_status(self) -> None:
         report = _report(
             _observation("claude.auth_material", status="warn", authoritative=False)
@@ -207,6 +527,7 @@ def _disposable_persona_binding(root: Path) -> "persona_bringup.PersonaBinding":
         account_home=account_home,
         pinned_rules=pinned_rules,
         mailbox=mailbox,
+        launch_cwd=root,
         launch=HarnessLaunchConfig(
             harness="claude", profile="interactive", executable=Path("/bin/echo"),
             model=None, mode="interactive", meter="subscription", quota_source="statusline",
@@ -286,6 +607,7 @@ class EnsureRuntimeChainLegTest(unittest.TestCase):
                 detail["call_order"],
                 ["start_runtime", "verify_started_runtime", "verify_runtime_input_ready"],
             )
+            self.assertEqual(detail["launch_cwd"], str(ctx.state_path))
             self.assertTrue(detail["handle_profile_matches"])
             self.assertTrue(detail["handle_tmux_matches"])
             state_path = root / "chain-state" / ctx.persona / "runtime-controller" / "runtime.json"

@@ -140,6 +140,77 @@ class CorpusProtectionTest(unittest.TestCase):
         self.assertIn("wish-grooming", (self.root / "adr" / "ORG-020-restart-for-all-pantheon-agents.md").read_text())
 
 
+class ArchitectureCorpusProtectionTest(unittest.TestCase):
+    """T-3479: after T-3472 umbrella-reorg, the design-history corpus lives under
+    architecture/{adr,rfc,engineering-practices,atlas}/. The corpus-skip must
+    cover the whole architecture/ subtree — else a fork's seed_rebrand pass
+    rewrites pantheon- tokens inside ADRs/RFCs/methodology files by default,
+    breaking the design-history contract (§2)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "instance.yaml").write_text("instance: {}\n")
+        arch_dirs = ("architecture/adr", "architecture/rfc",
+                     "architecture/engineering-practices", "architecture/atlas")
+        for d in arch_dirs:
+            (self.root / d).mkdir(parents=True)
+        # One design-history file in each subtree, each referencing pantheon- tokens
+        (self.root / "architecture" / "adr" / "ORG-093-methodology-tier.md").write_text(
+            "ORG-093 defines the pantheon-grooming methodology tier\n")
+        (self.root / "architecture" / "rfc" / "R-001-example.md").write_text(
+            "R-001 references pantheon-grooming as prior art\n")
+        (self.root / "architecture" / "engineering-practices" / "amendment-h.md").write_text(
+            "amendment H binds pantheon-grooming falsifier discipline\n")
+        (self.root / "architecture" / "atlas" / "map.md").write_text(
+            "the pantheon-grooming node sits here on the atlas\n")
+        (self.root / "architecture" / "README.md").write_text(
+            "architecture/ hosts the pantheon-grooming design-history corpus\n")
+        # A normal (non-corpus) file that MUST rebrand
+        (self.root / "tools").mkdir()
+        (self.root / "tools" / "pantheon-grooming.service").write_text(
+            "runs pantheon-grooming\n")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_architecture_subtree_skipped_by_default(self):
+        report = sr.run(self.root, "wish", apply=True)
+        # Every design-history file under architecture/ stays intact
+        for rel in ("architecture/adr/ORG-093-methodology-tier.md",
+                    "architecture/rfc/R-001-example.md",
+                    "architecture/engineering-practices/amendment-h.md",
+                    "architecture/atlas/map.md",
+                    "architecture/README.md"):
+            self.assertIn("pantheon-grooming", (self.root / rel).read_text(),
+                          f"{rel} was rebranded; corpus-skip did not protect the "
+                          "architecture/ subtree (T-3479)")
+        # But the non-corpus service DID rebrand
+        self.assertTrue((self.root / "tools" / "wish-grooming.service").exists())
+        # Report must not list any architecture/ path
+        self.assertFalse(
+            any(c.startswith("architecture/") for c in report["content_changed"]),
+            f"report leaked an architecture/ path: {report['content_changed']}",
+        )
+
+    def test_architecture_subtree_rebrands_under_include_corpus(self):
+        # --include-corpus opts back into the architecture/ subtree — verifying
+        # the skip is default-behavior, not a hard prohibition.
+        sr.run(self.root, "wish", apply=True, include_corpus=True)
+        self.assertIn(
+            "wish-grooming",
+            (self.root / "architecture" / "adr" / "ORG-093-methodology-tier.md").read_text(),
+        )
+        self.assertIn(
+            "wish-grooming",
+            (self.root / "architecture" / "rfc" / "R-001-example.md").read_text(),
+        )
+        self.assertIn(
+            "wish-grooming",
+            (self.root / "architecture" / "engineering-practices" / "amendment-h.md").read_text(),
+        )
+
+
 class SelfExclusionTest(unittest.TestCase):
     """§5: the tool must not rewrite its own source (idempotence for reconcile)."""
     def setUp(self):

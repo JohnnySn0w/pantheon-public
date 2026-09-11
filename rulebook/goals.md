@@ -4,16 +4,17 @@
 
 **What this file is.** The tier ABOVE principles. The amended D3 bar says "goal-level and above is the operator's; everything below is the orchestrator's" — this registry is what makes that test mechanical. Work maps to a registered goal → below the bar, adopt under P/D justification. Work maps to nothing here → goal-shaped by definition → see the unmapped-work rule in `policies/goal-mapping.md`.
 
-**Two goal layers (ORG-034, 2026-06-12).** This file holds **layer 1: north stars** — terminal, few, slow-moving, the operator's. **Layer 2: arc-intents** — what a given arc/ticket/dispatch is for, in outcome language — live on the work artifacts themselves (brief opening lines, ticket Asks, `serves:` fields), nested under a north star, agent-ownable at every tier. They are NOT registered here; this registry stays small and his. The justification chain runs ticket → arc-intent → north star, with P/Ds as the how (see `adr/ORG-034-two-layer-goal-architecture-intent-first-justification.md`).
+**Two goal layers (ORG-034, 2026-06-12).** This file holds **layer 1: north stars** — terminal, few, slow-moving, the operator's. **Layer 2: arc-intents** — what a given arc/ticket/dispatch is for, in outcome language — live on the work artifacts themselves (brief opening lines, ticket Asks, `serves:` fields), nested under a north star, agent-ownable at every tier. They are NOT registered here; this registry stays small and his. The justification chain runs ticket → arc-intent → north star, with P/Ds as the how (see `architecture/adr/ORG-034-two-layer-goal-architecture-intent-first-justification.md`).
 
 **Maintenance contract.** The operator owns the **North star** lines (content). HO owns structure, **Phase** lines, and **Deferred** lines, updated as state changes (no ratification needed — they're operational facts, P4-traceable to ledger/tickets). New entries are drafted by HO when unmapped work surfaces, marked DRAFT, and surface in the operator's next digest.
 
 ---
 
-## ⭐ THE GRAND PROJECT — this instance's ROOT north star
+## ⭐ THE GRAND PROJECT — a.k.a. SSEED — this instance's ROOT north star
 
 *Added 2026-08-02 per ratified ORG-053 §1 + its Consequences ("this instance's goals registry gains one Grand Project root entry after ratification"), T-2390. The text below is the operator's ratified wording from ORG-053, transcribed — not HO-authored.*
 
+- **Umbrella name — SSEED (Synthetic Self-Evolving Ecosystem Distribution).** Coined + ratified by the operator 2026-08-18 (TG 7964 → 7966 "pen it down yeah"). The written form is where the name mostly lives (docs, ADRs, ticket labels); spoken form is homophonous with lowercase "seed" (installer/checkout pattern, ORG-039, `pantheon-public seed`, T-2667 germination engine) — accepted trade. Case IS load-bearing: `SSEED` = the ORG-053 grand-project umbrella; `seed` (lowercase) stays the installer/checkout vocab.
 - **Root north star (ORG-053, ratified by the operator 2026-08-02, TG 665):**
   > Bootstrap a living digital companion and assistant: one coherent, per-user whole that remembers, learns, communicates, and acts through replaceable organs while preserving identity, trust, and human authority.
 - **What it is:** for the operator's instance, a **project-of-projects** and the architectural identity of the whole. **Developmental, not terminal** — a stage can complete, but the whole keeps growing, reorienting, maintaining itself, and deepening its relationship. It is a *relational* north star being attempted, not a completed claim.

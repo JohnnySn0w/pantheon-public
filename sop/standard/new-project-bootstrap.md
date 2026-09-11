@@ -8,6 +8,14 @@ At the **start of any new project intended to persist or ship** — a tool, a se
 
 Applies to personal projects (auto-karaoke, vibecamp-*) and Pantheon projects alike. The discipline is the same; only the remote/merge conventions differ per project.
 
+**Project formation precedes bootstrap** (per ORG-054, ratified 2026-08-24). A project's identity — `project_id`, telos, parent, lifecycle — is established BEFORE any repo work. Bootstrap does not create a project; it realizes an already-formed project as a fresh code artifact.
+
+Three cases + the routing this SOP owns:
+
+1. **New project + new dedicated repo** → THIS SOP. Bootstrap the repo + Tier-1 baseline as below.
+2. **New project embedded in an existing repo (no dedicated repo)** → SKIP THIS SOP. An "embedded project" (e.g. a script realized as a directory inside a shared repo, no independent build/release/support cadence, no distinct authority boundary) legitimately has no repo of its own. ORG-055's boundary tests explicitly do NOT force a repo per project. Consumers reach the code via the parent repo's remote; there's nothing for this SOP to bootstrap.
+3. **Existing code being carved into its own dedicated repo** → `sop/standard/repository-extraction.md`, NOT this SOP. Extraction is a distinct transaction with its own inventory, migration, and cut discipline.
+
 **Skip** for genuine one-shots: a throwaway diagnostic script, a one-render scratch job, anything that runs once and is discarded. If you find yourself running it a second time or handing it to someone, it has crossed into this SOP's scope — bootstrap it then.
 
 ## Procedure
@@ -32,10 +40,19 @@ Applies to personal projects (auto-karaoke, vibecamp-*) and Pantheon projects al
 
 ## Boundary
 
-This SOP covers *bootstrapping* — the one-time repo + Tier-1 baseline. It does NOT prescribe the project's ongoing test strategy, CI, or branch protection; those are per-project decisions made once the project has shape. It is a floor (no persisting project starts without a repo + a passing baseline), not a ceiling.
+This SOP covers *bootstrapping the one-time repo + Tier-1 baseline for a newly-formed project*. It does NOT:
+
+- **Form the project itself** — that's ORG-054 project identity, upstream of any repo work.
+- **Cover embedded projects** — projects that legitimately don't need their own repo (see When to use this §case 2).
+- **Cover extractions** — carving existing code into its own repo has its own SOP (`repository-extraction.md`).
+- **Prescribe the project's ongoing test strategy, CI, or branch protection** — those are per-project decisions made once the project has shape.
+
+It is a floor (no persisting project that gets a dedicated repo starts without a repo + a passing baseline), not a ceiling.
 
 ## Cross-references
 
+- `architecture/adr/ORG-054-project-lifecycle-and-purpose-chain.md` — project identity/formation authority upstream of this SOP.
+- `sop/standard/repository-extraction.md` — the SOP for carving existing code into its own dedicated repo (case 3 above).
 - `feedback_github_per_repo_deploy_keys` — Pantheon code-repo remote convention.
 - `sop/standard/plan-first-dispatch.md` — when the bootstrap is large enough to dispatch an implementer.
 - `feedback_project_digestion_loop_candidate_sop` (memory) — the infra→actualize→ticket-next-phase loop this bootstrap is the first beat of.

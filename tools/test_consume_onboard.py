@@ -60,7 +60,7 @@ def _manifest_dict(mailbox_hub: str, required_units: tuple[str, ...] = ()) -> di
                 "service_template": "tools/systemd/pantheon-persona-consume@.service",
                 "timer_template": "tools/systemd/pantheon-persona-consume@.timer",
             },
-            "policy": {"bundle": ["rulebook/", "sop/", "adr/"]},
+            "policy": {"bundle": ["rulebook/", "sop/", "architecture/adr/"]},
             "security": {
                 "credential_mode": "references-only",
                 "prohibit_auth_copy": True,

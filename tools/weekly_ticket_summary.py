@@ -264,6 +264,58 @@ def _adr_reeval_watch(week_activity: str, sunday: dt.date) -> str:
         return f"<!-- ADR re-eval watch unavailable: {exc} -->\n"
 
 
+def compute_scale_metrics(repo_root: Path = REPO_ROOT) -> str:
+    """Compute the fun cumulative 'Pantheon at scale' block (the operator req 2026-08-12).
+
+    Deterministic, exact numbers — NOT to be estimated by the LLM fulfiller; the
+    block is embedded in the prompt and reproduced verbatim. Best-effort like
+    `_adr_reeval_watch`: any failure degrades to an HTML comment so a git/FS hiccup
+    can never break the weekly report. Returns the markdown block, or a comment.
+    """
+    def _run(args: list[str]) -> str:
+        return subprocess.run(args, cwd=repo_root, capture_output=True, text=True,
+                              timeout=120, check=False).stdout
+
+    def _sh(cmd: str) -> str:
+        return subprocess.run(cmd, cwd=repo_root, shell=True, capture_output=True,
+                              text=True, timeout=180, check=False).stdout
+
+    try:
+        commits = int(_run(["git", "rev-list", "--count", "HEAD"]).strip() or 0)
+        tracked = len([ln for ln in _run(["git", "ls-files"]).splitlines() if ln])
+
+        tickets_root = repo_root / "tickets"
+        done = len(list((tickets_root / "done").glob("T-*.md")))
+        inbox = len(list((tickets_root / "inbox").glob("T-*.md")))
+        active = len(list((tickets_root / "active").glob("T-*.md")))
+        ids = [int(m.group(1)) for p in tickets_root.glob("*/T-*.md")
+               if (m := re.match(r"T-(\d+)", p.name))]
+        max_id = max(ids) if ids else (done + inbox + active)
+
+        # lines / words / bytes across ALL tracked files, then md + py splits.
+        lwc = _sh("git ls-files -z | xargs -0 cat 2>/dev/null | wc -lwc").split()
+        lines, words, byts = (int(lwc[0]), int(lwc[1]), int(lwc[2])) if len(lwc) == 3 else (0, 0, 0)
+        md_lwc = _sh("git ls-files -z '*.md' | xargs -0 cat 2>/dev/null | wc -lw").split()
+        md_lines, md_words = (int(md_lwc[0]), int(md_lwc[1])) if len(md_lwc) == 2 else (0, 0)
+        py_lines = int((_sh("git ls-files -z '*.py' | xargs -0 cat 2>/dev/null | wc -l").strip() or "0").split()[0] or 0)
+
+        if not (commits and lines):
+            return "<!-- scale metrics unavailable: empty git/fs read -->\n"
+
+        mb = byts / 1_000_000
+        novels = md_words / 90_000  # ~90k words = one full-length novel
+        return (
+            "### Pantheon at scale\n\n"
+            f"*Cumulative, `pantheon-config` only, as of {dt.datetime.now(dt.timezone.utc):%Y-%m-%d}:*\n\n"
+            f"- **{max_id:,}** tickets filed ({done:,} done, {inbox:,} queued, {active} active) · **{commits:,}** commits\n"
+            f"- **{lines:,}** lines · **{words:,}** words · ~**{mb:.0f} MB** of text across **{tracked:,}** tracked files\n"
+            f"- Prose vs code runs near-even: **{md_lines:,}** markdown lines ({md_words:,} words) to **{py_lines:,}** Python lines\n"
+            f"- That's ~**{novels:.0f}×** a full-length novel of prose — before a line of code\n"
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        return f"<!-- scale metrics unavailable: {exc} -->\n"
+
+
 def build_prompt(
     sop_text: str,
     exemplar_text: str,
@@ -273,6 +325,7 @@ def build_prompt(
     monday: dt.date,
     sunday: dt.date,
     ticket_count: int,
+    scale_metrics: str = "",
 ) -> str:
     return (
         "You are the weekly ticket-summary generator for Pantheon. "
@@ -285,6 +338,12 @@ def build_prompt(
         f"Week label: `{week_label_str}`\n"
         f"Date range: {monday.isoformat()} to {sunday.isoformat()}\n"
         f"Tickets resolved this week: {ticket_count}\n\n"
+        "==================== PRECOMPUTED SCALE METRICS (reproduce VERBATIM) ====================\n"
+        "the operator asked for these fun cumulative metrics in every weekly report (2026-08-12). "
+        "Place the block below at the END of the '## By the numbers' section, reproduced "
+        "EXACTLY as written — the numbers are precomputed and exact; do NOT recompute, round, "
+        "or reword them. If the block is empty or an HTML comment, omit the subsection.\n"
+        f"{scale_metrics}\n"
         "==================== SOP / AGENT BRIEF ====================\n"
         f"{sop_text}\n"
         "==================== APPROVED EXEMPLAR (reports/2026-W21.md) ====================\n"
@@ -352,7 +411,13 @@ def file_request(
         # run every week: prompt staged but the request ticket never filed.)
         "--title", f"Generate weekly ticket summary {label}",
         "--labels", "weekly-summary,in-session-gen",
+        "--project-id", "null",
+        "--nearest-intent-ref", "maintenance:ticket-summary",
         "--ask", ask,
+        # T-3328: connect via the goal/arc-intent edge rather than filing an
+        # orphan — the weekly summary generation request is infra maintenance.
+        "--serves", "the weekly ticket-summary generation request reaches "
+                    "session in-flow (no missed report)",
     ]
     result = subprocess.run(argv, capture_output=True, text=True, check=False)
     if result.returncode != 0:
@@ -553,6 +618,7 @@ def run(args: argparse.Namespace) -> int:
             monday=monday,
             sunday=sunday,
             ticket_count=len(tickets),
+            scale_metrics=compute_scale_metrics(),
         )
         print(prompt)
         return 0

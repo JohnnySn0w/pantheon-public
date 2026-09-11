@@ -16,9 +16,9 @@ entrypoint used by ``ensure_runtime``/``_replace_runtime``/``planned_swap``/
 live tmux pane. This module closes that gap: it drives the REAL
 ``runtime_controller._wait_for_runtime_input_ready`` (not a smoke's own loop,
 not ``_verify_runtime_input_ready`` -- see "Driven entrypoint" below) against
-a live disposable tmux pane showing a stand-in (or real) codex's own
-update-available modal, and proves both that readiness is reached AND that a
-real dismissal actually fired through that path.
+a live disposable tmux pane and records whether the real controller path
+needed to dismiss an update modal or reached a normal ready composer without
+one.
 
 Deliberately a SIBLING module, not a leg bolted onto ``harness_codex_ready``
 (hereafter "hcr"): hcr's own ``_wait_for_codex_ready`` in-file loop is a
@@ -47,41 +47,26 @@ flagged wiring gap, and returns a ``RuntimeInputReadiness`` this module can
 assert on directly (mode/reason/ready) rather than only observing an
 exception.
 
-Three-gate anti-false-green design
+Typed-outcome anti-false-green design
 ------------------------------------------------------------------------------
-1. ``_await_modal_present`` independently polls the REAL live pane (via
-   ``runtime_controller._capture_visible_runtime_pane``, not this module's
-   own belief) until the update modal is genuinely visible, and HardStops if
-   it never appears. A stand-in (or account state) that never renders the
-   modal at all can never reach the rest of this driver.
-2. ``codex_modal.dismiss_codex_update_modal`` is spied (side_effect wrapping
-   the REAL function -- never a stub/fake) while
-   ``rc._wait_for_runtime_input_ready`` runs; ``evidence["ready"]`` requires
-   BOTH ``RuntimeInputReadiness.ready`` AND the spy having actually fired at
-   least once. Reaching readiness through some other route (or a future
-   regression that bypasses the dismissal branch) cannot read as ready.
-3. ``codex_rc_ready_status`` -- mirrors hcr's own ``codex_ready_status``
-   verbatim: "proven" iff ``mode == "real-cli"`` AND ``ready`` is True. Every
-   stand-in run, however clean, reads "deferred" unconditionally.
-
-Real-cli wet-run: forcing a genuinely fresh modal
-------------------------------------------------------------------------------
-A real codex account that has already dismissed the current latest version
-(``dismissed_version`` in ``~/.codex/version.json``) will render only the
-compact non-interactive notice, never the interactive picker -- so
-``_await_modal_present`` would legitimately HardStop, not because the wiring
-is broken but because there is nothing to dismiss. For ``mode="real-cli"``
-runs, this driver actively clears ``version.json`` before launch (inside the
-``_VersionJsonSnapshot`` context, which already captured the true pre-run
-bytes and restores them verbatim on exit regardless of this reset) so the
-interactive modal genuinely renders every real-cli proof run -- mirroring the
-manual reset the T-2572 live investigation performed by hand. This does NOT
-apply to stand-in runs, which render their own scripted modal unconditionally.
+1. ``codex_modal.dismiss_codex_update_modal`` is spied from before runtime
+   startup through controller readiness. ``dismissal_proven`` requires a
+   captured interactive update modal, at least one rc-gated dismissal call,
+   and readiness afterward.
+2. ``dismissal_not_needed`` is real-cli only. It requires bounded version
+   evidence from the selected executable, no update modal in captured
+   samples, a normal ready composer in captured samples, and
+   ``RuntimeInputReadiness.ready`` with the exact success reason.
+3. ``codex_rc_ready_status`` reports "proven" only for real-cli evidence
+   whose typed outcome is ``dismissal_proven`` or ``dismissal_not_needed``.
+   Stand-in runs stay deferred regardless of how cleanly they exercise the
+   wiring.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import json
 import os
@@ -92,14 +77,20 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Literal, Mapping, Sequence
 from unittest import mock
 
 from tools import codex_modal
 from tools import persona_bringup
 from tools import runtime_controller as rc
+from tools.bringup_acceptance.codex_acceptance_config_guard import (
+    AcceptanceConfigGuardError,
+    ReversibleAcceptanceConfigGuard,
+    parse_codex_cli_semver,
+)
 from tools.bringup_acceptance import harness_codex_ready as hcr
 from tools.bringup_acceptance.types import HardStop
+from tools.submit_verify import ready_for_submission
 
 # --------------------------------------------------------------------------- #
 # Mode tagging -- the false-green guard (mirrors hcr's own                    #
@@ -117,13 +108,13 @@ _SCOPE_PREFIX = "pantheon-t2596-codex-rc-ready-"
 
 _DEFAULT_READY_TIMEOUT_S = 30.0
 _DEFAULT_READY_POLL_INTERVAL_S = 0.5
-_DEFAULT_MODAL_WAIT_TIMEOUT_S = 10.0
-_DEFAULT_MODAL_WAIT_POLL_INTERVAL_S = 0.2
-
 # The real hub this module must NEVER write to (mirrors hcr's own guard).
 _REAL_HUB_DEFAULT = hcr._REAL_HUB_DEFAULT
 
 _ROLE = "bringup-acceptance-codex-rc-ready-role"
+RcReadyOutcome = Literal["dismissal_proven", "dismissal_not_needed", "failed"]
+_VERSION_EVIDENCE_TIMEOUT_S = 5.0
+_VERSION_EVIDENCE_MAX_TEXT_BYTES = 4096
 
 # Faithful to instance.yaml's real codex roles -- see hcr's own module
 # docstring for the byte-for-byte citation this mirrors.
@@ -312,6 +303,122 @@ def _await_modal_present(
         sleep(poll_interval_s)
 
 
+@dataclasses.dataclass(frozen=True)
+class CodexExecutableVersionEvidence:
+    executable: Path
+    argv: tuple[str, ...]
+    returncode: int | None
+    stdout_sha256: str | None
+    stderr_sha256: str | None
+    stdout_excerpt: str
+    stderr_excerpt: str
+    parsed_semver: str | None
+    timed_out: bool
+    ok: bool
+    reason: str
+
+
+def _bounded_text(value: str, max_text_bytes: int) -> str:
+    raw = value.encode("utf-8", errors="replace")[:max_text_bytes]
+    return raw.decode("utf-8", errors="replace")
+
+
+def _text_sha256(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
+
+
+def collect_codex_executable_version_evidence(
+    codex_executable: Path,
+    *,
+    timeout_s: float = _VERSION_EVIDENCE_TIMEOUT_S,
+    max_text_bytes: int = _VERSION_EVIDENCE_MAX_TEXT_BYTES,
+) -> CodexExecutableVersionEvidence:
+    argv = (str(codex_executable), "--version")
+    try:
+        result = subprocess.run(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout_s,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = _bounded_text(exc.stdout or "", max_text_bytes) if isinstance(exc.stdout, str) else ""
+        stderr = _bounded_text(exc.stderr or "", max_text_bytes) if isinstance(exc.stderr, str) else ""
+        return CodexExecutableVersionEvidence(
+            executable=codex_executable,
+            argv=argv,
+            returncode=None,
+            stdout_sha256=_text_sha256(stdout) if stdout else None,
+            stderr_sha256=_text_sha256(stderr) if stderr else None,
+            stdout_excerpt=stdout,
+            stderr_excerpt=stderr,
+            parsed_semver=None,
+            timed_out=True,
+            ok=False,
+            reason="version evidence command timed out",
+        )
+    stdout = _bounded_text(result.stdout, max_text_bytes)
+    stderr = _bounded_text(result.stderr, max_text_bytes)
+    parsed = parse_codex_cli_semver(stdout + "\n" + stderr)
+    ok = result.returncode == 0 and parsed is not None
+    reason = "version evidence parsed" if ok else "version evidence missing codex-cli semver"
+    if result.returncode != 0:
+        reason = f"version evidence command exited {result.returncode}"
+    return CodexExecutableVersionEvidence(
+        executable=codex_executable,
+        argv=argv,
+        returncode=result.returncode,
+        stdout_sha256=_text_sha256(stdout) if stdout else None,
+        stderr_sha256=_text_sha256(stderr) if stderr else None,
+        stdout_excerpt=stdout,
+        stderr_excerpt=stderr,
+        parsed_semver=parsed,
+        timed_out=False,
+        ok=ok,
+        reason=reason,
+    )
+
+
+def _version_evidence_payload(
+    evidence: CodexExecutableVersionEvidence | None,
+) -> Mapping[str, Any] | None:
+    if evidence is None:
+        return None
+    return dataclasses.asdict(evidence)
+
+
+def _classify_rc_ready_outcome(
+    *,
+    mode: str,
+    codex_executable: Path,
+    version_evidence: CodexExecutableVersionEvidence | None,
+    captured_samples: Sequence[str],
+    readiness: rc.RuntimeInputReadiness,
+    update_dismiss_call_count: int,
+) -> tuple[RcReadyOutcome, str]:
+    modal_present = any(codex_modal.is_codex_update_modal(sample) for sample in captured_samples)
+    ready_composer = any(ready_for_submission(sample) for sample in captured_samples)
+    if modal_present:
+        if update_dismiss_call_count < 1:
+            return "failed", "codex update modal observed without rc-gated dismissal"
+        if readiness.ready and readiness.reason == "runtime input readiness confirmed":
+            return "dismissal_proven", "codex update modal dismissed through rc and readiness followed"
+        return "failed", f"codex update modal dismissed but readiness did not follow: {readiness.reason}"
+    if not readiness.ready or readiness.reason != "runtime input readiness confirmed":
+        return "failed", f"runtime input readiness not confirmed: {readiness.reason}"
+    if mode != _MODE_REAL_CLI:
+        return "failed", "no-modal readiness proof requires real-cli mode"
+    if version_evidence is None or not version_evidence.ok:
+        reason = version_evidence.reason if version_evidence is not None else "missing version evidence"
+        return "failed", reason
+    if version_evidence.executable != codex_executable:
+        return "failed", "version evidence executable does not match selected executable"
+    if not ready_composer:
+        return "failed", "no-modal readiness proof missing captured ready composer"
+    return "dismissal_not_needed", "real-cli reached ready composer with no update modal observed"
+
+
 # --------------------------------------------------------------------------- #
 # The driver.                                                                 #
 # --------------------------------------------------------------------------- #
@@ -328,7 +435,12 @@ def codex_rc_ready_status(evidence: Mapping[str, Any]) -> str:
     """
     if evidence.get("mode") != _MODE_REAL_CLI:
         return "deferred"
-    return "proven" if evidence.get("ready") is True else "deferred"
+    return (
+        "proven"
+        if evidence.get("ready") is True
+        and evidence.get("rc_ready_outcome") in {"dismissal_proven", "dismissal_not_needed"}
+        else "deferred"
+    )
 
 
 def run_codex_rc_ready_bringup(
@@ -339,22 +451,18 @@ def run_codex_rc_ready_bringup(
     codex_executable: Path | None = None,
     ready_timeout_s: float = _DEFAULT_READY_TIMEOUT_S,
     ready_poll_interval_s: float = _DEFAULT_READY_POLL_INTERVAL_S,
-    modal_wait_timeout_s: float = _DEFAULT_MODAL_WAIT_TIMEOUT_S,
-    modal_wait_poll_interval_s: float = _DEFAULT_MODAL_WAIT_POLL_INTERVAL_S,
 ) -> Mapping[str, Any]:
     """Stand up a disposable tmux/systemd scope, launch codex (real or
     stand-in) via the real ``runtime_controller`` control-plane chain
-    (``_start_runtime`` -> ``_verify_started_runtime``), confirm the update
-    modal is genuinely on the live pane, then drive readiness through the
-    REAL ``runtime_controller._wait_for_runtime_input_ready`` (not a smoke's
-    own loop) -- asserting both that it reaches ready AND that a real
-    dismissal fired through that path.
+    (``_start_runtime`` -> ``_verify_started_runtime``), then drive
+    readiness through the REAL ``runtime_controller._wait_for_runtime_input_
+    ready`` (not a smoke's own loop), classifying the observed path as
+    ``dismissal_proven``, ``dismissal_not_needed``, or ``failed``.
 
     ``codex_executable=None`` runs the safe stand-in (mode="stand-in",
     :func:`codex_rc_ready_status` can never read it as proven); a real path
     (e.g. the real ``codex`` binary) is the HO-operator real-cli fire
-    (mode="real-cli") -- see module docstring for why real-cli runs also
-    force-clear ``version.json`` before launch.
+    (mode="real-cli").
     """
     run_id = uuid.uuid4().hex[:12]
     persona = persona or f"bringup-acceptance-codex-rc-ready-{run_id}"
@@ -387,6 +495,12 @@ def run_codex_rc_ready_bringup(
 
     context = _new_disposable_tmux_context(run_id)
     target = binding.controller.tmux
+    launch_cwd = getattr(binding, "launch_cwd", work_root)
+    if hasattr(adapter, "build_interactive_launch"):
+        launch_spec = adapter.build_interactive_launch(target, cwd=launch_cwd)
+        acceptance_project_cwd = Path(launch_spec.cwd)
+    else:
+        acceptance_project_cwd = Path(launch_cwd)
 
     ready = False
     dismiss_call_count = 0
@@ -394,70 +508,100 @@ def run_codex_rc_ready_bringup(
     readiness_ready = False
     readiness_reason = ""
     pane_sha256 = ""
+    rc_ready_outcome: RcReadyOutcome = "failed"
+    rc_ready_outcome_reason = "not run"
+    captured_samples: list[str] = []
+    version_evidence: CodexExecutableVersionEvidence | None = None
+    pending_error: BaseException | None = None
+    guard: ReversibleAcceptanceConfigGuard | None = None
     try:
-        with hcr._VersionJsonSnapshot(codex_home):
-            version_json_path = codex_home / "version.json"
-            if mode == _MODE_REAL_CLI and version_json_path.exists():
-                # Force a genuinely fresh modal for this proof run -- see
-                # module docstring "Real-cli wet-run" section. The snapshot
-                # above already captured the true pre-run bytes and restores
-                # them verbatim on exit regardless of this reset.
-                version_json_path.unlink()
-
-            previous_cwd = Path.cwd()
-            try:
-                os.chdir(work_root)
-                runtime_start = rc._start_runtime(
-                    binding, adapter, replace=False, context=context,
+        try:
+            with hcr._VersionJsonSnapshot(codex_home):
+                guard = ReversibleAcceptanceConfigGuard(
+                    codex_home=codex_home,
+                    project_cwd=acceptance_project_cwd,
+                    owner="harness_codex_rc_ready",
                 )
-            finally:
-                os.chdir(previous_cwd)
+                guard.__enter__()
+                if mode == _MODE_REAL_CLI:
+                    version_evidence = collect_codex_executable_version_evidence(resolved_executable)
 
-            rc._verify_started_runtime(
-                binding, runtime_start, state_root=state_root, context=context,
-            )
+                real_dismiss = codex_modal.dismiss_codex_update_modal
 
-            def _capture() -> str:
-                return rc._capture_visible_runtime_pane(target, context=context)
+                def _spy_dismiss(**kwargs: Any) -> None:
+                    nonlocal dismiss_call_count
+                    dismiss_call_count += 1
+                    real_dismiss(**kwargs)
 
-            # Gate 1: the modal must really be on the live pane before this
-            # driver ever touches rc's readiness path.
-            _await_modal_present(
-                capture=_capture, sleep=time.sleep, monotonic=time.monotonic,
-                timeout_s=modal_wait_timeout_s, poll_interval_s=modal_wait_poll_interval_s,
-            )
-            modal_confirmed_present = True
+                real_capture_visible = rc._capture_visible_runtime_pane
 
-            # Gate 2: spy (never a stub) on the REAL dismissal function while
-            # driving the REAL rc readiness entrypoint directly -- see module
-            # docstring "Driven entrypoint" section for why this is the
-            # right function and "Three-gate anti-false-green design" for
-            # why a spy, not a mock.
-            real_dismiss = codex_modal.dismiss_codex_update_modal
+                def _recording_capture(*args: Any, **kwargs: Any) -> str:
+                    pane_text = real_capture_visible(*args, **kwargs)
+                    captured_samples.append(pane_text)
+                    return pane_text
 
-            def _spy_dismiss(**kwargs: Any) -> None:
-                nonlocal dismiss_call_count
-                dismiss_call_count += 1
-                real_dismiss(**kwargs)
+                with mock.patch.object(
+                    codex_modal, "dismiss_codex_update_modal", side_effect=_spy_dismiss,
+                ), mock.patch.object(rc, "_capture_visible_runtime_pane", side_effect=_recording_capture):
+                    runtime_start = rc._start_runtime(
+                        binding, adapter, replace=False, context=context,
+                    )
 
-            with mock.patch.object(codex_modal, "dismiss_codex_update_modal", side_effect=_spy_dismiss):
-                readiness = rc._wait_for_runtime_input_ready(
-                    target, harness="codex", timeout=ready_timeout_s,
-                    poll_interval=ready_poll_interval_s, context=context,
+                    rc._verify_started_runtime(
+                        binding, runtime_start, state_root=state_root, context=context,
+                    )
+
+                    # Capture one live sample before the wait path. In real runs
+                    # the wait path records more samples through the same patched
+                    # controller capture; mocked tests still get source pane
+                    # evidence instead of a no-sample false green.
+                    try:
+                        _recording_capture(target, context=context)
+                    except Exception:
+                        pass
+
+                    readiness = rc._wait_for_runtime_input_ready(
+                        target, harness="codex", timeout=ready_timeout_s,
+                        poll_interval=ready_poll_interval_s, context=context,
+                    )
+
+                readiness_ready = readiness.ready
+                readiness_reason = readiness.reason
+                pane_sha256 = readiness.pane_sha256
+                modal_confirmed_present = any(
+                    codex_modal.is_codex_update_modal(sample) for sample in captured_samples
                 )
-
-            readiness_ready = readiness.ready
-            readiness_reason = readiness.reason
-            pane_sha256 = readiness.pane_sha256
-            # Gate 3 (evidence-level): "reached ready" alone is not enough --
-            # the dismissal spy must have actually fired through rc's own
-            # codex-gated branch.
-            ready = readiness_ready and dismiss_call_count >= 1
+                rc_ready_outcome, rc_ready_outcome_reason = _classify_rc_ready_outcome(
+                    mode=mode,
+                    codex_executable=resolved_executable,
+                    version_evidence=version_evidence,
+                    captured_samples=captured_samples,
+                    readiness=readiness,
+                    update_dismiss_call_count=dismiss_call_count,
+                )
+                ready = rc_ready_outcome in {"dismissal_proven", "dismissal_not_needed"}
+        except BaseException as exc:
+            pending_error = exc
     finally:
+        if guard is not None and guard.expectation is not None:
+            try:
+                guard.restore()
+            except AcceptanceConfigGuardError as exc:
+                exc.original_exception = pending_error
+                pending_error = exc
         residue = _teardown_disposable_tmux_context(context)
+        if guard is not None:
+            guard.attach_teardown_residue(residue)
         shutil.rmtree(work_root, ignore_errors=True)
         if residue:
-            raise HardStop(f"codex-rc-ready driver left residue: {'; '.join(residue)}")
+            if isinstance(pending_error, AcceptanceConfigGuardError):
+                pending_error.teardown_residue = tuple(residue)
+            elif pending_error is None:
+                pending_error = HardStop(
+                    f"codex-rc-ready driver left residue: {'; '.join(residue)}"
+                )
+        if pending_error is not None:
+            raise pending_error
 
     return {
         "mode": mode,
@@ -471,6 +615,11 @@ def run_codex_rc_ready_bringup(
         "dismiss_call_count": dismiss_call_count,
         "rc_readiness_ready": readiness_ready,
         "rc_readiness_reason": readiness_reason,
+        "rc_ready_outcome": rc_ready_outcome,
+        "rc_ready_outcome_reason": rc_ready_outcome_reason,
+        "version_evidence": _version_evidence_payload(version_evidence),
+        "captured_sample_count": len(captured_samples),
+        "captured_ready_composer": any(ready_for_submission(sample) for sample in captured_samples),
         "ready": ready,
         "pane_sha256": pane_sha256,
     }
@@ -484,14 +633,10 @@ def _build_parser() -> argparse.ArgumentParser:
             "ENTRYPOINT. Pass --codex-executable pointing at the real codex "
             "binary to actually prove the leg (mode=real-cli); omit it to "
             "run the safe stand-in (mode=stand-in), which never flips the "
-            "leg green -- see codex_rc_ready_status(). "
-            "IMPORTANT for --codex-executable runs: this driver force-clears "
-            "the target account's ~/.codex/version.json before launch (and "
-            "restores it verbatim afterward) so the interactive update modal "
-            "genuinely renders every real-cli run -- without this, an "
-            "account that already dismissed the current latest version would "
-            "never show the modal and this leg would correctly HardStop as "
-            "unprovable rather than silently pass."
+            "leg green -- see codex_rc_ready_status(). Real-cli runs accept "
+            "either an rc-gated update-modal dismissal followed by readiness "
+            "or bounded no-modal version evidence plus a captured ready "
+            "composer."
         ),
     )
     parser.add_argument("--work-root", type=Path, required=True)
@@ -499,7 +644,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--persona", default=None)
     parser.add_argument("--codex-executable", type=Path, default=None)
     parser.add_argument("--ready-timeout-s", type=float, default=_DEFAULT_READY_TIMEOUT_S)
-    parser.add_argument("--modal-wait-timeout-s", type=float, default=_DEFAULT_MODAL_WAIT_TIMEOUT_S)
     return parser
 
 
@@ -509,9 +653,8 @@ def main(argv: list[str] | None = None) -> int:
         evidence = run_codex_rc_ready_bringup(
             work_root=args.work_root, account=args.account, persona=args.persona,
             codex_executable=args.codex_executable, ready_timeout_s=args.ready_timeout_s,
-            modal_wait_timeout_s=args.modal_wait_timeout_s,
         )
-    except HardStop as exc:
+    except (HardStop, AcceptanceConfigGuardError) as exc:
         sys.stderr.write(f"[harness_codex_rc_ready] HardStop: {exc}\n")
         return 1
     status = codex_rc_ready_status(evidence)

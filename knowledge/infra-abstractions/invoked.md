@@ -31,8 +31,8 @@ Scheduled + Hooked + Reactive — and never these.
 - **Stale-flock wedge:** repeating `lock … held by another instance` = a wedged child holds the flock; `lsof` → SIGKILL holder+child → rm lockfile → re-fire (memory `reference_stale_flock_restart_pipeline`). **Self-restart** leaves the fresh session silent unless the kick comes from a detached transient unit — use `tools/self_restart.sh` / `tools/recovery_self_restart.sh` (SOP `agent-self-restart-with-kick.md`).
 
 ### veneration — resurrect-a-dead-agent harness
-- `tools/veneration.py` (T-0766); HANDOFF archive in `tools/graveyard.py`.
-- The heavyweight stand-a-fresh-daemon-back-up harness: session selection from the durable HANDOFF graveyard → fresh daemon. CODE substrate complete + tested (88 tests, 2026-06-07); the **supervised live stand-up is the remaining step — do NOT rebuild** (memory `project_veneration_build_state`). Lends its group name to the ORG-026 hub.
+- `tools/veneration.py` (T-0766); HANDOFF archive in `tools/chronicle.py`.
+- The heavyweight stand-a-fresh-daemon-back-up harness: session selection from the durable HANDOFF Chronicle → fresh daemon. CODE substrate complete + tested (88 tests, 2026-06-07); the **supervised live stand-up is the remaining step — do NOT rebuild** (memory `project_veneration_build_state`). Lends its group name to the ORG-026 hub.
 
 ## Subtype: One-off — migrations kept for repeatability
 

@@ -345,6 +345,96 @@ class RunWalk(unittest.TestCase):
             filer.assert_not_called()
             self.assertTrue(res.filed and res.filed[0].startswith("(dry-run)"))
 
+    def test_owned_adapter_noops_when_index_pair_is_incomplete(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            adrs = root / "adr"; adrs.mkdir()
+            tickets = root / "tickets"
+            for sub in ("inbox", "active", "done"):
+                (tickets / sub).mkdir(parents=True)
+            (tickets / "grand-project-stage-evidence.yaml").write_text(
+                "schema_version: 1\nstages: []\n"
+            )
+            with mock.patch.object(W, "file_owned_review_ticket") as filer:
+                result = W.run_walk(now=dt.date(2026, 8, 25), adr_dir=adrs, tickets_root=tickets)
+            filer.assert_not_called()
+            self.assertEqual(result.owned_status, "incomplete")
+            self.assertEqual(result.owned_filed, ())
+
+    def test_real_owned_indexes_load_surface_51_and_file_nothing_without_new_evidence(self):
+        root = Path(__file__).resolve().parent.parent
+        with TemporaryDirectory() as td:
+            tickets = Path(td) / "tickets"
+            for sub in ("inbox", "active", "done"):
+                (tickets / sub).mkdir(parents=True)
+            with mock.patch.object(W, "file_owned_review_ticket") as filer:
+                result = W.run_walk(
+                    now=dt.date(2026, 8, 25),
+                    adr_dir=root / "architecture" / "adr",
+                    tickets_root=tickets,
+                    stage_index=root / "tickets" / "grand-project-stage-evidence.yaml",
+                    obligation_index=root / "tickets" / "grand-project-reevaluation-obligations.yaml",
+                )
+            filer.assert_not_called()
+            self.assertEqual(result.owned_status, "loaded")
+            self.assertEqual(result.owned_due, ())
+            self.assertEqual(result.owned_filed, ())
+            owned_section = result.watch_section.split(
+                "## Grand Project owned re-evaluation watch", 1
+            )[1]
+            self.assertEqual(owned_section.count("| ORG-0"), 51)
+
+    def test_clean_owned_pair_suppresses_same_id_from_legacy_autofile_lane(self):
+        with TemporaryDirectory() as td:
+            root = Path(td)
+            adrs = root / "adr"; adrs.mkdir()
+            _write(adrs, "ORG-053-owned.md", """\
+                ---
+                id: ORG-053
+                re_evaluate:
+                  - {id: R1, type: calendar, when: "2026-01-01", fires: auto-ticket}
+                ---
+                """)
+            tickets = root / "tickets"
+            for sub in ("inbox", "active", "done"):
+                (tickets / sub).mkdir(parents=True)
+            stage_path = tickets / "grand-project-stage-evidence.yaml"
+            obligation_path = tickets / "grand-project-reevaluation-obligations.yaml"
+            stage_path.write_text("paired")
+            obligation_path.write_text("paired")
+            obligation = W.grand_program.ReevaluationObligation(
+                obligation_id="ORG-053:R1",
+                source_ref="adr:ORG-053#R1",
+                source_text_sha256="sha256:" + "0" * 64,
+                owner_ref="role:steward",
+                review_target="orchestrator",
+                trigger_kind="calendar",
+                operational_predicate="next_check",
+                observable_source="observable:test",
+                state="armed",
+                armed_ticket=None,
+                last_evaluated=None,
+                next_check="2026-01-01T00:00:00Z",
+                evidence_refs=(),
+                outcome_ref=None,
+            )
+            report = W.grand_program.EvaluationReport((), (), (), (), ())
+            with (
+                mock.patch.object(W.grand_program, "load_stage_index", return_value=()),
+                mock.patch.object(W.grand_program, "load_obligation_index", return_value=(obligation,)),
+                mock.patch.object(W.grand_program, "scan_source_obligations", return_value=()),
+                mock.patch.object(W.grand_program, "lint_obligation_completeness", return_value=()),
+                mock.patch.object(W.grand_program, "lint_stage_evidence", return_value=()),
+                mock.patch.object(W.grand_program, "evaluate_indexes", return_value=report),
+                mock.patch.object(W, "file_reeval_ticket") as legacy_filer,
+            ):
+                result = W.run_walk(
+                    now=dt.date(2026, 8, 25), adr_dir=adrs, tickets_root=tickets,
+                    stage_index=stage_path, obligation_index=obligation_path,
+                )
+            legacy_filer.assert_not_called()
+            self.assertEqual(result.fired, [])
+
 
 class WatchSection(unittest.TestCase):
     def _t(self, tid, when):

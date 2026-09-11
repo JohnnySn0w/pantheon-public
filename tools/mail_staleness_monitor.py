@@ -874,16 +874,36 @@ def _inbox_seat_is_paused(inbox: str) -> bool:
 # typo/rename fails a test instead of silently disabling attribution.
 ON_DEMAND_PERSONAS: frozenset[str] = frozenset({"atlas", "metis", "mnemosyne"})
 
+# T-3454: park-suppression CEILING. An on-demand seat legitimately sits idle-with-
+# unread between dispatches, so we suppress — but NOT indefinitely. An up-but-idle
+# seat whose WAKE is broken (mail arrives, nothing wakes it to consume) is
+# INDISTINGUISHABLE from a legit park by the pane alone — that is exactly how the
+# metis/atlas 6-week rot (T-3427) slipped past this monitor: their wake timers were
+# never enabled, they sat idle-at-prompt, and park-suppression hid the aging queue.
+# So past this ceiling the "parked by design" attribution no longer holds and the
+# alert proceeds regardless of pane. Deliberately GENEROUS (48h): far beyond any
+# legit dispatch gap, ~20x under the rot that motivated it, and a rare false-positive
+# is only a read-only Recovery alert. Safe-direction: this can only REDUCE suppression,
+# never add a false-negative (the dangerous direction that caused the rot).
+ON_DEMAND_PARK_CEILING_SEC: float = float(
+    os.environ.get("PANTHEON_MAIL_STALENESS_PARK_CEILING_SEC", str(48 * 3600)))
 
-def _inbox_seat_is_on_demand_parked(inbox: str, pane_idle: bool | None) -> bool:
+
+def _inbox_seat_is_on_demand_parked(inbox: str, pane_idle: bool | None,
+                                    oldest_age_s: float | None = None) -> bool:
     """Is this inbox a declared on-demand-persona seat, observed idle-at-prompt
 
-    right now? T-2665.
+    right now, AND not stale past the park ceiling? T-2665 + T-3454.
 
     Returns True (parked-by-design, safe to attribute/suppress the undrained-queue
-    alert) ONLY when BOTH:
+    alert) ONLY when ALL of:
       (a) `inbox` is on the declared ON_DEMAND_PERSONAS allowlist above, AND
-      (b) `pane_idle` is affirmatively True (idle-at-prompt, not mid-turn).
+      (b) `pane_idle` is affirmatively True (idle-at-prompt, not mid-turn), AND
+      (c) `oldest_age_s` is below ON_DEMAND_PARK_CEILING_SEC (T-3454) — an idle seat
+          whose mail has aged past the ceiling is more likely a broken wake than a
+          legit park (the T-3427 rot signature), so suppression lifts. `None` age
+          (not supplied) does not trip the ceiling — callers without an age get the
+          pre-T-3454 behavior.
 
     CALLER CONTRACT — the load-bearing part: `pane_idle` MUST be the RAW
     three-state value, i.e. `obs[inbox].pane_idle` as built by `observe()` (or an
@@ -918,7 +938,13 @@ def _inbox_seat_is_on_demand_parked(inbox: str, pane_idle: bool | None) -> bool:
     more than a static `in`.
     """
     try:
-        return inbox in ON_DEMAND_PERSONAS and pane_idle is True
+        if inbox not in ON_DEMAND_PERSONAS or pane_idle is not True:
+            return False
+        # T-3454: past the ceiling, a "parked" idle seat is more likely a broken
+        # wake than a legit park — stop suppressing so the aging queue surfaces.
+        if oldest_age_s is not None and oldest_age_s >= ON_DEMAND_PARK_CEILING_SEC:
+            return False
+        return True
     except Exception:
         return False
 
@@ -1150,7 +1176,8 @@ def deliver(alerts, obs: dict | None = None, dry_run: bool = False,
         # to main's obs) — feeding a coarse_view-coerced value here would wrongly
         # suppress an absent-pane seat from silence alone.
         _o = obs.get(a.inbox) if obs else None
-        if _inbox_seat_is_on_demand_parked(a.inbox, _o.pane_idle if _o else None):
+        if _inbox_seat_is_on_demand_parked(a.inbox, _o.pane_idle if _o else None,
+                                           _o.oldest_unread_age_s if _o else None):
             print(f"[mail_staleness_monitor] {a.inbox}: on-demand persona seat "
                   f"idle-at-prompt (parked by design, T-2665) — not alerting: "
                   f"{a.text[:70]}")

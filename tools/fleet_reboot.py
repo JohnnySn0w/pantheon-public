@@ -2,7 +2,7 @@
 """tools/fleet_reboot.py — Recovery-driven coordinated fleet reboot orchestration (T-1049).
 
 The operator's protocol (Telegram 3055): "Recovery drives; agents are told to finish up +
-record info + write a graveyard entry + pause until reboot," then the machine
+record info + write a chronicle entry + pause until reboot," then the machine
 reboots. The checks bracket it and are ADVISORY, not hard gates (Telegram 3063):
 reboot_safety.py before (is everyone's work committed/pushed?) and fleet_health.py
 after (did everyone come back?).
@@ -10,10 +10,10 @@ after (did everyone come back?).
 This maps onto the EXISTING per-agent mechanism rather than reinventing it:
   * Per claude agent (orchestrator/specialist/recovery): `handoff_and_restart.sh --no-restart`
     (T-1049 pause mode) — prompt the agent to finish + write its HANDOFF, wait for
-    the mtime ack, archive it to the graveyard, then STOP (no restart). The
+    the mtime ack, archive it to the Chronicle, then STOP (no restart). The
     machine reboot is what cycles it; the agent's SessionStart hook resumes it
     from its handoff on the next boot.
-  * codex: a different harness with no claude HANDOFF/graveyard flow. Its quiesce
+  * codex: a different harness with no claude HANDOFF/chronicle flow. Its quiesce
     is "repo-clean + boot recovery": reboot_safety covers its repos, and
     codex-daemon.service comes back on boot (userns persistence fixed in T-1051).
     We optionally stop its services for a clean shutdown.
@@ -21,7 +21,7 @@ This maps onto the EXISTING per-agent mechanism rather than reinventing it:
 DRIVER SPECIAL-CASE: Recovery runs this script, so Recovery cannot prompt-itself-to-stop
 mid-orchestration (the prompt would land in the very pane executing this). Recovery is
 therefore quiesced LAST and DIFFERENTLY: the orchestrator archives Recovery's existing
-HANDOFF.md to the graveyard directly, then triggers the reboot (which terminates
+HANDOFF.md to the Chronicle directly, then triggers the reboot (which terminates
 Recovery). Refresh Recovery's HANDOFF.md before invoking with --execute.
 
 SAFETY: dry-run by DEFAULT. Nothing is quiesced and nothing reboots unless
@@ -71,7 +71,7 @@ _HANDOFF_SCRIPT = os.path.join(_TOOLS_DIR, "handoff_and_restart.sh")
 #   strategy "handoff_pause": cross-account `handoff_and_restart.sh --no-restart`.
 #   strategy "repo_clean":    no handoff flow; rely on reboot_safety + boot restart
 #                             (optionally stop services for a clean shutdown).
-#   strategy "driver":        recovery — graveyard its existing HANDOFF directly here,
+#   strategy "driver":        recovery — chronicle its existing HANDOFF directly here,
 #                             then this process triggers the reboot.
 
 DRIVER = "recovery"
@@ -162,21 +162,21 @@ def quiesce_repo_clean(agent: str, cfg: dict, *, run=_run, dry_run: bool,
     return {"agent": agent, "status": WARN if not dry_run else OK, "action": "; ".join(actions)}
 
 
-def quiesce_driver(agent: str, cfg: dict, *, graveyard_archive, dry_run: bool) -> dict:
-    """Recovery (driver): archive its existing HANDOFF.md to the graveyard directly
+def quiesce_driver(agent: str, cfg: dict, *, chronicle_archive, dry_run: bool) -> dict:
+    """Recovery (driver): archive its existing HANDOFF.md to the Chronicle directly
     (it cannot prompt-itself-to-stop mid-run). The reboot itself terminates Recovery;
     its SessionStart hook resumes from the handoff on the next boot."""
     if dry_run:
         return {"agent": agent, "status": OK,
-                "action": f"DRY-RUN would graveyard-archive {cfg['handoff_file']} then reboot"}
-    ok, detail = graveyard_archive(cfg["handoff_file"])
+                "action": f"DRY-RUN would chronicle-archive {cfg['handoff_file']} then reboot"}
+    ok, detail = chronicle_archive(cfg["handoff_file"])
     return {"agent": agent, "status": OK if ok else WARN,
-            "action": f"graveyard archive {cfg['handoff_file']}: {detail}"}
+            "action": f"chronicle archive {cfg['handoff_file']}: {detail}"}
 
 
-def graveyard_archive_handoff(handoff_file: str, *, run=_run) -> tuple[bool, str]:
-    """Best-effort graveyard archive of a handoff (Recovery's own clone). Non-fatal."""
-    script = os.path.join(_TOOLS_DIR, "graveyard.py")
+def chronicle_archive_handoff(handoff_file: str, *, run=_run) -> tuple[bool, str]:
+    """Best-effort Chronicle archive of a handoff (Recovery's own clone). Non-fatal."""
+    script = os.path.join(_TOOLS_DIR, "chronicle.py")
     home = os.path.expanduser("~")
     argv = [
         "python3", script, "archive",
@@ -225,7 +225,7 @@ def orchestrate(*, execute: bool, strict: bool, skip_reboot: bool,
                 quiesce_handoff=quiesce_handoff_pause,
                 quiesce_repo=quiesce_repo_clean,
                 quiesce_drv=quiesce_driver,
-                graveyard_archive=graveyard_archive_handoff,
+                chronicle_archive=chronicle_archive_handoff,
                 reboot=trigger_reboot,
                 log=print) -> dict:
     """Run the full sequence. Returns a structured report; the CLI maps it to an
@@ -259,7 +259,7 @@ def orchestrate(*, execute: bool, strict: bool, skip_reboot: bool,
         elif strat == "repo_clean":
             res = quiesce_repo(agent, cfg, dry_run=dry_run, stop_services=stop_codex_services)
         elif strat == "driver":
-            res = quiesce_drv(agent, cfg, graveyard_archive=graveyard_archive, dry_run=dry_run)
+            res = quiesce_drv(agent, cfg, chronicle_archive=chronicle_archive, dry_run=dry_run)
         else:
             res = {"agent": agent, "status": FAIL, "detail": f"unknown strategy {strat!r}"}
         report["quiesce"].append(res)

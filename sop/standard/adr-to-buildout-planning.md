@@ -21,6 +21,20 @@ ORG-064 (General Scheduler) got its substrate settled in conversation and was br
 
 Each step names the action, the verification that it took, and the escalation if it can't.
 
+### 0. Altitude gate — an ADR ratifies the decision, not the build spec
+
+An ADR ratifies a **decision**: the durable architectural commitment and its rationale. It must not carry builder-grade detail (parameter tables, numeric values, state-machine mechanics, enumerated invariants that are implementation rather than decision). When drafting surfaces such detail, RELOCATE it rather than delete it:
+
+- **Detailed reasoning / mechanism analysis → a referenced NOTE doc**, linked from the ADR (`notes/` is the working-tier home per ORG-015). The thinking is preserved and navigable from the decision without bloating the ratifiable body.
+- **Build values tuned at first-fire** (timeouts, budgets, cooldowns, SLO/RTO numbers) **→ the build ticket** (steps 2 + 4 below), where they are consumed.
+
+The gate fires at DRAFTING, so builder detail never reaches the operator's ratification queue — his ratification is of decisions only. The failure this closes is over-specification ahead of felt pain (a builder-grade spec for a surface stages away from build); it is the same appetite/altitude judgment as [[ORG-089]] / `shaping-and-viability.md`, applied to the ADR document boundary. Companion: `sop/standard/ratifiable-adr-shape.md` covers the paired clutter rule (review-cycle content out of the ratifiable copy) as a single discovery surface.
+
+Motivating exhibit: the ORG-047 passport cluster (ORG-069–072), where ORG-071's build-time parameter table (the operator RATIFY-WITH-TRIM TG 1784) and ORG-072's A-item mechanics (the operator RATIFY-WITH-RELOCATION TG 1786-1791) were relocated at ratification. Directed by the operator TG 1789 (2026-09-06).
+
+Verification: the ratifiable ADR body reads as decisions + intent only; every mechanism-tier claim has a build-ticket link or a referenced-note link.
+Escalation: if a mechanism-tier claim IS load-bearing for the decision itself (rare), keep it inline and NAME it explicitly as decision-load-bearing so a future reviewer knows not to relocate it.
+
 ### 1. Declare the ADR's build disposition in frontmatter
 
 Every ADR frontmatter carries `build_disposition: needs-build | no-build-needed | built`.
@@ -29,7 +43,7 @@ Every ADR frontmatter carries `build_disposition: needs-build | no-build-needed 
 
 **Prevent-at-creation:** a landing ADR is rejected by `.github/workflows/adr-scoping-lint.yml` (`tools/adr_scoping_lint.py`) unless its frontmatter carries EITHER `build_disposition: no-build-needed`/`built`, OR a `scoping_ticket: T-NNNN`. A `needs-build` ADR must therefore point at a scoping ticket at landing time — it may not silently skip the question.
 
-*Verify:* `python3 tools/adr_scoping_lint.py adr/ORG-NNN-*.md` passes (or the ADR-scoping-lint Action is green on the PR).
+*Verify:* `python3 tools/adr_scoping_lint.py architecture/adr/ORG-NNN-*.md` passes (or the ADR-scoping-lint Action is green on the PR).
 
 ### 2. Stand up the scoping ticket (the planning node)
 
@@ -60,7 +74,7 @@ Sequence dependent layers with `depends_on: [T-NNNN]` (ORG-013 cascade-unblock r
 
 The ADR needs one ticket that IS its ratification act, targeted at the human:
 
-- `target: operator`, `intent: ratify`, `ratifiable_files: [pantheon-config:adr/ORG-NNN-*.md]`.
+- `target: operator`, `intent: ratify`, `ratifiable_files: [pantheon-config:architecture/adr/ORG-NNN-*.md]`.
 - If ratification needs no implementation follow-up (the impl ticket already exists from step 4), mark it TERMINAL (`[T-0852] TERMINAL ratify`) so it doesn't imply a further build ticket.
 
 This is the surface the operator signs off on. A canonical ADR status flips to **Ratified only** on an unambiguous ratify against this surface — never on a conversational "keep what we have," which settles a sub-question, not the ADR (P5: humans ratify; the ORG-064 over-ratify was caught on exactly this).
@@ -90,11 +104,11 @@ When the operator ratifies against the surface: flip the ADR status line to Rati
 ## Cross-references
 
 - **Motivating case:** the ORG-064 miss (the operator TG 7629–7636; scoping ticket T-2837).
-- **Structural successor:** `adr/ORG-065` — the typed ADR-obligation → ticket → evidence lineage graph with closure-validation is the durable enforcement of this same lineage (this SOP is the near-term human process; ORG-065 is the machine-checked shape, T-2169-prose → ORG-065-structural). **Downstream vision (the operator TG 7636):** once ORG-065's graph provides a task-tier ontology — typed nodes + edges modeling which items are ready/blocked and at which tier — "plan out work" itself becomes safe autonomous idle work. This SOP is layer one of that progression.
+- **Structural successor:** `architecture/adr/ORG-065` — the typed ADR-obligation → ticket → evidence lineage graph with closure-validation is the durable enforcement of this same lineage (this SOP is the near-term human process; ORG-065 is the machine-checked shape, T-2169-prose → ORG-065-structural). **Downstream vision (the operator TG 7636):** ORG-065's base lineage graph is BUILT (T-2673 + BT1-5 + T-3328); the remaining step — typed nodes + edges modeling task-tier readiness/blocked-at-which-tier — turns "plan out work" itself into safe autonomous idle work. This SOP is layer one of that progression; the built base graph provides the machine-checked lineage this SOP produces prose-first.
 - **Guard mechanics:** `tools/ticket_grooming.py` (ratified-unbuilt + zero-ticket backstop; `build_disposition`/`scoping_ticket` exemptions, T-2806); `tools/adr_scoping_lint.py` + `.github/workflows/adr-scoping-lint.yml` (prevent-at-creation); `adr/README.md` §build_disposition.
 - **Ticket conventions:** ORG-003 (ticket system); ORG-013 (cascade-unblock); ORG-019 (block state in frontmatter, `blocked/` dir retired); the `agent/<task>` branch + HO-push flow.
 - **Principles + directives:** P4 (traceability — the ADR↔build lineage is the audit chain); P5 (humans ratify — the step-5 surface); D6 (plan-first + deviation-flag); D7 (decision/dispatch flow); chain-of-justification (DECISIONS carry the lineage across dispatch boundaries).
 
 ## Authoring discipline
 
-Hand-curated per D2 (HO authors). This SOP is the near-term prose enforcement of a lineage ORG-065 will later enforce structurally; when ORG-065 builds, revisit whether this reduces to a pointer at the graph.
+Hand-curated per D2 (HO authors). This SOP is the near-term prose enforcement of a lineage ORG-065 enforces structurally; the base graph is BUILT (T-2673 + BT1-5 + T-3328), and the SOP remains the human decomposition process (ratified ADR → set of dispatches) that produces the lineage the graph then validates. Revisit whether this SOP can reduce to a pointer once the task-tier ontology consumption matures.

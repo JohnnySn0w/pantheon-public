@@ -49,7 +49,7 @@ Combine either with a payload appearing in the terminal and the human reads "my 
 - **Check the STATE, not stdout.** After `block`: `grep '^depends_on:' tickets/**/T-NNNN.md`. After
   `file`: `list`. The mutation is the claim; the output is not.
 - **Never pipe a mutating CLI call through `head`/`tail`/`grep`/`wc`.** Redirect raw, filter at read
-  time. (Same mechanism as [[background-task-exit-code-is-last-command]].)
+  time. (Same mechanism as [[pipes-on-background-commands-eat-exit-codes-and-evidence]].)
 - **Flags are per-subcommand.** `--note` exists on `annotate` and not on `block`; `--with` exists on
   `resolve` and not on `annotate`. Confirm with `<subcommand> --help` before relying on one.
 

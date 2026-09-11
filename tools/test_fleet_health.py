@@ -9,11 +9,14 @@ from unittest import mock
 from tools import fleet_health as fh
 
 
-def _runner(*, svc="active", session="yes", bwrap="ok", enabled="enabled", ran=True):
+def _runner(*, svc="active", session="yes", bwrap="ok", enabled="enabled", ran=True,
+            policy_skip: str | None = None):
     """Build a stub `run(user, inner)` that answers each check kind.
 
     `enabled` defaults to "enabled" (not paused) so every pre-T-2706 test that
-    doesn't care about pause-state keeps exercising the normal check path."""
+    doesn't care about pause-state keeps exercising the normal check path.
+    `policy_skip` (T-3210) is the raw JSON text `cat <persona>.policyskip.json`
+    would print; None (default) reproduces "no counter file" (empty stdout)."""
     def _f(user, inner, timeout=15):
         if not ran:
             return (None, "", False)
@@ -25,6 +28,8 @@ def _runner(*, svc="active", session="yes", bwrap="ok", enabled="enabled", ran=T
             return (0, session, True)
         if "bwrap" in inner:
             return (0 if bwrap == "ok" else 1, bwrap, True)
+        if "policyskip.json" in inner:
+            return (0, policy_skip or "", True)
         return (0, "", True)
     return _f
 
@@ -179,13 +184,25 @@ class RenderWithFailedUnits(unittest.TestCase):
 
 
 class ControlPlaneProbe(unittest.TestCase):
-    """T-2685: control-plane seats (recovery, specialist — T-2590/T-2633 cutover) must be
-    probed via the persistently-active consume TIMER, not the disabled bespoke
-    unit and not the oneshot consume SERVICE (never is-active after it exits)."""
+    """T-2685: control-plane seats (specialist — T-2633 cutover) must be probed
+    via the persistently-active consume TIMER, not the disabled bespoke unit
+    and not the oneshot consume SERVICE (never is-active after it exits).
+    Recovery is NOT control-plane pre-T-3026 (T-2684 reverted T-3082, 2026-08-23)
+    -- T-2590 covers only the consume plane; the interactive session still
+    lives on the bespoke claude-telegram-fallback.service, so fleet_health
+    must probe THAT unit or it reports the consume timer as healthy while
+    the actual session is dead. T-3026 (interactive-session cutover) flips
+    recovery back onto the consume-timer probe once it lands. Orchestrator is likewise
+    NOT control-plane pre-T-2953 (T-2953 R31 reverted T-3098, 2026-08-23) --
+    the identical shape, one arc over."""
+
+    def test_orchestrator_fleet_health_uses_bespoke_service_pre_cutover(self):
+        self.assertEqual(fh.FLEET["orchestrator"]["services"],
+                         ["claude-telegram.service"])
 
     def test_control_plane_services_derive_from_consume_timer(self):
         self.assertEqual(fh.FLEET["recovery"]["services"],
-                         ["pantheon-persona-consume@recovery.timer"])
+                         ["claude-telegram-fallback.service"])
         self.assertEqual(fh.FLEET["specialist"]["services"],
                          ["pantheon-persona-consume@specialist.timer"])
 
@@ -199,10 +216,9 @@ class ControlPlaneProbe(unittest.TestCase):
         r = fh.check_agent("recovery", fh.FLEET["recovery"], run=_runner(svc="inactive"))
         self.assertEqual(r["status"], fh.FAIL)
         svc = [c for c in r["checks"] if c["name"].startswith("svc:")][0]
-        self.assertIn("pantheon-persona-consume@recovery.timer", svc["name"])
+        self.assertIn("claude-telegram-fallback.service", svc["name"])
 
-    def test_orchestrator_and_codex_stay_bespoke(self):
-        self.assertEqual(fh.FLEET["orchestrator"]["services"], ["claude-telegram.service"])
+    def test_codex_stays_bespoke(self):
         self.assertEqual(fh.FLEET["codex"]["services"],
                          ["codex-daemon.service", "codex-telegram-poller.service"])
 
@@ -407,6 +423,99 @@ class SudoDenial(unittest.TestCase):
         r = fh.check_agent("orchestrator", fh.FLEET["orchestrator"], run=denied_run)
         self.assertEqual(r["status"], fh.WARN)
         self.assertTrue(all(c["status"] == fh.WARN for c in r["checks"]))
+
+
+class PolicySkipVisibility(unittest.TestCase):
+    """T-3210: a consume seat whose attempt stage is 100% policy-skipped
+    completes every fire (exit 0/5) and reads healthy to every OTHER check --
+    this is the row that closes that gap."""
+
+    def _skip_json(self, reason="runtime_viability_blocked", count=27,
+                    since="2026-08-01T00:00:00Z"):
+        import json
+        return json.dumps({"reason": reason, "count": count, "since": since})
+
+    def test_no_counter_file_no_row(self):
+        r = fh.check_agent("specialist", fh.FLEET["specialist"], run=_runner())
+        self.assertFalse(any(c["name"] == "consume:policy-skip" for c in r["checks"]))
+
+    def test_corrupt_counter_file_no_row(self):
+        r = fh.check_agent("specialist", fh.FLEET["specialist"],
+                            run=_runner(policy_skip="{not json"))
+        self.assertFalse(any(c["name"] == "consume:policy-skip" for c in r["checks"]))
+
+    def test_below_floor_no_row(self):
+        r = fh.check_agent(
+            "specialist", fh.FLEET["specialist"],
+            run=_runner(policy_skip=self._skip_json(count=fh.POLICY_SKIP_ROW_MIN_FIRES - 1)),
+        )
+        self.assertFalse(any(c["name"] == "consume:policy-skip" for c in r["checks"]))
+
+    def test_at_floor_row_renders(self):
+        r = fh.check_agent(
+            "specialist", fh.FLEET["specialist"],
+            run=_runner(policy_skip=self._skip_json(count=fh.POLICY_SKIP_ROW_MIN_FIRES)),
+        )
+        row = next(c for c in r["checks"] if c["name"] == "consume:policy-skip")
+        self.assertIn("runtime_viability_blocked", row["detail"])
+        self.assertIn(f"({fh.POLICY_SKIP_ROW_MIN_FIRES} fires)", row["detail"])
+
+    def test_no_manifest_key_is_warn_unexpected(self):
+        with mock.patch.object(fh, "_instance_binding", return_value={}):
+            r = fh.check_agent("specialist", fh.FLEET["specialist"],
+                                run=_runner(policy_skip=self._skip_json()))
+        row = next(c for c in r["checks"] if c["name"] == "consume:policy-skip")
+        self.assertEqual(row["status"], fh.WARN)
+        self.assertIn("unexpected", row["detail"])
+        self.assertEqual(r["status"], fh.WARN)  # folds into the agent's overall status
+
+    def test_manifest_match_is_ok_expected(self):
+        with mock.patch.object(
+            fh, "_instance_binding",
+            return_value={"expected_policy_skip": "runtime_viability_blocked"},
+        ):
+            r = fh.check_agent("specialist", fh.FLEET["specialist"],
+                                run=_runner(policy_skip=self._skip_json()))
+        row = next(c for c in r["checks"] if c["name"] == "consume:policy-skip")
+        self.assertEqual(row["status"], fh.OK)
+        self.assertIn("expected (manifest expected_policy_skip)", row["detail"])
+        # an OK-status row must not itself push the agent's overall status
+        # (all other checks OK) above OK.
+        self.assertEqual(r["status"], fh.OK)
+
+    def test_manifest_mismatch_names_the_expected_reason(self):
+        with mock.patch.object(
+            fh, "_instance_binding", return_value={"expected_policy_skip": "backoff"},
+        ):
+            r = fh.check_agent(
+                "specialist", fh.FLEET["specialist"],
+                run=_runner(policy_skip=self._skip_json(reason="runtime_viability_blocked")),
+            )
+        row = next(c for c in r["checks"] if c["name"] == "consume:policy-skip")
+        self.assertEqual(row["status"], fh.WARN)
+        self.assertIn("unexpected (manifest expects backoff)", row["detail"])
+
+    def test_paused_seat_short_circuits_before_policy_skip_check(self):
+        r = fh.check_agent(
+            "mnemosyne", fh.FLEET["mnemosyne"],
+            run=_runner(enabled="disabled", policy_skip=self._skip_json()),
+        )
+        self.assertEqual(r["status"], fh.PAUSED)
+        self.assertEqual(len(r["checks"]), 1)
+
+    def test_render_shows_ok_status_policy_skip_row(self):
+        # The one deliberate exception to render()'s "only non-OK checks
+        # print" convention: this row is the expected-not-cut-over RECORD,
+        # not a pass/fail probe, so it must be visible even at OK.
+        results = [{
+            "agent": "specialist", "status": fh.OK,
+            "checks": [{"name": "consume:policy-skip", "status": fh.OK,
+                        "detail": "policy-skipped runtime_viability_blocked for 3.0d "
+                                  "(27 fires) — expected (manifest expected_policy_skip)"}],
+        }]
+        out = fh.render(results)
+        self.assertIn("consume:policy-skip", out)
+        self.assertIn("expected (manifest expected_policy_skip)", out)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,57 @@
+# STAGED ARTIFACT (T-2912, ORG-052 Unit 3a) — nothing in this unit
+# installs it. Installation, service-account creation, and executable
+# materialization are owned by the T-2920 install leg (supervised root
+# bootstrap, ORG-052 "Bootstrap and self-amendment boundary").
+#
+# PROVISIONAL values pending T-2920 ratification:
+#   - the service account name  pantheon-hostbroker
+#   - the ExecStart path        /usr/local/libexec/pantheon-host-broker
+#     (ORG-052 §7 introduces the /usr/local/libexec/ paths with "such
+#     as" — convention-consistent, not ratified)
+# The entrypoint binary and its root-owned config schema are T-2920's;
+# this unit ships the service class with injected dependencies only.
+
+[Unit]
+Description=Pantheon host capability broker (org.pantheon.HostBroker1)
+Documentation=file:adr/ORG-052-harness-neutral-host-capability-broker.md
+Requires=dbus.service
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.pantheon.HostBroker1
+ExecStart=/usr/local/libexec/pantheon-host-broker
+User=pantheon-hostbroker
+Group=pantheon-hostbroker
+
+# The broker is unprivileged by design (ORG-052 §3): it never runs as
+# root, holds no capabilities, and owns only its operation journal
+# (StateDirectory below).
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
+StateDirectory=pantheon-host-broker
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

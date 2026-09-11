@@ -1,7 +1,7 @@
 ---
 symptom: "Raw tmux capture-pane output interleaves ANSI cursor/control sequences inside tokens (e.g. sshpass -p 'PW' becomes sshpass<ESC>[16G-p<ESC>[19G'PW'), so line/token-based regex secret-scrubbing never matches and a secret-scan reports clean while the literal secret survives in the archive."
 fix: "Strip ANSI/control sequences before pattern matching, add a literal-string pass for any known secret in addition to the broadened pattern pass, and verify by searching for the literal secret post-scrub rather than trusting a 'scrub ran green' result."
-domain: pantheon, tmux, ansi, regex, secret-scrubbing, security, pty, graveyard
+domain: pantheon, tmux, ansi, regex, secret-scrubbing, security, pty, chronicle, graveyard
 ---
 
 # ANSI cursor codes defeat regex secret-scrubbing in tmux pane captures

@@ -408,6 +408,8 @@ def file_refresh_ticket(
         "--target", result.refresh_target or "recovery",
         "--title", title,
         "--labels", labels,
+        "--project-id", "null",
+        "--nearest-intent-ref", f"maintenance:mirrors/{slug}",
         "--ask", ask,
         "--serves", f"the {slug} outward-facing mirror does not silently rot behind its source",
     ]
@@ -418,7 +420,7 @@ def file_refresh_ticket(
         )
     # ticket.py prints the new id; extract a T-NNNN token from its output.
     import re
-    m = re.search(r"\bT-\d{4}\b", res.stdout + res.stderr)
+    m = re.search(r"\bT-\d{4,}\b", res.stdout + res.stderr)  # T-3215
     return m.group(0) if m else "(filed; id not parsed)"
 
 

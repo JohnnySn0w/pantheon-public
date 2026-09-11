@@ -93,7 +93,7 @@ class ParseTests(unittest.TestCase):
 class ClassificationTests(unittest.TestCase):
     def test_governance_classification(self):
         self.assertTrue(is_governance_path(REPO + "/sop/standard/foo.md", REPO))
-        self.assertTrue(is_governance_path(REPO + "/adr/ADR-001.md", REPO))
+        self.assertTrue(is_governance_path(REPO + "/architecture/adr/ADR-001.md", REPO))
         self.assertTrue(is_governance_path(REPO + "/rulebook/directives.md", REPO))
         self.assertTrue(is_governance_path("/home/claude-fallback/HANDOFF.md", REPO))
         self.assertTrue(is_governance_path(REPO + "/README.md", REPO))
@@ -105,7 +105,7 @@ class ClassificationTests(unittest.TestCase):
 
     def test_index_path_detection(self):
         self.assertTrue(is_index_path(REPO + "/sop/standard/README.md"))
-        self.assertTrue(is_index_path(REPO + "/adr/README.md"))
+        self.assertTrue(is_index_path(REPO + "/architecture/adr/README.md"))
         self.assertFalse(is_index_path(REPO + "/README.md"))
         self.assertFalse(is_index_path(REPO + "/sop/standard/deploy.md"))
 
@@ -200,7 +200,7 @@ class SessionAnalysisTests(unittest.TestCase):
         rep = self.analyze(
             [
                 read_line(REPO + "/sop/standard/README.md"),
-                read_line(REPO + "/adr/ADR-001.md"),
+                read_line(REPO + "/architecture/adr/ADR-001.md"),
             ]
         )
         self.assertFalse(rep["index_chain"][0]["followed"])
@@ -226,13 +226,13 @@ class SessionAnalysisTests(unittest.TestCase):
 
     def test_bash_touches_counted_separately_from_tool_reads(self):
         rep = self.analyze(
-            [read_line(REPO + "/adr/ADR-001.md"), bash_line("cat %s/adr/ADR-002.md" % REPO)]
+            [read_line(REPO + "/architecture/adr/ADR-001.md"), bash_line("cat %s/architecture/adr/ADR-002.md" % REPO)]
         )
         self.assertEqual(
-            rep["bash_touches"], [{"path": REPO + "/adr/ADR-002.md", "count": 1}]
+            rep["bash_touches"], [{"path": REPO + "/architecture/adr/ADR-002.md", "count": 1}]
         )
         gov_paths = [g["path"] for g in rep["governance_touches"]]
-        self.assertIn(REPO + "/adr/ADR-002.md", gov_paths)
+        self.assertIn(REPO + "/architecture/adr/ADR-002.md", gov_paths)
 
     def test_task_spawns_counted(self):
         rep = self.analyze(
@@ -247,14 +247,14 @@ class SessionAnalysisTests(unittest.TestCase):
     def test_top_files_categorized(self):
         rep = self.analyze(
             [
-                read_line(REPO + "/adr/ADR-001.md"),
-                read_line(REPO + "/adr/ADR-001.md"),
+                read_line(REPO + "/architecture/adr/ADR-001.md"),
+                read_line(REPO + "/architecture/adr/ADR-001.md"),
                 read_line(REPO + "/tools/ticket.py"),
                 read_line("/etc/hosts"),
             ]
         )
         cats = {tf["path"]: tf["category"] for tf in rep["top_files"]}
-        self.assertEqual(cats[REPO + "/adr/ADR-001.md"], "repo-docs")
+        self.assertEqual(cats[REPO + "/architecture/adr/ADR-001.md"], "repo-docs")
         self.assertEqual(cats[REPO + "/tools/ticket.py"], "code")
         self.assertEqual(cats["/etc/hosts"], "other")
         self.assertEqual(rep["top_files"][0]["count"], 2)
@@ -264,11 +264,11 @@ class RollupTests(unittest.TestCase):
     def make_repo(self, tmp):
         root = Path(tmp) / "pantheon-config"
         (root / "sop" / "standard").mkdir(parents=True)
-        (root / "adr").mkdir()
+        (root / "architecture" / "adr").mkdir(parents=True)
         (root / "rulebook").mkdir()
         (root / "sop" / "standard" / "deploy.md").write_text("x")
         (root / "sop" / "standard" / "never-read.md").write_text("x")
-        (root / "adr" / "ADR-001.md").write_text("x")
+        (root / "architecture" / "adr" / "ADR-001.md").write_text("x")
         (root / "README.md").write_text("x")
         return str(root)
 
@@ -286,7 +286,7 @@ class RollupTests(unittest.TestCase):
             rollup = build_rollup([rep, rep], root)
             self.assertNotIn("sop/standard/deploy.md", rollup["never_touched"])
             self.assertIn("sop/standard/never-read.md", rollup["never_touched"])
-            self.assertIn("adr/ADR-001.md", rollup["never_touched"])
+            self.assertIn("architecture/adr/ADR-001.md", rollup["never_touched"])
 
     def test_rollup_aggregates_and_boot_table(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -295,7 +295,7 @@ class RollupTests(unittest.TestCase):
                 "s1",
                 parse_transcript_lines(
                     [
-                        read_line("/home/claude/pantheon-config/adr/ADR-001.md"),
+                        read_line("/home/claude/pantheon-config/architecture/adr/ADR-001.md"),
                         read_line("/home/claude/HANDOFF.md"),
                     ]
                 ),
@@ -303,12 +303,12 @@ class RollupTests(unittest.TestCase):
             )
             rep2 = analyze_session(
                 "s2",
-                parse_transcript_lines([read_line(root + "/adr/ADR-001.md")]),
+                parse_transcript_lines([read_line(root + "/architecture/adr/ADR-001.md")]),
                 root,
             )
             rollup = build_rollup([rep1, rep2], root)
             counts = {g["path"]: g["count"] for g in rollup["governance_touch_counts"]}
-            self.assertEqual(counts["adr/ADR-001.md"], 2)  # prefixes merged
+            self.assertEqual(counts["architecture/adr/ADR-001.md"], 2)  # prefixes merged
             self.assertEqual(len(rollup["boot_adherence"]), 2)
             self.assertTrue(rollup["boot_adherence"][0]["handoff"])
             self.assertFalse(rollup["boot_adherence"][1]["handoff"])
@@ -318,7 +318,7 @@ class RollupTests(unittest.TestCase):
             root = self.make_repo(tmp)
             inv = inventory_governance_docs(root)
             self.assertIn("sop/standard/deploy.md", inv)
-            self.assertIn("adr/ADR-001.md", inv)
+            self.assertIn("architecture/adr/ADR-001.md", inv)
             self.assertIn("README.md", inv)
             self.assertNotIn("tools/anything.py", inv)
 
@@ -347,7 +347,7 @@ class CliTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "pantheon-config"
             (root / "sop" / "standard").mkdir(parents=True)
-            (root / "adr").mkdir()
+            (root / "architecture" / "adr").mkdir(parents=True)
             (root / "rulebook").mkdir()
             (root / "sop" / "standard" / "deploy.md").write_text("x")
             (root / "README.md").write_text("x")

@@ -62,7 +62,7 @@ This SOP is the *post-bypass* remediation. The *pre-bypass* structural fix lives
 
 - **Principles + directives:** P1 (architecture over policy — the failure family this SOP exists for); P5 (roles don't hop — implementer doesn't merge); D6 (plan-first protocol + locked-answer-deviation handling — the violated rule); D8 (HO self-discipline — sticky-belief N=2 trigger informs Path B); D3 (autonomy bar — Path C placement).
 - **Policies:** `rulebook/policies/trust-posture.md` (auto-approve scope for revert + redispatch); `rulebook/policies/autonomy.md` (auto-consumer interaction).
-- **ADRs:** `adr/ORG-002` (principles/directives split — this SOP sits at the policy-tier under the framework); `adr/ORG-010` (three-tier rulebook).
+- **ADRs:** `architecture/adr/ORG-002` (principles/directives split — this SOP sits at the policy-tier under the framework); `architecture/adr/ORG-010` (three-tier rulebook).
 - **Incidents:** `incidents/2026-05-09-b33-ticket-state-sweep-multi-violation/` (founding multi-violation case).
 - **Lessons:** [`lessons/instruction-fidelity-collapse-discipline-vs-architecture.md`](../../lessons/instruction-fidelity-collapse-discipline-vs-architecture.md) (the broader corpus framing this SOP slots into).
 - **Tickets:** T-0156 (structural prevention arc — Path 1 GitHub branch protection + Path 3 agent/<task> convention; the structural-prevention layer once informally tracked here as a "Path D" is the §Upstream prevention section, now landed — it is prevention, not a separate remediation path, so no Path D body exists); T-0157 (parent ratification + this SOP framework); T-0196 (this ticket — 9 founding remediation SOPs); T-0164 (lessons umbrella covering the b23/b28/b29/b31/b33 corpus); T-0096 (early recurrence).

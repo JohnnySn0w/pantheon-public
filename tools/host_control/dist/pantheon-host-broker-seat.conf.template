@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<!--
+  STAGED TEMPLATE (T-2912, ORG-052 Unit 3a). The T-2920 install leg
+  substitutes @SEAT_ACCOUNT@ with each registered seat account from the
+  root-owned seat registry and installs one fragment per seat. Exactly
+  the seven ratified Manager members, member-level; the restricted
+  ApprovalSource interface is deliberately absent - seats can never
+  call it, and the service re-checks the caller uid in code regardless
+  (bus policy is defence in depth, never the perimeter).
+-->
+<busconfig>
+  <policy user="@SEAT_ACCOUNT@">
+    <allow send_destination="org.pantheon.HostBroker1"
+           send_interface="org.pantheon.HostBroker1.Manager"
+           send_member="Capabilities"/>
+    <allow send_destination="org.pantheon.HostBroker1"
+           send_interface="org.pantheon.HostBroker1.Manager"
+           send_member="Plan"/>
+    <allow send_destination="org.pantheon.HostBroker1"
+           send_interface="org.pantheon.HostBroker1.Manager"
+           send_member="Apply"/>
+    <allow send_destination="org.pantheon.HostBroker1"
+           send_interface="org.pantheon.HostBroker1.Manager"
+           send_member="Verify"/>
+    <allow send_destination="org.pantheon.HostBroker1"
+           send_interface="org.pantheon.HostBroker1.Manager"
+           send_member="Rollback"/>
+    <allow send_destination="org.pantheon.HostBroker1"
+           send_interface="org.pantheon.HostBroker1.Manager"
+           send_member="OperationGet"/>
+    <allow send_destination="org.pantheon.HostBroker1"
+           send_interface="org.pantheon.HostBroker1.Manager"
+           send_member="ApprovalGet"/>
+  </policy>
+</busconfig>

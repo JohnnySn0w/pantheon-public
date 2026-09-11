@@ -51,6 +51,14 @@ EXCLUDED = {
         "invalidates the measured run instead of requiring an alert",
     "pantheon-bridge.service":
         "verified dead: disabled + inactive, code archived at /opt/pantheon-bridge.archived",
+    "pantheon-vps-state-backup.service":
+        "system/root unit -- it reads every account's home + the kino DB, which no "
+        "user-scoped unit can, so it cannot run as the account both the OnFailure "
+        "alerter and failed-unit-reconcile assume (both are per-account systemctl "
+        "--user, neither covers a system unit). A backup's health signal is commit-"
+        "freshness, not unit status: any failure (unit, hang, push, auth, box-down) "
+        "shows as a missing daily commit in the backup repo. The staleness check that "
+        "alerts on that is T-2886 (T-2178 follow-up).",
 }
 
 

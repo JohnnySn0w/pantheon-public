@@ -108,6 +108,10 @@ def _make_pantheon_repo(tmpdir: Path) -> Path:
         text=True,
         check=True,
     )
+    # Keep real ticket.py subprocess commits hermetic across worker accounts;
+    # they must not depend on an ambient global Git identity.
+    _git("config", "user.name", "Test", cwd=clone, check=True)
+    _git("config", "user.email", "test@example.com", cwd=clone, check=True)
     return clone
 
 
@@ -413,7 +417,15 @@ class TestBriefNamedSweep(unittest.TestCase):
             real_tools = REPO_ROOT / "tools"
             for fname in ("ticket.py", "_git_utils.py", "agent_role_map.py",
                           "__init__.py",
-                          "_md_table.py"):  # T-1936: ticket.py's README-row emitter imports it
+                          "_md_table.py",  # T-1936: ticket.py's README-row emitter imports it
+                          # T-2842: resolve's closure gate imports ticket_lint,
+                          # whose module-level imports pull the next two:
+                          "ticket_lint.py",
+                          "adr_reeval_walk.py",
+                          # T-2426: ticket_lint's owned ORG-061 index evaluator.
+                          "grand_project_program.py",
+                          "watch_digest.py",
+                          "priority_list_parse.py"):  # T-3020 BT3: ticket.py imports it at module scope
                 src = real_tools / fname
                 if src.is_file():
                     (clone / "tools" / fname).write_bytes(src.read_bytes())

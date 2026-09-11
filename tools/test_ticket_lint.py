@@ -152,7 +152,7 @@ class TestLintDetect(unittest.TestCase):
             p,
             tid="T-0002",
             target="operator",
-            ratifiable_files=["pantheon-config:adr/ORG-001-test.md"],
+            ratifiable_files=["pantheon-config:architecture/adr/ORG-001-test.md"],
         )
         result = self._run_detect(p)
         self.assertEqual(result.action, ticket_lint.LintAction.AUTO_FIX)
@@ -186,7 +186,7 @@ class TestLintDetect(unittest.TestCase):
             tid="T-0005",
             target="operator",
             intent="ratify",
-            ratifiable_files=["pantheon-config:adr/NONEXISTENT-FILE.md"],
+            ratifiable_files=["pantheon-config:architecture/adr/NONEXISTENT-FILE.md"],
         )
         # Run with a repo_root where that path doesn't exist.
         result = ticket_lint.detect_malformations(p, repo_root=self.root)
@@ -218,15 +218,15 @@ class TestLintDetect(unittest.TestCase):
     def test_clean_operator_ratify_with_valid_path(self) -> None:
         """target=operator, intent=ratify, ratifiable_files path exists on disk → CLEAN."""
         # Create the referenced file so the path-exists check passes.
-        (self.root / "adr").mkdir()
-        (self.root / "adr" / "ORG-TEST.md").write_text("# test\n")
+        (self.root / "architecture" / "adr").mkdir(parents=True)
+        (self.root / "architecture" / "adr" / "ORG-TEST.md").write_text("# test\n")
         p = self.root / "inbox" / "T-0009.md"
         _make_ticket(
             p,
             tid="T-0009",
             target="operator",
             intent="ratify",
-            ratifiable_files=["pantheon-config:adr/ORG-TEST.md"],
+            ratifiable_files=["pantheon-config:architecture/adr/ORG-TEST.md"],
         )
         result = ticket_lint.detect_malformations(p, repo_root=self.root)
         self.assertEqual(result.action, ticket_lint.LintAction.CLEAN)
@@ -381,7 +381,7 @@ class TestAutoFix(unittest.TestCase):
             p,
             tid="T-0011",
             target="operator",
-            ratifiable_files=["pantheon-config:adr/ORG-001-test.md"],
+            ratifiable_files=["pantheon-config:architecture/adr/ORG-001-test.md"],
         )
         ticket_lint.apply_auto_fix(p)
         text = p.read_text(encoding="utf-8")
@@ -485,6 +485,57 @@ class TestBuildLintDigest(unittest.TestCase):
         )
         self.assertIn("T-0002", msg)
         self.assertIn("flag", msg.lower())
+
+    def test_unverified_elements_section_rendered(self) -> None:
+        """T-2843: the element-lineage leak-detector's findings render in
+        their own digest section when passed through typed_graph_findings."""
+        msg = ticket_lint.build_lint_digest(
+            now_iso="2026-08-24 10:00 UTC",
+            auto_fixed=[],
+            flagged=[],
+            total_scanned=1,
+            typed_graph_findings=[
+                ticket_lint.TypedGraphFinding(
+                    kind="unverified_element",
+                    detail="ORG-065#E1 has no ticket verifies: edge (open or "
+                           "done) — unverified obligation, ORG-065 §3.4",
+                ),
+            ],
+        )
+        self.assertIn("Unverified ADR elements", msg)
+        self.assertIn("ORG-065#E1", msg)
+
+    def test_implemented_unverified_elements_section_rendered_distinctly(self) -> None:
+        """T-3179: a true leak and an implemented-but-unverified element
+        render in two DISTINCT sections, each with its own correct count —
+        the true-leak section must not absorb the implemented one."""
+        msg = ticket_lint.build_lint_digest(
+            now_iso="2026-08-25 10:00 UTC",
+            auto_fixed=[],
+            flagged=[],
+            total_scanned=1,
+            typed_graph_findings=[
+                ticket_lint.TypedGraphFinding(
+                    kind="unverified_element",
+                    detail="ORG-065#E1 has no ticket verifies: edge (open or "
+                           "done) — unverified obligation, ORG-065 §3.4",
+                ),
+                ticket_lint.TypedGraphFinding(
+                    kind="implemented_unverified_element",
+                    detail="ORG-065#E2 implemented by T-0001 but has no "
+                           "ticket verifies: edge — expected transitional "
+                           "shape, ORG-065 §3.4",
+                ),
+            ],
+        )
+        self.assertIn("Unverified ADR elements", msg)
+        self.assertIn("Implemented, evidence pending", msg)
+        self.assertIn("ORG-065#E1", msg)
+        self.assertIn("ORG-065#E2", msg)
+        self.assertIn("T-0001", msg)
+        # Distinct sections: each header's own count is 1, not 2.
+        self.assertIn("(1):", msg)
+        self.assertNotIn("(2):", msg)
 
     def test_no_markdown_parse_mode(self) -> None:
         """Digest must be plain text — no Markdown parse_mode-triggering chars."""
@@ -635,7 +686,7 @@ class TestOrphanRatifications(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self._tmp.name)
         # Artifact substrates + ticket dirs.
-        (self.repo / "adr").mkdir()
+        (self.repo / "architecture" / "adr").mkdir(parents=True)
         (self.repo / "sop" / "standard").mkdir(parents=True)
         (self.repo / "rulebook").mkdir()
         self.tickets = self.repo / "tickets"
@@ -652,7 +703,7 @@ class TestOrphanRatifications(unittest.TestCase):
 
     def test_awaiting_with_open_ratify_ticket_no_finding(self) -> None:
         """(a) awaiting + an open ratify ticket naming it → NOT an orphan."""
-        art = self.repo / "adr" / "ORG-900-test.md"
+        art = self.repo / "architecture" / "adr" / "ORG-900-test.md"
         _write_artifact(
             art,
             body="# ORG-900\n\n**Status:** Drafted 2026-06-01. Awaiting the operator ratification.\n",
@@ -660,7 +711,7 @@ class TestOrphanRatifications(unittest.TestCase):
         _write_ratify_ticket(
             self.tickets / "active" / "T-0900.md",
             tid="T-0900",
-            ratifiable_files=["pantheon-config:adr/ORG-900-test.md"],
+            ratifiable_files=["pantheon-config:architecture/adr/ORG-900-test.md"],
         )
         orphans = self._detect()
         self.assertEqual([o.rel_path for o in orphans], [])
@@ -678,7 +729,7 @@ class TestOrphanRatifications(unittest.TestCase):
 
     def test_ratified_artifact_no_finding(self) -> None:
         """(c) a Ratified artifact → never an orphan (even with no ticket)."""
-        art = self.repo / "adr" / "ORG-901-done.md"
+        art = self.repo / "architecture" / "adr" / "ORG-901-done.md"
         _write_artifact(
             art,
             body="# ORG-901\n\n**Status:** Ratified 2026-05-20 by the operator (msg_x).\n",
@@ -690,7 +741,7 @@ class TestOrphanRatifications(unittest.TestCase):
 
     def test_frontmatter_status_pending(self) -> None:
         """Frontmatter `status:` awaiting → orphan; body prose is not consulted."""
-        art = self.repo / "adr" / "ORG-902-fm.md"
+        art = self.repo / "architecture" / "adr" / "ORG-902-fm.md"
         _write_artifact(
             art,
             body=(
@@ -702,11 +753,11 @@ class TestOrphanRatifications(unittest.TestCase):
             ),
         )
         orphans = self._detect()
-        self.assertEqual([o.rel_path for o in orphans], ["adr/ORG-902-fm.md"])
+        self.assertEqual([o.rel_path for o in orphans], ["architecture/adr/ORG-902-fm.md"])
 
     def test_frontmatter_ratified_overrides_body_awaiting_mention(self) -> None:
         """Frontmatter Ratified is canonical even if body prose mentions awaiting."""
-        art = self.repo / "adr" / "ORG-903-fm-ratified.md"
+        art = self.repo / "architecture" / "adr" / "ORG-903-fm-ratified.md"
         _write_artifact(
             art,
             body=(
@@ -774,7 +825,7 @@ class TestOrphanRatifications(unittest.TestCase):
 
     def test_ratify_ticket_in_inbox_also_covers(self) -> None:
         """An open ratify ticket in inbox/ (not just active/) provides coverage."""
-        art = self.repo / "adr" / "ORG-904.md"
+        art = self.repo / "architecture" / "adr" / "ORG-904.md"
         _write_artifact(
             art,
             body="# ORG-904\n\n**Status:** Drafted. Awaiting ratification.\n",
@@ -782,7 +833,7 @@ class TestOrphanRatifications(unittest.TestCase):
         _write_ratify_ticket(
             self.tickets / "inbox" / "T-0904.md",
             tid="T-0904",
-            ratifiable_files=["pantheon-config:adr/ORG-904.md"],
+            ratifiable_files=["pantheon-config:architecture/adr/ORG-904.md"],
             state="inbox",
         )
         orphans = self._detect()
@@ -790,7 +841,7 @@ class TestOrphanRatifications(unittest.TestCase):
 
     def test_non_ratify_ticket_does_not_cover(self) -> None:
         """A ticket that is NOT target=operator intent=ratify provides no coverage."""
-        art = self.repo / "adr" / "ORG-905.md"
+        art = self.repo / "architecture" / "adr" / "ORG-905.md"
         _write_artifact(
             art,
             body="# ORG-905\n\n**Status:** Drafted. Awaiting ratification.\n",
@@ -803,7 +854,7 @@ class TestOrphanRatifications(unittest.TestCase):
             state="active",
         )
         orphans = self._detect()
-        self.assertEqual([o.rel_path for o in orphans], ["adr/ORG-905.md"])
+        self.assertEqual([o.rel_path for o in orphans], ["architecture/adr/ORG-905.md"])
 
     def test_digest_includes_orphan_section(self) -> None:
         """build_lint_digest renders a floating-ratifications section."""
@@ -814,12 +865,12 @@ class TestOrphanRatifications(unittest.TestCase):
             total_scanned=2,
             orphan_ratifications=[
                 ticket_lint.OrphanRatification(
-                    rel_path="adr/ORG-906.md",
+                    rel_path="architecture/adr/ORG-906.md",
                     status_excerpt="**Status:** Awaiting ratification.",
                 ),
             ],
         )
-        self.assertIn("adr/ORG-906.md", msg)
+        self.assertIn("architecture/adr/ORG-906.md", msg)
         self.assertIn("floating ratification", msg.lower())
 
 
@@ -1146,7 +1197,8 @@ class TestRetargetDetachedHeadPush(unittest.TestCase):
         wt_tools = self._env.repo_path / "tools"
         wt_tools.mkdir(parents=True, exist_ok=True)
         for fname in ("ticket.py", "_git_utils.py", "agent_role_map.py", "hermes_action.py",
-                      "_md_table.py"):  # T-1936: ticket.py's README-row emitter imports it
+                      "_md_table.py",  # T-1936: ticket.py's README-row emitter imports it
+                      "priority_list_parse.py"):  # T-3020 BT3: ticket.py imports it at module scope
             src = repo_tools / fname
             if src.exists():
                 shutil.copy2(src, wt_tools / fname)
@@ -1281,6 +1333,23 @@ class TestUnanchoredGates(unittest.TestCase):
         self._mk("T-0001", "inbox", not_before="2026-09-01T00:00:00Z",
                  anchor="operator:T-0002")
         self.assertEqual(self._detect(), [])
+
+    def test_valid_five_digit_ticket_anchor_not_flagged(self):
+        """T-3215: a 5-digit operator: anchor citing an existing ticket is clean."""
+        five_digit_id = "T-" + "12345"
+        self._mk(five_digit_id, "done")  # the cited decision ticket exists (resolved)
+        self._mk("T-0001", "inbox", not_before="2026-09-01T00:00:00Z",
+                 anchor=f"operator:{five_digit_id}")
+        self.assertEqual(self._detect(), [])
+
+    def test_dangling_five_digit_ticket_anchor_flagged(self):
+        """T-3215: widening the anchor regex must not blind the dangling-ref
+        check — a 5-digit id citing a ticket that does NOT exist is still
+        flagged, same as the 4-digit case above."""
+        five_digit_id = "T-" + "99999"
+        self._mk("T-0001", "inbox", not_before="2026-09-01T00:00:00Z",
+                 anchor=f"operator:{five_digit_id}")
+        self.assertEqual([f.kind for f in self._detect()], ["dangling"])
 
     def test_valid_tg_anchor_not_flagged(self):
         self._mk("T-0001", "inbox", not_before="2026-09-01T00:00:00Z",
@@ -1690,6 +1759,119 @@ class TestDoLintWarn(unittest.TestCase):
 
         self.assertEqual(rc, 0)
         mock_send.assert_not_called()
+
+
+class TestGrandProjectProgramIndexLint(unittest.TestCase):
+    """T-2426: the standing ticket lint surfaces paired index integrity."""
+
+    def test_real_repository_program_indexes_are_clean(self) -> None:
+        repo_root = Path(__file__).resolve().parent.parent
+        self.assertEqual(ticket_lint.detect_program_index_findings(repo_root), [])
+
+    def test_partial_index_pair_is_a_known_positive(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            tickets = repo_root / "tickets"
+            tickets.mkdir()
+            (tickets / "grand-project-stage-evidence.yaml").write_text(
+                "schema_version: 1\nstages: []\n"
+            )
+            findings = ticket_lint.detect_program_index_findings(repo_root)
+        self.assertEqual([finding.code for finding in findings], ["program-index-pair-incomplete"])
+
+    def test_digest_names_program_index_finding(self) -> None:
+        finding = ticket_lint.ProgramIndexFinding(
+            code="obligation-source-digest-drift",
+            record_id="ORG-061:R1",
+            description="source digest changed",
+        )
+        digest = ticket_lint.build_lint_digest(
+            now_iso="2026-08-25 00:00 UTC",
+            auto_fixed=[],
+            flagged=[],
+            total_scanned=0,
+            program_index_findings=[finding],
+        )
+        self.assertIn("ORG-061:R1", digest)
+        self.assertIn("obligation-source-digest-drift", digest)
+
+
+class AdrDirEaccesGuardTests(unittest.TestCase):
+    """T-3477 EACCES guard: an ADR dir under another agent's 700-mode home
+    (echo-prismatic's adr/ under /home/claude, unreadable to the recovery lint
+    runner) makes Path.exists() RAISE PermissionError instead of returning
+    False — which crashed the entire hourly lint. scan_adr_elements /
+    load_adr_obligation_index must skip such a dir like a missing one, never
+    propagate (mirrors ticket_grooming.py's existing try/except OSError guard)."""
+
+    def _inaccessible_dir(self) -> MagicMock:
+        d = MagicMock(spec=Path)
+        d.exists.side_effect = PermissionError(13, "Permission denied")
+        return d
+
+    def test_scannable_returns_false_on_eacces_and_can_warn(self) -> None:
+        import contextlib
+        import io
+
+        d = self._inaccessible_dir()
+        self.assertFalse(ticket_lint._adr_dir_scannable(d))  # silent by default
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            self.assertFalse(ticket_lint._adr_dir_scannable(d, warn=True))
+        self.assertIn("INACCESSIBLE", buf.getvalue())
+
+    def test_scan_adr_elements_skips_inaccessible_dir_without_crashing(self) -> None:
+        # DISCRIMINATING: pre-fix, scan_adr_elements did a bare
+        # `if not one_dir.exists()` which propagated PermissionError and failed
+        # the whole lint run. Post-fix it skips the inaccessible dir.
+        import contextlib
+        import io
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            known_ids, findings = ticket_lint.scan_adr_elements([self._inaccessible_dir()])
+        self.assertEqual(known_ids, set())
+        self.assertEqual(findings, [])
+
+    def test_load_adr_obligation_index_skips_inaccessible_dir(self) -> None:
+        # Must not raise on an inaccessible dir (defensive; silent guard).
+        idx = ticket_lint.load_adr_obligation_index(self._inaccessible_dir())
+        self.assertEqual(idx.details, {})
+
+
+class IsEchoScopedIdTests(unittest.TestCase):
+    """T-3495: is_echo_scoped_id's numeric ADR-id >= 200 discriminator —
+    the echo-prismatic agent-authored range vs. pantheon's own ORG-NNN ids
+    and the vault's 001-199 ADR range (a different, permanently-excluded
+    corpus)."""
+
+    def test_echo_range_element_id_in_scope(self) -> None:
+        self.assertTrue(ticket_lint.is_echo_scoped_id("ADR-207#E1"))
+
+    def test_echo_range_bare_adr_id_in_scope(self) -> None:
+        self.assertTrue(ticket_lint.is_echo_scoped_id("ADR-207"))
+
+    def test_vault_range_out_of_scope(self) -> None:
+        self.assertFalse(ticket_lint.is_echo_scoped_id("ADR-050#E1"))
+
+    def test_pantheon_org_id_out_of_scope(self) -> None:
+        self.assertFalse(ticket_lint.is_echo_scoped_id("ORG-065#E1"))
+
+    def test_plain_prose_out_of_scope(self) -> None:
+        self.assertFalse(ticket_lint.is_echo_scoped_id("no adr id here at all"))
+
+    def test_embedded_in_larger_detail_string(self) -> None:
+        self.assertTrue(ticket_lint.is_echo_scoped_id(
+            "T-0001 implements -> ADR-207#E1, which does not resolve to "
+            "any ADR elements: id"
+        ))
+
+    def test_open_ended_above_299_still_in_scope(self) -> None:
+        # Deliberately open-ended (real numeric comparison, not a fixed-width
+        # string match) — a hypothetical future ADR-2345 is still >=200.
+        self.assertTrue(ticket_lint.is_echo_scoped_id("ADR-2345#E1"))
+
+    def test_three_digit_id_below_200_out_of_scope(self) -> None:
+        self.assertFalse(ticket_lint.is_echo_scoped_id("ADR-199#E1"))
 
 
 if __name__ == "__main__":

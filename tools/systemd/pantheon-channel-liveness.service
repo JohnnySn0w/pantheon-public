@@ -18,6 +18,9 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # per-agent cooldown + consecutive-tracking + escalation (no restart-loop); healthy
 # bridges no-op.
 Environment=PANTHEON_CHANNEL_REMEDIATE_ENABLED=1
+# ORG-076 §7 per-persona notify-mute registry (T-2978/T-2987 go-live). A muted seat
+# withholds its comms-dark PAGE (alert-only; remediation is unaffected). Fail-open if absent.
+Environment=PANTHEON_MUTE_REGISTRY=/home/the-ancestor/health-plane/notify_mute.json
 ExecStart=/usr/bin/python3 %h/pantheon-config/tools/channel_liveness_monitor.py --all
 StandardOutput=journal
 StandardError=journal

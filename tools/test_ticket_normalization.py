@@ -61,7 +61,12 @@ def _make_file_args(
     args.terminal = False
     args.impl_title = None
     args.impl_ask = None
+    args.appetite = None  # T-3440/ORG-089: getattr-read default
+    args.bet_ref = None
     args.impl_target = None
+    # T-3328: this module tests persona-normalization mechanics, orthogonal
+    # to DAG connectivity — orphan escape hatch, not a real lineage edge.
+    args.orphan = "test fixture: T-0492 persona-canonical target/requester normalization"
     return args
 
 

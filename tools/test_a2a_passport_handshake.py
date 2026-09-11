@@ -17,6 +17,7 @@ import unittest
 from tools.a2a.passport_handshake import (
     AbortReason,
     AllowlistEntry,
+    DowngradeStore,
     HandshakeState,
     InMemoryDowngradeStore,
     MtlsAdapter,
@@ -411,6 +412,69 @@ class TestHelpers(unittest.TestCase):
     def test_scheme_precedence_ordering(self):
         self.assertGreater(Scheme.MTLS, Scheme.OIDC_BEARER)
         self.assertGreater(Scheme.OIDC_BEARER, Scheme.API_KEY)
+
+
+# ---------------------------------------------------------------------------
+# T-2867 arc-review hardening follow-ups.
+# ---------------------------------------------------------------------------
+
+
+class TestAdapterMapValidation(unittest.TestCase):
+    """T-2867 HANDSHAKE-4: a mis-wired adapter map (key != adapter.scheme) is an
+    operator programming error and must fail fast at CONSTRUCTION, not run a
+    selection for one scheme through another scheme's verifier at handshake time."""
+
+    def test_mismatched_adapter_key_raises_at_construction(self):
+        with self.assertRaises(ValueError) as cm:
+            PassportHandshake(
+                txt_resolver=_resolver(),
+                card_fetcher=_fetcher(b"{}"),
+                allowlist={},
+                # key MTLS holds an adapter presenting API_KEY.
+                adapters={Scheme.MTLS: _StubAdapter(Scheme.API_KEY)},
+            )
+        self.assertIn("mis-wired", str(cm.exception))
+
+    def test_correctly_wired_adapter_map_constructs(self):
+        # Sanity: matching key == adapter.scheme constructs without error.
+        PassportHandshake(
+            txt_resolver=_resolver(),
+            card_fetcher=_fetcher(b"{}"),
+            allowlist={},
+            adapters={Scheme.MTLS: _StubAdapter(Scheme.MTLS)},
+        )
+
+
+class TestHandshakeResultFrozen(unittest.TestCase):
+    """T-2867 HANDSHAKE-3: HandshakeResult is frozen so a caller cannot flip
+    content_trusted True (or any field) post-construction — the D4 invariant."""
+
+    def test_content_trusted_cannot_be_reassigned(self):
+        import dataclasses
+        hs, _, _ = _build()
+        r = hs.run(ENDPOINT)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            r.content_trusted = True  # type: ignore[misc]
+
+
+class TestDowngradeStoreProtocol(unittest.TestCase):
+    """T-2867 HANDSHAKE-2: reset() is part of the DowngradeStore contract, so a
+    persistent-store swap cannot silently drop the high-water-mark escape hatch."""
+
+    def test_reset_is_required_by_the_protocol(self):
+        # The default store satisfies the full contract.
+        self.assertIsInstance(InMemoryDowngradeStore(), DowngradeStore)
+
+        # A store with seen()+record() but no reset() no longer conforms — before
+        # HANDSHAKE-2 promoted reset() into the Protocol, this WAS a DowngradeStore.
+        class _NoReset:
+            def seen(self, endpoint_id):
+                return set()
+
+            def record(self, endpoint_id, schemes):
+                pass
+
+        self.assertNotIsInstance(_NoReset(), DowngradeStore)
 
 
 if __name__ == "__main__":

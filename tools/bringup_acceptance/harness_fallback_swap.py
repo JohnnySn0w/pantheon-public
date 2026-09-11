@@ -10,7 +10,7 @@ OS-touching leaves mocked -- the exact seam ``test_runtime_controller.py``'s
 own ``test_replace_runtime_publishes_after_ready`` already uses):
 
     _begin_transition -> phase=preparing (handoff requested, barred drains)
-      -> handoff verified changed -> graveyard.archive_required
+      -> handoff verified changed -> chronicle.archive_required
       -> _replace_runtime (real function; only its OS leaves are mocked)
       -> phase=awaiting-successor-read, runtime_swapped=True
       -> _prompt_successor -> acknowledge_successor_read
@@ -28,7 +28,7 @@ Four independently-gap-able legs:
 2. ``transition_state_machine`` -- the real ``planned_swap`` /
    ``acknowledge_successor_read`` / ``assert_drain_allowed`` contract,
    claude persona/tmux/state preserved, over a disposable
-   ``PANTHEON_GRAVEYARD_ROOT`` and a disposable ``state_root``. Only
+   ``PANTHEON_CHRONICLE_ROOT`` and a disposable ``state_root``. Only
    ``_target_known``/``_start_runtime``/``_verify_started_runtime``/
    ``_capture_visible_runtime_pane`` are mocked -- the EXACT seam
    ``test_runtime_controller.py``'s own ``test_replace_runtime_publishes_
@@ -36,7 +36,7 @@ Four independently-gap-able legs:
    runtime`` itself, the REAL ``_verify_runtime_input_ready`` polling/
    timeout/ready-detection loop (against a canned but real ``tools.
    submit_verify.ready_for_submission`` check on the mocked pane text),
-   ``graveyard.archive_required``, and every phase/ack/drain-barrier check
+   ``chronicle.archive_required``, and every phase/ack/drain-barrier check
    run for REAL.
 3. ``persona_target_selection`` -- proves ``persona_bringup.
    select_recorded_runtime_binding`` redirects to the incoming (fallback)
@@ -291,7 +291,7 @@ def _argv_gate_leg(ctx: RunContext) -> Mapping[str, Any]:
         adapter = ClaudeHarnessAdapter(
             "bringup-acceptance", claude_home=Path("/tmp"), launch=_claude_launch(native),
         )
-        spec = adapter.build_interactive_launch(target)
+        spec = adapter.build_interactive_launch(target, cwd=Path("/tmp/launch"))
         index = assert_exactly_one_permission_mode(
             spec.argv, expected_value=expected_value, label=label,
         )
@@ -609,8 +609,8 @@ class _EnvOverride:
                 os.environ[key] = saved
 
 
-def _disposable_graveyard_env(root: Path) -> _EnvOverride:
-    return _EnvOverride({"PANTHEON_GRAVEYARD_ROOT": str(root)})
+def _disposable_chronicle_env(root: Path) -> _EnvOverride:
+    return _EnvOverride({"PANTHEON_CHRONICLE_ROOT": str(root)})
 
 
 def _disposable_mailbox_env(hub_path: Path, state_path: Path) -> _EnvOverride:
@@ -653,11 +653,11 @@ class HarnessFallbackSwapModule:
         self._module_dirs = {
             "manifest": module_dir / "instance.yaml",
             "state_root": module_dir / "state",
-            "graveyard_root": module_dir / "graveyard",
+            "chronicle_root": module_dir / "chronicle",
         }
         manifest_path = self._module_dirs["manifest"]
         state_root = self._module_dirs["state_root"]
-        graveyard_root = self._module_dirs["graveyard_root"]
+        chronicle_root = self._module_dirs["chronicle_root"]
 
         if ctx.hub_path.resolve() == _REAL_HUB_DEFAULT.resolve():
             raise HardStop(
@@ -699,7 +699,7 @@ class HarnessFallbackSwapModule:
         if target is None:
             raise HardStop(f"{self.id}: fixture manifest produced no fallback binding")
 
-        with _disposable_graveyard_env(graveyard_root):
+        with _disposable_chronicle_env(chronicle_root):
             transition_detail = _transition_state_machine_leg(
                 ctx, manifest_path=manifest_path, state_root=state_root,
                 primary=primary, target=target,
@@ -1041,7 +1041,7 @@ def run_live_kick_lands_executes(
     work_root.mkdir(parents=True, exist_ok=True)
     manifest_path = work_root / "instance.yaml"
     state_root = work_root / "state"
-    graveyard_root = work_root / "graveyard"
+    chronicle_root = work_root / "chronicle"
     handoff_path = work_root / "HANDOFF.md"
     receipt_log = work_root / "receipts.log"
     mailbox_hub = work_root / "mailbox"
@@ -1084,7 +1084,7 @@ def run_live_kick_lands_executes(
     events: list[str] = []
 
     try:
-        with _disposable_graveyard_env(graveyard_root):
+        with _disposable_chronicle_env(chronicle_root):
             current_handle = rc._replace_runtime(current, state_root=state_root, context=context)
             events.append("current_runtime_started")
 

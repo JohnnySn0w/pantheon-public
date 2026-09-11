@@ -191,7 +191,7 @@ class HostPlanService:
             request_digest=request_digest,
             plan=envelope,
         )
-        summary = self._summary(stored)
+        summary = self.plan_summary(stored)
         return PlanResult(
             plan_handle=stored.plan_handle,
             plan_digest=stored.digest,
@@ -208,15 +208,35 @@ class HostPlanService:
         systemd = manifest.installer.get("systemd")
         if not isinstance(systemd, dict):
             raise HostControlError("frozen manifest systemd section is invalid")
+        quota_check = manifest.installer.get("quota_check")
+        if quota_check is None:
+            quota_check = {}
+        if not isinstance(quota_check, dict):
+            raise HostControlError("frozen manifest quota_check section is invalid")
         actual = (
             systemd.get("service_template"),
             systemd.get("timer_template"),
+            quota_check.get(
+                "service_template",
+                "tools/systemd/pantheon-persona-quota@.service",
+            ),
+            quota_check.get(
+                "timer_template",
+                "tools/systemd/pantheon-persona-quota@.timer",
+            ),
         )
         if actual != template_ids:
             raise HostControlError("registered template binding mismatch")
 
     @staticmethod
-    def _summary(plan: PlanEnvelope) -> str:
+    def plan_summary(plan: PlanEnvelope) -> str:
+        """Bounded redacted plan summary — the single canonical
+        redaction surface: both the public ``Plan`` result and the
+        restricted ``ApprovalSource.PlanSummary`` return exactly these
+        bytes (T-2912 OQ2 disposition: one surface, so the two
+        disclosure paths cannot drift apart).
+        """
+
         summary = {
             "schema": "pantheon-host-plan-summary/v1",
             "plan_handle": plan.plan_handle,

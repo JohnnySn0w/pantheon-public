@@ -70,6 +70,14 @@ from tools.harness_adapter.types import (
     TmuxTarget,
     Usage,
 )
+from tools.harness_permission_posture import (
+    CODEX_NATIVE_EXECUTION_BOUNDARY_KEY,
+    CODEX_NATIVE_PERMISSION_POSTURE_KEY,
+    PermissionPostureError,
+    codex_permission_native_overrides,
+    codex_permission_native_sandbox,
+    validate_codex_permission_native,
+)
 from tools.harness_adapter.provider_quota import (
     CodexAppServerQuotaObserver,
     read_codex_app_server_rate_limits,
@@ -292,7 +300,12 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
                     evidence={"profile": "", "legacy": "true"},
                 ),
             )
-        allowed_native = {"sandbox", "config_overrides"}
+        allowed_native = {
+            "sandbox",
+            "config_overrides",
+            CODEX_NATIVE_PERMISSION_POSTURE_KEY,
+            CODEX_NATIVE_EXECUTION_BOUNDARY_KEY,
+        }
         unknown = sorted(set(self.launch.native) - allowed_native)
         status = "fail" if unknown else "pass"
         return (
@@ -369,12 +382,13 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
             },
         )
 
-    def build_interactive_launch(self, target: TmuxTarget) -> CommandSpec:
+    def build_interactive_launch(self, target: TmuxTarget, *, cwd: Path) -> CommandSpec:
         argv = [str(self.executable)]
         model = self.launch.model if self.launch else None
         if model:
             argv.extend(["--model", model])
         self._append_native_args(argv)
+        self._append_writable_root_args(argv)
         # Wedge #6 (T-2597 wedge-map): --dangerously-bypass-hook-trust is a
         # CLI-only flag (codex-rs/cli/src/main.rs:1994,3048), NOT a
         # config.toml key -- it cannot be pre-seeded like the trust/update/
@@ -389,7 +403,7 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
         return CommandSpec(
             argv=tuple(argv),
             stdin=None,
-            cwd=Path.cwd(),
+            cwd=cwd,
             env={
                 "CODEX_HOME": str(self._codex_home / ".codex"),
                 "PANTHEON_TMUX_SESSION": target.session,
@@ -412,13 +426,35 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
     def _append_native_args(self, argv: list[str]) -> None:
         if self.launch is None:
             return
-        sandbox = self.launch.native.get("sandbox")
+        try:
+            validate_codex_permission_native(self.launch.native, role="adapter")
+        except PermissionPostureError as exc:
+            raise ValueError(str(exc)) from exc
+        try:
+            sandbox = codex_permission_native_sandbox(self.launch.native)
+        except PermissionPostureError as exc:
+            raise ValueError(str(exc)) from exc
+        if sandbox is None:
+            sandbox = self.launch.native.get("sandbox")
         if isinstance(sandbox, str):
             argv.extend(["--sandbox", sandbox])
-        overrides = self.launch.native.get("config_overrides")
-        if isinstance(overrides, dict):
+        try:
+            posture_overrides = codex_permission_native_overrides(self.launch.native)
+        except PermissionPostureError as exc:
+            raise ValueError(str(exc)) from exc
+        raw_overrides = self.launch.native.get("config_overrides")
+        overrides: dict[str, Any] = dict(posture_overrides)
+        if isinstance(raw_overrides, dict):
+            overrides.update(raw_overrides)
+        if overrides:
             for key, value in sorted(overrides.items()):
                 argv.extend(["--config", f"{key}={_toml_scalar(value)}"])
+
+    def _append_writable_root_args(self, argv: list[str]) -> None:
+        if self.launch is None:
+            return
+        for root in self.launch.writable_roots:
+            argv.extend(["--add-dir", str(root)])
 
     # -------------------------------------------------------------------------
     # Partition 1 — Generalized surfaces

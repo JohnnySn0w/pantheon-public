@@ -185,8 +185,14 @@ def file_soak_tickets(
             # NB: no --intent — ticket.py rejects it for non-operator targets.
             "--title", title,
             "--labels", SOAK_LABELS_CSV,
+            "--project-id", "null",
+            "--nearest-intent-ref", "maintenance:test-suite-soak",
             "--ask", _build_ask(agent),
             "--context", _build_context(agent, today),
+            # T-3328: connect via the goal/arc-intent edge rather than filing
+            # an orphan — the monthly soak leg is infra maintenance.
+            "--serves", "the monthly suite-health soak leg keeps running per "
+                        "agent (no missed regression window)",
         ]
         outcome, tid, detail = _invoke_ticket_file(
             argv, f"soak_filer {agent} {today.isoformat()}", subprocess_env

@@ -165,11 +165,15 @@ class ProbeBridgeTest(unittest.TestCase):
 
 class CheckAgentTest(unittest.TestCase):
     def _check(self, status, *, dry_run=False, cooldown=False, restart_window=False,
-               unit_disabled=None):
+               unit_disabled=None, maintenance=False, muted=False):
         # unit_disabled defaults to None = "could not tell", the fail-open value —
         # so every pre-existing case below still exercises the alerting path and
         # none of them silently starts shelling out to a real `systemctl`.
+        # maintenance/muted default False + are patched (not read from the real
+        # registries) so a live-armed/live-muted seat can never make these non-hermetic.
         with mock.patch.object(clm, "probe_bridge", return_value=(status, "detail")), \
+             mock.patch.object(clm, "_seat_in_maintenance", return_value=maintenance), \
+             mock.patch.object(clm, "_seat_muted", return_value=muted), \
              mock.patch.object(clm, "_session_unit_is_disabled", return_value=unit_disabled), \
              mock.patch.object(clm, "_in_alert_cooldown", return_value=cooldown), \
              mock.patch.object(clm, "_in_restart_window", return_value=restart_window), \
@@ -203,10 +207,42 @@ class CheckAgentTest(unittest.TestCase):
         alert.assert_not_called()
         rec.assert_not_called()
 
+    def test_down_muted_suppresses_page_but_still_remediates(self):
+        # T-2987 / ORG-076 §7: a muted seat withholds the comms-dark PAGE, but a mute is
+        # ALERT-ONLY — unlike 'paused'/'maintenance', remediation is UNAFFECTED. (Contrast
+        # test_down_on_a_deliberately_paused_seat which suppresses BOTH.)
+        with mock.patch.object(clm, "_maybe_remediate") as rem:
+            ret, alert, rec = self._check("down", muted=True)
+        self.assertEqual(ret, "down")
+        alert.assert_not_called()
+        rec.assert_not_called()
+        rem.assert_called_once()  # remediation still runs — mute never vetoes an action
+
     def test_down_dry_run_does_not_alert(self):
         _, alert, rec = self._check("down", dry_run=True)
         alert.assert_not_called()
         rec.assert_not_called()
+
+    def test_skip_set_short_circuits_before_probe(self):
+        # A seat in CHANNEL_LIVENESS_SKIP (e.g. mid-harness-migration orchestrator) is not
+        # probed/alerted/remediated at all — even when the bridge would read down.
+        with mock.patch.object(clm, "CHANNEL_LIVENESS_SKIP", {AGENT}), \
+             mock.patch.object(clm, "probe_bridge", return_value=("down", "detail")) as probe, \
+             mock.patch.object(clm, "_maybe_remediate") as rem, \
+             mock.patch("tools.inbox_consumer.route_failure_alert") as alert:
+            ret = clm.check_agent(AGENT, now=1000)
+        self.assertEqual(ret, "skipped")
+        probe.assert_not_called()
+        alert.assert_not_called()
+        rem.assert_not_called()
+
+    def test_empty_skip_set_is_inert(self):
+        # Default (empty) skip set must NOT suppress: the agent is probed normally
+        # and a fresh down still alerts. Guards against the skip accidentally firing.
+        with mock.patch.object(clm, "CHANNEL_LIVENESS_SKIP", set()):
+            ret, alert, rec = self._check("down")
+        self.assertEqual(ret, "down")
+        alert.assert_called_once()
 
     def test_up_does_not_alert(self):
         _, alert, _ = self._check("up")
@@ -242,6 +278,28 @@ class CheckAgentTest(unittest.TestCase):
              mock.patch.object(clm, "_in_restart_window") as win:
             ret, _, _ = self._check("down", unit_disabled=True)
         self.assertEqual(ret, "paused")
+
+    def test_down_on_a_seat_in_maintenance_does_not_alert_or_remediate(self):
+        # T-2984: during a runtime-controller cutover the bridge may read down while
+        # the harness is swapped. A seat in an active maintenance window is left alone
+        # — no alert, no remediation — so the monitor does not fight the cutover.
+        with mock.patch.object(clm, "_maybe_remediate") as rem:
+            ret, alert, rec = self._check("down", maintenance=True)
+        self.assertEqual(ret, "maintenance")
+        alert.assert_not_called()
+        rec.assert_not_called()
+        rem.assert_not_called()
+
+    def test_maintenance_check_precedes_pause_and_restart_window(self):
+        # Maintenance is the strongest "leave this seat alone" signal: it must win even
+        # when the seat also looks paused and mid-restart, and must never consult those.
+        with mock.patch.object(clm, "_maybe_remediate"), \
+             mock.patch.object(clm, "_session_unit_is_disabled") as dis, \
+             mock.patch.object(clm, "_in_restart_window") as win:
+            ret, _, _ = self._check("down", maintenance=True, unit_disabled=True, restart_window=True)
+        self.assertEqual(ret, "maintenance")
+        dis.assert_not_called()
+        win.assert_not_called()
         win.assert_not_called()
 
     def test_enabled_unit_still_alerts(self):

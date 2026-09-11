@@ -100,7 +100,7 @@ CORPUS_SUBDIRS = (
     "notes",
     "sop",
     "rulebook",
-    "adr",
+    "architecture/adr",
     "knowledge",
 )
 
@@ -314,8 +314,22 @@ def _build_ask(today: date, diff: dict[str, list[str]]) -> str:
         f"locked corpus scope + the ORG-012 tier-jump / demotion criteria + "
         f"bubble-up criteria verbatim + the HERMES rule + DECISIONS-propagation. "
         f"(SendMessage addresses teammates by the name you gave them.)\n"
-        f"2. Each worker applies ORG-012 promotion/demotion criteria to its slice "
-        f"of the corpus and returns candidates.\n"
+        f"2. Each worker applies TWO criteria classes to its slice of the corpus "
+        f"and returns candidates.\n"
+        f"   (a) ORG-012 tier-jump / demotion criteria (the classic sweep scope: "
+        f"observations promoting to lessons/, lessons promoting to SOPs, SOPs to "
+        f"ADRs, or the reverse demotions when a durable claim is contradicted).\n"
+        f"   (b) ORG-087 §7.1 judgment-bearing curation items (added 2026-09-05 "
+        f"per T-3420 execution of ratified ORG-087 — the T-1968-imagined curation "
+        f"items re-homed to Specialist's existing dispatch, no new timer/seat): "
+        f"**memory-pin arbitration** (contradictions or unresolved-tensions "
+        f"BETWEEN accessible feedback_*.md pins — flag the pair + propose "
+        f"reconcile/supersede/keep-both-with-scope) and **contested-record "
+        f"grooming** (corpus records that claim conflicting facts about the same "
+        f"subject — flag the pair + propose the reconcile shape). Cross-user "
+        f"access caveat carried forward from T-0872: the sweep sees Specialist's own "
+        f"pins + shared-readable feedback_*.md; other agents' 0750-homed pins "
+        f"are structurally invisible and out of scope until T-0872 lands.\n"
         f"3. Diff candidates vs the prior run; keep only NEW/changed ones.\n"
         f"4. VERIFY each surviving candidate against the live repo BEFORE filing — "
         f"the first dry-run (2026-06-06) found ~1 in 12 raw worker findings was "
@@ -345,7 +359,7 @@ def _build_context(today: date) -> str:
         f"in-session review fan-out (component 2) runs as a team-pattern cycle "
         f"per the team-orchestrator-dispatch-checklist SOP and files results per "
         f"the throughline-sweep-result-filing SOP. See "
-        f"adr/ORG-012-information-inflow-bubble-up-methodology.md §Cadence #6."
+        f"architecture/adr/ORG-012-information-inflow-bubble-up-methodology.md §Cadence #6."
     )
 
 
@@ -503,8 +517,14 @@ def file_sweep_ticket(
         # (it's target=operator-specific). The 2026-06-06 13:00 fire failed on this.
         "--title", title,
         "--labels", SWEEP_LABELS,
+        "--project-id", "null",
+        "--nearest-intent-ref", "maintenance:knowledge-corpus",
         "--ask", _build_ask(today, diff),
         "--context", _build_context(today),
+        # T-3328: connect via the goal/arc-intent edge rather than filing an
+        # orphan — the daily corpus-sweep dispatch is infra maintenance.
+        "--serves", "the daily knowledge-corpus sweep dispatch reaches Specialist "
+                    "for triage (ORG-012 §6)",
     ]
     outcome, tid, detail = _invoke_ticket_file(
         argv, f"file_sweep_ticket {today.isoformat()}", env

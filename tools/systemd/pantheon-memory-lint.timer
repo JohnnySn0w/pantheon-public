@@ -1,0 +1,10 @@
+[Unit]
+Description=Pantheon memory-pin health check — daily fire (10:00 UTC)
+
+[Timer]
+OnCalendar=*-*-* 10:00:00 UTC
+Persistent=true
+Unit=pantheon-memory-lint.service
+
+[Install]
+WantedBy=timers.target

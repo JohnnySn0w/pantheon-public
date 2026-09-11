@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon activity_monitor meta-drift alarm — daily fire (04:37 UTC, off-peak)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 04:37:00
+Persistent=true
+Unit=pantheon-activity-monitor-drift-check.service
+
+[Install]
+WantedBy=timers.target

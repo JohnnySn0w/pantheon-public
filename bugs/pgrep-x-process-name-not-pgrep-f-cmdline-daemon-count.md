@@ -22,6 +22,21 @@ systemctl status <unit>  # preferred for systemd-managed daemons
 
 For managed daemons, prefer `systemctl status/stop/restart <unit>` over signal-by-pattern entirely. Reserve `-f` for cases where you genuinely need to match on arguments, and then exclude self/shell explicitly.
 
+### Exception — daemon whose real process is `python3` AND lives outside its unit cgroup (acp-bridge, T-1689)
+
+Both fixes above FAIL for the ACP mailbox bridge (`pantheon-acp-bridge@<agent>`), so this case needs a third approach:
+
+- `pgrep -x python3` **over-counts** — the bridge is one of many `python3` processes on the host; the exact-name match can't single it out.
+- `systemctl status` / cgroup inspection **under-counts to 0** — T-1689 hosts the bridge's tmux session in the agent's *pre-existing* tmux server (specialist's TUI server), which is OUTSIDE the systemd unit's cgroup. The unit cgroup holds only the poll-waiting supervise script (its MainPID), not the `sg → sh → acp_bridge.py` tree. A `systemctl status`/cgroup consumer count therefore reads **0** even when the bridge is healthy — a real trap when checking for a split consumer after a restart.
+
+Count it by filtering `python3` processes to the bridge's argv (`-C` restricts to the exact comm so wrappers/`sudo`/`bash`/`pgrep` are excluded; the `[.]` bracket stops the grep line self-matching):
+
+```
+ps -C python3 -o pid=,etimes=,args= | grep 'acp_bridge[.]py --agent <agent>'   # expect exactly 1
+```
+
+Verified 2026-08-22 (T-2688 `--batch` / T-2797 recycle canary health sweep): the unit cgroup showed 0 `acp_bridge.py`; this `ps -C python3` filter showed the single real consumer with its full argv.
+
 ## Discovered
 
 - T-0557 echo deploy (2026-05-22). Postmortem: `notes/2026-05-22-echo-demo-integration-postmortem.md` §Reusable disciplines. Mentioned in passing in T-0562 but never cataloged until now.
@@ -29,6 +44,6 @@ For managed daemons, prefer `systemctl status/stop/restart <unit>` over signal-b
 
 ## Keywords
 
-pgrep, pkill, -f, -x, cmdline, process name, daemon count, +1 inflation, kill operator shell, phantom respawn, duplicate daemon, systemctl, T-0557, echo, deploy
+pgrep, pkill, -f, -x, cmdline, process name, daemon count, +1 inflation, kill operator shell, phantom respawn, duplicate daemon, systemctl, T-0557, echo, deploy, acp-bridge, cgroup shows 0 consumers, ps -C python3, external tmux server, T-1689, split-consumer check, acp_bridge.py
 
 **Pattern lifted to lesson** (ORG-012 criterion 3): `lessons/2026-07-21-cmdline-substring-process-predicates-unsound.md` (kill/count instance).

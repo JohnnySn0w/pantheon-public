@@ -632,13 +632,34 @@ def run(agent: str, *, inbox: Path | None = None, do_inject=inject,
                       idle_kicked=(reason == IDLE_REKICK_REASON))
         print(f"[mailbox_wake] {agent}: woke pane for {len(names)} unread message(s) ({reason})")
         return 0
-    # Kick failed on a NON-busy pane (idle, or unknown/dead). Do NOT advance the
-    # marker, so the next .path fire retries; messages are still in new/ (never acked
-    # here), so nothing is lost. Return 8 so the unit's OnFailure fires — this is the
-    # dead-seat send-liveness rung (T-2245): an idle pane that rejects the submit, or
-    # a target with no live session, is a genuine anomaly worth surfacing. (The benign
-    # busy-pane collision is already handled by the confirmed-busy skip above, T-2681.)
-    print(f"[mailbox_wake] {agent}: wake kick failed; messages remain in new/ for retry", file=sys.stderr)
+    # Kick failed. The pane was NOT confirmed-busy at decide-time (else the T-2681
+    # skip above would have deferred). Two sub-cases needing OPPOSITE dispositions:
+    #
+    #  (a) idle→busy RACE (T-3554): the pane was idle at the decide-time sample but the
+    #      agent started a turn before submit-verify confirmed, so send_keys_submit reports
+    #      'submit unconfirmed (still pending)' — the composer HOLDS the text because the
+    #      pane is now generating. This is the SAME benign busy collision T-2681 defers,
+    #      observed one sample too late; it recurs on a busy fleet (recovery + atlas 2026-09-07).
+    #  (b) genuine anomaly: an idle pane that rejects the submit, or a dead/unreadable
+    #      seat — the dead-seat send-liveness rung (T-2245), worth the OnFailure alarm.
+    #
+    # RE-VERIFY AT SEND TIME (the T-2681 predicate, one sample later —
+    # feedback_reverify_at_send_time_for_self_healing_signals): re-read the pane.
+    # Confirmed-busy NOW ⇒ case (a): soft-exit 0 (marker NOT advanced, mail still in new/,
+    # next .path fire retries once idle — no mail lost, no wake missed). Idle/unknown NOW ⇒
+    # case (b): exit 8 so OnFailure fires. Cannot regress a real wedge: a dead/wedged seat
+    # reads idle/unknown (not generating), so it still alarms, and the sustained backstops
+    # (T-2158 TTL/idle-transition rekick, T-2157 mail-staleness detector) still catch a
+    # genuinely stuck drain.
+    pane_now = pane_idle_fn(cfg["pane_target"])
+    if pane_now is False:
+        print(f"[mailbox_wake] {agent}: kick failed but pane now BUSY (idle→busy race, "
+              f"T-3554) — deferring, mail retained, will retry next fire ({reason})",
+              file=sys.stderr)
+        return 0
+    print(f"[mailbox_wake] {agent}: wake kick failed on "
+          f"{'idle' if pane_now else 'unknown'} pane; messages remain in new/ for retry",
+          file=sys.stderr)
     return 8
 
 

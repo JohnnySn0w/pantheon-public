@@ -7,6 +7,7 @@ cries wolf gets disabled and then there is no verifier at all.
 
 Run: python3 -m unittest tools.test_forgejo_mirror_verify -v
 """
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -101,9 +102,11 @@ class TestRealFailuresAreCaught(unittest.TestCase):
         self.assertIn("retained", detail)
 
     def test_missing_and_extra_together_is_drift_on_the_missing(self):
-        # Missing dominates: if the mirror lacks an upstream ref, it DRIFTs even if it
-        # also retains extras. up has b0,b1,tag; mirror has b0,b1,other → tag missing.
-        up = refs(2) | {"refs/tags/v1"}
+        # Missing dominates for a REAL gap: even with retained extras + a fresh sync,
+        # a drift LARGER than the T-2879 transient-lag ceiling DRIFTs (it is not the
+        # small new-ref lag the grace covers). up has b0,b1,+3 tags; mirror has
+        # b0,b1,other → 3 tags missing (> TRANSIENT_LAG_MAX_MISSING).
+        up = refs(2) | {"refs/tags/v1", "refs/tags/v2", "refs/tags/v3"}
         mir = refs(2) | {"refs/heads/retained-old"}
         verdict, detail = v.classify(repo(), up, mir, now=NOW)
         self.assertEqual(verdict, v.DRIFT)
@@ -238,6 +241,7 @@ class TestMainRoutesPatToPrivateOnly(unittest.TestCase):
         with mock.patch.object(v, "ref_set", side_effect=fake_ref_set), \
              mock.patch.object(v, "_api", return_value=forge_repos), \
              mock.patch.object(v, "read_github_pat", return_value="PAT123"), \
+             mock.patch.object(v, "github_repo_private", return_value=None), \
              mock.patch("builtins.open", mock.mock_open(read_data="forge-token")):
             v.main(["--quiet-ok"])
         upstream = {url: pat for (url, pat) in calls if "github.com" in url}
@@ -245,6 +249,282 @@ class TestMainRoutesPatToPrivateOnly(unittest.TestCase):
                          "private upstream must be authed with the PAT")
         self.assertIsNone(upstream["https://github.com/example-org/pub.git"],
                           "public upstream must NOT carry the PAT")
+
+
+class TestVisibilityParity(unittest.TestCase):
+    """T-2881: flag ONLY the exposure direction — PUBLIC on forge + PRIVATE on github."""
+
+    def test_public_mirror_private_upstream_is_EXPOSED(self):
+        verdict, detail = v.classify(repo(name="leak", private=False), refs(3), refs(3),
+                                     now=NOW, upstream_private=True)
+        self.assertEqual(verdict, v.EXPOSED)
+        self.assertIn("PUBLIC on forge but PRIVATE on github", detail)
+
+    def test_public_mirror_public_upstream_is_not_exposed(self):
+        verdict, _ = v.classify(repo(name="pub", private=False), refs(3), refs(3),
+                                now=NOW, upstream_private=False)
+        self.assertEqual(verdict, v.OK)
+
+    def test_private_mirror_public_upstream_is_benign_over_privacy(self):
+        # A private mirror of a public upstream is safe — over-privacy is never flagged.
+        verdict, _ = v.classify(repo(name="over", private=True), refs(3), refs(3),
+                                now=NOW, upstream_private=False)
+        self.assertEqual(verdict, v.OK)
+
+    def test_private_mirror_private_upstream_is_ok_not_exposed(self):
+        verdict, _ = v.classify(repo(name="both-priv", private=True), refs(2), refs(2),
+                                now=NOW, upstream_private=True)
+        self.assertEqual(verdict, v.OK)
+
+    def test_unreadable_upstream_visibility_is_not_flagged_failsafe(self):
+        # None = GitHub visibility unreadable → never cry wolf; falls through to ref/sync.
+        verdict, _ = v.classify(repo(name="unk", private=False), refs(2), refs(2),
+                                now=NOW, upstream_private=None)
+        self.assertEqual(verdict, v.OK)
+
+    def test_exposure_outranks_ref_drift_on_same_repo(self):
+        # A public-of-private mirror that is ALSO missing refs surfaces EXPOSED first
+        # (the security signal); the ref check resumes next run once visibility is fixed.
+        verdict, _ = v.classify(repo(name="both-bad", private=False), refs(5), refs(2),
+                                now=NOW, upstream_private=True)
+        self.assertEqual(verdict, v.EXPOSED)
+
+    def test_exposure_outranks_stale(self):
+        old = (NOW - timedelta(hours=200)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        verdict, _ = v.classify(repo(name="stale-exposed", private=False, mirror_updated=old),
+                                refs(2), refs(2), now=NOW, upstream_private=True)
+        self.assertEqual(verdict, v.EXPOSED)
+
+    def test_default_upstream_private_none_preserves_legacy_behavior(self):
+        # Omitting the new kwarg must not change any pre-T-2881 verdict.
+        verdict, _ = v.classify(repo(name="legacy", private=False), refs(3), refs(3), now=NOW)
+        self.assertEqual(verdict, v.OK)
+
+
+class TestGithubRepoPrivate(unittest.TestCase):
+    """T-2881: the read-only GitHub visibility GET — graceful None on any unreadable."""
+
+    def _opener(self, payload=None, exc=None):
+        import io
+
+        def opener(req, timeout=None):
+            if exc is not None:
+                raise exc
+            # capture the request for header assertions
+            self._req = req
+            return io.BytesIO(json.dumps(payload).encode())
+        return opener
+
+    def test_returns_true_for_private_upstream(self):
+        got = v.github_repo_private("secret", "PAT", opener=self._opener({"private": True}))
+        self.assertIs(got, True)
+
+    def test_returns_false_for_public_upstream(self):
+        got = v.github_repo_private("open", "PAT", opener=self._opener({"private": False}))
+        self.assertIs(got, False)
+
+    def test_no_pat_is_none_no_call(self):
+        # No PAT → None WITHOUT any network attempt (opener that would explode if called).
+        def boom(req, timeout=None):
+            raise AssertionError("must not open a connection without a PAT")
+        self.assertIsNone(v.github_repo_private("x", None, opener=boom))
+
+    def test_http_error_is_none_failsafe(self):
+        import urllib.error
+        err = urllib.error.HTTPError("u", 404, "nf", {}, None)
+        self.assertIsNone(v.github_repo_private("gone", "PAT", opener=self._opener(exc=err)))
+
+    def test_missing_private_field_is_none(self):
+        self.assertIsNone(v.github_repo_private("weird", "PAT", opener=self._opener({"name": "x"})))
+
+    def test_uses_bearer_and_github_accept_header(self):
+        v.github_repo_private("r", "PAT9", opener=self._opener({"private": True}))
+        self.assertEqual(self._req.get_header("Authorization"), "Bearer PAT9")
+        self.assertEqual(self._req.get_header("Accept"), "application/vnd.github+json")
+        self.assertIn("api.github.com/repos/example-org/r", self._req.full_url)
+
+
+class TestTransientLagGrace(unittest.TestCase):
+    """T-2879: a mirror syncing ON SCHEDULE, showing active churn (retained
+    upstream-deleted refs), missing only a SMALL number of refs = transient
+    new-ref lag → WARN (surfaced, not a bad/exit-1 alert). A quiet repo, a stale
+    mirror, or a large drift still DRIFTs. This is the echo-prismatic case that
+    daily-alerted on benign lag."""
+
+    def _churning(self, missing_n, extra_n, *, age_h=1, interval="24h0m0s"):
+        # A repo with `extra_n` retained (churn) and `missing_n` upstream refs the
+        # mirror lacks. up = base ∪ missing-tags; mir = base ∪ retained-extras.
+        base = refs(3)
+        up = base | {f"refs/heads/new{i}" for i in range(missing_n)}
+        mir = base | {f"refs/heads/retained{i}" for i in range(extra_n)}
+        updated = (NOW - timedelta(hours=age_h)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        return v.classify(repo(mirror_interval=interval, mirror_updated=updated),
+                          up, mir, now=NOW)
+
+    def test_fresh_churn_small_missing_is_WARN_not_drift(self):
+        # The echo-prismatic case: 1 new ref not yet pulled, 2 branches retained,
+        # synced 1h ago on a 24h interval → transient lag, WARN.
+        verdict, detail = self._churning(missing_n=1, extra_n=2)
+        self.assertEqual(verdict, v.WARN, detail)
+        self.assertIn("transient new-ref lag", detail)
+        self.assertIn("self-resolves", detail)
+
+    def test_WARN_at_the_ceiling_but_DRIFT_above_it(self):
+        # Boundary: missing == ceiling → WARN; ceiling+1 → DRIFT (a bigger gap is
+        # not benign lag even under active churn).
+        at, _ = self._churning(missing_n=v.TRANSIENT_LAG_MAX_MISSING, extra_n=1)
+        over, _ = self._churning(missing_n=v.TRANSIENT_LAG_MAX_MISSING + 1, extra_n=1)
+        self.assertEqual(at, v.WARN)
+        self.assertEqual(over, v.DRIFT)
+
+    def test_quiet_repo_no_churn_still_DRIFTs_on_any_missing(self):
+        # No retained extras = no active-churn signal → a missing ref is a real gap
+        # even on a fresh sync. The ticket's explicit guard: quiet repos still alert.
+        verdict, detail = self._churning(missing_n=1, extra_n=0)
+        self.assertEqual(verdict, v.DRIFT, detail)
+        self.assertIn("MISSING", detail)
+
+    def test_stale_mirror_with_small_churn_drift_is_STALE_not_WARN(self):
+        # Sync staleness (tier 1) is untouched and outranks the grace: a mirror that
+        # is NOT syncing on schedule is a real problem regardless of churn.
+        verdict, detail = self._churning(missing_n=1, extra_n=2, age_h=100)
+        self.assertEqual(verdict, v.STALE, detail)
+
+    def test_overdue_but_not_stale_sync_does_not_get_the_grace(self):
+        # Age between the interval and the 2.5x STALE threshold is NOT "on schedule"
+        # (a pull was missed) → no grace → DRIFT, even with churn + small missing.
+        verdict, detail = self._churning(missing_n=1, extra_n=2, age_h=30)  # >24h, <60h
+        self.assertEqual(verdict, v.DRIFT, detail)
+
+    def test_WARN_does_not_count_as_a_bad_verdict(self):
+        # The whole point: WARN must not fail the run. main() counts only
+        # DRIFT/STALE/HOLLOW/EXPOSED as bad; assert WARN is excluded from that set.
+        self.assertNotIn(v.WARN, (v.DRIFT, v.STALE, v.HOLLOW, v.EXPOSED))
+
+
+class TestStateBasedGrace(unittest.TestCase):
+    """T-3114: the state-based 1-cycle grace. A missing ref is transient (WARN) until it
+    SURVIVES a sync (mirror_updated advanced, ref still absent) → real gap (DRIFT). Handles
+    the pure-ADDITION churn case T-2879's stateless grace cannot (no retained-extra signal)."""
+
+    S1 = "2026-08-24T00:00:00Z"
+    S2 = "2026-08-24T12:00:00Z"  # a later mirror_updated = a sync ran between runs
+
+    def test_first_observation_of_missing_is_WARN_fresh_grace(self):
+        # No prior state → a newly-missing ref gets its 1-cycle grace even though a sync
+        # stamp exists (it hasn't been observed-then-survived yet).
+        v_, d, entry = v.apply_transient_grace(
+            "add", v.DRIFT, "add: 1 MISSING", missing={"b2"}, mirror_updated=self.S1, prev=None)
+        self.assertEqual(v_, v.WARN, d)
+        self.assertEqual(entry, {"mirror_updated": self.S1, "missing": ["b2"]})
+
+    def test_missing_ref_that_survived_a_sync_is_DRIFT(self):
+        prev = {"mirror_updated": self.S1, "missing": ["b2"]}
+        v_, d, _ = v.apply_transient_grace(
+            "add", v.DRIFT, "add: 1 MISSING", missing={"b2"}, mirror_updated=self.S2, prev=prev)
+        self.assertEqual(v_, v.DRIFT)
+        self.assertIn("survived a sync", d)
+
+    def test_missing_ref_no_sync_since_stays_WARN(self):
+        # Same missing ref, but mirror_updated UNCHANGED → no sync ran → still in grace.
+        prev = {"mirror_updated": self.S1, "missing": ["b2"]}
+        v_, _, _ = v.apply_transient_grace(
+            "add", v.DRIFT, "add: 1 MISSING", missing={"b2"}, mirror_updated=self.S1, prev=prev)
+        self.assertEqual(v_, v.WARN)
+
+    def test_new_missing_ref_after_a_sync_gets_its_own_grace(self):
+        # Prior gap resolved; a DIFFERENT ref is missing now → transient (its first cycle).
+        prev = {"mirror_updated": self.S1, "missing": ["b2"]}
+        v_, _, _ = v.apply_transient_grace(
+            "add", v.DRIFT, "add: 1 MISSING", missing={"b9"}, mirror_updated=self.S2, prev=prev)
+        self.assertEqual(v_, v.WARN)
+
+    def test_partial_some_survived_some_new_is_DRIFT(self):
+        prev = {"mirror_updated": self.S1, "missing": ["b2"]}
+        v_, d, _ = v.apply_transient_grace(
+            "add", v.DRIFT, "add: 2 MISSING", missing={"b2", "b9"}, mirror_updated=self.S2, prev=prev)
+        self.assertEqual(v_, v.DRIFT)
+        self.assertIn("1 upstream ref", d)  # only the survived-a-sync one counts as real
+
+    def test_no_mirror_updated_stamp_keeps_DRIFT(self):
+        # Cannot reason about 'survived a sync' without a stamp → do NOT silence (keep DRIFT).
+        prev = {"mirror_updated": self.S1, "missing": ["b2"]}
+        v_, _, _ = v.apply_transient_grace(
+            "add", v.DRIFT, "add: 1 MISSING", missing={"b2"}, mirror_updated=None, prev=prev)
+        self.assertEqual(v_, v.DRIFT)
+
+    def test_non_drift_passes_through_but_records_missing(self):
+        # A T-2879 WARN (or OK) is untouched; its current missing-set is still persisted.
+        v_, d, entry = v.apply_transient_grace(
+            "churn", v.WARN, "churn: transient", missing={"b2"}, mirror_updated=self.S2,
+            prev={"mirror_updated": self.S1, "missing": ["b2"]})
+        self.assertEqual((v_, d), (v.WARN, "churn: transient"))
+        self.assertEqual(entry["missing"], ["b2"])
+
+    def test_state_roundtrip_and_failopen(self):
+        import os
+        import tempfile
+        with tempfile.TemporaryDirectory() as td:
+            p = os.path.join(td, "sub", "state.json")
+            self.assertEqual(v.load_state(p), {})  # missing file → {} (fail-open)
+            st = {"add": {"mirror_updated": self.S1, "missing": ["b2"]}}
+            v.save_state(p, st)
+            self.assertEqual(v.load_state(p), st)
+            open(p, "w").write("{ not json")  # malformed → {} (fail-open)
+            self.assertEqual(v.load_state(p), {})
+
+    def test_main_pure_addition_lag_is_WARN_first_then_DRIFT_after_sync(self):
+        from unittest import mock
+        # The class-level self.S1/self.S2 are hard-coded 2026-08-24 stamps and
+        # work for the pure-function apply_transient_grace tests (which
+        # receive a pinned NOW). This test drives v.main(), which reads
+        # datetime.now(timezone.utc) live — so as real time drifts past the
+        # 24h mirror_interval since S1, the pre-classify STALE gate fires
+        # first and the transient-grace path never runs (rc=1 instead of 0,
+        # T-3547 class 5). Rebase the two stamps onto real-now so the
+        # freshness window holds regardless of when the suite runs.
+        now = datetime.now(timezone.utc)
+        s1 = (now - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        s2 = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+        up_refs = refs(3)
+        mir_refs = set(list(up_refs)[:2])  # missing exactly 1, NO extra retained (pure-addition)
+        missing_sorted = sorted(up_refs - mir_refs)
+
+        def fake_ref_set(url, *, token=None, pat=None, run=None):
+            return up_refs if "github.com" in url else mir_refs
+
+        saved = {}
+
+        def fake_save(path, state):
+            saved.clear()
+            saved.update(state)
+
+        common = dict(read_github_pat=None, github_repo_private=None)
+        # Run 1: no prior state → WARN (fresh grace), run must not fail.
+        r1 = repo(name="add", private=False, mirror_updated=s1)
+        with mock.patch.object(v, "ref_set", side_effect=fake_ref_set), \
+             mock.patch.object(v, "_api", return_value=[r1]), \
+             mock.patch.object(v, "read_github_pat", return_value=None), \
+             mock.patch.object(v, "github_repo_private", return_value=None), \
+             mock.patch.object(v, "load_state", return_value={}), \
+             mock.patch.object(v, "save_state", side_effect=fake_save), \
+             mock.patch("builtins.open", mock.mock_open(read_data="forge-token")):
+            rc1 = v.main(["--quiet-ok"])
+        self.assertEqual(rc1, 0, "pure-addition transient lag must WARN, not fail the run")
+        self.assertEqual(saved["add"]["missing"], missing_sorted)
+
+        # Run 2: same ref still missing, but mirror_updated ADVANCED (a sync ran) → DRIFT → exit 1.
+        r2 = repo(name="add", private=False, mirror_updated=s2)
+        prev = {"add": dict(saved["add"])}
+        with mock.patch.object(v, "ref_set", side_effect=fake_ref_set), \
+             mock.patch.object(v, "_api", return_value=[r2]), \
+             mock.patch.object(v, "read_github_pat", return_value=None), \
+             mock.patch.object(v, "github_repo_private", return_value=None), \
+             mock.patch.object(v, "load_state", return_value=prev), \
+             mock.patch.object(v, "save_state", side_effect=fake_save), \
+             mock.patch("builtins.open", mock.mock_open(read_data="forge-token")):
+            rc2 = v.main(["--quiet-ok"])
+        self.assertEqual(rc2, 1, "a ref still missing after a sync is a real gap → DRIFT → exit 1")
 
 
 if __name__ == "__main__":

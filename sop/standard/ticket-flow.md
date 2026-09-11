@@ -30,6 +30,8 @@ Authored 2026-06-02 (T-0727 thread). Canonical reference for how tickets move th
 
 Child tickets with non-empty `depends_on` file into `inbox/` with the dep gate set in frontmatter — they stay parked (grooming + consumer skip them) until the dep resolves. On parent `resolve`, ORG-013 cascade-unblock removes the resolved tid from each dependant's `depends_on` in place. `not_before` is reserved for **real calendar dependencies** only (release windows, scheduled events) — not HO-side pacing.
 
+**Carrier tickets vs the one-active WIP cap (PO arcs).** *(Added 2026-08-12 by Orchestrator, T-2652 arc.)* The T-0877 cap counts every `active` ticket whose `target` resolves to the claiming persona, and a project-orchestrator's sub-tickets normally carry the same persona as the arc's carrier. So the carrier must NOT sit in `active/` during sub-ticket execution — it would block every sub-ticket claim. Established shape (T-2812 / T-2815 / T-2868 precedent; ratified on the T-2652 broker arc): claim the carrier for its scoping burst, **unclaim it** back to `inbox/` before the first sub-ticket claim (its `auto_delivered` stamp keeps the consumer off it), run sub-tickets **claim→resolve serially, exactly one active at a time**, then re-claim the carrier for the closing burst (final legs, coverage-matrix rows, resolve). The active sub-ticket doubles as the persona's live "what's being worked" signal; the carrier's transition log + `parent_ticket` links carry the arc's continuity. Ordering corollary: when dep chains root at one ticket, file that root FIRST and claim it in the next command — file-time gating needs its id to exist, and claim-in-next-command is the minimal consumer window (D6-flagged and ratified, 2026-08-12).
+
 ## Git-mutation discipline (the auto-commit owns the index)
 
 *(Added 2026-07-14 by Orchestrator, T-1770 sweep S2 promotion — two failure modes, one root cause: `ticket.py`'s auto-commit assumes exclusive control of the git index/tree. Bugs: [`bugs/ticket-py-scope-guard-refuses-prestaged-index.md`](../../bugs/ticket-py-scope-guard-refuses-prestaged-index.md) + [`bugs/ticket-py-shared-checkout-interleaved-writer-race.md`](../../bugs/ticket-py-shared-checkout-interleaved-writer-race.md).)*
@@ -132,7 +134,7 @@ you build on it.
 
 ## Cross-references
 
-- `adr/ORG-019-blocked-state-retirement.md` — frontmatter blocks, no `blocked/` dir
+- `architecture/adr/ORG-019-blocked-state-retirement.md` — frontmatter blocks, no `blocked/` dir
 - ORG-013 (cascade-unblock) · ORG-015 (ratifiable_files) · T-0465 (intent) · T-0717 (one-active-ticket mutex)
 - `rulebook/directives.md` D9 (orchestrator response contract + ticket discipline)
 

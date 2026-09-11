@@ -69,5 +69,117 @@ class LiveSessionSlugTest(unittest.TestCase):
                 m.live_session_project_slug(acct).endswith("-pantheon-config"), acct)
 
 
+class ExpectedPolicySkipKeyTests(unittest.TestCase):
+    """T-3210: expected_policy_skip is a coarse reason-match TOKEN (one of
+    persona_bringup.py's four policy-skip reasons), not a free-text label --
+    validated at load (regex), not just isinstance(str), because it lives in
+    the same binding dict tools/persona_cutover_resolve.py's BespokeIdentity.
+    as_env() prints as an unquoted `KEY=value` line for a bash `eval` (see
+    _validated_expected_policy_skip's docstring in agent_role_map.py)."""
+
+    def _write_manifest(self, root, extra_line: str = "") -> "pathlib.Path":
+        import textwrap
+
+        manifest = root / "instance.yaml"
+        manifest.write_text(
+            textwrap.dedent(
+                f"""\
+                roles:
+                  specialist:
+                    persona: specialist
+                    account: claude-research
+                    {extra_line}
+                """
+            ),
+            encoding="utf-8",
+        )
+        return manifest
+
+    def test_valid_token_round_trips_through_instance_binding(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._write_manifest(
+                pathlib.Path(tmp), "expected_policy_skip: runtime_viability_blocked"
+            )
+            bindings = m._load_instance_bindings(manifest)
+            self.assertEqual(
+                bindings["specialist"]["expected_policy_skip"], "runtime_viability_blocked"
+            )
+
+    def test_free_text_label_is_rejected_not_passed_through(self):
+        # T-3210 Q1 disposition: a free-text label (parens/spaces) must NOT
+        # reach the loaded binding -- it would word-split under the unquoted
+        # bash eval BespokeIdentity.as_env() performs.
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._write_manifest(
+                pathlib.Path(tmp), 'expected_policy_skip: "not-cut-over (T-3210)"'
+            )
+            bindings = m._load_instance_bindings(manifest)
+            self.assertNotIn("expected_policy_skip", bindings["specialist"])
+
+    def test_absent_by_default(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            manifest = self._write_manifest(pathlib.Path(tmp))
+            bindings = m._load_instance_bindings(manifest)
+            self.assertNotIn("expected_policy_skip", bindings["specialist"])
+
+    def test_token_charset_is_eval_safe_in_a_real_subshell(self):
+        # The as_env-safety assertion Q1 asks for: prove the APPROVED charset
+        # (not the full BespokeIdentity/persona_cutover_resolve.py pipeline,
+        # which does not read this key today -- only bindings future
+        # consumers might inherit) survives an unquoted `KEY=value` eval
+        # unchanged, the exact shape tools/persona_cutover.sh/persona_
+        # rollback.sh use (see AsEnvBashSafetyTest in
+        # tools/test_persona_cutover_resolve.py).
+        import subprocess
+
+        value = "runtime_viability_blocked"
+        self.assertRegex(value, m._EXPECTED_POLICY_SKIP_RE)
+        result = subprocess.run(
+            ["bash", "-c", f"PCX_EXPECTED_POLICY_SKIP={value}\necho \"$PCX_EXPECTED_POLICY_SKIP\""],
+            capture_output=True, text=True, check=True,
+        )
+        self.assertEqual(result.stdout.strip(), value)
+
+
+class CairnAliasTests(unittest.TestCase):
+    """T-3478: cairn (the codex peer-daemon's self-name) must be a VALID ticket
+    target and must normalize to the codex account across all three resolve
+    axes. Before the fix, cairn passed through unchanged everywhere and was not
+    in the accepted-target set, so ticket_lint's retarget-to-originator bounce of
+    a cairn-requested ticket raised `unknown target 'cairn'` and the hourly
+    pantheon-ticket-lint unit exited 1."""
+
+    def test_resolve_persona_collapses_cairn_to_codex(self):
+        # The load-bearing one: ticket target/requester normalization. Pre-fix
+        # this returned "cairn" (identity passthrough).
+        self.assertEqual(m.resolve_persona("cairn"), "codex")
+
+    def test_resolve_role_collapses_cairn_to_codex(self):
+        # Ledger agent-id axis: an alias must not survive into a ledger write.
+        self.assertEqual(m.resolve_role("cairn"), "codex")
+
+    def test_resolve_instance_role_collapses_cairn_to_codex_grants(self):
+        # repos.yaml grants axis: cairn resolves to codex's instance role-key.
+        self.assertEqual(m.resolve_instance_role("cairn"), "peer-daemon-codex")
+
+    def test_cairn_is_an_accepted_target(self):
+        self.assertIn("cairn", m.valid_target_values())
+
+    def test_codex_and_other_names_unaffected(self):
+        # Regression guard: the alias must not disturb existing resolution.
+        self.assertEqual(m.resolve_persona("codex"), "codex")
+        self.assertEqual(m.resolve_persona("orchestrator"), "orchestrator")
+        self.assertEqual(m.resolve_persona("recovery"), "recovery")
+        self.assertEqual(m.resolve_role("codex"), "codex")
+        for name in ("orchestrator", "specialist", "recovery", "codex", "operator"):
+            self.assertIn(name, m.valid_target_values())
+
+
 if __name__ == "__main__":
     unittest.main()

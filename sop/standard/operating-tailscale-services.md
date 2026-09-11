@@ -8,7 +8,7 @@ Operating, observing, or restoring Pantheon's Tailscale Serve mappings:
 - Initial setup or re-setup after a host migration.
 - Auditing what the tailnet exposes from this node.
 
-Background: the kino backend (Pantheon PWA) binds `127.0.0.1:8443` only, fronted by Tailscale Serve which terminates TLS via Tailscale's cert machinery. See `adr/ORG-006-kino-pwa.md` §Decision/Auth-model for the full rationale (security invariant: backend MUST NEVER bind 0.0.0.0).
+Background: the kino backend (Pantheon PWA) binds `127.0.0.1:8443` only, fronted by Tailscale Serve which terminates TLS via Tailscale's cert machinery. See `architecture/adr/ORG-006-kino-pwa.md` §Decision/Auth-model for the full rationale (security invariant: backend MUST NEVER bind 0.0.0.0).
 
 ## The two service-scope serves Pantheon uses
 
@@ -126,7 +126,7 @@ This SOP covers operational state (status, restore, reset) of existing service-s
 
 ## Cross-references
 
-- `adr/ORG-006-kino-pwa.md` §Decision/Auth-model — auth model rationale + security invariant.
+- `architecture/adr/ORG-006-kino-pwa.md` §Decision/Auth-model — auth model rationale + security invariant.
 - `tickets/done/T-0098.md` — initial supervised first-fire of kino + tailscale serve setup (2026-05-06).
 - `tickets/done/T-0336.md` — first production restore (2026-05-14); the resolution surfaced the `--json` quirk that motivated this SOP.
 - `tickets/active/T-0337.md` — root-cause investigation for the disappearance (open).

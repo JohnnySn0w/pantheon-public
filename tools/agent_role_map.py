@@ -49,6 +49,7 @@ That doc covers the persona<->AUDIT-role-id table only, not instance role-keys.)
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -107,6 +108,51 @@ AGENT_ROLE_MAP: dict[str, str] = {
 # Inverse map: audit role-id → persona name (for ticket target/requester normalization).
 # Derived from AGENT_ROLE_MAP; recovery is its own inverse.
 _ROLE_PERSONA_MAP: dict[str, str] = {v: k for k, v in AGENT_ROLE_MAP.items()}
+
+
+# ---------------------------------------------------------------------------
+# Persona ALIASES — an alternate NAME for an already-registered persona, not a
+# new identity. Distinct from the audit-role-id ↔ persona axis above: a role-id
+# (orchestrator) and its persona (orchestrator) are two names the map already
+# pairs; an alias is a THIRD kind of name that collapses onto a persona which
+# already owns its role-id + account binding.
+#
+#   cairn → codex : cairn is the SELF-NAME of the codex peer-daemon
+#     (project_cairn_is_codex_persona / reference_cairn_rename_doc_scope). codex
+#     is the OS account + harness/CLI (ORG-018/ORG-031); cairn is the persona it
+#     named itself. A ticket can legitimately carry requester/target: cairn
+#     (e.g. T-3387), so cairn must be a VALID ticket target AND must normalize to
+#     the codex account EVERYWHERE. Modeled as an alias, NOT an AGENT_ROLE_MAP
+#     entry: codex already holds the audit role-id, instance-role, and account
+#     binding; a parallel `cairn` persona would fork that identity and, lacking
+#     an account binding, trip the account-map collision/None guards.
+#     (T-3478: without this, ticket_lint's retarget-to-originator bounce of a
+#     cairn-requested ticket shelled `ticket.py retarget --to cairn`, which
+#     raised `unknown target 'cairn'`, so pantheon-ticket-lint exited 1 hourly.)
+#
+# To add an alias: one entry here. It is folded into _valid_target_values() (in
+# ticket.py, via PERSONA_ALIASES keys) and into all three resolve_* functions
+# below (via _dealias), so an alias never survives into a ticket target/
+# requester, a ledger agent-id, or a repos.yaml grants lookup.
+# ---------------------------------------------------------------------------
+PERSONA_ALIASES: dict[str, str] = {
+    "cairn": "codex",
+}
+
+
+def _dealias(name: str) -> str:
+    """Collapse a persona ALIAS onto its canonical persona (cairn → codex);
+    every non-alias name passes through unchanged. Applied as the FIRST step of
+    the resolve_* functions so an alias is never emitted downstream."""
+    return PERSONA_ALIASES.get(name, name)
+
+
+def valid_target_values() -> set[str]:
+    """The set of names accepted as a ticket `target:`/`requester:` — persona
+    names + audit role-ids + persona aliases + `operator`. Single source of truth
+    for ticket.py's target validation (previously it unioned the map keys/values
+    inline and so did not know about aliases — the T-3478 gap)."""
+    return set(AGENT_ROLE_MAP.keys()) | set(AGENT_ROLE_MAP.values()) | set(PERSONA_ALIASES.keys()) | {"operator"}
 
 
 # ---------------------------------------------------------------------------
@@ -191,6 +237,15 @@ def _load_instance_role_map(manifest_path: Path) -> dict[str, str]:
 # just an account. `restart_pane` is the structured field that replaces parsing the
 # freeform `session:` prose.
 _FALLBACK_PERSONA_TO_BINDING: dict[str, dict] = {
+    # T-2953 R31 (reverted T-3098, 2026-08-23): mirrors instance.yaml
+    # roles.orchestrator's updated comment. `supervisor` stays ABSENT
+    # here pre-T-2953 cutover -- orchestrator's interactive session still lives on
+    # the bespoke claude-telegram.service below, so a control-plane marking
+    # made restart_drain.py / context_fill_monitor.py derive the oneshot
+    # consume unit as the restart target, which cannot cycle that session.
+    # restart_service below is the truthful pre-cutover target. T-2953 (the
+    # full control-plane cutover) re-adds this field as its own completion
+    # step.
     "orchestrator": {"account": "claude", "restart_service": "claude-telegram.service",
               "restart_mode": "user", "restart_pane": "claude-telegram-bot:0"},
     "specialist": {"account": "claude-research", "restart_service": "claude-telegram-research.service",
@@ -205,21 +260,41 @@ _FALLBACK_PERSONA_TO_BINDING: dict[str, dict] = {
               # a bespoke systemd unit -- restart_drain.py / context_fill_monitor.py
               # branch the restart mechanism on this, not on restart_service
               # (which stays the RETIRED bespoke unit's documentation value).
-              "supervisor": "control-plane"},
+              "supervisor": "control-plane",
+              # T-3210: mirrors instance.yaml roles.specialist.expected_policy_skip
+              # exactly (same exact-dict-equality guard). specialist is expected
+              # not-cut-over (stale 08-14 runtime.json -> every consume fire is
+              # runtime_viability_blocked); fleet_health renders OK+expected
+              # while the seat's coarse skip reason matches this, WARN if it
+              # drifts. Absent here, a manifest-less env would render WARN.
+              "expected_policy_skip": "runtime_viability_blocked"},
+    # T-2684 (reverted T-3082, 2026-08-23): mirrors instance.yaml
+    # roles.recovery's updated comment. `supervisor` stays ABSENT
+    # here pre-T-3026 -- recovery's control-plane cutover (T-2590) moved only
+    # the consume plane; the interactive session still lives on the bespoke
+    # claude-telegram-fallback.service below, so a control-plane marking
+    # made restart_drain.py / context_fill_monitor.py derive the oneshot
+    # consume unit as the restart target, which cannot cycle that session.
+    # restart_service below is the truthful pre-cutover target. T-3026 (the
+    # interactive-session cutover) re-adds this field as its own completion
+    # step.
     "recovery": {"account": "claude-fallback", "restart_service": "claude-telegram-fallback.service",
-             "restart_mode": "user", "restart_pane": "claude-telegram-bot-fallback:0",
-             # T-2684: mirrors instance.yaml roles.recovery.supervisor
-             # exactly (same exact-dict-equality guard as specialist's companion_units/
-             # supervisor above). Marks recovery as living on the control-plane
-             # (T-2590 cutover) rather than a bespoke systemd unit --
-             # restart_drain.py / context_fill_monitor.py branch the restart
-             # mechanism on this, not on restart_service (which stays the
-             # RETIRED bespoke unit's documentation value).
-             "supervisor": "control-plane"},
+             "restart_mode": "user", "restart_pane": "claude-telegram-bot-fallback:0"},
     "mnemosyne": {"account": "exocortex", "restart_service": "claude-telegram-exocortex.service",
                   "restart_mode": "user", "restart_pane": "claude-telegram-bot-exocortex:0"},
-    "metis": {"account": "suborch1"},
-    "atlas": {"account": "suborch2"},
+    # T-3210: metis mirrors instance.yaml roles.sub-orchestrator-1.expected_policy_skip
+    # (controller never onboarded metis -> every consume fire is
+    # runtime_viability_blocked; expected not-cut-over). Same guard as specialist above.
+    "metis": {"account": "suborch1", "expected_policy_skip": "runtime_viability_blocked"},
+    # T-3574 (orchestrator ruling (b), 2026-09-08): atlas mirrors instance.yaml
+    # roles.sub-orchestrator-2.expected_policy_skip — atlas is not-cut-over
+    # (controller never onboarded atlas -> initial-viability-state-not-selected;
+    # expected not-cut-over). DELIBERATELY NOT supervisor:control-plane — that
+    # premature marker was reverted twice (T-3098 orchestrator / T-3082 recovery) because it
+    # makes the monitors derive a consume mailbox-drain unit that cannot cycle the
+    # session. Kept in sync with the manifest per Guard D
+    # (test_binding_fallback_never_contradicts_instance_yaml). Same shape as metis.
+    "atlas": {"account": "suborch2", "expected_policy_skip": "runtime_viability_blocked"},
     # Peer daemons (T-2256): account-only, matching instance.yaml — neither carries
     # restart-config (codex runs under codex-supervise.sh with Restart=always; the
     # ancestor is a veneration daemon + mailbox hub, not a monitored session).
@@ -238,6 +313,29 @@ _FALLBACK_PERSONA_TO_BINDING: dict[str, dict] = {
 # same plain-string isinstance(v, str) loading path in _load_instance_bindings
 # below, no special-casing needed (unlike companion_units, which is list-typed).
 _BINDING_RESTART_KEYS = ("restart_service", "restart_mode", "restart_pane", "supervisor")
+
+# T-3210: matches persona_bringup.py's four coarse policy-skip counter reasons
+# (backoff / runtime_transition / quota_breaker_open / runtime_viability_blocked)
+# -- a reason-match TOKEN, not a free-text label, and validated (not merely
+# isinstance(str)) at load, unlike _BINDING_RESTART_KEYS' shared plain-string
+# loop below: this key's dict lives in the SAME binding BespokeIdentity.as_env()
+# (tools/persona_cutover_resolve.py) prints as an UNQUOTED `KEY=value` line for
+# persona_cutover.sh/persona_rollback.sh to `eval` directly (see
+# _encode_companion_units' docstring just below). A future consumer that reads
+# this key the way resolve_bespoke_identity() reads account/restart_service/
+# companion_units today would inherit that eval unchanged, so a value with
+# spaces or parens must never reach entry[...] -- restricted at the source,
+# not left to each future reader to remember.
+_EXPECTED_POLICY_SKIP_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def _validated_expected_policy_skip(raw: object) -> str | None:
+    """Return *raw* if it is a non-empty string matching
+    _EXPECTED_POLICY_SKIP_RE, else None (malformed entries are dropped, not
+    raised -- matching this loader's overall fail-safe posture)."""
+    if not isinstance(raw, str) or not raw:
+        return None
+    return raw if _EXPECTED_POLICY_SKIP_RE.match(raw) else None
 
 
 def _encode_companion_units(raw: object) -> str:
@@ -268,10 +366,11 @@ def _encode_companion_units(raw: object) -> str:
 
 def _load_instance_bindings(manifest_path: Path) -> dict[str, dict]:
     """Return persona → {account, restart_service, restart_mode, restart_pane,
-    companion_units} from instance.yaml `roles:`. Only the keys present in a
-    role are included. Falls back to _FALLBACK_PERSONA_TO_BINDING if the
-    manifest is absent/unreadable/malformed (fail-safe — a missing manifest
-    must not break the monitors' import)."""
+    companion_units, expected_policy_skip} from instance.yaml `roles:`. Only
+    the keys present in a role are included. Falls back to
+    _FALLBACK_PERSONA_TO_BINDING if the manifest is absent/unreadable/
+    malformed (fail-safe — a missing manifest must not break the monitors'
+    import)."""
     try:
         import yaml  # lazy import; matches the pattern above
         data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
@@ -297,6 +396,14 @@ def _load_instance_bindings(manifest_path: Path) -> dict[str, dict]:
             companion_units = _encode_companion_units(binding.get("companion_units"))
             if companion_units:
                 entry["companion_units"] = companion_units
+            # T-3210: validated separately (regex, not bare isinstance(str)) --
+            # see _validated_expected_policy_skip's docstring for why this
+            # key can't ride the shared _BINDING_RESTART_KEYS loop above.
+            expected_policy_skip = _validated_expected_policy_skip(
+                binding.get("expected_policy_skip")
+            )
+            if expected_policy_skip:
+                entry["expected_policy_skip"] = expected_policy_skip
             out[persona] = entry
         return out or {p: dict(b) for p, b in _FALLBACK_PERSONA_TO_BINDING.items()}
     except Exception:
@@ -377,10 +484,12 @@ def mailbox_group() -> str:
 
 def instance_binding(persona: str) -> dict:
     """Return a COPY of *persona*'s instance.yaml binding — {account[, restart_service,
-    restart_mode, restart_pane, companion_units]} — or {} if the persona has no role
-    binding. Used by the fleet monitors (T-2076) to source accounts/services from
-    instance.yaml, and by tools/persona_cutover_resolve.py (T-2648) for companion
-    systemd units sharing a persona's default tmux socket."""
+    restart_mode, restart_pane, companion_units, expected_policy_skip]} — or {} if the
+    persona has no role binding. Used by the fleet monitors (T-2076) to source
+    accounts/services from instance.yaml, by tools/persona_cutover_resolve.py (T-2648)
+    for companion systemd units sharing a persona's default tmux socket, and by
+    tools/fleet_health.py (T-3210) for the expected-not-cut-over policy-skip
+    annotation."""
     return dict(_PERSONA_TO_BINDING.get(persona, {}))
 
 
@@ -575,7 +684,11 @@ def resolve_role(persona: str) -> str:
     This returns the AUDIT role-id (underscored: orchestrator / specialist / recovery),
     which is the canonical form for ledger `agent:` fields. Do NOT use this for
     repos.yaml grants lookup — use resolve_instance_role() instead.
+
+    A persona alias (cairn) is collapsed to its canonical persona (codex) first,
+    so an alias never lands in a ledger `agent:` field either.
     """
+    persona = _dealias(persona)
     return AGENT_ROLE_MAP.get(persona, persona)
 
 
@@ -591,11 +704,13 @@ def resolve_persona(role_or_persona: str) -> str:
         resolve_persona("recovery")              -> "recovery"   (identity)
         resolve_persona("orchestrator")             -> "orchestrator"  (already persona; passthrough)
         resolve_persona("operator")           -> "operator" (not in map; passthrough)
+        resolve_persona("cairn")             -> "codex"   (alias → canonical persona)
 
     Identity fallback preserves backward compatibility for unregistered names.
     Ledger `agent:` fields should NOT be passed through this function — they
     remain audit-role-id-canonical for audit-chain continuity (use resolve_role there).
     """
+    role_or_persona = _dealias(role_or_persona)
     return _ROLE_PERSONA_MAP.get(role_or_persona, role_or_persona)
 
 
@@ -617,8 +732,13 @@ def resolve_instance_role(persona_or_audit_role: str) -> str:
         resolve_instance_role("recovery")           -> "recovery"
         resolve_instance_role("operator")        -> "operator"  (not in map; passthrough)
 
+        resolve_instance_role("cairn")          -> "peer-daemon-codex"  (alias → codex)
+
     Identity fallback preserves behavior for unregistered names.
     """
+    # Step 0: collapse a persona alias (cairn → codex) so it resolves to the
+    # canonical persona's grants, not an unbound alias name.
+    persona_or_audit_role = _dealias(persona_or_audit_role)
     # Step 1: normalize audit role-id → persona (e.g. specialist → specialist).
     persona = _ROLE_PERSONA_MAP.get(persona_or_audit_role, persona_or_audit_role)
     # Step 2: persona → instance role-key.

@@ -20,6 +20,7 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import yaml
@@ -32,6 +33,7 @@ from tools.persona_cutover_resolve import (
     resolve_bespoke_identity,
     resolve_persona,
 )
+from tools.persona_apply_path import controlled_apply_environment
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTANCE_YAML = REPO_ROOT / "instance.yaml"
@@ -340,6 +342,13 @@ class AsEnvBashSafetyTest(unittest.TestCase):
             "1001:/home/claude-fallback:claude-telegram-fallback.service",
         )
 
+    def test_cutover_and_rollback_export_resolver_dbus_address(self) -> None:
+        for script in ("persona_cutover.sh", "persona_rollback.sh"):
+            with self.subTest(script=script):
+                source = (REPO_ROOT / "tools" / script).read_text(encoding="utf-8")
+                self.assertIn('DBUS="$PCX_DBUS_SESSION_BUS_ADDRESS"', source)
+                self.assertIn('export DBUS_SESSION_BUS_ADDRESS="$DBUS"', source)
+
 
 class CompanionUnitsEncodingTest(unittest.TestCase):
     """T-2648: companion_units is a space-joined ``unit=session`` token string
@@ -382,6 +391,21 @@ class ResolveBespokeIdentityTest(unittest.TestCase):
     with ZERO manifest access, matching tools/t2590_recovery_rollback.sh's own
     precedent (grep-verified: no MANIFEST reference anywhere in that
     script)."""
+
+    def test_controlled_apply_environment_matches_cutover_resolver_for_arbitrary_uid_home(self) -> None:
+        home = Path("/srv/pantheon/accounts/example-seat")
+        passwd = SimpleNamespace(pw_uid=4242, pw_dir=str(home))
+        with mock.patch("tools.persona_cutover_resolve.pwd.getpwnam", return_value=passwd):
+            identity = resolve_bespoke_identity("recovery", unit_text=RECOVERY_UNIT_TEXT)
+        expected = controlled_apply_environment(home, passwd.pw_uid)
+        self.assertEqual(identity.home, home)
+        self.assertEqual(identity.apply_path, expected["PATH"])
+        self.assertEqual(identity.xdg_runtime_dir, Path(expected["XDG_RUNTIME_DIR"]))
+        self.assertEqual(identity.dbus_session_bus_address, expected["DBUS_SESSION_BUS_ADDRESS"])
+        self.assertEqual(
+            identity.as_env()["PCX_DBUS_SESSION_BUS_ADDRESS"],
+            expected["DBUS_SESSION_BUS_ADDRESS"],
+        )
 
     def test_recovery_bespoke_identity_matches_hardcoded_constants(self) -> None:
         identity = resolve_bespoke_identity("recovery", unit_text=RECOVERY_UNIT_TEXT)

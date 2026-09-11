@@ -1,0 +1,10 @@
+[Unit]
+Description=Pantheon VPS non-git state backup — daily fire (03:30 UTC, off the other fleet timers)
+
+[Timer]
+OnCalendar=*-*-* 03:30:00 UTC
+Persistent=true
+Unit=pantheon-vps-state-backup.service
+
+[Install]
+WantedBy=timers.target

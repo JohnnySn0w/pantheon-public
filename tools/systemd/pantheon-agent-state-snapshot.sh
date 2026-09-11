@@ -23,9 +23,12 @@
 # only path. Run it manually right after editing HANDOFF.md.
 set -Eeuo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CONTINUITY_TOOL="$SCRIPT_DIR/../persona_continuity.py"
 REPO="${PANTHEON_AGENT_STATE_REPO:-$HOME/.local/state/pantheon/agent-state-history}"
 MEMORY_DIR="${PANTHEON_MEMORY_DIR:-$HOME/.claude/projects/-home-claude/memory}"
 HANDOFF="${PANTHEON_HANDOFF:-$HOME/HANDOFF.md}"
+CONTINUITY_DIR="${PANTHEON_CONTINUITY_DIR:-$HOME/.local/state/pantheon/continuity}"
 # T-2736: not every memory-bearing seat has a HANDOFF.md. Sub-orchestrators
 # atlas/metis carry accumulated memory but no HANDOFF, so a hard "HANDOFF
 # MISSING -> exit 3" leaves their single-copy memory UNPROTECTED — the exact
@@ -58,6 +61,19 @@ rsync -a --delete "$MEMORY_DIR/" "$REPO/memory/"
 # Snapshot the HANDOFF whenever one exists (both modes); memory-only seats simply
 # have none to copy.
 [[ -f "$HANDOFF" ]] && cp -p "$HANDOFF" "$REPO/HANDOFF.md"
+
+# T-3176: record only a bounded local inventory of portable continuity
+# envelopes. The module owns the temp-write/fsync/readback/atomic-replace
+# transaction, so a failed validation cannot truncate prior inventory evidence.
+# Protected payload bytes stay in their source directory and no remote is used.
+if [[ -d "$CONTINUITY_DIR" ]]; then
+  python3 "$CONTINUITY_TOOL" snapshot-inventory \
+    --continuity-root "$CONTINUITY_DIR" \
+    --output "$REPO/continuity-inventory.json" \
+    --json >/dev/null
+else
+  echo "note: no continuity state at $CONTINUITY_DIR — inventory unchanged" >&2
+fi
 
 cd "$REPO"
 git add -A

@@ -1,0 +1,51 @@
+# Repo-global tool ops implicitly bind to the worktree they run from
+
+**Date authored:** 2026-08-27
+**Author:** Orchestrator (Orchestrator)
+**Status:** Authored (lessons/ is an Authored, non-ratifiable class per ORG-015)
+**Re-evaluate when:** a fourth same-pattern bug surfaces (promotes from "pattern" to "structural rule needed now"); or when a structural guard lands in `tools/_git_utils.py` / `tools/ticket.py` that refuses main-checkout-only ops from an agent worktree.
+
+## Observation
+
+Tools that assume a "repo-global" scope — the ones that talk to git remotes, mutate branches, run sync-at-startup, or commit as a side effect — bind implicitly to whatever checkout they run from. On the main checkout, the binding is invisible: a fetch+merge is a no-op if main is current; a ticket.py annotation lands on main; a hook check reads main's `HOOK_ALLOWLIST`. The exact same operation, run inside an `agent/<task>` worktree, silently mutates the AGENT branch instead — an in-flight branch's base fast-forwards under the worker; a ticket transition log lands on the branch (not main); the pairing-guard compares live seat state against a stale worktree checkout and refuses every commit.
+
+The pattern is: **the tool asks "what repo?" and gets the answer from `__file__` or cwd — not from an explicit "am I on the main checkout?" assertion**. The worktree looks like a repo to the tool, so the tool operates on it. Every mutation the tool makes "to the repo" is actually to whatever branch the worktree happens to be on.
+
+Three cases so far (three distinct tools, three distinct worker-shape failure modes, one shared mechanism):
+
+1. Test suite's `activity_digest.main()` path ran a real `git pull` at startup — the worktree's branch fast-forwarded silently during the test run, moving a bt1-builder's base commit mid-arc (bugs/test-suite-real-git-pull-moves-worktree-branch.md; T-2841/T-2898).
+2. `ticket.py annotate` inside a worktree auto-committed the transition-log note onto the AGENT branch (main's ticket file never saw it) AND the CLI's sync helper merged `origin/main` into the branch, pulling in a just-landed T-2842 diff and invalidating the PO's recorded sweep baseline (bugs/ticket-cli-in-agent-worktree-merges-main-into-branch.md; T-2910 arc, 2026-08-12).
+3. A live hook rollout landed the pairing-guard `HOOK_ALLOWLIST` addition on main. Every in-flight agent worktree on that seat was structurally stranded: the pairing guard reads the seat's LIVE `~/.claude/settings.json` (rollout applied) but compares against the WORKTREE's checkout of `tools/context_fill_monitor.py` (pre-rollout allowlist). Every commit on every stranded worktree refused (bugs/live-hook-rollout-strands-inflight-agent-worktrees-pairing-guard.md; T-2912 stranding, 2026-08-12).
+
+## Grounding
+
+The three bugs are the direct source. Each bug carries its own reproducer + fix + verification. Their shared frontmatter-symptom + domain don't collide by accident — the domain slot names `worktree` in all three even though the tool families differ (`tests` / `ticket-cli` / `hooks`).
+
+The bug-cluster meets ORG-012 promotion criterion 1 (bug-to-lesson threshold): three distinct bugs, one shared structural mechanism, first- and second-order design surface. Specialist flagged the promotion in T-2976 (filed 2026-08-18); T-2975's ORG-012 sweep index called out `worktree` as one of the two verified promotion candidates.
+
+Landing dates: T-2841 build-strand 2026-08-12; T-2910 ticket.py drift 2026-08-12; T-2912 hook stranding 2026-08-12. All three surfaced within a 24-hour window mid-broker-daemon rollout — the density itself is a signal: parallel worker cycles under an active hook rollout is exactly when the shared-mechanism failure mode compounds.
+
+## Design implications
+
+- **Structural guard on `tools/_git_utils.py`.** The bug-2 and bug-1 mechanisms are the same shape: sync helpers resolve `REPO_ROOT` from `__file__` and operate on the current checkout without asking whether the current checkout is main. A repo-root/branch guard here — refuse to run remote-mutating sync ops when `git branch --show-current` starts with `agent/` — would close both bugs at once. Bug-2's own fix section names this as the structural direction ("a structural fix would be a repo-root/branch guard in `_git_utils`"). Nothing has landed yet.
+- **Structural guard on `tools/ticket.py`.** Same shape at the CLI level: ticket.py should refuse verbs that mutate the ticket file when it's running on an `agent/*` branch. The bug-2 fix section explicitly calls this out ("worth a structural guard eventually — ticket.py refusing to run when `git branch --show-current` starts with `agent/`"). Discipline layer today; structural fix pending.
+- **Test-suite discipline for `main()`-path tests.** Any test that exercises a tool's `main()` must mock its repo-sync call — grep `pull_repo_or_warn` / `_pull_if_needed` callers when adding a new `main()`-path test (T-2898 landed the patch pattern for `activity_digest`; the RULE — grep before adding — is the durable output). A structural fix here would be a test-fixture-scoped `_git_utils` shim that fails the test suite fast if a real remote call escapes mocking.
+- **Hook-rollout dispatcher responsibility.** The rollout owner creates the stranding when they land a new `HOOK_ALLOWLIST` entry on main while agent worktrees exist; the rollout owner clears it (cherry-pick the allowlist commit onto each live `agent/*` branch on the seat, or brief the workers to). SOP-tier: candidate `sop/standard/hook-rollout-with-inflight-workers.md`.
+- **Worker briefs vs dispatcher-tier ownership.** Two dispatcher-side moves are both real prevention: (a) brief POs/implementers that ticket.py runs from the main checkout only; (b) HO absorbs the ticket-log persistence — the worker returns transition text, the dispatcher writes it on main. Option (b) matches [[feedback_dont_brief_workers_to_write_guarded_paths]] — the ticket file is a guarded shared-state surface and worker writes into it are exactly the failure mode the pin covers.
+- **Repo-root probe recipe (30-second check).** For any tool being added to the worker briefing surface, grep the tool for `pull_repo_or_warn` / `_pull_if_needed` / `git.commit` / `git.fetch` — every hit is a candidate for the worktree-implicit-binding failure mode. If the tool acts on remote git state, the tool needs either an explicit "main-checkout-only" guard or an alternate worker-safe entrypoint that operates on a passed-in repo path rather than a cwd-resolved one.
+
+## Open questions
+
+- **Guard shape.** Both structural guards (`_git_utils` + `ticket.py`) want the same test — "am I on main?" — but the two most-obvious probes have edge cases. `git branch --show-current` returns empty on detached HEAD (some review worktrees are detached; the guard would false-pass). `git rev-parse --show-superproject-working-tree` only names submodule superprojects, not worktree main-checkouts. The candidate probe: compare `git rev-parse --show-toplevel` to a hard-coded main-checkout path OR to the output of `git worktree list --porcelain | head -1`. Wants a small design pass before landing.
+- **Structural vs. discipline.** ORG-012 promotion criterion 2 (structural-fix-exists → prefer structural) suggests the guards SHOULD land rather than the discipline layer carrying them. Counter-argument: the same worker-tier discipline (dispatcher owns ticket-log-persistence + main-checkout ticket.py) prevents the failure mode across ALL new tools of the same class without waiting for each to be individually guarded. Both approaches are compatible.
+- **Cross-persona surface.** All three cases surfaced on the claude/Orchestrator seat. The mechanism is not persona-specific — an specialist or recovery worker on an agent branch would hit the same bugs. Specialist's ORG-012 promote likely reflects this. Verifying whether the fleet's other agent-branch-authoring seats (metis, atlas) have seen instances of the same pattern is a separate check.
+- **Live hook rollout mitigation ladder.** Bug-3's dispatcher-side prevention (cherry-pick the allowlist commit onto every live agent branch on the seat) works, but scales poorly if a rollout touches many hooks or many worktrees exist. A structural improvement would be to widen the pairing guard's read of `HOOK_ALLOWLIST` to include both the worktree's copy AND main's copy — a stranding-tolerant read, matching the failure mode's transient nature. Wants an ADR-adjacent design conversation.
+
+## Cross-references
+
+- Bugs (source): `bugs/test-suite-real-git-pull-moves-worktree-branch.md`, `bugs/ticket-cli-in-agent-worktree-merges-main-into-branch.md`, `bugs/live-hook-rollout-strands-inflight-agent-worktrees-pairing-guard.md`
+- Tickets: T-2841 (bt1-builder branch-drift arc), T-2898 (test-suite mock landing), T-2910 (broker-po-2 ticket.py drift), T-2912 (hook-stranding), T-2975 (ORG-012 sweep index), T-2976 (this lesson's promote request from specialist).
+- Related principles / directives: P4 evidence honesty (a silent branch fast-forward hides evidence of what code the test actually ran); D6 (structural-enforcement over discipline where feasible; the two guards above are the specific structural instances).
+- Related SOPs (candidate authoring): `sop/standard/hook-rollout-with-inflight-workers.md` (does not exist yet — candidate from design-implication 4 above).
+- Related memory pins: `feedback_worktree_ticket_copy_annotations_never_reach_main.md` (bug-2's dispatcher-side pinning), `feedback_dont_brief_workers_to_write_guarded_paths.md` (dispatcher owns writes to shared-state surfaces), `feedback_parallel_bash_calls_share_cwd_use_explicit_paths.md` (cwd-implicit binding is a broader class than just worktrees).
+- ADR context: ORG-015 (Authored non-ratifiable class for lessons/); ORG-012 (bug-to-lesson promotion methodology; bug-cluster criterion 1 met).

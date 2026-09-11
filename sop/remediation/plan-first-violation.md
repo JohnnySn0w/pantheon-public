@@ -63,7 +63,7 @@ This SOP is the *post-bypass* remediation. The *pre-bypass* structural fix is **
 
 - **Principles + directives:** P1 (architecture over policy — failure family); P5 (roles don't hop — implementer doesn't ratify own plan); D6 (plan-first protocol + locked-answer-deviation handling — directly violated rule); D8 (HO self-discipline — sticky-belief N=2 trigger informs Path B); D3 (autonomy bar — Path C placement).
 - **Policies:** `rulebook/policies/trust-posture.md` (auto-approve scope for REBOUND + revert + redispatch); `rulebook/policies/autonomy.md`.
-- **ADRs:** `adr/ORG-002` (principles/directives split — this SOP slots at the policy-tier).
+- **ADRs:** `architecture/adr/ORG-002` (principles/directives split — this SOP slots at the policy-tier).
 - **Incidents:** `incidents/2026-05-09-b33-ticket-state-sweep-multi-violation/` (founding multi-violation case; plan-first skip listed first of four).
 - **Lessons:** [`lessons/instruction-fidelity-collapse-discipline-vs-architecture.md`](../../lessons/instruction-fidelity-collapse-discipline-vs-architecture.md) (broader corpus framing).
 - **Sibling SOPs:** [`implementer-self-merge-to-main.md`](implementer-self-merge-to-main.md) (often co-occurs with plan-first skip; revert mechanics shared); [`claimed-prior-approval.md`](claimed-prior-approval.md) (sibling — framing-collapse often follows from plan-first skip when worker tries to back-attribute approval).

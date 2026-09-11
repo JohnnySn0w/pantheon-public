@@ -24,6 +24,7 @@ setup() {
   REPO="$SBX/repo"
   MEM="$SBX/memory"
   HO="$SBX/HANDOFF.md"
+  CONT="$SBX/continuity"
   git init -q "$REPO"
   git -C "$REPO" config user.email "test@pantheon.local"
   git -C "$REPO" config user.name "test"
@@ -40,6 +41,7 @@ run_sut() {
     "PANTHEON_AGENT_STATE_REPO=$REPO"
     "PANTHEON_MEMORY_DIR=$MEM"
     "PANTHEON_HANDOFF=$HO"
+    "PANTHEON_CONTINUITY_DIR=$CONT"
   )
   [[ "$req" != "-" ]] && env+=("PANTHEON_SNAPSHOT_REQUIRE_HANDOFF=$req")
   env "${env[@]}" bash "$SUT" >"$SBX/out" 2>"$SBX/err"
@@ -114,6 +116,41 @@ if [[ $RC -eq 0 && -f "$REPO/HANDOFF.md" ]]; then
   ok "optout_but_handoff_present_still_snapshotted"
 else
   bad "optout_but_handoff_present_still_snapshotted" "rc=$RC handoff_present=$([[ -f $REPO/HANDOFF.md ]]&&echo y)"
+fi
+teardown
+
+# --- 7: continuity envelopes produce local inventory, not copied payloads. --
+setup
+mkdir -m 700 "$CONT"
+cat > "$CONT/checkpoint.json" <<'JSON'
+{"schema":"pantheon-persona-continuity-checkpoint/v1","payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+JSON
+chmod 600 "$CONT/checkpoint.json"
+run_sut -
+if [[ $RC -eq 0 && -f "$REPO/continuity-inventory.json" ]] \
+   && grep -q 'pantheon-persona-continuity-checkpoint/v1' "$REPO/continuity-inventory.json" \
+   && [[ ! -f "$REPO/checkpoint.json" ]]; then
+  ok "continuity_inventory_records_envelope_without_copying_payload"
+else
+  bad "continuity_inventory_records_envelope_without_copying_payload" "rc=$RC inventory=$([[ -f $REPO/continuity-inventory.json ]]&&echo y)"
+fi
+teardown
+
+# --- 8: invalid continuity tree fails and preserves prior inventory bytes. ---
+setup
+mkdir -m 700 "$CONT"
+cat > "$CONT/checkpoint.json" <<'JSON'
+{"schema":"pantheon-persona-continuity-checkpoint/v1","payload_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}
+JSON
+chmod 600 "$CONT/checkpoint.json"
+run_sut -
+cp "$REPO/continuity-inventory.json" "$SBX/inventory.before"
+ln -s "$CONT/checkpoint.json" "$CONT/linked.json"
+run_sut -
+if [[ $RC -ne 0 ]] && cmp -s "$SBX/inventory.before" "$REPO/continuity-inventory.json"; then
+  ok "invalid_continuity_tree_preserves_prior_inventory"
+else
+  bad "invalid_continuity_tree_preserves_prior_inventory" "rc=$RC prior inventory changed or failure was accepted"
 fi
 teardown
 

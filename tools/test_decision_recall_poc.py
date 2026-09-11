@@ -336,8 +336,8 @@ class TestCLI(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.d = Path(self._tmp.name)
-        self.adr_dir = self.d / "adr"
-        self.adr_dir.mkdir()
+        self.adr_dir = self.d / "architecture" / "adr"
+        self.adr_dir.mkdir(parents=True)
         _write_adr(self.adr_dir, "ORG-013-relational.md", "ORG-013",
                    "Relational triggers on ticket resolve", "2026-05-14")
         self.triggers_path = self.d / "triggers.json"

@@ -1,0 +1,21 @@
+[Unit]
+Description=Pantheon activity_monitor meta-drift alarm — has a predicate gone silently stale? (T-3072)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+Documentation=file:///home/%u/pantheon-config/tools/activity_monitor_drift_check.py
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Reads the invoking account's own Recovery-local fire-log
+# (~/.local/state/pantheon/activity_monitor/fires.jsonl, written by that
+# account's own activity_monitor.py invocations via _record_fire, T-3072) —
+# no cross-account sudo needed; the fire-log and the monitor it observes are
+# colocated on the same (Recovery) account.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/activity_monitor_drift_check.py --check
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2min

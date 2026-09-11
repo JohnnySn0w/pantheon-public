@@ -1,0 +1,147 @@
+# Role-delta content — T-3339 Phase 1.
+#
+# Per-role body content composed on top of manifest.yaml's base_layer for
+# that role's spawn. Sibling of manifest.yaml; D2-protected; hand-curated,
+# NOT renderer-written (contrast with source-bindings.yaml).
+#
+# Each `roles.<role>.<delta_section>` value is either:
+#   - a single extract-descriptor dict (`{extract: ..., source: ..., ...}`
+#     or `{extract: inline, body: ...}`), or
+#   - a LIST of such descriptors, rendered in order and joined with a blank
+#     line between parts (used when a delta needs both a stamped-source
+#     excerpt AND inline commentary, e.g. project_orchestrator's
+#     chain_of_justification below).
+#
+# Cairn roles (cairn_worker, cairn_reviewer, cairn_temp_backup_orchestrator)
+# are declared in manifest.yaml's roles list but intentionally have NO entry
+# here — Phase 5 gates on the T-3333 charter ruling. Do not populate.
+
+version: 1
+
+roles:
+  implementer:
+    plan_first:
+      extract: heading-region
+      source: rulebook/directives.md
+      heading: "## D6 — Plan-first protocol + locked-answer-deviation handling"
+    testing_depth:
+      extract: heading-region
+      source: sop/standard/testing-depth-and-scope.md
+      heading: "## When to use this"
+    code_size_norms_body:
+      extract: full-file
+      source: rulebook/policies/code-size-norms.md
+    five_phase_signatures_first:
+      extract: inline
+      body: |
+        Five-phase signatures-first methodology (memory pin
+        `feedback_implementer_methodology_signatures_first.md`): plan ->
+        stubs -> tests -> code -> smoke. Return the plan first (this
+        section) and stop for approval; after approval, write function/method
+        SIGNATURES before bodies so the shape of the change is visible before
+        the logic is; write the FAILING test next (TDD is non-negotiable for
+        new behavior) and confirm it fails for the expected reason; then the
+        minimal implementation; then run the project's smoke loop. Not
+        sha-stamped — no ratified rulebook/sop source exists yet for this
+        specific five-phase framing; the text above restates the memory pin,
+        it does not invent new content.
+
+  reviewer:
+    preimplementation:
+      extract: full-file
+      source: sop/standard/pre-implementation-reviewer-discipline.md
+    codex_spec_review:
+      extract: full-file
+      source: sop/standard/codex-planning-spec-review.md
+    three_methodologies:
+      extract: full-file
+      source: sop/standard/reviewer-methodologies.md
+
+  project_orchestrator:
+    team_checklist:
+      extract: heading-region
+      source: sop/standard/team-orchestrator-dispatch-checklist.md
+      heading: "## Pre-dispatch checklist"
+    brief_construction:
+      extract: heading-region
+      source: sop/standard/team-orchestrator-brief-construction.md
+      heading: "## Canonical structure"
+    worker_silence_liveness:
+      extract: full-file
+      source: sop/standard/dispatch-and-wait-liveness.md
+    chain_of_justification:
+      - extract: heading-region
+        source: rulebook/principles.md
+        heading: "## P3 — Decisions justify upward"
+      - extract: inline
+        body: |
+          Operationalized: every dispatch brief explicitly requires the
+          dispatchee to (a) emit a DECISIONS section justifying-via P/D ids
+          on every material call, (b) recursively require the same of anyone
+          they in turn dispatch, (c) report back with the chain intact so it
+          can be lifted into the ledger. Do not rely on
+          inheritance-by-reference — a restart-fresh dispatchee may not load
+          a file merely named in the brief; spell the requirement out
+          operationally at every dispatch boundary. Full operational text:
+          `~/CLAUDE.md` section "Chain of justification" (user-scope, outside
+          this repo's git tree — not sha-stamped here; P3 above is the
+          stamped principle-tier anchor for the same rule).
+
+          FIX-SOON: no dedicated repo-stampable SOP exists for this
+          cross-cutting rule — several SOPs (team-orchestrator-brief
+          -construction.md, team-orchestrator-dispatch-checklist.md,
+          plan-first-dispatch.md, retask-dispatch.md) each restate it inline
+          and point back to CLAUDE.md rather than to a shared source. HO
+          decision, out of Phase 1 scope: consider landing a
+          `sop/standard/orchestrator-standing-rules.md` (or similar) as
+          a repo-stampable home for load-bearing HO-pinned rules.
+
+  orchestrator:
+    autonomy_calibration:
+      extract: heading-region
+      source: rulebook/policies/trust-posture.md
+      heading: "## Act-vs-park calibration — the deferred-judgment reframe (amendment, Ratified 2026-06-10 by the operator, Telegram 3096)"
+    ticket_routing:
+      extract: heading-region
+      source: sop/standard/ticket-flow.md
+      heading: "## The load-bearing rule: who claims what"
+    retask_discipline:
+      extract: full-file
+      source: sop/standard/retask-dispatch.md
+    user_message_closeout:
+      extract: full-file
+      source: sop/standard/how-to-message-the-org-user.md
+    ho_absent_operator:
+      extract: full-file
+      source: sop/standard/ho-absent-operator-keep-working.md
+
+  research:
+    research_standards:
+      extract: heading-region
+      source: sop/standard/research-dispatch-deliverable-standards.md
+      heading: "## When to use this"
+    filing_convention:
+      extract: full-file
+      source: sop/standard/research-dispatch-filing.md
+    isolation:
+      extract: full-file
+      source: sop/standard/web-research-isolation.md
+    a2a_shape:
+      extract: full-file
+      source: sop/standard/a2a-research-request-handling.md
+
+  recovery:
+    restart_pattern:
+      extract: full-file
+      source: sop/standard/handoff-restart-runbook.md
+    auto_resume:
+      extract: heading-region
+      source: sop/standard/auto-resume-operator-runbook.md
+      heading: "## What a clean cycle looks like"
+    cross_account_ops:
+      extract: heading-region
+      source: sop/standard/cross-account-ops-discipline.md
+      heading: "## Procedure"
+    error_handling:
+      extract: full-file
+      source: sop/standard/handling-low-level-errors.md

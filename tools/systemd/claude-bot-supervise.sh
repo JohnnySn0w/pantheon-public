@@ -29,34 +29,35 @@ set -euo pipefail
 
 SESSION="claude-telegram-bot"
 CLAUDE_BIN="/home/claude/.npm-global/bin/claude"
-# ⚠️ THESE TWO FLAGS WERE LIVE-ONLY UNTIL 2026-08-03 and the repo copy had NEITHER, so a
-# redeploy from this file would have silently dropped both — the model pin falling back to
-# settings.json, which still says `claude-fable-5[1m]`, a model that is gone fleet-wide.
-# Backported here so repo == live. See the drift class in T-2444.
-#
 # --permission-mode default pins the pre-v2.1.200 launch default (CC v2.1.200 flipped
-# unset to Manual; unattended relaunches stall at the first tool prompt). Fleet ruling
-# 2026-07-06 (orchestrator, T-1541/T-1544).
-#
-# --model: THE LAUNCH FLAG IS THE AUTHORITATIVE PIN and outranks settings.json — see
-# bugs/supervisor-launch-flag-outranks-settings-json-on-model-pin.md. Moved
-# claude-opus-5 -> claude-opus-4-7 on 2026-08-03 at the operator's request (TG 4958), after
-# verifying the id resolves with a real one-shot round-trip on a plugin-free seat.
-# Then 4-7 -> claude-opus-4-8 on 2026-08-03 at the operator's request (fleet uniform on
-# opus 4.8); live supervise pin was flipped same day, this repo copy backported to match.
-# NOTE: the cap-autoswitch mechanism this note used to guard against
-# (model_stepper.py) was removed (T-2737, 2026-08-10 — stepping policy retired
-# fleet-wide in favor of the opus-4-8 standard). context_fill_monitor's
-# model_pin is still `claude-fable-5` regardless — see the warning above
-# _MONITOR_TUNING in context_fill_monitor.py (T-2134/T-2136 history) before
-# "tidying" that pin.
-CLAUDE_ARGS="--channels plugin:telegram@claude-plugins-official --model claude-opus-4-8 --permission-mode default"
+# the unset default to Manual, which stalls unattended relaunches at the first tool
+# prompt — T-1541/T-1544, watch report 2026-07-06). Restores prior behavior, no escalation.
+# --effort xhigh: operator-directed baseline (TG 2026-08-10, T-1994 model-mix change).
+# --model claude-opus-4-7: operator-directed (TG 8481, 2026-08-25 17:52Z — "oh I forgot I
+# can't select opus 4.7 via /model. Yeah get the model line swapped and restart"). Flipped
+# by Orchestrator 2026-08-25T17:53Z on the live ~/.local/bin/claude-bot-supervise.sh; this repo
+# mirror backported 2026-08-25T19:4xZ after Recovery flagged the drift (T-2444-class untracked
+# backport — the mirror had been sync'd to fable-5 by T-3192 hours before the live flip).
+# To REVERT: restore --model claude-fable-5 (line below) — one-line change.
+# (prior lines, for the audit trail:)
+# --model claude-fable-5: operator-directed (TG 8368 + 8382, 2026-08-24 — "swapped you to
+# fable for the mental bandwidth" / "model fixed"). Set via TUI /model; the flag was
+# flipped 2026-08-24T23:3xZ so the choice survived restarts. Superseded by the opus-4-7
+# flip above.
+# --model claude-opus-4-7: operator-directed swap (TG 7885, 2026-08-12 23:38Z, at the
+# 95%-quota hold) — ended the first Fable experiment (TG 7727/7728). Standing baseline
+# reference remains opus-4.8 (model-policy pin).
+# --model claude-fable-5: EXPERIMENT — the operator directed orchestrator onto Fable (TG 7727/7728,
+# 2026-08-12, "let's try something new"). To REVERT to the standing opus-4.8 baseline,
+# restore: --model claude-opus-4-8 (see the model-policy pin).
+CLAUDE_ARGS="--channels plugin:telegram@claude-plugins-official --model claude-opus-4-7 --effort xhigh --permission-mode default"
 
 # (Re)create the session only if absent — idempotent across restarts. Wrapped in
 # `sg pantheon-shared -c` so the tmux server + inner claude inherit the shared
 # group (orchestrator-only; see header).
 if ! sg pantheon-shared -c "tmux has-session -t $SESSION" 2>/dev/null; then
   sg pantheon-shared -c "tmux new-session -d -s $SESSION '$CLAUDE_BIN $CLAUDE_ARGS'"
+  ~/pantheon-config/tools/arm_pane_log.sh "$SESSION:0" orchestrator || true  # T-1636 pane time-log tap
 fi
 
 # Block as systemd's MainPID until the session goes away (5s poll).

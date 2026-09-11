@@ -31,6 +31,7 @@ from tools.claude_quota_probe import (
     probe_tmux_target as claude_probe_tmux_target,
 )
 from tools.claude_statusline_capture import SCHEMA as CLAUDE_STATUSLINE_SCHEMA
+from tools import t2382_live_acceptance as t2382_module
 from tools.t2382_live_acceptance import (
     LEG_BATCH,
     LEG_CLAUDE,
@@ -62,6 +63,7 @@ from tools.t2382_live_acceptance import (
     parse_leg,
     require_live_gates,
     remove_quota_overlay,
+    _read_json_mapping,
     _source_manifest_hash,
     _event_hash,
 )
@@ -481,7 +483,7 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
             "runtime_swapped": True,
             "successor_read_ack": True,
             "successor_read_evidence": "read-ack",
-            "handoff_or_graveyard": "handoff",
+            "chronicle_evidence": "handoff",
         }
         payload.update(overrides)
         return self._write_json(f"transition/{name}.json", payload)
@@ -1080,7 +1082,7 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
     def test_live_same_unit_planned_harness_swap_preserves_persona_and_tmux(self) -> None:
         self._finalize_live_if_gated(LEG_SWAP)
 
-    def test_live_forced_cap_requeues_and_bootstraps_from_graveyard_receipt(self) -> None:
+    def test_live_forced_cap_requeues_and_bootstraps_from_chronicle_receipt(self) -> None:
         self._finalize_live_if_gated(LEG_FORCED_CAP)
 
     def test_live_explicit_claude_batch_sdk_is_nondefault_and_separately_metered(self) -> None:
@@ -2043,7 +2045,7 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
             phase="completed",
             breaker_open=True,
             successor_read_ack=True,
-            successor_read_evidence="graveyard-read",
+            successor_read_evidence="chronicle-read",
         )
         controller_evidence = self._controller_evidence(
             run_id,
@@ -2096,8 +2098,8 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
             correlation_id=requeue_corr,
             mailbox_root=mailbox,
         )
-        graveyard = self._write_json(
-            f"graveyard/{run_id}.json",
+        chronicle = self._write_json(
+            f"chronicle/{run_id}.json",
             {"id": message_id, "payload": {"correlation_id": correlation_id}},
         )
         receipt_corr = "corr-b" if receipt_mismatch else correlation_id
@@ -2108,12 +2110,12 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
                 "message_id": message_id,
                 "correlation_id": receipt_corr,
                 "transition_id": transition_id,
-                "graveyard_entry": str(graveyard.resolve()),
+                "chronicle_entry": str(chronicle.resolve()),
             },
         )
         observe_forced_cap_phase(
             recorder,
-            phase="graveyard_receipt",
+            phase="chronicle_receipt",
             message_id=message_id,
             correlation_id=correlation_id,
             receipt_path=receipt,
@@ -2337,6 +2339,35 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
                     evidence_root=self.evidence,
                     run_id=run_id,
                 )
+
+
+class ChronicleCompatRemovedTest(unittest.TestCase):
+    """T-3090 (Phase 5): the T-3039 graveyard -> chronicle read-both compat
+    in this script's own JSON-reading surface is fully stripped. Fail-close
+    proof: an old-format state file must be passed through RAW -- not
+    silently promoted to the new key -- so the real quota-swap acceptance
+    gate (which checks `transition.get("chronicle_evidence")`) correctly
+    refuses instead of misreading stale data as valid structural evidence.
+    """
+
+    def test_normalize_chronicle_keys_symbol_removed(self) -> None:
+        self.assertFalse(hasattr(t2382_module, "_normalize_chronicle_keys"))
+
+    def test_read_json_mapping_does_not_promote_legacy_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "legacy-transition.json"
+            path.write_text(
+                json.dumps({
+                    "handoff_or_graveyard": "/tmp/legacy-handoff.md",
+                    "graveyard_entry": "/tmp/legacy-evidence.md",
+                }),
+                encoding="utf-8",
+            )
+            value = _read_json_mapping(path, label="test state")
+            self.assertNotIn("chronicle_evidence", value)
+            self.assertNotIn("chronicle_entry", value)
+            self.assertEqual(value["handoff_or_graveyard"], "/tmp/legacy-handoff.md")
+            self.assertEqual(value["graveyard_entry"], "/tmp/legacy-evidence.md")
 
 
 if __name__ == "__main__":

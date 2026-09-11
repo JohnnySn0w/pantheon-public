@@ -87,6 +87,18 @@ from tools.agent_role_map import fleet_accounts  # noqa: E402
 
 AGENT_HOMES = fleet_accounts()
 
+# Per-home du bound + a SHARED total budget for the whole breakdown sweep. The
+# service TimeoutStartSec is 2min; 8 homes each waiting a per-home timeout in turn
+# could blow that and fire OnFailure (reporting the monitor, not the fault — the
+# same-second-timeout trap). So the sweep stops sizing once the shared budget is
+# spent (marking the rest ?skipped), and a home that cannot be sized within its
+# per-home bound is MARKED ?timeout, never dropped: an unsizable home is itself the
+# actionable signal. (The actual 2026-09-06 miss — T-3441 — was NOT a timeout but a
+# nonzero-du-exit drop; see the rc handling in _top_consumers. This budget is the
+# defensive companion so a genuinely slow home also stays visible within budget.)
+DU_PER_HOME_TIMEOUT_SEC = int(os.environ.get("PANTHEON_DISK_DU_PER_HOME_TIMEOUT_SEC", "30"))
+DU_TOTAL_BUDGET_SEC = int(os.environ.get("PANTHEON_DISK_DU_TOTAL_BUDGET_SEC", "90"))
+
 STATE_DIR = Path.home() / ".local" / "state" / "pantheon"
 STATE_PATH = STATE_DIR / "disk_usage_alert_state.json"
 
@@ -164,24 +176,47 @@ def _top_processes(sort_key: str, limit: int = 3) -> str:
 
 
 def _top_consumers(limit: int = 4) -> str:
-    """Best-effort per-home sizes, largest first. NEVER raises — returns '' on any
-    failure (the core df check must not depend on cross-account du working)."""
-    sizes: list[tuple[str, str]] = []
+    """Per-home sizes, largest first, followed by any home that could NOT be sized —
+    each MARKED (?timeout / ?err / ?skipped), never silently dropped. A home the
+    sweep cannot measure is the actionable signal, not noise: on 2026-09-06 the
+    largest home (claude) was dropped on a nonzero du exit, leaving the alert naming
+    a 6x-smaller home (T-3441). NEVER raises (the core df check must not depend on
+    cross-account du),
+    and the whole sweep is bounded by DU_TOTAL_BUDGET_SEC so it always fits inside
+    the service TimeoutStartSec."""
     import getpass
     me = getpass.getuser()
+    measured: list[tuple[str, str]] = []
+    unmeasured: list[tuple[str, str]] = []
+    deadline = time.monotonic() + DU_TOTAL_BUDGET_SEC
     for home in AGENT_HOMES:
-        path = f"/home/{home}"
-        try:
-            if home == me:
-                cmd = ["du", "-sh", path]
-            else:
-                cmd = ["sudo", "-n", "-u", home, "du", "-sh", path]
-            res = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            if res.returncode == 0 and res.stdout.strip():
-                sizes.append((home, res.stdout.split()[0]))
-        except (OSError, subprocess.SubprocessError):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            unmeasured.append((home, "?skipped"))
             continue
-    if not sizes:
+        path = f"/home/{home}"
+        cmd = ["du", "-sh", path] if home == me else ["sudo", "-n", "-u", home, "du", "-sh", path]
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True,
+                                 timeout=min(DU_PER_HOME_TIMEOUT_SEC, remaining))
+        except subprocess.TimeoutExpired:
+            unmeasured.append((home, "?timeout"))
+            continue
+        except (OSError, subprocess.SubprocessError):
+            unmeasured.append((home, "?err"))
+            continue
+        if res.stdout.strip():
+            # du prints the grand total even when it exits NONZERO from an unreadable
+            # subdir (e.g. the root-owned overlay dirs rootless podman leaves under
+            # .local/share/containers in the claude/claude-research/codex homes). A
+            # valid total is the actionable number — do NOT discard it for rc!=0.
+            # THIS was the 2026-09-06 miss: du printed a valid '/home/claude' total
+            # with rc=1 and the old `returncode == 0` guard dropped the biggest home
+            # every run, so the alert named a smaller home (T-3441).
+            measured.append((home, res.stdout.split()[0]))
+        else:
+            unmeasured.append((home, "?err"))
+    if not measured and not unmeasured:
         return ""
 
     def _to_bytes(s: str) -> float:
@@ -191,8 +226,12 @@ def _top_consumers(limit: int = 4) -> str:
         except (ValueError, IndexError):
             return 0.0
 
-    sizes.sort(key=lambda kv: _to_bytes(kv[1]), reverse=True)
-    return "  ".join(f"{h}:{sz}" for h, sz in sizes[:limit])
+    measured.sort(key=lambda kv: _to_bytes(kv[1]), reverse=True)
+    parts = [f"{h}:{sz}" for h, sz in measured[:limit]]
+    # Unmeasured homes are ALWAYS shown (never subject to the top-N truncation): the
+    # one we could not size is the most likely culprit, so its marker must survive.
+    parts += [f"{h}:{marker}" for h, marker in unmeasured]
+    return "  ".join(parts)
 
 
 def _load_state() -> dict:

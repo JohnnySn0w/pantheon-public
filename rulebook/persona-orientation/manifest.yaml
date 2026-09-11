@@ -1,0 +1,195 @@
+# Persona-orientation manifest — T-3339 Phase 1.
+#
+# Canonical source for what every Pantheon persona/role sees at spawn time, on
+# both the Claude and Codex harnesses (Codex side is Phase 2 — see
+# harness_adapters.codex below). Rendered by tools/persona_orientation/render.py
+# into ~/.claude/skills/pantheon-persona-orientation/SKILL.md (base layer) and
+# ~/.claude/skills/pantheon-role-<role>/SKILL.md (per-role deltas).
+#
+# This file is D2-protected (hand-curated; ratified changes only). Renderer
+# reads it; renderer does NOT write it. role-deltas.yaml is its sibling
+# (per-role delta content pointers). source-bindings.yaml is the renderer's
+# OWN write-only output (git-sha/blob/sha256 stamps) — never hand-edited.
+#
+# Extract modes (see tools/persona_orientation/render.py for the concrete
+# algorithm each mode runs):
+#   heading-list            — scan 1+ files for a heading regex; for each
+#                              match, capture heading text + one body
+#                              paragraph. Used only for p_d_vocabulary.
+#   heading-region-paragraph — single named heading in a single file;
+#                              capture the FIRST paragraph after it (or, if
+#                              the source names `select_prefix`, the first
+#                              paragraph whose first line starts with that
+#                              prefix — needed when the heading is followed
+#                              by a metadata block before the rule text,
+#                              e.g. trust-posture.md's "Emanates from:" line).
+#   heading-region          — single named heading in a single file;
+#                              capture the FULL section (heading through the
+#                              next heading of the same-or-shallower level).
+#   full-file               — the entire file's content.
+#   inline                  — literal `body:` text authored directly in this
+#                              file (no source, not sha-stamped, no drift
+#                              detection since there is nothing to drift
+#                              from).
+#
+# Every non-inline section names a `source`/`sources` path that
+# tools/persona_orientation/check_stale.py verifies for freshness against
+# source-bindings.yaml's stamped git blob.
+
+version: 1
+schema_version: "1.0.0"
+
+base_layer:
+  sections:
+    - id: p_d_vocabulary
+      extract: heading-list
+      sources:
+        - path: rulebook/principles.md
+          heading_regex: '^## (P\d+) — (.+)$'
+          # For principles.md the paragraph immediately following the
+          # heading IS the descriptive body (no intervening metadata block).
+        - path: rulebook/directives.md
+          heading_regex: '^## (D\d+) — (.+)$'
+          # For directives.md the heading is followed by an
+          # Emanates-from/Scope/Effective/Re-evaluate metadata block (and
+          # sometimes Re-eval amendment paragraphs) before the actual
+          # directive text. The renderer selects the first paragraph whose
+          # first line starts with the literal prefix "**The directive"
+          # rather than the first paragraph after the heading.
+          directive_prefix: "**The directive"
+
+    - id: policy_triggers
+      extract: heading-region-paragraph
+      sources:
+        - path: rulebook/policies/code-size-norms.md
+          heading: "## Policy"
+          label: code-size-norms
+        - path: rulebook/policies/autonomy.md
+          heading: "## Context"
+          label: autonomy
+        - path: rulebook/policies/cost-monitoring-thresholds.md
+          heading: "## Context"
+          label: cost-monitoring-thresholds
+        - path: rulebook/policies/goal-mapping.md
+          heading: "## The rule"
+          label: goal-mapping
+        - path: rulebook/policies/mcp-adoption.md
+          heading: "## 1. The standing posture (the default this policy defends)"
+          label: mcp-adoption
+        - path: rulebook/policies/trust-posture.md
+          heading: "## Act-vs-park calibration — the deferred-judgment reframe (amendment, Ratified 2026-06-10 by the operator, Telegram 3096)"
+          label: trust-posture
+          # This heading's first block is an "Emanates from:" metadata line,
+          # not the rule itself (same shape as directives.md) — select the
+          # paragraph that states the actual reframe instead.
+          select_prefix: "**The reframe"
+        - path: sop/standard/shaping-and-viability.md
+          heading: "## When it fires"
+          label: shaping-and-viability
+          # ORG-089 §Landing bundle Surface 5b (Ratified 2026-09-06 via TG 9047):
+          # every non-vault ADR drafter runs the viability pass in RECORD-mode
+          # + surfaces reserved-set material-change results to the operator. Cairn's
+          # ORG-041 review checklist points at this SOP for RECORD-field
+          # verification.
+
+    - id: discovery_checklist
+      extract: inline
+      body: |
+        Every session start (fresh, resumed, or restart), scan these five
+        signals before starting substantive work. All are cheap (grep + 1-line
+        reads).
+
+        1. Recency signal — skim `notes/recent-policy-changes.md` for what
+           P&Ds, ADRs, or SOPs changed in the last 30 days.
+        2. Own queue — check `python3 tools/ticket.py ready --target
+           <persona-name>` for anything ready to pull.
+        3. Ledger tip — check the current-week ledger shard for where the
+           fleet left off; resume anything mid-arc.
+        4. Mailbox — drain peer-authored messages via the mailbox MCP;
+           cross-check detector alerts against recent commits before
+           independently filing.
+        5. Worker silence check — if this session has spawned background
+           teammates in a prior turn, check inbox mtimes against role
+           thresholds (orchestrator 30min / implementer 15min / reviewer
+           5min).
+
+    - id: agents_claude_constraints
+      extract: inline
+      body: |
+        Persona-CLAUDE (`~/CLAUDE.md`) and project-AGENTS.md content OVERLAY
+        this base layer — they supersede or extend it for their scope, they
+        never replace it. A project's own `.claude/skills/` composes on top
+        of this user-scope skill; a Codex-side project AGENTS.md overlays the
+        manifest-loaded base (Phase 2). If a project-local rule and this base
+        layer conflict, the project-local rule wins for that project's scope
+        only — it does not change the fleet-wide base for other projects.
+
+    - id: smoke_report_contract
+      extract: inline
+      body: |
+        Every plan-tier and code-tier report that crosses a tier boundary
+        includes a `## DECISIONS` section: one line per non-obvious call,
+        shape `<choice> — justifies via <P/D id> — <rationale>`. Smoke
+        results are the LITERAL command-tail in a fenced block, never a
+        delta-claim like "+5 passing" — grep every result line, not a
+        curated subset. The smoke command is the project's actual CI
+        workflow command, not a hand-picked shortcut.
+
+    - id: forbidden_byte_guard
+      extract: inline
+      body: |
+        The literal byte sequence HERMES\.md (uppercase, contiguous, no
+        period escape at runtime) must not appear in any committed source
+        byte — file content or commit message — of any Pantheon-related
+        repo. It routes Claude Code traffic to an anti-abuse billing
+        classifier. When referencing the sequence in prose, escape the
+        period (as done in this sentence). In code needing the literal bytes
+        at runtime, assemble via string concatenation so the contiguous
+        sequence never appears in source. Audit staged diffs before commit.
+
+roles:
+  - id: implementer
+    delta_sections: [plan_first, testing_depth, code_size_norms_body, five_phase_signatures_first]
+    tool_scope: [read, edit, write, bash, grep, glob]
+    forbidden_tools: [telegram_reply, mailbox_send_to_operator]
+  - id: reviewer
+    delta_sections: [preimplementation, codex_spec_review, three_methodologies]
+    tool_scope: [read, grep, glob, bash]
+    forbidden_tools: [edit, write, telegram_reply, mailbox_send_to_operator]
+  - id: project_orchestrator
+    delta_sections: [team_checklist, brief_construction, worker_silence_liveness, chain_of_justification]
+    tool_scope: [read, edit, write, bash, grep, glob, agent_dispatch]
+    forbidden_tools: [telegram_reply]
+  - id: orchestrator
+    delta_sections: [autonomy_calibration, ticket_routing, retask_discipline, user_message_closeout, ho_absent_operator]
+    tool_scope: [all]
+  - id: research
+    delta_sections: [research_standards, filing_convention, isolation, a2a_shape]
+    tool_scope: [read, write, webfetch, websearch, bash, grep, glob]
+    forbidden_tools: [telegram_reply, mailbox_send_to_operator]
+  - id: recovery
+    delta_sections: [restart_pattern, auto_resume, cross_account_ops, error_handling]
+    tool_scope: [all]
+  - id: cairn_worker
+    delta_sections: [bounded_worker_boundary, s3star_authorship_transfer_rule]
+    tool_scope: [read, edit, write, bash, grep, glob]
+    # Phase 5 gate on T-3333 ruling — do not populate delta content yet.
+  - id: cairn_reviewer
+    delta_sections: [s3star_assurance_charter, three_methodologies, no_authorship_of_reviewed_artifact]
+    tool_scope: [read, grep, glob, bash]
+    # Phase 5 gate on T-3333 ruling — do not populate delta content yet.
+  - id: cairn_temp_backup_orchestrator
+    delta_sections: [temp_activation_boundary, no_standing_authority]
+    tool_scope: [all]
+    activation: explicit_only
+    # Phase 5 gate on T-3333 ruling — do not populate delta content yet.
+
+harness_adapters:
+  claude:
+    renders_to: "~/.claude/skills/pantheon-persona-orientation/SKILL.md"
+    role_skill_pattern: "~/.claude/skills/pantheon-role-{role}/SKILL.md"
+    forbidden_tool_enforcement: "skill-declared tool_scope/forbidden_tools rendered as an informational body section in Phase 1 (Claude Code skills have no tools-restriction frontmatter key); structural adapter-refuse enforcement is Phase 4 per RATIFY-POINT-4"
+  codex:
+    renders_to: "<TBD-phase-2>"
+    role_preload_pattern: "<TBD-phase-2>"
+    forbidden_tool_enforcement: "<TBD-phase-2>"

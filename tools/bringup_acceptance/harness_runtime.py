@@ -212,6 +212,56 @@ def _diagnose_leg(ctx: RunContext, *, mailbox_hub: Path | None = None) -> Mappin
     return _diagnose_verdict(report)
 
 
+def run_codex_controller_bootstrap_leg(
+    ctx: RunContext,
+    *,
+    manifest_path: Path = persona_bringup.DEFAULT_MANIFEST,
+    mailbox_hub: Path | None = None,
+    codex_executable: Path | None = None,
+) -> Mapping[str, Any]:
+    """Resolve real manifest bindings and report the Codex fallback target shape.
+
+    This does not start a live CLI. It is the acceptance-level proof that the
+    supervised command sheet and tests are pointing at the real configured Codex
+    executable instead of accepting a stand-in binary; live real-cli readiness is
+    proven only by the supervised readiness CLIs.
+    """
+
+    primary = persona_bringup.load_binding(
+        manifest_path,
+        ctx.persona,
+        mailbox_hub=mailbox_hub if mailbox_hub is not None else _resolve_mailbox_hub(),
+    )
+    fallback = persona_bringup.first_fallback_binding(manifest_path, primary)
+    if fallback is None:
+        raise HardStop("codex bootstrap: manifest declares no fallback runtime")
+    expected_executable = fallback.launch.executable
+    observed_executable = codex_executable or expected_executable
+    if fallback.launch.harness != "codex":
+        raise HardStop(f"codex bootstrap: first fallback is {fallback.launch.harness!r}, not codex")
+    if observed_executable != expected_executable:
+        raise HardStop(
+            "codex bootstrap: executable mismatch "
+            f"(observed={observed_executable}, expected={expected_executable})"
+        )
+    if not observed_executable.is_absolute():
+        raise HardStop("codex bootstrap: Codex executable must be an absolute path")
+    return {
+        "schema": "pantheon-codex-controller-bootstrap-proof/v1",
+        "status": "configured",
+        "mode": "configured-executable",
+        "persona": ctx.persona,
+        "account": ctx.account,
+        "primary": persona_bringup.runtime_reference(primary),
+        "fallback": persona_bringup.runtime_reference(fallback),
+        "codex_executable": str(observed_executable),
+        "tmux_target": rc.runtime_target_text(fallback.controller.tmux),
+        "mailbox_wake": "preserved-from-manifest",
+        "pane_logging": "preserved-from-post-start",
+        "restart_route": "runtime-controller",
+    }
+
+
 # ---------------------------------------------------------------------------
 # Leg 2: readiness gate -- real, fully isolated tmux
 # ---------------------------------------------------------------------------
@@ -239,6 +289,7 @@ def _disposable_binding(ctx: RunContext, tmux_target: TmuxTarget) -> SimpleNames
         account=ctx.account,
         account_home=Path(f"/home/{ctx.account}"),
         mailbox=ctx.hub_path / ctx.persona,
+        launch_cwd=ctx.state_path,
         selected_harness=ctx.harness,
         configured_harness=ctx.harness,
         launch=HarnessLaunchConfig(
@@ -258,9 +309,9 @@ class _DisposableAdapter:
     def __init__(self, binding: SimpleNamespace) -> None:
         self._binding = binding
 
-    def build_interactive_launch(self, target: TmuxTarget) -> CommandSpec:
+    def build_interactive_launch(self, target: TmuxTarget, *, cwd: Path) -> CommandSpec:
         return CommandSpec(
-            argv=(str(self._binding.launch.executable),), stdin=None, cwd=Path("/tmp"),
+            argv=(str(self._binding.launch.executable),), stdin=None, cwd=cwd,
         )
 
 
@@ -286,7 +337,7 @@ def _ensure_runtime_chain_leg(ctx: RunContext, *, state_root: Path) -> Mapping[s
     def _verify_runtime_input_ready(*_args: Any, **_kwargs: Any) -> None:
         call_order.append("verify_runtime_input_ready")
 
-    with mock.patch.object(rc, "_pane_exists", return_value=False), mock.patch.object(
+    with mock.patch.object(rc, "pane_exists", return_value=False), mock.patch.object(
         rc, "_start_runtime", side_effect=_start_runtime,
     ), mock.patch.object(
         rc, "_verify_started_runtime", side_effect=_verify_started_runtime,
@@ -301,6 +352,7 @@ def _ensure_runtime_chain_leg(ctx: RunContext, *, state_root: Path) -> Mapping[s
         "call_order": call_order,
         "handle_profile_matches": handle.profile == binding.launch,
         "handle_tmux_matches": handle.tmux == tmux_target,
+        "launch_cwd": str(binding.launch_cwd),
         "runtime_json_path": str(state_path),
         "runtime_json": published,
     }

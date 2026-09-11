@@ -43,7 +43,7 @@ ORG-012 (information-inflow bubble-up methodology) applies cross-agent. This SOP
 
 ## Cross-references
 
-- `adr/ORG-012-information-inflow-bubble-up-methodology.md` — the methodology this SOP operationalizes per-agent.
+- `architecture/adr/ORG-012-information-inflow-bubble-up-methodology.md` — the methodology this SOP operationalizes per-agent.
 - `sop/standard/external-blocker-stale-after-default.md` — Recovery's stale-after discipline.
 - `sop/standard/auto-resume-operator-runbook.md` — Recovery's auto-resume + activity-monitor mechanics.
 - `sop/standard/agent-role-map.md` — persona ↔ role-id mapping.

@@ -96,7 +96,9 @@ NEVER_ALERT_SKIP_VOCABS: frozenset[str] = frozenset({
     "dependency_blocked",       # tickets blocked on dep; intentional
     "interactive_required",     # tickets labeled interactive; intentional
     "not_before_unmet",         # date-deferred tickets; intentional (T-0219b)
+    "appetite_overrun_blocked", # T-3440/ORG-089: substate:appetite-overrun; intentional structural gate
     "dispatch_locked",          # T-0717: auto_delivered mutex held — healthy, not stuck
+    "concurrent_state_flip",    # T-3010: ticket state flipped between scan + deliver
     # stamp_write_failed is intentionally NOT here — persistent write failure
     # is a real infra problem (disk full? permissions?) worth the 6-skip alert.
 })
@@ -796,6 +798,7 @@ if __package__ in (None, ""):
 from tools.ticket import TICKETS_ROOT, parse_ticket  # noqa: E402
 from tools.agent_role_map import resolve_role  # noqa: E402
 from tools._git_utils import pull_repo_or_warn  # noqa: E402
+from tools.notify_policy import is_muted as _persona_is_muted  # noqa: E402  (ORG-076 §7 / T-2978)
 from tools._pane_predicates import (  # noqa: E402
     path_in_agent_cwd,
     path_in_canonical_pantheon_dirs,
@@ -922,7 +925,7 @@ def check_recent_inbound(agent: str) -> None:
 def _ticket_state_on_disk(ticket_id: str) -> str | None:
     """Return the state of a ticket by scanning the tickets/ tree."""
     tid_clean = ticket_id.strip()
-    if not re.fullmatch(r"T-\d{4}", tid_clean):
+    if not re.fullmatch(r"T-\d{4,}", tid_clean):  # T-3215
         return None
     fname = f"{tid_clean}.md"
     for state_dir in ("inbox", "active", "done"):
@@ -930,6 +933,29 @@ def _ticket_state_on_disk(ticket_id: str) -> str | None:
         if candidate.exists():
             return state_dir
     return None
+
+
+def _dep_is_shipped(dep: str) -> bool:
+    """ORG-089 completion predicate (T-3440 Scope B), bound to this module's
+    TICKETS_ROOT.
+
+    Shipped iff `dep` is in done/ AND not `substate: dropped`. A dropped dep is
+    NOT satisfied (D-N / falsifier 2) — a dependant gated on it stays dep-blocked.
+
+    Kept local (rather than importing ticket._dep_is_shipped) so it resolves
+    against `inbox_consumer.TICKETS_ROOT` — the root the consumer's own
+    `_ticket_state_on_disk` uses and the one tests patch. In production both
+    globals are the same path (inbox_consumer imports TICKETS_ROOT from ticket).
+    Fail-CLOSED on malformed id / unreadable file (never count as shipped).
+    """
+    if _ticket_state_on_disk(dep) != "done":
+        return False
+    path = TICKETS_ROOT / "done" / f"{dep.strip()}.md"
+    try:
+        t = parse_ticket(path)
+    except Exception:
+        return False
+    return t.fields.get("substate") != "dropped"
 
 
 def list_eligible_tickets(agent: str) -> list[TicketInfo]:
@@ -954,6 +980,7 @@ def list_eligible_tickets(agent: str) -> list[TicketInfo]:
     dep_blocked: list[TicketInfo] = []
     interactive_locked: list[TicketInfo] = []
     not_before_unmet: list[TicketInfo] = []
+    overrun_blocked: list[TicketInfo] = []  # T-3440 / ORG-089
 
     found_any = False
     for path in inbox_dir.iterdir():
@@ -993,9 +1020,18 @@ def list_eligible_tickets(agent: str) -> list[TicketInfo]:
             interactive_locked.append(info)
             continue
 
-        deps_done = all(
-            _ticket_state_on_disk(dep) == "done" for dep in depends_on
-        )
+        # T-3440 / ORG-089 §Decision.4 (Scope D): a ticket flagged
+        # substate: appetite-overrun is structurally not-deliverable (the breaker
+        # refuses claim/delivery/resolve until a re-decision command). Joins the
+        # not_before/depends_on skip family.
+        if fields.get("substate") == "appetite-overrun":
+            overrun_blocked.append(info)
+            continue
+
+        # T-3440 / ORG-089 Scope B: a dep counts as satisfied only when SHIPPED
+        # (in done/ and not `substate: dropped`). A dropped dep keeps the
+        # dependant dep-blocked (falsifier 2), same as a still-open dep.
+        deps_done = all(_dep_is_shipped(dep) for dep in depends_on)
         if not deps_done:
             dep_blocked.append(info)
             continue
@@ -1018,6 +1054,8 @@ def list_eligible_tickets(agent: str) -> list[TicketInfo]:
         return eligible
     if dep_blocked:
         raise SkipCycle("dependency_blocked")
+    if overrun_blocked:
+        raise SkipCycle("appetite_overrun_blocked")
     if interactive_locked:
         raise SkipCycle("interactive_required")
     if not_before_unmet:
@@ -1102,7 +1140,9 @@ def _is_non_workable(fields: dict) -> bool:
     a hand-clear; the T-0768 incident class via the interactive-required path).
     """
     depends_on = fields.get("depends_on") or []
-    if not all(_ticket_state_on_disk(dep) == "done" for dep in depends_on):
+    # T-3440 / ORG-089 Scope B: a dropped dep is NOT shipped, so a ticket gated
+    # on it is still non-workable (dep-blocked) — mirrors list_eligible_tickets.
+    if not all(_dep_is_shipped(dep) for dep in depends_on):
         return True
     nb_raw = fields.get("not_before")
     if nb_raw:
@@ -1176,11 +1216,15 @@ def _list_auto_delivered_unresolved_for_agent(agent: str) -> list[TicketInfo]:
 def _is_auto_delivered_stale(ticket: TicketInfo, threshold_seconds: int) -> bool:
     """Return True iff the ticket's liveness signal is older than threshold_seconds.
 
-    Liveness = max(transition-log timestamp, ticket-file mtime). Taking the max
-    catches tickets actively worked for hours with no state transitions (the file
-    gets touched on each agent edit even without a formal transition). Returns
-    False (not stale) when the transition log is absent or unparseable — skip-on-
-    None: cannot prove staleness, so don't claim it.
+    Liveness = max of the available signals: the transition-log timestamp and the
+    ticket-file mtime. Taking the max catches tickets actively worked for hours
+    with no state transitions (the file gets touched on each agent edit even
+    without a formal transition). When the transition log has no parseable ts, the
+    file mtime alone is the signal (T-2971 fix — the old skip-on-None early return
+    bailed here, wedging the dispatch mutex forever on a stale no-transition-log
+    auto_delivered ticket: T-2374 held cairn's lock 19 days). Returns False (not
+    stale) only when NEITHER signal is available (e.g. a missing file) — cannot
+    prove staleness, so don't claim it.
 
     Residual risk: a ticket with zero file touches AND no transitions could trip
     the backstop on a genuinely long active ticket. v1 mitigation: operator-alert
@@ -1190,20 +1234,26 @@ def _is_auto_delivered_stale(ticket: TicketInfo, threshold_seconds: int) -> bool
 
     # Arm 1: transition-log timestamp.
     log_ts = _last_transition_ts(ticket.body)
-    if log_ts is None:
-        return False  # skip-on-None: cannot prove staleness
-    if log_ts.tzinfo is None:
+    if log_ts is not None and log_ts.tzinfo is None:
         log_ts = log_ts.replace(tzinfo=timezone.utc)
 
-    # Arm 2: file mtime (catches ticket-file touches without formal transitions).
+    # Arm 2: file mtime (catches ticket-file touches without formal transitions,
+    # AND is the sole liveness signal when the ticket has no parseable transition
+    # log at all — the old skip-on-None early return bailed BEFORE reaching here,
+    # which wedged the dispatch mutex forever on a stale no-transition-log
+    # auto_delivered ticket: T-2374 held cairn's lock 19 days, T-2971).
     try:
         mtime_epoch = ticket.path.stat().st_mtime
         file_ts = datetime.fromtimestamp(mtime_epoch, tz=timezone.utc)
     except OSError:
-        file_ts = log_ts  # fall back to log ts if stat fails
+        file_ts = None
 
-    # Use the more-recent of the two as the liveness signal.
-    liveness_ts = max(log_ts, file_ts)
+    # Liveness = the most-recent available signal. Skip-on-None only when NEITHER
+    # a transition-log ts NOR a file mtime is available (genuinely cannot prove).
+    candidates = [t for t in (log_ts, file_ts) if t is not None]
+    if not candidates:
+        return False  # cannot prove staleness → don't claim it
+    liveness_ts = max(candidates)
     return (now - liveness_ts).total_seconds() > threshold_seconds
 
 
@@ -1259,27 +1309,90 @@ def check_dispatch_locked(agent: str) -> None:
         raise SkipCycle("dispatch_locked")
 
 
+def _git_direct_writable(repo_root: Path) -> bool:
+    """True when the running process can write `<repo_root>/.git` directly,
+    without the `sg pantheon-shared` group-hop.
+
+    T-3325 Defect 1: the group-hop used to be unconditional, so it fired even
+    for a process that already owns its own repo (codex's own worktree —
+    codex is not a pantheon-shared member by design, T-3324) and `sg` failed
+    outright ("Invalid password for group pantheon-shared"). This probes the
+    real, live permission bit via `os.access` (a kernel-checked, real-uid/gid
+    read — not a cached `/etc/group` lookup), so it also correctly falls back
+    to the sg-hop for T-0514's stale-supplementary-group case, where
+    `/etc/group` lists the membership but the process's own live group set
+    (fixed at process-creation time — e.g. an un-restarted `systemd --user`
+    manager) predates the grant and a direct write genuinely fails.
+
+    `.git/` (not the repo's top-level dir) is the actual write surface for
+    `git add` / `git commit` — index, objects, refs, logs — so it's the
+    precise thing to probe rather than a proxy for it.
+
+    Coverage caveat (flagged at plan-review, not a defect): on a `git
+    worktree` checkout, `<repo_root>/.git` is a FILE holding a `gitdir: ...`
+    pointer, not the real git-dir — so this checks the pointer file's
+    ownership/perms, not the pointed-at directory under
+    `.../.git/worktrees/<name>/` where the actual writes land. In every
+    known Pantheon deployment shape the two are co-owned (same uid created
+    both at `git worktree add` time), so the pointer is a reliable proxy for
+    the real surface — but it IS a proxy, not the surface itself, and a
+    deployment that ever split that ownership would need a different check.
+    """
+    return os.access(repo_root / ".git", os.W_OK)
+
+
 def _stamp_auto_delivered(ticket: TicketInfo) -> bool:
-    """Write auto_delivered: true + auto_delivered_at: <ISO-ts> to ticket frontmatter.
+    """Write auto_delivered: true + auto_delivered_at: <ISO-ts> to ticket
+    frontmatter, then commit + push that write to origin so the mutex is
+    visible fleet-wide (other agents' and HO's own reads of `origin` depend
+    on the push leg, not just the local file).
 
-    Split failure contract (two distinct failure classes):
+    Called AFTER delivery (T-2152 reordered stamp-then-deliver to
+    deliver-then-stamp). By the time this function runs the agent has
+    already been poked, so a False return here can no longer retroactively
+    un-deliver anything — it exists purely to tell the caller (main())
+    whether the audit/provenance leg landed. (Docstring-drift note: this
+    function's contract text used to say "caller must NOT inject on False"
+    — that was accurate for T-0717's original stamp-then-deliver order, but
+    stale ever since T-2152 reversed it; the text here never caught up until
+    T-3325 fixed it.)
 
-    1. WRITE FAILURE → returns False (fail-CLOSED for caller).
-       If the frontmatter write does not persist to disk, the mutex stamp is
-       absent — a subsequent consumer cycle will not see the lock and WILL
-       deliver another ticket. Caller (main()) must NOT inject on False; it
-       should raise SkipCycle('stamp_write_failed') and retry next cycle.
+    Two distinct failure classes, BOTH now fail-loud (T-3325 — previously
+    the git leg was fail-open and silently returned True):
 
-    2. COMMIT / PUSH FAILURE → returns True (best-effort; inject proceeds).
-       The local file-write already establishes the lock for THIS agent's own
-       consumer (it reads its own working tree), so the mutex is intact locally
-       even if the commit or push fails. Inject should happen. Failures are
-       logged prominently to stderr. Push is needed for HO's ff-only pulls and
-       cross-agent visibility; a push failure is notable but not fatal to
-       this-cycle delivery correctness.
+    1. LOCAL WRITE FAILURE → returns False (unchanged behavior). The
+       frontmatter write itself didn't persist; even this agent's own
+       next-cycle scan won't see the lock (self-healing risk of
+       re-delivery, same as before T-3325).
 
-    Returns True if the frontmatter write succeeded (inject may proceed),
-    False if the write failed (inject must NOT proceed).
+    2. COMMIT / ADD / PUSH FAILURE, OR A MUTATION-LOCK TIMEOUT → returns
+       False (T-3325; all four used to silently return True). The local
+       file write succeeded, so THIS agent's own next-cycle scan still
+       correctly sees the lock — but the stamp never reached `origin`, so
+       any OTHER reader (HO, a different agent's inbox_consumer, a human
+       `git pull`) sees no lock at all. Reporting success here would mean
+       the delivery pipeline lies about its own audit trail (P1); the
+       caller now surfaces this loudly (non-zero exit) instead of
+       swallowing it. Behavior-change note: a lock-timeout used to be
+       silent and is now equally loud — an operator who only ever saw the
+       "lock timeout (stamp written locally; commit deferred)" log line
+       should now also expect the unit's OnFailure= alert to fire if the
+       mutex genuinely times out.
+
+    Group-hop (T-0514): `add`/`commit` normally need `sg pantheon-shared`
+    when the running process's live supplementary-group set doesn't include
+    pantheon-shared — either the process was never a member (e.g. codex on
+    its own worktree, T-3325) or `/etc/group` was updated but this
+    process's manager predates the grant (T-0514's stale-group case).
+    `_git_direct_writable` probes the real on-disk permission first and
+    skips the `sg` wrap whenever the process can already write `.git/`
+    directly — the common case, and the T-3325 fix (codex owns its own
+    worktree, so the direct check passes and `sg`, which codex has no
+    password for, is never invoked). The `sg`-wrap remains as the T-0514
+    fallback for the genuine stale-group case.
+
+    Returns True only if the frontmatter write AND add AND commit AND push
+    all succeeded. False otherwise — see the two failure classes above.
     """
     from tools.ticket import parse_front_matter, _build_ticket_text
     from tools._git_utils import REPO_ROOT
@@ -1296,15 +1409,18 @@ def _stamp_auto_delivered(ticket: TicketInfo) -> bool:
               file=sys.stderr)
         return False  # fail-CLOSED: caller must not inject
 
-    # Commit + push via sg pantheon-shared (T-0514 group fix: daemon session
-    # may lack pantheon-shared supplementary group; wrap git writes in sg).
-    # Commit/push failures are best-effort: the local write established the
-    # mutex, so this-cycle delivery is safe. Log prominently but return True.
+    # Commit + push, direct when possible, via sg pantheon-shared as the
+    # T-0514 fallback (see _git_direct_writable + T-3325). Commit/add/push
+    # failures — and a lock timeout — are now FAIL-LOUD (T-3325): the local
+    # write already established the mutex for this agent's own reads, but an
+    # unpublished stamp is a real audit-provenance gap for every other
+    # reader, so it must not be reported as success. See the docstring above.
     try:
         rel_path = ticket.path.relative_to(REPO_ROOT)
     except ValueError:
         rel_path = ticket.path
 
+    direct = _git_direct_writable(REPO_ROOT)
     commit_msg = f"tickets: stamp auto_delivered on {ticket.id}"
     # T-2336: two defenses against the writer4 corruption (a bare pathspec-less
     # `git commit` swallowing ANOTHER writer's staged files under this message):
@@ -1312,41 +1428,58 @@ def _stamp_auto_delivered(ticket: TicketInfo) -> bool:
     #      files cannot enter this commit even if a writer bypasses the lock;
     #   2. add+commit+push run under git_mutation_lock, serializing with every
     #      lock-taking writer (ticket.py, grooming, watch_runner).
-    # Lock timeout degrades exactly like the other failures here: best-effort,
-    # log + return True — the local stamp write already established the mutex.
     try:
         with git_mutation_lock(label=f"stamp auto_delivered {ticket.id}"):
-            add_result = subprocess.run(
-                ["sg", "pantheon-shared", "-c",
-                 f"git -C {REPO_ROOT} add {rel_path}"],
-                capture_output=True, text=True, check=False,
-            )
+            if direct:
+                add_result = subprocess.run(
+                    ["git", "-C", str(REPO_ROOT), "add", str(rel_path)],
+                    capture_output=True, text=True, check=False,
+                )
+            else:
+                add_result = subprocess.run(
+                    ["sg", "pantheon-shared", "-c",
+                     f"git -C {REPO_ROOT} add {rel_path}"],
+                    capture_output=True, text=True, check=False,
+                )
             if add_result.returncode != 0:
-                print(f"[inbox_consumer] _stamp_auto_delivered git add failed (stamp written locally;"
-                      f" push skipped): {add_result.stderr}", file=sys.stderr)
-                return True  # write succeeded; inject should proceed
+                print(f"[inbox_consumer] _stamp_auto_delivered git add FAILED (stamp written"
+                      f" locally; NOT pushed — mutex not visible to other readers):"
+                      f" {add_result.stderr}", file=sys.stderr)
+                return False
 
-            commit_result = subprocess.run(
-                ["sg", "pantheon-shared", "-c",
-                 f"git -C {REPO_ROOT} commit -m {subprocess.list2cmdline([commit_msg])}"
-                 f" -- {rel_path}"],
-                capture_output=True, text=True, check=False,
-            )
+            if direct:
+                commit_result = subprocess.run(
+                    ["git", "-C", str(REPO_ROOT), "commit", "-m", commit_msg,
+                     "--", str(rel_path)],
+                    capture_output=True, text=True, check=False,
+                )
+            else:
+                commit_result = subprocess.run(
+                    ["sg", "pantheon-shared", "-c",
+                     f"git -C {REPO_ROOT} commit -m {subprocess.list2cmdline([commit_msg])}"
+                     f" -- {rel_path}"],
+                    capture_output=True, text=True, check=False,
+                )
             if commit_result.returncode != 0:
-                print(f"[inbox_consumer] _stamp_auto_delivered git commit failed (stamp written locally;"
-                      f" push skipped): {commit_result.stderr}", file=sys.stderr)
-                return True  # write succeeded; inject should proceed
+                print(f"[inbox_consumer] _stamp_auto_delivered git commit FAILED (stamp written"
+                      f" locally; NOT pushed — mutex not visible to other readers):"
+                      f" {commit_result.stderr}", file=sys.stderr)
+                return False
 
             # git push with retry on non-ff (fetch + rebase, up to 3 attempts)
             from tools._git_utils import push_with_retry
             ok, detail = push_with_retry(REPO_ROOT)
             if not ok:
-                print(f"[inbox_consumer] _stamp_auto_delivered push failed (stamp committed locally;"
-                      f" HO pull may need manual ff-only merge): {detail}", file=sys.stderr)
+                print(f"[inbox_consumer] _stamp_auto_delivered push FAILED (stamp committed"
+                      f" locally; NOT pushed — mutex not visible to other readers):"
+                      f" {detail}", file=sys.stderr)
+                return False
     except GitMutationLockTimeout as exc:
         print(f"[inbox_consumer] _stamp_auto_delivered lock timeout (stamp written locally;"
-              f" commit deferred to a later cycle): {exc}", file=sys.stderr)
-    return True  # write succeeded; inject should proceed
+              f" NOT committed/pushed — mutex not visible to other readers): {exc}",
+              file=sys.stderr)
+        return False
+    return True  # frontmatter write + add + commit + push all succeeded
 
 
 def _clear_auto_delivered(ticket: TicketInfo) -> bool:
@@ -1358,11 +1491,35 @@ def _clear_auto_delivered(ticket: TicketInfo) -> bool:
     stamp makes the alert idempotent — it fires once, on the cycle that first detects
     staleness.
 
-    Best-effort: returns True if the frontmatter write persisted (stamp gone locally,
-    so this consumer won't re-alert), False if the write failed (stamp remains; next
-    cycle will re-alert + retry — self-healing, no worse than the pre-fix behavior).
-    Commit/push failures are non-fatal (local write already suppresses re-alert for
-    this agent's own working-tree reads); logged to stderr.
+    Best-effort BY DESIGN — unlike the acquire side (`_stamp_auto_delivered`,
+    fail-loud since T-3325), a release-side commit/push failure does not open
+    the same fleet-wide correctness gap an unpublished ACQUIRE stamp does.
+    Argument (T-3325 — deliberately kept, not merely inherited):
+
+      - The caller (`check_dispatch_locked`'s staleness backstop) already
+        sent the stale-lock Telegram alert and already discards this
+        function's return value entirely — nothing downstream reads it.
+      - Acquire vs release is a real asymmetry, not a place to force
+        symmetry for its own sake: an unpublished ACQUIRE hides an
+        in-flight ticket from every OTHER reader, risking a genuine
+        fleet-wide double-dispatch. An unpublished CLEAR just means another
+        reader still sees the OLD (already-alerted, already-known-stale)
+        stamp until a later cycle's commit succeeds — self-healing, and
+        there is no "delivery" on this side for a False return to
+        misreport (clear doesn't deliver anything).
+      - The local frontmatter write already achieves this consumer's own
+        purpose: it stops THIS agent's own re-alerting, which is the
+        idempotency property `_clear_auto_delivered` exists to provide.
+
+    So this function keeps its historical best-effort contract: returns True
+    if the frontmatter write persisted (stamp gone locally, so this consumer
+    won't re-alert), False if the write failed (stamp remains; next cycle
+    will re-alert + retry — self-healing, no worse than the pre-fix
+    behavior). Commit/push failures remain non-fatal; logged to stderr.
+
+    T-3325 Defect 1 DOES apply here: `add`/`commit` skip the `sg
+    pantheon-shared` group-hop when `_git_direct_writable` says the process
+    can already write `.git/` directly (see that helper's docstring).
     """
     from tools.ticket import parse_front_matter, _build_ticket_text
     from tools._git_utils import REPO_ROOT, push_with_retry
@@ -1383,25 +1540,39 @@ def _clear_auto_delivered(ticket: TicketInfo) -> bool:
         rel_path = ticket.path.relative_to(REPO_ROOT)
     except ValueError:
         rel_path = ticket.path
+    direct = _git_direct_writable(REPO_ROOT)
     commit_msg = f"tickets: clear stale auto_delivered on {ticket.id} (lock release)"
     # T-2336: pathspec-scoped commit + git_mutation_lock — same two defenses and
     # the same best-effort degradation as _stamp_auto_delivered above.
     try:
         with git_mutation_lock(label=f"clear auto_delivered {ticket.id}"):
-            add_result = subprocess.run(
-                ["sg", "pantheon-shared", "-c", f"git -C {REPO_ROOT} add {rel_path}"],
-                capture_output=True, text=True, check=False,
-            )
+            if direct:
+                add_result = subprocess.run(
+                    ["git", "-C", str(REPO_ROOT), "add", str(rel_path)],
+                    capture_output=True, text=True, check=False,
+                )
+            else:
+                add_result = subprocess.run(
+                    ["sg", "pantheon-shared", "-c", f"git -C {REPO_ROOT} add {rel_path}"],
+                    capture_output=True, text=True, check=False,
+                )
             if add_result.returncode != 0:
                 print(f"[inbox_consumer] _clear_auto_delivered git add failed (cleared locally;"
                       f" push skipped): {add_result.stderr}", file=sys.stderr)
                 return True
-            commit_result = subprocess.run(
-                ["sg", "pantheon-shared", "-c",
-                 f"git -C {REPO_ROOT} commit -m {subprocess.list2cmdline([commit_msg])}"
-                 f" -- {rel_path}"],
-                capture_output=True, text=True, check=False,
-            )
+            if direct:
+                commit_result = subprocess.run(
+                    ["git", "-C", str(REPO_ROOT), "commit", "-m", commit_msg,
+                     "--", str(rel_path)],
+                    capture_output=True, text=True, check=False,
+                )
+            else:
+                commit_result = subprocess.run(
+                    ["sg", "pantheon-shared", "-c",
+                     f"git -C {REPO_ROOT} commit -m {subprocess.list2cmdline([commit_msg])}"
+                     f" -- {rel_path}"],
+                    capture_output=True, text=True, check=False,
+                )
             if commit_result.returncode != 0:
                 print(f"[inbox_consumer] _clear_auto_delivered git commit failed (cleared locally;"
                       f" push skipped): {commit_result.stderr}", file=sys.stderr)
@@ -1947,8 +2118,45 @@ def _send_to_recovery_pane(text: str, vocab: str = "") -> bool:
         )
         return True
     ok, why = _send_to_recovery_pane_diagnosed(text)
-    _log_recovery_routing("routed" if ok else "fallback", vocab, why)
+    _log_recovery_routing("routed" if ok else "pane-miss", vocab, why)
     return ok
+
+
+RECOVERY_MAILBOX = os.environ.get("PANTHEON_RECOVERY_MAILBOX", "/home/the-ancestor/mailbox/recovery")
+
+
+def _deliver_alert_to_recovery_mailbox(msg: str, vocab: str) -> bool:
+    """Cross-account-safe delivery of a recovery-bound alert whose pane-inject missed.
+
+    T-3474: send_keys into Recovery's pane CANNOT work from another agent's account —
+    Recovery's tmux server lives under a different UID, so a cross-account caller (e.g.
+    specialist's acp-dlq watchdog) gets rc=1 'can't find pane' and, before this, EVERY
+    such alert fell straight back to direct-operator, bypassing Recovery's triage lane
+    (specialist recovery_alert_routing.log: routed=0 / fallback=28, unbroken 2026-08-03..09-06).
+    The ORG-026 hub mailbox IS writable cross-account — it is how every inter-agent
+    message already flows — and Recovery drains its own inbox, so depositing the alert
+    there restores recovery-first routing with no cross-account tmux at all.
+
+    Returns True on successful deposit (caller skips the the operator fallback), False on
+    any failure (caller then falls back to direct-operator — a lost alert is worse
+    than a duplicated one). Suppressed as a no-op True in test contexts, the same
+    live-delivery boundary as the pane path (a test that stubs neither leg must not
+    write a real hub message)."""
+    if _live_telegram_suppressed():
+        return True
+    try:
+        mailbox.send(
+            RECOVERY_MAILBOX,
+            f"[{vocab}] {msg}",
+            "inbox_consumer",
+            subject=f"routed alert ({vocab})",
+            severity="normal",
+        )
+        return True
+    except Exception as exc:
+        print(f"[inbox_consumer] recovery-mailbox alert delivery FAILED ({exc!r}); "
+              f"falling back to direct the operator", file=sys.stderr)
+        return False
 
 
 def count_consecutive_skips(agent: str) -> int:
@@ -2184,6 +2392,17 @@ _IDLE_AT_PROMPT_SENTINELS: tuple[str, ...] = (
 )
 _GENERATING_SENTINEL = "esc to interrupt"
 
+# T-3579: the sub-orch/agent MANAGE-VIEW footer ("⏸ manual mode on · N shell ·
+# ← for agents · ↓ to manage") is shown iff background shells/agents are active
+# and the main loop is idle-waiting on them (the idle COMPOSER shows
+# "? for shortcuts" instead, never "↓ to manage"). In this state Claude Code
+# QUEUES injected input (it is working) rather than submitting it — so a
+# waker/poker send-keys is doomed (queued, never confirmed) and mislabels a false
+# unit-failure (mailbox_wake exit-8, activity_monitor exit-1). "↓ to manage" is
+# the distinctive token: "← for agents" also appears on the idle view, so it is
+# NOT usable; "↓ to manage" is manage-view-only.
+_MANAGE_VIEW_SENTINEL = "↓ to manage"
+
 
 def pane_idle_state(pane: str) -> bool | None:
     """THREE-state pane classification: True=idle at prompt, False=generating,
@@ -2223,6 +2442,16 @@ def pane_idle_state(pane: str) -> bool | None:
     # agent misread as busy costs one wasted sample. Pinned by
     # test_generating_wins_when_both_sentinels_present.
     if _GENERATING_SENTINEL in bottom:
+        return False
+    # T-3579: the manage-view (background shells/agents active, main loop
+    # idle-waiting) is BUSY for wake/poke purposes — injected input is queued, not
+    # submitted. Checked BEFORE the idle sentinels and returning False (busy) makes
+    # every consumer DEFER rather than inject a doomed submit. SAFE-DIRECTION vs the
+    # T-2729 hazard: T-2729 forbade classifying this view IDLE (the waker injects on
+    # idle → send-keys into a shell); classifying it BUSY only ever defers — it
+    # never injects, so the hazard is structurally impossible and the sole failure
+    # mode is over-defer (mail/poke retained; mail_staleness T-2157 backstops).
+    if _MANAGE_VIEW_SENTINEL in bottom:
         return False
     if any(s in bottom for s in _IDLE_AT_PROMPT_SENTINELS):
         return True
@@ -2693,7 +2922,15 @@ def _send_alert_via_recovery(msg: str, vocab: str) -> None:
     # T-2206: routing outcome + reason are recorded inside _send_to_recovery_pane
     # (which stays the single mockable boundary, so existing tests that stub it
     # keep suppressing both the injection AND the log).
-    if _send_to_recovery_pane(msg, vocab=vocab):
+    delivered = _send_to_recovery_pane(msg, vocab=vocab)
+    # T-3474: the pane leg is structurally impossible cross-account (specialist cannot
+    # see Recovery's tmux server), so a pane miss must try Recovery's INBOX before bypassing
+    # to the operator — the hub is writable cross-account and Recovery drains it. Only both
+    # legs failing is a true operator-fallback.
+    if not delivered and _deliver_alert_to_recovery_mailbox(msg, vocab):
+        _log_recovery_routing("routed", vocab, f"via recovery mailbox {RECOVERY_MAILBOX} (pane unreachable)")
+        delivered = True
+    if delivered:
         # T-2237 rev2 part 2: the AUDIT ping is throttled per vocab; the pane
         # injection above is NOT. The audit says "Recovery has this, you are not on
         # the decision path" — that is a standing fact about the routing, not a
@@ -2725,7 +2962,7 @@ def _send_alert_via_recovery(msg: str, vocab: str) -> None:
         )
         _send_telegram_info(audit)
     else:
-        _send_telegram_alert(f"[fallback: recovery-pane unreachable] {msg}")
+        _send_telegram_alert(f"[fallback: recovery pane+mailbox unreachable] {msg}")
 
 
 # Persona name of the self-monitoring/triage agent. Failure alerts for any OTHER
@@ -2747,7 +2984,21 @@ def route_failure_alert(agent: str, msg: str, vocab: str) -> None:
 
     Generalizes T-0709's "pipe internal alerts to Recovery" with the Recovery-self
     carve-out. Use for every per-agent failure-class alert.
+
+    ORG-076 §7 / T-2978 — the per-persona notification-mute chokepoint. 13 fleet
+    monitors route their per-agent failure alerts through here, so gating on
+    `is_muted(agent)` uniformly silences an intentionally-offline/retired persona's
+    pages from ONE place (superseding the piecemeal per-monitor skip envs). The
+    detecting monitor still classifies + logs the fault; only the operator page is
+    withheld (mute ≠ blind). FAIL-OPEN by construction: is_muted() returns False on
+    any registry fault, so a broken/absent registry never silences an alert — and
+    the whole check is a dormant no-op until the registry is provisioned + a persona
+    is explicitly muted.
     """
+    if _persona_is_muted(agent):
+        print(f"[inbox_consumer] {agent}: failure alert suppressed (persona muted) — {vocab}",
+              file=sys.stderr)
+        return
     if agent == SELF_TRIAGE_AGENT:
         _send_telegram_alert(
             f"⚠️ [recovery-self-failure] {msg}\n"
@@ -3126,14 +3377,25 @@ def main(agent: str) -> int:
     try:
         check_autonomy_off()
         check_cap_hit(agent)
-        check_recent_inbound(agent)
-        # T-0717: check_mid_turn (per-turn pane sentinel) REMOVED here.
-        # Dispatch gating is now handled by check_dispatch_locked (the
-        # auto_delivered-stamp mutex), which is state-derived and session-
-        # independent. The wedge-health-detection path (HEALTH_PANE_WEDGE)
-        # is a separate mechanism and is NOT changed by this ticket.
-        check_dispatch_locked(agent)
+        # T-3003 (Recovery, live root-cause 2026-08-21): pull FIRST, then run the
+        # dispatch-lock maintenance, BEFORE the recent_telegram gate.
+        #  - pull before check_dispatch_locked: the auto_delivered mutex scans the
+        #    working tree; run pre-pull it evaluates a stale view and can miss an
+        #    in-flight flag that exists on origin, over-delivering.
+        #  - check_dispatch_locked before check_recent_inbound: the stale-lock
+        #    release + one-in-flight enforcement live INSIDE check_dispatch_locked.
+        #    With recent_telegram checked first, a long active Telegram conversation
+        #    short-circuited every cycle, the cleanup never ran, and stale flags
+        #    accumulated (>1 in-flight) then dumped all-at-once on the first lull
+        #    (the 5-flag burst). Lock maintenance must run every cycle, independent
+        #    of user activity; recent_telegram gates DELIVERY only (it is still
+        #    checked below, before list_eligible_tickets/deliver).
         pull_repo_or_warn("inbox_consumer")
+        # T-0717: check_mid_turn (per-turn pane sentinel) REMOVED; dispatch gating is
+        # the auto_delivered-stamp mutex (state-derived, session-independent). The
+        # HEALTH_PANE_WEDGE wedge-detection path is separate and unchanged.
+        check_dispatch_locked(agent)
+        check_recent_inbound(agent)
         tickets = list_eligible_tickets(agent)
         ticket = pick_ticket(tickets)
         prompt = format_prompt(ticket, agent)
@@ -3158,21 +3420,49 @@ def main(agent: str) -> int:
         # This is also what makes the one-cycle code-staleness window safe (a fresh
         # process can re-run a failed delivery); with the old order, any transient
         # delivery failure became a persistent block.
+        #
+        # T-3010: re-check state RIGHT BEFORE deliver — the scan gate at
+        # list_eligible_tickets filters state=inbox at scan-time, but between scan
+        # and deliver the ticket state can flip (concurrent resolve, or the DLQ-retry
+        # path where a queued poke gets replayed after the target already handled the
+        # ticket). Without this check, a done+stamped ticket can be re-poked N times
+        # (observed T-3010, T-1098 x3 post-resolve). _ticket_state_on_disk returns None
+        # for a ticket that has disappeared entirely — treat that as not-inbox so we
+        # never deliver a poke for a missing ticket either.
+        state_now = _ticket_state_on_disk(ticket.id)
+        if state_now != "inbox":
+            print(
+                f"[inbox_consumer] {agent}: {ticket.id} state flipped "
+                f"scan→deliver (was inbox, now {state_now or 'missing'}); "
+                f"skipping stale poke",
+                file=sys.stderr,
+            )
+            raise SkipCycle("concurrent_state_flip")
         deliver(agent, tmux_target, prompt)
-        if not _stamp_auto_delivered(ticket):
-            # The agent HAS been poked — do not raise, that would log this as a skip
-            # and hide a delivery that happened. Loud, because an unstamped delivery
-            # means the next cycle may legitimately re-poke.
+        stamp_ok = _stamp_auto_delivered(ticket)
+        if not stamp_ok:
+            # The agent HAS been poked — do not raise SkipCycle, that would log
+            # this as a skip and hide a delivery that happened. Loud on stderr
+            # AND on the exit code (T-3325): an unpersisted stamp is a genuine
+            # provenance-audit failure — the delivery mutex the rest of the
+            # fleet reads from `origin` never got the update, even though this
+            # agent's own local state (and therefore its own next-cycle
+            # re-scan) sees the lock and won't double-deliver itself. A
+            # non-zero exit trips this unit's existing
+            # OnFailure=pantheon-unit-failure-alert@%n.service without
+            # changing the outcome-log vocab below, so log readers still see
+            # that the delivery itself happened.
             print(
                 f"[inbox_consumer] {agent}: WARNING delivered {ticket.id} but "
-                f"auto_delivered stamp FAILED — mutex not set; next cycle may re-deliver "
-                f"(safe: payload is a durable state-pointer)",
+                f"auto_delivered stamp FAILED — mutex not persisted to origin; "
+                f"next cycle may re-deliver (safe: payload is a durable "
+                f"state-pointer)",
                 file=sys.stderr,
             )
         outcome = f"pulled {ticket.id}"
         log_outcome(agent, outcome)
         print(f"[inbox_consumer] {agent}: {outcome}")
-        return 0
+        return 0 if stamp_ok else 1
     except SkipCycle as exc:
         skip_vocab = exc.vocab
         outcome = f"skip:{skip_vocab}"

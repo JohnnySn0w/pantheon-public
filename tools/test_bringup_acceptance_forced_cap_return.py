@@ -4,10 +4,10 @@ Five legs, each independently exercised, plus the full declare -> prove ->
 restore -> report lifecycle:
 
 * forced_cap_transition_state_machine -- the REAL runtime_controller.
-  forced_swap() end-to-end (breaker_opened -> factual graveyard archive ->
+  forced_swap() end-to-end (breaker_opened -> factual Chronicle archive ->
   durable forced-failover receipt, credentials scrubbed -> replace -> await
   successor read -> ack), plus an identical-identity replay proving the
-  graveyard-receipt-bootstrap fast path (no re-open, no re-archive, no
+  chronicle-receipt-bootstrap fast path (no re-open, no re-archive, no
   re-replace), plus a differing-identity replay proving that fast path is
   identity-scoped, not blanket idempotent.
 * mailbox_requeue_and_reclaim -- real tools.mailbox against a disposable
@@ -177,10 +177,10 @@ class ForcedCapTransitionStateMachineLegTest(unittest.TestCase):
             ctx = _run_context(root)
             _manifest_path, primary, target = _load_bindings(root, ctx)
             state_root = root / "state-root"
-            graveyard_root = root / "graveyard-root"
+            chronicle_root = root / "chronicle-root"
 
             with _provenance_patch(), mock.patch.dict(
-                "os.environ", {"PANTHEON_GRAVEYARD_ROOT": str(graveyard_root)},
+                "os.environ", {"PANTHEON_CHRONICLE_ROOT": str(chronicle_root)},
             ):
                 # The leg self-contains its own OS-leaf mocking (matches
                 # harness_fallback_swap.py's landed seam) -- nothing to wrap here.
@@ -210,7 +210,7 @@ class ForcedCapTransitionStateMachineLegTest(unittest.TestCase):
             self.assertIn("<redacted-cred>", receipt["provider_error"])
 
             self.assertTrue(detail["idempotent_replay"]["reused"])
-            self.assertEqual(detail["idempotent_replay"]["handoff_or_graveyard"], detail["handoff_or_graveyard"])
+            self.assertEqual(detail["idempotent_replay"]["chronicle_evidence"], detail["chronicle_evidence"])
 
     def test_differing_identity_replay_does_not_reuse_the_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -218,10 +218,10 @@ class ForcedCapTransitionStateMachineLegTest(unittest.TestCase):
             ctx = _run_context(root)
             _manifest_path, primary, target = _load_bindings(root, ctx)
             state_root = root / "state-root"
-            graveyard_root = root / "graveyard-root"
+            chronicle_root = root / "chronicle-root"
 
             with _provenance_patch(), mock.patch.dict(
-                "os.environ", {"PANTHEON_GRAVEYARD_ROOT": str(graveyard_root)},
+                "os.environ", {"PANTHEON_CHRONICLE_ROOT": str(chronicle_root)},
             ):
                 _forced_cap_transition_state_machine_leg(
                     ctx, state_root=state_root, primary=primary, target=target,
@@ -258,10 +258,10 @@ class MailboxRequeueAndReclaimLegTest(unittest.TestCase):
             ctx = _run_context(root)
             _manifest_path, primary, target = _load_bindings(root, ctx)
             state_root = root / "state-root"
-            graveyard_root = root / "graveyard-root"
+            chronicle_root = root / "chronicle-root"
 
             with _provenance_patch(), mock.patch.dict(
-                "os.environ", {"PANTHEON_GRAVEYARD_ROOT": str(graveyard_root)},
+                "os.environ", {"PANTHEON_CHRONICLE_ROOT": str(chronicle_root)},
             ):
                 detail = _mailbox_requeue_and_reclaim_leg(
                     hub_path=ctx.hub_path, state_root=state_root, primary=primary, target=target,
@@ -324,10 +324,10 @@ class PrimaryRecoveryGateFindingLegTest(unittest.TestCase):
             ctx = _run_context(root)
             _manifest_path, primary, target = _load_bindings(root, ctx)
             state_root = root / "state-root"
-            graveyard_root = root / "graveyard-root"
+            chronicle_root = root / "chronicle-root"
 
             with _provenance_patch(), mock.patch.dict(
-                "os.environ", {"PANTHEON_GRAVEYARD_ROOT": str(graveyard_root)},
+                "os.environ", {"PANTHEON_CHRONICLE_ROOT": str(chronicle_root)},
             ):
                 _forced_cap_transition_state_machine_leg(
                     ctx, state_root=state_root, primary=primary, target=target,
@@ -350,10 +350,10 @@ class QuotaResetReturnContinuationLegTest(unittest.TestCase):
             ctx = _run_context(root)
             _manifest_path, primary, target = _load_bindings(root, ctx)
             state_root = root / "state-root"
-            graveyard_root = root / "graveyard-root"
+            chronicle_root = root / "chronicle-root"
 
             with _provenance_patch(), mock.patch.dict(
-                "os.environ", {"PANTHEON_GRAVEYARD_ROOT": str(graveyard_root)},
+                "os.environ", {"PANTHEON_CHRONICLE_ROOT": str(chronicle_root)},
             ):
                 _forced_cap_transition_state_machine_leg(
                     ctx, state_root=state_root, primary=primary, target=target,

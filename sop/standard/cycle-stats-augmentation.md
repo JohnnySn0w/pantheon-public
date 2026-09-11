@@ -104,7 +104,7 @@ The original entry stays untouched (D2 + ledger append-only discipline); the cor
 
 - **Principles + directives:** P3 (decisions justify upward — metrics is structural-justifies-via at the cycle-tier); P4 (traceability — structured fields > regex-parsed prose); D1 (the operator's bandwidth — structured cycle-stats reduce HO's estimation drift, the original surfacing problem from msg_1199); D4 (brief quality bar — wall_clock_min calibration informs future estimate accuracy); D10 (context-frugality — structured fields are minimum-traversal-to-precise-info compared to grepping prose).
 - **Policies:** `rulebook/policies/trust-posture.md` (auto-approve scope for ledger appends + close-entry writes).
-- **ADRs:** `adr/ORG-002` (principles/directives split — this SOP slots at the policy-tier under the framework).
+- **ADRs:** `architecture/adr/ORG-002` (principles/directives split — this SOP slots at the policy-tier under the framework).
 - **Ratification chain:** T-0193 (parent — shape ratification per the operator msg_1214; the founding shape this SOP documents).
 - **Sibling implementation cycles:** T-0203 (tools/cycle_stats.py — Recovery-target read tool that consumes the metrics field); T-0204 (Recovery-target one-time retro pass on pre-2026-05-10 entries; blocked on T-0203).
 - **Telegram refs:** msg_1199 + msg_1200 (the founding observations — HO's cycle-time estimates anchored on prose-buried numbers; structural fix needed); msg_1213 (HO surfaces strawman shape); msg_1214 (the operator ratifies all 6 points).

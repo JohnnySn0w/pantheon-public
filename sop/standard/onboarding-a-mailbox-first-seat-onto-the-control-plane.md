@@ -131,5 +131,5 @@ Out of scope: personas with a bespoke telegram supervisor (`migrating-an-existin
 - `tools/systemd/pantheon-persona-consume@.service` / `@.timer` — the unit templates.
 - `tools/persona_bringup.py` (`consume`) + `tools/runtime_controller.py` (`ensure_runtime`) — the consume runtime.
 - `tools/harness_adapter/claude.py` `build_interactive_launch` — where `--channels` is conditionally added (the channel-less fact).
-- `adr/ORG-031-harness-abstraction-and-daemon-onboarding.md` / `adr/ORG-050-security-and-identity-contract.md` — the control-plane ADRs.
+- `architecture/adr/ORG-031-harness-abstraction-and-daemon-onboarding.md` / `architecture/adr/ORG-050-security-and-identity-contract.md` — the control-plane ADRs.
 - T-2677 (the metis/atlas execution this SOP was written from), T-2678 (the kill-stale-pane failure), T-2679 (generalize step 3 + this SOP).

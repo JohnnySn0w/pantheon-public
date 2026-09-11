@@ -62,6 +62,7 @@ source "${SCRIPT_DIR}/t2590_cutover_verify_lib.sh"
 # file's existing clau[d]e bracket-literal below (kept in sync manually,
 # grep both files if either ever changes).
 RUNTIME_SCOPE_UNIT="pantheon-runtime-tmux.scope"
+CODEX_RECEIVER_UNIT="codex-telegram-poller.service"
 # T-2642 note (b): observed live coupling the leftover control-plane launch
 # to the restored bespoke seat. NOT a unit this repo defines anywhere
 # (grep-verified: no unit file, no Slice=, no constant) -- most likely
@@ -99,10 +100,13 @@ fi
 eval "$RESOLVE_OUTPUT"
 
 XRD="$PCX_XDG_RUNTIME_DIR"
+DBUS="$PCX_DBUS_SESSION_BUS_ADDRESS"
 
 [[ "$(id -u)" == "$PCX_UID" ]] || die "must run as ${PCX_ACCOUNT} (uid ${PCX_UID}); got uid $(id -u). Wrap with sudo -u ${PCX_ACCOUNT}."
 [[ -d "$XRD" ]] || die "XDG_RUNTIME_DIR $XRD missing — user bus unreachable; cannot drive ${PCX_ACCOUNT}'s systemctl --user"
+[[ -n "$DBUS" ]] || die "DBUS_SESSION_BUS_ADDRESS missing — user bus unreachable; cannot drive ${PCX_ACCOUNT}'s systemctl --user"
 export XDG_RUNTIME_DIR="$XRD"
+export DBUS_SESSION_BUS_ADDRESS="$DBUS"
 
 declare -a FILES=(
   "$PCX_SERVICE_UNIT_PATH"
@@ -118,6 +122,104 @@ done
 
 DROPIN_FILE="${PCX_HOME}/.config/systemd/user/${PCX_CONSUME_SERVICE}.d/urgent.conf"
 
+consume_timer_link_path() {
+  printf '%s/.config/systemd/user/timers.target.wants/%s\n' "$PCX_HOME" "$PCX_CONSUME_TIMER"
+}
+
+consume_timer_link_require_absent() {
+  local link_path
+  link_path="$(consume_timer_link_path)"
+  [[ ! -e "$link_path" && ! -L "$link_path" ]] || die "${PCX_CONSUME_TIMER} enablement link still exists: ${link_path}"
+}
+
+consume_unit_show_state() {
+  local unit="$1"
+  systemctl --user show "$unit" -p LoadState -p UnitFileState -p ActiveState -p SubState
+}
+
+PCX_UNIT_STATE_ERROR=""
+
+consume_unit_state_matches() {
+  local unit="$1"
+  local require_not_found="$2"
+  local output line key value
+  local load_state="__missing__"
+  local unit_file_state="__missing__"
+  local active_state="__missing__"
+  local sub_state="__missing__"
+  if ! output="$(consume_unit_show_state "$unit" 2>&1)"; then
+    PCX_UNIT_STATE_ERROR="${unit} state proof failed -- ${output}"
+    return 1
+  fi
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    if [[ "$line" != *=* ]]; then
+      PCX_UNIT_STATE_ERROR="${unit} state proof malformed line: ${line}"
+      return 1
+    fi
+    key="${line%%=*}"
+    value="${line#*=}"
+    case "$key" in
+      LoadState) [[ "$load_state" == "__missing__" ]] || { PCX_UNIT_STATE_ERROR="${unit} duplicate LoadState"; return 1; }; load_state="$value" ;;
+      UnitFileState) [[ "$unit_file_state" == "__missing__" ]] || { PCX_UNIT_STATE_ERROR="${unit} duplicate UnitFileState"; return 1; }; unit_file_state="$value" ;;
+      ActiveState) [[ "$active_state" == "__missing__" ]] || { PCX_UNIT_STATE_ERROR="${unit} duplicate ActiveState"; return 1; }; active_state="$value" ;;
+      SubState) [[ "$sub_state" == "__missing__" ]] || { PCX_UNIT_STATE_ERROR="${unit} duplicate SubState"; return 1; }; sub_state="$value" ;;
+      *) PCX_UNIT_STATE_ERROR="${unit} state proof unexpected key: ${key}"; return 1 ;;
+    esac
+  done <<< "$output"
+  if [[ "$load_state" == "__missing__" || "$unit_file_state" == "__missing__" || "$active_state" == "__missing__" || "$sub_state" == "__missing__" ]]; then
+    PCX_UNIT_STATE_ERROR="${unit} state proof missing required keys"
+    return 1
+  fi
+  if [[ "$active_state" != "inactive" || "$sub_state" != "dead" ]]; then
+    PCX_UNIT_STATE_ERROR="${unit} is not inactive/dead (LoadState=${load_state} UnitFileState=${unit_file_state} ActiveState=${active_state} SubState=${sub_state})"
+    return 1
+  fi
+  if [[ "$require_not_found" == 1 ]]; then
+    if [[ "$load_state" != "not-found" ]]; then
+      PCX_UNIT_STATE_ERROR="${unit} LoadState is ${load_state}, expected not-found"
+      return 1
+    fi
+    if [[ "$unit_file_state" != "not-found" && "$unit_file_state" != "" ]]; then
+      PCX_UNIT_STATE_ERROR="${unit} UnitFileState is ${unit_file_state}, expected not-found/empty"
+      return 1
+    fi
+  fi
+  PCX_UNIT_STATE_ERROR=""
+}
+
+consume_unit_require_state() {
+  local unit="$1"
+  local require_not_found="$2"
+  consume_unit_state_matches "$unit" "$require_not_found" || die "$PCX_UNIT_STATE_ERROR"
+}
+
+consume_unit_stop_or_notfound_dead() {
+  local unit="$1"
+  local output rc digest
+  if output="$(systemctl --user stop "$unit" 2>&1)"; then
+    consume_unit_require_state "$unit" 0
+    return
+  fi
+  rc=$?
+  digest="$(printf '%s' "$output" | sha256sum | awk '{print $1}')"
+  consume_unit_state_matches "$unit" 1 || die "failed to stop ${unit}; stop_rc=${rc}; stop_output_sha256=${digest}; ${PCX_UNIT_STATE_ERROR}"
+}
+
+consume_timer_service_teardown_before_staged_rollback() {
+  consume_unit_stop_or_notfound_dead "$PCX_CONSUME_TIMER"
+  consume_unit_stop_or_notfound_dead "$PCX_CONSUME_SERVICE"
+  echo "confirmed: consume timer stopped and consume service inactive/dead before staged rollback"
+}
+
+consume_units_final_proof_after_staged_rollback() {
+  systemctl --user daemon-reload
+  consume_timer_link_require_absent
+  consume_unit_require_state "$PCX_CONSUME_TIMER" 1
+  consume_unit_require_state "$PCX_CONSUME_SERVICE" 1
+  echo "confirmed: consume link absent and timer/service inactive/dead before bespoke restart"
+}
+
 echo "== T-2633 ${PERSONA} generic rollback =="
 echo "persona: $PERSONA (role: $PCX_ROLE, account: $PCX_ACCOUNT)"
 echo "stamp:   $STAMP"
@@ -132,10 +234,19 @@ if [[ $EXECUTE != 1 ]]; then
   echo "  systemctl --user daemon-reload"
   echo "  systemctl --user stop ${RUNTIME_SCOPE_UNIT}            # T-2642: tear down leftover control-plane scope before bespoke restart"
   echo "  systemctl --user reset-failed ${RUNTIME_SCOPE_UNIT}"
+  echo "  systemctl --user stop ${CODEX_RECEIVER_UNIT}           # R5: emergency rollback stop-codex-poller"
+  echo "  [abort if ${CODEX_RECEIVER_UNIT} remains active]       # R5: probe-codex-absent before bespoke restart"
   echo "  systemctl --user stop ${RUNTIME_CONSUME_SLICE}   # T-2642: best-effort, no-op if absent (not a unit this repo defines)"
   echo "  systemctl --user reset-failed ${RUNTIME_CONSUME_SLICE}"
   echo "  tmux kill-session -t ${PCX_TMUX_SESSION}   # T-2642: symmetric inverse of persona_cutover.sh's own pre-apply guard"
   echo "  [abort if ${PCX_TMUX_SESSION} survives the kill]"
+  echo "  systemctl --user stop ${PCX_CONSUME_TIMER}"
+  echo "  systemctl --user stop ${PCX_CONSUME_SERVICE}"
+  echo "  [abort unless ${PCX_CONSUME_SERVICE} and ${PCX_CONSUME_TIMER} prove inactive/dead]"
+  echo "  PATH=${PCX_APPLY_PATH} python3 ${PCX_HOME}/pantheon-config/tools/t2611_recovery_persona_apply.py rollback-staged --persona ${PERSONA} --stamp ${STAMP} --account-home ${PCX_HOME}"
+  echo "          # R5: checkpoint rollback before bespoke restart; no manifest read"
+  echo "  systemctl --user daemon-reload"
+  echo "  [abort unless $(consume_timer_link_path) is absent and ${PCX_CONSUME_TIMER}/${PCX_CONSUME_SERVICE} prove not-found/inactive/dead]"
   echo "  systemctl --user enable ${PCX_SERVICE}   # T-2611: cutover's disable --now removed the enable symlink"
   echo "  systemctl --user restart ${PCX_SERVICE}"
   echo "  verify: is-active ${PCX_SERVICE}; tmux has-session ${PCX_TMUX_SESSION}; claude+bun children present;"
@@ -181,6 +292,12 @@ if [[ "$(systemctl --user show "$RUNTIME_SCOPE_UNIT" -p ActiveState --value 2>/d
 fi
 systemctl --user reset-failed "$RUNTIME_SCOPE_UNIT" >/dev/null 2>&1 || true
 
+systemctl --user stop "$CODEX_RECEIVER_UNIT" >/dev/null 2>&1 || true
+if systemctl --user is-active --quiet "$CODEX_RECEIVER_UNIT"; then
+  die "codex receiver ${CODEX_RECEIVER_UNIT} still active -- refusing to restart bespoke ${PCX_SERVICE}"
+fi
+echo "confirmed: ${CODEX_RECEIVER_UNIT} inactive/not-found before bespoke restart"
+
 # T-2642 note (b): best-effort teardown of the auto-derived persona-consume
 # slice observed coupling the leftover control-plane launch to the restored
 # bespoke seat. Not a unit defined anywhere in this repo (grep-verified) --
@@ -199,6 +316,18 @@ if tmux has-session -t "$PCX_TMUX_SESSION" 2>/dev/null; then
 fi
 echo "confirmed: default tmux socket has no ${PCX_TMUX_SESSION} session (control-plane torn down)"
 
+consume_timer_service_teardown_before_staged_rollback
+
+PERSONA_APPLY_HELPER="${PCX_HOME}/pantheon-config/tools/t2611_recovery_persona_apply.py"
+if ! STAGED_ROLLBACK_OUTPUT="$(PATH="$PCX_APPLY_PATH" python3 "$PERSONA_APPLY_HELPER" rollback-staged --persona "$PERSONA" --stamp "$STAMP" --account-home "$PCX_HOME" 2>&1)"; then
+  echo "$STAGED_ROLLBACK_OUTPUT" >&2
+  die "staged checkpoint rollback failed before bespoke restart"
+fi
+echo "$STAGED_ROLLBACK_OUTPUT"
+echo "staged checkpoint rollback complete before bespoke restart"
+
+consume_units_final_proof_after_staged_rollback
+
 # T-2611: the cutover's `disable --now` removes the enable symlink -- without
 # this, rollback restores the files and restarts the service for THIS boot
 # only, silently leaving the persona unsupervised across the next reboot.
@@ -209,19 +338,12 @@ systemctl --user restart "$PCX_SERVICE"
 sleep 6
 
 # Shape-1 inverse (T-2608): after a Shape-1 cutover, pantheon-persona-consume
-# @<persona>.timer is the live supervisor. Leaving it enabled post-rollback
-# means every ~2min it hits a live non-scope-owned default tmux server and
-# raises recurring OnFailure alerts. Undo both cutover-only artifacts here,
-# AFTER the bespoke service is confirmed restarted above -- so there is never
-# a gap where neither supervisor owns the pane. `rm -f` is unconditionally
-# safe: the urgent drop-in may never have been installed (persona_cutover.sh
-# only writes it when --with-urgent-env was passed at fire time), and this
-# rollback has no way to know that in advance -- removing an absent file is a
-# no-op, matching direction-independent restore semantics.
-systemctl --user disable --now "$PCX_CONSUME_TIMER" || true
+# @<persona>.timer is the live supervisor. The staged rollback above owns
+# disabling/removing the consume units and this script proves both dead before
+# bespoke restart. The urgent drop-in remains a shell-local cutover artifact.
 rm -f "$DROPIN_FILE"
 systemctl --user daemon-reload
-echo "shape-1 inverse: consume timer disabled, urgent dropin removed (if present)"
+echo "shape-1 inverse: consume units proven dead, urgent dropin removed (if present)"
 
 # T-2648: restore any companion unit(s) the cutover's fire may have stopped
 # (e.g. specialist's acp-bridge, which shares the default tmux socket with the

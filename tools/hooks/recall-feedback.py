@@ -59,7 +59,7 @@ SEEN_TTL_SECONDS = 24 * 3600
 
 # High-signal exact-token patterns. Each is inherently distinctive (near-zero
 # false-positive substring match against a memory body).
-_RE_TICKET = re.compile(r"\bT-\d{4}\b")
+_RE_TICKET = re.compile(r"\bT-\d{4,}\b")  # T-3215
 _RE_ORG = re.compile(r"\bORG-\d{3}\b")
 # A path segment or filename with a known code/config extension.
 _CODE_EXT = (

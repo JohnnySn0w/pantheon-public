@@ -85,6 +85,25 @@ cutover_urgent_env_confirmed() {
   printf '%s\n' "$show" | tr ' ' '\n' | grep -qx -- "$token"
 }
 
+_t2590_cutover_bun_runner_argv0_ok() { # <argv0> <home>
+  local argv0="$1" home="$2" bun="$home/.bun/bin/bun"
+  [[ "$argv0" == "bun" || "$argv0" == "$bun" ]]
+}
+
+_t2590_cutover_bun_absolute_argv0_ok() { # <argv0> <home>
+  local argv0="$1" home="$2"
+  [[ "$argv0" == "$home/.bun/bin/bun" ]]
+}
+
+_t2590_cutover_plugin_dir_ok() { # <path> <home>
+  local candidate="$1" home="$2"
+  local plugin="$home/.claude/plugins/cache/claude-plugins-official/telegram/"
+  local suffix
+  [[ "$candidate" == "$plugin"* ]] || return 1
+  suffix="${candidate#"$plugin"}"
+  [[ -n "$suffix" && "$suffix" != "." && "$suffix" != ".." && "$suffix" != */* ]]
+}
+
 # cutover_telegram_poller_present <pane> <home> <proc-root> — true (rc 0) iff
 # BOTH telegram-plugin bun children are alive under <pane>'s tmux-owned
 # process tree: the plugin `bun run --cwd <plugin-dir> ... start` runner AND
@@ -105,10 +124,9 @@ cutover_telegram_poller_present() {
   local root
   root="$(tmux display-message -p -t "$pane" "#{pane_pid}" 2>/dev/null)" || return 1
   [[ "$root" =~ ^[0-9]+$ && -r "$proc/$root/status" ]] || return 1
-  local bun="$home/.bun/bin/bun"
-  local plugin="$home/.claude/plugins/cache/claude-plugins-official/telegram/"
-  local queue=("$root") seen=0 runner=0 server=0 runner_pid=""
+  local queue=("$root") seen=0 runner_count=0 server_count=0 direct_count=0 pair_count=0 complete_count=0
   local parent children pid exe argv arg
+  local -A runner_seen=() server_for_runner=()
   while (( ${#queue[@]} )); do
     parent="${queue[0]}"; queue=("${queue[@]:1}")
     children="$(pgrep -P "$parent" 2>/dev/null || true)"
@@ -122,44 +140,57 @@ cutover_telegram_poller_present() {
       # on /proc/<pid>/environ. The old `exe==bun` gate therefore SILENTLY SKIPPED
       # a live poller in the cutover-verify context (false-negatived a green
       # cutover). /proc/<pid>/cmdline IS readable, and argv carries what we need:
-      # argv[0]=the bun exe path; argv[3]=the --cwd plugin dir (authoritative for
-      # `bun run --cwd`, so the process's real cwd need not be readlink'd).
+      # argv[0]=either the account-local bun exe path or, for the runner shape
+      # only, the literal token `bun`; argv[3]=the --cwd plugin dir
+      # (authoritative for `bun run --cwd`, so the process's real cwd need not
+      # be readlink'd).
       argv=()
       while IFS= read -r -d "" arg; do argv+=("$arg"); done < "$proc/$pid/cmdline" 2>/dev/null
       (( ${#argv[@]} )) || continue
-      [[ "${argv[0]}" == "$bun" ]] || continue
-      if (( ${#argv[@]} >= 5 )) && [[ "${argv[1]}" == run && "${argv[2]}" == --cwd \
-           && "${argv[3]}" == "$plugin"* && -n "${argv[3]#"$plugin"}" \
-           && "${argv[3]#"$plugin"}" != */* ]]; then
-        for arg in "${argv[@]:4}"; do [[ "$arg" == start ]] && { runner=1; runner_pid="$pid"; }; done
+      if (( ${#argv[@]} >= 5 )) && [[ "${argv[1]}" == run && "${argv[2]}" == --cwd ]] \
+           && _t2590_cutover_bun_runner_argv0_ok "${argv[0]}" "$home" \
+           && _t2590_cutover_plugin_dir_ok "${argv[3]}" "$home"; then
+        for arg in "${argv[@]:4}"; do
+          if [[ "$arg" == start ]]; then
+            runner_seen["$pid"]=1
+            runner_count=$((runner_count + 1))
+            break
+          fi
+        done
       fi
       # T-2651: identify the server.ts CHILD by TREE POSITION (its direct
       # parent, `$parent` — the pid whose children this BFS iteration is
-      # walking — is the already-matched runner pid), NOT by readlink cwd.
+      # walking — must be the matched runner pid), NOT by readlink cwd.
       # Specialist's poller is a 2-process shape (runner spawns `bun server.ts` as
       # a direct child); the prior `cwd == "$plugin"*` gate required
       # readlink(/proc/<pid>/cwd), which yama ptrace_scope denies for a
       # same-uid non-ancestor — the SAME restriction class T-2630 fixed for
-      # the runner/single-process branches, missed here. `runner_pid` is
-      # always set (if it will be) before the runner's own children are
-      # walked, since a pid is matched as a child strictly before it is later
-      # dequeued as `parent` — the BFS FIFO invariant.
+      # the runner/single-process branches, missed here.
       if (( ${#argv[@]} == 2 )) && [[ "${argv[1]}" == server.ts ]] \
-           && [[ -n "$runner_pid" && "$parent" == "$runner_pid" ]]; then
-        server=1
+           && _t2590_cutover_bun_absolute_argv0_ok "${argv[0]}" "$home"; then
+        server_count=$((server_count + 1))
+        if [[ -n "${runner_seen[$parent]:-}" ]]; then
+          server_for_runner["$parent"]=$(( ${server_for_runner[$parent]:-0} + 1 ))
+        fi
       fi
       # T-2624/T-2630: the absolute-bun direct-spawn launch (the PATH fix) is a
       # SINGLE process `bun run --cwd <plugin-dir> --silent server.ts`, identified
       # PURELY by cmdline (argv[3] carries the plugin dir via --cwd — ptrace-safe,
       # no readlink cwd needed). Single process = whole poller (runner+server).
-      if (( ${#argv[@]} >= 4 )) && [[ "${argv[1]}" == run && "${argv[2]}" == --cwd \
-           && "${argv[3]}" == "$plugin"* && -n "${argv[3]#"$plugin"}" \
-           && "${argv[3]#"$plugin"}" != */* ]]; then
-        for arg in "${argv[@]:4}"; do [[ "$arg" == server.ts ]] && { runner=1; server=1; }; done
+      if (( ${#argv[@]} >= 4 )) && [[ "${argv[1]}" == run && "${argv[2]}" == --cwd ]] \
+           && _t2590_cutover_bun_absolute_argv0_ok "${argv[0]}" "$home" \
+           && _t2590_cutover_plugin_dir_ok "${argv[3]}" "$home"; then
+        for arg in "${argv[@]:4}"; do
+          [[ "$arg" == server.ts ]] && { direct_count=$((direct_count + 1)); break; }
+        done
       fi
     done
   done
-  [[ "$runner" == 1 && "$server" == 1 ]]
+  for pid in "${!runner_seen[@]}"; do
+    [[ "${server_for_runner[$pid]:-0}" == 1 ]] && pair_count=$((pair_count + 1))
+  done
+  complete_count=$((direct_count + pair_count))
+  [[ "$complete_count" == 1 && "$runner_count" == "$pair_count" && "$server_count" == "$pair_count" ]]
 }
 
 # cutover_companion_rejoined <unit> <session> — true (rc 0) iff a companion

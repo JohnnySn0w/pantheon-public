@@ -19,6 +19,9 @@ Per agent it reads the credential and classifies (first match wins):
   MALFORMED   — file missing/unreadable/unparseable, or no accessToken
   NO_REFRESH  — refreshToken missing/empty (the exact Specialist failure — cannot
                 auto-renew; a ticking time bomb that fires at access-token expiry)
+  NEAR_CLIFF  — refreshTokenExpiresAt within the warn window (default 3d) or already
+                past (T-2973): the non-rotating ~30-day refresh token is about to/has
+                lapsed → PRE-EMPTIVE re-login needed before the next renew zeroes it
   EXPIRED     — now >= expiresAt
   NEAR_EXPIRY — expiresAt - now <= warn-window (default 12h)
   OK          — otherwise
@@ -42,6 +45,11 @@ from pathlib import Path
 
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+try:  # ORG-076 §7 / T-2978: the unified per-persona mute registry.
+    from tools.notify_policy import is_muted as _persona_is_muted
+except ImportError:  # bare run with cwd=tools/
+    from notify_policy import is_muted as _persona_is_muted  # type: ignore
 
 # Accounts that authenticate with a Claude OAuth credential file (agent -> unix
 # user). Deliberately INDEPENDENT of context_fill_monitor.AGENT_CONFIG: that set
@@ -71,6 +79,22 @@ CREDENTIALED_ACCOUNTS = {
 
 # Tunable (env-overridable): re-alert cadence per (agent, problem class).
 ALERT_COOLDOWN_SECONDS = int(os.environ.get("PANTHEON_CRED_ALERT_COOLDOWN_SECONDS", str(6 * 3600)))
+# Agents whose credential ALERTS are suppressed — intentionally offline/retired seats
+# (T-2973: mnemosyne offline, the-ancestor retiring). Their credentials will trip
+# NEAR_CLIFF/MALFORMED forever with no one to relogin, so alerting the operator about them
+# is pure noise (a D1 violation). The class is still CLASSIFIED + LOGGED (trace kept,
+# so a resurrected seat is not silently blind — check the log), only the the operator page
+# + Recovery wake are suppressed, and the agent is not counted a problem. Comma-separated
+# env, mirrors channel_liveness's CHANNEL_LIVENESS_SKIP. REVERSIBLE: drop from the env
+# when a seat comes back online.
+CREDENTIAL_ALERT_SKIP = {a.strip() for a in os.environ.get("PANTHEON_CRED_ALERT_SKIP", "").split(",") if a.strip()}
+# T-2973: the refresh token is NON-rotating and expires ~30d from login; when it
+# lapses the next access-token renew hard-fails and Claude Code ZEROES the credential
+# (the 2026-08-18 cascade — atlas/orchestrator/recovery/metis within hours, undetected because
+# this monitor only watched the short-lived ACCESS token). Warn this many seconds
+# before the refreshTokenExpiresAt cliff so the SOP's pre-emptive relogin arc fires in
+# time. Default 3 days — enough runway to batch-relogin the whole cohort.
+REFRESH_CLIFF_WARN_SECONDS = int(os.environ.get("PANTHEON_CRED_REFRESH_CLIFF_WARN_SECONDS", str(3 * 24 * 3600)))
 
 STATE_DIR = Path.home() / ".local" / "state" / "pantheon"
 STATE_PATH = STATE_DIR / "credential_expiry_alert_state.json"
@@ -155,6 +179,24 @@ def classify(agent: str, cfg: dict, now: float | None = None) -> tuple[str, str]
         return "MALFORMED", "expiresAt missing/non-numeric"
     exp = exp_ms / 1000.0
     secs_left = exp - now
+
+    # T-2973 — the ~30-day refresh-token cliff. Unlike the access token (short-lived,
+    # routine silent renew — deliberately NOT an alert class per the note above), the
+    # refresh token is non-rotating; once refreshTokenExpiresAt lapses the next renew
+    # hard-fails and Claude Code zeroes the credential. This is the one file-readable
+    # signal that PRE-warns the cliff, so it IS actionable/alertable. Absent field
+    # (older login format) → fall through to OK, never a false cliff.
+    rte_ms = oauth.get("refreshTokenExpiresAt")
+    if isinstance(rte_ms, (int, float)):
+        rte_left = rte_ms / 1000.0 - now
+        if rte_left <= REFRESH_CLIFF_WARN_SECONDS:
+            when = f"expired {_fmt_dur(-rte_left)} ago" if rte_left <= 0 else f"expires in {_fmt_dur(rte_left)}"
+            return "NEAR_CLIFF", (
+                f"refresh token {when} ({_fmt_ts(rte_ms / 1000.0)}) — the ~30-day cliff. A "
+                f"PRE-EMPTIVE re-login is needed before it lapses, or the next access-token "
+                f"renew hard-fails and the credential is zeroed (T-2973)."
+            )
+
     if secs_left <= 0:
         return "OK", f"refresh token present; access token expired {_fmt_dur(-secs_left)} ago — will auto-renew on next use"
     return "OK", f"refresh token present; access token valid for {_fmt_dur(secs_left)} ({_fmt_ts(exp)})"
@@ -301,6 +343,19 @@ def check(agents: list[str], *, dry_run: bool, now: float | None = None) -> int:
         if not dry_run:
             _track_login_event(agent, cfg, now, state)
         if cls == "OK":
+            continue
+        # Intentionally offline/retired seat (T-2973): classified + logged above so the
+        # trace survives, but no alert/wake and not counted a problem — nobody is going
+        # to relogin it, so paging the operator would be pure noise.
+        # Suppress the operator page for an intentionally offline/retired persona, via
+        # the unified mute registry (ORG-076 §7 / T-2978, the go-forward path). The
+        # legacy per-monitor env skip (PANTHEON_CRED_ALERT_SKIP) was RETIRED at the
+        # T-2987 go-live once the shared registry was provisioned + populated with the
+        # offline seats; the CREDENTIAL_ALERT_SKIP clause is kept as a dormant, always-
+        # empty escape hatch (re-set the env for an emergency skip without a code change).
+        # is_muted fail-opens, so an absent/broken registry is a no-op (never silences).
+        if agent in CREDENTIAL_ALERT_SKIP or _persona_is_muted(agent):
+            _log(agent, f"alert suppressed (persona muted / skip-list: intentionally offline/retired) — {cls}")
             continue
         problems += 1
         if dry_run:

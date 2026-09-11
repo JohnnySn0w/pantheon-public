@@ -126,7 +126,7 @@ DRY_RUN=0
 SKIP_ACK=0                               # T-0510: force-restart mode — skip steps 2-4 (handoff prompt + ack-wait)
 DISMISS_MODAL=0                          # T-2829: send Escape before the handoff prompt to clear a blocking permission modal (fail-closed — Escape CANCELS/denies, never approves). Opt-in; autonomous wedge-recovery passes it, the operator's attended manual restart does not.
 HARD_RESTART_ON_ACK_TIMEOUT=0            # T-2829: on step-4 ack timeout, fall through to the restart (steps 5-8) instead of exit 4, so a session that cannot hand off (e.g. modal-wedged) is still recovered rather than left wedged. Opt-in.
-NO_RESTART=0                             # T-1049: pause mode — run steps 1-4 + graveyard, then STOP (no restart). For the fleet-reboot quiesce: each agent finishes + writes HANDOFF + is graveyard'd + pauses, then the machine reboots.
+NO_RESTART=0                             # T-1049: pause mode — run steps 1-4 + chronicle, then STOP (no restart). For the fleet-reboot quiesce: each agent finishes + writes HANDOFF + is chronicle'd + pauses, then the machine reboots.
 KICK_ENABLED=1                           # T-0172: post-step-7 HANDOFF kick (default on; --no-kick to disable)
 KICK_PROMPT=""                           # default below if unset
 
@@ -190,15 +190,15 @@ Optional:
                               that cannot hand off (modal-wedged, or otherwise not progressing) rather
                               than abandoning it wedged (the pre-T-2829 hole that left specialist stuck on a
                               settings.json modal ~3.3d). The fresh handoff is lost, but the prior
-                              cycle's handoff + graveyard remain. Paired with --dismiss-modal by the
+                              cycle's handoff + chronicle remain. Paired with --dismiss-modal by the
                               autonomous wedge-recovery path (restart_drain graceful invocation): Escape
                               first (preserve the handoff), hard-restart if it still can't. Off by default.
-  --no-restart                pause mode (T-1049): run steps 1-4 + graveyard archive (prompt the agent to
+  --no-restart                pause mode (T-1049): run steps 1-4 + chronicle archive (prompt the agent to
                               finish + write its HANDOFF, wait for the mtime ack, snapshot to the
-                              graveyard), then STOP — skip the restart and all post-restart steps (5-8).
+                              chronicle), then STOP — skip the restart and all post-restart steps (5-8).
                               The fleet-reboot quiesce: each agent is left finished + recorded + paused;
                               the machine reboot (driven by the fleet orchestrator) is what cycles it.
-                              Mutually exclusive with --skip-ack (which has no fresh handoff to graveyard).
+                              Mutually exclusive with --skip-ack (which has no fresh handoff to chronicle).
   --dry-run                   print plan; perform no side effects
   --supervisor <bespoke|control-plane>
                               default: bespoke. T-2658: control-plane seats (a persona cut
@@ -260,8 +260,14 @@ case "$SUPERVISOR" in
   bespoke|control-plane) ;;
   *) echo "--supervisor must be 'bespoke' or 'control-plane'" >&2; exit 64 ;;
 esac
+if [[ "$SUPERVISOR" == "control-plane" ]]; then
+  if [[ ! "$SERVICE" =~ ^pantheon-persona-consume@[a-z][a-z0-9_-]*\.service$ ]]; then
+    echo "control-plane supervisor requires pantheon-persona-consume@<safe-persona>.service; got '$SERVICE'" >&2
+    exit 64
+  fi
+fi
 if [[ "$NO_RESTART" == "1" && "$SKIP_ACK" == "1" ]]; then
-  echo "--no-restart and --skip-ack are mutually exclusive (skip-ack has no fresh handoff to graveyard, and no-restart skips the restart skip-ack exists to perform)" >&2
+  echo "--no-restart and --skip-ack are mutually exclusive (skip-ack has no fresh handoff to chronicle, and no-restart skips the restart skip-ack exists to perform)" >&2
   exit 64
 fi
 # In pause mode the agent is asked to finish + write its handoff + STOP (it will
@@ -570,23 +576,23 @@ if [[ "$ack_ok" != "1" ]]; then
   fi
 else
 
-# T-0766 (Veneration graveyard): snapshot the freshly-written handoff to on-disk local
+# T-0766 (Veneration Chronicle): snapshot the freshly-written handoff to on-disk local
 # state (NOT the repo — portability + no .git bloat, msg 2758) so a successor can READ its
 # predecessor's last words (the cheap recovery tier) rather than resurrecting the dead
 # session. Runs only on the ack path (a fresh handoff exists); the forced/--skip-ack path
 # has no fresh handoff → no archive → that is precisely the live claude --resume tier.
 # Best-effort + non-fatal: a failure here must NEVER block the restart (same discipline as
 # the session_reset_log emit below).
-GRAVEYARD_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+CHRONICLE_TS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # T-1636 review fix: detect the dying session's uuid ONCE and pass it to BOTH
 # the handoff archive and the pane-log companion below — two independent
 # detections could scan different newest-jsonls seconds apart and break the
 # self-pairing <ts>-<uuid> stem contract.
-GRAVEYARD_UUID="$(python3 "$(dirname "$0")/graveyard.py" detect-uuid \
+CHRONICLE_UUID="$(python3 "$(dirname "$0")/chronicle.py" detect-uuid \
       --projects-dir "$HOME/.claude/projects" 2>/dev/null || echo unknown)"
 
 # T-2638: conservation check BEFORE the archive call below — at this point
-# graveyard.py's latest snapshot is still the PRIOR cycle's handoff, so this
+# chronicle.py's latest snapshot is still the PRIOR cycle's handoff, so this
 # compares two genuinely consecutive HANDOFF rewrites (the archive call right
 # after this turns the current text into the new latest). Advisory only: it
 # only ever prints ALERT lines on suspected silent detail loss (context
@@ -598,13 +604,13 @@ python3 "$(dirname "$0")/handoff_conservation.py" check \
       --handoff-file "$HANDOFF_FILE" \
       2>&1 | sed 's/^/  [handoff-conservation] /'
 
-if ! python3 "$(dirname "$0")/graveyard.py" archive \
+if ! python3 "$(dirname "$0")/chronicle.py" archive \
       --handoff-file "$HANDOFF_FILE" \
       --reason "graceful_restart" \
-      --ts "$GRAVEYARD_TS" \
-      --uuid "$GRAVEYARD_UUID" \
-      2>&1 | sed 's/^/  [graveyard] /'; then
-  log "graveyard archive failed (non-fatal); see [graveyard] lines above"
+      --ts "$CHRONICLE_TS" \
+      --uuid "$CHRONICLE_UUID" \
+      2>&1 | sed 's/^/  [chronicle] /'; then
+  log "chronicle archive failed (non-fatal); see [chronicle] lines above"
 fi
 
 fi  # T-2829: end ack-outcome branch (archive only on a successful ack)
@@ -612,13 +618,13 @@ fi  # T-2829: end ack-outcome branch (archive only on a successful ack)
 fi  # end SKIP_ACK guard (steps 2-4)
 
 # ---------------------------------------------------------------------------
-# T-1049 pause mode: handoff written + graveyard'd → STOP here (no restart).
+# T-1049 pause mode: handoff written + chronicle'd → STOP here (no restart).
 # The agent is now finished + recorded + idle; the fleet orchestrator's machine
 # reboot is what cycles it. Skips steps 5-8 (restart, is-active, steady-state,
 # kick) entirely — the wrapper deliberately does NOT own systemctl in this mode.
 # ---------------------------------------------------------------------------
 if [[ "$NO_RESTART" == "1" ]]; then
-  log "pause mode (--no-restart): handoff written + graveyard archived; skipping restart. Agent paused pending machine reboot."
+  log "pause mode (--no-restart): handoff written + chronicle archived; skipping restart. Agent paused pending machine reboot."
   exit 0
 fi
 
@@ -631,7 +637,7 @@ fi
 # --skip-ack paths (review fix: an unconsumed log would blend two sessions'
 # scrollback under the next archive's stem) but NOT in pause mode (session
 # stays alive there — its tap must keep its file). Stage 2/2 gzips the staged
-# file into the graveyard AFTER the restart kills the session (file complete).
+# file into the Chronicle AFTER the restart kills the session (file complete).
 # Best-effort throughout: staging failure must never block the restart.
 for _panelog in "${PANE_LOG_DIR:-$HOME/.local/log/pantheon}"/pane-timed-*.log; do
   [[ -e "$_panelog" ]] || continue
@@ -688,7 +694,7 @@ if ! python3 "$(dirname "$0")/session_reset_log.py" emit \
 fi
 
 # T-1636 stage 2/2: the restart above killed the dying session (and its tap),
-# so the staged .dying pane logs are COMPLETE — gzip each into the graveyard as
+# so the staged .dying pane logs are COMPLETE — gzip each into the Chronicle as
 # <ts>-<uuid>.pane.log.gz beside the handoff snapshot. Agent derived from the
 # handoff PATH via argv (review fix: no inline-python splice — quote-safe, no
 # injection surface); uuid/ts reuse the archive call's values on the ack path
@@ -698,13 +704,13 @@ fi
 # stage-2 sweep (the *.log glob in stage 1 can't re-blend it).
 for _staged in "${PANE_LOG_DIR:-$HOME/.local/log/pantheon}"/pane-timed-*.log.dying; do
   [[ -e "$_staged" ]] || continue
-  _companion_out="$(python3 "$(dirname "$0")/graveyard.py" companion \
+  _companion_out="$(python3 "$(dirname "$0")/chronicle.py" companion \
         --source "$_staged" \
         --handoff-file "$HANDOFF_FILE" \
-        --ts "${GRAVEYARD_TS:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
-        --uuid "${GRAVEYARD_UUID:-unknown-forced}" \
+        --ts "${CHRONICLE_TS:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
+        --uuid "${CHRONICLE_UUID:-unknown-forced}" \
         2>&1)"; _companion_rc=$?
-  [[ -n "$_companion_out" ]] && printf '%s\n' "$_companion_out" | sed 's/^/  [graveyard] /'
+  [[ -n "$_companion_out" ]] && printf '%s\n' "$_companion_out" | sed 's/^/  [chronicle] /'
   if [[ "$_companion_rc" -ne 0 ]]; then
     log "pane-log companion not archived for ${_staged##*/} (non-fatal; retried next restart)"
   fi

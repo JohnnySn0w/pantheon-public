@@ -97,6 +97,6 @@ Every **ad-hoc Agent-tool dispatch whose deliverable is a file** gets a **files-
 ## Cross-references
 
 - [`research-dispatch-filing.md`](research-dispatch-filing.md) — follow-up filing mechanics; the "just file" discipline Standard 2 scopes at noodle tier.
-- `adr/ORG-012-information-inflow-bubble-up-methodology.md` — the deliverable→promotion pathway; this SOP is itself an ORG-012 §Promotion #6 memory-pin→SOP lift.
+- `architecture/adr/ORG-012-information-inflow-bubble-up-methodology.md` — the deliverable→promotion pathway; this SOP is itself an ORG-012 §Promotion #6 memory-pin→SOP lift.
 - **T-0791** — Standard 1 origin (prediction-markets research). **T-0455** — Standard 2 origin (ticket-system noodle). **T-0871 / T-0869** — this SOP's promotion (first scripted ORG-012 sweep). **T-1170** — Standard 3 origin (Mandela-effect mitigation eval, arXiv:2602.00428); deliverable `knowledge/episodic/2026-06-16-mandela-effect-mitigation/notes.md`. **T-1276 / T-1220** — Standard 4 origin (cyber-classifier orchestrator-wedge incident; operator-ratified Sonnet-for-cyber policy TG msg 3338, 2026-06-22); recovery memory `reference_cyber_safeguard_block_on_security_research`.
 - On ratification, the two source pins (`feedback_research_surface_setup_and_generalization`, `feedback_design_noodle_explicit_not_filed`) convert to reference-pointers to this SOP per the ORG-012 memory-vs-SOP layering rule.

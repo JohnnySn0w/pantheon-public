@@ -74,6 +74,19 @@ BRIDGE_MAIN_PANE="${ACP_BRIDGE_MAIN_PANE:-}"
 # affirmatively idle main pane takes the drain via a mailbox_wake kick instead
 # of paying one ACP turn per message. Opt-in per agent via unit drop-in.
 BRIDGE_PREFER_MAIN_SEAT="${ACP_BRIDGE_PREFER_MAIN_SEAT:-}"
+# T-2688/T-3025: batched mail delivery — process the whole backlog in ONE ACP turn
+# (numbered [i/N] FIFO envelope) instead of one turn per message. Default ON fleet-wide
+# as of T-3025, after a clean ~34h soak on specialist (15 batched drains N=2..6, 0 non-cap
+# batch failures). Opt OUT per seat with ACP_BRIDGE_BATCH=0. The runtime still auto-
+# DEGRADES to per-message on any non-cap batch failure (T-2352 fallback), so the safe
+# path is preserved even default-on; worst case is exactly the pre-T-2688 per-message.
+BRIDGE_BATCH="${ACP_BRIDGE_BATCH:-1}"
+# T-2797: opt-in proactive session recycling — recycle the ACP wrapper session
+# (delete state file -> session/new on the next IDLE drain) after this many DELIVERED
+# turns, BEFORE it accrues enough context to wedge on -32603 "Prompt is too long".
+# Per-seat + reversible via unit drop-in (set ACP_BRIDGE_RECYCLE_AFTER_TURNS=<N>);
+# default OFF; drop the var -> no recycling. Mirrors ACP_BRIDGE_BATCH.
+BRIDGE_RECYCLE_AFTER_TURNS="${ACP_BRIDGE_RECYCLE_AFTER_TURNS:-}"
 # The hub group. `veneration` was RETIRED (renamed to pantheon-mailbox, gid 1006)
 # and no longer exists on the host — `sg veneration -c ...` exits 1 before the
 # bridge ever starts, and this default is unconditionally what the ExecStart wraps
@@ -133,6 +146,15 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
   fi
   if [ -n "$BRIDGE_PREFER_MAIN_SEAT" ]; then
     inner_argv+=(--prefer-main-seat)
+  fi
+  # T-3025: default-on (BRIDGE_BATCH defaults to 1); ACP_BRIDGE_BATCH=0 is the opt-out.
+  # Gate on != "0" (not -n) because the default is now non-empty, so any value other
+  # than the explicit "0" enables --batch (preserves the old "set to anything = on").
+  if [ "$BRIDGE_BATCH" != "0" ]; then
+    inner_argv+=(--batch)
+  fi
+  if [ -n "$BRIDGE_RECYCLE_AFTER_TURNS" ]; then
+    inner_argv+=(--recycle-after-turns "$BRIDGE_RECYCLE_AFTER_TURNS")
   fi
   inner_cmd=$(printf '%q ' "${inner_argv[@]}")
   sg_cmd="/usr/bin/sg $BRIDGE_GROUP -c $(printf '%q' "$inner_cmd")"

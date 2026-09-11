@@ -26,6 +26,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -37,6 +38,19 @@ from tools import _git_utils, ticket
 # Runtime-constructed unescaped trigger; never appears as a contiguous
 # 9-byte sequence in this source file. See module docstring.
 TRIGGER = "HERME" + "S.md"
+
+
+def _branch_proc(
+    stdout: str,
+    returncode: int = 0,
+    stderr: str = "",
+) -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(
+        ["git", "branch", "--show-current"],
+        returncode,
+        stdout=stdout,
+        stderr=stderr or ("fatal: synthetic branch query failure\n" if returncode else ""),
+    )
 
 
 def _write_ticket(
@@ -94,6 +108,211 @@ def _write_ticket(
     path.write_text("\n".join(fm_lines + body_lines), encoding="utf-8")
 
 
+class TestMainCheckoutGuard(unittest.TestCase):
+    def _run_main_with_branch(
+        self,
+        argv: list[str],
+        branch_stdout: str,
+        *,
+        returncode: int = 0,
+        branch_stderr: str = "",
+    ) -> tuple[int, str, MagicMock]:
+        git_mock = MagicMock(
+            return_value=_branch_proc(branch_stdout, returncode, branch_stderr)
+        )
+        with patch.object(ticket, "_git", git_mock), \
+                contextlib.redirect_stderr(io.StringIO()) as stderr:
+            rc = ticket.main(argv)
+        git_mock.assert_called_once_with(
+            "branch", "--show-current", cwd=ticket.REPO_ROOT
+        )
+        return rc, stderr.getvalue(), git_mock
+
+    def _assert_bounded_one_line(self, stderr: str) -> None:
+        lines = stderr.splitlines()
+        self.assertEqual(len(lines), 1, stderr)
+        self.assertLessEqual(len(lines[0]), 220)
+        self.assertNotIn("/home/", stderr)
+
+    def test_main_refuses_agent_branch_before_mutating_dispatch(self) -> None:
+        handler = MagicMock(return_value=23)
+        with patch.object(ticket, "cmd_annotate", handler):
+            rc, stderr, _ = self._run_main_with_branch(
+                ["annotate", "T-2929", "--note", "blocked in agent checkout"],
+                "agent/test\n",
+            )
+
+        self.assertEqual(rc, 1)
+        self._assert_bounded_one_line(stderr)
+        self.assertIn("agent/test", stderr)
+        self.assertIn("canonical pantheon-config checkout on branch main", stderr)
+        handler.assert_not_called()
+
+    def test_main_refuses_agent_branch_before_each_read_only_dispatch(self) -> None:
+        cases = (
+            ("list", ["list"], "cmd_list"),
+            ("ready", ["ready"], "cmd_ready"),
+            ("prime", ["prime"], "cmd_prime"),
+        )
+        for name, argv, handler_name in cases:
+            with self.subTest(name=name):
+                handler = MagicMock(return_value=24)
+                with patch.object(ticket, handler_name, handler):
+                    rc, stderr, _ = self._run_main_with_branch(argv, "agent/test\n")
+
+                self.assertEqual(rc, 1)
+                self._assert_bounded_one_line(stderr)
+                self.assertIn("agent/test", stderr)
+                handler.assert_not_called()
+
+    def test_main_allows_non_agent_branches(self) -> None:
+        for branch in ("main\n", "feature/ticket-cleanup\n"):
+            with self.subTest(branch=branch.strip()):
+                handler = MagicMock(return_value=25)
+                with patch.object(ticket, "cmd_list", handler):
+                    rc, stderr, _ = self._run_main_with_branch(["list"], branch)
+
+                self.assertEqual(rc, 25)
+                self.assertEqual(stderr, "")
+                handler.assert_called_once()
+
+    def test_main_refuses_when_branch_query_fails(self) -> None:
+        handler = MagicMock(return_value=26)
+        with patch.object(ticket, "cmd_list", handler):
+            rc, stderr, _ = self._run_main_with_branch(
+                ["list"],
+                "stdout first line\nstdout final line\n",
+                returncode=128,
+                branch_stderr=(
+                    "stderr first line /home/codex/ignored\n"
+                    "\n"
+                    "fatal: cannot read /home/codex/worktrees/T-2929/.git\n"
+                ),
+            )
+
+        self.assertEqual(rc, 1)
+        self._assert_bounded_one_line(stderr)
+        self.assertIn("rc=128", stderr)
+        self.assertIn("cannot determine current git branch", stderr)
+        self.assertIn("fatal: cannot read <path>", stderr)
+        self.assertNotIn("stdout final line", stderr)
+        self.assertIn("canonical pantheon-config checkout on branch main", stderr)
+        handler.assert_not_called()
+
+    def test_main_allows_detached_head(self) -> None:
+        handler = MagicMock(return_value=27)
+        with patch.object(ticket, "cmd_list", handler):
+            rc, stderr, _ = self._run_main_with_branch(["list"], "")
+
+        self.assertEqual(rc, 27)
+        self.assertEqual(stderr, "")
+        handler.assert_called_once()
+
+    def test_agent_branch_subprocess_refuses_before_ticket_or_head_mutation(self) -> None:
+        from tools._test_fixtures import (
+            _run,
+            assert_real_repo_untouched,
+            git_head,
+            setup_integration_env,
+            snapshot_real_repo,
+            teardown_integration_env,
+        )
+
+        real_snapshot = snapshot_real_repo()
+        env = setup_integration_env()
+        try:
+            tools_dir = env.repo_path / "tools"
+            tools_dir.mkdir(parents=True, exist_ok=True)
+            repo_tools = Path(__file__).resolve().parent
+            for fname in (
+                "__init__.py",
+                "ticket.py",
+                "_git_utils.py",
+                "agent_role_map.py",
+                "_md_table.py",
+                "hermes_action.py",
+                # T-3020 BT3 / ORG-078: ticket.py now imports this at module
+                # scope (priority-sort's rank-map source) — the subprocess
+                # fixture needs it on disk too, or import fails before the
+                # guard under test even runs.
+                "priority_list_parse.py",
+            ):
+                src = repo_tools / fname
+                if src.exists():
+                    shutil.copy2(src, tools_dir / fname)
+
+            for state in ("inbox", "active", "done"):
+                (env.repo_path / "tickets" / state).mkdir(parents=True, exist_ok=True)
+                (env.repo_path / "tickets" / state / ".gitkeep").touch()
+            (env.repo_path / "tickets" / "README.md").write_text(
+                "# Tickets\n\n## Current state\n\n<!-- AUTOGEN -->\n",
+                encoding="utf-8",
+            )
+            ticket_path = env.repo_path / "tickets" / "active" / "T-2929.md"
+            _write_ticket(
+                ticket_path,
+                tid="T-2929",
+                state="active",
+                title="Agent branch guard fixture",
+            )
+            _run(["git", "add", "tickets/", "tools/"], cwd=env.repo_path)
+            _run(["git", "commit", "-m", "seed ticket cli fixture"], cwd=env.repo_path)
+            _run(["git", "push", "origin", "main"], cwd=env.repo_path)
+            _run(["git", "switch", "-c", "agent/test"], cwd=env.repo_path)
+
+            pre_head = git_head(env.repo_path)
+            pre_ticket = ticket_path.read_bytes()
+            pre_status = subprocess.run(
+                ["git", "status", "--short"],
+                cwd=env.repo_path,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+
+            result = subprocess.run(
+                [
+                    "python3",
+                    str(env.repo_path / "tools" / "ticket.py"),
+                    "annotate",
+                    "T-2929",
+                    "--note",
+                    "must not mutate from agent branch",
+                    "--no-push",
+                    "--no-pull",
+                ],
+                cwd=env.repo_path,
+                capture_output=True,
+                text=True,
+                check=False,
+                env={
+                    **os.environ,
+                    **env.env_overrides,
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+                timeout=60,
+            )
+
+            post_status = subprocess.run(
+                ["git", "status", "--short"],
+                cwd=env.repo_path,
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+            self._assert_bounded_one_line(result.stderr)
+            self.assertIn("agent/test", result.stderr)
+            self.assertIn("canonical pantheon-config checkout on branch main", result.stderr)
+            self.assertEqual(git_head(env.repo_path), pre_head)
+            self.assertEqual(ticket_path.read_bytes(), pre_ticket)
+            self.assertEqual(post_status, pre_status)
+        finally:
+            teardown_integration_env(env)
+            assert_real_repo_untouched(real_snapshot)
+
+
 # ---------------------------------------------------------------------------
 # ID generation
 # ---------------------------------------------------------------------------
@@ -142,10 +361,22 @@ class TestIdGeneration(unittest.TestCase):
         self.assertEqual(ticket._next_ticket_id(), "T-0006")
 
     def test_skips_non_matching_filenames(self) -> None:
-        for name in ("README.md", "T-not-a-ticket.md", "T-12.md", "T-12345.md"):
+        # T-3215: "T-12345.md" was dropped from this fixture — under the
+        # widened TICKET_FILENAME_RE (4+ digits) it is now WELL-FORMED and
+        # counts toward the max (see test_five_digit_filename_counts_toward_max
+        # below), so it no longer belongs in a "does not match" list.
+        for name in ("README.md", "T-not-a-ticket.md", "T-12.md", "T-123.md"):
             (self.root / "inbox" / name).write_text("stub")
-        # Only well-formed T-NNNN.md counts. None match → T-0001.
+        # Only well-formed T-NNNN(N+).md counts. None match → T-0001.
         self.assertEqual(ticket._next_ticket_id(), "T-0001")
+
+    def test_five_digit_filename_counts_toward_max(self) -> None:
+        """T-3215: a five-or-more-digit filename must count toward allocation —
+        the ten-thousandth ticket (crossing four digits) must not silently
+        become invisible to _next_ticket_id."""
+        five_digit_id = "T-" + "12345"
+        (self.root / "inbox" / f"{five_digit_id}.md").write_text("stub")
+        self.assertEqual(ticket._next_ticket_id(), "T-" + "12346")
 
     def test_skips_origin_side_id_higher_than_local(self) -> None:
         """Origin/main has a HIGHER ticket than the local tree → allocate above origin.
@@ -329,6 +560,80 @@ class TestFrontMatterRoundTrip(unittest.TestCase):
     def test_missing_opening_delimiter_refused(self) -> None:
         with self.assertRaises(ticket.TicketError):
             ticket.parse_front_matter("id: T-0001\n")
+
+
+# ---------------------------------------------------------------------------
+# T-3440 / ORG-089: appetite + DROPPED substate frontmatter round-trip.
+# ---------------------------------------------------------------------------
+
+
+class TestAppetiteFieldRoundTrip(unittest.TestCase):
+    """Every new ORG-089 frontmatter field survives a full
+    parse_front_matter → serialize_front_matter → parse round-trip, and
+    renders in FRONT_MATTER_FIELD_ORDER position (not the unknown-key tail)."""
+
+    def _roundtrip_fields(self, extra_lines: str) -> dict:
+        text = (
+            "---\n"
+            "id: T-0001\n"
+            "created: 2026-09-06T01:30:00Z\n"
+            "requester: orchestrator\n"
+            "target: metis\n"
+            "state: active\n"
+            f"{extra_lines}"
+            "---\n"
+            "\n"
+            "# t\n"
+        )
+        fields, body = ticket.parse_front_matter(text)
+        serialized = ticket.serialize_front_matter(fields)
+        fields2, _ = ticket.parse_front_matter(serialized + "\n# t\n")
+        return fields2
+
+    def test_appetite_bet_ref_round_trip(self) -> None:
+        fields2 = self._roundtrip_fields("appetite: 7\nbet_ref: ORG-089\n")
+        # appetite is stored as the raw scalar string on the generic path;
+        # normalization to int is the validator's job, not the parser's.
+        self.assertEqual(fields2["appetite"], "7")
+        self.assertEqual(fields2["bet_ref"], "ORG-089")
+
+    def test_substate_appetite_overrun_round_trip(self) -> None:
+        fields2 = self._roundtrip_fields("substate: appetite-overrun\n")
+        self.assertEqual(fields2["substate"], "appetite-overrun")
+
+    def test_dropped_disposition_round_trip(self) -> None:
+        fields2 = self._roundtrip_fields(
+            "substate: dropped\n"
+            'dropped_reason: bet no longer worth it at score 3\n'
+            "dropped_from_state: active\n"
+        )
+        self.assertEqual(fields2["substate"], "dropped")
+        self.assertEqual(fields2["dropped_reason"], "bet no longer worth it at score 3")
+        self.assertEqual(fields2["dropped_from_state"], "active")
+
+    def test_new_fields_render_in_field_order_not_unknown_tail(self) -> None:
+        # A field present in FRONT_MATTER_FIELD_ORDER renders in its canonical
+        # slot; the unknown-key fallback appends AFTER the closing sentinel would
+        # be, so an int appetite line must appear before any stray key.
+        text = (
+            "---\n"
+            "id: T-0001\n"
+            "created: 2026-09-06T01:30:00Z\n"
+            "requester: orchestrator\n"
+            "target: metis\n"
+            "state: active\n"
+            "appetite: 5\n"
+            "stray_key: x\n"
+            "---\n"
+            "\n# t\n"
+        )
+        fields, _ = ticket.parse_front_matter(text)
+        serialized = ticket.serialize_front_matter(fields)
+        self.assertLess(
+            serialized.index("appetite: 5"),
+            serialized.index("stray_key: x"),
+            "known ORG-089 field must render before unknown-key tail",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -741,6 +1046,13 @@ class TestListFiltering(unittest.TestCase):
         # logic accidentally invoked git, it would route through here.
         self._sub_patch = patch("tools._git_utils.subprocess.run")
         self.mock_run = self._sub_patch.start()
+        # T-3020 BT3: cmd_list's default --sort priority now writes a
+        # telemetry line per invocation (ORG-078 §4) — redirect it off the
+        # real user homedir so these tests don't leave side effects there.
+        self._health_patch = patch.object(
+            ticket, "PRIORITY_LIST_HEALTH_PATH", self.root / "priority_list_health.jsonl"
+        )
+        self._health_patch.start()
         # Seed: 1 inbox/recovery/foo, 1 active/recovery/bar, 1 active/science/baz, 1 done/recovery/foo
         _write_ticket(
             self.root / "inbox" / "T-0001.md",
@@ -774,6 +1086,7 @@ class TestListFiltering(unittest.TestCase):
     def tearDown(self) -> None:
         self._tickets_patch.stop()
         self._sub_patch.stop()
+        self._health_patch.stop()
         self._tmp.cleanup()
 
     def _run_list(self, **kwargs) -> int:
@@ -785,6 +1098,12 @@ class TestListFiltering(unittest.TestCase):
         # be set explicitly or every pre-existing list test would silently
         # run with --show-unblocks ON.
         ns.show_unblocks = kwargs.get("show_unblocks", False)
+        # T-3020 BT3: same MagicMock auto-vivification footgun — `sort`/
+        # `explain_priority` must be set explicitly, or every pre-existing
+        # list test would silently run in --explain-priority mode (an
+        # auto-vivified MagicMock is truthy) instead of a normal listing.
+        ns.sort = kwargs.get("sort", "priority")
+        ns.explain_priority = kwargs.get("explain_priority", None)
         return ticket.cmd_list(ns)
 
     def test_list_no_filter_returns_all(self) -> None:
@@ -896,6 +1215,17 @@ class TestReadyFiltering(unittest.TestCase):
         )
         # T-0007 inbox/specialist, clean → ready but other-target (for --target filter)
         _write_ticket(self.root / "inbox" / "T-0007.md", tid="T-0007", state="inbox", target="specialist")
+        # T-0008 inbox/orchestrator, clean, labelled → ready, but hideable via --exclude-label (T-3540)
+        _write_ticket(
+            self.root / "inbox" / "T-0008.md", tid="T-0008", state="inbox",
+            target="orchestrator", labels=["interactive-required", "cutover"],
+        )
+        # T-0009 inbox/metis, clean, labelled → the ONLY metis ticket, so excluding its
+        # label empties the metis scope and must exercise the label-excluded diagnostic (T-3540)
+        _write_ticket(
+            self.root / "inbox" / "T-0009.md", tid="T-0009", state="inbox",
+            target="metis", labels=["interactive-required"],
+        )
 
     def tearDown(self) -> None:
         self._tickets_patch.stop()
@@ -907,6 +1237,9 @@ class TestReadyFiltering(unittest.TestCase):
         ns.target = kwargs.get("target")
         # T-2720: see TestListFiltering._run_list — same MagicMock gotcha.
         ns.show_unblocks = kwargs.get("show_unblocks", False)
+        # T-3540: cmd_ready reads args.exclude_label; a bare MagicMock attr
+        # iterates empty by luck, but set it explicitly so the helper is honest.
+        ns.exclude_label = kwargs.get("exclude_label")
         with patch("builtins.print") as mock_print:
             rc = ticket.cmd_ready(ns)
         self.assertEqual(rc, 0)
@@ -952,6 +1285,33 @@ class TestReadyFiltering(unittest.TestCase):
             line for line in printed.splitlines() if line.startswith("T-0002")
         )
         self.assertIn("unblocks: T-0003", t0002_line)
+
+    # --- T-3540: --exclude-label ---
+    def test_ready_includes_labelled_by_default(self) -> None:
+        # No --exclude-label → a labelled-but-otherwise-ready ticket still shows.
+        self.assertIn("T-0008", self._run_ready())
+
+    def test_ready_exclude_label_hides_matching(self) -> None:
+        printed = self._run_ready(exclude_label=["interactive-required"])
+        self.assertNotIn("T-0008", printed)   # carries the excluded label → hidden
+        self.assertIn("T-0001", printed)      # unlabelled → still ready
+
+    def test_ready_exclude_label_multiple_values(self) -> None:
+        # Repeatable: any match hides. T-0008 has 'cutover'; hide on that too.
+        self.assertNotIn("T-0008", self._run_ready(exclude_label=["nope", "cutover"]))
+
+    def test_ready_exclude_label_nonmatching_keeps_all(self) -> None:
+        # Excluding a label nothing carries changes nothing.
+        self.assertIn("T-0008", self._run_ready(exclude_label=["no-such-label"]))
+
+    def test_ready_exclude_label_diagnostic_not_genuinely_empty(self) -> None:
+        # metis has exactly one ready ticket (T-0009) and it is label-excluded,
+        # so the empty result must say WHY (label-excluded), NOT "genuinely EMPTY"
+        # (the T-2220 state-why-empty contract).
+        printed = self._run_ready(target="metis", exclude_label=["interactive-required"])
+        self.assertIn("label-excluded", printed)
+        self.assertIn("T-0009", printed)
+        self.assertNotIn("genuinely EMPTY", printed)
 
 
 class TestPrime(unittest.TestCase):
@@ -1269,9 +1629,16 @@ class TestFullLifecycleGitCommands(unittest.TestCase):
         self._tmp.cleanup()
 
     def _git_kinds_after(self, n_before: int) -> list[str]:
-        """Return the second-token of each git invocation since marker n_before."""
+        """Return the second-token of each git invocation since marker n_before.
+
+        Excludes the T-3600 push-guard's read-only probe: push_with_retry runs
+        `git symbolic-ref` (and, on a named branch, `git log`) before every push to
+        warn about a HEAD:main push from a feature branch. Those probes are
+        orthogonal to the lifecycle command sequence these tests pin (and are
+        covered directly by test_git_utils.TestPushGuardT3600)."""
         argvs = [c.args[0] for c in self.mock_run.call_args_list[n_before:]]
-        return [a[1] for a in argvs if a and a[0] == "git"]
+        return [a[1] for a in argvs
+                if a and a[0] == "git" and a[1] not in ("symbolic-ref", "log")]
 
     def test_file_then_claim_then_resolve_full_command_sequence(self) -> None:
         # Use a fixed actor for determinism
@@ -1295,7 +1662,13 @@ class TestFullLifecycleGitCommands(unittest.TestCase):
             file_args.terminal = False
             file_args.impl_title = None
             file_args.impl_ask = None
+            file_args.appetite = None  # T-3440/ORG-089: getattr-read default
+            file_args.bet_ref = None
             file_args.impl_target = None
+            # T-3328: this test is about the git-command sequence, not DAG
+            # connectivity — orphan escape hatch (fires before any git call,
+            # so it does not perturb the asserted sequence below).
+            file_args.orphan = "test fixture: full file/claim/resolve git-command sequence"
             ticket.cmd_file(file_args)
             kinds = self._git_kinds_after(mark)
             # file: no mv. _next_ticket_id issues fetch + ls-tree first
@@ -1570,7 +1943,13 @@ class TestRatifiableFilesField(unittest.TestCase):
                     args.terminal = True
                     args.impl_title = None
                     args.impl_ask = None
+                    args.appetite = None  # T-3440/ORG-089: getattr-read default
+                    args.bet_ref = None
                     args.impl_target = None
+                    # T-3328: ratifiable_files is not itself a lineage edge —
+                    # orphan escape hatch (this test is about the repeatable
+                    # --ratifiable-file flag, not DAG connectivity).
+                    args.orphan = "test fixture: repeatable --ratifiable-file CLI flag"
                     ticket.cmd_file(args)
                     filed = list((root / "tickets" / "inbox").iterdir())
                     self.assertEqual(len(filed), 1)
@@ -1644,7 +2023,13 @@ class TestRatifiablePairingEnforcement(unittest.TestCase):
         args.terminal = terminal
         args.impl_title = impl_title
         args.impl_ask = None
+        args.appetite = None  # T-3440/ORG-089: getattr-read default
+        args.bet_ref = None
         args.impl_target = None
+        # T-3328: this class's fixtures fabricate a root-tier test ticket with
+        # no semantic lineage (ORG-022 pairing enforcement is orthogonal to
+        # the DAG-connectivity guard) — orphan escape hatch, not a real edge.
+        args.orphan = "test fixture: ORG-022 ratifiable-label pairing enforcement"
         return args
 
     def _file_under_tmp(self, args) -> str:
@@ -1743,7 +2128,13 @@ class TestIntentField(unittest.TestCase):
         args.terminal = terminal
         args.impl_title = impl_title
         args.impl_ask = None
+        args.appetite = None  # T-3440/ORG-089: getattr-read default
+        args.bet_ref = None
         args.impl_target = None
+        # T-3328: this class's fixtures fabricate a root-tier test ticket with
+        # no semantic lineage (intent-field disambiguation is orthogonal to
+        # DAG connectivity) — orphan escape hatch, not a real edge.
+        args.orphan = "test fixture: T-0465 intent-field disambiguation"
         return args
 
     def _file_under_tmp(self, args) -> str:
@@ -1857,6 +2248,12 @@ class TestRatifyImplGate(unittest.TestCase):
         args.impl_title = impl_title
         args.impl_ask = impl_ask
         args.impl_target = impl_target
+        args.appetite = None  # T-3440/ORG-089: getattr-read default
+        args.bet_ref = None
+        # T-3328: this class tests the T-0852 ratify-impl-gate, orthogonal to
+        # DAG connectivity — orphan escape hatch so the gate tests exercise
+        # their own error paths uninterrupted by the lineage guard.
+        args.orphan = "test fixture: T-0852 ratify impl-followup gate"
         return args
 
     def _run(self, args, *, ids=("T-0100", "T-0101")):
@@ -1989,8 +2386,13 @@ class TestRatifyRequiresRatifiableFiles(unittest.TestCase):
         args.terminal = terminal
         args.impl_title = impl_title
         args.impl_ask = None
+        args.appetite = None  # T-3440/ORG-089: getattr-read default
+        args.bet_ref = None
         args.impl_target = None
         args.serves = None
+        # T-3328: this class tests T-1321 ratifiable_files requirements,
+        # orthogonal to DAG connectivity — orphan escape hatch.
+        args.orphan = "test fixture: T-1321 ratify-requires-ratifiable-files gate"
         return args
 
     def _run_file(self, args):
@@ -3403,7 +3805,14 @@ class TestCmdFilePushRaceRetry(unittest.TestCase):
         args.terminal = False
         args.impl_title = None
         args.impl_ask = None
+        args.appetite = None  # T-3440/ORG-089: getattr-read default
+        args.bet_ref = None
         args.impl_target = None
+        # T-3328: this class tests push-race retry mechanics, orthogonal to
+        # DAG connectivity — orphan escape hatch (individual tests override
+        # args.parent_ticket where a real edge is the thing under test, which
+        # coexists harmlessly with this default).
+        args.orphan = "test fixture: push-race retry mechanics"
         return args
 
     def test_parent_ticket_flag_lands_in_front_matter(self) -> None:
@@ -3776,6 +4185,75 @@ class TestRetarget(unittest.TestCase):
         self.mock_commit.assert_called_once()
         # no_push kwarg either absent or False — both satisfy "default pushes"
         self.assertFalse(self.mock_commit.call_args.kwargs.get("no_push", False))
+
+    # -- T-3020 BT2: retargeted_at frontmatter field ----------------------
+
+    def test_retarget_writes_retargeted_at_utc_iso8601(self) -> None:
+        """Fresh retarget on a ticket with no prior retargeted_at writes one,
+        UTC ISO-8601 second-precision Z-suffixed (matching `_now_iso()` shape)."""
+        path = self._seed("T-0012", "inbox", target="recovery")
+        fields_before, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertNotIn("retargeted_at", fields_before)
+
+        rc = ticket.cmd_retarget(self._make_args("T-0012", "orchestrator"))
+        self.assertEqual(rc, 0)
+
+        fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertRegex(
+            fields["retargeted_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
+        )
+
+    def test_retarget_second_retarget_updates_retargeted_at(self) -> None:
+        """A second retarget UPDATES the field to the new write's timestamp —
+        current value, not an append-only history.
+
+        `_now_iso` is patched with `return_value` (not `side_effect`) per
+        call, since cmd_retarget calls it more than once internally
+        (append_transition stamps the log entry too) — pinning every call
+        within one invocation to the same value keeps the assertion about
+        call *order* inside cmd_retarget, not about it."""
+        path = self._seed("T-0013", "inbox", target="recovery")
+
+        with patch.object(ticket, "_now_iso", return_value="2026-08-01T00:00:00Z"):
+            ticket.cmd_retarget(self._make_args("T-0013", "orchestrator"))
+        fields_1, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields_1["retargeted_at"], "2026-08-01T00:00:00Z")
+
+        with patch.object(ticket, "_now_iso", return_value="2026-08-02T00:00:00Z"):
+            ticket.cmd_retarget(self._make_args("T-0013", "specialist"))
+        fields_2, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields_2["retargeted_at"], "2026-08-02T00:00:00Z")
+
+    def test_retarget_ticket_without_existing_field_is_retargetable(self) -> None:
+        """Backwards-compat: a historic ticket with no retargeted_at field
+        (the `_seed` fixture never writes one) reads fine and retargets
+        cleanly — the field's absence never raises."""
+        path = self._seed("T-0014", "active", target="recovery")
+        text_before = path.read_text(encoding="utf-8")
+        self.assertNotIn("retargeted_at", text_before)
+
+        rc = ticket.cmd_retarget(self._make_args("T-0014", "orchestrator", keep_state=True))
+        self.assertEqual(rc, 0)
+        fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields["target"], "orchestrator")
+        self.assertIn("retargeted_at", fields)
+
+    def test_retarget_retargeted_at_lands_in_same_commit_as_target_change(self) -> None:
+        """Transactional invariant: the retargeted_at write and the target
+        change land in the SAME commit, not two. cmd_retarget performs one
+        `path.write_text` + one `_commit_and_push` call per invocation, so
+        proving single-commit + both-fields-present-post-call is sufficient
+        evidence there was no separate second write/commit for the stamp."""
+        path = self._seed("T-0015", "inbox", target="recovery")
+        rc = ticket.cmd_retarget(self._make_args("T-0015", "orchestrator"))
+        self.assertEqual(rc, 0)
+
+        self.mock_commit.assert_called_once()
+        fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields["target"], "orchestrator")
+        self.assertRegex(
+            fields["retargeted_at"], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4456,7 +4934,11 @@ class TestNoPushFlag(unittest.TestCase):
         args.terminal = False
         args.impl_title = None
         args.impl_ask = None
+        args.appetite = None  # T-3440/ORG-089: getattr-read default
+        args.bet_ref = None
         args.impl_target = None
+        # T-3328: this test is about --no-push behavior, not DAG connectivity.
+        args.orphan = "test fixture: --no-push local-commit-skip-push behavior"
         ticket.cmd_file(args)
         kinds = self._git_kinds_after(mark)
         self.assertNotIn("push", kinds)
@@ -4585,7 +5067,14 @@ class TestCascadeUnblockOnResolve(unittest.TestCase):
         args.terminal = False
         args.impl_title = "Build the SOP follow-up"
         args.impl_ask = None
+        args.appetite = None  # T-3440/ORG-089: getattr-read default
+        args.bet_ref = None
         args.impl_target = "recovery"
+        # T-3328: the ratify PARENT itself carries no lineage edge in this
+        # fixture (the CHILD gets depends_on/parent_ticket automatically via
+        # _spawn_child_ticket, which is what's under test) — orphan escape
+        # hatch for the parent.
+        args.orphan = "test fixture: T-0852 ratify-spawns-impl end-to-end cascade"
         ticket.cmd_file(args)
         ratify = self.root / "inbox" / "T-0001.md"
         impl = self.root / "inbox" / "T-0002.md"
@@ -4689,7 +5178,9 @@ class TestCascadeUnblockOnResolve(unittest.TestCase):
         self.assertTrue((self.root / "done" / "T-0001.md").exists())
         self.mock_commit.assert_called_once()
         affected_paths = self.mock_commit.call_args.args[0]
-        self.assertEqual(len(affected_paths), 2)  # only parent's old + new
+        # +1: T-3451 appetite-outcome shard now folded into the same commit
+        # (parent's old + new, plus the resolve's appetite-outcome shard path).
+        self.assertEqual(len(affected_paths), 3)
 
     def test_cascade_paths_threaded_into_commit(self) -> None:
         # When cascade fires, _commit_and_push receives parent paths + dependant paths.
@@ -4699,8 +5190,9 @@ class TestCascadeUnblockOnResolve(unittest.TestCase):
         ticket.cmd_resolve(self._resolve_args("T-0001"))
         affected = self.mock_commit.call_args.args[0]
         # Parent: 2 paths (old active + new done). Each cascade dep: 1 path each (in-place edit).
-        # Total: 2 + 2*1 = 4
-        self.assertEqual(len(affected), 4)
+        # Total: 2 + 2*1 = 4, +1: T-3451 appetite-outcome shard now folded into
+        # the same commit.
+        self.assertEqual(len(affected), 5)
         # Commit message should mention the cascade
         commit_msg = self.mock_commit.call_args.args[1]
         self.assertIn("Auto-unblock cascade", commit_msg)
@@ -5271,6 +5763,29 @@ class TestCmdBlock(unittest.TestCase):
             (self.root / "active" / "T-0001.md").read_text(encoding="utf-8"))
         self.assertEqual(fields["not_before_anchor"], "operator:T-0002")
 
+    def test_block_accepts_five_digit_ticket_anchor(self) -> None:
+        """T-3215: operator:<T-NNNNN> (5+ digits) must not be rejected as
+        malformed once the cited ticket exists."""
+        five_digit_id = "T-" + "12345"
+        self._seed("T-0001", "active")
+        self._seed(five_digit_id, "inbox")  # the cited decision ticket exists
+        ticket.cmd_block(self._seed_bare_block_args(
+            "T-0001", not_before="2026-09-01",
+            not_before_anchor=f"operator:{five_digit_id}"))
+        fields, _ = ticket.parse_front_matter(
+            (self.root / "active" / "T-0001.md").read_text(encoding="utf-8"))
+        self.assertEqual(fields["not_before_anchor"], f"operator:{five_digit_id}")
+
+    def test_block_rejects_short_digit_ticket_anchor(self) -> None:
+        """T-3215: widening to 4+ digits must not open the door to a
+        still-malformed (fewer than 4 digit) id."""
+        self._seed("T-0001", "active")
+        short_id = "T-" + "123"
+        with self.assertRaises(ticket.TicketError):
+            ticket.cmd_block(self._seed_bare_block_args(
+                "T-0001", not_before="2026-09-01",
+                not_before_anchor=f"operator:{short_id}"))
+
     def test_block_anchor_without_not_before_refused(self) -> None:
         self._seed("T-0001", "active")
         with self.assertRaises(ticket.TicketError) as cm:
@@ -5307,6 +5822,61 @@ class TestCmdBlock(unittest.TestCase):
         with self.assertRaises(ticket.TicketError):
             ticket.cmd_block(self._seed_bare_block_args(
                 "T-0001", not_before="2026-09-10", not_before_anchor="event:cert-expiry"))
+
+    # T-3103: the event:<kind>:<param> form is regex-valid but the param is still
+    # gameable — a pseudo-window that names a HOW ("focused session") not a WHEN
+    # laundered arbitrary defers of actionable work 3x (2026-08-11/20/23). The
+    # denylist must reject the HOW-word at block/file SET time.
+    def test_block_rejects_pseudo_window_focused_session(self) -> None:
+        """The exact 3x-recurring bypass: event:window:...-focused-session."""
+        self._seed("T-0001", "active")
+        with self.assertRaises(ticket.TicketError) as cm:
+            ticket.cmd_block(self._seed_bare_block_args(
+                "T-0001", not_before="2026-09-10",
+                not_before_anchor="event:window:passport-hardening-focused-session"))
+        self.assertIn("T-3103", str(cm.exception))
+        self.assertIn("HOW", str(cm.exception))
+
+    def test_block_rejects_pseudo_window_how_words(self) -> None:
+        """Each HOW-word in the denylist is rejected across event kinds."""
+        for anchor in (
+            "event:window:dedicated-pass",
+            "event:window:robustness-review",
+            "event:window:careful-pass",
+            "event:window:batch-cleanup",
+            "event:cadence:unhurried",          # gaming via a different kind
+            "event:window:when-im-focused",
+        ):
+            with self.subTest(anchor=anchor):
+                self._seed("T-0001", "active")
+                with self.assertRaises(ticket.TicketError):
+                    ticket.cmd_block(self._seed_bare_block_args(
+                        "T-0001", not_before="2026-09-10", not_before_anchor=anchor))
+                # reset for the next subTest (block writes into active/)
+                (self.root / "active" / "T-0001.md").unlink(missing_ok=True)
+
+    def test_block_accepts_genuine_dated_window(self) -> None:
+        """A real maintenance window (dated param, no HOW-word) still passes."""
+        self._seed("T-0001", "active")
+        ticket.cmd_block(self._seed_bare_block_args(
+            "T-0001", not_before="2026-09-02",
+            not_before_anchor="event:window:2026-09-02-pve2-maintenance"))
+        fields, _ = ticket.parse_front_matter(
+            (self.root / "active" / "T-0001.md").read_text(encoding="utf-8"))
+        self.assertEqual(fields["not_before_anchor"],
+                         "event:window:2026-09-02-pve2-maintenance")
+
+    def test_block_denylist_no_false_positive_on_passport(self) -> None:
+        """Guard: a genuine param must not trip a substring false-positive.
+        'passport-renewal' contains 'pass' but NOT the denied 'careful-pass'."""
+        self._seed("T-0001", "active")
+        ticket.cmd_block(self._seed_bare_block_args(
+            "T-0001", not_before="2026-09-02",
+            not_before_anchor="event:window:passport-renewal-2026-09"))
+        fields, _ = ticket.parse_front_matter(
+            (self.root / "active" / "T-0001.md").read_text(encoding="utf-8"))
+        self.assertEqual(fields["not_before_anchor"],
+                         "event:window:passport-renewal-2026-09")
 
     def test_block_sets_depends_on_on_inbox_ticket(self) -> None:
         path = self._seed("T-0001", "inbox")
@@ -5356,6 +5926,129 @@ class TestCmdBlock(unittest.TestCase):
         self.assertEqual(rc, 0)
         fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
         self.assertIn("T-9999", fields.get("depends_on") or [])
+
+    # T-3081: block-that-ADDS-a-gate must strip auto_delivered / auto_delivered_at.
+    # A ticket that was auto_delivered then PARKED via block keeps the stamp;
+    # when the gate later clears + it becomes un-gated + 8h-stale,
+    # `check_dispatch_locked`'s backstop force-releases the lock + operator-alerts.
+    # Mirrors T-2350 (retarget-clears) + T-0971 arm-A (cascade-unblock).
+
+    def _seed_with_auto_delivered(self, tid: str, state: str) -> Path:
+        path = self._seed(tid, state)
+        text = path.read_text(encoding="utf-8").replace(
+            "target: recovery",
+            "target: recovery\nauto_delivered: true\nauto_delivered_at: 2026-08-01T00:00:00Z",
+            1,
+        )
+        path.write_text(text, encoding="utf-8")
+        fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        assert fields.get("auto_delivered") is not None, "seed did not carry the stamp"
+        return path
+
+    def test_block_with_not_before_strips_auto_delivered_stamp(self) -> None:
+        path = self._seed_with_auto_delivered("T-0007", "active")
+        ticket.cmd_block(self._block_args("T-0007", not_before="2026-09-01"))
+        fields, body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields["not_before"], "2026-09-01T00:00:00Z")
+        self.assertNotIn("auto_delivered", fields)
+        self.assertNotIn("auto_delivered_at", fields)
+        self.assertIn("auto_delivered stamp cleared", body,
+                      "clear must be visible in transition log per T-2350 audit-trail rationale")
+
+    def test_block_with_depends_on_strips_auto_delivered_stamp(self) -> None:
+        path = self._seed_with_auto_delivered("T-0008", "active")
+        ticket.cmd_block(self._block_args("T-0008", depends_on=["T-9998"]))
+        fields, body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertIn("T-9998", fields.get("depends_on") or [])
+        self.assertNotIn("auto_delivered", fields)
+        self.assertNotIn("auto_delivered_at", fields)
+        self.assertIn("auto_delivered stamp cleared", body)
+
+    def test_block_without_stamp_is_unaffected(self) -> None:
+        """Complement: popping an absent key must not raise or spuriously log."""
+        path = self._seed("T-0009", "active")
+        ticket.cmd_block(self._block_args("T-0009", not_before="2026-09-01"))
+        fields, body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields["not_before"], "2026-09-01T00:00:00Z")
+        self.assertNotIn("auto_delivered", fields)
+        self.assertNotIn("auto_delivered stamp cleared", body,
+                         "no spurious log entry when there was no stamp to clear")
+
+    # T-3112: the INVERSE of T-3081 — block that CLEARS a gate (--clear-not-before /
+    # --clear-dep / --clear-deps) must ALSO strip auto_delivered / auto_delivered_at.
+    # De-gating re-enters a ticket into the workable set, so a lingering stamp
+    # becomes a live in-flight dispatch (holds the dispatch mutex + fires the 8h
+    # backstop). Exact cause of the 8 spurious lock-release notifs on 2026-08-24:
+    # a --clear-not-before de-gate batch left stale stamps that flipped
+    # cosmetic→active. Mirrors T-0971 arm-A (cascade-unblock strip).
+
+    def _seed_gated_with_stamp(self, tid, state="inbox", not_before=None,
+                               depends_on=None) -> Path:
+        path = self.root / state / f"{tid}.md"
+        _write_ticket(path, tid=tid, state=state, not_before=not_before,
+                      depends_on=depends_on)
+        text = path.read_text(encoding="utf-8").replace(
+            "target: recovery",
+            "target: recovery\nauto_delivered: true\nauto_delivered_at: 2026-08-01T00:00:00Z",
+            1,
+        )
+        path.write_text(text, encoding="utf-8")
+        fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        assert fields.get("auto_delivered") is not None, "seed did not carry the stamp"
+        return path
+
+    def _clear_args(self, tid, clear_not_before=False, clear_dep=None,
+                    clear_deps=False, no_push=True) -> argparse.Namespace:
+        ns = argparse.Namespace()
+        ns.ticket = tid
+        ns.not_before = None
+        ns.not_before_anchor = None
+        ns.depends_on = None
+        ns.clear_not_before = clear_not_before
+        ns.clear_dep = clear_dep
+        ns.clear_deps = clear_deps
+        ns.no_push = no_push
+        return ns
+
+    def test_clear_not_before_strips_auto_delivered_stamp(self) -> None:
+        """T-3112: reproduction of 2026-08-24 — de-gating must strip the stamp."""
+        path = self._seed_gated_with_stamp("T-0011", not_before="2026-09-01T00:00:00Z")
+        ticket.cmd_block(self._clear_args("T-0011", clear_not_before=True))
+        fields, body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertNotIn("not_before", fields)
+        self.assertNotIn("auto_delivered", fields)
+        self.assertNotIn("auto_delivered_at", fields)
+        self.assertIn("auto_delivered stamp cleared", body,
+                      "clear must be visible in the transition log (audit trail)")
+
+    def test_clear_dep_strips_auto_delivered_stamp(self) -> None:
+        path = self._seed_gated_with_stamp("T-0012", depends_on=["T-9998"])
+        ticket.cmd_block(self._clear_args("T-0012", clear_dep=["T-9998"]))
+        fields, body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields.get("depends_on") or [], [])
+        self.assertNotIn("auto_delivered", fields)
+        self.assertNotIn("auto_delivered_at", fields)
+        self.assertIn("auto_delivered stamp cleared", body)
+
+    def test_clear_deps_strips_auto_delivered_stamp(self) -> None:
+        path = self._seed_gated_with_stamp("T-0013", depends_on=["T-9998", "T-9997"])
+        ticket.cmd_block(self._clear_args("T-0013", clear_deps=True))
+        fields, body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields.get("depends_on") or [], [])
+        self.assertNotIn("auto_delivered", fields)
+        self.assertNotIn("auto_delivered_at", fields)
+        self.assertIn("auto_delivered stamp cleared", body)
+
+    def test_clear_not_before_without_stamp_is_unaffected(self) -> None:
+        """Complement: popping an absent stamp must not raise or spuriously log."""
+        path = self.root / "inbox" / "T-0014.md"
+        _write_ticket(path, tid="T-0014", state="inbox",
+                      not_before="2026-09-01T00:00:00Z")
+        ticket.cmd_block(self._clear_args("T-0014", clear_not_before=True))
+        fields, body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertNotIn("not_before", fields)
+        self.assertNotIn("auto_delivered stamp cleared", body,
+                         "no spurious log entry when there was no stamp to clear")
 
 
 class TestUnclaim(unittest.TestCase):
@@ -5451,6 +6144,53 @@ class TestUnclaim(unittest.TestCase):
         ticket.cmd_unclaim(self._unclaim_args("T-0001", no_push=True))
         # _pull_if_needed is called with no_push=True.
         self.mock_pull.assert_called_once_with(True)
+
+    # T-3081: unclaim (active→inbox) must strip auto_delivered / auto_delivered_at
+    # for the same dispatch-mutex reason as cmd_block above + cmd_retarget (T-2350)
+    # + cascade-unblock (T-0971 arm-A). This test lives in TestUnclaim (not
+    # TestRetarget) per the T-3081 gotcha — TestRetarget mocks subprocess.run so
+    # git-mv is a no-op and the state-move never happens; TestUnclaim uses the
+    # real-git-mv-shim shape via fake_run in setUp.
+
+    def _seed_with_auto_delivered(self, tid: str, state: str) -> Path:
+        _write_ticket(self.root / state / f"{tid}.md", tid=tid, state=state)
+        path = self.root / state / f"{tid}.md"
+        text = path.read_text(encoding="utf-8").replace(
+            "target: recovery",
+            "target: recovery\nauto_delivered: true\nauto_delivered_at: 2026-08-01T00:00:00Z",
+            1,
+        )
+        path.write_text(text, encoding="utf-8")
+        fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        assert fields.get("auto_delivered") is not None, "seed did not carry the stamp"
+        return path
+
+    def test_unclaim_strips_auto_delivered_stamp(self) -> None:
+        active_path = self._seed_with_auto_delivered("T-0002", "active")
+        inbox_path = self.root / "inbox" / "T-0002.md"
+
+        rc = ticket.cmd_unclaim(self._unclaim_args("T-0002"))
+
+        self.assertEqual(rc, 0)
+        self.assertFalse(active_path.exists())
+        self.assertTrue(inbox_path.exists())
+        fields, body = ticket.parse_front_matter(inbox_path.read_text(encoding="utf-8"))
+        self.assertEqual(fields["state"], "inbox")
+        self.assertNotIn("auto_delivered", fields)
+        self.assertNotIn("auto_delivered_at", fields)
+        self.assertIn("auto_delivered stamp cleared", body,
+                      "clear must be visible in transition log per T-2350 audit-trail rationale")
+
+    def test_unclaim_without_stamp_is_unaffected(self) -> None:
+        """Complement: popping an absent key must not raise or spuriously log."""
+        self._seed("T-0003", "active")
+        rc = ticket.cmd_unclaim(self._unclaim_args("T-0003"))
+        self.assertEqual(rc, 0)
+        inbox_path = self.root / "inbox" / "T-0003.md"
+        fields, body = ticket.parse_front_matter(inbox_path.read_text(encoding="utf-8"))
+        self.assertNotIn("auto_delivered", fields)
+        self.assertNotIn("auto_delivered stamp cleared", body,
+                         "no spurious log entry when there was no stamp to clear")
 
 
 class TestBlockClearNotBefore(unittest.TestCase):
@@ -5818,7 +6558,8 @@ class TestOpenWorldWritable(unittest.TestCase):
 class TestServesField(unittest.TestCase):
     """T-1103: --serves flag on file and retarget subcommands writes serves: frontmatter field."""
 
-    def _file_args(self, *, target: str = "orchestrator", serves: str | None = None):
+    def _file_args(self, *, target: str = "orchestrator", serves: str | None = None,
+                   appetite: str | None = None):
         args = MagicMock()
         args.requester = "orchestrator"
         args.target = target
@@ -5837,8 +6578,16 @@ class TestServesField(unittest.TestCase):
         args.terminal = False
         args.impl_title = None
         args.impl_ask = None
+        args.appetite = appetite  # T-3440/ORG-089: a non-hygiene serves is a bet
+        args.bet_ref = None
         args.impl_target = None
         args.serves = serves
+        # T-3328: tests that omit `serves` (retest_status / serves-omission
+        # coverage) need SOME lineage edge or the orphan escape hatch — this
+        # class is testing serves-field mechanics specifically, not DAG
+        # connectivity, so orphan is the honest fixture choice. Harmless when
+        # `serves` is also set (both may be present at once).
+        args.orphan = "test fixture: T-1103/T-2613 serves+retest_status field mechanics"
         return args
 
     def _file_under_tmp(self, args) -> str:
@@ -5864,7 +6613,8 @@ class TestServesField(unittest.TestCase):
 
     def test_file_writes_serves_when_provided(self) -> None:
         """--serves value appears in frontmatter."""
-        text = self._file_under_tmp(self._file_args(serves="ORG-034 arc-intent structural"))
+        text = self._file_under_tmp(self._file_args(
+            serves="ORG-034 arc-intent structural", appetite="5"))
         self.assertIn("serves: ORG-034 arc-intent structural", text)
 
     def test_file_writes_retest_status_when_provided(self) -> None:
@@ -5890,7 +6640,7 @@ class TestServesField(unittest.TestCase):
 
     def test_file_serves_roundtrips_through_frontmatter(self) -> None:
         """serves: value survives serialize/parse round-trip."""
-        text = self._file_under_tmp(self._file_args(serves="my-arc-intent"))
+        text = self._file_under_tmp(self._file_args(serves="my-arc-intent", appetite="5"))
         fields, _body = ticket.parse_front_matter(text)
         self.assertEqual(fields.get("serves"), "my-arc-intent")
 
@@ -5969,6 +6719,121 @@ class TestServesField(unittest.TestCase):
 
             fields, _body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
             self.assertEqual(fields.get("serves"), "existing-arc")
+
+
+class TestFileTimeLineageGuardT3328(unittest.TestCase):
+    """T-3328: a new ticket must carry >=1 lineage edge (parent_ticket,
+    depends_on, serves, implements, verifies, supersedes, informs) or an
+    explicit --orphan justification — closes the file-time orphan-bleed.
+    """
+
+    def _file_args(self, **overrides) -> MagicMock:
+        args = MagicMock()
+        args.requester = "orchestrator"
+        args.target = "recovery"
+        args.title = "T-3328 guard test ticket"
+        args.labels = None
+        args.depends_on = None
+        args.stale_after = None
+        args.not_before = None
+        args.parent_ticket = None
+        args.ratifiable_file = None
+        args.intent = None
+        args.ask = ""
+        args.context = ""
+        args.no_push = False
+        args.spawn_impl = False
+        args.terminal = False
+        args.impl_title = None
+        args.impl_ask = None
+        args.appetite = None  # T-3440/ORG-089: getattr-read default
+        args.bet_ref = None
+        args.impl_target = None
+        args.serves = None
+        args.implements = None
+        args.verifies = None
+        args.supersedes = None
+        args.informs = None
+        args.orphan = None
+        for k, v in overrides.items():
+            setattr(args, k, v)
+        return args
+
+    def _file_under_tmp(self, args) -> str:
+        """Run cmd_file inside a fresh tmpdir; return the filed ticket text."""
+        with (
+            patch("tools.ticket._next_ticket_id", return_value="T-0099"),
+            patch("tools.ticket._pull_if_needed"),
+            patch("tools.ticket._commit_and_push"),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                orig_root = ticket.TICKETS_ROOT
+                ticket.TICKETS_ROOT = root / "tickets"
+                (root / "tickets" / "inbox").mkdir(parents=True)
+                try:
+                    ticket.cmd_file(args)
+                    filed = list((root / "tickets" / "inbox").iterdir())
+                    self.assertEqual(len(filed), 1)
+                    return filed[0].read_text(encoding="utf-8")
+                finally:
+                    ticket.TICKETS_ROOT = orig_root
+
+    def test_refuses_when_no_edge_and_no_orphan(self) -> None:
+        with self.assertRaises(ticket.TicketError) as cm:
+            self._file_under_tmp(self._file_args())
+        msg = str(cm.exception)
+        self.assertIn("orphan", msg.lower())
+        self.assertIn("--serves", msg)
+        self.assertIn("--orphan", msg)
+
+    def test_accepts_each_of_the_seven_lineage_edges(self) -> None:
+        cases = {
+            "parent_ticket": "T-0042",
+            "depends_on": "T-0042",
+            "serves": "goal-neutral-maintenance",
+            "implements": "T-0042",
+            "verifies": "T-0042",
+            "supersedes": "T-0042",
+            "informs": "T-0042",
+        }
+        for field, value in cases.items():
+            with self.subTest(field=field):
+                text = self._file_under_tmp(self._file_args(**{field: value}))
+                self.assertIn("id: T-0099", text)
+
+    def test_accepts_orphan_with_valid_justification(self) -> None:
+        text = self._file_under_tmp(
+            self._file_args(orphan="a genuinely rootless one-off ticket")
+        )
+        self.assertIn("orphan_reason: a genuinely rootless one-off ticket", text)
+
+    def test_refuses_orphan_with_empty_justification(self) -> None:
+        with self.assertRaises(ticket.TicketError) as cm:
+            self._file_under_tmp(self._file_args(orphan=""))
+        self.assertIn("--orphan justification too short", str(cm.exception))
+
+    def test_refuses_orphan_with_short_justification(self) -> None:
+        with self.assertRaises(ticket.TicketError) as cm:
+            self._file_under_tmp(self._file_args(orphan="too short"))
+        self.assertIn("--orphan justification too short", str(cm.exception))
+        self.assertIn("minimum 20", str(cm.exception))
+
+    def test_orphan_reason_roundtrips_through_frontmatter(self) -> None:
+        text = self._file_under_tmp(
+            self._file_args(orphan="a genuinely rootless one-off ticket")
+        )
+        fields, _body = ticket.parse_front_matter(text)
+        self.assertEqual(fields.get("orphan_reason"), "a genuinely rootless one-off ticket")
+        serialized = ticket.serialize_front_matter(fields)
+        self.assertIn("orphan_reason: a genuinely rootless one-off ticket", serialized)
+        fields2, _ = ticket.parse_front_matter(serialized + "\n")
+        self.assertEqual(fields2.get("orphan_reason"), fields.get("orphan_reason"))
+
+    def test_orphan_reason_absent_when_lineage_edge_present(self) -> None:
+        """No --orphan given + a real edge present → no orphan_reason field."""
+        text = self._file_under_tmp(self._file_args(serves="goal-neutral-maintenance"))
+        self.assertNotIn("orphan_reason:", text)
 
 
 class TestParseNotBefore(unittest.TestCase):

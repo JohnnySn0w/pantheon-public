@@ -1,5 +1,14 @@
 # B9 team-orchestrator brief — DRAFT (awaiting the operator's review)
 
+> ## ⚠️ RETIRED 2026-09-05 — DO NOT FOLLOW THIS PROCEDURE
+>
+> A one-off DRAFT team brief for the completed b9 arc (2026-05-04), never spawned, built on the **TeamCreate**
+> spawn machinery **removed in Claude Code 2.1.178** (replaced by spawn-with-brief, ORG-036). It is not a
+> decision-removing SOP; it was pinned as a "reference" but describes a mechanism that no longer exists.
+> Retired per the operator's directive (Telegram 2026-09-05, TG 1729/1731) as part of the org-planning L3 SOP
+> wheat-from-chaff. Kept in place per the superseded-conceptions-remain-visible convention; the live dispatch
+> discipline is `team-orchestrator-dispatch-checklist.md` + `team-orchestrator-brief-construction.md`.
+
 **Team name:** `b9-inbox-consumer`
 **Lead agent_type:** `project-orchestrator`
 **Lead name:** `b9-lead`

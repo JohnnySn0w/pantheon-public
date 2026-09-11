@@ -1397,7 +1397,7 @@ class TestFullFireIntegration(unittest.TestCase):
         # HEAD is rewritten by the pre-push rebase and made 22 of 33 citations
         # unreachable. Keeping this as a SET so the next read-only probe is a
         # one-word change rather than a red suite.
-        READ_ONLY_PROBES = {"rev-parse", "merge-base"}
+        READ_ONLY_PROBES = {"rev-parse", "merge-base", "symbolic-ref", "log"}  # T-3600 push-guard branch/log probe
         probes = [k for k in kinds if k in READ_ONLY_PROBES]
         mutating = [k for k in kinds if k not in READ_ONLY_PROBES]
         self.assertEqual(mutating, ["fetch", "merge", "add", "diff", "commit", "push"])
@@ -2421,7 +2421,7 @@ class TestRatifiedADRDirsCoverage(unittest.TestCase):
             dirs = ticket_grooming._default_adr_dirs()
         self.assertEqual(
             dirs,
-            [fake_root / "adr", Path("/home/claude/echo-prismatic/adr")],
+            [fake_root / "architecture" / "adr", Path("/home/claude/echo-prismatic/adr")],
         )
 
     def test_missing_configured_dir_produces_coverage_gap_line(self) -> None:
@@ -2872,6 +2872,66 @@ class TestDryRunRatifiedUnbuiltADR(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("COVERAGE-GAP", out)
         self.assertIn(str(absent), out)
+
+
+class TestTicketIntegrityIssues(unittest.TestCase):
+    """T-2982: find_ticket_integrity_issues detects dup-IDs + same-not_before clusters."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        for state in ("inbox", "active", "done", "blocked"):
+            (self.root / state).mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _write(self, state: str, tid: str, not_before: str | None = None) -> None:
+        fm = ["---", f"id: {tid}", "target: recovery", f"state: {state}"]
+        if not_before is not None:
+            fm.append(f"not_before: {not_before}")
+        fm.append("---")
+        (self.root / state / f"{tid}.md").write_text("\n".join(fm) + f"\n# {tid}\n", encoding="utf-8")
+
+    def test_clean_tree_no_issues(self) -> None:
+        self._write("inbox", "T-0001")
+        self._write("active", "T-0002")
+        self.assertEqual(ticket_grooming.find_ticket_integrity_issues(self.root), [])
+
+    def test_duplicate_id_flagged(self) -> None:
+        self._write("done", "T-0001")
+        self._write("inbox", "T-0001")  # same id in two dirs = collision
+        issues = ticket_grooming.find_ticket_integrity_issues(self.root)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("DUP-ID", issues[0])
+        self.assertIn("T-0001", issues[0])
+
+    def test_same_not_before_cluster_of_3_flagged(self) -> None:
+        for tid in ("T-0010", "T-0011", "T-0012"):
+            self._write("inbox", tid, not_before="2026-08-20T12:00:00Z")
+        issues = ticket_grooming.find_ticket_integrity_issues(self.root)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("GATE-CLUSTER", issues[0])
+        self.assertIn("2026-08-20T12:00:00Z", issues[0])
+
+    def test_cluster_of_2_not_flagged(self) -> None:
+        # threshold is >=3; a pair is not a thundering-herd
+        self._write("inbox", "T-0010", not_before="2026-08-20T12:00:00Z")
+        self._write("inbox", "T-0011", not_before="2026-08-20T12:00:00Z")
+        self.assertEqual(ticket_grooming.find_ticket_integrity_issues(self.root), [])
+
+    def test_distinct_not_before_not_flagged(self) -> None:
+        # staggered gates (different timestamps) are correct, not a cluster
+        self._write("inbox", "T-0010", not_before="2026-08-20T12:00:00Z")
+        self._write("inbox", "T-0011", not_before="2026-08-21T12:00:00Z")
+        self._write("inbox", "T-0012", not_before="2026-08-22T12:00:00Z")
+        self.assertEqual(ticket_grooming.find_ticket_integrity_issues(self.root), [])
+
+    def test_render_section_empty_when_clean(self) -> None:
+        self.assertEqual(ticket_grooming._render_integrity_section([]), "")
+
+    def test_render_section_lists_issues(self) -> None:
+        out = ticket_grooming._render_integrity_section(["[DUP-ID] T-0001 ...", "[GATE-CLUSTER] 3 tickets ..."])
+        self.assertIn("Ticket-integrity issues (2)", out)
+        self.assertIn("DUP-ID", out)
 
 
 if __name__ == "__main__":

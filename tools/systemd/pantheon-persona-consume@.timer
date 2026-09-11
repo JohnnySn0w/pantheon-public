@@ -2,7 +2,7 @@
 Description=Poll durable mailbox for Pantheon persona %i
 
 [Timer]
-OnBootSec=2min
+OnActiveSec=2min
 OnUnitInactiveSec=2min
 RandomizedDelaySec=20s
 Unit=pantheon-persona-consume@%i.service

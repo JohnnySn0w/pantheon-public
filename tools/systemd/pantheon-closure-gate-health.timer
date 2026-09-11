@@ -1,0 +1,12 @@
+[Unit]
+Description=Pantheon closure-gate health monitor — hourly fire (*:40 UTC, offset from :00/:20/:30 hourly slots)
+Documentation=file:///home/%u/pantheon-config/adr/ORG-065-first-class-dependency-graph.md
+
+[Timer]
+OnCalendar=*-*-* *:40:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=pantheon-closure-gate-health.service
+
+[Install]
+WantedBy=timers.target

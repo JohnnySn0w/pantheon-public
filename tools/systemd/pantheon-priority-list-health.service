@@ -1,0 +1,22 @@
+[Unit]
+Description=Pantheon priority-list persistent-broken health watchdog (T-3020 BT4, ORG-078 §4)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+Documentation=file:///home/%u/pantheon-config/adr/ORG-078-priority-aware-ticket-queue-ordering.md
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Reads the INVOKING account's own ~/.local/log/pantheon/priority_list_health.jsonl
+# (written by that account's own `ticket.py list` calls, T-3020 BT3) — no
+# cross-account sudo. rulebook/priority-list.md is a single shared git-tracked
+# file, so a parse failure is identical across every clone once pulled; Recovery's
+# own ticket.py invocation cadence (grooming/drain timers + interactive use)
+# is a sufficient fleet-wide proxy without reading every other seat's log.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/priority_list_health_watchdog.py --check
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2min

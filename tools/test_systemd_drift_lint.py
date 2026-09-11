@@ -240,6 +240,44 @@ class TestDriftSeverity(_Base):
         drift = self._kinds(sdl.check(self.repo, self.inst), "drift")
         self.assertEqual([f.severity for f in drift], ["substantive"])
 
+    # T-3097 (Cat D): pantheon-persona-quota@.timer carries placeholder tokens
+    # in repo ({quota_cadence_minutes}, {quota_randomized_delay_seconds}) that
+    # persona_installer.py substitutes at install time — repo bytes can never
+    # be byte-identical to an installed copy on those two directives by
+    # design. OnUnitInactiveSec/RandomizedDelaySec drift confined to that is
+    # expected, but any OTHER directive change on the unit still pages.
+    _QUOTA = "pantheon-persona-quota@.timer"
+
+    def test_quota_timer_placeholder_vs_rendered_is_cosmetic(self):
+        self._write(self.repo, self._QUOTA,
+                    "[Timer]\nOnBootSec=5min\n"
+                    "OnUnitInactiveSec={quota_cadence_minutes}min\n"
+                    "RandomizedDelaySec={quota_randomized_delay_seconds}s\n"
+                    "Unit=pantheon-persona-quota@%i.service\n")
+        self._write(self.inst, self._QUOTA,
+                    "[Timer]\nOnBootSec=5min\n"
+                    "OnUnitInactiveSec=30min\n"
+                    "RandomizedDelaySec=300s\n"
+                    "Unit=pantheon-persona-quota@%i.service\n")
+        drift = self._kinds(sdl.check(self.repo, self.inst), "drift")
+        self.assertEqual([f.severity for f in drift], ["cosmetic"])
+
+    def test_quota_timer_other_directive_change_still_substantive(self):
+        # Signal preserved: a real scheduling/exec change on the exempt unit
+        # (here OnBootSec, which carries no placeholder) still pages.
+        self._write(self.repo, self._QUOTA,
+                    "[Timer]\nOnBootSec=5min\n"
+                    "OnUnitInactiveSec={quota_cadence_minutes}min\n"
+                    "RandomizedDelaySec={quota_randomized_delay_seconds}s\n"
+                    "Unit=pantheon-persona-quota@%i.service\n")
+        self._write(self.inst, self._QUOTA,
+                    "[Timer]\nOnBootSec=999min\n"
+                    "OnUnitInactiveSec=30min\n"
+                    "RandomizedDelaySec=300s\n"
+                    "Unit=pantheon-persona-quota@%i.service\n")
+        drift = self._kinds(sdl.check(self.repo, self.inst), "drift")
+        self.assertEqual([f.severity for f in drift], ["substantive"])
+
 
 class _FakeSource(sdl.InstalledSource):
     """A hermetic InstalledSource — no filesystem, no sudo. Models the three

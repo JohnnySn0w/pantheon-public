@@ -36,6 +36,16 @@ and is never alerted on.
 
 Alerts land in orchestrator's own ORG-026 mailbox (the supervised-pull remediator);
 pulls stay supervised, per T-2794's option-(b) decision.
+
+T-3425 (2026-09-05, from T-3009 5-obs threshold hit): per-account
+dispositioned-mitigation skip-list. A seat can be listed at
+fleet-clone-currency-skip-list.yaml with a disposition_ticket + expected_state
+(inbox/active/done); while the ticket sits in that state, DRIFTED/UNKNOWN for
+that seat is downgraded to SKIPPED and dropped from the alert. Fail-open at
+EVERY step (missing file, parse error, missing/moved disposition ticket, state
+mismatch, malformed entry — every failure yields "no skip applied", so a
+broken skip-list can never suppress an alert). Skipped seats are still
+visible in --dry-run/--json output and in a footer section on any real alert.
 """
 from __future__ import annotations
 
@@ -67,7 +77,16 @@ ORCHESTRATOR_INBOX = os.environ.get("PANTHEON_ORCHESTRATOR_INBOX", f"{arm.mailbo
 # default, --threshold overrides per-invocation.
 DRIFT_THRESHOLD_DEFAULT = int(os.environ.get("PANTHEON_FLEET_CLONE_DRIFT_THRESHOLD", "20"))
 
-CURRENT, DRIFTED, NO_CLONE, UNKNOWN = "CURRENT", "DRIFTED", "NO_CLONE", "UNKNOWN"
+CURRENT, DRIFTED, NO_CLONE, UNKNOWN, SKIPPED = (
+    "CURRENT", "DRIFTED", "NO_CLONE", "UNKNOWN", "SKIPPED",
+)
+
+# T-3425: per-account dispositioned-mitigation skip-list. Fail-open (missing
+# file / parse error / unresolvable expiry-condition = zero skips applied, so
+# a broken skip-list can never SUPPRESS an alert — only ever fail to add one).
+SKIP_LIST_PATH_DEFAULT = REPO_ROOT / "fleet-clone-currency-skip-list.yaml"
+SKIP_LIST_PATH = Path(os.environ.get("PANTHEON_FLEET_CLONE_SKIP_LIST", str(SKIP_LIST_PATH_DEFAULT)))
+_TICKET_STATE_DIRS = ("inbox", "active", "done")
 
 # git stderr shapes that mean "this account has no pantheon-config clone at
 # all" (path absent, or present but not a repo) — distinct from every other
@@ -185,11 +204,104 @@ def sweep(seats: list[Seat], *, threshold: int, head_run=subprocess.run, count_r
 def needs_alert(results: list[dict]) -> list[dict]:
     """DRIFTED (over threshold) and UNKNOWN (could not verify) both need
     attention — an unverifiable seat is exactly the silent-drift risk this
-    tool exists to catch; NO_CLONE is never a problem."""
+    tool exists to catch; NO_CLONE is never a problem; SKIPPED is a
+    dispositioned-mitigation carve-out (T-3425) that was verified to still
+    apply at check time (fail-open: expired disposition = seat re-alerts)."""
     return [r for r in results if r["verdict"] in (DRIFTED, UNKNOWN)]
 
 
-def render_alert(flagged: list[dict]) -> str:
+def load_skip_list(path: Path | None = None) -> list[dict]:
+    """Load the per-account dispositioned-mitigation skip-list (T-3425).
+
+    Fail-open at every step: a missing file, an unreadable file, a parse
+    error, or a malformed root shape all yield []. A skip-list that we
+    cannot understand must never silently suppress alerts — the whole
+    point of this check is to catch silent drift, so an unreadable
+    skip-list defaults to "no skips" (alert normally), never "skip
+    everything I can't parse" (suppression by malformation).
+    """
+    p = path or SKIP_LIST_PATH
+    try:
+        raw = p.read_text()
+    except OSError:
+        return []
+    try:
+        import yaml
+        data = yaml.safe_load(raw) or {}
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    entries = data.get("skips")
+    if not isinstance(entries, list):
+        return []
+    return [e for e in entries if isinstance(e, dict)]
+
+
+def is_skip_active(entry: dict, *, repo_root: Path = REPO_ROOT) -> tuple[bool, str]:
+    """Check whether a skip entry's expiry-condition still holds.
+
+    An entry names a disposition ticket + expected state; the entry is
+    "active" iff the ticket file currently lives in the expected state
+    directory (tickets/<state>/<id>.md). Any other outcome — missing
+    ticket, missing state, mismatched state, malformed entry — is fail-open
+    ("expired", so the seat re-alerts). The reason string is included
+    verbatim in render_alert's SKIPPED footer for auditability.
+    """
+    account = entry.get("account")
+    ticket_id = entry.get("disposition_ticket")
+    expected = entry.get("expected_state")
+    reason = entry.get("reason", "(no reason given)")
+    if not (account and ticket_id and expected):
+        return False, f"malformed skip entry (account/disposition_ticket/expected_state required); ignored"
+    if expected not in _TICKET_STATE_DIRS:
+        return False, f"skip for {account}: expected_state '{expected}' is not one of {_TICKET_STATE_DIRS}; ignored"
+    actual = None
+    for state in _TICKET_STATE_DIRS:
+        if (repo_root / "tickets" / state / f"{ticket_id}.md").exists():
+            actual = state
+            break
+    if actual is None:
+        return False, f"skip for {account} EXPIRED: disposition ticket {ticket_id} not found in tickets/{{inbox,active,done}}/"
+    if actual != expected:
+        return False, f"skip for {account} EXPIRED: {ticket_id} now in tickets/{actual}/ (was expected in tickets/{expected}/)"
+    return True, f"skip active per {ticket_id} (state={actual}): {reason}"
+
+
+def apply_skip_list(results: list[dict], skip_list: list[dict],
+                    *, repo_root: Path = REPO_ROOT) -> list[dict]:
+    """Suppress DRIFTED/UNKNOWN verdicts to SKIPPED for accounts whose
+    disposition-skip is currently active. Returns a NEW list; never
+    mutates the input results. CURRENT and NO_CLONE are never suppressed
+    (nothing to suppress). The SKIPPED result carries the original verdict
+    under `original_verdict` and the reason under `skip_reason` for the
+    dry-run/json output and the alert footer.
+    """
+    by_account: dict[str, dict] = {}
+    for entry in skip_list:
+        acct = entry.get("account")
+        if isinstance(acct, str):
+            by_account[acct] = entry
+    out: list[dict] = []
+    for r in results:
+        entry = by_account.get(r.get("account", ""))
+        if entry is None or r["verdict"] not in (DRIFTED, UNKNOWN):
+            out.append(r)
+            continue
+        active, reason = is_skip_active(entry, repo_root=repo_root)
+        if active:
+            out.append({**r, "verdict": SKIPPED, "original_verdict": r["verdict"],
+                        "skip_reason": reason,
+                        "detail": f"{r.get('detail', '')} — SKIPPED: {reason}"})
+        else:
+            # Expired / malformed skip: keep the original verdict so the seat
+            # still alerts. Annotate the detail so an operator can see WHY
+            # the skip didn't apply on this cycle.
+            out.append({**r, "detail": f"{r.get('detail', '')} — skip attempted but not applied: {reason}"})
+    return out
+
+
+def render_alert(flagged: list[dict], *, skipped: list[dict] | None = None) -> str:
     lines = [f"Fleet clone-currency check: {len(flagged)} seat(s) need attention.", ""]
     for r in flagged:
         lines.append(f"- {r['persona']}/{r['account']}: {r['verdict']} — {r['detail']}")
@@ -198,13 +310,25 @@ def render_alert(flagged: list[dict]) -> str:
         "Remedy: supervised ff-pull each seat (T-2743 pattern) — confirm the clone is "
         "clean, ff-only pull to origin/main, verify a clean consume fire.",
     ]
+    if skipped:
+        lines += [
+            "",
+            f"Skipped (dispositioned-mitigation carve-outs still active, T-3425): "
+            f"{len(skipped)} seat(s).",
+        ]
+        for r in skipped:
+            lines.append(
+                f"- {r['persona']}/{r['account']}: "
+                f"was {r.get('original_verdict', 'DRIFTED')} → SKIPPED. "
+                f"{r.get('skip_reason', '')}"
+            )
     return "\n".join(lines)
 
 
-def alert(flagged: list[dict]) -> None:
+def alert(flagged: list[dict], *, skipped: list[dict] | None = None) -> None:
     from tools import mailbox
     mailbox.send(
-        ORCHESTRATOR_INBOX, render_alert(flagged), "fleet_clone_currency_check",
+        ORCHESTRATOR_INBOX, render_alert(flagged, skipped=skipped), "fleet_clone_currency_check",
         subject=f"fleet clone-currency: {len(flagged)} seat(s) need attention",
     )
 
@@ -219,6 +343,9 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--dry-run", action="store_true", help="sweep + print, send no alert")
     p.add_argument("--threshold", type=int, default=DRIFT_THRESHOLD_DEFAULT,
                     help=f"commits-behind alert threshold (default {DRIFT_THRESHOLD_DEFAULT})")
+    p.add_argument("--skip-list", type=Path, default=SKIP_LIST_PATH,
+                    help=f"per-account dispositioned-mitigation skip-list YAML "
+                         f"(default {SKIP_LIST_PATH}; T-3425)")
     p.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
 
@@ -245,8 +372,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         return 0
 
-    results = sweep(seats, threshold=args.threshold)
+    raw_results = sweep(seats, threshold=args.threshold)
+    skip_list = load_skip_list(args.skip_list)
+    results = apply_skip_list(raw_results, skip_list)
     flagged = needs_alert(results)
+    skipped = [r for r in results if r["verdict"] == SKIPPED]
 
     if args.json:
         print(json.dumps(results, indent=2))
@@ -255,12 +385,14 @@ def main(argv: list[str] | None = None) -> int:
             _log(f"[{r['verdict']:<8}] {r['persona']:10} {r['account']:12} {r['detail']}")
 
     if flagged and not args.dry_run:
-        alert(flagged)
-        _log(f"alerted orchestrator: {len(flagged)} seat(s) need attention")
+        alert(flagged, skipped=skipped)
+        _log(f"alerted orchestrator: {len(flagged)} seat(s) need attention "
+             f"({len(skipped)} dispositioned-skipped)")
     elif flagged:
-        _log(f"[dry-run] would alert: {len(flagged)} seat(s) need attention")
+        _log(f"[dry-run] would alert: {len(flagged)} seat(s) need attention "
+             f"({len(skipped)} dispositioned-skipped)")
     else:
-        _log("all seats current; no alert")
+        _log(f"all seats current; no alert ({len(skipped)} dispositioned-skipped)")
     # Exit 0 always: a monitor must not fail its own timer.
     return 0
 

@@ -1,0 +1,20 @@
+[Unit]
+Description=Pantheon backup-staleness watchdog — fail if the off-box VPS backup misses its daily commit (T-2886)
+Documentation=file:///home/%u/pantheon-config/tools/backup_staleness_check.py
+After=network-online.target
+Wants=network-online.target
+
+# This IS the alert path for the T-2178 backup: the backup itself is a system/
+# root unit the user-scoped fleet alerting cannot see, so this user unit checks
+# the backup repo's commit freshness and fails loudly on staleness — routing
+# through the standard alerter below. Fail-closed on API errors.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/backup_staleness_check.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

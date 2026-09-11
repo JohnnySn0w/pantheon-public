@@ -271,6 +271,13 @@ def _git(*args: str, cwd: Path = REPO_ROOT) -> subprocess.CompletedProcess:
 
 _NON_FF_MARKERS = ("rejected", "non-fast-forward", "fetch first")
 
+# Transient concurrent-fetch ref-lock race (T-3207): another git op updating
+# refs/remotes/origin/main mid-fetch fails "cannot lock ref". Retried in
+# with_worktree's fetch; non-ref-lock fetch errors (network/auth) are NOT retried.
+_REF_LOCK_MARKERS = ("cannot lock ref",)
+_FETCH_REF_LOCK_ATTEMPTS = 3
+_FETCH_REF_LOCK_BACKOFF_S = 0.5
+
 
 def _unmerged_paths(cwd: Path) -> list[str]:
     """Repo-relative paths currently in an unmerged (conflicted) state."""
@@ -304,6 +311,79 @@ def _resolve_and_continue_rebase(cwd: Path, resolver, max_iters: int = 50) -> bo
         return False
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# HEAD:main push guard (T-3600).
+#
+# ticket.py (and other callers) push refspec="HEAD:main" — the commit lands on
+# whatever branch is checked out, then the push fast-forwards origin/main to that
+# HEAD, carrying EVERY commit between origin/main and HEAD. Run such an op from a
+# feature branch and its non-ticket commits leak onto main unreviewed (hit
+# 2026-09-09 on T-3599: an unreviewed poke-coupled commit rode to main).
+#
+# This guard WARNS (never blocks, never mutates) when a HEAD:main push is issued
+# from a NAMED non-main branch and would carry commits touching paths OUTSIDE
+# tickets/. It is fail-open in every limb: any error skips the guard and the push
+# proceeds unchanged. It must NOT fire on the legitimate detached-HEAD worktree
+# case the HEAD:main default exists for (symbolic-ref fails on detached HEAD ->
+# skip). Opt out entirely with PANTHEON_TICKET_PUSH_GUARD_OFF=1.
+# ---------------------------------------------------------------------------
+_PUSH_GUARD_OPT_OUT_ENV = "PANTHEON_TICKET_PUSH_GUARD_OFF"
+
+
+def _refspec_targets_main(refspec: str) -> bool:
+    """True iff `refspec` pushes to the remote `main` branch. Handles "HEAD:main",
+    "main", "main:main", "refs/heads/x:refs/heads/main", "HEAD:main^{}" etc. — the
+    destination is the segment after the last ':' (or the whole spec if none)."""
+    dst = refspec.rsplit(":", 1)[-1].strip()
+    return dst in ("main", "refs/heads/main")
+
+
+def _warn_if_branch_carries_nonticket_commits(cwd: Path, refspec: str) -> None:
+    """T-3600 guard — WARN (never block) before a HEAD:main push from a named
+    non-main branch that would carry non-ticket commits onto origin/main.
+
+    Fail-open: any exception or unexpected git state returns silently and the push
+    proceeds. Never raises, never mutates repo state.
+    """
+    try:
+        if os.environ.get(_PUSH_GUARD_OPT_OUT_ENV, "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            return
+        if not _refspec_targets_main(refspec):
+            return
+        # Current branch. Detached HEAD (the worktree case the HEAD:main default
+        # serves) makes symbolic-ref exit non-zero -> skip the guard. main -> the
+        # normal, safe case -> skip.
+        head = _git("symbolic-ref", "--short", "-q", "HEAD", cwd=cwd)
+        branch = head.stdout.strip()
+        if head.returncode != 0 or not branch or branch == "main":
+            return
+        # Commits that WOULD land on main = origin/main..HEAD. Use the local
+        # remote-tracking ref (no network); if it is absent the log fails -> skip
+        # (cannot compute the delta safely, so do not guess).
+        names = _git("log", "--format=", "--name-only", "origin/main..HEAD", cwd=cwd)
+        if names.returncode != 0:
+            return
+        paths = {p.strip() for p in names.stdout.splitlines() if p.strip()}
+        nonticket = sorted(p for p in paths if not p.startswith("tickets/"))
+        if not nonticket:
+            return  # every carried commit is tickets/-only — the intended shape
+        sample = ", ".join(nonticket[:3]) + (" …" if len(nonticket) > 3 else "")
+        sys.stderr.write(
+            f"\n⚠️  [push guard T-3600] pushing '{refspec}' from branch '{branch}' — "
+            f"this carries {len(nonticket)} path(s) OUTSIDE tickets/ ({sample}) onto "
+            f"origin/main.\n"
+            f"    A HEAD:main push lands EVERY commit in origin/main..HEAD. If those "
+            f"non-ticket commits are unreviewed feature/branch work, abort now and run "
+            f"the op from main instead (see memory "
+            f"reference_ticket_py_pushes_head_main_from_any_branch).\n"
+            f"    To silence this guard: {_PUSH_GUARD_OPT_OUT_ENV}=1\n"
+        )
+    except Exception:
+        return  # fail-open — the guard must NEVER break a push
 
 
 def push_with_retry(
@@ -346,6 +426,14 @@ def push_with_retry(
         (True, "<detail>") on success.
         (False, "<reason>") on any failure.
     """
+    # T-3600: warn (never block) if this HEAD:main push from a named non-main
+    # branch would carry non-ticket commits onto origin/main. The guard is already
+    # internally fail-open; this second try/except guarantees no guard bug can ever
+    # break a push on this fleet-shared path (advisory-only side effect).
+    try:
+        _warn_if_branch_carries_nonticket_commits(cwd, refspec)
+    except Exception:
+        pass
     for attempt_num in range(1, attempts + 1):
         res = _git("push", "origin", refspec, cwd=cwd)
         if res.returncode == 0:
@@ -1034,21 +1122,33 @@ def with_worktree(fn: Callable[[Path], T]) -> T:
             f"remove it before re-running (prior cron may have crashed mid-run)"
         )
 
-    # Step 2: fetch origin/main so worktree-add gets a fresh tip.
-    try:
-        fetch_result = subprocess.run(
-            ["git", "fetch", "origin", "main"],
-            cwd=REPO_ROOT,
-            capture_output=True,
-            text=True,
-            timeout=30,
-            check=False,
-        )
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        raise WorktreeError(f"git fetch origin main failed: {exc!r}") from exc
-    if fetch_result.returncode != 0:
+    # Step 2: fetch origin/main so worktree-add gets a fresh tip. Bounded retry
+    # on the concurrent-fetch ref-lock race (T-3207): another git op updating
+    # refs/remotes/origin/main mid-fetch fails "cannot lock ref" — transient (the
+    # next attempt sees the settled ref). Non-ref-lock failures (network/auth) are
+    # NOT retried, preserving the prior fail-fast posture.
+    for _fetch_attempt in range(1, _FETCH_REF_LOCK_ATTEMPTS + 1):
+        try:
+            fetch_result = subprocess.run(
+                ["git", "fetch", "origin", "main"],
+                cwd=REPO_ROOT,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            raise WorktreeError(f"git fetch origin main failed: {exc!r}") from exc
+        if fetch_result.returncode == 0:
+            break
         detail = (fetch_result.stderr or fetch_result.stdout).strip()
-        raise WorktreeError(f"git fetch origin main failed (rc={fetch_result.returncode}): {detail}")
+        is_ref_lock = any(m in detail.lower() for m in _REF_LOCK_MARKERS)
+        if is_ref_lock and _fetch_attempt < _FETCH_REF_LOCK_ATTEMPTS:
+            time.sleep(_FETCH_REF_LOCK_BACKOFF_S * _fetch_attempt)
+            continue
+        raise WorktreeError(
+            f"git fetch origin main failed (rc={fetch_result.returncode}): {detail}"
+        )
 
     # Step 3: create the worktree.
     try:

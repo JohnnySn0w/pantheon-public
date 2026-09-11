@@ -93,6 +93,39 @@ class TestX(unittest.TestCase):
         self.tmp = mkdtemp()
 '''
 
+# T-3097 (Cat E): the real test_activity_monitor.py shape — setUpModule
+# creates, tearDownModule cleans. No enclosing ClassDef unifies the pair the
+# way a TestCase class does for setUp/tearDown, so the lint's scope-detector
+# must recognize the setUpModule/tearDownModule idiom explicitly.
+CLEAN_MODULE_SETUP_TEARDOWN_PAIR = '''
+import tempfile
+_TMP = None
+def setUpModule():
+    global _TMP
+    _TMP = tempfile.TemporaryDirectory()
+def tearDownModule():
+    if _TMP is not None:
+        _TMP.cleanup()
+'''
+
+LEAKY_MODULE_SETUP_NO_TEARDOWN = '''
+import tempfile
+_TMP = None
+def setUpModule():
+    global _TMP
+    _TMP = tempfile.TemporaryDirectory()
+'''
+
+LEAKY_MODULE_SETUP_TEARDOWN_NO_CLEANUP = '''
+import tempfile
+_TMP = None
+def setUpModule():
+    global _TMP
+    _TMP = tempfile.TemporaryDirectory()
+def tearDownModule():
+    pass
+'''
+
 
 class TestLintSource(unittest.TestCase):
     def _scopes(self, src):
@@ -135,6 +168,25 @@ class TestLintSource(unittest.TestCase):
 
     def test_syntax_error_source_is_skipped(self):
         self.assertEqual(thl.lint_source("def (:\n", "test_fix.py"), [])
+
+    def test_module_setup_teardown_pair_is_clean(self):
+        # T-3097 (Cat E): cleanup living in the SIBLING module-level function
+        # must be found, same as a class unifies setUp/tearDown.
+        self.assertEqual(thl.lint_source(CLEAN_MODULE_SETUP_TEARDOWN_PAIR, "test_fix.py"), [])
+
+    def test_module_setup_with_no_teardown_still_flagged(self):
+        # Negative case: pairing recognition must not become a blanket
+        # exemption for any setUpModule — no tearDownModule at all still leaks.
+        f = thl.lint_source(LEAKY_MODULE_SETUP_NO_TEARDOWN, "test_fix.py")
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0].scope, "setUpModule")
+
+    def test_module_setup_teardown_pair_without_cleanup_still_flagged(self):
+        # tearDownModule exists but does not actually clean anything up —
+        # pairing must fold in the sibling's SOURCE, not just its presence.
+        f = thl.lint_source(LEAKY_MODULE_SETUP_TEARDOWN_NO_CLEANUP, "test_fix.py")
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0].scope, "setUpModule")
 
 
 class TestExitCodeAndDict(unittest.TestCase):

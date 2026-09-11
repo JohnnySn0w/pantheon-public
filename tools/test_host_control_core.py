@@ -28,11 +28,11 @@ from tools.host_control.contracts import (
     SubjectMismatch,
     compute_effect_digest,
 )
+from tools.host_control.contracts import MigrationRequired
 from tools.host_control.journal import (
     APPLICATION_ID,
-    DDL,
-    SCHEMA_DIGEST,
-    USER_VERSION,
+    DDL_V1,
+    SCHEMA_DIGEST_V1,
     BrokerJournal,
 )
 from tools.host_control.planner import HostPlanService
@@ -70,7 +70,7 @@ def _manifest_dict() -> dict:
                     "tools/systemd/pantheon-persona-consume@.timer"
                 ),
             },
-            "policy": {"bundle": ["rulebook/", "sop/", "adr/"]},
+            "policy": {"bundle": ["rulebook/", "sop/", "architecture/adr/"]},
             "security": {
                 "credential_mode": "references-only",
                 "prohibit_auth_copy": True,
@@ -142,6 +142,8 @@ class HostControlCase(unittest.TestCase):
         self.template_ids = (
             "tools/systemd/pantheon-persona-consume@.service",
             "tools/systemd/pantheon-persona-consume@.timer",
+            "tools/systemd/pantheon-persona-quota@.service",
+            "tools/systemd/pantheon-persona-quota@.timer",
         )
         self.registry_path = self.root / "registry.json"
         self.policy_path = self.root / "policy.json"
@@ -945,87 +947,60 @@ os._exit(17)
         self.assertEqual(self.row_count(), 0)
 
     def test_journal_initializes_exact_v1_schema_and_refuses_version_drift(self) -> None:
-        self.journal.close()
-        with sqlite3.connect(self.journal_path) as connection:
-            self.assertEqual(
-                connection.execute("PRAGMA application_id").fetchone()[0],
-                APPLICATION_ID,
-            )
-            self.assertEqual(
-                connection.execute("PRAGMA user_version").fetchone()[0],
-                1,
-            )
+        # Retargeted under its reviewed name (T-2909, directed by the
+        # dispatcher): this test now guards DDL_V1 byte-stability against the
+        # LITERAL v1 digest. Pinning the literal here means a self-consistent
+        # edit of DDL_V1 plus SCHEMA_DIGEST_V1 cannot silently re-anchor what
+        # "v1" means, which is the precondition for v1->v2 migration
+        # correctness. v2 initialization and drift-refusal coverage lives in
+        # tools.test_host_control_operations.
+        locked_digest = (
+            "82b1b18c874607a62119778fd92d7310"
+            "ac75936c08e56fedd356fdc3fa8ee2fa"
+        )
+        self.assertEqual(
+            hashlib.sha256(DDL_V1.encode("utf-8")).hexdigest(),
+            locked_digest,
+        )
+        self.assertEqual(SCHEMA_DIGEST_V1, locked_digest)
+
+        with sqlite3.connect(":memory:") as connection:
+            connection.executescript(DDL_V1)
             tables = connection.execute(
                 "SELECT name, strict FROM pragma_table_list "
                 "WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
             ).fetchall()
             self.assertEqual(tables, [("journal_meta", 1), ("plans", 1)])
+            indexes = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='index' "
+                "AND name NOT LIKE 'sqlite_%' ORDER BY name"
+            ).fetchall()
+            self.assertEqual(
+                indexes,
+                [("plans_effect_digest_idx",), ("plans_subject_expiry_idx",)],
+            )
 
-        def assert_refused(name: str, mutation: str) -> None:
-            path = self.root / f"{name}.sqlite3"
-            journal = BrokerJournal.open(path)
-            journal.close()
-            with sqlite3.connect(path) as connection:
-                connection.executescript(mutation)
-                connection.commit()
-            with self.subTest(schema_case=name):
-                with self.assertRaises(HostControlError):
-                    BrokerJournal.open(path)
-
-        assert_refused("older", "PRAGMA user_version=0;")
-        assert_refused("newer", "PRAGMA user_version=2;")
-        assert_refused("wrong-app", "PRAGMA application_id=1;")
-        assert_refused(
-            "metadata-digest",
-            f"UPDATE journal_meta SET schema_digest='{'a' * 64}';",
-        )
-        assert_refused(
-            "missing-index",
-            "DROP INDEX plans_effect_digest_idx;",
-        )
-        assert_refused(
-            "extra-table",
-            "CREATE TABLE extra(value TEXT) STRICT;",
-        )
-        assert_refused(
-            "extra-column",
-            "ALTER TABLE plans ADD COLUMN extra TEXT;",
-        )
-        assert_refused(
-            "mutated-column",
-            "ALTER TABLE plans RENAME COLUMN action TO changed_action;",
-        )
-        assert_refused(
-            "mutated-index",
-            "DROP INDEX plans_effect_digest_idx;"
-            "CREATE INDEX plans_effect_digest_idx ON plans(plan_digest);",
-        )
-        assert_refused("missing-table", "DROP TABLE plans;")
-
-        legacy_path = self.root / "legacy-v0.sqlite3"
-        with sqlite3.connect(legacy_path) as connection:
-            connection.execute("CREATE TABLE legacy(value TEXT)")
-            connection.commit()
-        with self.assertRaises(HostControlError):
-            BrokerJournal.open(legacy_path)
-
-        non_strict_path = self.root / "non-strict.sqlite3"
-        with sqlite3.connect(non_strict_path) as connection:
-            connection.executescript(DDL.replace(") STRICT;", ");"))
+        # Version drift is still refused: a byte-exact v1 journal no longer
+        # serves (explicit migration required), and a mutated v1 is refused
+        # outright rather than being offered migration.
+        v1_path = self.root / "legacy-v1.sqlite3"
+        with sqlite3.connect(v1_path) as connection:
+            connection.executescript(DDL_V1)
             connection.execute(f"PRAGMA application_id={APPLICATION_ID}")
-            connection.execute(f"PRAGMA user_version={USER_VERSION}")
+            connection.execute("PRAGMA user_version=1")
             connection.execute(
-                "INSERT INTO journal_meta VALUES (1, ?, ?, ?)",
-                (
-                    USER_VERSION,
-                    SCHEMA_DIGEST,
-                    "2026-07-31T00:00:00+00:00",
-                ),
+                "INSERT INTO journal_meta VALUES (1, 1, ?, ?)",
+                (SCHEMA_DIGEST_V1, "2026-07-31T00:00:00+00:00"),
             )
             connection.commit()
-        with self.assertRaises(HostControlError):
-            BrokerJournal.open(non_strict_path)
-        self.journal = BrokerJournal.open(self.root / "replacement.sqlite3")
+        with self.assertRaises(MigrationRequired):
+            BrokerJournal.open(v1_path)
+        with sqlite3.connect(v1_path) as connection:
+            connection.executescript("CREATE TABLE extra(value TEXT) STRICT;")
+            connection.commit()
+        with self.assertRaises(HostControlError) as caught:
+            BrokerJournal.open(v1_path)
+        self.assertNotIsInstance(caught.exception, MigrationRequired)
 
     def test_journal_enforces_unique_handles_digests_and_idempotency_tuples(self) -> None:
         self.plan()

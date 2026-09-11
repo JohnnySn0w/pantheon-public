@@ -1,5 +1,5 @@
 ---
-symptom: "A root-run enumeration over N items prints N-1 rows with no error, no blank line and no gap — the missing row is always the FIRST. `sudo -S` writes its `[sudo] password for ...` prompt to stderr with NO trailing newline, so under `2>&1` it concatenates with the first line of real output, and the conventional `| grep -v 'sudo\]'` cleanup then discards prompt and first data row together."
+symptom: "A root-run enumeration over N items prints N-1 rows with no error, no blank line and no gap — the missing row is always the FIRST. `sudo -S` writes its `[sudo] password for ...` prompt to stderr with NO trailing newline, so under `2>&1` it concatenates with the first line of real output, and the conventional `| grep -v 'sudo\\]'` cleanup then discards prompt and first data row together."
 fix: "Pass `-p ''` to sudo and NOTHING ELSE — keep `2>&1`, drop the `grep -v`. Do NOT reach for `2>/dev/null`: that fixes the first-row loss and silently discards every FAILING row instead, which is worse for a sweep. Verify over a known-length list containing one deliberate failure and count rows."
 domain: pantheon, sudo, shell, stderr, enumeration, silent-data-loss, measurement-integrity
 ---

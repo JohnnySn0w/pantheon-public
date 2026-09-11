@@ -1,0 +1,12 @@
+[Unit]
+Description=Pantheon priority-list health watchdog — hourly fire (*:45 UTC, offset from :35/:40 hourly slots)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* *:45:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=pantheon-priority-list-health.service
+
+[Install]
+WantedBy=timers.target

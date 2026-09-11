@@ -27,7 +27,7 @@ The goal-anchored rule framework: goals + principles + directives + policies. OR
 
 ## Per-policy file shape
 
-See `adr/ORG-010-three-tier-policies-extension.md` §Implementation §2 for the canonical front-matter + section template. Copy-shape:
+See `architecture/adr/ORG-010-three-tier-policies-extension.md` §Implementation §2 for the canonical front-matter + section template. Copy-shape:
 
 ```
 **Status:** Drafted / Ratified <date> / Superseded by <ID>
@@ -50,10 +50,11 @@ Sections: Context → Policy → Boundary → Re-evaluate when → Related.
 | [`directives.md`](directives.md) | **Status:** **Ratified 2026-05-26 by the operator.** Established 2026-04-28 by ORG-002. **Origin:** First three directives are demotions from the original P1/P7/P9 (the "operationally true now, obviously change later" subset of the initial 9-principle set). |
 | [`goals.md`](goals.md) | **Status:** Drafted 2026-06-11 by Orchestrator (HO) per the operator msg 3737/3738; **the three core north stars are the operator's verbatim words (msg 3740, 2026-06-11)** — canonical, not draft. Remaining entries carry DRAFT north stars until he blesses or rewrites them. Phase lines and deferred-items are HO-maintained operational state. |
 | [`principles.md`](principles.md) | **Status:** Ratified 2026-04-28 by the operator (Telegram). Restructured 2026-04-28 per ORG-002 (two-tier framework: Principles + Directives). **Origin:** Drafted in Telegram 2026-04-26 / 2026-04-27. Initial 9-principle ratification 2026-04-28 (`ledger 2026-04-28T00:40:20Z-001`). Restructured the same day after research grounding (`ledger 2026-04-28T14:08:00Z-001`). |
+| [`priority-list.md`](priority-list.md) | **Status:** Ratified 2026-08-22 by the operator via T-3019 (with ORG-078). HO-drafted 2026-08-21 per T-3018. **Editability:** HO-drafts on operator-direction (TG or arc-planning). Additive edits (adding a label to an existing rank) will be auto-approve HO-tier once ORG-015 is extended to include this file. New ranks or label REMOVALS require operator-ratify. **Below-goal re-sequencing authority (the operator TG 1754, 2026-09-05, org-planning Decision 3):** HO may re-order the priority list BELOW the goal line as reality shifts, under the act-vs-park bar (deferred judgment → proceed reversibly + log + surface a lean per `rulebook/policies/trust-posture.md`). The operator keeps the goal-level ranks (reserved), never silently reordered. Weekly reconciliation cadence per `sop/standard/weekly-arc-reconciliation.md` (T-3437 build) surfaces re-ordering leans + drops in the weekly digest. |
 <!-- AUTOGEN-END spine-index -->
 
 ## Related
 
-- `adr/ORG-002-principles-directives-split.md` — the original two-tier split.
-- `adr/ORG-010-three-tier-policies-extension.md` — the policies-tier extension + migration ratification.
+- `architecture/adr/ORG-002-principles-directives-split.md` — the original two-tier split.
+- `architecture/adr/ORG-010-three-tier-policies-extension.md` — the policies-tier extension + migration ratification.
 - T-0173 (parent ticket: ORG-010 + rulebook authoring) — T-0191 (this migration).

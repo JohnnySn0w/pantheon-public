@@ -179,6 +179,19 @@ class ListWorktrees(unittest.TestCase):
             self.assertEqual(sw.list_worktrees("claude", "/nope"), [])
 
 
+class DuGib(unittest.TestCase):
+    def test_uses_total_even_on_nonzero_rc(self):
+        # du exits nonzero from an unreadable subdir but still prints the grand
+        # total; the size must be USED, not discarded for rc!=0 (T-3441 sibling).
+        with mock.patch.object(sw, "_run", return_value=_cp(rc=1, out="1073741824\t/tmp/wt\n")):
+            self.assertAlmostEqual(sw._du_gib("claude", "/tmp/wt"), 1.0, places=3)
+
+    def test_empty_stdout_is_zero(self):
+        # A genuine failure (no total on stdout) still reports 0.0, never raises.
+        with mock.patch.object(sw, "_run", return_value=_cp(rc=1, out="")):
+            self.assertEqual(sw._du_gib("claude", "/tmp/wt"), 0.0)
+
+
 class SweepDryRun(unittest.TestCase):
     def test_dry_run_never_calls_remove(self):
         wt_main = {"path": "/home/claude/echo-prismatic", "head": "a", "main": True}

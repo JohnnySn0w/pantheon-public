@@ -77,9 +77,9 @@ class ParseLogTests(unittest.TestCase):
         # new path, never the dead old one.
         raw = "\n".join([
             "C\tnn222\t2026-06-13\tadr: renumber ORG-024->ORG-025",
-            "R100\tadr/ORG-024-specialist.md\tadr/ORG-025-specialist.md",
+            "R100\tarchitecture/adr/ORG-024-specialist.md\tarchitecture/adr/ORG-025-specialist.md",
             "C\taa111\t2026-06-10\tadr: add ORG-024 specialist",
-            "A\tadr/ORG-024-specialist.md",
+            "A\tarchitecture/adr/ORG-024-specialist.md",
         ])
         out = pos.build_digest(Path("/nonexistent-root"), pos.parse_log(raw), since_days=30)
         self.assertNotIn("ORG-024-specialist.md", out)
@@ -113,19 +113,19 @@ class BuildDigestTests(unittest.TestCase):
     def test_grouped_newest_first_with_links_no_inline(self):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
-            (root / "adr").mkdir()
-            (root / "adr" / "ORG-035.md").write_text("# ORG-035 — memory portability\n\nbody here\n")
+            (root / "architecture" / "adr").mkdir(parents=True)
+            (root / "architecture" / "adr" / "ORG-035.md").write_text("# ORG-035 — memory portability\n\nbody here\n")
             changes = {
-                "adr/ORG-035.md": {"hash": "aaa111", "date": "2026-06-13",
-                                   "subject": "adopt", "status": "A"},
+                "architecture/adr/ORG-035.md": {"hash": "aaa111", "date": "2026-06-13",
+                                                "subject": "adopt", "status": "A"},
                 "rulebook/directives.md": {"hash": "bbb222", "date": "2026-06-10",
                                            "subject": "tweak", "status": "M"},
             }
             out = pos.build_digest(root, changes, since_days=30)
-        self.assertIn("## adr/", out)
+        self.assertIn("## architecture/adr/", out)
         self.assertIn("## rulebook/", out)
         # Title pulled from the file's first heading; link is relative to notes/.
-        self.assertIn("[ORG-035 — memory portability](../adr/ORG-035.md)", out)
+        self.assertIn("[ORG-035 — memory portability](../architecture/adr/ORG-035.md)", out)
         self.assertIn("new", out)       # status A → "new"
         self.assertIn("changed", out)   # status M → "changed"
         # No artifact body inlined.
@@ -154,6 +154,29 @@ class TitleOfTests(unittest.TestCase):
             (root / "a.md").write_text("\n\n## Second\n# First\n")
             self.assertEqual(pos._title_of(root, "a.md"), "Second")
             self.assertEqual(pos._title_of(root, "missing.md"), "missing")
+
+    def test_skip_yaml_frontmatter_with_hash_comments(self):
+        """YAML comment lines inside frontmatter must NOT be treated as the H1."""
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            body = (
+                "---\n"
+                "aliases: [ORG-076]\n"
+                "title: some yaml title\n"
+                "# elements: not the heading either — YAML comment inside frontmatter\n"
+                "# more yaml comment\n"
+                "---\n"
+                "# Real Heading Below Frontmatter\n"
+                "prose\n"
+            )
+            (root / "a.md").write_text(body)
+            self.assertEqual(pos._title_of(root, "a.md"), "Real Heading Below Frontmatter")
+
+    def test_no_frontmatter_still_works(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "a.md").write_text("prose\n# Only Heading\nmore\n")
+            self.assertEqual(pos._title_of(root, "a.md"), "Only Heading")
 
 
 class StandingContextFilesTests(unittest.TestCase):
@@ -280,22 +303,22 @@ class FindAuthorityMarkersTests(unittest.TestCase):
     def test_no_hit_without_operator(self):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
-            (root / "adr").mkdir()
-            (root / "adr" / "X.md").write_text("Ratified 2026-06-01 (T-9001, msg_9001)\n")
+            (root / "architecture" / "adr").mkdir(parents=True)
+            (root / "architecture" / "adr" / "X.md").write_text("Ratified 2026-06-01 (T-9001, msg_9001)\n")
             self.assertEqual(pos.find_authority_markers(root), [])
 
     def test_no_hit_without_date(self):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
-            (root / "adr").mkdir()
-            (root / "adr" / "X.md").write_text("Ratified by the operator (T-9001, msg_9001)\n")
+            (root / "architecture" / "adr").mkdir(parents=True)
+            (root / "architecture" / "adr" / "X.md").write_text("Ratified by the operator (T-9001, msg_9001)\n")
             self.assertEqual(pos.find_authority_markers(root), [])
 
     def test_bare_frontmatter_tag_ignored_no_date(self):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
-            (root / "adr").mkdir()
-            (root / "adr" / "X.md").write_text("ratified_by: operator\n")
+            (root / "architecture" / "adr").mkdir(parents=True)
+            (root / "architecture" / "adr" / "X.md").write_text("ratified_by: operator\n")
             self.assertEqual(pos.find_authority_markers(root), [])
 
     def test_anchor_less_ratified_claim_skipped(self):
@@ -303,8 +326,8 @@ class FindAuthorityMarkersTests(unittest.TestCase):
         # repeated) and the real 2026-04-28 founding markers ("(Telegram)").
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
-            (root / "adr").mkdir()
-            (root / "adr" / "X.md").write_text(
+            (root / "architecture" / "adr").mkdir(parents=True)
+            (root / "architecture" / "adr" / "X.md").write_text(
                 "**Status:** **Ratified 2026-07-06 by the operator.** Some more prose.\n")
             self.assertEqual(pos.find_authority_markers(root), [])
 
@@ -335,15 +358,15 @@ class FindAuthorityMarkersTests(unittest.TestCase):
     def test_deterministic_sort_order(self):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
-            (root / "adr").mkdir()
-            (root / "adr" / "B.md").write_text(
+            (root / "architecture" / "adr").mkdir(parents=True)
+            (root / "architecture" / "adr" / "B.md").write_text(
                 "Ratified 2026-06-01 by the operator (T-9002, msg_9002)\n")
-            (root / "adr" / "A.md").write_text(
+            (root / "architecture" / "adr" / "A.md").write_text(
                 "Ratified 2026-06-01 by the operator (T-9001, msg_9001)\n")
             first = pos.find_authority_markers(root)
             second = pos.find_authority_markers(root)
         self.assertEqual(first, second)
-        self.assertEqual([m.rel_path for m in first], ["adr/A.md", "adr/B.md"])
+        self.assertEqual([m.rel_path for m in first], ["architecture/adr/A.md", "architecture/adr/B.md"])
 
 
 def _write_ledger_entry(ledger_dir: Path, ts: str, rationale: str, links: list[dict]) -> None:
@@ -366,8 +389,8 @@ def _write_ledger_entry(ledger_dir: Path, ts: str, rationale: str, links: list[d
 class AuthorityCorroborationWarningsTests(unittest.TestCase):
     def _root_with_marker(self, t, marker_line: str) -> Path:
         root = Path(t)
-        (root / "adr").mkdir()
-        (root / "adr" / "X.md").write_text(marker_line + "\n")
+        (root / "architecture" / "adr").mkdir(parents=True)
+        (root / "architecture" / "adr" / "X.md").write_text(marker_line + "\n")
         return root
 
     def test_marker_with_no_ledger_entry_warns(self):
@@ -477,7 +500,7 @@ class AuthorityCorroborationRealPairTests(unittest.TestCase):
         root = pos.repo_root()
         markers = [
             m for m in pos.find_authority_markers(root)
-            if m.rel_path.startswith("adr/ORG-038") and "T-1582" in m.ticket_refs
+            if m.rel_path.startswith("architecture/adr/ORG-038") and "T-1582" in m.ticket_refs
         ]
         self.assertTrue(markers, "expected the real ORG-038/T-1582 marker to be found")
         entries = pos._load_ledger_anchor_index(root)
@@ -547,8 +570,8 @@ class MainDryRunTests(unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as t:
                 root = Path(t)
-                (root / "adr").mkdir()
-                (root / "adr" / "X.md").write_text(
+                (root / "architecture" / "adr").mkdir(parents=True)
+                (root / "architecture" / "adr" / "X.md").write_text(
                     "Ratified 2026-06-01 by the operator (T-9010, msg_9010)\n")
                 out_buf, err_buf = io.StringIO(), io.StringIO()
                 with redirect_stdout(out_buf), redirect_stderr(err_buf):

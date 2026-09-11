@@ -162,6 +162,16 @@ def verify_mtls_binding(
             logger.warning("mtls: presented cert fingerprint != allowlist pin — refused")
             return False
 
+    # T-2867 MTLS-3: what is DELIBERATELY NOT checked here — the cert's VALIDITY
+    # DATES (not_valid_before / not_valid_after) and its SIGNATURE / issuer CA
+    # chain. This is by design, not an omission. The trust anchor is DID-key
+    # POSSESSION proven by the TLS layer (the mTLS handshake), NOT a PKI: a
+    # self-signed / expired / unknown-CA cert that carries the DID-authenticated
+    # key (and, when set, the pinned fingerprint) is ADMITTED, while a perfectly
+    # chained, in-date cert with the WRONG key is REFUSED. Adding an expiry or
+    # chain check here would silently couple the trust model to cert-content
+    # dates / a CA — do NOT add one without changing the model. Locked by the
+    # MTLS-3 doc test (an expired-but-right-key cert still binds).
     return True
 
 

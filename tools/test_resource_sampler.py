@@ -28,6 +28,36 @@ class TestSample(unittest.TestCase):
         for p in rec["procs"]:
             self.assertIn("swap_kb", p)
 
+    def test_records_memory_PSI_the_metric_oomd_sheds_on(self):
+        """mem_used_pct is RAM-fullness, not stall — the box sits high on cache with
+        ~0 stall. PSI is the stall signal AND the exact metric systemd-oomd sheds on
+        (T-2241), so sampling it makes the T-3399 threshold-calibration data-driven.
+        Present whenever the kernel exposes PSI."""
+        if not pathlib.Path("/proc/pressure/memory").exists():
+            self.skipTest("kernel without PSI")
+        rec = rs.sample()
+        for k in ("psi_mem_some_avg10", "psi_mem_full_avg10", "psi_mem_full_avg300"):
+            self.assertIn(k, rec)
+            self.assertIsInstance(rec[k], float)
+
+    def test_parse_mem_pressure_extracts_avg_of_some_and_full(self):
+        text = ("some avg10=1.23 avg60=4.56 avg300=7.89 total=3049166864\n"
+                "full avg10=0.12 avg60=0.34 avg300=0.56 total=2165028337\n")
+        out = rs._parse_mem_pressure(text)
+        self.assertEqual(out["psi_mem_some_avg10"], 1.23)
+        self.assertEqual(out["psi_mem_some_avg300"], 7.89)
+        self.assertEqual(out["psi_mem_full_avg60"], 0.34)
+        self.assertNotIn("psi_mem_some_total", out)  # totals are not averages; not kept
+
+    def test_parse_mem_pressure_never_raises_and_skips_garbage(self):
+        """A malformed /proc line must be skipped, not crash the sample."""
+        for bad in ("", "garbage\n", "some\n", "cpu avg10=1.0 total=1\n"):
+            self.assertEqual(rs._parse_mem_pressure(bad), {})
+        # a bad numeric value is skipped, the good sibling still parses
+        out = rs._parse_mem_pressure("some avg10=notanum avg60=2.0 total=1\n")
+        self.assertNotIn("psi_mem_some_avg10", out)
+        self.assertEqual(out["psi_mem_some_avg60"], 2.0)
+
     def test_procs_are_ranked_and_capped(self):
         rec = rs.sample()
         self.assertLessEqual(len(rec["procs"]), rs.TOP_N)

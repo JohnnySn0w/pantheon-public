@@ -8,7 +8,7 @@ adr is ratified." This is the STRUCTURAL PRIMARY for that rule.
 predates this lint or slips through once an ADR is ratified. This lint only
 inspects genuinely NEW files in a diff; existing ADRs are grandfathered.
 
-Rejects a newly-added `adr/(ADR|ORG)-NNN*.md` file whose frontmatter doesn't
+Rejects a newly-added `architecture/adr/(ADR|ORG)-NNN*.md` file whose frontmatter doesn't
 declare either:
   - `build_disposition: no-build-needed` or `built` (exempt — no
     implementation is expected), OR
@@ -52,8 +52,10 @@ _EXEMPT_DISPOSITIONS = frozenset({"no-build-needed", "built"})
 
 # Matches the `+++ b/<path>` diff header line.
 _PLUS_PLUS_PLUS_RE = re.compile(r"^\+\+\+ (?:b/)?(.+)$")
-# A newly-added ADR file path, e.g. "adr/ORG-069-foo.md" / "adr/ADR-500-x.md".
-_NEW_ADR_PATH_RE = re.compile(r"^adr/(?:ADR|ORG)-\d+[^/]*\.md$")
+# A newly-added ADR file path, e.g. "architecture/adr/ORG-069-foo.md" /
+# "architecture/adr/ADR-500-x.md" (path per ORG-094 architecture umbrella; the
+# repo-root adr/ tree was moved to architecture/adr/ on 2026-09-06, T-3472).
+_NEW_ADR_PATH_RE = re.compile(r"^architecture/adr/(?:ADR|ORG)-\d+[^/]*\.md$")
 
 
 def check_adr_frontmatter(path_display: str, text: str) -> str | None:
@@ -83,7 +85,7 @@ def check_adr_frontmatter(path_display: str, text: str) -> str | None:
 
 def scan_diff_for_new_adrs(diff_text: str) -> list[str]:
     """Parse unified-diff text; return violation messages for every newly
-    ADDED `adr/(ADR|ORG)-NNN...md` file whose reconstructed content fails
+    ADDED `architecture/adr/(ADR|ORG)-NNN...md` file whose reconstructed content fails
     `check_adr_frontmatter`.
 
     Only genuinely NEW files are considered — a `new file mode` line must

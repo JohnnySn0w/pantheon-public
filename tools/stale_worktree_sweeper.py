@@ -79,7 +79,12 @@ def _git(user: str, repo: str, *args: str, timeout: int = 60):
 def _du_gib(user: str, path: str) -> float:
     try:
         res = _run(user, ["du", "-sb", path], timeout=120)
-        if res.returncode == 0 and res.stdout.strip():
+        # du prints a valid grand total even when it exits NONZERO from an
+        # unreadable subdir; use the total rather than discarding it for rc!=0
+        # (same du semantics fixed in disk_usage_monitor per T-3441). This is
+        # report-only (size never gates removal), so the effect is just a more
+        # honest reclaim-size summary when a worktree has an unreadable subdir.
+        if res.stdout.strip():
             return int(res.stdout.split()[0]) / (1024 ** 3)
     except (OSError, subprocess.SubprocessError, ValueError):
         pass

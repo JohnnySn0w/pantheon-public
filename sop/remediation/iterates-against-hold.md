@@ -68,7 +68,7 @@ Until structural enforcement lands, this SOP fires every time a worker iterates 
 
 - **Principles + directives:** P5 (roles don't hop — implementer doesn't override orchestrator's pause); D6 (plan-first protocol — hold-handling is part of the plan-tier-gate discipline); D8 (HO self-discipline — sticky-belief N=2 trigger informs Path B); D3 (autonomy bar — Path C placement); D10 (context-frugality — literal-ack protocol is minimum-traversal-to-precise-info compared to elaborate hold acknowledgments).
 - **Policies:** `rulebook/policies/trust-posture.md` (auto-approve scope); `rulebook/policies/autonomy.md`.
-- **ADRs:** `adr/ORG-002` (principles/directives split — this SOP slots at the policy-tier).
+- **ADRs:** `architecture/adr/ORG-002` (principles/directives split — this SOP slots at the policy-tier).
 - **Incidents:** `incidents/2026-05-09-b33-ticket-state-sweep-multi-violation/` (founding case; 5th violation explicitly named as iterates-against-hold).
 - **Lessons:** [`lessons/instruction-fidelity-collapse-discipline-vs-architecture.md`](../../lessons/instruction-fidelity-collapse-discipline-vs-architecture.md) (broader corpus framing); [`lessons/structural-enforcement-retires-the-prose-rule.md`](../../lessons/structural-enforcement-retires-the-prose-rule.md) (the framework for retiring this SOP's brief-language requirements once a harness primitive lands).
 - **Sibling SOPs:** [`implementer-self-merge-to-main.md`](implementer-self-merge-to-main.md), [`claimed-prior-approval.md`](claimed-prior-approval.md), [`plan-first-violation.md`](plan-first-violation.md) (corpus siblings; b33 had all 4+ co-occurring).

@@ -12,6 +12,9 @@ Subcommands:
     ticket.py claim <T-NNNN>
     ticket.py block <T-NNNN> (--not-before YYYY-MM-DD | --depends-on T-NNNN) [repeatable --depends-on]
     ticket.py resolve <T-NNNN> [--with "summary"]
+    ticket.py cascade --tid <T-NNNN> [--no-push]  (ORG-013 cascade-unblock pass
+        for an already-resolved tid; T-3289 PR-merge trigger — the tid never
+        moves, only its dependants' depends_on frontmatter changes)
     ticket.py list [--state inbox|active|done] [--target X] [--label X]
 
 `list` is read-only. Every other subcommand performs exactly one
@@ -34,6 +37,7 @@ import contextlib
 import fcntl
 import getpass
 import json
+import math
 import os
 import re
 import sys
@@ -65,6 +69,10 @@ from tools._md_table import _md_row  # noqa: E402  — leaf module, re-only (T-1
 from tools.agent_role_map import (  # noqa: E402  — after sys.path bootstrap.
     account_persona_map as _account_persona_map,
 )
+# T-3020 BT3 / ORG-078 §2-3: priority-list parse — leaf module (only stdlib +
+# yaml), no cycle risk importing it at module scope (unlike ticket_lint,
+# which imports FROM this module).
+from tools import priority_list_parse  # noqa: E402
 
 # T-0761 c4: clone-on-demand repo provisioning (called after a successful claim).
 # Guarded top-level import: module may be absent in isolated worktrees used by
@@ -81,6 +89,33 @@ TICKETS_ROOT = REPO_ROOT / "tickets"
 
 STATES = ("inbox", "active", "done")  # ORG-019: blocked/ retired
 
+# T-3168 migration leg: malformed ref syntax is always refused, while missing
+# or dangling graph state is warning-only.  The literal is intentionally
+# auditable; flipping it to ``enforce`` is a separately approved activation.
+TICKET_PURPOSE_ENFORCEMENT = "warn"
+
+# T-3020 BT3 / ORG-078 §4: failure-mode + cadence-observation telemetry sink
+# for `cmd_list`'s priority-sort path. ADR-literal path (matches BT1's
+# priority_list_parse.py docstring) — `.local/log/` is this tree's existing
+# home for append-only diagnostic logs (inbox_consumer.log,
+# activity_digest.log); `.jsonl` here is a deliberate ADR-directed exception
+# to the `.local/state/` convention most OTHER `.jsonl` trend files use.
+PRIORITY_LIST_HEALTH_PATH = Path.home() / ".local" / "log" / "pantheon" / "priority_list_health.jsonl"
+
+# T-3080 / ORG-078 §Priority-list-drift-hygiene: `ticket.py priority-list
+# validate` heuristic thresholds. Named module constants keep them readable
+# + change-in-one-place; two knobs don't justify a config file.
+#
+# NOTE: semantic-drift heuristic DEFERRED (T-3424 follow-up). ORG-078's
+# "label suddenly appearing on many tickets outside its original arc"
+# wording implies a temporal / rate-of-change signal; the first-cut
+# static parent_ticket-root-fanout implementation false-fired on 6 of 8
+# real priority-list labels (legitimate cross-cutting design-layer labels
+# like org-065 / ticket-flow / harness-controller trip a static count).
+# Deferred pending a proper design pass on the drift signal shape.
+PRIORITY_LIST_HIGH_VOLUME_THRESHOLD = 30  # label carried by > N tickets -> "may be over-broad"
+PRIORITY_LIST_SAMPLE_SIZE = 5  # sample matching (ticket_id, title) pairs shown per label
+
 # MUST stay in sync with sibling at pantheon-pwa/src/server/ticketRoutes.ts
 RATIFIABLE_REPO_ALLOWLIST = ("pantheon-config", "revenue-project", "echo-prismatic", "pantheon-pwa",
                              "pantheon-public")  # T-1964: seed ratify surfaces live here (T-1933 arc)
@@ -90,9 +125,54 @@ FRONT_MATTER_FIELD_ORDER = (
     "created",
     "requester",
     "target",
+    # ORG-078 / T-3020 BT2: when `target` last changed via `ticket.py retarget`.
+    # Written transactionally by cmd_retarget alongside the target field itself
+    # (same file write, same commit) — feeds ORG-078 §3's effective_queue_ts
+    # sort key. Absent on tickets never retargeted; readers fall back to
+    # `created` for those (see ORG-078 §3).
+    "retargeted_at",
     "state",
+    # T-3168 / ORG-054: stable project membership and nearest typed purpose.
+    # Explicit null is meaningful for project/goal roots and maintenance work.
+    "project_id",
+    "nearest_intent_ref",
     "parent_ticket",
     "depends_on",
+    # T-2841 / ORG-065 BT1: typed-edge fields (warn-only model layer). Absorb
+    # depends_on/parent_ticket/ratifiable_files as-is (no parallel fields) —
+    # these four are the NEW edges: implements/verifies -> a ticket or an ADR
+    # obligation (`ORG-NNN#E1[.C1]`); supersedes -> the node this replaces;
+    # informs -> advisory notify only, NEVER gates, acyclicity-EXEMPT (see
+    # _GATING_EDGE_FIELDS in ticket_lint.py). All optional; unknown target is
+    # a corpus-wide lint WARN, never a refusal here (resolved-decision 1).
+    "implements",
+    "verifies",
+    "supersedes",
+    "informs",
+    # T-3476 / ORG-065 Call 1: a distinct edge type from `implements` — a
+    # ticket that RATIFIES an ADR obligation (the operator's TG 6734 ruling) is
+    # graph-distinguishable from one that IMPLEMENTS it. The load-bearing
+    # invariant: a `ratifies` edge alone must never satisfy an implements-
+    # obligation (see ticket_lint.detect_unverified_elements). Same target
+    # shape as the four fields above (ticket id or ADR-NNN#E<k>[.C<m>]),
+    # including the reserved whole-ADR sentinel `#E0` (T-3205 policy).
+    "ratifies",
+    # T-3328: the file-time lineage-guard escape-hatch justification. Written
+    # only when `--orphan "<justification>"` was used to file a ticket with NO
+    # lineage edge (parent_ticket/depends_on/serves/implements/verifies/
+    # supersedes/informs) — a genuine root-tier ticket. Registered adjacent to
+    # the edge fields it explains the absence of. NOT the same concept as
+    # ticket_lint.py's `orphan_ratifications` (a ratifiable ticket with no open
+    # ratify ticket) — that's a report-only detector, unrelated frontmatter.
+    "orphan_reason",
+    # T-2842 / ORG-065 BT2: the closure-gate evidence field. Deliberately
+    # separate from `verifies` (which stays exactly as BT1 built it — a
+    # coarse declarative edge) — `receipts` carries the actual evidence a
+    # `verifies`/`implements` obligation edge needs to CLOSE (§3.3/§3.5).
+    # Entries are encoded `<clause>=<receipt-id>=<provenance>` strings (see
+    # _parse_receipt_entries / ticket_lint.decode_receipt) so this reuses the
+    # existing flow-list serializer unchanged — no new frontmatter shape.
+    "receipts",
     "labels",
     "stale_after",
     "not_before",
@@ -110,6 +190,18 @@ FRONT_MATTER_FIELD_ORDER = (
     "intent",
     "serves",
     "retest_status",
+    # T-3440 / ORG-089: appetite circuit-breaker + DROPPED substate schema.
+    # `appetite` is the machine-readable bet-sizing field (int 1-10, ORG-089
+    # §Decision.4 / D-E); `bet_ref` optionally names the bet this ticket serves;
+    # `substate` carries the two ORG-021-frontmatter substates this ADR adds
+    # (`appetite-overrun` enforcing gate, `dropped` terminal disposition);
+    # `dropped_reason` is REQUIRED when substate==dropped (ORG-021 §substates);
+    # `dropped_from_state` records the open dir the drop came from (inbox|active).
+    "appetite",
+    "bet_ref",
+    "substate",
+    "dropped_reason",
+    "dropped_from_state",
 )
 # ORG-019: blocked_by / unblock_when / unblock_check removed from schema.
 # Legacy tickets may still carry these fields; serialize_front_matter emits
@@ -117,8 +209,18 @@ FRONT_MATTER_FIELD_ORDER = (
 # without data loss until Phase 3 migration strips them.
 REQUIRED_FRONT_MATTER = ("id", "created", "requester", "target", "state")
 OPTIONAL_FRONT_MATTER = (
+    "project_id",  # T-3168 / ORG-054; explicit null differs from absence
+    "nearest_intent_ref",
     "parent_ticket",
+    "retargeted_at",  # T-3020 BT2 / ORG-078
     "depends_on",
+    "implements",  # T-2841 / ORG-065 BT1
+    "verifies",
+    "supersedes",
+    "informs",
+    "ratifies",  # T-3476 / ORG-065 Call 1
+    "orphan_reason",  # T-3328
+    "receipts",  # T-2842 / ORG-065 BT2
     "labels",
     "stale_after",
     "not_before",
@@ -128,8 +230,16 @@ OPTIONAL_FRONT_MATTER = (
     "intent",
     "serves",
     "retest_status",
+    "appetite",  # T-3440 / ORG-089
+    "bet_ref",
+    "substate",
+    "dropped_reason",
+    "dropped_from_state",
 )
-LIST_FIELDS = ("depends_on", "labels", "ratifiable_files")
+LIST_FIELDS = (
+    "depends_on", "implements", "verifies", "supersedes", "informs",
+    "ratifies", "receipts", "labels", "ratifiable_files",
+)
 
 # T-0465: `intent` frontmatter disambiguates target=operator tickets.
 # action  — "the operator, do X" (operator action request; default for target=operator)
@@ -150,7 +260,12 @@ INTENT_VOCAB = ("action", "ratify", "noodle")
 # see tools/s3star_audit_runner.py find_open_retest_tickets for the read side.
 RETEST_STATUS_VOCAB = ("pending", "verified", "overridden")
 
-TICKET_FILENAME_RE = re.compile(r"T-(\d{4})\.md$")
+# T-3215: id space is allocated sequentially and crosses into five digits in
+# roughly a year at the current rate — 4 was never a promise, so this widens
+# to "4 or more". Filename-shaped (adds `.md$` + a capture group); the bare
+# id-shape sibling is _TICKET_ID_SHAPE below, kept separate on purpose since
+# a filename check and a bare-id check are not the same regex.
+TICKET_FILENAME_RE = re.compile(r"T-(\d{4,})\.md$")
 
 # ---------------------------------------------------------------------------
 # Allocation lock (T-0786, amended T-0823)
@@ -262,6 +377,20 @@ def _allocation_lock():
 
 class TicketError(Exception):
     """Raised for any user-surfaced lifecycle / parse failure."""
+
+
+class AppetiteRequired(TicketError):
+    """T-3440 / ORG-089 §Decision.4e: `file` refused because an applicable bet
+    (bet_ref present OR non-vault-ADR parent OR non-hygiene serves) was filed
+    without an `appetite:` score. Subclasses TicketError so main()'s existing
+    catch surfaces it as a non-zero exit."""
+
+
+class AppetiteOverrunNotResolvable(TicketError):
+    """T-3440 / ORG-089 §Decision.4: `resolve` refused because the ticket is in
+    `substate: appetite-overrun`. A re-decision verb (re-earn / drop /
+    adjust-appetite) must run first — resolve stays terminal, never overloaded
+    (D-P)."""
 
 
 # ---------------------------------------------------------------------------
@@ -406,6 +535,439 @@ def _parse_ratifiable_files(entries: list[str]) -> list[str]:
         _validate_ratifiable_path_part(path)
         validated.append(entry)
     return validated
+
+
+# T-2841 / ORG-065 BT1: typed-edge target shape — a ticket id (T-NNNN) or an
+# ADR obligation/clause id (ADR-NNN#E<k> / ORG-NNN#E<k>.C<m>, matching the
+# `_ADR_ID_RE`-style prefix already used elsewhere in the repo, e.g.
+# ticket_grooming.py's `_ADR_ID_RE = r"^(ADR|ORG)-(\d+)"`). SHAPE only — this
+# is enforced at every insertion point (cmd_file); whether the target actually
+# RESOLVES in the corpus is a separate, WARN-tier, lint-only check
+# (ticket_lint.detect_typed_graph_issues) per resolved-decision 1: an unknown
+# target is a corpus-wide WARN, never a refusal here.
+#
+# KNOWN BT1 SIMPLIFICATION for `verifies`: the ADR's strict model (§3.2,
+# §3.5.2) has `verifies` point commit/test/evidence -> obligation, and §3.5.2
+# is explicit that "a verifies edge must point at an actual test/run
+# RECEIPT... NOT merely a commit link". This shape accepts a plain ticket id
+# (T-NNNN) as a `verifies` target too — same as `implements` — because BT1
+# has no commit/test/evidence NODE IDENTITY yet (NODE_KINDS in ticket_lint.py
+# registers those kinds but nothing constructs them; that's downstream work).
+# A ticket-id `verifies` target today means "this ticket [stands in for /
+# tracks] the evidence", not a real receipt — BT2's closure validation (§3.3)
+# MUST NOT treat a bare ticket-id `verifies` edge as satisfying the
+# receipt/evidence-authority requirements (§3.5.2/§3.5.4) without a real
+# commit/test/evidence node behind it. Do not inherit this as settled
+# semantics.
+_EDGE_TARGET_RE = re.compile(r"^(?:T-\d{4,}|(?:ADR|ORG)-\d+#E\d+(?:\.C\d+)?)$")  # T-3215
+
+
+def _parse_edge_targets(field_name: str, entries: list[str]) -> list[str]:
+    """Validate a typed-edge field's (implements/verifies/supersedes/informs)
+    list of target strings. Each entry must match _EDGE_TARGET_RE. Raises
+    TicketError on a malformed entry; never checks existence (see above)."""
+    validated: list[str] = []
+    for entry in entries:
+        e = entry.strip()
+        if not e:
+            raise TicketError(f"{field_name}: empty target entry")
+        if not _EDGE_TARGET_RE.fullmatch(e):
+            raise TicketError(
+                f"{field_name}: {e!r} is not a valid edge target — expected a "
+                f"ticket id (T-NNNN) or an ADR obligation/clause id "
+                f"(ADR-NNN#E<k> / ORG-NNN#E<k>.C<m>)"
+            )
+        validated.append(e)
+    return validated
+
+
+# T-2842 / ORG-065 BT2: shape validation for the `receipts:` field's
+# `<clause>=<receipt-id>=<provenance>` entries. Delegates the actual shape
+# check to tools.ticket_lint.decode_receipt (lazy-imported, same
+# ticket<->ticket_lint cycle-avoidance pattern as _reject_if_cycle below) so
+# the clause-id / receipt-id / provenance shapes have exactly one definition
+# each, not two independently-maintained regexes for the WHOLE entry (the
+# _CLAUSE_ID_RE half is still independently duplicated in ticket_lint.py —
+# see that module's note — but the receipt-id/provenance shapes are NOT
+# duplicated here; this function reuses decode_receipt wholesale instead of
+# re-deriving those two).
+def _parse_receipt_entries(field_name: str, entries: list[str]) -> list[str]:
+    """Validate a `receipts:`-shaped field's list of
+    `<clause>=<receipt-id>=<provenance>` strings (T-2842 / ORG-065 BT2).
+    Raises TicketError on a malformed entry; returns entries unchanged
+    (encoded strings — same round-trip-as-is shape as _parse_edge_targets)."""
+    from tools.ticket_lint import decode_receipt
+
+    validated: list[str] = []
+    for entry in entries:
+        e = entry.strip()
+        if not e:
+            raise TicketError(f"{field_name}: empty receipt entry")
+        if decode_receipt(e) is None:
+            raise TicketError(
+                f"{field_name}: {e!r} is not a valid receipt — expected "
+                f"<clause>=<receipt-id>=<provenance>, e.g. "
+                f"ADR-2842#E1.C1=ci-run:12345=ci (provenance one of "
+                f"ci/reviewer/self; receipt-id namespaced "
+                f"ci-run:/test-result:/observable:)"
+            )
+        validated.append(e)
+    return validated
+
+
+# ---------------------------------------------------------------------------
+# T-3440 / ORG-089 §Decision.4e: file-time appetite applicability.
+# ---------------------------------------------------------------------------
+
+# ORG-089 landing date — the legacy grandfather boundary (D-H / DECISION-10).
+# Tickets `created` before this are legacy (medium-default, never refused). At
+# file-time `created` is always "now", so this branch effectively fires only
+# for pre-landing corpus reads, not genuinely new files (noted, DECISION-4/Q2).
+_ORG089_LANDING = datetime(2026, 9, 6, tzinfo=timezone.utc)
+
+
+def _created_is_legacy(created_iso: str | None) -> bool:
+    if not created_iso:
+        return False
+    try:
+        dt = datetime.fromisoformat(str(created_iso).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False  # unparseable → not legacy (fail toward applicability)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt < _ORG089_LANDING
+
+
+def _is_hygiene(fields: dict) -> bool:
+    """Hygiene / goal-neutral-maintenance class — routed to the medium-default,
+    never refused (D-H). Three equivalent fleet signals of goal-neutral work:
+      - a hygiene label (hygiene/chore/cleanup/noodle/noop),
+      - the `goal-neutral-maintenance` serves marker, OR
+      - a `maintenance:` nearest_intent_ref kind (ORG-054 typed purpose).
+
+    The maintenance-kind intent ref is the machine-readable form of the same
+    goal-neutral category (a maintenance ref points at a logical/path asset, not
+    a goal/bet). Every AUTOMATED_FILER_EXPECTATIONS filer files with a
+    `maintenance:<...>` ref (knowledge_sweep, watch_runner, adr_reeval_walk,
+    mirror_drift_sweep, s3star_audit_runner, soak_filer, weekly_ticket_summary,
+    grand_project_program) and a descriptive (non-`goal-neutral-maintenance`)
+    serves string, so this arm is what keeps automated filing in the
+    medium-default branch without threading appetite into the filers
+    (T-3440 Q3-guard; DECISION-12)."""
+    from tools.ticket_purpose import (
+        HYGIENE_LABELS, GOAL_NEUTRAL_SERVES,
+        parse_intent_ref, PurposeError, PurposeRefKind,
+    )
+
+    labels = set(fields.get("labels") or [])
+    serves = (fields.get("serves") or "").strip()
+    if bool(labels & HYGIENE_LABELS) or serves == GOAL_NEUTRAL_SERVES:
+        return True
+    nir = fields.get("nearest_intent_ref")
+    if isinstance(nir, str) and nir.strip():
+        try:
+            if parse_intent_ref(nir).kind is PurposeRefKind.MAINTENANCE:
+                return True
+        except PurposeError:
+            pass  # unparseable ref → not a hygiene signal (fail toward applicability)
+    return False
+
+
+def _references_non_vault_adr(fields: dict) -> bool:
+    """True iff any lineage edge names a NON-VAULT (agent-authored) ADR — the
+    '§4e non-vault-ADR parent' trigger. Scans nearest_intent_ref + the typed
+    obligation edges for an ORG-NNN / ADR-NNN token."""
+    from tools.ticket_purpose import ADR_ID_RE, is_vault_adr
+
+    candidates: list[str] = []
+    nir = fields.get("nearest_intent_ref")
+    if isinstance(nir, str):
+        candidates.append(nir)
+    # T-3476: `ratifies` is a real ORG-089 §Decision.4e "bet" trigger too — a
+    # ratify-class ticket citing a non-vault ADR is exactly as consequential
+    # as one citing implements/verifies/supersedes.
+    for key in ("implements", "verifies", "supersedes", "ratifies"):
+        val = fields.get(key)
+        if isinstance(val, list):
+            candidates.extend(str(v) for v in val)
+        elif isinstance(val, str):
+            candidates.append(val)
+    for cand in candidates:
+        for adr_id in ADR_ID_RE.findall(cand):
+            if not is_vault_adr(adr_id):
+                return True
+    return False
+
+
+def _appetite_applicable(fields: dict, created_iso: str | None) -> bool:
+    """§Decision.4e applicability: True (appetite REQUIRED) iff this is a 'bet'
+    ticket AND it is neither hygiene nor legacy.
+
+    bet := bet_ref present OR non-vault-ADR parent OR non-hygiene serves.
+    (Hygiene + legacy are excluded first, so 'non-hygiene serves' reduces to
+    'serves is set' here.)"""
+    if _is_hygiene(fields) or _created_is_legacy(created_iso):
+        return False
+    serves = (fields.get("serves") or "").strip()
+    return (
+        bool((fields.get("bet_ref") or "").strip())
+        or _references_non_vault_adr(fields)
+        or bool(serves)
+    )
+
+
+def _apply_appetite_at_file_time(fields: dict, raw_appetite, created_iso: str | None) -> None:
+    """Resolve the appetite field at file-time (T-3440 Scope A).
+
+    - appetite supplied → normalize to int and set.
+    - absent + hygiene/legacy → stamp the medium default (5) so the field is
+      present going forward (D-H / D-O / DECISION-4).
+    - absent + applicable bet → raise AppetiteRequired.
+    - absent + below-the-line non-bet → leave absent.
+    Fail-fast (raises before any mutation)."""
+    from tools.ticket_purpose import (
+        normalize_appetite,
+        AppetiteError,
+        APPETITE_MEDIUM_DEFAULT,
+    )
+
+    try:
+        normalized = normalize_appetite(raw_appetite)
+    except AppetiteError as exc:
+        raise TicketError(str(exc)) from exc
+    if normalized is not None:
+        fields["appetite"] = normalized
+        return
+    if _is_hygiene(fields) or _created_is_legacy(created_iso):
+        fields["appetite"] = APPETITE_MEDIUM_DEFAULT
+        return
+    if _appetite_applicable(fields, created_iso):
+        raise AppetiteRequired(
+            "appetite required: this bet (bet_ref / non-vault-ADR parent / "
+            "non-hygiene serves) must carry an appetite score. Pass "
+            "--appetite <1-10> (per ORG-089 §Decision.4 / RECORD-mode). Hygiene "
+            "or goal-neutral-maintenance work is exempt (medium-default 5)."
+        )
+
+
+# T-2842 / ORG-065 BT2 (§3.3): closure-validation gate mode. warn (default)
+# NAMES violations without refusing the transition; gate REFUSES. Mirrors the
+# existing PANTHEON_MAX_ACTIVE_TICKETS env-override precedent (test
+# isolation without a permanent production behavior flip). An unset or
+# unrecognized value fails SAFE to "warn" — a typo must never silently start
+# gating production closures.
+_CLOSURE_GATE_MODE_ENV = "PANTHEON_CLOSURE_GATE_MODE"
+_CLOSURE_GATE_MODES = ("warn", "gate")
+
+
+def _closure_gate_mode() -> str:
+    raw = (os.environ.get(_CLOSURE_GATE_MODE_ENV) or "gate").strip().lower()
+    return raw if raw in _CLOSURE_GATE_MODES else "warn"
+
+
+def _gate_echo_adr_dir() -> Path:
+    """The echo-prismatic ADR directory this actor's own clone resolves to
+    (T-3578 / ORG-065 closure-gate cross-repo fix). ACTOR-RELATIVE by design:
+    the closure-gate runs inside the resolving process, so it must read that
+    process's OWN echo clone —
+      - atlas/suborch2 -> /home/suborch2/echo-prismatic/adr (readable, carries
+        the merged echo ADRs incl. ADR-216#E4);
+      - orchestrator/claude   -> /home/claude/echo-prismatic/adr (same path the old
+        hardcode `_ECHO_PRISMATIC_ADR_DIR` named).
+    The `ECHO_PRISMATIC_ADR_DIR` env var overrides (used by the T-3578 tests to
+    point at a fixture echo-ADR dir); otherwise defaults to
+    `$HOME/echo-prismatic/adr`.
+
+    Distinct from `ticket_lint._ECHO_PRISMATIC_ADR_DIR` (which stays hardcoded
+    under /home/claude for the recovery-side echo_corpus_lint.py, run as recovery with
+    native /home/claude read access) — do NOT collapse the two (T-3578).
+    """
+    override = os.environ.get("ECHO_PRISMATIC_ADR_DIR")
+    if override:
+        return Path(override)
+    return Path.home() / "echo-prismatic" / "adr"
+
+
+def _check_closure_gate(tid: str, fields: dict) -> None:
+    """Run the ORG-065 §3.3 closure-validation gate against `fields` (the
+    ticket's frontmatter as it will be at the moment of closure — see
+    _do_transition's call site for the pre-mv timing). No-op when there are
+    no findings (the overwhelming majority of tickets, which never declared
+    an ADR obligation via `implements`).
+
+    gate mode: raises TicketError naming every finding (refuses the
+    transition; caller must invoke this BEFORE any mutation so the refusal
+    leaves no trace, mirroring _reject_if_cycle's fail-fast shape).
+
+    warn mode (default): prints one stderr line per finding in a stable,
+    greppable format — `[closure-gate] <tid> <kind>: <clause-id> ... —
+    '<element text>'` (each ClosureFinding.detail already embeds the clause/
+    obligation id and its element/clause TEXT — see evaluate_closure_fields
+    — so coverage is checkable against the obligation body, not a label,
+    per §3.3's own framing). The corpus migration walk and the flip-leg
+    live-fire smoke both parse the `[closure-gate] <tid> <kind>:` prefix;
+    do not change it without updating both.
+    """
+    from tools.ticket_lint import (
+        _CLAUSE_ID_RE,
+        _adr_dir_scannable,
+        evaluate_closure_fields,
+    )
+
+    # T-3578 / ORG-065: resolve obligations against BOTH the pantheon ORG-*
+    # corpus AND this actor's echo-prismatic clone (actor-relative, so a
+    # cross-repo echo obligation like ADR-216#E4 resolves — see
+    # _gate_echo_adr_dir). The echo dir is unioned only when it is scannable by
+    # this actor; a clone-less actor degrades to a warn-fallback below rather
+    # than spuriously blocking on an echo obligation it structurally cannot
+    # validate.
+    adr_dirs = [REPO_ROOT / "architecture" / "adr"]
+    echo_dir = _gate_echo_adr_dir()
+    echo_scannable = _adr_dir_scannable(echo_dir)
+    if echo_scannable:
+        adr_dirs.append(echo_dir)
+
+    findings = evaluate_closure_fields(fields, adr_dirs)
+    if not findings:
+        return
+
+    # WARN-FALLBACK (T-3578): when this actor has no readable echo clone AND the
+    # ticket carries an echo-namespace obligation (ADR-*), the echo obligation(s)
+    # are UNVALIDATED this resolve — we cannot distinguish a genuinely-dangling
+    # echo id from one that lives in the unreadable clone. Degrade to a LOUD warn
+    # (do not raise) so a clone-less actor is not permanently blocked, while
+    # PANTHEON (ORG-*) obligations continue to gate fully: if the findings
+    # include ANY non-echo (ORG-*) obligation defect, we still fall through to
+    # the gate-mode raise below. Only when EVERY finding is echo-namespace do we
+    # warn-and-return. For atlas/orchestrator (readable clones) echo_scannable is True,
+    # so this branch never triggers — echo obligations validate normally.
+    if not echo_scannable:
+        implements = fields.get("implements") or []
+        echo_obligations = [
+            str(t) for t in implements
+            if _CLAUSE_ID_RE.fullmatch(str(t)) and str(t).startswith("ADR-")
+        ]
+        if echo_obligations:
+            def _finding_is_echo(f) -> bool:
+                # An unreadable echo clone can only SPURIOUSLY produce a
+                # `dangling_obligation` (the id resolves in NO scannable corpus).
+                # A resolved-but-unsatisfied finding (`unsatisfied_clause` /
+                # `evidence_authority_denied`) means the obligation DID resolve —
+                # necessarily in the scannable pantheon corpus, since the echo
+                # dir is unreadable here — so it is a REAL pantheon finding that
+                # MUST keep gating, even for an ADR-NNN id. (pantheon-config's
+                # own corpus uses ADR-NNN ids too, e.g. ADR-2842 — the id prefix
+                # alone does NOT mean echo-resident; only a dangle on such an id,
+                # with echo unreadable, is plausibly an echo obligation we could
+                # not see.) `malformed_receipt` has no id prefix and keeps
+                # gating. This is the T-3578 rebound fix: keying on the prefix
+                # ALONE wrongly demoted resolved pantheon ADR-NNN obligations to
+                # warn on a clone-less actor (CI runner).
+                return (
+                    f.kind == "dangling_obligation"
+                    and f.detail.startswith("ADR-")
+                )
+
+            non_echo_findings = [f for f in findings if not _finding_is_echo(f)]
+            if not non_echo_findings:
+                print(
+                    f"[closure-gate] {tid} echo_adr_unreadable: echo ADR dir "
+                    f"{echo_dir} is UNREADABLE by this actor "
+                    f"({getpass.getuser()}); cross-repo echo obligation(s) "
+                    f"{', '.join(echo_obligations)} are UNVALIDATED this resolve "
+                    f"— resolve from an account/clone that can read "
+                    f"echo-prismatic (ref T-3578).",
+                    file=sys.stderr,
+                )
+                return
+            # Mixed ORG-* + echo obligations: keep only the non-echo findings so
+            # the gate blocks on the pantheon defect (integrity preserved) while
+            # not spuriously blocking on the unvalidatable echo obligation.
+            findings = non_echo_findings
+
+    if _closure_gate_mode() == "gate":
+        lines = [f"  - {f.kind}: {f.detail}" for f in findings]
+        raise TicketError(
+            f"closure-gate (ORG-065 §3.3): {tid} has unsatisfied obligation(s):\n"
+            + "\n".join(lines)
+        )
+
+    for f in findings:
+        print(f"[closure-gate] {tid} {f.kind}: {f.detail}", file=sys.stderr)
+
+
+# T-2841 / ORG-065 BT1 (§3.6): the gating/structural edge set whose acyclicity
+# is a BINDING invariant, even in this warn-only phase. `informs` is
+# deliberately excluded here — advisory-only, exempt from the DAG check.
+# `parent_ticket` is scalar (not a list) so callers handle it separately from
+# the list-typed fields in this tuple. T-3476: `ratifies` joins this list —
+# same unioned acyclicity domain as implements/verifies/supersedes (see
+# ticket_lint.ACYCLICITY_DOMAINS; no falsifying wet-run evidence exists for
+# giving it its own exempt domain the way parent_of has).
+_GATING_LIST_FIELDS = ("depends_on", "implements", "verifies", "supersedes", "ratifies")
+
+
+def _reject_if_cycle(tid: str, candidate_edges: dict[str, list[str]]) -> None:
+    """Raise TicketError, naming the offending path, if any of
+    `candidate_edges` (field_name -> raw target strings this ticket would
+    newly point at) would close a cycle against the EXISTING on-disk corpus
+    graph — checked BEFORE the edit lands, so the graph never accrues a bad
+    edge (ORG-065 §3.6: "reject a cycle-creating edge at insertion and name
+    the offending path"). Callers must only pass gating/structural fields
+    (depends_on, parent_ticket, implements, verifies, supersedes, ratifies) —
+    `informs` is acyclicity-exempt and must never be checked here.
+
+    Checked PER ACYCLICITY DOMAIN (ticket_lint.ACYCLICITY_DOMAINS), never on
+    one graph unioning every edge type — a live corpus wet-run found that
+    union false-positives on a widespread, legitimate idiom (a parent ticket
+    depends_on its own child). See the module note atop ticket_lint.py's
+    typed-edge-graph section for the full rationale.
+
+    Lazy-imports tools.ticket_lint (the generalized graph-builder) to avoid
+    the ticket<->ticket_lint import cycle — same pattern cmd_ready already
+    uses for its dep-graph deadlock lookup.
+    """
+    from tools.ticket_lint import ACYCLICITY_DOMAINS, build_typed_edge_graph, edge_node_id, find_path
+
+    outbound: list[tuple[str, str]] = [
+        (field_name, raw)
+        for field_name, targets in candidate_edges.items()
+        for raw in targets
+    ]
+    if not outbound:
+        return
+
+    def _domain_for(field_name: str) -> tuple[str, ...]:
+        key = "parent_of" if field_name == "parent_ticket" else field_name
+        for domain in ACYCLICITY_DOMAINS:
+            if key in domain:
+                return domain
+        # Unreachable for the fields this function's callers pass, but a
+        # safe fallback (a self-contained singleton domain) rather than a
+        # KeyError if a future caller adds a field this dict doesn't know.
+        return (key,)
+
+    src = ("ticket", tid)
+    graph_cache: dict[tuple[str, ...], dict] = {}
+    for field_name, raw in outbound:
+        domain = _domain_for(field_name)
+        if domain not in graph_cache:
+            graph_cache[domain] = build_typed_edge_graph(TICKETS_ROOT, domain)
+        graph = graph_cache[domain]
+        tgt = edge_node_id(raw)
+        if tgt == src:
+            raise TicketError(
+                f"{field_name}: {raw!r} would create a self-referential edge on "
+                f"{tid} — the graph must stay acyclic (ORG-065 §3.6)"
+            )
+        path = find_path(graph, tgt, src)
+        if path is not None:
+            chain = " -> ".join(f"{kind}:{ident}" for kind, ident in path)
+            raise TicketError(
+                f"{field_name}: {tid} -> {raw} would close a cycle in domain "
+                f"{domain} — the graph must stay acyclic (ORG-065 §3.6): "
+                f"ticket:{tid} -> {chain} -> ticket:{tid}"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -688,8 +1250,21 @@ def _next_ticket_id() -> str:
     return f"T-{max(local_max, origin_max) + 1:04d}"
 
 
+# T-3215: canonical bare-ticket-id SHAPE — the single source for every place
+# in this module that validates "is this string a well-formed ticket id"
+# (existence is a separate question — see _ticket_exists). Four digits was
+# never a promise; ids allocate sequentially and the id space crosses into
+# five digits in roughly a year at the current rate, so every site sharing
+# this shape widens together instead of drifting independently. Sibling of
+# TICKET_FILENAME_RE (above), which is FILENAME-shaped (adds `.md$` + a
+# capture group) and stays separate on purpose — not the same regex despite
+# sharing this digit shape.
+_TICKET_ID_SHAPE = r"T-\d{4,}"
+_TICKET_ID_FULL_RE = re.compile(_TICKET_ID_SHAPE)
+
+
 def _find_ticket(tid: str) -> Path:
-    if not re.fullmatch(r"T-\d{4}", tid):
+    if not _TICKET_ID_FULL_RE.fullmatch(tid):
         raise TicketError(f"invalid ticket id: {tid!r} (expected T-NNNN)")
     fname = f"{tid}.md"
     for state in STATES:
@@ -702,7 +1277,7 @@ def _find_ticket(tid: str) -> Path:
 def _ticket_exists(tid: str) -> bool:
     """Non-raising existence check across all states (inbox/active/done).
     The boolean sibling of _find_ticket, for anchor resolution (T-2833)."""
-    if not re.fullmatch(r"T-\d{4}", tid):
+    if not _TICKET_ID_FULL_RE.fullmatch(tid):
         return False
     fname = f"{tid}.md"
     return any((TICKETS_ROOT / state / fname).exists() for state in STATES)
@@ -722,9 +1297,26 @@ def _ticket_exists(tid: str) -> bool:
 # form — it is a pickup note in the body, or the real blocker is a --depends-on
 # dependency. Enforced everywhere a not_before is SET; pre-existing unanchored
 # gates are grandfathered in the files and surfaced by ticket_lint.
-_OPERATOR_ANCHOR_RE = re.compile(r"^operator:(T-\d{4}|tg:\d+)$")
+# T-3215: composed from _TICKET_ID_SHAPE (above) so the ticket-id half of this
+# anchor widens in lockstep with the rest of the module instead of drifting.
+_OPERATOR_ANCHOR_RE = re.compile(rf"^operator:({_TICKET_ID_SHAPE}|tg:\d+)$")
 _EVENT_ANCHOR_KINDS = ("cert-expiry", "key-expiry", "cadence", "window")
 _EVENT_ANCHOR_RE = re.compile(r"^event:(?:" + "|".join(_EVENT_ANCHOR_KINDS) + r"):.+$")
+
+# T-3103: the event:<kind>:<param> form is anchor-VALID but the param is still
+# gameable — `window` especially takes an open-ended param, and past Recovery
+# sessions laundered arbitrary defers of ACTIONABLE work through pseudo-windows
+# like `event:window:passport-hardening-focused-session` (3rd recurrence:
+# 2026-08-11/20/23; 13 tickets cleared 08-23). A real anchor names a WHEN
+# (a date, a deadline, a cadence); these HOW-words name a way-of-working
+# ("do it in a focused session / a careful pass / when I'm unhurried") — a
+# pickup note, not a gate. Rejected at SET time in every event param. Genuine
+# params (dates, hostnames, weekly/quarterly, cert names) contain none of them.
+# See feedback_no_arbitrary_date_gates_on_actionable_work.
+_PSEUDO_WINDOW_TOKENS = (
+    "focused", "dedicated", "robustness", "careful-pass", "careful",
+    "session", "batch", "unhurried",
+)
 
 
 def _validate_not_before_anchor(anchor: str | None) -> str:
@@ -751,6 +1343,24 @@ def _validate_not_before_anchor(anchor: str | None) -> str:
             )
         return a
     if _EVENT_ANCHOR_RE.match(a):
+        # T-3103: close the pseudo-window bypass — the param must name a WHEN,
+        # not a HOW. `event:window:<self-invented>-focused-session` matched the
+        # regex above yet named a way-of-working, laundering an arbitrary defer
+        # of actionable work (3rd recurrence 2026-08-23). Reject any event param
+        # carrying a HOW-word; genuine date/deadline/cadence params carry none.
+        param = a.split(":", 2)[2].lower()
+        hit = next((w for w in _PSEUDO_WINDOW_TOKENS if w in param), None)
+        if hit:
+            raise TicketError(
+                f"invalid --not-before-anchor {a!r}: the event param names a HOW "
+                f"(matched {hit!r}), not a real-world WHEN. "
+                "'event:window:<self-invented>-focused-session' is the gameable "
+                "bypass this rule exists to close (3rd recurrence 2026-08-23). Use "
+                "a real deadline/cadence (event:cert-expiry:<host>, "
+                "event:cadence:weekly, a dated maintenance window), a "
+                "operator:<T-NNNN|tg:MSGID>, a --depends-on dependency, or put the "
+                "pickup guidance in the ticket body — not a date gate. [T-3103]"
+            )
         return a
     raise TicketError(
         f"invalid --not-before-anchor {a!r}: must be {_forms}. No free-text "
@@ -769,6 +1379,10 @@ _TRANSITION_HEADER = "## Transition log"
 # Map lifecycle verb (driving CLI subcommand + commit subject) to the
 # past-tense form recorded in the in-file transition log. Per ADR-003
 # §"Transition-log format": verbs are past-tense in the log.
+# T-3440 / ORG-089: sentinel for _do_transition field_updates that DELETES a
+# frontmatter key (distinct from setting it to None, which renders as `null`).
+_DELETE_FIELD = object()
+
 _LOG_VERB = {
     "claim": "claimed",
     "unclaim": "unclaimed",
@@ -972,13 +1586,32 @@ def _build_commit_message(verb: str, tid: str, title: str | None, detail: str | 
         if detail:
             short = detail if len(detail) <= 60 else detail[:57] + "..."
             subject = f"tickets: close-action {tid} — {short}"
+    elif verb == "label-add":
+        subject = f"tickets: label add {tid}"
+        if detail:
+            short = detail if len(detail) <= 60 else detail[:57] + "..."
+            subject = f"tickets: label add {tid} — {short}"
+    elif verb == "label-remove":
+        subject = f"tickets: label remove {tid}"
+        if detail:
+            short = detail if len(detail) <= 60 else detail[:57] + "..."
+            subject = f"tickets: label remove {tid} — {short}"
+    elif verb in ("re-earn", "drop", "adjust-appetite", "reopen"):
+        # T-3440 / ORG-089: the four re-decision verbs. Subject names the verb;
+        # full rationale/reason lands in the body when truncated (see below).
+        subject = f"tickets: {verb} {tid}"
+        if detail:
+            short = detail if len(detail) <= 60 else detail[:57] + "..."
+            subject = f"tickets: {verb} {tid} — {short}"
     else:
         raise TicketError(f"unknown verb for commit message: {verb!r}")
 
     body_parts: list[str] = []
     # Include the full detail in the body when it was truncated in the subject,
     # so the audit chain retains the unabbreviated reason / summary.
-    if verb in ("block", "resolve", "retarget", "close-noodle", "close-action") \
+    if verb in ("block", "resolve", "retarget", "close-noodle", "close-action",
+                "label-add", "label-remove",
+                "re-earn", "drop", "adjust-appetite", "reopen") \
             and detail and len(detail) > 60:
         body_parts.append(detail)
 
@@ -1554,6 +2187,27 @@ def _parse_csv_list(raw: str | None) -> list[str]:
     return [s.strip() for s in raw.split(",") if s.strip()]
 
 
+def _str_arg(args: argparse.Namespace, name: str) -> str | None:
+    """Return args.<name> if it is a str, else None.
+
+    Same isinstance-guard `getattr(args, "parent_ticket", None)` + `isinstance(
+    ..., str)` already uses just below — factored out for the T-2841 typed-edge
+    flags for the same reason that precedent guards `parent_ticket`: `_parse_
+    csv_list`'s own contract is `raw: str | None`, and this is the one place
+    that boundary is enforced before a non-str, non-None value can reach it.
+    (Empirically, a MagicMock happens to survive `_parse_csv_list` unguarded —
+    MagicMock auto-configures `__iter__` to `iter([])`, so `raw.split(",")` on
+    an unset MagicMock attribute silently yields `[]` rather than raising. That
+    is a MagicMock implementation detail, not a documented one, and it doesn't
+    generalize — a real caller passing an int or a list would still hit
+    `raw.strip()`/`raw.split(",")` and raise. The guard's job is enforcing the
+    real type contract, not working around a mock quirk that happens not to
+    bite today.)
+    """
+    raw = getattr(args, name, None)
+    return raw if isinstance(raw, str) else None
+
+
 _MAX_FILE_RETRIES = 3
 
 
@@ -1646,7 +2300,82 @@ def _warn_near_duplicates(labels: list[str], now_iso: str,
         print(f"  {tid}  [{','.join(shared)}]  {title}", file=sys.stderr)
 
 
+def _purpose_values_from_args(args: argparse.Namespace) -> tuple[bool, str | None, str | None]:
+    """Return (project field present, normalized project id, typed intent ref).
+
+    ``--project-id null`` is an explicit root declaration and is therefore
+    distinct from an omitted option.  Typed-ref syntax is always fail-closed,
+    even while corpus/existence migration remains warning-only.
+    """
+    raw_project = getattr(args, "project_id", None)
+    project_present = isinstance(raw_project, str)
+    project_id: str | None = None
+    if project_present:
+        normalized = raw_project.strip()
+        if normalized.lower() != "null":
+            from tools.project_catalogue import PROJECT_ID_RE
+
+            if not PROJECT_ID_RE.fullmatch(normalized):
+                raise TicketError(f"--project-id has invalid stable id: {raw_project!r}")
+            project_id = normalized
+    raw_ref = getattr(args, "nearest_intent_ref", None)
+    nearest = raw_ref.strip() if isinstance(raw_ref, str) and raw_ref.strip() else None
+    if nearest is not None:
+        from tools.ticket_purpose import PurposeError, parse_intent_ref
+
+        try:
+            parse_intent_ref(nearest)
+        except PurposeError as exc:
+            raise TicketError(f"--nearest-intent-ref: {exc}") from exc
+    return project_present, project_id, nearest
+
+
+def _purpose_issues_for_fields(fields: dict, *, mode) -> tuple:
+    """Validate candidate fields against the on-disk ticket/project graph."""
+    from tools.project_catalogue import load_project_records
+    from tools.ticket_purpose import (
+        TicketPurpose,
+        load_ticket_purpose_index,
+        validate_new_ticket_purpose,
+    )
+    tid = str(fields["id"])
+    purposes = load_ticket_purpose_index(TICKETS_ROOT)
+    candidate = TicketPurpose(
+        ticket_id=tid,
+        project_id=fields.get("project_id"),
+        project_id_present="project_id" in fields,
+        nearest_intent_ref=fields.get("nearest_intent_ref"),
+        serves=fields.get("serves"),
+        labels=frozenset(str(label) for label in (fields.get("labels") or [])),
+        state=str(fields.get("state") or "inbox"),
+    )
+    purposes[tid] = candidate
+    records = load_project_records(REPO_ROOT / "projects" / "records")
+    return validate_new_ticket_purpose(
+        candidate, purposes, records, frozenset(), mode
+    )
+
+
+def _report_purpose_warnings(issues: tuple) -> None:
+    for issue in issues:
+        print(
+            f"[ticket-purpose] WARN {issue.ticket_id} {issue.code}: {issue.detail}",
+            file=sys.stderr,
+        )
+
+
+def _apply_purpose_policy(issues: tuple, *, mode) -> None:
+    if not issues:
+        return
+    if mode.value == "enforce":
+        detail = "; ".join(f"{issue.code}: {issue.detail}" for issue in issues)
+        raise TicketError(f"structured ticket purpose refused: {detail}")
+    _report_purpose_warnings(issues)
+
+
 def cmd_file(args: argparse.Namespace) -> int:
+    from tools.ticket_purpose import PurposeEnforcement
+
     title = args.title.strip()
     if not title:
         raise TicketError("--title must not be empty")
@@ -1673,15 +2402,103 @@ def cmd_file(args: argparse.Namespace) -> int:
     created = _now_iso()
     labels = _parse_csv_list(args.labels)
     depends_on = _parse_csv_list(args.depends_on)
+    # T-2841 / ORG-065 BT1: the four new typed-edge fields. Shape-validated
+    # up front (same place depends_on/labels are parsed) — malformed shape is
+    # a refusal; an unresolvable-but-well-formed target is NOT (see
+    # _parse_edge_targets docstring).
+    implements = _parse_edge_targets("implements", _parse_csv_list(_str_arg(args, "implements")))
+    verifies = _parse_edge_targets("verifies", _parse_csv_list(_str_arg(args, "verifies")))
+    supersedes = _parse_edge_targets("supersedes", _parse_csv_list(_str_arg(args, "supersedes")))
+    informs = _parse_edge_targets("informs", _parse_csv_list(_str_arg(args, "informs")))
+    # T-3476 / ORG-065 Call 1: fifth typed-edge field, same shape as the four
+    # above. Distinct from `implements` — see FRONT_MATTER_FIELD_ORDER note.
+    ratifies = _parse_edge_targets("ratifies", _parse_csv_list(_str_arg(args, "ratifies")))
     raw_parent = getattr(args, "parent_ticket", None)
     parent_ticket: str | None = None
     if isinstance(raw_parent, str) and raw_parent.strip():
         parent_ticket = raw_parent.strip()
-        if not re.fullmatch(r"T-\d{4}", parent_ticket):
+        if not _TICKET_ID_FULL_RE.fullmatch(parent_ticket):  # T-3215
             raise TicketError(
                 f"--parent-ticket value {parent_ticket!r} does not match the T-NNNN format"
             )
     actor = _actor()
+    project_id_present, project_id, nearest_intent_ref = _purpose_values_from_args(args)
+
+    # --- T-3328: file-time lineage-guard (resolved once, pre-loop) ---
+    # A first-class ticket DAG needs every node connected — a new ticket must
+    # carry >=1 lineage edge or explicitly assert (via --orphan) that it is a
+    # genuine root. Checked here (after all 7 edge fields are known, before
+    # any mutation) so a refusal leaves no trace — same fail-fast-before-
+    # mutation shape as _reject_if_cycle below.
+    #
+    # Heterogeneous node model (T-3328, Specialist's 2026-08-28 13:51:39Z scope
+    # refinement): the graph root is the Grand Goal; goals/ADRs/tickets are
+    # all nodes on ONE graph. This guard does not add new fields for that —
+    # the existing edges already reach every node type:
+    #   serves      -> a goal/arc-intent (ORG-034; traces to rulebook/goals.md)
+    #   implements/verifies/supersedes/informs -> a ticket OR an ADR
+    #       obligation (ADR-NNN#E<k>[.C<m>] / ORG-NNN#E<k>[.C<m>]) — already
+    #       accepted by _parse_edge_targets (T-2841/ORG-065 BT1), unchanged.
+    #   parent_ticket/depends_on -> another ticket.
+    # A genuine one-off with no goal alignment is still connected, not
+    # orphaned: use --serves with a non-goal-root value ('goal-neutral-
+    # maintenance' for housekeeping, 'operator-ad-hoc' for the operator's ungoaled
+    # asks — both free text today; a designated non-goal-root registry is
+    # future work, not built here). Existence of a referenced goal/ADR/ticket
+    # is NOT validated at file-time — same warn-only-at-grooming precedent
+    # already established for implements/verifies/supersedes/informs.
+    #
+    # NOTE: distinct from ticket_lint.py's `orphan_ratifications` (a
+    # ratifiable ticket with no open ratify ticket) — unrelated concept,
+    # shares only the English word.
+    raw_serves_for_guard = getattr(args, "serves", None)
+    _has_serves = isinstance(raw_serves_for_guard, str) and bool(raw_serves_for_guard.strip())
+    raw_orphan = getattr(args, "orphan", None)
+    orphan_reason: str | None = raw_orphan.strip() if isinstance(raw_orphan, str) else None
+
+    has_lineage_edge = bool(
+        parent_ticket
+        or depends_on
+        or _has_serves
+        or nearest_intent_ref
+        or project_id
+        or implements
+        or verifies
+        or supersedes
+        or informs
+        or ratifies
+    )
+    if not has_lineage_edge:
+        if orphan_reason is None:
+            raise TicketError(
+                "refusing to file an orphan ticket: no lineage edge is set "
+                "(T-3328 — every new ticket must connect to the DAG). Add "
+                ">=1 of:\n"
+                "  --parent-ticket T-NNNN     this ticket's parent\n"
+                "  --depends-on T-NNNN[,...]  ticket(s) that gate this one\n"
+                "  --serves \"<phrase>\"        the goal/arc-intent this ticket "
+                "serves (ORG-034) — traces to a rulebook/goals.md north star; "
+                "use 'goal-neutral-maintenance' for housekeeping or "
+                "'operator-ad-hoc' for a genuine one-off with no goal\n"
+                "  --implements <T-NNNN|ADR-NNN#E<k>>  the parent work or ADR "
+                "obligation this ticket implements\n"
+                "  --verifies <T-NNNN|ADR-NNN#E<k>>    the obligation this "
+                "ticket's evidence verifies\n"
+                "  --supersedes <T-NNNN|ADR-NNN#E<k>>  the node this ticket "
+                "replaces\n"
+                "  --informs <T-NNNN|ADR-NNN#E<k>>     advisory-only notify "
+                "edge (never gates)\n"
+                "  --ratifies <T-NNNN|ADR-NNN#E<k>>    the ADR obligation "
+                "this ticket ratifies (distinct from implements — T-3476)\n"
+                "Escape hatch: --orphan \"<justification, >=20 chars>\" asserts "
+                "this is a genuine root with no natural connection — rare; "
+                "recorded as orphan_reason: for audit."
+            )
+        if len(orphan_reason) < 20:
+            raise TicketError(
+                f"--orphan justification too short ({len(orphan_reason)} chars, "
+                f"minimum 20): {orphan_reason!r}"
+            )
 
     # --- T-0852: ratify file-time impl-followup gate (resolved once, pre-loop) ---
     # A target=operator + intent=ratify file must not dead-end: it carries either a
@@ -1771,6 +2588,25 @@ def cmd_file(args: argparse.Namespace) -> int:
                 "parent_ticket": parent_ticket,
                 "depends_on": depends_on,
             }
+            if project_id_present:
+                fields["project_id"] = project_id
+            if nearest_intent_ref is not None:
+                fields["nearest_intent_ref"] = nearest_intent_ref
+            # T-2841 / ORG-065 BT1.
+            if implements:
+                fields["implements"] = implements
+            if verifies:
+                fields["verifies"] = verifies
+            if supersedes:
+                fields["supersedes"] = supersedes
+            if informs:
+                fields["informs"] = informs
+            if ratifies:
+                fields["ratifies"] = ratifies
+            # T-3328: record the escape-hatch justification whenever supplied
+            # (even alongside a real edge — harmless, and useful audit either way).
+            if orphan_reason:
+                fields["orphan_reason"] = orphan_reason
             if labels:
                 fields["labels"] = labels
             if args.stale_after:
@@ -1847,11 +2683,46 @@ def cmd_file(args: argparse.Namespace) -> int:
             if isinstance(raw_serves, str) and raw_serves.strip():
                 fields["serves"] = raw_serves.strip()
 
+            # T-3440 / ORG-089 §Decision.4e: appetite applicability at file-time.
+            # bet_ref is set first (it is one of the applicability triggers), then
+            # the appetite is resolved: supplied → normalized int; hygiene/legacy →
+            # medium-default 5; applicable bet without a score → AppetiteRequired;
+            # below-the-line non-bet → left absent. Fail-fast before any mutation,
+            # same posture as the lineage/cycle guards.
+            raw_bet_ref = getattr(args, "bet_ref", None)
+            if isinstance(raw_bet_ref, str) and raw_bet_ref.strip():
+                fields["bet_ref"] = raw_bet_ref.strip()
+            _apply_appetite_at_file_time(
+                fields, getattr(args, "appetite", None), created
+            )
+
+            # T-3168: syntax is already fail-closed above.  During the approved
+            # migration leg, graph/corpus findings are named but do not refuse
+            # filing.  ENFORCE remains a tested API until a canonical goal-key
+            # adapter exists and the activation gate is separately approved.
+            purpose_mode = PurposeEnforcement(TICKET_PURPOSE_ENFORCEMENT)
+            purpose_issues = _purpose_issues_for_fields(fields, mode=purpose_mode)
+            _apply_purpose_policy(purpose_issues, mode=purpose_mode)
+
             # T-2613 / ORG-038: retest_status — vocab already enforced by argparse
             # `choices=RETEST_STATUS_VOCAB` on the flag itself.
             raw_retest_status = getattr(args, "retest_status", None)
             if isinstance(raw_retest_status, str) and raw_retest_status.strip():
                 fields["retest_status"] = raw_retest_status.strip()
+
+            # T-2841 / ORG-065 §3.6: reject a cycle-creating edge at insertion,
+            # BEFORE the pull/write below — a failed cycle check must leave no
+            # trace (matches the fail-fast shape of every other file-time
+            # validation above). Checked against every gating/structural field
+            # this ticket carries; `informs` is excluded (acyclicity-exempt).
+            _reject_if_cycle(tid, {
+                "depends_on": depends_on,
+                "parent_ticket": [parent_ticket] if parent_ticket else [],
+                "implements": implements,
+                "verifies": verifies,
+                "supersedes": supersedes,
+                "ratifies": ratifies,
+            })
 
             # Pull-first (T-0244): must succeed BEFORE writing the new file so
             # a pull failure doesn't leave an untracked ticket file orphaned.
@@ -1980,14 +2851,63 @@ def _do_transition(
     detail: str | None,
     no_push: bool = False,
     cascade_callback=None,
+    receipts_to_attach: list[str] | None = None,
+    strip_auto_delivered: bool = False,
+    field_updates: dict | None = None,
+    skip_closure_gate: bool = False,
+    appetite_outcome: str | None = None,
 ) -> int:
-    """Shared implementation for claim / block / unblock / resolve.
+    """Shared implementation for claim / block / unblock / resolve / drop / reopen.
+
+    field_updates (optional, T-3440 / ORG-089): a dict of frontmatter fields to
+    set (value) or delete (value is the sentinel `_DELETE_FIELD`) on the ticket
+    as part of THIS transition's atomic write. Used by `drop` (set substate:
+    dropped + dropped_reason + dropped_from_state) and `reopen` (clear those +
+    set appetite). Applied after `state` is set, before the transition-log
+    append, so the whole change lands in one commit.
+
+    skip_closure_gate (optional, T-3440): bypass the ORG-065 §3.3 closure gate
+    when transitioning INTO done. `drop` sets this — a dropped bet is ABANDONED,
+    not satisfied, so the obligation-satisfaction gate is semantically wrong for
+    it (D-N: dropped does not satisfy obligations).
 
     cascade_callback (optional): callable(parent_tid: str) -> list[Path].
     Called AFTER the parent's git mv + frontmatter edit but BEFORE the
     commit, so any side-effect file moves it performs land in the same
     atomic commit as the parent transition. Used by cmd_resolve for
     auto-unblock cascade per T-0328.
+
+    receipts_to_attach (optional, T-2842 / ORG-065 BT2): pre-validated
+    `<clause>=<receipt-id>=<provenance>` entries (see _parse_receipt_entries)
+    to merge into the ticket's `receipts:` list as part of THIS transition —
+    threaded from cmd_resolve's `--receipt` flag. Merged in (deduped) before
+    the closure gate runs, so freshly-supplied evidence is what the gate
+    evaluates. Ignored when new_state != "done" (only resolve wires this
+    today; claim/unclaim never reach `done` and never pass it).
+
+    Closure-validation gate (ORG-065 §3.3, T-2842 BT2): whenever this
+    transition moves a ticket INTO `done` (resolve / close-noodle /
+    close-action — the only three `_do_transition` callers that ever pass
+    new_state="done"; claim/unclaim do not), `_check_closure_gate` runs
+    against the ticket's fields BEFORE the git mv, so a gate-mode refusal
+    leaves no trace (mirrors _reject_if_cycle's fail-fast-before-mutation
+    shape). This is a single, verb-agnostic hook — closure applies to any
+    node reaching `done`, not to `resolve` specifically (§3.3's own "a node
+    cannot close" framing), so close-noodle/close-action tickets carrying
+    `implements` obligations are gated too, even though only `resolve`
+    exposes `--receipt` in this ticket's scope.
+
+    appetite_outcome (optional, T-3451 / ORG-089): one of "shipped" / "dropped"
+    / "reopened" — passed by cmd_resolve/cmd_drop/cmd_reopen, the only three
+    verbs that fire a terminal appetite event (T-3440 Scope C). When set,
+    `_record_appetite_outcome` runs INSIDE this critical section, after the
+    ticket's own mv + frontmatter/transition-log edit (so its active-spend
+    read sees the same final snapshot the pre-T-3451 post-transition call
+    used) and BEFORE the commit-message build, and a successful write's shard
+    Path is folded into this transition's `affected_paths` — so the shard
+    lands in the SAME commit as the transition instead of as an untracked
+    side effect. Fail-safe throughout: a write failure yields None and the
+    shard is simply absent from this commit, never blocking the transition.
     """
     old_path = _find_ticket(tid)
     if old_path.parent.name != expected_state:
@@ -2041,6 +2961,27 @@ def _do_transition(
         old_path = current
         new_path = new_dir / old_path.name
 
+        # 0c. Closure-validation gate + receipt attach (T-2842 / ORG-065 BT2,
+        # §3.3) — BEFORE the git mv, so a gate-mode refusal leaves no trace
+        # (same fail-fast-before-mutation shape as _reject_if_cycle). Reads
+        # from old_path since the mv hasn't happened yet. Only evaluated when
+        # transitioning INTO done — see this function's docstring.
+        merged_receipts: list[str] | None = None
+        if new_state == "done":
+            pre_text = old_path.read_text(encoding="utf-8")
+            pre_fields, _pre_body = parse_front_matter(pre_text)
+            if receipts_to_attach:
+                merged_receipts = list(pre_fields.get("receipts") or [])
+                for r in receipts_to_attach:
+                    if r not in merged_receipts:
+                        merged_receipts.append(r)
+                pre_fields["receipts"] = merged_receipts
+            # T-3440 / ORG-089: `drop` skips the closure gate — a dropped bet is
+            # abandoned, not satisfied, so the obligation-satisfaction gate does
+            # not apply (D-N).
+            if not skip_closure_gate:
+                _check_closure_gate(tid, pre_fields)
+
         # 1. git mv (renames index entry + working-tree file in one step).
         rel_old = str(old_path.relative_to(REPO_ROOT))
         rel_new = str(new_path.relative_to(REPO_ROOT))
@@ -2053,7 +2994,40 @@ def _do_transition(
         # 2. Edit front matter + append transition log.
         text = new_path.read_text(encoding="utf-8")
         fields, body = parse_front_matter(text)
+        # T-2842 / ORG-065 BT2: splice in the receipts merged by step 0c (if
+        # any) so freshly-attached evidence lands in the same atomic write —
+        # re-reading fresh from new_path above would otherwise lose it.
+        if merged_receipts is not None:
+            fields["receipts"] = merged_receipts
         fields["state"] = new_state
+        # T-3440 / ORG-089: apply drop/reopen field mutations in the same atomic
+        # write (substate/dropped_reason/dropped_from_state/appetite). A value of
+        # the _DELETE_FIELD sentinel removes the key (reopen clears the dropped
+        # disposition); any other value sets it.
+        if field_updates:
+            for key, value in field_updates.items():
+                if value is _DELETE_FIELD:
+                    fields.pop(key, None)
+                else:
+                    fields[key] = value
+        # T-3081: strip auto_delivered / auto_delivered_at when the transition
+        # is a re-shelve/defer (e.g. cmd_unclaim: active→inbox). Same rationale
+        # as the cmd_block strip + T-0971 arm-A (cascade-unblock) + T-2350
+        # (retarget): a delivered-but-parked ticket keeps the stamp; when it
+        # later becomes un-gated + 8h-stale, check_dispatch_locked's backstop
+        # force-releases the lock + operator-alerts. Only strip when the caller
+        # explicitly asks (default False preserves existing claim / resolve
+        # behavior).
+        stripped_ad = None
+        stripped_ad_at = None
+        if strip_auto_delivered:
+            stripped_ad = fields.pop("auto_delivered", None)
+            stripped_ad_at = fields.pop("auto_delivered_at", None)
+            if (stripped_ad is not None or stripped_ad_at is not None):
+                detail = (
+                    f"{detail}; auto_delivered stamp cleared"
+                    if detail else "auto_delivered stamp cleared"
+                )
         actor = _actor()
         log_verb = _LOG_VERB.get(verb, verb)
         body = append_transition(body, actor, log_verb, detail)
@@ -2096,6 +3070,32 @@ def _do_transition(
                 for w in lift_warnings:
                     print(f"warning: ratify-lift: {w}", file=sys.stderr)
 
+        # 2d. T-3451 / ORG-089: appetite outcome-log fold-into-commit. Runs
+        # only when the caller passed `appetite_outcome` — the three verbs
+        # that fire a terminal appetite event (resolve->shipped, drop->dropped,
+        # reopen->reopened; T-3440 Scope C). Must run HERE: after the ticket's
+        # own mv + frontmatter/transition-log edit (steps 1-2, so the shard's
+        # active-spend read sees the SAME final ticket snapshot the pre-T-3451
+        # post-transition call used) and BEFORE the commit-message build /
+        # scope-guard (steps 3/5 below), so the shard lands in THIS
+        # transition's affected_paths and is staged+committed atomically
+        # instead of as an untracked side effect (the T-3439/T-3440 bug this
+        # ticket fixes). The narrow "current-week-only" admission is
+        # structural, not a separate allowlist check: the shard path is
+        # always `_iso_week_shard_name(now)` for the actual current week, so
+        # no other-week/other-tree path can ever ride along. Fail-safe
+        # throughout: `_record_appetite_outcome` never raises; a write
+        # failure yields None and the shard is simply absent from this
+        # commit — never blocks the ticket transition itself. Locking this
+        # write inside git_mutation_lock (it previously ran AFTER this whole
+        # function returned, outside the lock) is an incidental concurrent-
+        # write-safety improvement on the shared weekly shard file.
+        outcome_paths: list[Path] = []
+        if appetite_outcome is not None:
+            shard_path = _record_appetite_outcome(tid, appetite_outcome)
+            if shard_path is not None:
+                outcome_paths.append(shard_path)
+
         # 3. Build commit message + auto-commit pipeline. Both old and new
         #    paths must be staged so the rename is captured atomically.
         title = _extract_title(body)
@@ -2116,7 +3116,7 @@ def _do_transition(
             )
 
         _commit_and_push(
-            [old_path, new_path] + cascade_paths + lift_paths,
+            [old_path, new_path] + cascade_paths + lift_paths + outcome_paths,
             commit_message,
             no_push=no_push,
         )
@@ -2245,6 +3245,7 @@ def cmd_unclaim(args: argparse.Namespace) -> int:
         verb="unclaim",
         detail="moving to inbox",
         no_push=getattr(args, "no_push", False),
+        strip_auto_delivered=True,  # T-3081: re-shelve clears the dispatch-mutex stamp
     )
 
 
@@ -2342,8 +3343,21 @@ def cmd_block(args: argparse.Namespace) -> int:
         del fields["not_before"]
         # T-2833: a cleared gate must not leave a dangling anchor behind.
         fields.pop("not_before_anchor", None)
+        # T-3112: strip auto_delivered / auto_delivered_at on the DE-gate op.
+        # T-3081 stripped on the ADD (park) direction; this is the missing INVERSE.
+        # De-gating re-enters the ticket into the workable set, so a lingering
+        # stamp becomes a live in-flight dispatch that holds the dispatch mutex +
+        # fires the 8h backstop (the 8 spurious lock-release notifs Recovery diagnosed
+        # 2026-08-24: a --clear-not-before batch left stale stamps that flipped
+        # cosmetic→active). Mirrors T-0971 arm-A (cascade-unblock strip); cleared
+        # VISIBLY in the transition log for the same audit-trail reason.
+        had_ad = fields.pop("auto_delivered", None)
+        had_ad_at = fields.pop("auto_delivered_at", None)
         actor = _actor()
-        body = append_transition(body, actor, "not_before gate cleared", None)
+        clear_note = "not_before gate cleared"
+        if had_ad is not None or had_ad_at is not None:
+            clear_note += "; auto_delivered stamp cleared"
+        body = append_transition(body, actor, clear_note, None)
         new_text = _build_ticket_text(fields, body)
         # T-1770 Part b: pull → write → commit is one atomic critical section.
         with git_mutation_lock(label=f"block --clear-not-before {args.ticket}"):
@@ -2394,6 +3408,16 @@ def cmd_block(args: argparse.Namespace) -> int:
             summary = f"deps cleared: {', '.join(clear_dep_list)}"
 
         fields["depends_on"] = new_deps
+        # T-3112: strip auto_delivered / auto_delivered_at on the DE-gate op —
+        # same missing-inverse of T-3081 as the --clear-not-before branch above.
+        # Removing a dep-gate re-enters the ticket into the workable set, so a
+        # lingering stamp would hold the dispatch mutex + fire the 8h backstop.
+        # Mirrors T-0971 arm-A (cascade-unblock), which strips on the AUTOMATIC
+        # dep-removal path; this covers the MANUAL --clear-dep/--clear-deps path.
+        had_ad = fields.pop("auto_delivered", None)
+        had_ad_at = fields.pop("auto_delivered_at", None)
+        if had_ad is not None or had_ad_at is not None:
+            note += "; auto_delivered stamp cleared"
         actor = _actor()
         body = append_transition(body, actor, note, None)
         new_text = _build_ticket_text(fields, body)
@@ -2443,15 +3467,30 @@ def cmd_block(args: argparse.Namespace) -> int:
         if depends_on_list:
             merged_deps = list(existing_deps)
             for dep in depends_on_list:
-                if not re.fullmatch(r"T-\d{4}", dep):
+                if not _TICKET_ID_FULL_RE.fullmatch(dep):  # T-3215
                     raise TicketError(f"--depends-on value {dep!r} does not match T-NNNN format")
                 if dep not in merged_deps:
                     merged_deps.append(dep)
+            # T-2841 / ORG-065 §3.6: reject a cycle-creating edge at insertion,
+            # BEFORE the merge lands in `fields` — "depends_on via block" is
+            # explicitly one of the two insertion points named in the ADR.
+            _reject_if_cycle(args.ticket, {"depends_on": depends_on_list})
             fields["depends_on"] = merged_deps
 
         if not_before:
             fields["not_before"] = not_before
             fields["not_before_anchor"] = not_before_anchor  # T-2833 (validated above)
+
+        # T-3081: strip auto_delivered / auto_delivered_at when ADDING a gate.
+        # A ticket that was auto_delivered then PARKED keeps the stamp; when the
+        # gate later clears + it becomes un-gated + 8h-stale,
+        # `check_dispatch_locked`'s backstop force-releases the lock + alerts
+        # the operator — the source of alert-noise Recovery diagnosed 2026-08-23. Mirrors
+        # T-0971 arm-A (cascade-unblock strip) + T-2350 retarget strip; keeps
+        # all three paths in step. Cleared VISIBLY in the transition log for
+        # the same audit-trail reason as retarget.
+        had_ad = fields.pop("auto_delivered", None)
+        had_ad_at = fields.pop("auto_delivered_at", None)
 
         # Build log detail line.
         detail_parts: list[str] = []
@@ -2459,6 +3498,8 @@ def cmd_block(args: argparse.Namespace) -> int:
             detail_parts.append(f"not_before: {not_before} (anchor: {not_before_anchor})")
         if depends_on_list:
             detail_parts.append(f"depends_on: [{', '.join(depends_on_list)}]")
+        if had_ad is not None or had_ad_at is not None:
+            detail_parts.append("auto_delivered stamp cleared")
         detail = "; ".join(detail_parts)
 
         actor = _actor()
@@ -2512,9 +3553,38 @@ def _warn_unmet_deps(tid: str, verb: str) -> None:
         return
 
 
+def _refuse_resolve_if_overrun(tid: str) -> None:
+    """T-3440 / ORG-089 §Decision.4: resolve is refused on a ticket in
+    `substate: appetite-overrun` — a re-decision verb (re-earn / drop /
+    adjust-appetite) must run first. Fail-fast BEFORE the lock/git-mv (same
+    posture as _warn_unmet_deps / receipt-parse). Fail-safe: any read error is
+    swallowed (never block a legitimate resolve on a corrupt/missing field —
+    the breaker's job is surfacing overrun, not blocking work)."""
+    try:
+        fields = parse_ticket(_find_ticket(tid)).fields
+    except Exception:
+        return
+    if fields.get("substate") == "appetite-overrun":
+        raise AppetiteOverrunNotResolvable(
+            f"resolve refused: {tid} is in substate: appetite-overrun "
+            f"(ORG-089 §Decision.4). Run a re-decision first: "
+            f"`re-earn --appetite <N> --rationale ...` (keep working), "
+            f"`adjust-appetite --appetite <N> --rationale ...` (original score "
+            f"was wrong), or `drop --dropped-reason ...` (abandon the bet)."
+        )
+
+
 def cmd_resolve(args: argparse.Namespace) -> int:
     detail = getattr(args, "with_summary", None)
     _warn_unmet_deps(args.ticket, "resolving")
+    # T-3440 / ORG-089 §Decision.4: refuse resolve on appetite-overrun (typed).
+    _refuse_resolve_if_overrun(args.ticket)
+    # T-2842 / ORG-065 BT2: validate --receipt entries fail-fast, BEFORE
+    # _do_transition (same "abort before touching the lock/git-mv" posture
+    # as every other file-time/transition-time shape check).
+    receipts_to_attach = _parse_receipt_entries(
+        "receipts", getattr(args, "receipt", None) or []
+    )
     rc = _do_transition(
         tid=args.ticket,
         expected_state="active",
@@ -2523,12 +3593,227 @@ def cmd_resolve(args: argparse.Namespace) -> int:
         detail=detail,
         no_push=getattr(args, "no_push", False),
         cascade_callback=_cascade_unblock_dependants,
+        receipts_to_attach=receipts_to_attach,
+        # T-3440 / ORG-089: log the shipped outcome for the calibration
+        # warm-up. T-3451: folded into _do_transition's own commit (was a
+        # disconnected post-transition call that left the shard uncommitted).
+        appetite_outcome="shipped",
     )
     # T-2273: AFTER the transition, and only on success. The warning asks a
     # question at the one moment the author is still present; it must never look
     # like a gate on the resolve, and a failed resolve has nothing to ask about.
     if rc == 0:
         _warn_recurrence_prediction(detail or "", args.ticket)
+    return rc
+
+
+# ---------------------------------------------------------------------------
+# T-3440 / ORG-089 §Decision.4: the four appetite re-decision verbs.
+#   re-earn         — new appetite + rationale; clears overrun, stays active,
+#                     restarts the overrun clock (D-P). Requires overrun.
+#   adjust-appetite — original score was wrong; corrects appetite in place,
+#                     clears overrun if present, does NOT restart the clock.
+#   drop            — terminal; open → done/ with substate: dropped (skips the
+#                     ORG-065 closure gate — a dropped bet is abandoned, not
+#                     satisfied, D-N).
+#   reopen          — dropped (done/) → inbox/; clears the dropped disposition,
+#                     re-earns a new appetite, restarts the clock.
+# Resolve stays terminal and is never overloaded.
+# ---------------------------------------------------------------------------
+
+
+def _record_appetite_outcome(tid: str, outcome: str) -> Path | None:
+    """Best-effort append of a terminal appetite event to the warm-up ledger
+    (ledger/appetite/<year>-W<NN>.jsonl) on resolve->shipped / drop->dropped /
+    reopen->reopened. Reads the ticket's current appetite + computes active-spend
+    from its transition log so the warm-up carries the calibration signal
+    (appetite vs actual). Fail-safe: never raises into the verb — the outcome log
+    is calibration data, not a gate (ORG-089 §Build plan). Co-located writer +
+    spend machine in ticket_grooming, lazy-imported (no hard dep).
+
+    Returns the shard Path on a successful write (T-3451: `_do_transition` folds
+    this into the SAME commit as the transition it fired from), None on any
+    failure/no-op."""
+    try:
+        from tools import ticket_grooming
+        from tools.ticket_purpose import normalize_appetite, AppetiteError
+        now = datetime.now(timezone.utc)
+        t = parse_ticket(_find_ticket(tid))
+        try:
+            appetite = normalize_appetite(t.fields.get("appetite"))
+        except AppetiteError:
+            appetite = None
+        spend_s = ticket_grooming.active_spend_from_transition_log(t, now=now)
+        # Pass an explicit ledger_root derived from ticket.REPO_ROOT (the root
+        # ticket lifecycle tests patch) rather than letting the writer fall back
+        # to ticket_grooming.REPO_ROOT — keeps outcome logging isolated in tests
+        # and byte-identical in production (both resolve to the same repo path).
+        return ticket_grooming._appetite_outcome_log(
+            tid=tid, appetite=appetite, outcome=outcome, now=now,
+            active_spend_s=spend_s,
+            ledger_root=REPO_ROOT / "ledger" / "appetite",
+        )
+    except Exception:  # noqa: BLE001 — outcome logging must never break a verb
+        return None
+
+
+def _inplace_appetite_edit(
+    tid: str,
+    *,
+    verb: str,
+    appetite: int,
+    rationale: str,
+    no_push: bool,
+    require_overrun: bool,
+    clear_overrun: bool,
+) -> int:
+    """Shared in-place (no dir move) frontmatter edit for re-earn / adjust-appetite.
+
+    The authoritative read + edit + write happen INSIDE the git_mutation_lock
+    after the pull, so a concurrent writer cannot interleave (T-1770 posture).
+    """
+    # Fail-fast pre-lock check (avoid taking the lock for an obviously-bad ask).
+    pre = _find_ticket(tid)
+    if pre.parent.name == "done":
+        raise TicketError(
+            f"{verb} refused: {tid} is in done/ (terminal). Reopen it first "
+            f"(`reopen --re-earn-appetite <N> --rationale ...`) to keep working."
+        )
+
+    detail = f"appetite -> {appetite}; {rationale}"
+    commit_message = _build_commit_message(verb, tid, None, detail)
+    with git_mutation_lock(label=f"{verb} {tid}"):
+        _pull_if_needed(no_push)
+        path = _find_ticket(tid)
+        if path.parent.name == "done":
+            raise TicketError(
+                f"{verb} refused: {tid} moved to done/ before the lock; nothing changed."
+            )
+        fields, body = parse_front_matter(path.read_text(encoding="utf-8"))
+        if require_overrun and fields.get("substate") != "appetite-overrun":
+            raise TicketError(
+                f"{verb} refused: {tid} is not in substate: appetite-overrun. "
+                f"re-earn is a re-decision on an overrun bet; use adjust-appetite "
+                f"to correct a score outside overrun."
+            )
+        fields["appetite"] = appetite
+        if clear_overrun and fields.get("substate") == "appetite-overrun":
+            fields.pop("substate", None)
+        actor = _actor()
+        body = append_transition(body, actor, verb, detail)
+        path.write_text(_build_ticket_text(fields, body), encoding="utf-8")
+        _commit_and_push([path], commit_message, no_push=no_push)
+    print(f"{verb} {tid}: appetite -> {appetite} ({rationale})")
+    return 0
+
+
+def cmd_re_earn(args: argparse.Namespace) -> int:
+    from tools.ticket_purpose import normalize_appetite, AppetiteError
+    try:
+        appetite = normalize_appetite(args.appetite)
+    except AppetiteError as exc:
+        raise TicketError(str(exc)) from exc
+    rationale = (args.rationale or "").strip()
+    if not rationale:
+        raise TicketError("re-earn requires a non-empty --rationale")
+    return _inplace_appetite_edit(
+        args.ticket, verb="re-earn", appetite=appetite, rationale=rationale,
+        no_push=getattr(args, "no_push", False),
+        require_overrun=True, clear_overrun=True,
+    )
+
+
+def cmd_adjust_appetite(args: argparse.Namespace) -> int:
+    from tools.ticket_purpose import normalize_appetite, AppetiteError
+    try:
+        appetite = normalize_appetite(args.appetite)
+    except AppetiteError as exc:
+        raise TicketError(str(exc)) from exc
+    rationale = (args.rationale or "").strip()
+    if not rationale:
+        raise TicketError("adjust-appetite requires a non-empty --rationale")
+    return _inplace_appetite_edit(
+        args.ticket, verb="adjust-appetite", appetite=appetite, rationale=rationale,
+        no_push=getattr(args, "no_push", False),
+        require_overrun=False, clear_overrun=True,
+    )
+
+
+def cmd_drop(args: argparse.Namespace) -> int:
+    dropped_reason = (args.dropped_reason or "").strip()
+    if not dropped_reason:
+        raise TicketError("drop requires a non-empty --dropped-reason")
+    # Resolve the origin dir up front so _do_transition gets the right
+    # expected_state; it re-verifies inside the lock (T-2140) so a concurrent
+    # move is caught, not acted on.
+    path = _find_ticket(args.ticket)
+    origin = path.parent.name
+    if origin == "done":
+        raise TicketError(
+            f"drop refused: {args.ticket} is already in done/ "
+            f"(if it is a dropped bet, it is already terminal)."
+        )
+    field_updates = {
+        "substate": "dropped",
+        "dropped_reason": dropped_reason,
+        "dropped_from_state": origin,
+    }
+    rc = _do_transition(
+        tid=args.ticket,
+        expected_state=origin,
+        new_state="done",
+        verb="drop",
+        detail=dropped_reason,
+        no_push=getattr(args, "no_push", False),
+        field_updates=field_updates,
+        skip_closure_gate=True,  # dropped != satisfied (D-N)
+        # T-3451: folded into _do_transition's own commit — see cmd_resolve.
+        appetite_outcome="dropped",
+    )
+    return rc
+
+
+def cmd_reopen(args: argparse.Namespace) -> int:
+    from tools.ticket_purpose import normalize_appetite, AppetiteError
+    try:
+        appetite = normalize_appetite(args.re_earn_appetite)
+    except AppetiteError as exc:
+        raise TicketError(str(exc)) from exc
+    if appetite is None:
+        raise TicketError("reopen requires --re-earn-appetite <1-10>")
+    rationale = (args.rationale or "").strip()
+    if not rationale:
+        raise TicketError("reopen requires a non-empty --rationale")
+    # Must be a dropped bet in done/ (fail-fast; _do_transition re-verifies).
+    path = _find_ticket(args.ticket)
+    if path.parent.name != "done":
+        raise TicketError(
+            f"reopen refused: {args.ticket} is in `{path.parent.name}`, not done/ "
+            f"(reopen is for a DROPPED bet)."
+        )
+    fields, _body = parse_front_matter(path.read_text(encoding="utf-8"))
+    if fields.get("substate") != "dropped":
+        raise TicketError(
+            f"reopen refused: {args.ticket} is in done/ but not substate: dropped "
+            f"(reopen clears a DROPPED disposition; a shipped ticket is not reopened here)."
+        )
+    field_updates = {
+        "substate": _DELETE_FIELD,
+        "dropped_reason": _DELETE_FIELD,
+        "dropped_from_state": _DELETE_FIELD,
+        "appetite": appetite,
+    }
+    rc = _do_transition(
+        tid=args.ticket,
+        expected_state="done",
+        new_state="inbox",  # reopened dropped bet needs re-triage/re-claim (Q5)
+        verb="reopen",
+        detail=f"re-earn appetite {appetite}; {rationale}",
+        no_push=getattr(args, "no_push", False),
+        field_updates=field_updates,
+        # T-3451: folded into _do_transition's own commit — see cmd_resolve.
+        appetite_outcome="reopened",
+    )
     return rc
 
 
@@ -2590,6 +3875,9 @@ def _spawn_child_ticket(
     lock_cm = contextlib.nullcontext() if _locked else _allocation_lock()
     with lock_cm:
         tid = _next_ticket_id()
+        parent_fields, _parent_body = parse_front_matter(
+            _find_ticket(parent_tid).read_text(encoding="utf-8")
+        )
         fields: dict = {
             "id": tid,
             "created": _now_iso(),
@@ -2598,7 +3886,13 @@ def _spawn_child_ticket(
             "state": "inbox",
             "parent_ticket": parent_tid,
             "depends_on": list(depends_on) if depends_on else [],
+            # T-3168: spawned children inherit membership and point to their
+            # actual parent ticket.  This is the one child-filing path that
+            # does not cross the public ``file`` parser.
+            "project_id": parent_fields.get("project_id"),
+            "nearest_intent_ref": f"ticket:{parent_tid}",
         }
+        fields["serves"] = parent_fields.get("serves") or f"follow-up to {parent_tid}"
         if labels:
             fields["labels"] = labels
         if intent is not None and target == "operator":
@@ -2776,28 +4070,57 @@ def _find_dependants(parent_tid: str) -> list[Path]:
     return dependants
 
 
-def _dep_is_done(dep: str) -> bool:
-    """True iff `dep` is a well-formed ticket id currently in done/.
+def _is_shipped(ticket: "Ticket") -> bool:
+    """ORG-089 typed completion predicate (T-3440 Scope B).
 
-    Malformed ids return False so they are never pruned — same fail-closed
-    posture as `_all_other_deps_done`, which refuses to auto-unblock on an
-    id it cannot check (T-2177).
+    Shipped iff the ticket is in `done/` AND its substate is not `dropped`.
+    This is the single source of truth ORG-021 (§substates) names: a DROPPED
+    bet lives in done/ but does NOT satisfy dependencies or ORG-065 obligations
+    (D-N). Every done-as-resolved consumer routes through this (or the id-keyed
+    `_dep_is_shipped` below) so `dropped != resolved` holds everywhere.
     """
-    if not re.fullmatch(r"T-\d{4}", dep):
+    return ticket.state_dir == "done" and ticket.fields.get("substate") != "dropped"
+
+
+def _dep_is_shipped(dep: str) -> bool:
+    """True iff `dep` is a well-formed ticket id currently SHIPPED (in done/ and
+    not `substate: dropped`).
+
+    Replaces `_dep_is_done` (T-3440 Scope B). Fail-CLOSED: a malformed id, a
+    dep not in done/, an unparseable done/ file, or a `substate: dropped` file
+    all return False — the cascade must never auto-unblock (or prune a dep) on
+    uncertainty (same T-2177 posture as `_all_other_deps_shipped`), and a
+    dropped dep is deliberately NOT satisfied (falsifier 2 / D-N).
+    """
+    if not _TICKET_ID_FULL_RE.fullmatch(dep):  # T-3215
         return False
-    return (TICKETS_ROOT / "done" / f"{dep}.md").exists()
+    path = TICKETS_ROOT / "done" / f"{dep}.md"
+    if not path.exists():
+        return False
+    try:
+        fields, _body = parse_front_matter(path.read_text(encoding="utf-8"))
+    except (TicketError, OSError):
+        # Unparseable/unreadable done ticket — fail closed (do not treat as
+        # shipped; grooming surfaces malformed files separately).
+        return False
+    return fields.get("substate") != "dropped"
 
 
-def _all_other_deps_done(deps: list[str], just_resolved_tid: str) -> bool:
-    """True iff every dep besides just_resolved_tid is currently in done/."""
+def _all_other_deps_shipped(deps: list[str], just_resolved_tid: str) -> bool:
+    """True iff every dep besides just_resolved_tid is currently SHIPPED.
+
+    Replaces `_all_other_deps_done` (T-3440 Scope B). Load-bearing for the
+    ORG-013 cascade guard: a still-open OR dropped sibling dep must keep the
+    dependant gated (falsifier 2). Fail-closed on a malformed dep id (unchanged
+    T-2177 posture); a dropped-in-done sibling returns False via `_dep_is_shipped`.
+    """
     for dep in deps:
         if dep == just_resolved_tid:
             continue
-        if not re.fullmatch(r"T-\d{4}", dep):
+        if not _TICKET_ID_FULL_RE.fullmatch(dep):  # T-3215
             # Malformed dep id — fail closed (don't auto-unblock on uncertainty)
             return False
-        fname = f"{dep}.md"
-        if not (TICKETS_ROOT / "done" / fname).exists():
+        if not _dep_is_shipped(dep):
             return False
     return True
 
@@ -2824,12 +4147,12 @@ def _cascade_unblock_dependants(parent_tid: str) -> list[Path]:
         except TicketError:
             continue
         deps = t.fields.get("depends_on") or []
-        if not _all_other_deps_done(deps, parent_tid):
-            continue  # multi-dep partial-resolve; wait for the rest
+        if not _all_other_deps_shipped(deps, parent_tid):
+            continue  # multi-dep partial-resolve OR a dropped sibling; wait for the rest
 
-        # Remove parent_tid AND every already-done dep from depends_on (T-2177).
+        # Remove parent_tid AND every already-shipped dep from depends_on (T-2177).
         #
-        # The guard above (_all_other_deps_done) reasons over the WHOLE dep set;
+        # The guard above (_all_other_deps_shipped) reasons over the WHOLE dep set;
         # this mutation used to touch a SINGLE member. That asymmetry was the bug:
         # for depends_on [A, B], A resolving skipped correctly, then B resolving
         # fired and removed only B — stranding A, a DONE ticket, as a live gate
@@ -2845,7 +4168,7 @@ def _cascade_unblock_dependants(parent_tid: str) -> list[Path]:
         fields = t.fields
         remaining_deps = [
             d for d in deps
-            if d != parent_tid and not _dep_is_done(d)
+            if d != parent_tid and not _dep_is_shipped(d)
         ]
         fields["depends_on"] = remaining_deps
 
@@ -2868,6 +4191,95 @@ def _cascade_unblock_dependants(parent_tid: str) -> list[Path]:
 
         affected.append(dep_path)
     return affected
+
+
+def cmd_cascade(args: argparse.Namespace) -> int:
+    """ORG-013 cascade-unblock pass for an already-resolved tid (T-3289).
+
+    Closes the T-3288 PR-squash-merge gap: when a ticket lands in done/ via
+    `gh pr merge --squash` (or an admin-merge) rather than `ticket.py
+    resolve`, `_do_transition`'s cascade_callback hook never runs, so
+    dependants keep stale `depends_on:` refs indefinitely. This subcommand is
+    the standalone trigger `.github/workflows/cascade-on-merge.yml` invokes
+    per resolved tid it finds in a push's diff range.
+
+    Reuses `_cascade_unblock_dependants` VERBATIM (T-3288's diagnosis: the
+    cascade LOGIC is correct — the guard semantics tested extensively in
+    TestComputeUnblocks / the resolve-time path are unchanged — only the
+    PR-merge TRIGGER was missing). Also reuses the same lock/pull/re-verify
+    shape and the same `_commit_and_push` primitive that `_do_transition`
+    itself calls for the parent-transition case (single atomic commit,
+    HERMES guard, README rebuild, push-with-retry).
+
+    Deliberately does NOT call `_do_transition`: that function's contract is
+    a `git mv` state transition (`expected_state` -> `new_state`) of the
+    PASSED tid. Here `--tid` is already `done` and never moves — only its
+    DEPENDANTS' depends_on frontmatter changes. Forcing this through
+    `_do_transition` would require a fake no-op transition on a ticket that
+    isn't transitioning, which doesn't fit the function's shape.
+
+    Fail-closed (raises TicketError -> non-zero exit via main()'s catch):
+    tid is malformed, not found in any state, or found but not currently in
+    `done/`. Idempotent: a tid with no live dependants (every dependant
+    either already cleared, or blocked by a still-unshipped sibling dep per
+    `_all_other_deps_shipped`) makes no filesystem change and creates no commit
+    ("no cascade updates" — same idempotent-no-op-skips-commit shape as
+    `block --clear-dep` / `--clear-not-before`).
+    """
+    tid = args.tid
+    no_push = getattr(args, "no_push", False)
+
+    # Fail-fast BEFORE the lock/pull — same shape as _do_transition's initial
+    # expected-state check. A request for a tid that isn't (yet) done/ is a
+    # caller error a pull can't fix.
+    path = _find_ticket(tid)  # raises TicketError: malformed id or not found anywhere
+    if path.parent.name != "done":
+        raise TicketError(
+            f"cascade refused: {tid} is in `{path.parent.name}`, not `done` — "
+            f"cascade only fires for an already-resolved (done) tid"
+        )
+
+    # T-1770 Part b: the mutate -> stage -> commit -> push span is one atomic
+    # critical section against other writers on the shared checkout. The lock
+    # starts before the pull (which can itself bring in a concurrent writer's
+    # transition of this very tid) and extends through _commit_and_push.
+    with git_mutation_lock(label=f"cascade {tid}"):
+        _pull_if_needed(no_push)
+
+        # T-2140-style re-verify inside the lock, after the pull: prove the
+        # state again rather than trust the pre-lock check, which proves
+        # nothing by the time the lock is actually held.
+        current = _find_ticket(tid)
+        if current.parent.name != "done":
+            raise TicketError(
+                f"concurrent-transition conflict: {tid} was in `done` when "
+                f"checked but is now in `{current.parent.name}` — another "
+                f"writer moved it while this cascade was waiting for the "
+                f"lock. Nothing was changed. Re-read and retry."
+            )
+
+        affected = _cascade_unblock_dependants(tid)
+        if not affected:
+            print(f"cascade {tid}: no cascade updates")
+            return 0
+
+        cascade_count = len(affected)
+        # Distinct subject from resolve's own "tickets: resolve <tid> — ..."
+        # (which carries its cascade line in the BODY) so `git log` can tell
+        # a PR-merge-triggered cascade apart from a resolve-time one.
+        commit_message = (
+            f"cascade: {tid} → {cascade_count} dependant"
+            f"{'s' if cascade_count != 1 else ''} updated\n\n"
+            f"Auto-unblock cascade per ORG-013 (orig. T-0328), invoked via "
+            f"`ticket.py cascade` (T-3289 PR-merge trigger)."
+        )
+        _commit_and_push(affected, commit_message, no_push=no_push)
+
+    print(
+        f"cascade {tid}: {cascade_count} dependant"
+        f"{'s' if cascade_count != 1 else ''} had depends_on updated in place"
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -3100,9 +4512,14 @@ def _apply_ratify_lift(
 
 
 def _valid_target_values() -> set[str]:
-    """Union of persona names + role IDs from the agent role map."""
-    from tools.agent_role_map import AGENT_ROLE_MAP
-    return set(AGENT_ROLE_MAP.keys()) | set(AGENT_ROLE_MAP.values()) | {"operator"}
+    """Persona names + role IDs + persona aliases (e.g. cairn) + operator.
+
+    Delegates to agent_role_map.valid_target_values() so the accepted-target set
+    has ONE source of truth. Before T-3478 this unioned the map keys/values
+    inline and so did not include persona aliases — a `requester: cairn` ticket
+    then failed retarget validation with `unknown target 'cairn'`."""
+    from tools.agent_role_map import valid_target_values
+    return valid_target_values()
 
 
 def _resolve_persona(value: str) -> str:
@@ -3284,6 +4701,10 @@ def cmd_retarget(args: argparse.Namespace) -> int:
             path = new_path
             paths_to_stage = [old_path_abs, new_path]
 
+        # T-3020 BT2 / ORG-078: stamp when target last changed. Same write +
+        # same commit as the target/state mutation above — free transactionality.
+        fields["retargeted_at"] = _now_iso()
+
         new_text = _build_ticket_text(fields, body)
         path.write_text(new_text, encoding="utf-8")
 
@@ -3301,6 +4722,219 @@ def cmd_retarget(args: argparse.Namespace) -> int:
         _commit_and_push(paths_to_stage, commit_message, no_push=args.no_push)
     state_suffix = f" (state {old_state} → {new_state})" if new_state != old_state else ""
     print(f"retarget {args.ticket} → {new_target}{state_suffix}")
+    return 0
+
+
+def cmd_purpose(args: argparse.Namespace) -> int:
+    """Set structured purpose fields without changing lifecycle state."""
+    from tools.ticket_purpose import PurposeEnforcement
+
+    tid = args.ticket
+    project_present, project_id, nearest = _purpose_values_from_args(args)
+    if not project_present or nearest is None:  # argparse requires both; defensive API guard
+        raise TicketError("purpose requires --project-id and --nearest-intent-ref")
+    raw_serves = getattr(args, "serves", None)
+    serves = raw_serves.strip() if isinstance(raw_serves, str) and raw_serves.strip() else None
+
+    _find_ticket(tid)  # fail before taking the mutation lock when plainly absent
+
+    no_push = getattr(args, "no_push", False)
+    with git_mutation_lock(label=f"purpose {tid}"):
+        _pull_if_needed(no_push)
+        path = _find_ticket(tid)
+        fields, body = parse_front_matter(path.read_text(encoding="utf-8"))
+        candidate = dict(fields)
+        candidate["project_id"] = project_id
+        candidate["nearest_intent_ref"] = nearest
+        if serves is not None:
+            candidate["serves"] = serves
+        if candidate == fields:
+            raise TicketError(
+                f"purpose: {tid} already has exactly those values; refusing empty no-op"
+            )
+        issues = _purpose_issues_for_fields(
+            candidate, mode=PurposeEnforcement.ENFORCE
+        )
+        if issues:
+            detail = "; ".join(f"{issue.code}: {issue.detail}" for issue in issues)
+            raise TicketError(f"purpose validation refused {tid}: {detail}")
+        fields = candidate
+        body = append_transition(
+            body,
+            _actor(),
+            "purpose-set",
+            f"project_id={project_id if project_id is not None else 'null'}; "
+            f"nearest_intent_ref={nearest}",
+        )
+        path.write_text(_build_ticket_text(fields, body), encoding="utf-8")
+        _commit_and_push(
+            [path], f"tickets: set structured purpose for {tid}", no_push=no_push
+        )
+    print(f"purpose set for {tid} (state preserved: {fields.get('state')})")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# T-3020 BT5 / ORG-078 scope-addition: `ticket.py label` verb (add/remove/list)
+# + backfill-audit. Motivated by Recovery's rollout-gap flag — ORG-078 sorts on
+# arc-labels but tickets don't reliably carry them (T-3026 had zero labels).
+# See T-3020 transition log for the full scope-addition note.
+# ---------------------------------------------------------------------------
+
+
+def _read_labels(tid: str) -> list[str]:
+    """Read-only: current `labels` frontmatter for a ticket. No side effects."""
+    path = _find_ticket(tid)
+    text = path.read_text(encoding="utf-8")
+    fields, _body = parse_front_matter(text)
+    return list(fields.get("labels") or [])
+
+
+def _labels_add_frontmatter(
+    fields: dict, labels_to_add: list[str]
+) -> tuple[dict, list[str], list[str]]:
+    """Pure: add `labels_to_add` to `fields["labels"]`, deduping.
+
+    Returns `(new_fields, added, already_present)`. Order of `labels_to_add`
+    is preserved for both the `added` and `already_present` outputs.
+    """
+    current = list(fields.get("labels") or [])
+    added: list[str] = []
+    already_present: list[str] = []
+    for label in labels_to_add:
+        if label in current:
+            already_present.append(label)
+        else:
+            current.append(label)
+            added.append(label)
+    new_fields = dict(fields)
+    new_fields["labels"] = current
+    return new_fields, added, already_present
+
+
+def _labels_remove_frontmatter(
+    fields: dict, labels_to_remove: list[str]
+) -> tuple[dict, list[str], list[str]]:
+    """Pure: remove `labels_to_remove` from `fields["labels"]`.
+
+    Returns `(new_fields, removed, missing)`. Does not decide error-vs-no-op
+    semantics for a partial miss — that's `cmd_label_remove`'s job (this stays
+    a pure field-transform, mirroring `_labels_add_frontmatter`).
+    """
+    current = list(fields.get("labels") or [])
+    missing = [label for label in labels_to_remove if label not in current]
+    removed = [label for label in labels_to_remove if label in current]
+    new_current = [label for label in current if label not in labels_to_remove]
+    new_fields = dict(fields)
+    new_fields["labels"] = new_current
+    return new_fields, removed, missing
+
+
+def cmd_label_add(args: argparse.Namespace) -> int:
+    """`ticket.py label add <T-NNNN> <label> [<label>...]` — idempotent add.
+
+    Adding an already-present label is a no-op for that label (not an error);
+    if EVERY named label is already present, the whole call is a no-op (exit 0,
+    no commit). Refuses on done/ (closed; matches retarget/block convention).
+    """
+    tid: str = args.ticket
+    labels_to_add: list[str] = args.labels
+    no_push: bool = getattr(args, "no_push", False)
+
+    path = _find_ticket(tid)
+    if path.parent.name == "done":
+        raise TicketError(
+            f"state-mismatch: {tid} is in `done`; label add refuses on done (closed)"
+        )
+
+    text = path.read_text(encoding="utf-8")
+    fields, body = parse_front_matter(text)
+    new_fields, added, already_present = _labels_add_frontmatter(fields, labels_to_add)
+
+    if not added:
+        print(
+            f"label add {tid}: already-present: {', '.join(already_present)}; no change",
+            file=sys.stderr,
+        )
+        return 0
+
+    actor = _actor()
+    detail = f"labels added: {', '.join(added)}"
+    if already_present:
+        detail += f"; already-present (skipped): {', '.join(already_present)}"
+    body = append_transition(body, actor, "labels added", detail)
+    new_text = _build_ticket_text(new_fields, body)
+
+    # T-1770 Part b: pull → write → commit is one atomic critical section.
+    with git_mutation_lock(label=f"label add {tid}"):
+        _pull_if_needed(no_push)
+        path.write_text(new_text, encoding="utf-8")
+        commit_message = _build_commit_message("label-add", tid, _extract_title(body), detail)
+        _commit_and_push([path], commit_message, no_push=no_push)
+
+    suffix = f"; already-present: [{', '.join(already_present)}]" if already_present else ""
+    print(f"label add {tid}: added [{', '.join(added)}]{suffix}")
+    return 0
+
+
+def cmd_label_remove(args: argparse.Namespace) -> int:
+    """`ticket.py label remove <T-NNNN> <label> [<label>...]`.
+
+    ALL named labels absent -> idempotent no-op (exit 0, warning, no commit) —
+    names no target that's actually there, same shape as `block --clear-deps`.
+    SOME (not all) named labels absent -> CLEAN ERROR (exit 1) naming the miss
+    — mirrors `block --clear-dep`'s asymmetry: a partial miss names a specific
+    target that isn't there, so it's surfaced rather than silently dropped.
+    Refuses on done/ (closed; matches retarget/block convention).
+    """
+    tid: str = args.ticket
+    labels_to_remove: list[str] = args.labels
+    no_push: bool = getattr(args, "no_push", False)
+
+    path = _find_ticket(tid)
+    if path.parent.name == "done":
+        raise TicketError(
+            f"state-mismatch: {tid} is in `done`; label remove refuses on done (closed)"
+        )
+
+    text = path.read_text(encoding="utf-8")
+    fields, body = parse_front_matter(text)
+    new_fields, removed, missing = _labels_remove_frontmatter(fields, labels_to_remove)
+
+    if missing and not removed:
+        print(
+            f"label remove {tid}: none of {labels_to_remove} present; no change",
+            file=sys.stderr,
+        )
+        return 0
+    if missing:
+        current = fields.get("labels") or []
+        raise TicketError(
+            f"label remove {tid}: label(s) not present: {missing}; "
+            f"current labels = {current or '[]'}"
+        )
+
+    actor = _actor()
+    detail = f"labels removed: {', '.join(removed)}"
+    body = append_transition(body, actor, "labels removed", detail)
+    new_text = _build_ticket_text(new_fields, body)
+
+    # T-1770 Part b: pull → write → commit is one atomic critical section.
+    with git_mutation_lock(label=f"label remove {tid}"):
+        _pull_if_needed(no_push)
+        path.write_text(new_text, encoding="utf-8")
+        commit_message = _build_commit_message("label-remove", tid, _extract_title(body), detail)
+        _commit_and_push([path], commit_message, no_push=no_push)
+
+    print(f"label remove {tid}: removed [{', '.join(removed)}]")
+    return 0
+
+
+def cmd_label_list(args: argparse.Namespace) -> int:
+    """`ticket.py label list <T-NNNN>` — print current labels, one per line.
+    Read-only; no side effects."""
+    for label in _read_labels(args.ticket):
+        print(label)
     return 0
 
 
@@ -3749,6 +5383,170 @@ def compute_unblocks(tickets: list[Ticket]) -> dict[str, list[str]]:
     return out
 
 
+# ---------------------------------------------------------------------------
+# T-3020 BT5: `ticket.py label backfill-audit` — report-only suggestion tool.
+# Never auto-applies; operator reviews the report and applies via a
+# `ticket.py label add` loop (per T-3020's scope-addition note).
+# ---------------------------------------------------------------------------
+
+# Labels that name a whole arc/project and are expected to propagate across
+# parent_ticket / depends_on chains. Pattern-shaped (not a static list)
+# because the brief's own examples ARE patterns: t-XXXX-arc, phase-N-*,
+# org-XXX. A label matching one of these AND not in `_PER_TICKET_LABELS`
+# below is "inheritable".
+_INHERITABLE_LABEL_PATTERNS: tuple[re.Pattern, ...] = (
+    re.compile(r"^t-\d+-arc$"),          # e.g. t-2953-arc, t-3071-arc
+    re.compile(r"^[a-z][a-z0-9]*-arc$"), # generic <project>-arc
+    re.compile(r"^phase-\d+(-.+)?$"),    # phase-N-*
+    re.compile(r"^org-\d+$"),            # org-XXX
+    re.compile(r"^harness-controller$"),
+    re.compile(r"^concordance$"),
+)
+
+# Labels that describe a property of ONE ticket, not the arc it belongs to —
+# never inherited even if they happen to match a pattern above. Exact-match
+# denylist; wins over `_INHERITABLE_LABEL_PATTERNS`.
+_PER_TICKET_LABELS: frozenset[str] = frozenset({
+    "interactive-required", "ratify-impl", "cutover", "preventive",
+    "re-eval", "quarterly", "production",
+})
+
+
+def _is_inheritable_label(label: str) -> bool:
+    if label in _PER_TICKET_LABELS:
+        return False
+    return any(pattern.match(label) for pattern in _INHERITABLE_LABEL_PATTERNS)
+
+
+def _parent_chain_suggestions(t: Ticket, by_id: dict[str, "Ticket"]) -> list[tuple[str, str]]:
+    """Direct parent_ticket only (not transitive — ORG-065 graph closure is
+    explicitly deferred per T-3020's scope-addition note, option (c))."""
+    parent_id = t.fields.get("parent_ticket")
+    if not parent_id:
+        return []
+    parent = by_id.get(str(parent_id).strip())
+    if parent is None:
+        return []
+    current = set(t.fields.get("labels") or [])
+    return [
+        (label, "parent-chain")
+        for label in (parent.fields.get("labels") or [])
+        if _is_inheritable_label(label) and label not in current
+    ]
+
+
+def _dep_chain_suggestions(
+    t: Ticket, tid: str, dependants_by_id: dict[str, list["Ticket"]]
+) -> list[tuple[str, str]]:
+    """Direction: dependant -> dependency. If ticket A `depends_on` t and A
+    carries an inheritable label, t (the dependency) is probably the same
+    arc and is suggested that label. Not the reverse (t's labels are not
+    propagated onto A here) — only one direction is named in the brief, and
+    doubling it would double the false-positive surface on a report-only
+    tool with no clear signal the reverse is wanted."""
+    current = set(t.fields.get("labels") or [])
+    out: list[tuple[str, str]] = []
+    for dependant in dependants_by_id.get(tid, []):
+        for label in dependant.fields.get("labels") or []:
+            if _is_inheritable_label(label) and label not in current:
+                out.append((label, "dep-chain"))
+    return out
+
+
+def _body_pattern_suggestions(
+    t: Ticket, known_labels: list[str], *, body_lines: int = 15
+) -> list[tuple[str, str]]:
+    """Substring-match `known_labels` (arc labels drawn from
+    rulebook/priority-list.md) against the ticket title + first `body_lines`
+    lines of body. Case-insensitive."""
+    current = set(t.fields.get("labels") or [])
+    haystack = " ".join([t.title, *t.body.splitlines()[:body_lines]]).lower()
+    out: list[tuple[str, str]] = []
+    for label in known_labels:
+        if label in current or not _is_inheritable_label(label):
+            continue
+        if label.lower() in haystack:
+            out.append((label, f"body-pattern:{label}"))
+    return out
+
+
+def _label_suggestions_for_ticket(
+    t: Ticket,
+    tid: str,
+    by_id: dict[str, "Ticket"],
+    dependants_by_id: dict[str, list["Ticket"]],
+    known_labels: list[str],
+) -> dict[str, set[str]]:
+    """label -> set of source tags that suggested it."""
+    merged: dict[str, set[str]] = {}
+    for label, source in (
+        _parent_chain_suggestions(t, by_id)
+        + _dep_chain_suggestions(t, tid, dependants_by_id)
+        + _body_pattern_suggestions(t, known_labels)
+    ):
+        merged.setdefault(label, set()).add(source)
+    return merged
+
+
+def _backfill_audit_report(scope: str | None) -> list[str]:
+    """Pure (besides reading the ticket tree): one line per ticket-with-
+    suggestions, `T-NNNN: missing [label-a, label-b] (source: ... / ...)`.
+    `scope` is one of inbox/active/done/all, or None for the default
+    inbox+active. Never raises — a priority-list parse failure just means
+    `known_labels` degrades to `[]` (parent-chain/dep-chain suggestions are
+    unaffected)."""
+    if scope == "all":
+        states: tuple[str, ...] = STATES
+    elif scope:
+        states = (scope,)
+    else:
+        states = ("inbox", "active")
+
+    all_tickets = _iter_all_tickets()
+    by_id = {(t.fields.get("id") or t.path.stem): t for t in all_tickets}
+    dependants_by_id: dict[str, list[Ticket]] = {}
+    for t in all_tickets:
+        tid = t.fields.get("id") or t.path.stem
+        for dep in t.fields.get("depends_on") or []:
+            dependants_by_id.setdefault(str(dep).strip(), []).append(t)
+
+    try:
+        known_labels = list(priority_list_parse.parse_file().keys())
+    except priority_list_parse.PriorityListParseError:
+        known_labels = []
+
+    lines: list[str] = []
+    scoped = sorted(
+        (t for t in all_tickets if t.state_dir in states),
+        key=lambda t: t.fields.get("id") or t.path.stem,
+    )
+    for t in scoped:
+        tid = t.fields.get("id") or t.path.stem
+        suggestions = _label_suggestions_for_ticket(t, tid, by_id, dependants_by_id, known_labels)
+        if not suggestions:
+            continue
+        labels_sorted = sorted(suggestions)
+        sources_sorted = sorted({s for srcs in suggestions.values() for s in srcs})
+        lines.append(
+            f"{tid}: missing [{', '.join(labels_sorted)}] "
+            f"(source: {' / '.join(sources_sorted)})"
+        )
+    return lines
+
+
+def cmd_label_backfill_audit(args: argparse.Namespace) -> int:
+    """`ticket.py label backfill-audit [--scope inbox|active|done|all]`.
+    Report-only — never mutates. Exit code is always 0 (informational)."""
+    scope = getattr(args, "scope", None)
+    lines = _backfill_audit_report(scope)
+    if not lines:
+        print("backfill-audit: no missing-label suggestions")
+        return 0
+    for line in lines:
+        print(line)
+    return 0
+
+
 def _format_age(created_iso: str, now: datetime | None = None) -> str:
     if now is None:
         now = datetime.now(timezone.utc)
@@ -3771,6 +5569,399 @@ def _format_age(created_iso: str, now: datetime | None = None) -> str:
     return f"{seconds // 86400}d"
 
 
+@dataclass
+class _PriorityInfo:
+    """Per-ticket ORG-078 priority computation result (T-3020 BT3).
+
+    `own_rank` — ceiling priority-rank across the ticket's OWN labels (§3);
+    `math.inf` if none match `rank_map`. `matched_label` — the label that
+    produced `own_rank` (None if own_rank is inf). `effective_rank` — after
+    dependency-inheritance (§Priority-inversion):
+    `min(own_rank, min(effective_rank of tickets whose depends_on contains
+    this ticket))`. `elevated_by` — the direct-dependent ticket id that
+    supplied `effective_rank`, set ONLY on a STRICT improvement
+    (`effective_rank < own_rank`); None otherwise (own rank stands even on a
+    tie — a tie doesn't need to borrow credit from a dependent).
+    """
+
+    own_rank: float
+    matched_label: str | None
+    effective_rank: float
+    elevated_by: str | None
+
+
+def _own_priority_rank(
+    labels: list[str] | None, rank_map: dict[str, int]
+) -> tuple[float, str | None]:
+    """Ceiling priority-rank (ORG-078 §1/§3): the MINIMUM rank across
+    `labels` that appear in `rank_map` (lower number = higher priority).
+    Multi-label ties (two labels sharing the lowest rank) resolve to
+    whichever is encountered first in `labels` order — display-only choice
+    of `matched_label`, doesn't affect the numeric rank. No label present in
+    `rank_map` (or `labels` empty/None) -> `(math.inf, None)`, the FIFO
+    tail."""
+    best_rank: float = math.inf
+    best_label: str | None = None
+    for label in labels or []:
+        rank = rank_map.get(label)
+        if rank is not None and rank < best_rank:
+            best_rank = rank
+            best_label = label
+    return best_rank, best_label
+
+
+def _effective_queue_ts(fields: dict) -> str:
+    """ORG-078 §3 secondary sort key: `fields['retargeted_at']` (T-3020 BT2)
+    if present, else `fields['created']`. Both are `_now_iso()`-shaped
+    (`%Y-%m-%dT%H:%M:%SZ`), so plain string comparison sorts correctly with
+    no datetime parsing needed."""
+    return str(fields.get("retargeted_at") or fields.get("created") or "")
+
+
+def _build_depends_on_graph(tickets_root: Path) -> dict[str, list[str]]:
+    """Ticket-id-keyed depends_on adjacency: `{tid: [prereq_tid, ...]}`,
+    restricted to ticket-kind targets. ORG-078's §Priority-inversion
+    inherits via `depends_on` ONLY — not the `implements`/`verifies`/
+    `supersedes` union ORG-065's acyclicity check uses — so this passes a
+    single-field `edge_fields` restriction, and unwraps
+    `ticket_lint.build_typed_edge_graph`'s `("ticket"|"obligation", id)`
+    NodeId shape down to bare ticket ids (an `obligation`-kind depends_on
+    target, or one pointing off a ticket entirely, is dropped — dependency
+    inheritance only makes sense between tickets).
+
+    Lazy-imports `tools.ticket_lint` — same circular-import guard
+    `_reject_if_cycle` and `cmd_ready`'s deadlock lookup already use
+    (`ticket_lint` imports FROM this module)."""
+    from tools.ticket_lint import build_typed_edge_graph
+
+    raw_graph = build_typed_edge_graph(tickets_root, edge_fields=("depends_on",))
+    out: dict[str, list[str]] = {}
+    for (src_kind, src_id), targets in raw_graph.items():
+        if src_kind != "ticket":
+            continue
+        out[src_id] = [tgt_id for (tgt_kind, tgt_id) in targets if tgt_kind == "ticket"]
+    return out
+
+
+def _compute_priority_info(
+    tickets: list["Ticket"],
+    rank_map: dict[str, int],
+    depends_on_graph: dict[str, list[str]],
+) -> dict[str, _PriorityInfo]:
+    """ORG-078 §3 own-rank + §Priority-inversion dependency-inheritance, in
+    one pass over `tickets` (a single graph snapshot per `list` invocation —
+    §Priority-inversion Implementation-shape).
+
+    `effective_rank[Y] = min(own_rank[Y], min(effective_rank[X] for X in
+    tickets whose depends_on contains Y))` — Y inherits the best rank of any
+    ticket that (directly or transitively) depends on it. Computed via a
+    Kahn's-algorithm topological walk over the reverse-depends_on adjacency:
+    a ticket's dependents are always processed before the ticket itself (a
+    node reaches in-degree 0 — ready to process — only once every ticket
+    that depends on it has already been processed), so each node's
+    `effective_rank` is only ever derived from already-finalized inputs.
+    O(V+E) total — matches ORG-078's linear-time requirement; ORG-065 §3.6
+    DAG-acyclicity guarantees termination. A residual cycle (shouldn't
+    happen given §3.6, but a read-only `list` must never hang on a bad
+    external invariant) leaves any unprocessed node at its own `own_rank` —
+    fails soft.
+
+    Returns `{tid: _PriorityInfo}` for every ticket in `tickets`. A
+    `depends_on` target outside `tickets` (dangling ref, or a ticket outside
+    this listing's node universe) contributes no inheritance and gets no
+    entry of its own.
+    """
+    own_rank: dict[str, float] = {}
+    matched_label: dict[str, str | None] = {}
+    for t in tickets:
+        tid = t.fields.get("id") or t.path.stem
+        rank, label = _own_priority_rank(t.fields.get("labels"), rank_map)
+        own_rank[tid] = rank
+        matched_label[tid] = label
+
+    # dependents_of[Y] = [X, ...] where X's depends_on contains Y (X depends
+    # on Y). in_degree[Y] = len(dependents_of[Y]) = count of Y's not-yet-
+    # processed dependents; Y becomes ready once every dependent is resolved.
+    dependents_of: dict[str, list[str]] = {}
+    in_degree: dict[str, int] = {tid: 0 for tid in own_rank}
+    for tid, prereqs in depends_on_graph.items():
+        if tid not in own_rank:
+            continue
+        for prereq in prereqs:
+            if prereq not in own_rank:
+                continue
+            dependents_of.setdefault(prereq, []).append(tid)
+            in_degree[prereq] += 1
+
+    effective_rank: dict[str, float] = {}
+    elevated_by: dict[str, str | None] = {}
+    queue: list[str] = [tid for tid, deg in in_degree.items() if deg == 0]
+    while queue:
+        next_queue: list[str] = []
+        for tid in queue:
+            best_rank = own_rank[tid]
+            best_source: str | None = None
+            for dependent in dependents_of.get(tid, []):
+                dep_rank = effective_rank[dependent]
+                if dep_rank < best_rank:
+                    best_rank = dep_rank
+                    best_source = dependent
+            effective_rank[tid] = best_rank
+            elevated_by[tid] = best_source
+            for prereq in depends_on_graph.get(tid, []):
+                if prereq not in in_degree:
+                    continue
+                in_degree[prereq] -= 1
+                if in_degree[prereq] == 0:
+                    next_queue.append(prereq)
+        queue = next_queue
+
+    # Residual-cycle guard: never leave a node unresolved (never hang).
+    for tid, rank in own_rank.items():
+        if tid not in effective_rank:
+            effective_rank[tid] = rank
+            elevated_by[tid] = None
+
+    return {
+        tid: _PriorityInfo(
+            own_rank=own_rank[tid],
+            matched_label=matched_label[tid],
+            effective_rank=effective_rank[tid],
+            elevated_by=elevated_by[tid],
+        )
+        for tid in own_rank
+    }
+
+
+def _record_priority_list_health(entry: dict) -> None:
+    """Best-effort JSON-line append to `PRIORITY_LIST_HEALTH_PATH` (ORG-078
+    §4 failure-mode telemetry + §Cadence-observation counters, T-3020 BT3).
+    Never raises — a telemetry-write failure must not break `ticket.py
+    list` (same fail-open posture as `closure_gate_health_monitor.py`'s
+    `--record`)."""
+    try:
+        PRIORITY_LIST_HEALTH_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with PRIORITY_LIST_HEALTH_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except OSError:
+        pass
+
+
+def _priority_list_dead_labels(
+    rank_map: dict[str, int], tickets: list["Ticket"]
+) -> list[str]:
+    """Labels that are keys of `rank_map` (i.e. referenced in
+    rulebook/priority-list.md) but carried by ZERO of `tickets` — the
+    "probably-dead label" detection named in ORG-078
+    §Priority-list-drift-hygiene, narrowed for T-3020 BT4 to a pure
+    zero-usage check (the ADR's richer high-volume + sample-matching
+    heuristics landed later, T-3080; semantic-drift deferred per T-3424).
+
+    `tickets` is expected to be the FULL corpus (inbox+active+done, e.g.
+    `_iter_all_tickets()`) — a label used only on a done ticket still
+    counts as used, per the brief's explicit tickets/{inbox,active,done}/
+    scope. Sorted for deterministic output."""
+    used: set[str] = set()
+    for t in tickets:
+        used.update(t.fields.get("labels") or [])
+    return sorted(label for label in rank_map if label not in used)
+
+
+def _priority_list_high_volume_labels(
+    rank_map: dict[str, int], tickets: list["Ticket"]
+) -> list[tuple[str, int]]:
+    """Labels carried by MORE than `PRIORITY_LIST_HIGH_VOLUME_THRESHOLD`
+    tickets across the full corpus (T-3080, ORG-078
+    §Priority-list-drift-hygiene: "labels that are HIGH-VOLUME (may be
+    over-broad)"). Same full-corpus scope as `_priority_list_dead_labels`.
+
+    Returns `(label, count)` pairs sorted by label."""
+    counts: dict[str, int] = {label: 0 for label in rank_map}
+    for t in tickets:
+        for label in t.fields.get("labels") or []:
+            if label in counts:
+                counts[label] += 1
+    return sorted(
+        (label, n) for label, n in counts.items()
+        if n > PRIORITY_LIST_HIGH_VOLUME_THRESHOLD
+    )
+
+
+def _priority_list_label_samples(
+    rank_map: dict[str, int], tickets: list["Ticket"]
+) -> dict[str, list[tuple[str, str]]]:
+    """For every priority-list label, up to `PRIORITY_LIST_SAMPLE_SIZE`
+    `(ticket_id, title)` pairs of tickets carrying it (T-3080, ORG-078
+    §Priority-list-drift-hygiene: "shows sample matching tickets per
+    ... label ... so the editor confirms the label attaches to the
+    intended tickets"). Sorted by ticket id and truncated (not randomly
+    sampled) — the lowest ids are typically a label's founding tickets,
+    the most useful confirmation sample; also keeps output deterministic.
+
+    Every label in `rank_map` gets a key, even an empty list (zero
+    matches — the dead-label case), so callers never need to guard a
+    KeyError."""
+    matches: dict[str, list[tuple[str, str]]] = {label: [] for label in rank_map}
+    for t in tickets:
+        tid = t.fields.get("id") or t.path.stem
+        for label in t.fields.get("labels") or []:
+            if label in matches:
+                matches[label].append((tid, t.title))
+    return {
+        label: sorted(pairs)[:PRIORITY_LIST_SAMPLE_SIZE]
+        for label, pairs in matches.items()
+    }
+
+
+def _priority_list_validate_report() -> tuple[int, list[str]]:
+    """ORG-078 §Priority-list-drift-hygiene validation (T-3020 BT4 dead-
+    label check + T-3080 high-volume heuristic): parse
+    `rulebook/priority-list.md`, then check for probably-dead and
+    high-volume labels.
+
+    Returns `(exit_code, lines)`:
+      0  — clean parse, no warnings fired. `lines` is a single
+           human-readable summary.
+      1  — `PriorityListParseError` — `lines` is `[str(exc)]` (carries the
+           parser's failure-class prefix, e.g. "sentinel-missing: ...").
+      2  — clean parse, but >=1 warning (dead-label / high-volume) fired —
+           `lines` is one message per warning; a single label can appear
+           more than once if it trips more than one heuristic.
+
+    No printing, no sys.exit — callers (the CLI wrapper below and the
+    pre-commit hook) own presentation and blocking-vs-warning semantics,
+    which differ between the two (CLI surfaces exit 2 as a caller-visible
+    warn-exit; the hook treats exit 2 as non-blocking). Sample-matching
+    output (T-3080 ask #3) is NOT part of this report — it's an
+    always-on informational surface, not a warn/ok signal, and is
+    generated separately by the CLI wrapper below.
+
+    NOTE: semantic-drift heuristic (ORG-078's fourth named check) is
+    DEFERRED per T-3424 — first-cut static parent_ticket-root-fanout
+    implementation false-fired on legitimate cross-cutting labels; the
+    ADR's "suddenly" wording implies a temporal signal that needs a
+    proper design pass."""
+    try:
+        rank_map = priority_list_parse.parse_file()
+    except priority_list_parse.PriorityListParseError as exc:
+        return 1, [str(exc)]
+
+    tickets = _iter_all_tickets()
+    warnings: list[str] = []
+
+    warnings.extend(
+        f"label {label!r} is referenced in rulebook/priority-list.md but "
+        "carried by zero tickets across tickets/{inbox,active,done}/ "
+        "(probably-dead label)"
+        for label in _priority_list_dead_labels(rank_map, tickets)
+    )
+    warnings.extend(
+        f"label {label!r} is carried by {count} tickets across "
+        "tickets/{inbox,active,done}/, above the "
+        f"{PRIORITY_LIST_HIGH_VOLUME_THRESHOLD}-ticket high-volume "
+        "threshold (may be over-broad)"
+        for label, count in _priority_list_high_volume_labels(rank_map, tickets)
+    )
+
+    if warnings:
+        return 2, warnings
+    return 0, [
+        f"priority-list parses cleanly; {len(rank_map)} label(s), 0 warnings"
+    ]
+
+
+def _fmt_priority_list_samples(rank_map: dict[str, int], tickets: list["Ticket"]) -> list[str]:
+    """Render the T-3080 sample-matching section: for every priority-list
+    label (sorted), up to `PRIORITY_LIST_SAMPLE_SIZE` `id: title` lines, or
+    an explicit "(no matching tickets)" marker for a dead label — the
+    editor's "did I attach the right label" confirmation surface (ORG-078
+    §Priority-list-drift-hygiene)."""
+    samples = _priority_list_label_samples(rank_map, tickets)
+    lines = ["sample matching tickets per label:"]
+    for label in sorted(samples):
+        lines.append(f"  {label}:")
+        pairs = samples[label]
+        if not pairs:
+            lines.append("    (no matching tickets)")
+        else:
+            lines.extend(f"    {tid}: {title}" for tid, title in pairs)
+    return lines
+
+
+def cmd_priority_list_validate(args: argparse.Namespace) -> int:
+    """`ticket.py priority-list validate` (ORG-078 §Priority-list-drift-hygiene,
+    T-3020 BT4 + T-3080). Read-only. Exit 0 clean / 1 parse-fail / 2 parse-
+    ok-with-warnings — see `_priority_list_validate_report`. When the parse
+    succeeds (any exit code but 1), also prints the T-3080 sample-matching
+    section to stdout — an always-on surface, independent of warn/ok."""
+    code, lines = _priority_list_validate_report()
+    prefix = {0: "ok", 1: "error", 2: "warning"}[code]
+    stream = sys.stdout if code == 0 else sys.stderr
+    for line in lines:
+        print(f"{prefix}: {line}", file=stream)
+
+    if code != 1:
+        rank_map = priority_list_parse.parse_file()
+        print("", file=sys.stdout)
+        for line in _fmt_priority_list_samples(rank_map, _iter_all_tickets()):
+            print(line, file=sys.stdout)
+    return code
+
+
+def _fmt_rank(rank: float) -> str:
+    """Render a priority rank for human-facing output: `math.inf` -> `∞`
+    (the FIFO tail), else the plain integer."""
+    return "∞" if rank == math.inf else str(int(rank))
+
+
+def _explain_priority_report(
+    tid: str, info: _PriorityInfo, info_by_id: dict[str, _PriorityInfo]
+) -> str:
+    """Render the `--explain-priority T-NNNN` diagnostic (ORG-078
+    §Priority-inversion + §Missing-label-detection: "doubles as an
+    operator-facing sanity check"). No ADR-literal output-shape spec exists
+    (the dispatch brief's "§5" citation didn't resolve to an actual
+    section) — this format is an autonomous design call: prose over a
+    table, since it's always exactly one ticket.
+
+    Reports own_rank + matched_label, effective_rank, and — when
+    `info.elevated_by` is set — the full inheritance chain (walks
+    `elevated_by` through `info_by_id` until it bottoms out at the ticket
+    whose own_rank actually supplied the value)."""
+    lines = [f"--explain-priority {tid}"]
+    if info.matched_label is not None:
+        lines.append(
+            f"  own_rank: {_fmt_rank(info.own_rank)} (matched label {info.matched_label!r})"
+        )
+    else:
+        lines.append(f"  own_rank: {_fmt_rank(info.own_rank)} (no label in priority-list matched)")
+
+    if info.elevated_by is None:
+        lines.append(
+            f"  effective_rank: {_fmt_rank(info.effective_rank)} "
+            "(own rank stands — no dependent elevates it)"
+        )
+    else:
+        chain = [tid]
+        cur: str | None = info.elevated_by
+        while cur is not None:
+            chain.append(cur)
+            cur_info = info_by_id.get(cur)
+            cur = cur_info.elevated_by if cur_info else None
+        source = chain[-1]
+        source_rank = info_by_id[source].own_rank if source in info_by_id else info.effective_rank
+        lines.append(
+            f"  effective_rank: {_fmt_rank(info.effective_rank)} "
+            f"(inherited via depends_on chain: {' <- '.join(chain)}; "
+            f"source {source} own_rank {_fmt_rank(source_rank)})"
+        )
+    lines.append(
+        "  sort keys: (effective_rank, effective_queue_ts, ticket_id) ASC — "
+        "ties broken by ticket_id (ORG-078 §3)"
+    )
+    return "\n".join(lines)
+
+
 def cmd_list(args: argparse.Namespace) -> int:
     all_tickets = _iter_all_tickets()
     # T-2720: unblocks is computed over the FULL corpus, before any of the
@@ -3778,6 +5969,64 @@ def cmd_list(args: argparse.Namespace) -> int:
     # ROWS print, not what a shown ticket unblocks (a dependent outside the
     # filter still counts).
     unblocks = compute_unblocks(all_tickets) if args.show_unblocks else {}
+
+    sort_mode: str = getattr(args, "sort", "priority") or "priority"
+    explain_tid: str | None = getattr(args, "explain_priority", None)
+
+    # T-3020 BT3 / ORG-078 §3/§4: priority_info is only computed when needed
+    # — `--sort created|retargeted` bypass the priority-list parse entirely
+    # (ADR §4), so neither the parse nor the telemetry write fires for them.
+    priority_info: dict[str, _PriorityInfo] = {}
+    if sort_mode == "priority" or explain_tid:
+        rank_map: dict[str, int] = {}
+        parse_ok = True
+        fail_class: str | None = None
+        try:
+            rank_map = priority_list_parse.parse_file()
+        except priority_list_parse.PriorityListParseError as exc:
+            parse_ok = False
+            fail_class = str(exc).split(":", 1)[0]
+            print(
+                f"warning: priority-list parse failed ({fail_class}); "
+                f"falling back to created-ASC FIFO ({exc})",
+                file=sys.stderr,
+            )
+            sort_mode = "created"
+
+        if parse_ok:
+            depends_on_graph = _build_depends_on_graph(TICKETS_ROOT)
+            priority_info = _compute_priority_info(all_tickets, rank_map, depends_on_graph)
+
+        n_ranked = sum(1 for i in priority_info.values() if i.effective_rank != math.inf)
+        n_labels_seen = sum(1 for i in priority_info.values() if i.own_rank != math.inf)
+        n_promotions = sum(1 for i in priority_info.values() if i.elevated_by is not None)
+        _record_priority_list_health(
+            {
+                "ts": _now_iso(),
+                "parse_ok": parse_ok,
+                "parse_fail_class": fail_class,
+                "n_tickets_ranked": n_ranked,
+                "n_tickets_tail_fifo": len(all_tickets) - n_ranked,
+                "n_dep_inherit_promotions": n_promotions,
+                "n_ticket_labels_seen": n_labels_seen,
+            }
+        )
+
+    if explain_tid:
+        if not any((t.fields.get("id") or t.path.stem) == explain_tid for t in all_tickets):
+            print(f"(no such ticket: {explain_tid})", file=sys.stderr)
+            return 1
+        info = priority_info.get(explain_tid)
+        if info is None:
+            # Parse failed — priority_info is empty; nothing to explain.
+            print(
+                f"(priority-list unavailable; {explain_tid}'s rank cannot be "
+                "explained — see stderr warning above)"
+            )
+            return 0
+        print(_explain_priority_report(explain_tid, info, priority_info))
+        return 0
+
     tickets = all_tickets
     if args.state:
         tickets = [t for t in tickets if t.fields.get("state") == args.state]
@@ -3791,6 +6040,21 @@ def cmd_list(args: argparse.Namespace) -> int:
     if not tickets:
         print("(no tickets)")
         return 0
+
+    def _tid(t: "Ticket") -> str:
+        return t.fields.get("id") or t.path.stem
+
+    if sort_mode == "priority":
+        def _priority_key(t: "Ticket"):
+            info = priority_info.get(_tid(t))
+            rank = info.effective_rank if info else math.inf
+            return (rank, _effective_queue_ts(t.fields), _tid(t))
+
+        tickets = sorted(tickets, key=_priority_key)
+    elif sort_mode == "retargeted":
+        tickets = sorted(tickets, key=lambda t: (_effective_queue_ts(t.fields), _tid(t)))
+    else:  # "created" — either explicit --sort created, or the parse-failure fallback
+        tickets = sorted(tickets, key=lambda t: (t.fields.get("created", ""), _tid(t)))
 
     rows = []
     for t in tickets:
@@ -3849,6 +6113,12 @@ def cmd_ready(args: argparse.Namespace) -> int:
     or is absent (ORG-019 block semantics). Optional `--target` filter. Read-only.
     """
     now = datetime.now(timezone.utc)
+    # T-3540: caller may hide tickets carrying certain labels — e.g. an
+    # autonomous scan asking "what can I do solo right now" excludes
+    # `interactive-required` (structurally needs a supervised/human session,
+    # so it can never be picked up autonomously). Read-only, additive; absent
+    # → default set() → behaviour unchanged.
+    exclude_labels = set(getattr(args, "exclude_label", None) or [])
     tickets = _iter_all_tickets()
     # T-2720: unblocks over the full unfiltered corpus — see cmd_list.
     unblocks = compute_unblocks(tickets) if args.show_unblocks else {}
@@ -3862,6 +6132,8 @@ def cmd_ready(args: argparse.Namespace) -> int:
             continue
         nb = t.fields.get("not_before")
         if nb and not _not_before_passed(nb, now):  # future calendar gate → blocked
+            continue
+        if exclude_labels & set(t.fields.get("labels") or []):  # T-3540 label filter
             continue
         ready.append(t)
 
@@ -3877,7 +6149,7 @@ def cmd_ready(args: argparse.Namespace) -> int:
         # identical in the healthy and the wedged case, so it could not
         # discriminate the only two states a reader cares about.
         scope = f" for target '{args.target}'" if args.target else ""
-        dep_blocked, date_blocked = [], []
+        dep_blocked, date_blocked, label_excluded = [], [], []
         for t in tickets:
             if t.fields.get("state") not in ("inbox", "active"):
                 continue
@@ -3885,20 +6157,33 @@ def cmd_ready(args: argparse.Namespace) -> int:
                 continue
             if t.fields.get("depends_on"):
                 dep_blocked.append(t.fields.get("id", "?"))
-            else:
-                nb = t.fields.get("not_before")
-                if nb and not _not_before_passed(nb, now):
-                    date_blocked.append(t.fields.get("id", "?"))
-        if not dep_blocked and not date_blocked:
+                continue
+            nb = t.fields.get("not_before")
+            if nb and not _not_before_passed(nb, now):
+                date_blocked.append(t.fields.get("id", "?"))
+                continue
+            # T-3540: a ticket the caller's --exclude-label hid is otherwise-ready,
+            # NOT gated — account for it separately so "genuinely EMPTY" stays honest.
+            if exclude_labels & set(t.fields.get("labels") or []):
+                label_excluded.append(t.fields.get("id", "?"))
+        if not dep_blocked and not date_blocked and not label_excluded:
             print(f"(no ready tickets{scope} — and none blocked either: the queue "
                   f"is genuinely EMPTY, not gated)")
             return 0
-        print(f"(no ready tickets{scope} — but {len(dep_blocked)} dep-gated, "
-              f"{len(date_blocked)} date-gated, so the queue is NOT empty)")
+        parts = []
+        if dep_blocked:
+            parts.append(f"{len(dep_blocked)} dep-gated")
+        if date_blocked:
+            parts.append(f"{len(date_blocked)} date-gated")
+        if label_excluded:
+            parts.append(f"{len(label_excluded)} label-excluded")
+        print(f"(no ready tickets{scope} — but {', '.join(parts)}, so the queue is NOT empty)")
         if dep_blocked:
             print(f"  dep-gated:  {', '.join(sorted(dep_blocked))}")
         if date_blocked:
             print(f"  date-gated: {', '.join(sorted(date_blocked))}")
+        if label_excluded:
+            print(f"  label-excluded: {', '.join(sorted(label_excluded))}")
         # A cycle among those is a DEADLOCK, not a gate — it will never clear on
         # its own, so it is the one case that needs a human now. Lazy import:
         # ticket_lint imports FROM this module, so a top-level import would be
@@ -4164,6 +6449,60 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="parent ticket id (T-NNNN format); links this ticket as a child for lineage tracking",
     )
+    f.add_argument(
+        "--project-id",
+        default=None,
+        metavar="STABLE-ID|null",
+        help="T-3168/ORG-054 stable project membership. Use literal 'null' for "
+             "goal/project-formation roots or goal-neutral maintenance; omission "
+             "is retained only for historic compatibility.",
+    )
+    f.add_argument(
+        "--nearest-intent-ref",
+        dest="nearest_intent_ref",
+        default=None,
+        metavar="ticket:T-NNNN|project:ID|goal:KEY|maintenance:ASSET",
+        help="T-3168/ORG-054 typed nearest-purpose edge. Goal-neutral maintenance "
+             "must name the maintained asset with maintenance:<asset-ref>.",
+    )
+    # T-2841 / ORG-065 BT1: typed-edge fields (warn-only model layer). Each is
+    # a comma-separated list of targets — a ticket id (T-NNNN) or an ADR
+    # obligation/clause id (ADR-NNN#E<k> / ORG-NNN#E<k>.C<m>). Set only at
+    # file-time in this phase (mirrors --parent-ticket's set-once-at-creation
+    # precedent); a post-creation editor is a natural follow-up once real
+    # usage patterns emerge (kept out of scope here — P7).
+    f.add_argument(
+        "--implements", default=None,
+        help="comma-separated targets (T-NNNN or ADR-NNN#E<k>[.C<m>]) this "
+             "ticket implements — ticket -> ADR obligation, or -> parent work",
+    )
+    f.add_argument(
+        "--verifies", default=None,
+        help="comma-separated targets (T-NNNN or ADR-NNN#E<k>[.C<m>]) this "
+             "ticket's evidence verifies (satisfies) — ticket -> ADR obligation. "
+             "A T-NNNN target is a BT1 simplification (stands in for a real "
+             "commit/test/evidence receipt, which doesn't have a node identity "
+             "yet) — see _EDGE_TARGET_RE's docstring before treating it as "
+             "closure-validation-ready evidence.",
+    )
+    f.add_argument(
+        "--supersedes", default=None,
+        help="comma-separated targets (T-NNNN or ADR-NNN#E<k>[.C<m>]) this "
+             "ticket replaces",
+    )
+    f.add_argument(
+        "--informs", default=None,
+        help="comma-separated targets (T-NNNN or ADR-NNN#E<k>[.C<m>]) this "
+             "ticket advises — NEVER gates, acyclicity-exempt (ORG-065 §3.6)",
+    )
+    f.add_argument(
+        "--ratifies", default=None,
+        help="comma-separated targets (T-NNNN or ADR-NNN#E<k>[.C<m>]) this "
+             "ticket ratifies — DISTINCT from --implements (T-3476 / ORG-065 "
+             "Call 1): a ratifies edge alone never satisfies an implements-"
+             "obligation. Whole-ADR anchoring uses the reserved element id "
+             "#E0 (T-3205 policy).",
+    )
     f.add_argument("--stale-after", default=None, help="e.g. 4h, 2d")
     f.add_argument(
         "--not-before",
@@ -4235,9 +6574,13 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="T-1103 / ORG-034: arc-intent declaration — a short phrase naming "
              "what this ticket serves (e.g. a goals.md key or a free-text arc "
-             "descriptor). 'goal-neutral-maintenance' is a valid value for "
-             "housekeeping tickets. Optional; the ticket-lint will WARN (never "
-             "fail) on new inbox tickets that omit this field.",
+             "descriptor). Also the goal-edge in the T-3328 lineage DAG: this "
+             "is how a ticket traces to a rulebook/goals.md north star. "
+             "'goal-neutral-maintenance' is a valid value for housekeeping "
+             "tickets; 'operator-ad-hoc' is a valid value for a genuine "
+             "one-off with no goal alignment (both non-goal-root conventions, "
+             "free text — no registry enforcement yet). Satisfies the T-3328 "
+             "file-time lineage guard (see --orphan below for the alternative).",
     )
     f.add_argument(
         "--retest-status",
@@ -4248,7 +6591,56 @@ def _build_parser() -> argparse.ArgumentParser:
              "Optional; set by s3star_audit_runner.py's finding filer to 'pending' "
              "at file time. Not for general ticket-filing use.",
     )
+    f.add_argument(
+        "--orphan",
+        default=None,
+        metavar="JUSTIFICATION",
+        help="T-3328: file this ticket with NO lineage edge (parent-ticket/"
+             "depends-on/serves/implements/verifies/supersedes/informs/"
+             "ratifies) — "
+             "rare, for genuine root-tier work with no natural connection to "
+             "a goal, ADR, or parent ticket. Requires a >=20-char "
+             "justification, stored as orphan_reason: in frontmatter for "
+             "audit. Prefer a real edge when one exists.",
+    )
+    f.add_argument(
+        "--appetite",
+        dest="appetite",
+        default=None,
+        metavar="1-10",
+        help="T-3440 / ORG-089: bet-sizing score (integer 1-10, average of "
+             "value / strategic-alignment / reversibility per §Decision.3). "
+             "REQUIRED for an applicable bet (bet_ref / non-vault-ADR parent / "
+             "non-hygiene serves) — filing without it is refused (AppetiteRequired). "
+             "Hygiene or goal-neutral-maintenance work is exempt (medium-default 5).",
+    )
+    f.add_argument(
+        "--bet-ref",
+        dest="bet_ref",
+        default=None,
+        metavar="REF",
+        help="T-3440 / ORG-089: optional reference to the bet this ticket serves "
+             "(e.g. an ADR id). Its presence marks the ticket a bet for the "
+             "appetite-applicability check.",
+    )
     f.set_defaults(func=cmd_file)
+
+    purpose = sub.add_parser(
+        "purpose",
+        help="set structured purpose fields without changing ticket state",
+    )
+    purpose.add_argument("ticket")
+    purpose.add_argument(
+        "--project-id", required=True, metavar="STABLE-ID|null",
+        help="stable project id, or literal null for an explicit root",
+    )
+    purpose.add_argument(
+        "--nearest-intent-ref", dest="nearest_intent_ref", required=True,
+        metavar="ticket:T-NNNN|project:ID|goal:KEY|maintenance:ASSET",
+    )
+    purpose.add_argument("--serves", default=None)
+    purpose.add_argument("--no-push", dest="no_push", action="store_true", default=False)
+    purpose.set_defaults(func=cmd_purpose)
 
     c = sub.add_parser("claim", help="move ticket inbox/ → active/")
     c.add_argument("ticket")
@@ -4413,7 +6805,89 @@ def _build_parser() -> argparse.ArgumentParser:
     r.add_argument("--with", dest="with_summary", default=None)
     r.add_argument("--no-push", dest="no_push", action="store_true", default=False,
                    help="commit locally but skip git push; the next pushing op (or a manual push) carries it to origin")
+    r.add_argument(
+        "--receipt",
+        action="append",
+        default=None,
+        metavar="CLAUSE=RECEIPT_ID=PROVENANCE",
+        help="T-2842 / ORG-065 BT2: attach an obligation-clause receipt at "
+             "resolve time, e.g. ADR-2842#E1.C1=ci-run:12345=ci. Repeatable. "
+             "Feeds the closure-validation gate (ORG-065 §3.3) — GATING by "
+             "default since the T-2934 flip (2026-08-12): resolve is refused "
+             "when a required clause is unsatisfied. "
+             "PANTHEON_CLOSURE_GATE_MODE=warn demotes to warn-only.",
+    )
     r.set_defaults(func=cmd_resolve)
+
+    # T-3440 / ORG-089: the four appetite re-decision verbs.
+    re_earn = sub.add_parser(
+        "re-earn",
+        help="ORG-089: clear appetite-overrun with a new appetite + rationale "
+             "(stays active; restarts the overrun clock)",
+    )
+    re_earn.add_argument("ticket")
+    re_earn.add_argument("--appetite", required=True, metavar="1-10",
+                         help="new appetite score (integer 1-10)")
+    re_earn.add_argument("--rationale", required=True,
+                         help="why the bet is still worth it at the new score")
+    re_earn.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                         help="commit locally but skip git push")
+    re_earn.set_defaults(func=cmd_re_earn)
+
+    adj = sub.add_parser(
+        "adjust-appetite",
+        help="ORG-089: correct the appetite score in place (the ORIGINAL score "
+             "was wrong; does not restart the clock)",
+    )
+    adj.add_argument("ticket")
+    adj.add_argument("--appetite", required=True, metavar="1-10",
+                     help="corrected appetite score (integer 1-10)")
+    adj.add_argument("--rationale", required=True,
+                     help="why the original score was wrong")
+    adj.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                     help="commit locally but skip git push")
+    adj.set_defaults(func=cmd_adjust_appetite)
+
+    dr = sub.add_parser(
+        "drop",
+        help="ORG-089: terminally drop a bet (open -> done/ with substate: dropped; "
+             "does NOT satisfy dependencies/obligations)",
+    )
+    dr.add_argument("ticket")
+    dr.add_argument("--dropped-reason", dest="dropped_reason", required=True,
+                    help="one-line disposition: why this bet is being abandoned")
+    dr.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                    help="commit locally but skip git push")
+    dr.set_defaults(func=cmd_drop)
+
+    ro = sub.add_parser(
+        "reopen",
+        help="ORG-089: reopen a DROPPED bet (done/ -> inbox/) with a fresh "
+             "re-earned appetite; restarts the overrun clock",
+    )
+    ro.add_argument("ticket")
+    ro.add_argument("--re-earn-appetite", dest="re_earn_appetite", required=True,
+                    metavar="1-10", help="new appetite score for the reopened bet")
+    ro.add_argument("--rationale", required=True,
+                    help="why the dropped bet is worth reopening")
+    ro.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                    help="commit locally but skip git push")
+    ro.set_defaults(func=cmd_reopen)
+
+    cs = sub.add_parser(
+        "cascade",
+        help="ORG-013 cascade-unblock pass for a resolved tid (T-3289 PR-merge trigger)",
+    )
+    cs.add_argument(
+        "--tid",
+        required=True,
+        help="resolved (done/) ticket id whose dependants should be re-checked "
+             "for auto-unblock; T-NNNN. Fail-closed: refuses if tid is "
+             "malformed, not found, or not currently in done/.",
+    )
+    cs.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                    help="commit locally but skip git push; the next pushing op (or a manual push) carries it to origin")
+    cs.set_defaults(func=cmd_cascade)
 
     rt = sub.add_parser(
         "retarget",
@@ -4504,6 +6978,21 @@ def _build_parser() -> argparse.ArgumentParser:
         help="annotate each row with the derived reverse of depends_on — "
              "which tickets THIS one unblocks (T-2720). Off by default.",
     )
+    ls.add_argument(
+        "--sort", choices=("priority", "created", "retargeted"), default="priority",
+        help="ORG-078 §4: 'priority' (default) applies ceiling priority-rank "
+             "+ dependency-inheritance (§Priority-inversion) over "
+             "(effective_rank, effective_queue_ts, ticket_id). 'created'/"
+             "'retargeted' are pure-FIFO bypass views that skip the "
+             "priority-list parse entirely.",
+    )
+    ls.add_argument(
+        "--explain-priority", metavar="T-NNNN", default=None,
+        help="ORG-078 §Priority-inversion: print a diagnostic explaining "
+             "why the named ticket ranks where it does (own_rank, "
+             "effective_rank, inheritance chain if elevated) instead of "
+             "the normal row listing.",
+    )
     ls.set_defaults(func=cmd_list)
 
     rdy = sub.add_parser(
@@ -4512,6 +7001,12 @@ def _build_parser() -> argparse.ArgumentParser:
              "not_before passed) — read-only",
     )
     rdy.add_argument("--target", default=None, help="filter by target persona")
+    rdy.add_argument(
+        "--exclude-label", action="append", metavar="LABEL", default=None,
+        help="hide tickets carrying this label (repeatable). e.g. "
+             "--exclude-label interactive-required drops supervised/human-session "
+             "tickets from an autonomous 'what can I do solo' scan (T-3540).",
+    )
     rdy.add_argument(
         "--show-unblocks", action="store_true",
         help="annotate each row with the derived reverse of depends_on — "
@@ -4528,13 +7023,104 @@ def _build_parser() -> argparse.ArgumentParser:
     pr.add_argument("--done-limit", type=int, default=15, help="max recently-done tickets (default 15)")
     pr.set_defaults(func=cmd_prime)
 
+    pl = sub.add_parser(
+        "priority-list",
+        help="ORG-078 priority-list operator tooling",
+    )
+    pl_sub = pl.add_subparsers(dest="priority_list_cmd", required=True,
+                                parser_class=_NoAbbrevParser)
+    plv = pl_sub.add_parser(
+        "validate",
+        help="validate rulebook/priority-list.md — parse errors + "
+             "probably-dead/high-volume label warnings + sample-matching "
+             "tickets per label (ORG-078 §Priority-list-drift-hygiene; "
+             "semantic-drift deferred per T-3424) — read-only",
+    )
+    plv.set_defaults(func=cmd_priority_list_validate)
+
+    lb = sub.add_parser(
+        "label",
+        help="T-3020 BT5: label add/remove/list + backfill-audit — labels: "
+             "frontmatter operator tooling",
+    )
+    lb_sub = lb.add_subparsers(dest="label_cmd", required=True,
+                                parser_class=_NoAbbrevParser)
+
+    la = lb_sub.add_parser(
+        "add", help="add one or more labels to a ticket (idempotent)"
+    )
+    la.add_argument("ticket")
+    la.add_argument("labels", nargs="+", metavar="LABEL")
+    la.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                     help="commit locally but skip git push")
+    la.set_defaults(func=cmd_label_add)
+
+    lr = lb_sub.add_parser(
+        "remove", help="remove one or more labels from a ticket"
+    )
+    lr.add_argument("ticket")
+    lr.add_argument("labels", nargs="+", metavar="LABEL")
+    lr.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                     help="commit locally but skip git push")
+    lr.set_defaults(func=cmd_label_remove)
+
+    ll = lb_sub.add_parser(
+        "list", help="print a ticket's current labels, one per line — read-only"
+    )
+    ll.add_argument("ticket")
+    ll.set_defaults(func=cmd_label_list)
+
+    lba = lb_sub.add_parser(
+        "backfill-audit",
+        help="report tickets missing arc-labels inferable from parent_ticket "
+             "/ depends_on chains + title/body pattern-matching — read-only, "
+             "report only (does not auto-apply)",
+    )
+    lba.add_argument(
+        "--scope", choices=["inbox", "active", "done", "all"], default=None,
+        help="ticket states to audit (default: inbox+active)",
+    )
+    lba.set_defaults(func=cmd_label_backfill_audit)
+
     return p
+
+
+def _current_branch(repo_root: Path) -> str:
+    res = _git("branch", "--show-current", cwd=repo_root)
+    if res.returncode != 0:
+        raw_detail = res.stderr if res.stderr.strip() else res.stdout
+        detail_lines = [
+            " ".join(line.split())
+            for line in raw_detail.splitlines()
+            if line.strip()
+        ]
+        detail = detail_lines[-1] if detail_lines else "no git diagnostic"
+        detail = re.sub(r"/home/\S+", "<path>", detail)
+        if len(detail) > 90:
+            detail = detail[:87] + "..."
+        raise TicketError(
+            f"cannot determine current git branch (rc={res.returncode}): "
+            f"{detail}; refusing before dispatch; "
+            "run ticket.py from the canonical pantheon-config checkout on branch main"
+        )
+    return res.stdout.strip()
+
+
+def _assert_cli_checkout_allowed(repo_root: Path) -> None:
+    branch = _current_branch(repo_root)
+    if branch.startswith("agent/"):
+        observed = branch[:120]
+        raise TicketError(
+            f"refusing to run ticket.py from branch {observed!r}; "
+            "run ticket.py from the canonical pantheon-config checkout on branch main"
+        )
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
+        _assert_cli_checkout_allowed(REPO_ROOT)
         return args.func(args)
     except TicketError as e:
         print(f"error: {e}", file=sys.stderr)

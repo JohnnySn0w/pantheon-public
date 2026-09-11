@@ -24,7 +24,7 @@ legs:
   test_live_codex_interactive_tmux_quota_and_ack
   test_live_claude_interactive_tmux_quota_and_ack
   test_live_same_unit_planned_harness_swap_preserves_persona_and_tmux
-  test_live_forced_cap_requeues_and_bootstraps_from_graveyard_receipt
+  test_live_forced_cap_requeues_and_bootstraps_from_chronicle_receipt
   test_live_explicit_claude_batch_sdk_is_nondefault_and_separately_metered
 
 required gates for finalize:
@@ -98,7 +98,7 @@ require_live_gate_env() {
     test_live_same_unit_planned_harness_swap_preserves_persona_and_tmux)
       [[ "${T2382_LIVE_SWAP:-}" == "1" ]] || die "missing T2382_LIVE_SWAP=1"
       ;;
-    test_live_forced_cap_requeues_and_bootstraps_from_graveyard_receipt)
+    test_live_forced_cap_requeues_and_bootstraps_from_chronicle_receipt)
       [[ "${T2382_LIVE_FORCED_CAP:-}" == "1" ]] || die "missing T2382_LIVE_FORCED_CAP=1"
       ;;
     test_live_explicit_claude_batch_sdk_is_nondefault_and_separately_metered)

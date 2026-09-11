@@ -71,6 +71,8 @@ if __package__ in (None, ""):
 # truth for sudo_user) and inbox_consumer's failure-alert router.
 from tools.context_fill_monitor import (  # noqa: E402
     AGENT_CONFIG,
+    _seat_in_maintenance,
+    _seat_muted,
     _sudo_prefix,
     fire_restart_detached,
     write_tombstone,
@@ -108,6 +110,16 @@ VOCAB = "channel-liveness"
 REMEDIATE_ENABLED = os.environ.get("PANTHEON_CHANNEL_REMEDIATE_ENABLED", "").strip().lower() in (
     "1", "true", "yes", "on",
 )
+# Per-agent probe SKIP set (comma-separated agent names via env). A listed seat is
+# not probed/alerted/remediated at all — for a seat whose bridge this probe cannot
+# model (e.g. mid-harness-migration: orchestrator on the Codex harness writes no Claude
+# `bot.pid`, so the Claude-bridge probe reads a PERMANENT false comms-dark that only
+# noise-wakes Recovery). Default empty (skip nothing) — the path is inert when unset.
+# Set via the systemd drop-in; remove when the seat's real substrate is probeable
+# (T-2959). Reversible config, not code logic. Loses no real signal: the probe is
+# already blind to a non-Claude seat, whose health is covered by mail-staleness +
+# the seat's own harness monitoring.
+CHANNEL_LIVENESS_SKIP = {a.strip() for a in os.environ.get("CHANNEL_LIVENESS_SKIP", "").split(",") if a.strip()}
 # Restart reason recorded on the tombstone / in logs.
 REMEDIATE_REASON = "bridge_down"
 # Cooldown between bridge-down remediations per agent — spaces restarts so a
@@ -594,6 +606,9 @@ def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) ->
     deliberately taken out of service. Not alertable, not remediable.
     """
     now = int(time.time()) if now is None else now
+    if agent in CHANNEL_LIVENESS_SKIP:
+        _log(agent, "migration-exempt (CHANNEL_LIVENESS_SKIP); not probing/alerting/remediating")
+        return "skipped"
     cfg = AGENT_CONFIG.get(agent)
     if cfg is None:
         _log(agent, "no AGENT_CONFIG entry; skipping")
@@ -602,6 +617,15 @@ def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) ->
     _log(agent, f"bridge {status}: {detail}")
     if status != "down":
         return status
+    # Seat-maintenance precondition (T-2984) — the strongest "leave this seat alone"
+    # signal, checked first among the down-path preconditions. During a runtime-
+    # controller cutover (T-2953) the bridge may read down while the harness is being
+    # swapped; alerting is noise and remediating fights the cutover. Auto-expires in
+    # notify_policy, so a forgotten window self-clears and monitoring resumes.
+    if _seat_in_maintenance(agent):
+        _log(agent, "down but seat is in T-2984 maintenance mode (runtime-controller "
+                    "cutover window) — not alerting/remediating this poll")
+        return "maintenance"
     # Deliberate-pause precondition (T-2393) — checked BEFORE the restart window,
     # because a paused seat is not mid-restart and should not consult restart state
     # at all. A disabled session unit means somebody took this seat out of service;
@@ -624,8 +648,14 @@ def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) ->
     if dry_run:
         _log(agent, "DRY-RUN: would alert + (if enabled) remediate (bridge down)")
         return status
-    # Alert (throttled by the alert cooldown).
-    if _in_alert_cooldown(agent, now, ALERT_COOLDOWN_SECONDS):
+    # Alert (throttled by the alert cooldown). Operator mute (ORG-076 §7 / T-2987) is
+    # checked FIRST: a deliberately-silenced persona withholds the comms-dark PAGE, but —
+    # unlike 'paused'/'maintenance' above — a mute is ALERT-ONLY, so the remediation block
+    # below still runs. Fail-open (is_muted → False on any registry fault). Trace stays in
+    # the bridge-status _log above.
+    if _seat_muted(agent):
+        _log(agent, "down but seat muted (ORG-076 §7) — page suppressed (trace kept); remediation unaffected")
+    elif _in_alert_cooldown(agent, now, ALERT_COOLDOWN_SECONDS):
         _log(agent, "down but in alert cooldown; not re-alerting")
     else:
         msg = (

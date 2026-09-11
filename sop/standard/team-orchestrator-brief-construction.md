@@ -4,7 +4,7 @@ Authored 2026-05-07 post-T-0113 retrospective. Captures the structural rules HO 
 
 > **Amended 2026-06-05 (T-0611, ratified by the operator):** added §Directives in force (item 4 — per-ticket-class D-id map so implementer DECISIONS cite by id; closes the T-0603 gap where D11 was in the skill but never named for the class) + the §Memory composition anti-drift layering. The directive↔skill auto-sync structural fix is deferred to a sibling ticket.
 >
-> **Amended 2026-06-16 (T-1199, ORG-012 outflow of the already-ratified ORG-034):** briefs now OPEN with an arc-intent line, and §DECISIONS minimums is intent-first (intent/goal-served first, P/D-ids as the how). Propagates `adr/ORG-034` + the D7 amendment into the operational SOP — the ratified decision predates this SOP's prior revision, so a brief built from the template was missing the mandatory intent-first opening.
+> **Amended 2026-06-16 (T-1199, ORG-012 outflow of the already-ratified ORG-034):** briefs now OPEN with an arc-intent line, and §DECISIONS minimums is intent-first (intent/goal-served first, P/D-ids as the how). Propagates `architecture/adr/ORG-034` + the D7 amendment into the operational SOP — the ratified decision predates this SOP's prior revision, so a brief built from the template was missing the mandatory intent-first opening.
 
 ## When this applies
 
@@ -12,7 +12,7 @@ Multi-step build arcs going via Team + project-orchestrator (per `rulebook/direc
 
 ## Canonical structure
 
-Every brief **OPENS with its arc-intent line** (per `adr/ORG-034` + `rulebook/directives.md` D7 — intent-first justification, ratified 2026-06-12): one sentence stating the outcome this arc/ticket is for + which north star (`rulebook/goals.md`) or parent arc-intent it serves, in outcome language ("installer never ships ahead of the daemon wire shape"). It is the brief's first line, before §Ask. "Goal-neutral maintenance" is the honest cite when the arc is hygiene / tooling / process — name it as such, never dress it up. The arc-intent cites the north star; leaf DECISIONS cite the *arc-intent*, not the north star directly (pasting north stars into leaf DECISIONS is how the middle tier becomes ceremony).
+Every brief **OPENS with its arc-intent line** (per `architecture/adr/ORG-034` + `rulebook/directives.md` D7 — intent-first justification, ratified 2026-06-12): one sentence stating the outcome this arc/ticket is for + which north star (`rulebook/goals.md`) or parent arc-intent it serves, in outcome language ("installer never ships ahead of the daemon wire shape"). It is the brief's first line, before §Ask. "Goal-neutral maintenance" is the honest cite when the arc is hygiene / tooling / process — name it as such, never dress it up. The arc-intent cites the north star; leaf DECISIONS cite the *arc-intent*, not the north star directly (pasting north stars into leaf DECISIONS is how the middle tier becomes ceremony).
 
 Then these sections, in this order:
 
@@ -51,7 +51,7 @@ Then these sections, in this order:
    Always in force: D2 (don't edit hand-curated docs — propose instead), D6 (plan-first; no push/merge), HERMES byte-sequence rule, chain-of-justification.
    ~~~
 
-5. **§DECISIONS minimums** — list of choice points the implementer must justify-via, **intent-first** (per `adr/ORG-034`): each material call names the arc-intent / goal served FIRST (or "goal-neutral maintenance" honestly), with P/D ids as **the how** — methodology compliance, no longer carrying the why. When methodology and intent genuinely conflict mid-arc, intent binds and the deviation is FLAGGED per D6 (the licensed-deviation seam — the flag is mandatory, not an escape hatch). Don't enumerate every possible choice; list the architecturally-load-bearing ones. Implementer adds more as they encounter.
+5. **§DECISIONS minimums** — list of choice points the implementer must justify-via, **intent-first** (per `architecture/adr/ORG-034`): each material call names the arc-intent / goal served FIRST (or "goal-neutral maintenance" honestly), with P/D ids as **the how** — methodology compliance, no longer carrying the why. When methodology and intent genuinely conflict mid-arc, intent binds and the deviation is FLAGGED per D6 (the licensed-deviation seam — the flag is mandatory, not an escape hatch). Don't enumerate every possible choice; list the architecturally-load-bearing ones. Implementer adds more as they encounter.
 
 6. **§Acceptance** — smoke loops + test-count delta + byte-sequence-guard + hand-curated-doc-protection + scope-bounds. One bulleted list. Refer to standing discipline in `~/CLAUDE.md` + memory pins instead of restating.
 
@@ -135,7 +135,7 @@ The one-line principle: directives.md is canonical; the skill summarizes it; the
 
 ## Cross-references
 
-- `adr/ORG-034` (two-layer goal architecture — arc-intents as the missing justification tier; the brief's intent-first opening + DECISIONS intent-first derive from here)
+- `architecture/adr/ORG-034` (two-layer goal architecture — arc-intents as the missing justification tier; the brief's intent-first opening + DECISIONS intent-first derive from here)
 - `rulebook/goals.md` (north stars — layer 1, the operator's; arc-intents nest under these)
 - `rulebook/principles.md` P1 (architecture over policy), P2 (principles-first, re-grounded as intent-first per ORG-034), P3, P4, P5
 - `rulebook/directives.md` D1 (the operator's bandwidth), D2 (hand-curated docs), D3 (autonomy bar), D4 (brief quality bar — verify symbols at source; coverage cross-check; e2e smoke for read-paths), D5 (smoke verification discipline — literal output, orchestrator runs smokes directly, IPC wet-run), D6 (plan-first protocol + locked-answer-deviation handling), D7 (decision flow execution — Team-pattern dispatch; D2 dynamic scope-split; 3-REBOUND budget; bubble-up criteria), D8 (HO self-discipline — sticky-belief at N=2 → fresh-context redispatch), D9 (orchestrator response contract + inbox discipline), D10 (context-frugality / minimum-traversal-to-precise-info), D11 (third-party / outbound-API surface — read the authoritative spec; fixtures from the real surface, never hand-invented)

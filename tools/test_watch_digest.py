@@ -181,6 +181,72 @@ class TestSendTelegramFallback(unittest.TestCase):
         self.assertFalse(ok)
 
 
+class TestDigestChunking(unittest.TestCase):
+    """T-3135-day regression (2026-08-24): a 20-topic digest overflowed Telegram's
+    4096-char cap and BOTH Markdown + plain-text 400'd (length, not formatting, so the
+    fallback couldn't save it) — the unit exited 1. send_telegram must CHUNK on line
+    boundaries and send each part."""
+
+    def _resp(self, status):
+        m = MagicMock()
+        m.status = status
+        m.__enter__ = lambda s: m
+        m.__exit__ = lambda s, *a: False
+        return m
+
+    def test_chunk_lines_packs_on_line_boundaries_under_limit(self):
+        text = "\n".join(f"line-{i:03d} " + "x" * 50 for i in range(200))  # ~11k chars
+        chunks = watch_digest._chunk_lines(text, limit=1000)
+        self.assertGreater(len(chunks), 1)
+        for c in chunks:
+            self.assertLessEqual(len(c), 1000)
+        self.assertEqual("\n".join(chunks).count("line-"), text.count("line-"))  # nothing dropped
+
+    def test_chunk_lines_hard_splits_a_single_overlong_line(self):
+        long = "z" * 2500
+        chunks = watch_digest._chunk_lines(long, limit=1000)
+        self.assertTrue(all(len(c) <= 1000 for c in chunks))
+        self.assertEqual("".join(chunks), long)
+
+    def test_chunk_lines_single_chunk_when_small(self):
+        self.assertEqual(watch_digest._chunk_lines("short", limit=1000), ["short"])
+
+    def test_oversized_digest_sends_all_chunks_within_cap(self):
+        import urllib.parse as up
+        calls = []
+
+        def fake_urlopen(req, timeout=None):
+            calls.append(req.data.decode("utf-8"))
+            return self._resp(200)
+
+        big = "\n".join(f"* item {i} *" + "y" * 60 for i in range(300))  # well over 4096
+        with patch("tools.watch_digest.urllib.request.urlopen", side_effect=fake_urlopen), \
+             patch("sys.stderr", new_callable=io.StringIO):
+            ok = watch_digest.send_telegram("tok", "123", big)
+        self.assertTrue(ok)
+        self.assertGreater(len(calls), 1)  # actually chunked
+        for body in calls:
+            fields = dict(up.parse_qsl(body))
+            self.assertLessEqual(len(fields["text"]), watch_digest.TELEGRAM_MAX_CHARS)
+            self.assertIn("part", fields["text"])  # continuation marker present when split
+
+    def test_oversized_partial_failure_returns_false(self):
+        import urllib.error
+        state = {"n": 0}
+
+        def fake_urlopen(req, timeout=None):
+            state["n"] += 1
+            if state["n"] >= 2:  # chunk 1 delivers; everything from chunk 2 (both attempts) 400s
+                raise urllib.error.HTTPError("u", 400, "Bad Request", {}, None)
+            return self._resp(200)
+
+        big = "\n".join("x" * 100 for _ in range(100))  # multi-chunk
+        with patch("tools.watch_digest.urllib.request.urlopen", side_effect=fake_urlopen), \
+             patch("sys.stderr", new_callable=io.StringIO):
+            ok = watch_digest.send_telegram("tok", "123", big)
+        self.assertFalse(ok)  # incomplete delivery is a failure → main() won't stamp leans
+
+
 # ---------------------------------------------------------------------------
 # T-2199: the operator-facing lean slot.
 #

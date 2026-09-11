@@ -39,8 +39,13 @@ import subprocess
 import sys
 from pathlib import Path
 
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tools import grand_project_program as grand_program
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
-ADR_DIR = REPO_ROOT / "adr"
+ADR_DIR = REPO_ROOT / "architecture" / "adr"
 TICKETS_ROOT = REPO_ROOT / "tickets"
 TICKET_BIN = REPO_ROOT / "tools" / "ticket.py"
 
@@ -331,6 +336,8 @@ def file_reeval_ticket(
         "--target", "orchestrator",
         "--title", title,
         "--labels", labels,
+        "--project-id", "null",
+        "--nearest-intent-ref", "maintenance:adr-reevaluation",
         "--ask", ask,
         "--serves", "ADR re-eval triggers fire instead of becoming invisible permanent rules (ORG-002)",
     ]
@@ -409,6 +416,54 @@ class WalkResult:
     deduped: list[str]            # trigger ids skipped (open ticket already exists)
     fired: list[str]              # all deterministic trigger ids that fired
     surface_count: int
+    owned_status: str = "not-configured"
+    owned_due: tuple[str, ...] = ()
+    owned_filed: tuple[str, ...] = ()
+    owned_existing: tuple[str, ...] = ()
+    owned_findings: tuple[str, ...] = ()
+
+
+def file_owned_review_ticket(
+    args: tuple[str, ...], *, repo_root: Path = REPO_ROOT, push: bool = True
+) -> str:
+    """Execute one typed owned-obligation ticket proposal through ticket.py."""
+    cmd = [sys.executable, str(repo_root / "tools" / "ticket.py"), *args]
+    if not push:
+        cmd.append("--no-push")
+    result = subprocess.run(cmd, cwd=str(repo_root), capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise subprocess.CalledProcessError(
+            result.returncode, cmd, output=result.stdout, stderr=result.stderr
+        )
+    match = re.search(r"\bfiled (T-\d+)", result.stdout)
+    return match.group(1) if match else "T-????"
+
+
+def _owned_watch_section(
+    obligations: tuple[grand_program.ReevaluationObligation, ...],
+    report: grand_program.EvaluationReport,
+) -> str:
+    """Render owned metadata without copying normative ADR trigger prose."""
+    surfaced = set(report.surfaced_obligation_ids)
+    lines = [
+        "## Grand Project owned re-evaluation watch",
+        "",
+        "Owned ORG-053–061 obligations are evaluator surfaces only. Review work is "
+        "filed solely from new deterministic evidence; this table is not an architecture "
+        "or stage-state mutation.",
+        "",
+        "| Obligation | Kind | State | Review target |",
+        "|---|---|---|---|",
+    ]
+    for obligation in obligations:
+        if obligation.obligation_id not in surfaced:
+            continue
+        lines.append(
+            f"| {obligation.obligation_id} | {obligation.trigger_kind} | "
+            f"{obligation.state} | {obligation.review_target} |"
+        )
+    lines.append("")
+    return "\n".join(lines)
 
 
 def run_walk(
@@ -418,8 +473,11 @@ def run_walk(
     adr_dir: Path = ADR_DIR,
     tickets_root: Path = TICKETS_ROOT,
     metrics: dict[str, float] | None = None,
+    metric_evidence_refs: dict[str, str] | None = None,
     dry_run: bool = False,
     push: bool = True,
+    stage_index: Path | None = None,
+    obligation_index: Path | None = None,
 ) -> WalkResult:
     """Walk all ADRs: auto-file fired deterministic triggers (deduped), and build
     the surface-only watch section."""
@@ -432,21 +490,99 @@ def run_walk(
     filed: list[str] = []
     deduped: list[str] = []
     fired: list[str] = []
-    for t in deterministic:
-        if not trigger_fired(t, now=now, resolved=resolved, metrics=metrics):
+
+    owned_status = "not-configured"
+    owned_due: tuple[str, ...] = ()
+    owned_filed: list[str] = []
+    owned_existing: tuple[str, ...] = ()
+    owned_findings: tuple[str, ...] = ()
+    tickets_parent = tickets_root.parent
+    stage_path = stage_index or tickets_parent / "tickets" / "grand-project-stage-evidence.yaml"
+    obligation_path = obligation_index or tickets_parent / "tickets" / "grand-project-reevaluation-obligations.yaml"
+    owned_watch = ""
+    if stage_path.is_file() and obligation_path.is_file():
+        try:
+            stages = grand_program.load_stage_index(stage_path)
+            obligations = grand_program.load_obligation_index(obligation_path)
+            source = grand_program.scan_source_obligations(adr_dir)
+            lint_findings = (
+                grand_program.lint_obligation_completeness(source, obligations, tickets_root)
+                + grand_program.lint_stage_evidence(stages, tickets_root)
+            )
+            if lint_findings:
+                owned_status = "invalid"
+                owned_findings = tuple(
+                    f"{finding.code}:{finding.record_id}" for finding in lint_findings
+                )
+            else:
+                evaluation = grand_program.evaluate_indexes(
+                    grand_program.ProgramIndexes(stages=stages, obligations=obligations),
+                    grand_program.EvaluationInputs(
+                        now=dt.datetime.combine(now, dt.time.min, tzinfo=dt.timezone.utc),
+                        resolved_ticket_ids=frozenset(resolved),
+                        instrumented_metrics=metrics or {},
+                        metric_evidence_refs=metric_evidence_refs or {},
+                        weekly_activity_ref=f"observable:weekly/{now.isoformat()}",
+                    ),
+                    tickets_root,
+                    max_new=1,
+                )
+                owned_status = "loaded"
+                owned_due = evaluation.due_obligation_ids
+                owned_existing = evaluation.existing_ticket_ids
+                owned_findings = tuple(
+                    f"{finding.code}:{finding.record_id}" for finding in evaluation.findings
+                )
+                owned_ids = {obligation.obligation_id for obligation in obligations}
+                surface = [trigger for trigger in surface if trigger.trigger_id not in owned_ids]
+                deterministic = [
+                    trigger for trigger in deterministic if trigger.trigger_id not in owned_ids
+                ]
+                owned_watch = "\n" + _owned_watch_section(obligations, evaluation)
+                for args in evaluation.proposed_ticket_args:
+                    obligation_id = next(
+                        label.split(":", 1)[1]
+                        for value, label in zip(args, args[1:])
+                        if value == "--labels" and "reeval:" in label
+                    ).split(",", 1)[0]
+                    if dry_run:
+                        owned_filed.append(f"(dry-run) {obligation_id}")
+                    else:
+                        owned_filed.append(file_owned_review_ticket(args, push=push))
+        except (OSError, ValueError, grand_program.ticket.TicketError) as exc:
+            owned_status = "invalid"
+            owned_findings = (f"index-load:{type(exc).__name__}:{exc}",)
+    elif stage_path.exists() or obligation_path.exists():
+        owned_status = "incomplete"
+        owned_findings = ("index-pair-incomplete",)
+
+    # Legacy behavior remains byte-for-byte for unowned ADRs. When the paired
+    # owned indexes are clean, their IDs are removed from this legacy lane so
+    # one trigger can never file through both authorities in the same walk.
+    for trigger in deterministic:
+        if not trigger_fired(trigger, now=now, resolved=resolved, metrics=metrics):
             continue
-        fired.append(t.trigger_id)
-        if existing_open_reeval_ticket(t.dedup_key, tickets_root) is not None:
-            deduped.append(t.trigger_id)
+        fired.append(trigger.trigger_id)
+        if existing_open_reeval_ticket(trigger.dedup_key, tickets_root) is not None:
+            deduped.append(trigger.trigger_id)
             continue
         if dry_run:
-            filed.append(f"(dry-run) {t.trigger_id}")
+            filed.append(f"(dry-run) {trigger.trigger_id}")
             continue
-        filed.append(file_reeval_ticket(t, push=push))
+        filed.append(file_reeval_ticket(trigger, push=push))
+
+    # Preserve WalkResult.filed as the existing weekly caller's aggregate
+    # newly-filed surface while retaining owned_filed for typed diagnostics.
+    filed.extend(owned_filed)
 
     return WalkResult(
-        watch_section=build_watch_section(surface, week_activity),
+        watch_section=build_watch_section(surface, week_activity) + owned_watch,
         filed=filed, deduped=deduped, fired=fired, surface_count=len(surface),
+        owned_status=owned_status,
+        owned_due=owned_due,
+        owned_filed=tuple(owned_filed),
+        owned_existing=owned_existing,
+        owned_findings=owned_findings,
     )
 
 
@@ -468,6 +604,11 @@ def main(argv: list[str] | None = None) -> int:
     print(f"[adr_reeval_walk] scanned ADRs; {len(result.fired)} deterministic trigger(s) fired, "
           f"{len(result.filed)} filed, {len(result.deduped)} deduped, "
           f"{result.surface_count} surface-only.")
+    print(
+        f"[adr_reeval_walk] owned program: {result.owned_status}; "
+        f"{len(result.owned_due)} due, {len(result.owned_filed)} filed, "
+        f"{len(result.owned_existing)} deduped, {len(result.owned_findings)} finding(s)."
+    )
     if result.filed:
         print("  filed: " + ", ".join(result.filed))
     if result.deduped:

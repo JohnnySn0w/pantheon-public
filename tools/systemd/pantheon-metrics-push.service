@@ -1,0 +1,25 @@
+[Unit]
+Description=Pantheon metrics — regenerate + push JSON to CT103 (pantheon-metrics.snowis.me) (T-3625)
+Documentation=file:///home/%u/pantheon-config/tickets/done/T-3625.md
+After=network-online.target
+Wants=network-online.target
+
+# NO OnFailure= here, deliberately. A single missed push is self-healing: the
+# next fire (~90s) recovers, and specialist's >2min stale-fallback covers the gap by
+# design (T-3626). Routing transient ssh/network blips to the mailbox would spam.
+# Failures still land in the journal (StandardError=journal) for inspection.
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/pantheon-config/tools/pantheon_metrics_push.sh
+StandardOutput=journal
+StandardError=journal
+# gen samples /proc for ~1s then one ssh push; sub-2s in practice. The ceiling
+# only exists so a hung ssh cannot pile up instances.
+TimeoutStartSec=60s
+Nice=10
+
+[Install]
+WantedBy=default.target

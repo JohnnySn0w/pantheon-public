@@ -95,6 +95,10 @@ from typing import Any, Callable, Mapping
 from tools import codex_modal
 from tools import persona_bringup
 from tools import runtime_controller as rc
+from tools.bringup_acceptance.codex_acceptance_config_guard import (
+    AcceptanceConfigGuardError,
+    ReversibleAcceptanceConfigGuard,
+)
 from tools.bringup_acceptance.types import HardStop
 from tools.submit_verify import ready_for_submission
 
@@ -545,6 +549,12 @@ def run_codex_ready_bringup(
 
     context = _new_disposable_tmux_context(run_id)
     target = binding.controller.tmux
+    launch_cwd = getattr(binding, "launch_cwd", work_root)
+    if hasattr(adapter, "build_interactive_launch"):
+        launch_spec = adapter.build_interactive_launch(target, cwd=launch_cwd)
+        acceptance_project_cwd = Path(launch_spec.cwd)
+    else:
+        acceptance_project_cwd = Path(launch_cwd)
 
     def _capture() -> str:
         return rc._capture_visible_runtime_pane(target, context=context)
@@ -554,37 +564,53 @@ def run_codex_ready_bringup(
 
     ready = False
     pane_text = ""
+    pending_error: BaseException | None = None
+    guard: ReversibleAcceptanceConfigGuard | None = None
     try:
-        with _VersionJsonSnapshot(codex_home):
-            # build_interactive_launch's CommandSpec.cwd reads Path.cwd()
-            # synchronously at THIS one call -- scope the chdir as tightly
-            # as possible around it (P7: minimal blast radius) rather than
-            # around the whole driver.
-            previous_cwd = Path.cwd()
-            try:
-                os.chdir(work_root)
-                # A fresh disposable target has never existed before --
-                # always a create, never a replace.
+        try:
+            with _VersionJsonSnapshot(codex_home):
+                guard = ReversibleAcceptanceConfigGuard(
+                    codex_home=codex_home,
+                    project_cwd=acceptance_project_cwd,
+                    owner="harness_codex_ready",
+                )
+                guard.__enter__()
+            # A fresh disposable target has never existed before -- always a
+            # create, never a replace. The launch cwd is the fixture manifest's
+            # parent, not the driver's ambient process cwd.
                 runtime_start = rc._start_runtime(
                     binding, adapter, replace=False, context=context,
                 )
-            finally:
-                os.chdir(previous_cwd)
 
-            rc._verify_started_runtime(
-                binding, runtime_start, state_root=state_root, context=context,
-            )
+                rc._verify_started_runtime(
+                    binding, runtime_start, state_root=state_root, context=context,
+                )
 
-            pane_text = _wait_for_codex_ready(
-                timeout_s=ready_timeout_s, poll_interval_s=ready_poll_interval_s,
-                capture=_capture, send_keys=_send_key,
-            )
-            ready = True
+                pane_text = _wait_for_codex_ready(
+                    timeout_s=ready_timeout_s, poll_interval_s=ready_poll_interval_s,
+                    capture=_capture, send_keys=_send_key,
+                )
+                ready = True
+        except BaseException as exc:
+            pending_error = exc
     finally:
+        if guard is not None and guard.expectation is not None:
+            try:
+                guard.restore()
+            except AcceptanceConfigGuardError as exc:
+                exc.original_exception = pending_error
+                pending_error = exc
         residue = _teardown_disposable_tmux_context(context)
+        if guard is not None:
+            guard.attach_teardown_residue(residue)
         shutil.rmtree(work_root, ignore_errors=True)
         if residue:
-            raise HardStop(f"codex-ready driver left residue: {'; '.join(residue)}")
+            if isinstance(pending_error, AcceptanceConfigGuardError):
+                pending_error.teardown_residue = tuple(residue)
+            elif pending_error is None:
+                pending_error = HardStop(f"codex-ready driver left residue: {'; '.join(residue)}")
+        if pending_error is not None:
+            raise pending_error
 
     return {
         "mode": mode,
@@ -624,7 +650,7 @@ def main(argv: list[str] | None = None) -> int:
             work_root=args.work_root, account=args.account, persona=args.persona,
             codex_executable=args.codex_executable, ready_timeout_s=args.ready_timeout_s,
         )
-    except HardStop as exc:
+    except (HardStop, AcceptanceConfigGuardError) as exc:
         sys.stderr.write(f"[harness_codex_ready] HardStop: {exc}\n")
         return 1
     status = codex_ready_status(evidence)

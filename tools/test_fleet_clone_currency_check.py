@@ -347,11 +347,14 @@ class MainDryRunAndModeGate(unittest.TestCase):
         with mock.patch.object(fccc, "discover_seats", return_value=[]), \
              mock.patch.object(fccc, "_fetch_origin_main", return_value=True), \
              mock.patch.object(fccc, "sweep", return_value=flagged), \
+             mock.patch.object(fccc, "apply_skip_list", return_value=flagged), \
              mock.patch.object(fccc, "needs_alert", return_value=flagged), \
              mock.patch.object(fccc, "alert") as malert:
             rc = fccc.main(["--check"])
         self.assertEqual(rc, 0)
-        malert.assert_called_once_with(flagged)
+        # T-3425 extended alert() with a keyword-only `skipped=` param; the
+        # main flow always passes it (empty when nothing was suppressed).
+        malert.assert_called_once_with(flagged, skipped=[])
 
     def test_check_no_alert_when_clean(self):
         with mock.patch.object(fccc, "discover_seats", return_value=[]), \
@@ -373,6 +376,281 @@ class MainDryRunAndModeGate(unittest.TestCase):
         msweep.assert_not_called()
         msend.assert_called_once()
         self.assertIn("fetch", msend.call_args[0][1].lower())
+
+
+class SkipListLoad(unittest.TestCase):
+    """T-3425: fail-open at every failure mode. A broken skip-list must NEVER
+    suppress an alert -- it must always default to zero skips."""
+
+    def setUp(self):
+        self._tmp_ctx = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp_ctx.name)
+        self.addCleanup(self._tmp_ctx.cleanup)
+
+    def test_missing_file_returns_empty(self):
+        self.assertEqual(fccc.load_skip_list(self.tmp / "does-not-exist.yaml"), [])
+
+    def test_happy_path_yaml(self):
+        p = self.tmp / "skips.yaml"
+        p.write_text("skips:\n  - account: codex\n    disposition_ticket: T-3304\n    expected_state: done\n    reason: hist\n")
+        self.assertEqual(
+            fccc.load_skip_list(p),
+            [{"account": "codex", "disposition_ticket": "T-3304", "expected_state": "done", "reason": "hist"}],
+        )
+
+    def test_parse_error_returns_empty_not_raises(self):
+        p = self.tmp / "broken.yaml"
+        p.write_text(": :\n  - not\n  even yaml [\n")
+        self.assertEqual(fccc.load_skip_list(p), [])
+
+    def test_malformed_root_shape_returns_empty(self):
+        # A YAML file whose top-level isn't a mapping -- must not crash.
+        p = self.tmp / "list-root.yaml"
+        p.write_text("- one\n- two\n")
+        self.assertEqual(fccc.load_skip_list(p), [])
+
+    def test_skips_not_a_list_returns_empty(self):
+        p = self.tmp / "skips-scalar.yaml"
+        p.write_text("skips: notalist\n")
+        self.assertEqual(fccc.load_skip_list(p), [])
+
+    def test_non_mapping_entries_are_dropped(self):
+        p = self.tmp / "mixed.yaml"
+        p.write_text("skips:\n  - account: codex\n    disposition_ticket: T-3304\n    expected_state: done\n    reason: r\n  - 'a bare string'\n  - null\n")
+        result = fccc.load_skip_list(p)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(result[0]["account"], "codex")
+
+    def test_empty_file_returns_empty(self):
+        p = self.tmp / "empty.yaml"
+        p.write_text("")
+        self.assertEqual(fccc.load_skip_list(p), [])
+
+    def test_unreadable_file_returns_empty(self):
+        p = self.tmp / "unreadable.yaml"
+        p.write_text("skips: []\n")
+        p.chmod(0o000)
+        try:
+            self.assertEqual(fccc.load_skip_list(p), [])
+        finally:
+            p.chmod(0o644)
+
+
+class SkipListIsActive(unittest.TestCase):
+    """T-3425: expiry-condition evaluation against ticket state."""
+
+    def setUp(self):
+        self._tmp_ctx = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp_ctx.name)
+        self.addCleanup(self._tmp_ctx.cleanup)
+        for state in ("inbox", "active", "done"):
+            (self.tmp / "tickets" / state).mkdir(parents=True)
+
+    def _touch(self, state: str, ticket_id: str):
+        (self.tmp / "tickets" / state / f"{ticket_id}.md").write_text("stub\n")
+
+    def test_active_when_ticket_matches_expected_state(self):
+        self._touch("done", "T-3304")
+        entry = {"account": "codex", "disposition_ticket": "T-3304", "expected_state": "done", "reason": "hist"}
+        active, reason = fccc.is_skip_active(entry, repo_root=self.tmp)
+        self.assertTrue(active)
+        self.assertIn("T-3304", reason)
+
+    def test_expired_when_ticket_in_different_state(self):
+        # Ticket exists but has moved to a different state -- skip must expire.
+        self._touch("active", "T-3009")
+        entry = {"account": "exocortex", "disposition_ticket": "T-3009", "expected_state": "inbox", "reason": "window"}
+        active, reason = fccc.is_skip_active(entry, repo_root=self.tmp)
+        self.assertFalse(active)
+        self.assertIn("EXPIRED", reason)
+        self.assertIn("active", reason)
+
+    def test_expired_when_ticket_missing_entirely(self):
+        entry = {"account": "codex", "disposition_ticket": "T-9999", "expected_state": "done", "reason": "n/a"}
+        active, reason = fccc.is_skip_active(entry, repo_root=self.tmp)
+        self.assertFalse(active)
+        self.assertIn("EXPIRED", reason)
+        self.assertIn("not found", reason)
+
+    def test_malformed_entry_missing_field_ignored(self):
+        active, reason = fccc.is_skip_active({"account": "codex"}, repo_root=self.tmp)
+        self.assertFalse(active)
+        self.assertIn("malformed", reason)
+
+    def test_invalid_expected_state_ignored(self):
+        entry = {"account": "codex", "disposition_ticket": "T-3304", "expected_state": "blocked", "reason": "r"}
+        active, reason = fccc.is_skip_active(entry, repo_root=self.tmp)
+        self.assertFalse(active)
+        self.assertIn("expected_state", reason)
+
+
+class SkipListApply(unittest.TestCase):
+    """T-3425: end-to-end suppression + fail-open behavior."""
+
+    def setUp(self):
+        self._tmp_ctx = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp_ctx.name)
+        self.addCleanup(self._tmp_ctx.cleanup)
+        for state in ("inbox", "active", "done"):
+            (self.tmp / "tickets" / state).mkdir(parents=True)
+
+    def _touch(self, state: str, ticket_id: str):
+        (self.tmp / "tickets" / state / f"{ticket_id}.md").write_text("stub\n")
+
+    def test_drifted_with_active_skip_becomes_skipped(self):
+        self._touch("done", "T-3304")
+        results = [{"persona": "codex", "account": "codex", "verdict": fccc.DRIFTED,
+                    "detail": "HEAD=abc, 1677 commit(s) behind origin/main"}]
+        skips = [{"account": "codex", "disposition_ticket": "T-3304", "expected_state": "done", "reason": "hist"}]
+        out = fccc.apply_skip_list(results, skips, repo_root=self.tmp)
+        self.assertEqual(out[0]["verdict"], fccc.SKIPPED)
+        self.assertEqual(out[0]["original_verdict"], fccc.DRIFTED)
+        self.assertIn("T-3304", out[0]["skip_reason"])
+        # Original detail preserved so an operator can still see the behind-count.
+        self.assertIn("1677", out[0]["detail"])
+
+    def test_unknown_with_active_skip_becomes_skipped(self):
+        self._touch("done", "T-3304")
+        results = [{"persona": "codex", "account": "codex", "verdict": fccc.UNKNOWN,
+                    "detail": "sudo failed"}]
+        skips = [{"account": "codex", "disposition_ticket": "T-3304", "expected_state": "done", "reason": "hist"}]
+        out = fccc.apply_skip_list(results, skips, repo_root=self.tmp)
+        self.assertEqual(out[0]["verdict"], fccc.SKIPPED)
+        self.assertEqual(out[0]["original_verdict"], fccc.UNKNOWN)
+
+    def test_current_never_suppressed_even_with_skip_entry(self):
+        # A CURRENT seat has nothing to suppress; the skip is a no-op here.
+        self._touch("done", "T-3304")
+        results = [{"persona": "codex", "account": "codex", "verdict": fccc.CURRENT,
+                    "detail": "HEAD=abc, 5 commit(s) behind origin/main"}]
+        skips = [{"account": "codex", "disposition_ticket": "T-3304", "expected_state": "done", "reason": "r"}]
+        out = fccc.apply_skip_list(results, skips, repo_root=self.tmp)
+        self.assertEqual(out[0]["verdict"], fccc.CURRENT)
+        self.assertNotIn("SKIPPED", out[0]["detail"])
+
+    def test_no_clone_never_suppressed(self):
+        results = [{"persona": "mnemosyne", "account": "exocortex", "verdict": fccc.NO_CLONE, "detail": "no clone"}]
+        skips = [{"account": "exocortex", "disposition_ticket": "T-3009", "expected_state": "inbox", "reason": "r"}]
+        out = fccc.apply_skip_list(results, skips, repo_root=self.tmp)
+        self.assertEqual(out[0]["verdict"], fccc.NO_CLONE)
+
+    def test_drifted_with_expired_skip_stays_drifted_with_note(self):
+        # Ticket has moved -- skip must not apply, seat must re-alert.
+        self._touch("done", "T-3009")  # was expected: inbox
+        results = [{"persona": "mnemosyne", "account": "exocortex", "verdict": fccc.DRIFTED,
+                    "detail": "HEAD=abc, 546 commit(s) behind"}]
+        skips = [{"account": "exocortex", "disposition_ticket": "T-3009", "expected_state": "inbox", "reason": "window"}]
+        out = fccc.apply_skip_list(results, skips, repo_root=self.tmp)
+        self.assertEqual(out[0]["verdict"], fccc.DRIFTED)
+        self.assertIn("skip attempted but not applied", out[0]["detail"])
+
+    def test_no_skip_entry_for_account_passes_through(self):
+        results = [{"persona": "specialist", "account": "claude-research", "verdict": fccc.DRIFTED, "detail": "x"}]
+        # skip list mentions a different account -- must not touch this one.
+        skips = [{"account": "codex", "disposition_ticket": "T-3304", "expected_state": "done", "reason": "r"}]
+        out = fccc.apply_skip_list(results, skips, repo_root=self.tmp)
+        self.assertEqual(out[0]["verdict"], fccc.DRIFTED)
+
+    def test_empty_skip_list_is_identity(self):
+        results = [{"persona": "codex", "account": "codex", "verdict": fccc.DRIFTED, "detail": "x"}]
+        out = fccc.apply_skip_list(results, [], repo_root=self.tmp)
+        self.assertEqual(out, results)
+
+    def test_apply_never_mutates_input(self):
+        self._touch("done", "T-3304")
+        results = [{"persona": "codex", "account": "codex", "verdict": fccc.DRIFTED, "detail": "x"}]
+        original = [dict(r) for r in results]
+        skips = [{"account": "codex", "disposition_ticket": "T-3304", "expected_state": "done", "reason": "r"}]
+        fccc.apply_skip_list(results, skips, repo_root=self.tmp)
+        self.assertEqual(results, original)
+
+    def test_skipped_never_in_needs_alert(self):
+        # The whole point: SKIPPED must not flow into the alert body.
+        self._touch("done", "T-3304")
+        results = [
+            {"persona": "codex", "account": "codex", "verdict": fccc.DRIFTED, "detail": "x"},
+            {"persona": "specialist", "account": "claude-research", "verdict": fccc.DRIFTED, "detail": "y"},
+        ]
+        skips = [{"account": "codex", "disposition_ticket": "T-3304", "expected_state": "done", "reason": "r"}]
+        out = fccc.apply_skip_list(results, skips, repo_root=self.tmp)
+        flagged = fccc.needs_alert(out)
+        self.assertEqual(len(flagged), 1)
+        self.assertEqual(flagged[0]["account"], "claude-research")
+
+
+class RenderAlertWithSkipped(unittest.TestCase):
+    def test_skipped_footer_renders_when_present(self):
+        flagged = [{"persona": "specialist", "account": "claude-research", "verdict": fccc.DRIFTED,
+                    "detail": "HEAD=abc, 25 behind"}]
+        skipped = [{"persona": "codex", "account": "codex", "verdict": fccc.SKIPPED,
+                    "original_verdict": fccc.DRIFTED,
+                    "skip_reason": "skip active per T-3304 (state=done): historical",
+                    "detail": "..."}]
+        out = fccc.render_alert(flagged, skipped=skipped)
+        self.assertIn("specialist/claude-research", out)
+        self.assertIn("dispositioned-mitigation carve-outs", out)
+        self.assertIn("codex/codex", out)
+        self.assertIn("T-3304", out)
+
+    def test_no_skipped_section_when_empty(self):
+        flagged = [{"persona": "specialist", "account": "claude-research", "verdict": fccc.DRIFTED, "detail": "x"}]
+        out = fccc.render_alert(flagged, skipped=None)
+        self.assertNotIn("dispositioned-mitigation carve-outs", out)
+        out2 = fccc.render_alert(flagged, skipped=[])
+        self.assertNotIn("dispositioned-mitigation carve-outs", out2)
+
+    def test_backwards_compat_call_without_skipped_kwarg(self):
+        # Existing callers pass positional flagged only.
+        flagged = [{"persona": "specialist", "account": "claude-research", "verdict": fccc.DRIFTED, "detail": "x"}]
+        out = fccc.render_alert(flagged)
+        self.assertIn("specialist/claude-research", out)
+
+
+class MainSkipListIntegration(unittest.TestCase):
+    def test_main_dry_run_applies_skip_list(self):
+        # End-to-end: main() loads the skip-list, applies it against real
+        # ticket-state on disk, and drops the skipped seats from the alert
+        # while keeping non-skipped drift alerts.
+        with tempfile.TemporaryDirectory() as td:
+            tmp = Path(td)
+            (tmp / "tickets" / "done").mkdir(parents=True)
+            (tmp / "tickets" / "done" / "T-3304.md").write_text("stub\n")
+            skip_yaml = tmp / "skips.yaml"
+            skip_yaml.write_text(
+                "skips:\n  - account: codex\n    disposition_ticket: T-3304\n"
+                "    expected_state: done\n    reason: hist\n"
+            )
+            raw = [
+                {"persona": "codex", "account": "codex", "verdict": fccc.DRIFTED, "detail": "1677 behind"},
+                {"persona": "specialist", "account": "claude-research", "verdict": fccc.DRIFTED, "detail": "21 behind"},
+            ]
+            with mock.patch.object(fccc, "discover_seats", return_value=[]), \
+                 mock.patch.object(fccc, "_fetch_origin_main", return_value=True), \
+                 mock.patch.object(fccc, "sweep", return_value=raw), \
+                 mock.patch.object(fccc, "REPO_ROOT", tmp), \
+                 mock.patch.object(fccc, "alert") as malert:
+                rc = fccc.main(["--check", "--skip-list", str(skip_yaml)])
+            self.assertEqual(rc, 0)
+            malert.assert_called_once()
+            call_flagged = malert.call_args[0][0]
+            self.assertEqual([f["account"] for f in call_flagged], ["claude-research"])
+            call_skipped = malert.call_args[1].get("skipped", [])
+            self.assertEqual([s["account"] for s in call_skipped], ["codex"])
+
+    def test_main_with_no_skip_file_falls_through_cleanly(self):
+        # Fail-open: pointing --skip-list at a nonexistent path must not
+        # crash and must not suppress any alerts.
+        with tempfile.TemporaryDirectory() as td:
+            raw = [{"persona": "codex", "account": "codex", "verdict": fccc.DRIFTED, "detail": "x"}]
+            with mock.patch.object(fccc, "discover_seats", return_value=[]), \
+                 mock.patch.object(fccc, "_fetch_origin_main", return_value=True), \
+                 mock.patch.object(fccc, "sweep", return_value=raw), \
+                 mock.patch.object(fccc, "alert") as malert:
+                rc = fccc.main(["--check", "--skip-list", str(Path(td) / "nope.yaml")])
+            self.assertEqual(rc, 0)
+            # Alert fires normally -- codex NOT suppressed.
+            malert.assert_called_once()
+            self.assertEqual([f["account"] for f in malert.call_args[0][0]], ["codex"])
 
 
 if __name__ == "__main__":

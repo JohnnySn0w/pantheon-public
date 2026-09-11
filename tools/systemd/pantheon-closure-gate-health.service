@@ -1,0 +1,16 @@
+[Unit]
+Description=Pantheon closure-gate health monitor — gate-mode drift + finding-volume trend (T-2845 / ORG-065 BT5)
+Documentation=file:///home/%u/pantheon-config/adr/ORG-065-first-class-dependency-graph.md
+After=network.target
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/closure_gate_health_monitor.py --record
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

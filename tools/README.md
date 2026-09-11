@@ -182,6 +182,7 @@ Canonical templates for the timer + service units. Install instructions in [`sys
 | [`acp_bridge_wetrun.py`](acp_bridge_wetrun.py) | tools/acp_bridge_wetrun.py — T-1633 empirical gate for tools/acp_bridge.py. |
 | [`activity_digest.py`](activity_digest.py) | Activity digest — 5hr cycle system-pulse signal to the operator's Telegram. |
 | [`activity_monitor.py`](activity_monitor.py) | activity_monitor — fire structural poke to an agent's pane when one of: |
+| [`activity_monitor_drift_check.py`](activity_monitor_drift_check.py) | tools/activity_monitor_drift_check.py — activity_monitor meta-drift alarm |
 | [`adaptive_finish_detect.py`](adaptive_finish_detect.py) | adaptive_finish_detect — Audit-tier Stop hook for narrate-then-exit detection. |
 | [`adaptive_finish_digest.py`](adaptive_finish_digest.py) | tools/adaptive_finish_digest.py — weekly Telegram digest of adaptive-finish hits. |
 | [`adr_reeval_walk.py`](adr_reeval_walk.py) | ADR re-evaluation trigger walk (T-2527, design T-2526). |
@@ -190,26 +191,37 @@ Canonical templates for the timer + service units. Install instructions in [`sys
 | [`agent_role_map.py`](agent_role_map.py) | Persona-name <-> role-id resolution for Pantheon agents. |
 | [`ancestor_consume.py`](ancestor_consume.py) | tools/ancestor_consume.py — the-ancestor daemon's mailbox dispatch loop (T-0765 #2 glue). |
 | [`ancestor_liveness_monitor.py`](ancestor_liveness_monitor.py) | tools/ancestor_liveness_monitor.py — light alive-but-wedged recovery for the-ancestor (T-1134). |
+| [`architecture_atlas.py`](architecture_atlas.py) | Architecture atlas derivation and validation contracts. |
 | [`artifact_gc.py`](artifact_gc.py) | Artifact-GC — sweep stale ticket-scoped evidence dirs (T-1360). |
 | [`auto_commit_contract_lint.py`](auto_commit_contract_lint.py) | auto_commit_contract_lint — structural enforcement of the auto-commit-cron default-safe contract. |
+| [`backup_staleness_check.py`](backup_staleness_check.py) | backup_staleness_check.py — T-2886: alert when the off-box VPS backup goes stale. |
 | [`bugs_frontmatter_lint.py`](bugs_frontmatter_lint.py) | bugs_frontmatter_lint — enforce the bugs/ YAML frontmatter contract. |
+| [`cascade_diff_scan.py`](cascade_diff_scan.py) | GHA-side diff-walk for the ORG-013 cascade-on-PR-merge trigger (T-3289). |
 | [`channel_liveness_monitor.py`](channel_liveness_monitor.py) | Channel-liveness monitor — detect a comms-dark-but-session-healthy agent (T-0894). |
 | [`check_public_architecture_maps.py`](check_public_architecture_maps.py) | Validate public architecture diagrams as bounded derivatives of canon. |
+| [`chronicle.py`](chronicle.py) | tools/chronicle.py — durable HANDOFF archive for Veneration session-selection (T-0766). |
 | [`ci_audit_liveness.py`](ci_audit_liveness.py) | tools/ci_audit_liveness.py — alert when the origin-side byte-sequence audit STOPS RUNNING (T-2440). |
 | [`ci_fleet_account_reconcile.py`](ci_fleet_account_reconcile.py) | tools/ci_fleet_account_reconcile.py — ORG-066 Rung-1 fleet-account reconciler (T-2219). |
 | [`cited_hash_lint.py`](cited_hash_lint.py) | cited_hash_lint — find commit hashes cited in tickets that are NOT on origin/main. |
 | [`cited_ticket_lint.py`](cited_ticket_lint.py) | cited_ticket_lint — find T-NNNN ids cited in commit messages that did not exist yet. |
 | [`claude_quota_probe.py`](claude_quota_probe.py) | Run one isolated Claude ping/pong turn to refresh subscription quota data. |
 | [`claude_statusline_capture.py`](claude_statusline_capture.py) | Persist Claude Code status-line quota data as a minimal atomic observation. |
+| [`closure_gate_health_monitor.py`](closure_gate_health_monitor.py) | Closure-gate health monitor (T-2845 / ORG-065 BT5 flip prerequisite). |
+| [`codex_context_lifecycle.py`](codex_context_lifecycle.py) | Codex context lifecycle primitives for T-2957. |
 | [`codex_modal.py`](codex_modal.py) | tools/codex_modal.py -- shared codex first-run-modal detection + precise |
 | [`codex_modal_monitor.py`](codex_modal_monitor.py) | tools/codex_modal_monitor.py — detect codex wedged on a rate-limit model-switch |
 | [`codex_recovery.py`](codex_recovery.py) | codex-recovery broker — ORG-048 §5 privilege surface, increment 1 (T-2805). |
+| [`codex_telegram_actions.py`](codex_telegram_actions.py) | Shared Telegram receiver handoff action ordering. |
+| [`codex_telegram_bridge.py`](codex_telegram_bridge.py) | Target-local Codex Telegram bridge controls for T-2950. |
+| [`component_catalogue.py`](component_catalogue.py) | Strict ORG-055 component catalogue, boundary decisions, and generated index. |
 | [`conftest.py`](conftest.py) | Suite-wide safety net: no test may fire a real Telegram notification. |
 | [`consume_onboard.py`](consume_onboard.py) | T-2679: one-command, persona-parameterized onboarding of a from-scratch, |
 | [`consumer_liveness_monitor.py`](consumer_liveness_monitor.py) | tools/consumer_liveness_monitor.py — a live inbox-consumer that SILENTLY stops |
 | [`context_fill_hold.py`](context_fill_hold.py) | context_fill_hold — explicit, TTL-bounded hold on context_fill_monitor's |
 | [`context_fill_monitor.py`](context_fill_monitor.py) | Context-fill monitor — auto-fire graceful restart on a Pantheon agent's session context-fill threshold. |
 | [`continuity_counter.py`](continuity_counter.py) | continuity_counter.py — Pantheon system-continuity day-count tool. |
+| [`continuity_response_capture.py`](continuity_response_capture.py) | Candidate response-capture adapter (T-3461). |
+| [`continuity_switch_coordinator.py`](continuity_switch_coordinator.py) | External ContinuitySwitchCoordinator (T-3177). |
 | [`credential_broker.py`](credential_broker.py) | Provider-neutral credential leases for Pantheon (ORG-051, T-2380). |
 | [`credential_broker_cli.py`](credential_broker_cli.py) | Installer-interface CLI over tools/credential_broker.py (ORG-051, T-2868). |
 | [`credential_expiry_monitor.py`](credential_expiry_monitor.py) | Proactive OAuth-credential-expiry monitor for the fleet (T-1216 / Jun-2026 401 outage). |
@@ -223,6 +235,7 @@ Canonical templates for the timer + service units. Install instructions in [`sys
 | [`dispatch.py`](dispatch.py) | Pantheon Dispatch contract + dispatch-ledger — schemaful cross-agent delegation audit. |
 | [`doc_traversal_report.py`](doc_traversal_report.py) | Transcript-mining observability — governance-doc traversal report (T-1805). |
 | [`durable_commit_lint.py`](durable_commit_lint.py) | durable_commit_lint — structural guard that keeps the T-2334 concurrent-writer |
+| [`echo_corpus_lint.py`](echo_corpus_lint.py) | Echo-corpus obligation lint — companion to recovery's pantheon-ticket-lint |
 | [`failed_unit_reconcile.py`](failed_unit_reconcile.py) | failed_unit_reconcile — find unit failures whose ALERT never arrived (T-2362). |
 | [`fleet_clone_currency_check.py`](fleet_clone_currency_check.py) | tools/fleet_clone_currency_check.py — fleet clone-currency check (T-2798, T-2794 option-b). |
 | [`fleet_health.py`](fleet_health.py) | Read-only fleet-health verification sweep (T-1049 — the *verifiable* half). |
@@ -230,8 +243,13 @@ Canonical templates for the timer + service units. Install instructions in [`sys
 | [`fleet_reboot.py`](fleet_reboot.py) | tools/fleet_reboot.py — Recovery-driven coordinated fleet reboot orchestration (T-1049). |
 | [`forgejo_mirror_verify.py`](forgejo_mirror_verify.py) | forgejo_mirror_verify — prove the github-mirror repos actually hold what they claim (T-2217). |
 | [`forward_ref_gate.py`](forward_ref_gate.py) | Reject a commit message citing a ticket that does not exist yet. |
-| [`graveyard.py`](graveyard.py) | tools/graveyard.py — durable HANDOFF archive for Veneration session-selection (T-0766). |
+| [`gepa_eval_extract.py`](gepa_eval_extract.py) | GEPA reviewer-eval candidate extractor (T-2809 Phase 1). |
+| [`grand_project_program.py`](grand_project_program.py) | ORG-061 stage evidence and owned re-evaluation obligation machinery. |
 | [`handoff_conservation.py`](handoff_conservation.py) | tools/handoff_conservation.py — detect silent detail loss across a HANDOFF rewrite (T-2638). |
+| [`harness.py`](harness.py) | tools/harness.py — manual-override CLI for the T-2953 harness controller (T-2967 BT4). |
+| [`harness_permission_posture.py`](harness_permission_posture.py) | Fixed transitional Codex permission posture helpers. |
+| [`harness_state.py`](harness_state.py) | Durable-state schema helpers for the T-2953 harness controller (T-2967 BT4). |
+| [`harness_telegram.py`](harness_telegram.py) | tools/harness_telegram.py — /harness command surface for Telegram (T-2967 BT4). |
 | [`heartbeat_write.py`](heartbeat_write.py) | Write a per-agent liveness heartbeat file (ORG-048 D2a). |
 | [`hermes_diff_scan.py`](hermes_diff_scan.py) | Scan git unified-diff output for byte-sequence discipline violations. |
 | [`hermes_history_audit.py`](hermes_history_audit.py) | Whole-history HERMES byte-sequence audit. |
@@ -254,25 +272,42 @@ Canonical templates for the timer + service units. Install instructions in [`sys
 | [`mailbox_mcp.py`](mailbox_mcp.py) | tools/mailbox_mcp.py — MCP stdio server wrapping tools/mailbox.py (T-1112). |
 | [`mailbox_onboard.py`](mailbox_onboard.py) | T-2683: convergent, manifest-driven full-lifecycle installer for the ORG-026 |
 | [`mailbox_wake.py`](mailbox_wake.py) | tools/mailbox_wake.py — the wake half of the ORG-026 mailbox (T-0772 deployment layer). |
+| [`mailbox_writable_roots.py`](mailbox_writable_roots.py) | Resolve manifest-declared mailbox writable roots for harness launch. |
 | [`main_guard_lint.py`](main_guard_lint.py) | main_guard_lint — catch top-level definitions that sit AFTER a `__main__` guard. |
 | [`memory_index.py`](memory_index.py) | tools/memory_index.py — keep MEMORY.md's pin inventory drift-free (ORG-035 / T-1130). |
 | [`memory_lint.py`](memory_lint.py) | tools/memory_lint.py — validate an agent's auto-memory pins (ORG-035 baseline; T-1129). |
+| [`memory_lint_sweep.py`](memory_lint_sweep.py) | memory_lint_sweep.py — T-2888 (ORG-068 memory Health leg): lint EVERY pin store. |
 | [`memory_provenance_backfill.py`](memory_provenance_backfill.py) | tools/memory_provenance_backfill.py — add ORG-035 provenance fields to memory pins (T-1131). |
 | [`memory_search.py`](memory_search.py) | tools/memory_search.py — rg-backed search over an agent's memory pins (ORG-035 / T-1129). |
 | [`memory_snapshot_coverage_monitor.py`](memory_snapshot_coverage_monitor.py) | Coverage monitor for the fleet's memory-snapshot guard (T-2838 / T-1871 rot). |
+| [`memory_store_teardown.py`](memory_store_teardown.py) | memory_store_teardown.py — T-2888 (ORG-068 memory Remove leg): archive-then-delete a pin store. |
 | [`migrate_ledger_to_weekly_shards.py`](migrate_ledger_to_weekly_shards.py) | One-shot migration: flat ledger/2026.jsonl → weekly subfolder shards (T-0148). |
 | [`mint_telegram_sticker_set.py`](mint_telegram_sticker_set.py) | Mint Telegram sticker set(s) from assets/stickers/manifest.json (T-1002). |
 | [`mirror_drift_sweep.py`](mirror_drift_sweep.py) | Weekly mirror drift-sweep (T-1994). |
 | [`mirror_state.py`](mirror_state.py) | Mirror publish-state manager (T-1994). |
+| [`mutation_gate.py`](mutation_gate.py) | tools/mutation_gate.py — targeted-mutation gate for Amendment H falsification. |
 | [`neutralize_seed.py`](neutralize_seed.py) | Build the pantheon-public seed from a pantheon-config source tree. |
+| [`notify_policy.py`](notify_policy.py) | Per-persona notification mute policy — the ORG-076 §7 "Operator plane" control (T-2978). |
+| [`organism_capability_health.py`](organism_capability_health.py) | tools/organism_capability_health.py — ORG-056 Unit E (T-3189). |
+| [`organism_topology.py`](organism_topology.py) | Strict ORG-056 organism topology contracts, validation, and generation. |
+| [`organism_topology_audit.py`](organism_topology_audit.py) | tools/organism_topology_audit.py — ORG-056 Unit F (T-3190). |
 | [`pantheon_config_sync.py`](pantheon_config_sync.py) | pantheon-config bidirectional sync — T-0211 Phase B. |
+| [`pantheon_metrics_gen.py`](pantheon_metrics_gen.py) | pantheon_metrics_gen.py -- emit COARSE, surface-level fleet metrics JSON for the |
+| [`persona_apply_path.py`](persona_apply_path.py) | Shared account-local environment for persona apply/preflight helpers. |
+| [`persona_brief.py`](persona_brief.py) | Resolve manifest-declared persona brief paths. |
 | [`persona_bringup.py`](persona_bringup.py) | Harness-neutral persona diagnosis and headless bring-up. |
+| [`persona_continuity.py`](persona_continuity.py) | Portable, reference-only persona continuity substrate (T-3176). |
+| [`persona_controller_health_dbus.py`](persona_controller_health_dbus.py) | D-Bus health surface for the T-2953 harness controller (T-2969 BT3). |
 | [`persona_cutover_resolve.py`](persona_cutover_resolve.py) | T-2633: persona-generic identity resolver for tools/persona_cutover.sh and |
 | [`persona_installer.py`](persona_installer.py) | Manifest-driven, fail-closed Pantheon persona installer. |
 | [`pgrep_predicate_lint.py`](pgrep_predicate_lint.py) | pgrep_predicate_lint — flag cmdline-substring process predicates in repo scripts. |
 | [`policy_outflow_sync.py`](policy_outflow_sync.py) | tools/policy_outflow_sync.py — ORG-012 OUTFLOW: keep briefs pointed at changed policy. |
 | [`postprocess_ai_sticker_png.py`](postprocess_ai_sticker_png.py) | Convert built-in image_gen chroma-key PNGs into 512x512 RGBA stickers. |
+| [`priority_list_health_watchdog.py`](priority_list_health_watchdog.py) | tools/priority_list_health_watchdog.py — priority-list persistent-broken |
+| [`priority_list_parse.py`](priority_list_parse.py) | Parse the sentinel-delimited YAML priority-list region (ORG-078 §2 — |
+| [`proactive_swap_init.py`](proactive_swap_init.py) | Initiate an operator-directed harness swap for one persona. |
 | [`probe_mailbox_lease_holders.py`](probe_mailbox_lease_holders.py) | — |
+| [`project_catalogue.py`](project_catalogue.py) | Strict ORG-054 project-record catalogue and generated index. |
 | [`promote_lessons.py`](promote_lessons.py) | Lessons → hooks promotion pipeline — detector (T-0649), increment 2. |
 | [`promote_lessons_cron.py`](promote_lessons_cron.py) | Weekly promotion-pipeline runner (T-0649 inc 4). |
 | [`provision_context_fill_monitor_dropins.py`](provision_context_fill_monitor_dropins.py) | Provision + verify the context-fill-monitor per-agent enablement drop-ins (T-1214). |
@@ -285,9 +320,12 @@ Canonical templates for the timer + service units. Install instructions in [`sys
 | [`retro_metrics.py`](retro_metrics.py) | retro_metrics.py — one-time best-effort retro-extraction of the cycle-stats |
 | [`runtime_controller.py`](runtime_controller.py) | Deterministic Pantheon runtime controller for persistent persona harnesses. |
 | [`s3star_audit_runner.py`](s3star_audit_runner.py) | tools/s3star_audit_runner.py — HO-side scheduler for the ORG-038 System-3* |
-| [`scrub_graveyard_companions.py`](scrub_graveyard_companions.py) | Retroactively scrub credentials from existing graveyard companion archives (T-1683). |
+| [`scheduler_reconcile.py`](scheduler_reconcile.py) | tools/scheduler_reconcile.py — ORG-064 General Scheduler, phase 1: render the |
+| [`scheduler_spec.py`](scheduler_spec.py) | tools/scheduler_spec.py — ORG-064 General Scheduler, phase 1: the `schedules/` |
+| [`scrub_chronicle_companions.py`](scrub_chronicle_companions.py) | Retroactively scrub credentials from existing Chronicle companion archives (T-1683). |
 | [`seed_genericize.py`](seed_genericize.py) | seed_genericize.py — T-1327 (recurring weekly). |
 | [`seed_rebrand.py`](seed_rebrand.py) | seed_rebrand.py — official Pantheon seed rebrand tool (T-2072). |
+| [`send_sticker.py`](send_sticker.py) | Send a persona sticker via the Telegram Bot API (T-3319 Part B ceremony-reduction). |
 | [`session_reset_log.py`](session_reset_log.py) | session_reset_log — structured event log for session-reset class events. |
 | [`session_reset_reconcile.py`](session_reset_reconcile.py) | session_reset_reconcile — daily cron that lands session-reset jsonl entries |
 | [`soak_filer.py`](soak_filer.py) | Pantheon suite-health soak filer (T-0991 option b / T-0992). |
@@ -306,6 +344,7 @@ Canonical templates for the timer + service units. Install instructions in [`sys
 | [`ticket.py`](ticket.py) | Pantheon ticket lifecycle CLI. |
 | [`ticket_grooming.py`](ticket_grooming.py) | Pantheon ticket-grooming staleness scanner. |
 | [`ticket_lint.py`](ticket_lint.py) | Pantheon ticket-lint — hourly frontmatter format scanner and auto-fixer. |
+| [`ticket_purpose.py`](ticket_purpose.py) | Typed ORG-054 purpose links for Pantheon tickets. |
 | [`ticket_state_sweep.py`](ticket_state_sweep.py) | Pantheon ticket-state ↔ ledger consistency sweep. |
 | [`tui_wedge_sampler.py`](tui_wedge_sampler.py) | Measure how long a HEALTHY agent can look wedged (T-1369, last branch). |
 | [`unit_failure_alert.py`](unit_failure_alert.py) | OnFailure handler: route a systemd unit failure into Recovery-triage (T-1868). |
@@ -316,9 +355,11 @@ Canonical templates for the timer + service units. Install instructions in [`sys
 | [`verify_hub_cut.py`](verify_hub_cut.py) | Post-cut gate for the T-2156 hub rename: the OLD path must not survive as a |
 | [`verify_seed.py`](verify_seed.py) | verify_seed.py — T-1678, independent post-build seed verifier. |
 | [`watch_digest.py`](watch_digest.py) | Pantheon watch-loop digest. |
+| [`watch_pipeline_decommission.py`](watch_pipeline_decommission.py) | T-2887: scripted, default-safe decommission of the watch/research pipeline |
 | [`watch_runner.py`](watch_runner.py) | Pantheon watch-loop driver. |
 | [`weekly_ticket_summary.py`](weekly_ticket_summary.py) | Pantheon weekly ticket-summary generator. |
 | [`welltrod_stats.py`](welltrod_stats.py) | Well-trod pathing stats — recurring fleet doc-traversal snapshot (T-1811). |
+| [`window_executor.py`](window_executor.py) | Pantheon maintenance-window executor — the D13 queue-drainer. |
 <!-- AUTOGEN-END spine-index -->
 
 

@@ -147,7 +147,7 @@ class TraceEvent:
 LEG_CODEX = "test_live_codex_interactive_tmux_quota_and_ack"
 LEG_CLAUDE = "test_live_claude_interactive_tmux_quota_and_ack"
 LEG_SWAP = "test_live_same_unit_planned_harness_swap_preserves_persona_and_tmux"
-LEG_FORCED_CAP = "test_live_forced_cap_requeues_and_bootstraps_from_graveyard_receipt"
+LEG_FORCED_CAP = "test_live_forced_cap_requeues_and_bootstraps_from_chronicle_receipt"
 LEG_BATCH = "test_live_explicit_claude_batch_sdk_is_nondefault_and_separately_metered"
 
 TRACE_SCHEMA = "pantheon-t2382-live-trace/v2"
@@ -1730,7 +1730,7 @@ def observe_forced_cap_phase(
         "forced_before",
         "forced_cap",
         "message_requeued",
-        "graveyard_receipt",
+        "chronicle_receipt",
         "receipt_read_ack",
         "fallback_retry",
     ],
@@ -1800,9 +1800,9 @@ def observe_forced_cap_phase(
         payload["receipt_sha256"] = _sha256_file(receipt_path)
         receipt = _read_json_mapping(receipt_path, label="forced failover receipt")
         payload["receipt"] = receipt
-        graveyard_path = Path(str(receipt.get("graveyard_entry", "")))
-        payload["graveyard_path"] = graveyard_path.resolve()
-        payload["graveyard_sha256"] = _sha256_file(graveyard_path)
+        chronicle_path = Path(str(receipt.get("chronicle_entry", "")))
+        payload["chronicle_path"] = chronicle_path.resolve()
+        payload["chronicle_sha256"] = _sha256_file(chronicle_path)
     if retired_pid is not None:
         payload["retired_pid"] = retired_pid
         payload["retired_pid_absent"] = not (proc_root / str(retired_pid)).exists()
@@ -2256,7 +2256,7 @@ def _finalize_swap(events: Sequence[TraceEvent], reviewed: str) -> tuple[None, R
         mismatched = [key for key, value in expected.items() if transition.get(key) != value]
         if mismatched:
             raise AcceptanceRefused(f"{label} swap transition mismatch: {', '.join(mismatched)}")
-        if not transition.get("successor_read_evidence") or not transition.get("handoff_or_graveyard"):
+        if not transition.get("successor_read_evidence") or not transition.get("chronicle_evidence"):
             raise AcceptanceRefused(f"{label} swap lacks structural handoff/read evidence")
     recovery = reset.get("quota_evidence")
     if not isinstance(recovery, Mapping) or not recovery:
@@ -2334,7 +2334,7 @@ def _finalize_forced_cap(events: Sequence[TraceEvent], reviewed: str) -> tuple[M
             "forced_before",
             "forced_cap",
             "message_requeued",
-            "graveyard_receipt",
+            "chronicle_receipt",
             "receipt_read_ack",
             "fallback_retry",
             "mailbox_cur",
@@ -2355,7 +2355,7 @@ def _finalize_forced_cap(events: Sequence[TraceEvent], reviewed: str) -> tuple[M
             "forced_before",
             "forced_cap",
             "message_requeued",
-            "graveyard_receipt",
+            "chronicle_receipt",
             "receipt_read_ack",
             "fallback_retry",
         )
@@ -2408,7 +2408,7 @@ def _finalize_forced_cap(events: Sequence[TraceEvent], reviewed: str) -> tuple[M
     if cap_transition.get("phase") not in {"awaiting-successor-read", "completed"}:
         raise AcceptanceRefused("forced-cap controller is not at the successor-read barrier")
     if ack_transition.get("phase") != "completed" or ack_transition.get("successor_read_ack") is not True:
-        raise AcceptanceRefused("successor did not structurally acknowledge graveyard read")
+        raise AcceptanceRefused("successor did not structurally acknowledge chronicle read")
     if not ack_transition.get("successor_read_evidence"):
         raise AcceptanceRefused("forced-cap read acknowledgement lacks evidence")
 
@@ -2418,8 +2418,8 @@ def _finalize_forced_cap(events: Sequence[TraceEvent], reviewed: str) -> tuple[M
     for key, value in {"message_id": mailbox_identity[0], "correlation_id": mailbox_identity[1]}.items():
         if receipt.get(key) != value:
             raise AcceptanceRefused(f"forced-cap receipt {key} mismatch")
-    if not receipt_event.get("graveyard_sha256"):
-        raise AcceptanceRefused("forced-cap graveyard entry is absent")
+    if not receipt_event.get("chronicle_sha256"):
+        raise AcceptanceRefused("forced-cap chronicle entry is absent")
     transition_id = cap_transition.get("transition_id")
     if not isinstance(transition_id, str) or not transition_id:
         raise AcceptanceRefused("forced-cap transition lacks transition_id")
@@ -2880,7 +2880,7 @@ def _dispatch_observe(args: argparse.Namespace) -> TraceEvent:
         "forced_before",
         "forced_cap",
         "message_requeued",
-        "graveyard_receipt",
+        "chronicle_receipt",
         "receipt_read_ack",
         "fallback_retry",
     }:

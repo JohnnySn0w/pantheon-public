@@ -50,10 +50,10 @@ def fake_report(session_id, gov_touches, handoff=True):
 def make_gov_repo(root):
     """Governance inventory: two sop docs + one adr + top README."""
     (root / "sop" / "standard").mkdir(parents=True)
-    (root / "adr").mkdir()
+    (root / "architecture" / "adr").mkdir(parents=True)
     (root / "sop" / "standard" / "alpha.md").write_text("a\n")
     (root / "sop" / "standard" / "beta.md").write_text("b\n")
-    (root / "adr" / "ORG-001.md").write_text("c\n")
+    (root / "architecture" / "adr" / "ORG-001.md").write_text("c\n")
     (root / "README.md").write_text("r\n")
 
 
@@ -122,7 +122,7 @@ class BuildSnapshotTest(unittest.TestCase):
         self.assertEqual(cov["inventory_size"], 4)  # alpha, beta, ORG-001, README
         self.assertEqual(cov["touched_count"], 1)
         self.assertIn("sop/standard/beta.md", cov["never_touched"])
-        self.assertIn("adr/ORG-001.md", cov["never_touched"])
+        self.assertIn("architecture/adr/ORG-001.md", cov["never_touched"])
         self.assertNotIn("sop/standard/alpha.md", cov["never_touched"])
 
     def test_handoff_counts_outside_inventory(self):

@@ -95,6 +95,15 @@ repos:
     description: genericized codex-config release template (T-1472); private mirror example-org/codex-config-template published by HO (T-1501); public flip operator-gated
     grants: { orchestrator: rw }
 
+  # Added 2026-08-28 (T-2090, descriptive-of-current-reality — both repos already
+  # cloned on HO, surfaced during an operator ticket walk):
+  - name: exocortex-skeleton
+    description: exocortex/mnemosyne memory-substrate skeleton
+    grants: { orchestrator: rw }   # ssh alias github-exocortex-skeleton (read-only deploy key not on the repo; HTTPS via PAT for writes)
+  - name: pantheon-public
+    description: neutralized public-facing mirror of pantheon-config, orphan-root private (initial publish gated on T-1963/T-1970/T-1989)
+    grants: { orchestrator: rw }
+
 # Repos PRESENT on an agent's box but intentionally NOT sanctioned project repos
 # (the operator ruling msg 3848, T-0761): the present-but-undeclared audit (T-0761
 # component 5, when built) must SKIP these rather than flag them. Not granted,
@@ -103,8 +112,16 @@ repos:
 ignored:
   - repo: excalidraw-diagram-skill
     reason: "document-implementation tool, not a Pantheon/the operator project (the operator msg 3848)"
+  - repo: sentient-internal
+    reason: "SentientHome crew-facing repo (client engagement); business/client material lives outside pantheon per the operator's standing rule (T-2090 ruling 2026-08-28)"
+  - repo: sentienthardware
+    reason: "SentientHome contract client-facing repo; business/client material, not Pantheon (T-2090 ruling 2026-08-28)"
+  - repo: studio-operator
+    reason: "firm-level engagement records; business material, not Pantheon (T-2090 ruling 2026-08-28)"
   - repo: toys
     reason: "catchall/experiments, not to be truly committed (the operator msg 3848)"
+  - repo: vibecamp-trials-tracker
+    reason: "personal project (event-specific tooling); not Pantheon material (T-2090 ruling 2026-08-28)"
 
 # NOTE (grants policy, pending reclass): today orchestrator holds all
 # project repos; specialist/recovery hold only pantheon-config. Specialist

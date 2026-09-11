@@ -35,6 +35,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -50,6 +51,10 @@ from tools.harness_adapter.types import (
     HarnessEvent,
     HarnessSurfaceDescriptors,
     InboundRequest,
+    PostStartAssessment,
+    PostStartPaneSample,
+    ProviderCompletionAssessment,
+    ProviderCompletionProbe,
     SessionHandle,
     TmuxTarget,
 )
@@ -170,7 +175,7 @@ class PantheonHarnessAdapter(ABC):
         ...
 
     @abstractmethod
-    def build_interactive_launch(self, target: TmuxTarget) -> CommandSpec:
+    def build_interactive_launch(self, target: TmuxTarget, *, cwd: Path) -> CommandSpec:
         """Build the persistent interactive launch for the operator tmux plane."""
         ...
 
@@ -178,6 +183,76 @@ class PantheonHarnessAdapter(ABC):
     def quota_observer(self, state_dir: Path) -> QuotaObserver:
         """Return the provider-native quota evidence reader for this profile."""
         ...
+
+    def assess_post_start_readiness(
+        self,
+        *,
+        harness: str,
+        profile: str,
+        baseline: PostStartPaneSample,
+        samples: Iterable[PostStartPaneSample],
+    ) -> PostStartAssessment:
+        """Assess provider UI after post-start hooks without serializing text."""
+        sample_tuple = tuple(samples)
+        return PostStartAssessment(
+            schema="pantheon-harness-post-start-assessment/v1",
+            harness=harness,
+            profile=profile,
+            status="unknown",
+            cause=None,
+            pattern_id=None,
+            baseline_sha256=baseline.sha256,
+            capture_count=len(sample_tuple),
+            changed_capture_indices=tuple(
+                sample.capture_index
+                for sample in sample_tuple
+                if sample.sha256 != baseline.sha256
+            ),
+        )
+
+    def prepare_interactive_provider_completion(
+        self,
+        *,
+        harness: str,
+        profile: str,
+        persona: str,
+        account_home: Path,
+        state_dir: Path,
+        pane_baseline: PostStartPaneSample,
+        submitted_at: datetime,
+        nonce_marker: str,
+        nonce_sha256: str,
+    ) -> ProviderCompletionProbe | None:
+        """Return a transient provider-completion probe, if this harness supports one."""
+
+        del harness, profile, persona, account_home, state_dir, pane_baseline, submitted_at, nonce_marker, nonce_sha256
+        return None
+
+    def assess_interactive_provider_completion(
+        self,
+        *,
+        harness: str,
+        profile: str,
+        probe: ProviderCompletionProbe | None,
+        samples: Iterable[PostStartPaneSample],
+    ) -> ProviderCompletionAssessment:
+        """Assess interactive provider completion without serializing raw text."""
+
+        sample_tuple = tuple(samples)
+        return ProviderCompletionAssessment(
+            schema="pantheon-harness-provider-completion/v1",
+            harness=harness,
+            profile=profile,
+            status="not-applicable",
+            cause=None,
+            pattern_id=None,
+            nonce_sha256=probe.nonce_sha256 if probe is not None else None,
+            prompt_sha256=probe.prompt_sha256 if probe is not None else None,
+            statusline_baseline_sha256=None,
+            statusline_observed_sha256=None,
+            capture_count=len(sample_tuple),
+            changed_capture_indices=(),
+        )
 
     # -------------------------------------------------------------------------
     # Partition 1 — Generalized surfaces (7).

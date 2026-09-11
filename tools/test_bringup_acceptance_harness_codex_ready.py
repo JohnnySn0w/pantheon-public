@@ -20,18 +20,29 @@ No live production systemd/tmux server or real mailbox hub is ever touched.
 
 from __future__ import annotations
 
+import dataclasses
 import getpass
+import hashlib
 import json
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from tools import runtime_controller as rc
+from tools.bringup_acceptance import codex_acceptance_config_guard as config_guard
 from tools.bringup_acceptance import harness_codex_ready as hcr
+from tools.bringup_acceptance import harness_codex_rc_ready as hrc
 from tools.bringup_acceptance.types import HardStop
+from tools.harness_adapter.codex import (
+    ensure_model_migration_prompts_hidden,
+    ensure_project_trusted,
+    ensure_update_check_disabled,
+)
+from tools.harness_adapter.types import TmuxTarget
 from tools.submit_verify import ready_for_submission
 
 
@@ -557,6 +568,322 @@ class ManifestFixtureTest(unittest.TestCase):
         text = hcr._fixture_manifest_text(persona="p", account="claude")
         self.assertIn("sandbox: workspace-write", text)
         self.assertIn("approval_policy: never", text)
+
+
+def _config_fingerprint(path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
+class _FakeCodexAdapter:
+    def __init__(self, cwd: Path) -> None:
+        self.cwd = cwd
+
+    def build_interactive_launch(self, _target: TmuxTarget, *, cwd: Path) -> object:
+        return SimpleNamespace(cwd=self.cwd, argv=("/bin/true",), env={})
+
+
+class CodexAcceptanceConfigGuardIntegrationTest(unittest.TestCase):
+    def test_codex_acceptance_steps_restore_config_fingerprint_after_ready_and_rc_ready(self) -> None:
+        target = TmuxTarget(session="s", window="w", pane="0")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / "account-home"
+            codex_home = account_home / ".codex"
+            codex_home.mkdir(parents=True)
+            config_path = codex_home / "config.toml"
+            original = 'approval_policy = "never"\n'
+            config_path.write_text(original, encoding="utf-8")
+            before = _config_fingerprint(config_path)
+            assert before is not None
+            ready_work = root / "ready-work"
+            rc_work = root / "rc-work"
+            ready_adapter = _FakeCodexAdapter(ready_work)
+            rc_adapter = _FakeCodexAdapter(rc_work)
+
+            def binding(work_root: Path) -> object:
+                return SimpleNamespace(
+                    controller=SimpleNamespace(tmux=target),
+                    account_home=account_home,
+                    persona="fake-persona",
+                    launch=SimpleNamespace(harness="codex"),
+                    launch_cwd=work_root,
+                )
+
+            def mutate_startup(fake_binding: object, _adapter: object, *, replace: bool, context: object) -> rc.RuntimeStart:
+                del replace, context
+                ensure_project_trusted(codex_home, Path(fake_binding.launch_cwd))
+                ensure_update_check_disabled(codex_home)
+                ensure_model_migration_prompts_hidden(codex_home)
+                return rc.RuntimeStart(scope_unit="fake.scope", created_scope=True)
+
+            common = (
+                mock.patch.object(rc, "_start_runtime", side_effect=mutate_startup),
+                mock.patch.object(rc, "_verify_started_runtime", return_value=None),
+            )
+            with common[0], common[1], \
+                 mock.patch.object(hcr.persona_bringup, "load_binding", return_value=binding(ready_work)), \
+                 mock.patch.object(hcr.persona_bringup, "build_adapter", return_value=ready_adapter), \
+                 mock.patch.object(hcr, "_wait_for_codex_ready", return_value=READY_COMPOSER_AFTER_DISMISS), \
+                 mock.patch.object(hcr, "_teardown_disposable_tmux_context", return_value=[]):
+                hcr.run_codex_ready_bringup(work_root=ready_work, account="testaccount")
+
+            self.assertEqual(_config_fingerprint(config_path), before)
+
+            fake_readiness = rc.RuntimeInputReadiness(
+                ready=True,
+                pane_sha256="readyhash",
+                reason="runtime input readiness confirmed",
+            )
+            with mock.patch.object(rc, "_start_runtime", side_effect=mutate_startup), \
+                 mock.patch.object(rc, "_verify_started_runtime", return_value=None), \
+                 mock.patch.object(hrc.persona_bringup, "load_binding", return_value=binding(rc_work)), \
+                 mock.patch.object(hrc.persona_bringup, "build_adapter", return_value=rc_adapter), \
+                 mock.patch.object(rc, "_capture_visible_runtime_pane", return_value=MODAL_CURSOR_ON_OPTION_3), \
+                 mock.patch.object(rc, "_wait_for_runtime_input_ready", return_value=fake_readiness), \
+                 mock.patch.object(hrc, "_teardown_disposable_tmux_context", return_value=[]):
+                hrc.run_codex_rc_ready_bringup(work_root=rc_work, account="testaccount")
+
+            self.assertEqual(config_path.read_text(encoding="utf-8"), original)
+            self.assertEqual(_config_fingerprint(config_path), before)
+
+
+class CodexAcceptanceConfigGuardUnitTest(unittest.TestCase):
+    def test_prefix_snapshots_restore_after_each_writer_boundary_and_preexisting_noops(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config_path = codex_home / "config.toml"
+            original = 'approval_policy = "never"\n'
+            config_path.write_text(original, encoding="utf-8")
+            project_cwd = root / "project"
+            project_cwd.mkdir()
+
+            baseline = config_path.read_bytes()
+            expectation = config_guard.build_startup_config_expectation(
+                codex_home=codex_home,
+                project_cwd=project_cwd,
+                owner="test",
+            )
+            self.assertEqual([prefix.prefix_index for prefix in expectation.prefixes], [0, 1, 2, 3])
+            self.assertEqual(
+                [result.name for result in expectation.writer_results],
+                [
+                    "ensure_project_trusted",
+                    "ensure_update_check_disabled",
+                    "ensure_model_migration_prompts_hidden",
+                ],
+            )
+            for prefix in expectation.prefixes[1:]:
+                with self.subTest(prefix=prefix.prefix_index):
+                    config_path.write_bytes(prefix.snapshot.content)
+                    guard = config_guard.ReversibleAcceptanceConfigGuard(
+                        codex_home=codex_home,
+                        project_cwd=project_cwd,
+                        owner="test",
+                    )
+                    guard.expectation = expectation
+                    guard.restore()
+                    self.assertEqual(config_path.read_bytes(), baseline)
+
+            ensure_project_trusted(codex_home, project_cwd)
+            ensure_update_check_disabled(codex_home)
+            preexisting = config_path.read_bytes()
+            expectation = config_guard.build_startup_config_expectation(
+                codex_home=codex_home,
+                project_cwd=project_cwd,
+                owner="test",
+            )
+            self.assertFalse(expectation.writer_results[0].modified)
+            self.assertFalse(expectation.writer_results[1].modified)
+            self.assertEqual(expectation.prefixes[-1].snapshot.content, preexisting)
+
+    def test_config_guard_rejects_same_bytes_mode_or_owner_metadata_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config_path = codex_home / "config.toml"
+            config_path.write_text('approval_policy = "never"\n', encoding="utf-8")
+            project_cwd = root / "project"
+            project_cwd.mkdir()
+            expectation = config_guard.build_startup_config_expectation(
+                codex_home=codex_home,
+                project_cwd=project_cwd,
+                owner="test",
+            )
+            prefix = expectation.prefixes[1].snapshot
+            config_path.write_bytes(prefix.content)
+            current_mode = config_path.stat().st_mode & 0o777
+            config_path.chmod(0o600 if current_mode != 0o600 else 0o644)
+            guard = config_guard.ReversibleAcceptanceConfigGuard(
+                codex_home=codex_home,
+                project_cwd=project_cwd,
+                owner="test",
+            )
+            guard.expectation = expectation
+            with self.assertRaises(config_guard.AcceptanceConfigGuardError):
+                guard.restore()
+
+            owner_drift = dataclasses.replace(
+                prefix,
+                uid=(prefix.uid or 0) + 1,
+            )
+            guard = config_guard.ReversibleAcceptanceConfigGuard(
+                codex_home=codex_home,
+                project_cwd=project_cwd,
+                owner="test",
+            )
+            guard.expectation = expectation
+            with mock.patch.object(config_guard, "snapshot_config_bytes", return_value=owner_drift):
+                with self.assertRaises(config_guard.AcceptanceConfigGuardError):
+                    guard.restore()
+
+    def test_config_guard_preflight_refuses_unparseable_symlink_or_nonregular_without_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_cwd = root / "project"
+            project_cwd.mkdir()
+
+            bad_home = root / "bad" / ".codex"
+            bad_home.mkdir(parents=True)
+            bad_config = bad_home / "config.toml"
+            bad_config.write_text("this is not [valid toml\n", encoding="utf-8")
+            with self.assertRaisesRegex(
+                config_guard.AcceptanceConfigGuardError,
+                "refuses unparseable config.toml",
+            ):
+                config_guard.ReversibleAcceptanceConfigGuard(
+                    codex_home=bad_home,
+                    project_cwd=project_cwd,
+                    owner="test",
+                ).__enter__()
+            self.assertEqual(bad_config.read_text(encoding="utf-8"), "this is not [valid toml\n")
+
+            symlink_home = root / "symlink" / ".codex"
+            symlink_home.mkdir(parents=True)
+            outside = root / "outside.toml"
+            outside.write_text('approval_policy = "never"\n', encoding="utf-8")
+            (symlink_home / "config.toml").symlink_to(outside)
+            with self.assertRaisesRegex(
+                config_guard.AcceptanceConfigGuardError,
+                "refuses symlink config target",
+            ):
+                config_guard.ReversibleAcceptanceConfigGuard(
+                    codex_home=symlink_home,
+                    project_cwd=project_cwd,
+                    owner="test",
+                ).__enter__()
+            self.assertEqual(outside.read_text(encoding="utf-8"), 'approval_policy = "never"\n')
+
+            directory_home = root / "directory" / ".codex"
+            directory_config = directory_home / "config.toml"
+            directory_config.mkdir(parents=True)
+            with self.assertRaisesRegex(
+                config_guard.AcceptanceConfigGuardError,
+                "refuses non-regular config target",
+            ):
+                config_guard.ReversibleAcceptanceConfigGuard(
+                    codex_home=directory_home,
+                    project_cwd=project_cwd,
+                    owner="test",
+                ).__enter__()
+            self.assertTrue(directory_config.is_dir())
+
+    def test_codex_acceptance_config_guard_refuses_concurrent_drift_duplicate_or_unparseable_config(self) -> None:
+        target = TmuxTarget(session="s", window="w", pane="0")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / "account-home"
+            codex_home = account_home / ".codex"
+            codex_home.mkdir(parents=True)
+            config_path = codex_home / "config.toml"
+            config_path.write_text('approval_policy = "never"\n', encoding="utf-8")
+            work_root = root / "ready-work"
+            fake_binding = SimpleNamespace(
+                controller=SimpleNamespace(tmux=target),
+                account_home=account_home,
+                persona="fake-persona",
+                launch=SimpleNamespace(harness="codex"),
+                launch_cwd=work_root,
+            )
+            fake_adapter = _FakeCodexAdapter(work_root)
+
+            def drift_startup(_binding: object, _adapter: object, *, replace: bool, context: object) -> rc.RuntimeStart:
+                del replace, context
+                ensure_project_trusted(codex_home, work_root)
+                with config_path.open("a", encoding="utf-8") as handle:
+                    handle.write('\n[projects."/concurrent-drift"]\ntrust_level = "trusted"\n')
+                return rc.RuntimeStart(scope_unit="fake.scope", created_scope=True)
+
+            with mock.patch.object(hcr.persona_bringup, "load_binding", return_value=fake_binding), \
+                 mock.patch.object(hcr.persona_bringup, "build_adapter", return_value=fake_adapter), \
+                 mock.patch.object(rc, "_start_runtime", side_effect=drift_startup), \
+                 mock.patch.object(rc, "_verify_started_runtime", return_value=None), \
+                 mock.patch.object(hcr, "_wait_for_codex_ready", return_value=READY_COMPOSER_AFTER_DISMISS), \
+                 mock.patch.object(hcr, "_teardown_disposable_tmux_context", return_value=[]):
+                with self.assertRaises(Exception) as ctx:
+                    hcr.run_codex_ready_bringup(work_root=work_root, account="testaccount")
+
+            self.assertIn("config", str(ctx.exception).lower())
+            self.assertIn("/concurrent-drift", config_path.read_text(encoding="utf-8"))
+
+    def test_config_guard_refuses_replaced_symlink_nonregular_and_failed_post_verify(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config_path = codex_home / "config.toml"
+            secret_original = 'approval_policy = "never"\n# secret-config-bytes\n'
+            config_path.write_text(secret_original, encoding="utf-8")
+            project_cwd = root / "project"
+            project_cwd.mkdir()
+            expectation = config_guard.build_startup_config_expectation(
+                codex_home=codex_home,
+                project_cwd=project_cwd,
+                owner="test",
+            )
+
+            config_path.unlink()
+            outside = root / "outside.toml"
+            outside.write_text("outside\n", encoding="utf-8")
+            config_path.symlink_to(outside)
+            guard = config_guard.ReversibleAcceptanceConfigGuard(
+                codex_home=codex_home,
+                project_cwd=project_cwd,
+                owner="test",
+            )
+            guard.expectation = expectation
+            with self.assertRaises(config_guard.AcceptanceConfigGuardError) as symlink_ctx:
+                guard.restore()
+            self.assertNotIn("secret-config-bytes", str(symlink_ctx.exception))
+            self.assertEqual(outside.read_text(encoding="utf-8"), "outside\n")
+
+            config_path.unlink()
+            config_path.mkdir()
+            guard = config_guard.ReversibleAcceptanceConfigGuard(
+                codex_home=codex_home,
+                project_cwd=project_cwd,
+                owner="test",
+            )
+            guard.expectation = expectation
+            with self.assertRaises(config_guard.AcceptanceConfigGuardError):
+                guard.restore()
+            config_path.rmdir()
+            config_path.write_bytes(expectation.prefixes[1].snapshot.content)
+
+            with mock.patch.object(config_guard, "_snapshot_matches", return_value=False):
+                with self.assertRaises(config_guard.AcceptanceConfigGuardError) as verify_ctx:
+                    config_guard.restore_config_snapshot_atomically(
+                        config_path=config_path,
+                        desired=expectation.before,
+                    )
+            self.assertNotIn("secret-config-bytes", str(verify_ctx.exception))
 
 
 # --------------------------------------------------------------------------- #

@@ -1,0 +1,12 @@
+[Unit]
+Description=Echo-corpus obligation lint — hourly fire (*:50 UTC, clear of this account's other :00/:15/:30/:36-48 slots and recovery's own :20 ticket-lint)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* *:50:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=pantheon-echo-lint.service
+
+[Install]
+WantedBy=timers.target

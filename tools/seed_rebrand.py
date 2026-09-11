@@ -45,10 +45,13 @@ What the tool DELIBERATELY leaves alone (per the wish-factory review §1.1/§2/�
   - Its OWN source (`seed_rebrand.py` + test) — a rename tool contains the tokens
     it replaces; rewriting itself would break idempotence for the pull-reconcile
     workflow that re-runs it after every upstream pull. See SELF_EXCLUDE.
-  - The DESIGN-HISTORY corpus (`knowledge/ lessons/ adr/ bugs/`) — skipped by
-    default; rewriting the origin's reasoning-prose turns it into the fork's, and
-    rewriting `[[ORG-NNN]]` ADR references breaks the vault link graph. Pass
-    `--include-corpus` to override. See CORPUS_DIRS.
+  - The DESIGN-HISTORY corpus (`knowledge/ lessons/ bugs/` + the whole
+    `architecture/` subtree — `architecture/adr/ architecture/rfc/
+    architecture/engineering-practices/ architecture/atlas/` — plus the bare
+    `adr/` name for pre-T-3472 forks that still hold ADRs at the root) —
+    skipped by default; rewriting the origin's reasoning-prose turns it into
+    the fork's, and rewriting `[[ORG-NNN]]` ADR references breaks the vault
+    link graph. Pass `--include-corpus` to override. See CORPUS_DIRS.
   - The bare `pantheon` STATE/LOG dir (`~/.local/state/pantheon`, `.../log/pantheon`)
     — the rules only match `pantheon-` / `pantheon_` (trailing sep), never a bare
     `pantheon/` or `"pantheon"`, so the state/log root is untouched ON PURPOSE.
@@ -87,7 +90,7 @@ SKIP_DIRS = {".git", "node_modules", ".venv", "__pycache__", ".svelte-kit", "dis
 # and rewriting ADR-filename references breaks the `[[ORG-NNN]]` link graph +
 # vault_link_check. A fork should KEEP this corpus as-is (it's the most valuable
 # thing in the seed) or rewrite files from scratch — not blanket-rename it.
-CORPUS_DIRS = {"knowledge", "lessons", "adr", "bugs"}
+CORPUS_DIRS = {"knowledge", "lessons", "adr", "bugs", "architecture"}
 
 # SELF-EXCLUSION (review §5): a rename tool contains the very tokens it replaces
 # (its rules + keep-list + docstring). Without this it rewrites its own rules on

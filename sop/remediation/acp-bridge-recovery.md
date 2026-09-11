@@ -4,6 +4,8 @@
 
 **Amendment adopted 2026-07-28 (Recovery, T-2132)** — verification-step corrections only; the remediation itself was executed verbatim on specialist and worked as written. Added the run-on-your-own-seat pre-flight (transcript mtime as the am-I-resetting-myself discriminator), and rewrote the verify step after measuring that its process check could report a *failed stop that had actually succeeded*. Amendment tier is below the goal-level bar per amended D3, so it is adopted rather than held for a stamp; the base SOP's ratification status above is unchanged by it.
 
+**Amendment adopted 2026-08-18 (Recovery, T-2972)** — added **Class C (auth staleness)** below (failure shape + remediation step 3.5 + a Class-C exception to step 4), from the specialist 2026-08-18 incident: the bridge held a stale token for hours after specialist's OAuth re-login and all ACP delivery silently failed `-32000: Authentication required`. Remediation content only, below the goal-level bar per amended D3 → adopted rather than held; base SOP ratification status above unchanged.
+
 The `pantheon-acp-bridge@<agent>.service` bridge (`tools/acp_bridge.py`) connects a
 seat/keeper (specialist, mnemosyne, …) to its mailbox over a persistent ACP wrapper
 session. Two distinct failure shapes recur; both look like "the bridge is alive but
@@ -27,6 +29,17 @@ iterations observed on specialist). **Fixed in T-2038**: a cap is now classed tr
 (`AcpCapError`, `mailbox_transient=True`) → left in `new/` uncounted, plus a circuit
 breaker defers drains for `cap_cooldown_secs`. If you see Class B on a bridge, first
 confirm it's running the post-T-2038 code; if so it self-recovers on cap reset.
+
+**Class C — auth staleness (`-32000: Authentication required`).** After the agent's
+`~/.claude/.credentials.json` is wiped + recovered (an OAuth re-login, see
+`sop/remediation/agent-oauth-relogin.md`), the long-running `claude-code-acp` process
+keeps its PRE-wipe token in memory → every `session/prompt` returns
+`ACP error -32000: Authentication required`, even though the credential FILE and the
+agent's interactive pane are both perfectly healthy (auth-liveness ≠ process-liveness).
+Live instance: specialist, 2026-08-18 — keep_going nudges + mailbox mail dead-lettered for
+HOURS post-re-login until a `mail_staleness` alert surfaced it. Unlike Class A, the fix
+is a PROCESS restart ALONE (§3.5) — the token is per-process, so resuming the same ACP
+`sessionId` is fine; do NOT delete the state file.
 
 **Where the evidence lives — NOT journald.** The bridge tees its per-drain status
 JSON + stderr to `~/.local/state/pantheon/acp-bridge-<agent>.log` (on the agent's
@@ -107,8 +120,19 @@ confirm the unit name and the running invocation before acting.
    predates T-2038, pull the clone to current `origin/main` + restart (a per-fire
    oneshot picks up new code on respawn; the bridge is `Type=simple`, so it needs a
    `systemctl --user restart`).
-4. **Never** raw `tmux kill-session` alone — the supervisor just respawns it; and
-   never `claude mcp list` a live bot.
+3.5. **Class C (auth staleness) — a PROCESS restart ALONE, no state-file delete:** respawn
+   `claude-code-acp` so it re-reads the current credential.
+   `tmux kill-session -t acp-bridge-<agent>` (→ supervise exits → `Restart=always`
+   respawns fresh) OR `systemctl --user stop pantheon-acp-bridge@<agent>` + `start`. Do
+   NOT delete the state file — resuming the same `sessionId` is correct here (the stale
+   thing was the process token, not the session context). **`systemctl --user restart`
+   alone was a NO-OP in the specialist case** (the bridge survived in its detached tmux session
+   across the MainPID restart) — `kill-session` or `stop`+`start` actually cycles the
+   process. This normally FOLLOWS an OAuth re-login (`agent-oauth-relogin.md` step 5).
+4. **Never** raw `tmux kill-session` alone **for Class A** — the supervisor respawns it and
+   RESUMES the same wedged context session (you need the state-file delete in §2). *(Class C
+   is the exception — there the respawn IS the fix, §3.5.)* And never `claude mcp list` a
+   live bot.
 
 ## Verify after any restart — and do NOT count processes with a bare pattern
 

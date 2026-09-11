@@ -65,6 +65,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools import agent_role_map
+from tools.persona_apply_path import controlled_apply_environment
 from tools.persona_bringup import load_binding
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -135,6 +136,7 @@ class BespokeIdentity:
     uid: int
     home: Path
     xdg_runtime_dir: Path
+    dbus_session_bus_address: str
     tmux_session: str
     service: str
     service_unit_path: Path
@@ -260,13 +262,15 @@ def resolve_bespoke_identity(persona: str, *, unit_text: str | None = None) -> B
     text = unit_text if unit_text is not None else _service_unit_text(service_unit_path)
     supervise_wrapper_path = Path(parse_supervise_wrapper(text))
 
+    apply_env = controlled_apply_environment(home, uid)
     return BespokeIdentity(
         persona=persona,
         role=role,
         account=account,
         uid=uid,
         home=home,
-        xdg_runtime_dir=Path(f"/run/user/{uid}"),
+        xdg_runtime_dir=Path(apply_env["XDG_RUNTIME_DIR"]),
+        dbus_session_bus_address=apply_env["DBUS_SESSION_BUS_ADDRESS"],
         tmux_session=tmux_session,
         service=service,
         service_unit_path=service_unit_path,
@@ -274,7 +278,7 @@ def resolve_bespoke_identity(persona: str, *, unit_text: str | None = None) -> B
         supervise_wrapper_path=supervise_wrapper_path,
         consume_timer=f"pantheon-persona-consume@{persona}.timer",
         consume_service=f"pantheon-persona-consume@{persona}.service",
-        apply_path=f"{home}/.npm-global/bin:/usr/local/bin:/usr/bin:/bin",
+        apply_path=apply_env["PATH"],
         # T-2648: already encoded as `unit=session` tokens by
         # agent_role_map._load_instance_bindings; "" when the persona
         # declares none.

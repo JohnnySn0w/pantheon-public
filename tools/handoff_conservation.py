@@ -24,10 +24,10 @@ Design (decided in T-2533, implemented here):
   3. ALERT, never block. This is advisory only; every failure mode here
      degrades to "no alert printed", never to a blocked restart.
 
-OLD comes from tools/graveyard.py's existing latest_handoff_text() — the
+OLD comes from tools/chronicle.py's existing latest_handoff_text() — the
 snapshot the *previous* handoff-and-restart cycle archived. NEW is the
 HANDOFF.md about to be archived by *this* cycle. Wired into
-handoff_and_restart.sh immediately before its graveyard.py archive call,
+handoff_and_restart.sh immediately before its chronicle.py archive call,
 while latest_handoff_text() still returns the prior cycle's snapshot (the
 archive call below it is what turns the current text into the new latest).
 That ordering is what makes OLD/NEW two genuinely consecutive HANDOFF
@@ -46,14 +46,14 @@ import re
 import sys
 from pathlib import Path
 
-# Repo root on sys.path so `from tools.graveyard import ...` resolves whether
+# Repo root on sys.path so `from tools.chronicle import ...` resolves whether
 # this file is run as a script (handoff_and_restart.sh) or imported top-level
 # as `handoff_conservation` (test_handoff_conservation.py). Same guard as
-# tools/graveyard.py.
+# tools/chronicle.py.
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from tools import graveyard  # noqa: E402
+from tools import chronicle  # noqa: E402
 
 # --------------------------------------------------------------- thresholds
 # All three checks are independent; ANY firing raises an alert (OR'd, not
@@ -193,7 +193,7 @@ def _log(msg: str) -> None:
 
 
 def _cli_check(args: argparse.Namespace) -> int:
-    """check a live HANDOFF against its latest graveyard snapshot; print any
+    """check a live HANDOFF against its latest Chronicle snapshot; print any
     alerts (non-fatal — always safe to ignore the return code, the caller
     must never block a restart on this)."""
     try:
@@ -202,15 +202,15 @@ def _cli_check(args: argparse.Namespace) -> int:
         _log(f"cannot read handoff {args.handoff_file} (non-fatal): {exc}")
         return 0
 
-    agent = args.agent or graveyard.agent_from_handoff_path(args.handoff_file)
+    agent = args.agent or chronicle.agent_from_handoff_path(args.handoff_file)
     if not agent:
         _log(f"cannot resolve agent from {args.handoff_file} and no --agent given; skipping")
         return 0
 
     root = Path(args.root) if args.root else None
-    old_text = graveyard.latest_handoff_text(agent, root=root)
+    old_text = chronicle.latest_handoff_text(agent, root=root)
     if old_text is None:
-        _log(f"no prior graveyard snapshot for {agent}; nothing to compare, skipping")
+        _log(f"no prior chronicle snapshot for {agent}; nothing to compare, skipping")
         return 0
 
     alerts = check_conservation(old_text, new_text)
@@ -229,12 +229,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sub = p.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser(
         "check",
-        help="compare the current HANDOFF against its latest graveyard snapshot; "
+        help="compare the current HANDOFF against its latest Chronicle snapshot; "
              "alert (non-fatal) on suspected detail loss",
     )
     c.add_argument("--handoff-file", required=True)
     c.add_argument("--agent", default=None, help="override (else derived from handoff path)")
-    c.add_argument("--root", default=None, help="graveyard root (default: <state-dir>/graveyard)")
+    c.add_argument("--root", default=None, help="chronicle root (default: <state-dir>/chronicle)")
     c.set_defaults(func=_cli_check)
     return p
 

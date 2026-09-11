@@ -63,6 +63,7 @@ Exit codes:
 from __future__ import annotations
 
 import argparse
+import ast
 import getpass
 import json
 import os
@@ -74,8 +75,10 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Literal
 
 try:  # run-as-script (python3 tools/context_fill_monitor.py): tools/ on sys.path[0]
     from agent_role_map import instance_binding as _instance_binding
@@ -89,6 +92,7 @@ except ImportError:  # run-as-package (import tools.context_fill_monitor)
 # ---------------------------------------------------------------------------
 
 _DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "pantheon"
+_REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Tombstone filename pattern for agents that use tombstone-write instead of
 # direct restart (currently only Recovery). Drained by pantheon-restart-drain timer.
@@ -559,6 +563,9 @@ HOOK_ALLOWLIST = {
         "ensure-hooks-active.sh",  # SessionStart auto-repair of core.hooksPath (T-1216 option B, the operator 2026-07-01 TG4512; self-heals the 6/09 silent-drift)
         "telegram-reply-gate.py",  # Stop hook: block a turn that answered a Telegram inbound only in the TRANSCRIPT (T-2188, operator-directed via mnemosyne TG 206/211/212). CURATED, not auto-derived: read the file before adding — fail-open on every error path, bounded to ONE block per inbound (sha1 marker, 10-min prune) so an agent that genuinely cannot reply still ends its turn, and tail-reads the transcript (38MB measured) rather than parsing it whole. This is the STRUCTURAL form of the rule pinned at the top of CLAUDE.md, which is the highest-failure-rate rule I carry and has been the dominant lapse across HO sessions — its own docstring says it: "A pin is a reminder; this is a mechanism."
         "background-pipe-gate.py",  # T-2313, allowlist-FIRST. ORCHESTRATOR WAS THE GAP, and the ticket as filed said otherwise: the Ask asserted "orchestrator + recovery carry this guard already (T-1907)" and recovery MEASURED orchestrator at ZERO refs across settings.json, settings.local.json and the project-level surface, re-verified independently here. What made it easy to read past: this seat has five other PreToolUse hooks registered and working, so the failure is not "hooks are broken here". The wrong belief came from recovery's own allowlist entry above reading "recovery-first soak" — an allowlist records that a hook is PERMITTED, not that any seat RUNS it, and reading it as coverage is the presence-vs-activation conflation T-2261 and T-2312 both landed on this same week. Widened to every seat but recovery on recovery's argument, accepted: long-suite-backgrounded-through-a-pipe is the orchestrator's normal working mode, and a false green here propagates further than a false green on a worker, because the rest of the fleet acts on this seat's readings.
+        "urgent-mail-inject.py",  # PreToolUse(*) urgent-mail preempt (T-1641 Phase-2; proven live on recovery 2026-08-05). T-2692 fleet rollout 2026-08-12, operator-directed live window (TG 7830): wired into orchestrator settings.json + flag in claude-telegram.service Environment= same-day as this entry — effective at the seat's next session restart.
+        "prune-stale-teams.py",  # SessionStart prune of dead sessions' ~/.claude/teams/session-<id>/ dirs (T-3074, PR #343; orchestrator-first live fire 2026-08-25). CURATED: fail-open, 6h staleness bar, three ANDed conjuncts, keep-on-doubt incl. unresolvable session id, symlinks skipped, --dry-run; session id from stdin JSON then CLAUDE_CODE_SESSION_ID. Wired via ~/.claude/hooks/ symlink like ensure-hooks-active.sh.
+        # ups-capture.py (T-3241 ORG-073 §4 contract-capture probe) pruned 2026-09-01 (Recovery): T-3241 resolved 2026-08-26, wire unwound 2026-08-25T21:16Z with leave-no-trace (P5), no seat wires it, T-3006 needs no future capture window. Removing the stale allowlist-first entry completes the leave-no-trace + closes the T-1965 stale-basename pre-bless surface. Re-add allowlist-first if a future ORG-073 capture window is opened.
     },
     "specialist": {
         "telegram-reply-gate.py",  # Stop hook — block a telegram-inbound turn ending without the reply tool (T-2188, operator-directed; recovery-first soak 2026-07-28)
@@ -567,6 +574,7 @@ HOOK_ALLOWLIST = {
         "verify-hook-integrity.sh",  # SessionStart hook content-integrity check vs canonical (T-1286/T-1284 fleet rollout; Miasma persistence-vector defense)
         "ensure-hooks-active.sh",  # SessionStart auto-repair of core.hooksPath (T-1216 option B, the operator 2026-07-01 TG4512; self-heals the 6/09 silent-drift)
         "background-pipe-gate.py",  # T-2313, allowlist-FIRST. Fleet-wide pass; specialist runs long research/watch suites backgrounded.
+        "urgent-mail-inject.py",  # PreToolUse(*) urgent-mail preempt (T-1641 Phase-2; T-2692 fleet rollout 2026-08-12). ALLOWLIST-FIRST per the T-1947 bounded-exception ordering: self-install instruction dispatched via mailbox 2026-08-12; the seat wires its own settings.json at its next session cycle. If specialist's settings.json has no urgent-mail-inject entry yet, that is the expected transient, not drift.
     },
     # T-1945: EMPTY allowlists are the strictest posture, not a no-op — these
     # personas were inventoried 2026-07-21 with ZERO hooks configured in
@@ -588,6 +596,7 @@ HOOK_ALLOWLIST = {
         # install half has not happened yet — that is the expected transient, not drift.
         "handoff-auto-read.sh",   # SessionStart org-content injection (fleet rollout; allowlist-first 2026-07-28, install pending)
         "background-pipe-gate.py",  # T-2313, allowlist-FIRST. mnemosyne is a pure-ACP seat but runs the same backgrounded-suite workload; included in the fleet-wide pass rather than deferred, since the hazard is workload-shaped, not architecture-shaped.
+        "urgent-mail-inject.py",  # PreToolUse(*) urgent-mail preempt (T-1641 Phase-2; T-2692 fleet rollout 2026-08-12). ALLOWLIST-FIRST per the T-1947 bounded-exception ordering: self-install instruction dispatched via mailbox 2026-08-12; the seat wires its own settings.json at its next session cycle. If mnemosyne's settings.json has no urgent-mail-inject entry yet, that is the expected transient, not drift.
     },
     "metis": {
         # T-1937(a): FIRST hook deliberately installed on a seat. suborch1's
@@ -715,7 +724,7 @@ _MONITOR_TUNING: dict[str, dict] = {
     "orchestrator": {
         "context_window": DEFAULT_CONTEXT_WINDOW_TOKENS,
         "supervise_script_name": "claude-bot-supervise.sh",
-        "model_pin": "claude-opus-4-8",
+        "model_pin": "claude-opus-4-7",
     },
     "specialist": {
         "context_window": DEFAULT_CONTEXT_WINDOW_TOKENS,
@@ -815,6 +824,142 @@ def _build_agent_config() -> dict[str, dict]:
 
 
 AGENT_CONFIG: dict[str, dict] = _build_agent_config()
+
+
+@dataclass(frozen=True)
+class ActiveHarnessMonitorGate:
+    """Controller-state gate for Claude-only continuity remediation."""
+
+    agent: str
+    status: Literal["enabled", "disabled"]
+    active_harness: str
+    source: Literal["manifest-runtime", "runtime-json", "pre-controller"]
+    reason: str
+
+
+def _runtime_state_path_for_agent(agent: str) -> Path:
+    state_root_env = os.environ.get("PANTHEON_PERSONA_STATE_DIR")
+    if state_root_env:
+        state_root = Path(state_root_env)
+    else:
+        context_state_root = os.environ.get("PANTHEON_STATE_DIR")
+        state_root = Path(context_state_root) / "personas" if context_state_root else _DEFAULT_STATE_DIR / "personas"
+    return state_root / agent / "runtime-controller" / "runtime.json"
+
+
+def _manifest_runtime_references_codex(agent: str, manifest_path: Path | None = None) -> bool:
+    try:
+        import yaml
+        from agent_role_map import resolve_instance_role as _resolve_instance_role
+    except ImportError:
+        try:
+            import yaml
+            from tools.agent_role_map import resolve_instance_role as _resolve_instance_role  # type: ignore
+        except ImportError:
+            return False
+
+    path = manifest_path or _REPO_ROOT / "instance.yaml"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    runtime = data.get("harness_runtime")
+    if not isinstance(runtime, dict):
+        return False
+    roles = runtime.get("roles")
+    if not isinstance(roles, dict):
+        return False
+    role_key = _resolve_instance_role(agent)
+    role_runtime = roles.get(role_key)
+    if not isinstance(role_runtime, dict):
+        return False
+    fallbacks = role_runtime.get("fallbacks")
+    if isinstance(fallbacks, list):
+        for fallback in fallbacks:
+            if isinstance(fallback, str) and fallback.split("/", 1)[0] == "codex":
+                return True
+    codex_config = role_runtime.get("codex")
+    return isinstance(codex_config, dict)
+
+
+def active_harness_monitor_gate(agent: str, cfg: dict, manifest_path: Path | None = None) -> ActiveHarnessMonitorGate:
+    """Return whether Claude-only continuity monitors may run for this agent.
+
+    A missing controller state is pre-controller while the role still runs on
+    bespoke supervision. Once controller ownership is declared or a runtime state
+    file exists, malformed/unavailable active-runtime evidence fails closed.
+    """
+
+    if not _manifest_runtime_references_codex(agent, manifest_path):
+        return ActiveHarnessMonitorGate(
+            agent=agent,
+            status="enabled",
+            active_harness="",
+            source="manifest-runtime",
+            reason="manifest has no Codex runtime binding",
+        )
+    state_path = _runtime_state_path_for_agent(agent)
+    del cfg
+    if not state_path.exists():
+        return ActiveHarnessMonitorGate(
+            agent=agent,
+            status="enabled",
+            active_harness="",
+            source="pre-controller",
+            reason="Codex fallback configured but controller runtime state not present",
+        )
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return ActiveHarnessMonitorGate(
+            agent=agent,
+            status="disabled",
+            active_harness="",
+            source="runtime-json",
+            reason=f"runtime state unavailable or malformed: {exc}",
+        )
+    if not isinstance(state, dict) or state.get("schema") != "pantheon-runtime-state/v1":
+        return ActiveHarnessMonitorGate(
+            agent=agent,
+            status="disabled",
+            active_harness="",
+            source="runtime-json",
+            reason="runtime state missing schema",
+        )
+    harness = state.get("harness")
+    if not isinstance(harness, str) or not harness:
+        return ActiveHarnessMonitorGate(
+            agent=agent,
+            status="disabled",
+            active_harness="",
+            source="runtime-json",
+            reason="runtime state missing active harness",
+        )
+    if harness == "claude":
+        return ActiveHarnessMonitorGate(
+            agent=agent,
+            status="enabled",
+            active_harness=harness,
+            source="runtime-json",
+            reason="recorded active runtime is Claude",
+        )
+    if harness == "codex":
+        return ActiveHarnessMonitorGate(
+            agent=agent,
+            status="disabled",
+            active_harness=harness,
+            source="runtime-json",
+            reason="recorded active runtime is Codex",
+        )
+    return ActiveHarnessMonitorGate(
+        agent=agent,
+        status="disabled",
+        active_harness=harness,
+        source="runtime-json",
+        reason=f"runtime state has unsupported active harness: {harness}",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -966,17 +1111,55 @@ def _sudo_prefix(sudo_user: str) -> list[str]:
     return ["sudo", "-nu", sudo_user]
 
 
-def find_latest_jsonl(projects_dir: Path, sudo_user: str, agent: str) -> Path | None:
-    """Return Path to the most-recently-modified jsonl in projects_dir.
+def _cwd_to_project_slug(cwd: str) -> str:
+    """Claude Code's project-dir slugification: replace path separators with
+    hyphens (verified 2026-08-23 against live ``~/.claude/projects/`` dirs —
+    e.g. cwd ``/home/claude/pantheon-config`` -> slug
+    ``-home-claude-pantheon-config``). No other character substitution is
+    needed for the paths cfm resolves (unix account homes + /tmp worktrees),
+    so this stays a straight replace rather than a general slugify."""
+    return cwd.replace("/", "-")
 
-    Uses sudo'd `find` since projects_dir is on the agent's account (700-mode).
-    Returns None on any failure (no jsonl, sudo denied, etc.) — fail-open per
-    the bail-and-poll design.
-    """
+
+def _pane_cwd(pane: str, sudo_user: str, agent: str) -> str | None:
+    """Best-effort resolve *pane*'s live foreground working directory via
+    ``tmux display-message``. Mirrors ``_capture_pane_text``'s cross-account
+    pattern (``XDG_RUNTIME_DIR`` + ``_sudo_prefix``).
+
+    Returns None on any failure (pane gone, tmux not running, sudo denied,
+    empty output) — callers MUST fall back to the global parent-scan
+    (fail-open, matches ``find_latest_jsonl``'s existing contract)."""
+    inner = (
+        f"XDG_RUNTIME_DIR=/run/user/$(id -u) tmux display-message "
+        f"-t {shlex.quote(pane)} -p '#{{pane_current_path}}'"
+    )
+    cmd = _sudo_prefix(sudo_user) + ["bash", "-c", inner]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=JSONL_PROBE_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        _log(agent, f"_pane_cwd: subprocess error {exc!r}")
+        return None
+    if result.returncode != 0:
+        return None
+    cwd = result.stdout.strip()
+    return cwd or None
+
+
+def _newest_jsonl_in(scan_root: Path, sudo_user: str, agent: str) -> Path | None:
+    """Run the sudo'd ``find`` over *scan_root* (maxdepth 2) and return the
+    newest-mtime jsonl path found, or None on any failure / empty result.
+    Shared by ``find_latest_jsonl``'s env-override / pane-preference /
+    parent-scan tiers — pure extraction, no behavior change (T-3083)."""
     cmd = _sudo_prefix(sudo_user) + [
         "bash",
         "-c",
-        f"find {projects_dir} -maxdepth 1 -name '*.jsonl' -printf '%T@ %p\\n' 2>/dev/null",
+        f"find {scan_root} -maxdepth 2 -name '*.jsonl' -printf '%T@ %p\\n' 2>/dev/null",
     ]
     try:
         result = subprocess.run(
@@ -1000,6 +1183,53 @@ def find_latest_jsonl(projects_dir: Path, sudo_user: str, agent: str) -> Path | 
         return Path(lines[0].split(" ", 1)[1])
     except IndexError:
         return None
+
+
+def find_latest_jsonl(
+    projects_dir: Path, sudo_user: str, agent: str, pane: str | None = None
+) -> Path | None:
+    """Return Path to the most-recently-modified jsonl for the agent, resolved
+    via a 3-tier precedence chain:
+
+      1. ``CONTEXT_FILL_PROJECTS_DIR_<AGENT>`` env override (T-3086) — scans
+         EXACTLY ``projects_dir`` (the caller-named override target).
+      2. Pane-cwd preference (T-3083) — if *pane* is given, resolve its live
+         tmux pane's foreground cwd, derive that cwd's project-dir slug, and
+         scan ONLY that dir. Guards against a stray sibling-dir jsonl (a
+         worktree agent or subagent session) outpacing the real session by
+         mtime — the global parent-scan below is fleet-wide-newest, which is
+         correct in the common case but not anchored to what the live pane is
+         actually working in.
+      3. Global parent-scan (55ba7c7372) — scan the parent
+         ``~/.claude/projects/`` at maxdepth 2 (all ``-home-<account>*``
+         sibling project dirs); return newest .jsonl across all. Robust to
+         any project-slug scheme, any bespoke↔HC transition, any cwd change.
+
+    Each tier falls through to the next on any failure (pane unresolved,
+    pane's dir has no jsonl yet, etc.) — fail-open throughout, per the
+    bail-and-poll design. Per-account sudo scope guarantees every tier stays
+    confined to the target account's project-space.
+
+    T-3086: the env override names the EXACT directory to scan; it is an
+    explicit test-isolation / ops override, not a binding-derived guess. Both
+    the parent-scan and the pane-preference exist solely to route around
+    slug mis-derivation / stray-sibling risk in the unoverridden path — that
+    rationale doesn't apply once the caller has named the directory
+    explicitly, so the override bypasses both rather than composing with
+    them.
+    """
+    if os.environ.get(f"CONTEXT_FILL_PROJECTS_DIR_{agent.upper()}"):
+        return _newest_jsonl_in(projects_dir, sudo_user, agent)
+
+    if pane:
+        pane_cwd = _pane_cwd(pane, sudo_user, agent)
+        if pane_cwd:
+            pane_dir = projects_dir.parent / _cwd_to_project_slug(pane_cwd)
+            found = _newest_jsonl_in(pane_dir, sudo_user, agent)
+            if found is not None:
+                return found
+
+    return _newest_jsonl_in(projects_dir.parent, sudo_user, agent)
 
 
 def _jsonl_mtime(jsonl_path: Path, sudo_user: str, agent: str) -> float | None:
@@ -1819,6 +2049,11 @@ def record_restart_and_maybe_alert_cluster(
         f"({stamps}) — compaction-as-diagnostic signal: the session's task scope may "
         f"be too large to fit one context window. Active tickets: {actives_str}. (T-0650)"
     )
+    if _seat_muted(agent):
+        # ORG-076 §7 mute: the cluster edge was recorded in the ring above (trace kept);
+        # only the operator page is withheld. No alert sent → return False.
+        _log(agent, "restart-cluster: edge reached but seat muted (ORG-076 §7) — page suppressed (trace kept)")
+        return False
     try:
         try:
             from tools.inbox_consumer import _send_alert_via_recovery  # run-as-package / tests
@@ -2321,6 +2556,23 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "Zero side effects — no alerts, no restarts, no state writes. "
              "Intercepts before the monitor/remediation loop (T-2709).",
     )
+    parser.add_argument(
+        "--suppress-wedge",
+        action="store_true",
+        help="T-2965: set an EXPIRING wedge-restart suppress flag for --agent (use "
+             "before driving a seat's /login), then exit. TTL via --suppress-minutes.",
+    )
+    parser.add_argument(
+        "--clear-suppress",
+        action="store_true",
+        help="T-2965: clear --agent's wedge-restart suppress flag and exit.",
+    )
+    parser.add_argument(
+        "--suppress-minutes",
+        type=int,
+        default=WEDGE_SUPPRESS_DEFAULT_MINUTES,
+        help="T-2965: TTL in minutes for --suppress-wedge (default %(default)s).",
+    )
     return parser.parse_args(argv)
 
 
@@ -2428,6 +2680,17 @@ def _maybe_fire_api_health(agent: str, cfg: dict, jsonl: Path) -> int | None:
     return 1
 
 
+def _stamp_simple_cooldown(state_path: Path, agent: str, reason: str) -> None:
+    """Best-effort {ts, agent, reason} cooldown-marker write (mirrors the inline stamp
+    several alert paths use). Used by the ORG-076 §7 mute branches (T-3165) so a muted
+    seat's cooldown keeps advancing — it doesn't re-detect + re-log every poll."""
+    try:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(json.dumps({"ts": int(time.time()), "agent": agent, "reason": reason}))
+    except OSError as exc:
+        _log(agent, f"{reason}: could not persist mute cooldown stamp {exc!r}")
+
+
 def _maybe_fire_model_outage(agent: str, cfg: dict, jsonl: Path) -> bool:
     """Detect an agent pinned to a REMOVED/inaccessible model and ALERT (T-1126).
 
@@ -2470,6 +2733,12 @@ def _maybe_fire_model_outage(agent: str, cfg: dict, jsonl: Path) -> bool:
         f"that reason. FIX: change the agent's --model to a live model, then restart. "
         f"(T-1126 / incident T-1125 — the ~18h Fable-5 outage.)"
     )
+    if _seat_muted(agent):
+        # ORG-076 §7 mute (T-3165): the 404 run is classified + logged (trace kept);
+        # cooldown stamped so a muted seat doesn't re-detect every poll. Page withheld.
+        write_model_outage_state(state_path, agent, jsonl)
+        _log(agent, "model-outage: sustained 404 run detected but seat muted (ORG-076 §7) — page suppressed (trace kept)")
+        return False
     delivered = False
     try:
         try:
@@ -2531,6 +2800,13 @@ def _maybe_fire_auth_outage(agent: str, cfg: dict, jsonl: Path) -> bool:
         f"sop/remediation/agent-oauth-relogin.md (drive /login → code-paste). No agent can "
         f"self-remediate an OAuth credential. (T-1223 / the 2026-06-20→22 fleet 401 outage.)"
     )
+    if _seat_muted(agent):
+        # ORG-076 §7 mute: the sustained-401 run is classified + logged (trace kept); the
+        # cooldown is stamped so a muted seat doesn't re-detect+re-log every poll. Only the
+        # operator page is withheld. No alert fired → return False.
+        write_auth_outage_state(state_path, agent, jsonl)
+        _log(agent, "auth-outage: sustained 401 run detected but seat muted (ORG-076 §7) — page suppressed (trace kept)")
+        return False
     delivered = False
     try:
         try:
@@ -2603,6 +2879,12 @@ def _maybe_fire_capability_cap(agent: str, cfg: dict, jsonl: Path) -> bool:
         f"keeps working, so a seat can look healthy while its work dies. "
         f"(T-1980 / T-2290.)"
     )
+    if _seat_muted(agent):
+        # ORG-076 §7 mute (T-3165): cap run classified + logged (trace kept); cooldown
+        # stamped. Page withheld.
+        _stamp_simple_cooldown(state_path, agent, CAPABILITY_CAP_ALERT_LABEL)
+        _log(agent, "capability-cap: sustained cap run detected but seat muted (ORG-076 §7) — page suppressed (trace kept)")
+        return False
     delivered = False
     try:
         try:
@@ -2670,6 +2952,12 @@ def _maybe_fire_consent_fallback(agent: str, cfg: dict, jsonl: Path) -> bool:
         f"supervisor --model pin {original} → claude-opus-4-8 (backup-first) so a restart "
         f"lands opus. (T-1980 consent-fallback detector / 2026-07-24 Fable-5 credits cap.)"
     )
+    if _seat_muted(agent):
+        # ORG-076 §7 mute (T-3165): fallback detected + logged (trace kept); cooldown
+        # stamped. Nudge withheld.
+        _stamp_simple_cooldown(state_path, agent, CONSENT_FALLBACK_ALERT_LABEL)
+        _log(agent, f"consent-fallback: {original}->{fallback} detected but seat muted (ORG-076 §7) — page suppressed (trace kept)")
+        return False
     delivered = False
     try:
         try:
@@ -2705,7 +2993,9 @@ def _sweep_cap_detectors_for(agent: str, cfg: dict) -> None:
     seats). Fail-soft: a sweep hiccup must never wedge recovery's own cycle."""
     try:
         projects_dir = _projects_dir_for_agent(agent, cfg)
-        jsonl = find_latest_jsonl(projects_dir, cfg["sudo_user"], agent)
+        jsonl = find_latest_jsonl(
+            projects_dir, cfg["sudo_user"], agent, pane=cfg.get("restart_target_pane")
+        )
         if jsonl is not None:
             _maybe_fire_capability_cap(agent, cfg, jsonl)
             _maybe_fire_consent_fallback(agent, cfg, jsonl)
@@ -2772,6 +3062,13 @@ def _maybe_fire_spend_limit(agent: str, cfg: dict) -> bool:
         f"(your account action — no agent can self-remediate), then the agent needs a "
         f"modal-dismiss + poke to resume. (2026-06-26 fleet spend-limit wedge.)"
     )
+    if _seat_muted(agent):
+        # ORG-076 §7 mute (T-3165): the modal was scraped + logged (trace kept); cooldown
+        # stamped. Page withheld — a muted (intentionally-offline/retired) seat sitting on a
+        # spend-limit modal is expected, not a page.
+        _stamp_simple_cooldown(state_path, agent, SPEND_LIMIT_ALERT_LABEL)
+        _log(agent, "spend-limit: modal detected but seat muted (ORG-076 §7) — page suppressed (trace kept)")
+        return False
     delivered = False
     try:
         try:
@@ -2884,7 +3181,13 @@ def maybe_alert_missing_projects_dir(agent: str, projects_dir: Path, *, reason: 
         f"and will never fire a restart — likely a recovery-layer misconfig. "
         f"Run `context_fill_monitor.py --validate` to check all agent configs."
     )
-    send_telegram(msg)
+    if _seat_muted(agent):
+        # ORG-076 §7 mute (T-3165): a muted (intentionally-offline/retired) seat legitimately
+        # has no jsonl_dir, so this misconfig page is expected noise. Still write the episode
+        # marker (dedup) so it stays quiet until the dir reappears; page withheld (trace above).
+        _log(agent, f"missing-projects-dir: {projects_dir} absent but seat muted (ORG-076 §7) — page suppressed (trace kept)")
+    else:
+        send_telegram(msg)
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
         marker.write_text(
@@ -3079,6 +3382,9 @@ def maybe_alert_undeclared_repos(agent: str, cfg: dict, repo_root: Path) -> None
         f"{', '.join(undeclared)}. "
         f"Declare via a ticket repos: field or add to repos.yaml ignored: list."
     )
+    # DELIBERATELY NOT mute-gated (ORG-076 §7 / T-3165): this is a P1 present-but-undeclared
+    # GOVERNANCE tripwire (T-0761), same class as the 🚨 hook-deviation security page — a noise
+    # mute silences operational/health pages, never a governance/leak-surface finding on a seat.
     send_telegram(msg)
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
@@ -3286,6 +3592,11 @@ def maybe_alert_restart_failure_threshold(agent: str, count: int, last_error_tai
     actively wedged; we WANT periodic reminders). Returns True on send success.
     """
     if count < RESTART_FAILURE_ALERT_THRESHOLD:
+        return False
+    if _seat_muted(agent):
+        # ORG-076 §7 mute: the wedge is already tracked in the failure-count state
+        # (trace kept); only the operator page is withheld. No alert sent → return False.
+        _log(agent, f"restart-failure: {count} consecutive failures but seat muted (ORG-076 §7) — page suppressed (trace kept)")
         return False
     text = (
         f"[context_fill_monitor] {agent} auto-restart wedged: "
@@ -3583,6 +3894,13 @@ def maybe_alert_allowlist_staleness(agent: str, cfg: dict) -> None:
         f"HOOK_ALLOWLIST in tools/context_fill_monitor.py (or re-wire the hook). "
         f"Hygiene, not an active compromise."
     )
+    if _seat_muted(agent):
+        # ORG-076 §7 mute: this is a HYGIENE page ("not an active compromise"), so a
+        # muted seat withholds it (trace kept in the WARN log above). Contrast the
+        # 🚨 hook-DEVIATION path (maybe_alert_hook_deviation) which is NOT muted — a
+        # possible-injection alert must never be silenced by a noise mute.
+        _log(agent, f"hook-stale: {len(stale)} stale entr(y/ies) but seat muted (ORG-076 §7) — page suppressed (trace kept)")
+        return
     try:
         try:
             from tools.inbox_consumer import _send_alert_via_recovery
@@ -3595,11 +3913,210 @@ def maybe_alert_allowlist_staleness(agent: str, cfg: dict) -> None:
         _log(agent, f"hook-stale: alert routing failed ({exc!r}); WARN log only this cycle")
 
 
+# --- T-3204: origin-aware hook-allowlist deviation reclassification --------
+# 2026-08-25 incident: HO wired a new hook + its allowlist entry landed on
+# origin/main; Recovery's not-yet-pulled clone read a stale HOOK_ALLOWLIST and
+# fired a possible-injection page on a hook that was already blessed upstream.
+# Before paging, re-evaluate any deviation against origin/main's copy of this
+# very file's HOOK_ALLOWLIST — a command allowlisted there is a checking-clone
+# staleness problem, not a possible injection, and is downgraded to a
+# throttled hygiene notice instead of the 🚨 page. A command absent from BOTH
+# allowlists is untouched by any of this and still pages at full severity.
+
+# Bounded per-call timeout for each of the (at most three) git subprocess
+# calls below. Only ever invoked when check_hook_allowlist has already found
+# ≥1 deviation — the common/clean tick makes zero git calls.
+_ORIGIN_GIT_TIMEOUT_SECONDS = 20
+
+
+def _extract_hook_allowlist_from_source(text: str) -> dict[str, set[str]] | None:
+    """Parse a `HOOK_ALLOWLIST = {...}` module-level literal out of `text` via
+    `ast` — NEVER `exec`/`import` (this text comes from a remote git ref and
+    must never run). Returns None if the assignment can't be found or doesn't
+    literal_eval to the expected `dict[str, set[str]]` shape (a future
+    refactor of the constant, e.g. building it programmatically, is exactly
+    the case this must fail open on rather than mis-extract).
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "HOOK_ALLOWLIST" for t in node.targets):
+            continue
+        try:
+            value = ast.literal_eval(node.value)
+        except (ValueError, SyntaxError, TypeError, MemoryError, RecursionError):
+            return None
+        if not isinstance(value, dict):
+            return None
+        result: dict[str, set[str]] = {}
+        for k, v in value.items():
+            if not isinstance(k, str) or not isinstance(v, (set, frozenset)):
+                return None
+            if not all(isinstance(x, str) for x in v):
+                return None
+            result[k] = set(v)
+        return result
+    return None
+
+
+def _origin_hook_allowlist(agent: str) -> tuple[set[str] | None, str | None]:
+    """Best-effort read of `HOOK_ALLOWLIST[agent]` as committed on origin/main
+    of THIS clone (`_REPO_ROOT`, derived from `__file__` — the checking
+    seat's own clone, not this implementer's worktree).
+
+    Returns `(origin_allow, origin_ref)`. `origin_allow is None` is the
+    fail-OPEN signal ("no usable origin view") — fetch failure, show
+    failure, or a parse/shape failure all collapse to this ONE signal, and
+    every caller MUST treat None as "do not downgrade any deviation" (a
+    security check must not be silenced by a git/network outage, including a
+    flaky fetch — SSH connection resets are a live occurrence on this fleet
+    today, and the correct behavior on one is a real page, not a swallowed
+    one). `origin_allow` being an empty-but-real set (agent has no origin
+    entry) is a normal, usable result, distinct from None.
+
+    `git fetch --quiet origin main` only updates this clone's remote-tracking
+    ref (`refs/remotes/origin/main`); it never touches the working tree or
+    the checked-out branch. That is what keeps this inside the "the monitor
+    must never mutate the clone it runs from" rule that rejected the
+    pull-before-check shape at plan time.
+    """
+    try:
+        fetch = subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "fetch", "--quiet", "origin", "main"],
+            capture_output=True, timeout=_ORIGIN_GIT_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        _log(agent, f"hook-check: origin fetch failed ({exc!r}); no origin view — deviations stand")
+        return None, None
+    if fetch.returncode != 0:
+        _log(agent, f"hook-check: origin fetch rc={fetch.returncode}; no origin view — deviations stand")
+        return None, None
+    try:
+        show = subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "show", "origin/main:tools/context_fill_monitor.py"],
+            capture_output=True, text=True, timeout=_ORIGIN_GIT_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        _log(agent, f"hook-check: origin show failed ({exc!r}); no origin view — deviations stand")
+        return None, None
+    if show.returncode != 0 or not show.stdout:
+        _log(agent, f"hook-check: origin show rc={show.returncode}; no origin view — deviations stand")
+        return None, None
+    origin_map = _extract_hook_allowlist_from_source(show.stdout)
+    if origin_map is None:
+        _log(agent, "hook-check: could not ast-extract HOOK_ALLOWLIST from origin/main text; no origin view — deviations stand")
+        return None, None
+    origin_ref: str | None = None
+    try:
+        rev = subprocess.run(
+            ["git", "-C", str(_REPO_ROOT), "rev-parse", "--short=9", "origin/main"],
+            capture_output=True, text=True, timeout=_ORIGIN_GIT_TIMEOUT_SECONDS,
+        )
+        if rev.returncode == 0:
+            origin_ref = (rev.stdout or "").strip() or None
+    except (subprocess.TimeoutExpired, OSError):
+        pass  # the sha is cosmetic for the message only; its absence must not flip the verdict
+    return origin_map.get(agent, set()), origin_ref
+
+
+def _reclassify_deviations_against_origin(
+    agent: str, deviations: list[str]
+) -> tuple[list[str], list[str], str | None]:
+    """Partition local deviations into (still_deviant, stale_on_origin, origin_ref)
+    by re-checking each against origin/main's HOOK_ALLOWLIST for `agent`.
+
+    Fail-open: if `_origin_hook_allowlist` returns no usable view, EVERY
+    deviation stays in `still_deviant` unchanged — behavior-identical to
+    pre-T-3204.
+    """
+    origin_allow, origin_ref = _origin_hook_allowlist(agent)
+    if origin_allow is None:
+        return deviations, [], None
+    still_deviant: list[str] = []
+    stale_on_origin: list[str] = []
+    for command in deviations:
+        if _command_is_allowlisted(command, origin_allow):
+            stale_on_origin.append(command)
+        else:
+            still_deviant.append(command)
+    return still_deviant, stale_on_origin, origin_ref
+
+
+def _hook_clone_stale_state_path_for_agent(agent: str) -> Path:
+    """Throttle-state file for the clone-stale hygiene notice (per agent).
+
+    Deliberately a SEPARATE namespace from `_hook_stale_state_path_for_agent`
+    (the allowlist-staleness twin, a different signal about a different
+    surface — unwired-but-allowlisted names vs. this-clone-hasn't-pulled-yet)
+    so one firing can never suppress the other's independent throttle.
+    """
+    state_dir_env = os.environ.get("PANTHEON_STATE_DIR")
+    state_dir = Path(state_dir_env) if state_dir_env else _DEFAULT_STATE_DIR
+    return state_dir / f"hook_clone_stale_alert_{agent}.json"
+
+
+def maybe_alert_hook_clone_stale(
+    agent: str, cfg: dict, stale_commands: list[str], origin_ref: str | None
+) -> None:
+    """WARN-log + weekly-throttled hygiene notice: these deviation(s) are
+    ALREADY allowlisted on origin/main — this clone hasn't pulled yet, not a
+    possible injection. Mirrors `maybe_alert_allowlist_staleness`'s shape
+    exactly (mute-gated, weekly-throttled, no Telegram fallback) — this is
+    the same hygiene alert CLASS, just a different stale-signal source.
+    """
+    _log(agent, f"hook-check: {len(stale_commands)} deviation(s) resolved by origin/main "
+                f"re-read (clone stale, not injection): {stale_commands}")
+    if _seat_muted(agent):
+        # Same ORG-076 §7 posture as the allowlist-staleness twin: hygiene, not
+        # compromise, so a muted seat withholds it (trace kept in the WARN log
+        # above). The 🚨 hook-DEVIATION path stays unmuted — only this
+        # downgraded hygiene notice is mute-gated.
+        _log(agent, f"hook-check: {len(stale_commands)} clone-stale entr(y/ies) but seat muted "
+                    f"(ORG-076 §7) — page suppressed (trace kept)")
+        return
+    path = _hook_clone_stale_state_path_for_agent(agent)
+    now = time.time()
+    try:
+        last = json.loads(path.read_text()).get("last_alert_at", 0)
+    except (OSError, ValueError):
+        last = 0
+    if now - last < HOOK_STALE_ALERT_THROTTLE_SECONDS:
+        return
+    ref_note = f" (origin/main {origin_ref})" if origin_ref else ""
+    lines = "\n".join(f"  • {d}" for d in stale_commands)
+    msg = (
+        f"🧹 [hook-allowlist-clone-stale] {agent}: deviation(s) already allowlisted on "
+        f"origin/main{ref_note} — this clone has not pulled yet, NOT a possible injection "
+        f"(T-3204):\n{lines}\n"
+        f"No action needed once the clone's next pull catches up; if this persists, check "
+        f"the clone's pull cadence."
+    )
+    try:
+        try:
+            from tools.inbox_consumer import _send_alert_via_recovery
+        except ImportError:
+            from inbox_consumer import _send_alert_via_recovery
+        _send_alert_via_recovery(msg, "hook-allowlist-clone-stale")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"last_alert_at": now, "stale": stale_commands, "origin_ref": origin_ref}))
+    except Exception as exc:
+        _log(agent, f"hook-check: clone-stale alert routing failed ({exc!r}); WARN log only this cycle")
+
+
 def maybe_alert_hook_deviation(agent: str, cfg: dict) -> None:
     """Run the hook-allowlist check; alert Recovery (throttled) on any deviation.
 
     Best-effort + side-effect-only — never raises into the main control loop.
     """
+    # DELIBERATELY NOT mute-gated (ORG-076 §7 / T-2987): this is a 🚨 possible-injection
+    # SECURITY page, not operational noise. A persona mute silences noise; it must never
+    # blind the fleet to a suspected compromise on a muted seat. Mute gating lives only on
+    # the operational/hygiene paths (restart-cluster, auth-outage, restart-failure,
+    # hook-allowlist-STALE, channel-liveness, credential-expiry).
     enabled = os.environ.get(HOOK_CHECK_ENABLED_ENV, "1").strip().lower()
     if enabled in ("0", "false", "no", "off"):
         return
@@ -3611,6 +4128,24 @@ def maybe_alert_hook_deviation(agent: str, cfg: dict) -> None:
     if not deviations:
         return
     _log(agent, f"hook-check: {len(deviations)} DEVIATION(S) detected: {deviations}")
+    # T-3204: before paging, re-evaluate each deviation against origin/main's
+    # HOOK_ALLOWLIST — a checking clone racing a just-merged allowlist entry
+    # (the 2026-08-25 T-3074 incident) must not page as a possible injection.
+    # This runs BEFORE the throttle check below: a clone-stale downgrade must
+    # never consume the 6h 🚨 throttle window (it never called
+    # _record_hook_alert, so nothing to consume — but ordering it first keeps
+    # that invariant obvious at the call site rather than implicit).
+    try:
+        still_deviant, stale_on_origin, origin_ref = _reclassify_deviations_against_origin(agent, deviations)
+    except Exception as exc:  # defense in depth, mirrors the check_hook_allowlist wrap above
+        _log(agent, f"hook-check: origin reclassification errored ({exc!r}); fail-open, treating all as deviations")
+        still_deviant, stale_on_origin, origin_ref = deviations, [], None
+    if stale_on_origin:
+        maybe_alert_hook_clone_stale(agent, cfg, stale_on_origin, origin_ref)
+    if not still_deviant:
+        _log(agent, "hook-check: all deviation(s) cleared by origin/main re-read (clone-stale, not injection)")
+        return
+    deviations = still_deviant
     if _hook_alert_throttled(agent):
         _log(agent, "hook-check: alert throttled (already fired within window)")
         return
@@ -3790,6 +4325,168 @@ def _notify_wedge_restart(agent: str, tokens: int, mode: str) -> None:
         send_telegram(f"[fallback: recovery-routing unavailable] {msg}")
 
 
+# --- T-2965: wedge-restart suppression for intentional human-interactive modals ---
+# An agent in a /login (OAuth) or similar modal is NON-IDLE with frozen fill — byte-for-
+# byte the wedge signature (cf. the T-1776 subagent-block case) — but it is HEALTHY, and
+# an auto-restart there is ALWAYS wrong: the restart's handoff send-keys inject into the
+# modal (the 2026-08-17 specialist re-login produced 'OAuth error: Invalid code'), and a
+# respawn mid credential re-login lands on wiped creds (401). Two independent, safety-
+# bounded suppressors, EITHER of which vetoes the wedge restart:
+#   (a) PANE SENTINEL — automatic, best-effort. Recognises the /login OAuth screen chrome
+#       in the captured pane. Conservative + STRUCTURAL (login-screen chrome, never
+#       conversational content) to keep false positives ~0, because a false positive here
+#       is a MISSED REAL WEDGE. It suppresses only the poll on which the modal is on
+#       screen; a genuine wedge (no modal chrome) is untouched and still fires.
+#   (b) EXPLICIT FLAG — deterministic, non-brittle. Recovery writes a per-seat suppress flag
+#       (with a MANDATORY expiry) before driving a seat's /login and clears it after; the
+#       expiry means a forgotten flag can never permanently blind the detector. This is
+#       the mechanism for when Recovery IS in the loop (as it was in the witnessed incident).
+# The unified "seat maintenance mode" suppressing BOTH auto-restart AND alerts fleet-wide
+# (fork b generalised) is ORG-076 §7 + T-2984's Phase-3 seat-maintenance-mode; this is the
+# local, self-contained restart-veto, cross-referenced there rather than duplicated.
+# STRUCTURAL /login-screen chrome only (never conversational content), grounded in the
+# actual text from sop/remediation/agent-oauth-relogin.md — a false positive here is a
+# MISSED REAL WEDGE, so keep these specific to the login screen.
+INTERACTIVE_MODAL_SENTINELS = (
+    "select login method",               # the /login method menu header
+    "claude account with subscription",  # the /login menu option (SOP §2)
+    "paste code here",                   # the OAuth code prompt (SOP §2)
+    "oauth/authorize",                   # the OAuth URL chrome (claude.com/cai/oauth/authorize)
+    "log in to claude",
+)
+WEDGE_SUPPRESS_FLAG_PATTERN = "wedge_suppress_{agent}.json"
+WEDGE_SUPPRESS_DEFAULT_MINUTES = 45
+# Hard ceiling on the suppress TTL: a fat-fingered --suppress-minutes must not be able to
+# blind the wedge path for days. Bounded exposure keeps the "can never permanently blind"
+# property honest even against a typo.
+WEDGE_SUPPRESS_MAX_MINUTES = 240
+
+
+def _wedge_suppress_flag_path(agent: str) -> Path:
+    state_dir_env = os.environ.get("PANTHEON_STATE_DIR")
+    state_dir = Path(state_dir_env) if state_dir_env else _DEFAULT_STATE_DIR
+    return state_dir / WEDGE_SUPPRESS_FLAG_PATTERN.format(agent=agent)
+
+
+def set_wedge_suppress(agent: str, minutes: int = WEDGE_SUPPRESS_DEFAULT_MINUTES) -> Path:
+    """Write an EXPIRING per-seat wedge-restart suppress flag. Recovery calls this before
+    driving a seat's /login (or other interactive maintenance). The expiry is mandatory:
+    a forgotten flag auto-lapses so the wedge detector can never be permanently blinded."""
+    minutes = max(1, min(int(minutes), WEDGE_SUPPRESS_MAX_MINUTES))
+    path = _wedge_suppress_flag_path(agent)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    until = int(time.time()) + minutes * 60
+    path.write_text(json.dumps({"agent": agent, "until": until, "minutes": minutes}))
+    return path
+
+
+def clear_wedge_suppress(agent: str) -> bool:
+    """Remove a seat's suppress flag. Returns True iff one was present."""
+    try:
+        _wedge_suppress_flag_path(agent).unlink()
+        return True
+    except OSError:
+        return False
+
+
+def _wedge_suppressed_by_flag(agent: str) -> bool:
+    """True iff a NON-EXPIRED suppress flag exists for the seat. An expired or MALFORMED
+    flag (bad JSON, or valid JSON that isn't our object — null/int/list) is ignored and
+    cleaned up. Fail-safe by construction: anything we cannot read as a live 'until' in
+    the future returns False, so a stale or corrupt flag can never mask a real wedge."""
+    path = _wedge_suppress_flag_path(agent)
+    try:
+        raw = path.read_text()
+    except OSError:
+        return False  # absent → nothing to suppress or clean up
+    until = 0
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):  # guard: data.get on a non-dict would AttributeError
+            until = int(data.get("until", 0))
+    except (ValueError, TypeError):
+        until = 0
+    if time.time() < until:
+        return True
+    try:  # expired / malformed / non-object → clean up so it can't linger
+        path.unlink()
+    except OSError:
+        pass
+    return False
+
+
+def _pane_in_interactive_modal(agent: str, cfg: dict) -> str | None:
+    """Best-effort: the matched sentinel if the captured pane shows a /login|OAuth modal
+    (an auto-restart there is always wrong), else None. A capture failure returns None —
+    never suppress on an unread pane (that would mask real wedges)."""
+    pane = _capture_pane_text(agent, cfg)
+    if not pane:
+        return None
+    low = pane.lower()
+    for sentinel in INTERACTIVE_MODAL_SENTINELS:
+        if sentinel in low:
+            return sentinel
+    return None
+
+
+def _seat_in_maintenance(agent: str) -> bool:
+    """True iff `agent` is in an ACTIVE T-2984 seat-maintenance window — remediation
+    ACTIONS must be suppressed while a runtime-controller cutover install has the pane
+    in a non-standard state (T-2953). Fail-open (False) on any import/registry fault so
+    a broken registry can never silently mask a real wedge (auto-expiry in notify_policy
+    is the other half: a forgotten toggle self-clears)."""
+    try:
+        try:
+            from tools.notify_policy import in_maintenance
+        except ImportError:  # bare run with cwd=tools/
+            from notify_policy import in_maintenance  # type: ignore
+        return bool(in_maintenance(agent))
+    except Exception:
+        return False
+
+
+def _seat_muted(agent: str) -> bool:
+    """True iff `agent` is muted in the ORG-076 §7 notify-mute registry (T-2978/T-2987)
+    — its operator PAGE must be withheld while the persona is deliberately silenced (an
+    intentionally-offline/retired/known-noisy seat). Muting a persona uniformly quiets
+    ALL its per-agent monitors from one place, superseding the piecemeal per-monitor
+    skip envs.
+
+    DISTINCT from _seat_in_maintenance in two ways that matter:
+      - Domain: mute suppresses the ALERT only. Classification, trace-logging, and
+        cooldown-stamping stay, and REMEDIATION actions are UNTOUCHED (suppressing an
+        action is maintenance's job, T-2984 — a separate registry with auto-expiry).
+      - Scope: a mute is for NOISE. It deliberately does NOT gate security-compromise
+        pages (the 🚨 hook-deviation path) — silencing a seat for noise must never
+        blind the fleet to a possible injection on it.
+
+    FAIL-OPEN (returns False) on any import/registry fault, so a broken or absent
+    registry can never SILENCE a page — the safe direction is a spurious alert, never a
+    missed one. The registry path resolves via notify_policy (PANTHEON_MUTE_REGISTRY)."""
+    try:
+        try:
+            from tools.notify_policy import is_muted
+        except ImportError:  # bare run with cwd=tools/
+            from notify_policy import is_muted  # type: ignore
+        return bool(is_muted(agent))
+    except Exception:
+        return False
+
+
+def _wedge_restart_suppressed(agent: str, cfg: dict) -> str | None:
+    """Reason a confirmed-wedged pane must NOT be auto-restarted, or None:
+    (a) the seat is in a T-2984 maintenance window (cutover), (b) an explicit non-expired
+    suppress flag (T-2965), or (c) a recognised interactive modal."""
+    if _seat_in_maintenance(agent):
+        return "seat in T-2984 maintenance mode (runtime-controller cutover window)"
+    if _wedge_suppressed_by_flag(agent):
+        return "explicit suppress flag set (interactive maintenance)"
+    modal = _pane_in_interactive_modal(agent, cfg)
+    if modal:
+        return f"pane shows an interactive modal (matched {modal!r})"
+    return None
+
+
 def _maybe_fire_staleness(
     agent: str,
     cfg: dict,
@@ -3818,6 +4515,18 @@ def _maybe_fire_staleness(
             f"fill frozen at {fill_tokens} tok for {STALENESS_POLLS} polls but pane "
             f"is idle/healthy/uncheckable — treating as healthy-idle, NOT firing",
         )
+        return None
+
+    # T-2965: an intentional human-interactive modal (/login OAuth, /usage, permission
+    # prompt) is non-idle with frozen fill — the wedge signature — but a restart there is
+    # ALWAYS wrong (it send-keys into the modal and, mid credential re-login, respawns
+    # onto wiped creds). Veto the restart when the seat is in explicit interactive
+    # maintenance (flag) or the pane shows a recognised modal. See _wedge_restart_suppressed.
+    suppressed = _wedge_restart_suppressed(agent, cfg)
+    if suppressed:
+        _log(agent, f"fill frozen at {fill_tokens} tok + pane confirmed non-idle, BUT "
+                    f"{suppressed} — intentional interactive state, NOT a wedge; NOT "
+                    f"firing (T-2965)")
         return None
 
     # T-1776: the pane reads non-idle, but a session BLOCKED on a live subagent
@@ -3901,7 +4610,9 @@ def _print_context_report(agent: str, cfg: dict) -> int:
     threshold = resolve_base_threshold_fraction(context_window, cfg)
     projects_dir = _projects_dir_for_agent(agent, cfg)
 
-    jsonl = find_latest_jsonl(projects_dir, cfg["sudo_user"], agent)
+    jsonl = find_latest_jsonl(
+        projects_dir, cfg["sudo_user"], agent, pane=cfg.get("restart_target_pane")
+    )
     if jsonl is None:
         print(
             f"[context-fill-monitor --report] agent={agent}: no session jsonl "
@@ -3965,6 +4676,18 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "report", False):
         return _print_context_report(agent, cfg)
 
+    # T-2965: wedge-restart suppress-flag management — a side channel that exits
+    # before the remediation loop (like --report), so it never falls through to a poll.
+    if getattr(args, "clear_suppress", False):
+        existed = clear_wedge_suppress(agent)
+        print(f"{agent}: wedge-suppress flag {'cleared' if existed else 'was not set'}")
+        return 0
+    if getattr(args, "suppress_wedge", False):
+        path = set_wedge_suppress(agent, args.suppress_minutes)
+        print(f"{agent}: wedge-restart suppressed for {args.suppress_minutes} min "
+              f"(auto-expires; {path})")
+        return 0
+
     # Hook-allowlist security check (T-0536): independent of the jsonl/restart
     # loop — runs every cycle, alert-only, never restarts. Done first so it still
     # fires even when the session jsonl is missing (the bail below) or in cooldown.
@@ -4003,6 +4726,17 @@ def main(argv: list[str] | None = None) -> int:
     # for the blocking fire_restart's synchronous success/failure return).
     reconcile_prior_dispatch(agent)
 
+    harness_gate = active_harness_monitor_gate(agent, cfg)
+    if harness_gate.status != "enabled":
+        _log(
+            agent,
+            "Claude-only continuity monitor disabled: "
+            f"{harness_gate.reason} "
+            f"(active_harness={harness_gate.active_harness or 'unknown'}, "
+            f"source={harness_gate.source})",
+        )
+        return 0
+
     cooldown = int(
         os.environ.get(
             "CONTEXT_FILL_COOLDOWN_SECONDS", CONTEXT_FILL_COOLDOWN_SECONDS
@@ -4021,7 +4755,9 @@ def main(argv: list[str] | None = None) -> int:
     # context-fill check read from it. Done BEFORE the context-fill cooldown
     # gate so api-health can still fire during a context-fill cooldown (the two
     # are independent control loops — per the T-0510 review).
-    jsonl = find_latest_jsonl(projects_dir, cfg["sudo_user"], agent)
+    jsonl = find_latest_jsonl(
+        projects_dir, cfg["sudo_user"], agent, pane=cfg.get("restart_target_pane")
+    )
     if jsonl is None:
         # T-0824 part 2: a None jsonl has two very different causes. Probe whether
         # the directory itself exists to tell them apart instead of logging the
@@ -4189,6 +4925,20 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     if fill_pct < eff_threshold:
+        return 0
+
+    # T-2965: about to fire the absolute-threshold restart — but if the seat is in
+    # interactive maintenance (explicit flag) or its pane shows a /login|OAuth modal, a
+    # restart here is the same send-keys-into-the-modal / respawn-onto-wiped-creds hazard
+    # as the wedge path (which the same veto already guards above). The explicit flag in
+    # particular means "leave this seat alone" and must gate ALL restart paths, not just
+    # the wedge one. Placed AFTER the below-threshold bail so a routine (non-firing) poll
+    # never pays for the pane capture; it resumes next poll once the modal/flag clears.
+    suppressed = _wedge_restart_suppressed(agent, cfg)
+    if suppressed:
+        _log(agent, f"fill {fill_pct:.2%} >= threshold {eff_threshold:.2%}, BUT "
+                    f"{suppressed} — NOT firing the context-fill restart (T-2965); "
+                    f"resumes once the modal/flag clears")
         return 0
 
     _log(

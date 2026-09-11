@@ -114,6 +114,13 @@ def verify_bearer_jwt(
     try:
         pyjwk = PyJWK.from_dict(vm.public_key_jwk)
     except (InvalidTokenError, DidResolutionError, Exception) as exc:  # noqa: BLE001
+        # T-2867 BEARER-4: the bare `Exception` is LOAD-BEARING, not lazy. PyJWK
+        # .from_dict raises a zoo of types on a counterparty-controlled JWK —
+        # PyJWKError / InvalidKeyError, plus KeyError/ValueError/TypeError from
+        # malformed dict shapes — and this key material comes from the (trusted-
+        # but-still-parsed) DID doc. Any of them must FAIL CLOSED (return False),
+        # never escape and violate verify()'s no-raise contract. The named
+        # types are listed first for intent; `Exception` is the fail-closed net.
         logger.warning("bearer: cannot build key from JWK: %r", exc)
         return False
 

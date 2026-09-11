@@ -920,6 +920,21 @@ class AcpBridge:
             if _is_cap_error(exc):
                 self._trip_cap_breaker(exc)
                 raise AcpCapError(str(exc)) from exc
+            # T-2981: a NON-cap JSON-RPC AcpError (e.g. -32000 "Authentication
+            # required" — a transient auth flap during a quota hold) dead-letters by
+            # default. For a DISPOSABLE fire-and-forget nudge (keep_going) that is
+            # wrong: the nudge is superseded by its next fire (dedupe-collapsed,
+            # T-1935), so quarantining it only spawns a self-echoing mailbox-dlq alert
+            # (the T-2038 loop class) for a message that is already obsolete. Mark the
+            # failure transient so mailbox._drain leaves it in new/ UNCOUNTED — it is
+            # superseded, not lost. A REAL (non-disposable) sender still propagates →
+            # dead-letters → alerts, so a PERMANENT auth break is never silently
+            # swallowed for a message that matters; the disposable nudge's own loss is
+            # acceptable by design (that is what fire-and-forget means). NB scoped to
+            # AcpError (JSON-RPC), not a bare AcpTransportError (wrapper-exit), which
+            # is a different failure mode outside this ticket.
+            if fire_and_forget:
+                exc.mailbox_transient = True  # type: ignore[attr-defined]
             raise
         stop_reason = result.get("stopReason") if isinstance(result, dict) else None
         if not stop_reason:

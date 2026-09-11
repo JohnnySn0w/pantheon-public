@@ -1,0 +1,25 @@
+[Unit]
+Description=Pantheon VPS non-git state backup — off-box copy of the irreplaceable non-git state (T-2178)
+Documentation=file:///home/claude/pantheon-config/tickets/done/T-2178.md
+After=network-online.target
+Wants=network-online.target
+
+# NO OnFailure= here is DELIBERATE (this unit is on the EXCLUDED list in
+# test_unit_failure_alert_coverage.py): it is a system/root unit, and the fleet
+# OnFailure alerter + failed-unit-reconcile are both user-scoped (per-account
+# systemctl --user) — neither fires for a system unit. A backup's real health
+# signal is commit-freshness, not unit status: any failure shows as a missing
+# daily commit in the backup repo. The staleness monitor that alerts on that is
+# T-2886.
+
+[Service]
+# SYSTEM unit (installed at /etc/systemd/system/, runs as root): the backup
+# reads every account's home state + /etc + the kino DB, which no single agent
+# account can. Canonical script lives in the tracked repo; root runs it in place
+# (claude/HO already holds sudo, so this is not a new privilege boundary). To
+# harden later, cp it to /usr/local/sbin root-owned and point ExecStart there.
+Type=oneshot
+ExecStart=/usr/bin/bash /home/claude/pantheon-config/tools/vps_state_backup.sh
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=15min

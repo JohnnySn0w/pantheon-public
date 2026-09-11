@@ -63,7 +63,7 @@ When an action's cost is near-zero (filing a ticket, running a smoke, reading a 
 
 ## Old-to-new numbering map (post-ORG-002)
 
-For readers and tools navigating ledger entries written under the original P1–P9 scheme, see the canonical mapping in `adr/ORG-002-principles-directives-split.md` §Mapping table. Old ledger entries remain valid in their original-numbering frame (P4 = append-only).
+For readers and tools navigating ledger entries written under the original P1–P9 scheme, see the canonical mapping in `architecture/adr/ORG-002-principles-directives-split.md` §Mapping table. Old ledger entries remain valid in their original-numbering frame (P4 = append-only).
 
 Quick reference:
 - Old P2 → new **P1** (architecture over policy)

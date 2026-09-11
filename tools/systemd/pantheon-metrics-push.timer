@@ -1,0 +1,22 @@
+[Unit]
+Description=Pantheon metrics push — every ~90s, under specialist's 2min stale threshold (T-3625)
+Documentation=file:///home/%u/pantheon-config/tickets/done/T-3625.md
+
+[Timer]
+# 60s cadence keeps data.json fresh with a wide margin under specialist's 2min (120s)
+# stale->sim fallback. OnUnitActiveSec counts from the last run's completion, so
+# the effective period is ~60s + the (sub-2s) run time -> max origin age ~62s.
+# (Verified cf-cache-status=DYNAMIC: CF does NOT edge-cache the JSON, so the
+# edge-served age == origin age; no cache TTL to add on top.)
+# AccuracySec=1s defeats systemd's default 1min timer-batching slack, which
+# would otherwise let a fire drift up to +60s late and approach the 120s cliff.
+AccuracySec=1s
+OnBootSec=45s
+OnActiveSec=15s
+OnUnitActiveSec=60s
+# NOT Persistent=true: a replayed stale sample is worse than a gap — the endpoint
+# must only ever carry fresh data, and the >2min stale-fallback covers real gaps.
+Unit=pantheon-metrics-push.service
+
+[Install]
+WantedBy=timers.target

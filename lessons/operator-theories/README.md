@@ -54,6 +54,7 @@ was off, and by how much.
 | Date | Theory | Verdict | Score |
 |---|---|---|---|
 | 2026-05-09 | [1M context not as useful as it would seem — degrades halfway in](2026-05-09-1m-context-halfway-hypothesis.md) | Directionally-correct-magnitude-off | ~80 |
+| 2026-08-26 | [Intellectual arbitrage — LLM-native tool-arbitrage across disciplinary boundaries](2026-08-26-intuition-anchor-plus-giants-methodology.md) | Unresolved (first scored application in-flight: germination-arc layer-methodology corpus, post-POC) | pending |
 
 ## Future seed candidates (per T-0163 §4)
 

@@ -577,6 +577,13 @@ class TestLedgerWrite(unittest.TestCase):
             env_path = Path(tmp) / ".env"
             env_path.write_text("TELEGRAM_BOT_TOKEN=fake\n", encoding="utf-8")
             with (
+                # T-2898: pull_repo_or_warn MUST be patched in every main()-path
+                # test — unmocked it runs a REAL `git fetch` + `merge --ff-only
+                # origin/main` against whatever repo the suite runs in, which
+                # fast-forwards a checked-out agent-worktree branch mid-run (the
+                # silent base-drift that hit the T-2841 build) and makes the
+                # suite network-dependent.
+                patch("tools.activity_digest.pull_repo_or_warn"),
                 patch("tools.activity_digest.gather_resolved_tickets", return_value=[]),
                 patch("tools.activity_digest.send_telegram"),
                 patch("tools.activity_digest.write_ledger_entry") as mock_ledger,
@@ -665,6 +672,7 @@ class TestDryRun(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "digest.log"
             with (
+                patch("tools.activity_digest.pull_repo_or_warn"),  # T-2898: never real git in tests
                 patch(
                     "tools.activity_digest.gather_resolved_tickets",
                     return_value=[self._non_empty_ticket()],
@@ -684,6 +692,7 @@ class TestDryRun(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             log_path = Path(tmp) / "digest.log"
             with (
+                patch("tools.activity_digest.pull_repo_or_warn"),  # T-2898: never real git in tests
                 patch(
                     "tools.activity_digest.gather_resolved_tickets",
                     return_value=[self._non_empty_ticket()],

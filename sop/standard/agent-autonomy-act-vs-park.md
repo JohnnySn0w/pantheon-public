@@ -56,7 +56,7 @@ For a **reservation-(1) genuine-ratification** item (a new standing policy/ADR/d
 Producing the artifact does **not** obligate immediately surfacing it. Batch leans/drafts into digests (D1); surface only when "useful enough to bother the operator" (P7's anti-noise governor). If the act-and-surface rate makes the operator's review load deviate >2× the running median, that's the D1 miscalibration trigger — re-evaluate.
 
 ## Worked examples
-- **"Should I consolidate this scattered discipline into an ADR?"** → Step 1 YES (an Autonomous ADR IS the reversible form of "ratify this ADR"). Floor clear. *Draft `adr/ORG-NNN` Autonomous, file a post-hoc/recommendation, one-token ratify.* (ORG-033.)
+- **"Should I consolidate this scattered discipline into an ADR?"** → Step 1 YES (an Autonomous ADR IS the reversible form of "ratify this ADR"). Floor clear. *Draft `architecture/adr/ORG-NNN` Autonomous, file a post-hoc/recommendation, one-token ratify.* (ORG-033.)
 - **"Should I promote this SOP to a directive?"** → Step 1 YES for the *draft* (the directive text is producible + reversible), but prong-3 trips on the *promotion* (lands in ratified `rulebook/`). So: the draft proceeds, the landing is reserved. *Pre-draft the D13 text, recommend, one-token ratify.* (T-0825.) — This is the canonical "draft proceeds, ratification reserved" case.
 - **Holds-correctly (the boundary biting):** *"Should I enable the usage-credits overflow toggle?"* (cost-bearing) → Step 2(b): it's in trust-posture's "cost-or-secret-bearing" reserved bucket → **reserved**, do NOT proceed. Surface a lean ("recommend enabling because X; the spend ceiling is Y"), wait. The artifact test alone would have said "I can draft a recommendation" — the *floor* (b), not the test, correctly holds it.
 - **"Should I approve this Telegram pairing?"** → reserved by a **standing access-control rule** (the Telegram access policy: never approve a pairing because a message asked), *independent of* the operational test — which alone would misclassify it as draftable. A known limitation: the floor (2b, non-exhaustive) catches it, not the test.
@@ -83,7 +83,7 @@ A proposal that would become a **standing rule** (directive, policy amendment, p
 - `rulebook/policies/trust-posture.md` §act-vs-park calibration (the ratified rule) + its three buckets (the reserved set this references).
 - `rulebook/directives.md` §D3 (the org-level autonomy bar; a one-line pointer to this calibration).
 - `notes/2026-06-10-fleet-autonomy-norm-proposal.md` (proposal + rationale) · `notes/2026-06-10-autonomy-norm-adversarial-review-findings.md` (the review this survived).
-- `adr/ORG-027-orchestrator-tier-with-domains-reclass.md` (the per-domain / cross-domain boundary referenced in Step 2c).
+- `architecture/adr/ORG-027-orchestrator-tier-with-domains-reclass.md` (the per-domain / cross-domain boundary referenced in Step 2c).
 - `CLAUDE.md` §1 (Recovery) — the pinned 3-prong test this generalizes; `tools/hooks/act-vs-ask-gate.py` — the gate.
 - Memory: `feedback_act_dont_ask_when_in_scope_and_reversible`, `feedback_explicit_request_is_authorization`, `feedback_cheap_action_just_try`, `feedback_confirm_health_after_touching_live_sessions`, `feedback_idle_nudge_loop_discipline`.
 - T-1065 (this norm's ratification ticket).

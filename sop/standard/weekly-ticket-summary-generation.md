@@ -56,6 +56,8 @@ status: GENERATED   # not DRAFT-SAMPLE — the cron produces final reports
 
 <One paragraph. Total tickets resolved + the four-way split (new capabilities / improvements / fixes / batch closures + follow-ups). Notable counts: ADRs ratified, SOPs ratified, ratification-tier closes. Be concise — this is the footer, not the headline.>
 
+<Then the `### Pantheon at scale` block. The generation prompt supplies it PRECOMPUTED under the "PRECOMPUTED SCALE METRICS" delimiter — reproduce it VERBATIM at the end of this section, numbers exact; do NOT recompute, round, or reword. These cumulative fun-metrics (the operator request 2026-08-12: "tuck those metrics into the weekly pr report, I think they're fun") are computed deterministically by `tools/weekly_ticket_summary.py::compute_scale_metrics()`. If the block arrives empty or as an HTML comment (a git/FS hiccup), omit the subsection — never fabricate the numbers.>
+
 ---
 
 *Detailed ticket trail available in `tickets/done/` under the date range above; commits referenced by individual ticket transition logs.*

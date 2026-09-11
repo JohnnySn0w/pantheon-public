@@ -55,7 +55,7 @@ This is a **containment** posture, not a **prevention** claim — it remains val
 ## Cross-references
 
 - [`research-dispatch-deliverable-standards.md`](research-dispatch-deliverable-standards.md) §Standard 4 — cyber/exploit isolation; the hardened superset on the cyber-classifier axis. This SOP is its general-web sibling on the injection axis.
-- `adr/ORG-025-*` — the in-session watch-dispatch pattern that already isolates 100% of Specialist's untrusted fetch by construction (the de facto practice this SOP codifies).
-- `adr/ORG-012-information-inflow-bubble-up-methodology.md` — the assessment→SOP promotion pathway this entry travelled.
+- `architecture/adr/ORG-025-*` — the in-session watch-dispatch pattern that already isolates 100% of Specialist's untrusted fetch by construction (the de facto practice this SOP codifies).
+- `architecture/adr/ORG-012-information-inflow-bubble-up-methodology.md` — the assessment→SOP promotion pathway this entry travelled.
 - **External anchor — NSA AISC Cybersecurity Information Sheet**, *"Model Context Protocol (MCP): Security Design Considerations for AI-Driven Automation"* (U/OO/6030316-26, 2026-05-20; verified citation, T-1412). Its **rec #7** (treat tool output as untrusted input; screen for hidden instructions / prompt injection in tool responses) and **rec #5** (execution sandboxing under OS-level isolation) independently prescribe the isolation discipline this SOP and cyber Standard 4 codify — a second, authoritative source converging on the same posture.
 - **T-1437 / T-1401** — this SOP's origin (Specialist injection-risk assessment, lean-to-HO); assessment `knowledge/episodic/2026-06-29-specialist-web-research-injection-risk/notes.md`. arXiv **2604.27202** (production-scale indirect injection, primary/empirical) + **2605.17634** (unresolvability, hedged/single-source).

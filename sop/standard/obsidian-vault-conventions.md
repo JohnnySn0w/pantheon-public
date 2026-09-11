@@ -20,7 +20,7 @@ pantheon-config doubles as an **Obsidian vault**: open the repo folder (or its p
 | Link form | Resolves because | Rule |
 |---|---|---|
 | `[[T-1497]]` | tickets are named `T-NNNN.md` | nothing to do — works everywhere |
-| `[[ORG-020]]` | every `adr/ORG-NNN-slug.md` carries `aliases: [ORG-NNN]` frontmatter | new ADRs MUST include the alias line |
+| `[[ORG-020]]` | every `architecture/adr/ORG-NNN-slug.md` carries `aliases: [ORG-NNN]` frontmatter | new ADRs MUST include the alias line |
 | `[[notes/2026-05-10-pantheon-as-contracting-firm.md]]` | vault-relative paths resolve | fine, but bare basenames are shorter |
 | `[[feedback_*]] [[reference_*]] [[project_*]] [[user_*]] …` | they DON'T — these name **agent-private memory files** outside the repo | intentional; read them as "an agent has a memory pin by this name" |
 | `[[ADR-212]]`, `[[Supplementary Material/…]]` | echo-repo namespace | resolves only in a multi-repo vault once echo adopts aliases; until then a known cross-repo pointer |

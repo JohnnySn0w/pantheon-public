@@ -120,5 +120,5 @@ Out of scope: editing `instance.yaml`'s `harness_runtime.roles.<role>` stanza it
 - `tools/t2590_cutover_verify_lib.sh` — the shared, persona-general verify predicates (pid selection, urgent-env confirm, telegram-poller tree-walk) both scripts source.
 - `sop/standard/onboarding-a-new-harness.md` — the companion SOP for a brand-new, non-claude harness.
 - `sop/standard/adding-restart-capability-to-a-new-agent.md` — the companion SOP for a brand-new claude-code agent's full ORG-020 restart stack.
-- `adr/ORG-031-harness-abstraction-and-daemon-onboarding.md` §iii — the ADR this SOP is authored per.
-- `adr/ORG-050-security-and-identity-contract.md` — the installer plan/apply/verify/identity contract `t2611_recovery_persona_apply.py` implements against.
+- `architecture/adr/ORG-031-harness-abstraction-and-daemon-onboarding.md` §iii — the ADR this SOP is authored per.
+- `architecture/adr/ORG-050-security-and-identity-contract.md` — the installer plan/apply/verify/identity contract `t2611_recovery_persona_apply.py` implements against.

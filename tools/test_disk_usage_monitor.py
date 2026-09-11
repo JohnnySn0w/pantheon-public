@@ -118,9 +118,76 @@ class WakeWard(unittest.TestCase):
 
 class TopConsumers(unittest.TestCase):
     def test_never_raises_on_failure(self):
-        # Even if every du subprocess errors, returns '' rather than propagating.
-        with mock.patch.object(dum.subprocess, "run", side_effect=OSError("boom")):
-            self.assertEqual(dum._top_consumers(), "")
+        # Even if every du subprocess errors, must not propagate (fail-soft: the core
+        # df check never depends on cross-account du). Post-T-3441 the errored homes
+        # are MARKED rather than dropped, so the result is non-empty markers, not ''.
+        with mock.patch.object(dum, "AGENT_HOMES", ["claude", "recovery"]), \
+             mock.patch.object(dum.subprocess, "run", side_effect=OSError("boom")):
+            out = dum._top_consumers()  # must not raise
+        self.assertIn("claude:?err", out)
+        self.assertIn("recovery:?err", out)
+
+    def test_du_timeout_marks_home_not_dropped(self):
+        # Regression (T-3441): a home whose du TIMES OUT must appear MARKED, never
+        # silently absent. The 2026-09-06 miss: claude (69.5G) vanished from the
+        # breakdown because its du exceeded the per-home timeout, so the live alert
+        # named a 6x-smaller home as the top consumer and pointed triage at it.
+        import subprocess as _sp
+        with mock.patch.object(dum, "AGENT_HOMES", ["claude", "recovery"]), \
+             mock.patch.object(dum.subprocess, "run",
+                               side_effect=_sp.TimeoutExpired(cmd=["du"], timeout=1)):
+            out = dum._top_consumers()
+        self.assertIn("claude", out)
+        self.assertIn("?timeout", out)
+
+    def test_measured_and_unmeasured_both_present(self):
+        # A sized home and a timed-out home in the same sweep: the sized one shows its
+        # size, the timed-out one is marked AND present (never truncated out by the
+        # top-N limit even though a marker sorts below every real size).
+        import subprocess as _sp
+
+        def fake_run(cmd, **kw):
+            home = cmd[-1]  # ".../home/<name>"
+            if home.endswith("/claude"):
+                raise _sp.TimeoutExpired(cmd=cmd, timeout=1)
+            return mock.Mock(returncode=0, stdout="3.0G\t" + home + "\n")
+
+        with mock.patch.object(dum, "AGENT_HOMES", ["claude", "recovery"]), \
+             mock.patch.object(dum.subprocess, "run", side_effect=fake_run):
+            out = dum._top_consumers()
+        self.assertIn("recovery:3.0G", out)
+        self.assertIn("claude:?timeout", out)
+
+    def test_nonzero_rc_with_valid_total_is_measured(self):
+        # The REAL 2026-09-06 miss (T-3441): du exits NONZERO from an unreadable
+        # subdir (root-owned rootless-podman overlay dirs in the claude/claude-research
+        # /codex homes) but still prints a valid grand total. That total must be USED,
+        # not discarded for rc!=0 — the old `returncode == 0` guard dropped the biggest
+        # home on every single run, which is what hid claude (verified live 2026-09-06).
+        def fake_run(cmd, **kw):
+            return mock.Mock(returncode=1, stdout="38G\t" + cmd[-1] + "\n")
+        with mock.patch.object(dum, "AGENT_HOMES", ["claude"]), \
+             mock.patch.object(dum.subprocess, "run", side_effect=fake_run):
+            out = dum._top_consumers()
+        self.assertIn("claude:38G", out)
+        self.assertNotIn("?err", out)
+
+    def test_no_stdout_is_err_marked(self):
+        # A genuine failure — nonzero rc AND no total on stdout (sudo denied, path
+        # gone) — is marked ?err, still never dropped.
+        def fake_run(cmd, **kw):
+            return mock.Mock(returncode=1, stdout="")
+        with mock.patch.object(dum, "AGENT_HOMES", ["claude"]), \
+             mock.patch.object(dum.subprocess, "run", side_effect=fake_run):
+            out = dum._top_consumers()
+        self.assertEqual(out, "claude:?err")
+
+    def test_total_budget_bounds_walltime(self):
+        # The whole sweep must fit inside the service TimeoutStartSec (2min): with a
+        # shared budget, once it is spent the remaining homes are marked ?skipped
+        # rather than each waiting its own per-home timeout (8x60s would blow 2min).
+        self.assertLessEqual(dum.DU_TOTAL_BUDGET_SEC, 110)
+        self.assertLessEqual(dum.DU_PER_HOME_TIMEOUT_SEC, dum.DU_TOTAL_BUDGET_SEC)
 
 
 class RamCpuClassifiers(unittest.TestCase):

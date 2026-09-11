@@ -1,0 +1,13 @@
+[Unit]
+Description=Pantheon memory-pin health check — lint every pin store on this account (T-2888, ORG-068 memory Health leg)
+Documentation=file:///home/%u/pantheon-config/tools/memory_lint_sweep.py
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/memory_lint_sweep.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

@@ -139,7 +139,7 @@ class TestAllowlistIntegrity(unittest.TestCase):
     #: not merely pattern-matched: a bare "T-NNNN" mentioned in passing must not
     #: be mistaken for the tracker (a reason citing some other, possibly
     #: long-resolved, ticket would otherwise trip the resolution check below).
-    _TRACKER_RE = re.compile(r"tracked:\s*(T-\d{4})", re.IGNORECASE)
+    _TRACKER_RE = re.compile(r"tracked:\s*(T-\d{4,})", re.IGNORECASE)  # T-3215
 
     def _known_violations(self):
         return [(p, r) for p, r in ppl.ALLOWLIST if "KNOWN VIOLATION" in r]

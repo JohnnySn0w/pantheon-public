@@ -7,7 +7,7 @@ accepts a secret VALUE -- every verb operates on non-secret reference
 metadata (ids, owners, on-disk paths, modes, expiry), the same fields
 tools/credential_broker.py's own dataclasses already treat as safe.
 
-Verbs, matching ORG-051 (adr/ORG-051-secret-and-authentication-lifecycle.md)
+Verbs, matching ORG-051 (architecture/adr/ORG-051-secret-and-authentication-lifecycle.md)
 Installer interface:
 
     check / verify <ref-spec.json> --audit-path PATH

@@ -9,7 +9,7 @@ date: 2026-06-05
 
 You have already **decided** to promote a piece of knowledge to a higher tier — per ORG-012's promotion criteria (the "when/why" methodology). This SOP is the "how you actually do it" companion. It covers the mechanical execution steps, the filing contract, who ratifies what, and the supersedure bookkeeping on the source artifact.
 
-If you haven't applied ORG-012's criteria yet (threshold tests, ratification gates, two-axis model) — stop and read `adr/ORG-012-information-inflow-bubble-up-methodology.md` first. That ADR owns the decision; this SOP owns the execution.
+If you haven't applied ORG-012's criteria yet (threshold tests, ratification gates, two-axis model) — stop and read `architecture/adr/ORG-012-information-inflow-bubble-up-methodology.md` first. That ADR owns the decision; this SOP owns the execution.
 
 **What counts as a promotion:** the move of a rule, pattern, or artifact from a lower-weight tier to a higher-weight one, or into a different *kind* of container when the kind is a better fit (e.g., lesson → ADR when the shape is architectural, not just a behavioral rule bump). ORG-012 §Tier map enumerates the full vertical and horizontal axes.
 
@@ -29,11 +29,11 @@ Pulled verbatim from ORG-012 §Tier map and §Promotion criteria. The *target* c
 | Working scratch | `notes/`, ledger comments | `lessons/` (if pattern emerges — 2+ instances, same shape) | HO autonomous at write |
 | Concrete gotcha | `bugs/` | No upward promotion (bugs stay bugs; archive at decay) | N/A |
 | Postmortem | `incidents/` | No upward promotion (incidents stay incidents; lessons abstract from them) | N/A |
-| Abstracted pattern | `lessons/` | `sop/standard/` or `sop/remediation/` (role-defining operational sequence); `rulebook/directives.md` (structurally enforceable + org-tier); `adr/ORG-NNN` (decision-among-alternatives with named tradeoffs) | the operator pre-merge |
+| Abstracted pattern | `lessons/` | `sop/standard/` or `sop/remediation/` (role-defining operational sequence); `rulebook/directives.md` (structurally enforceable + org-tier); `architecture/adr/ORG-NNN` (decision-among-alternatives with named tradeoffs) | the operator pre-merge |
 | Bug cluster | `bugs/` (multiple) | `sop/remediation/` (when the cluster defines a class of failure with a reproducible mitigation pattern) | the operator pre-merge |
 | Operational playbook | `sop/standard/` or `sop/remediation/` | `rulebook/directives.md` (structurally enforceable + org-tier) | the operator pre-merge |
 | Org-level rule | `rulebook/directives.md` (D-class) | `rulebook/principles.md` (foundational; cited in 2+ other directives' `justifies-via` chains as ground reason) | the operator pre-merge, explicit |
-| HO memory pin | `feedback_*.md` | `sop/standard/` (role-defining for any agent, not just HO habit); `rulebook/directives.md` (structurally enforceable + multi-workflow); `adr/ORG-NNN` (architectural shape) | the operator pre-merge of the SOP/ADR |
+| HO memory pin | `feedback_*.md` | `sop/standard/` (role-defining for any agent, not just HO habit); `rulebook/directives.md` (structurally enforceable + multi-workflow); `architecture/adr/ORG-NNN` (architectural shape) | the operator pre-merge of the SOP/ADR |
 
 **Two-axis note.** A single observation can land in multiple containers if it has both an architectural and an operational shape (ORG-012 §Tier map §Two-axis distinction). Build both artifacts; file one ratify ticket per artifact.
 
@@ -72,7 +72,7 @@ Create the new file at the target path with the correct structure for that tier:
 **Status:** **Ratified 2026-06-05 by the operator.** Drafted <date> by <author> (<ticket>).
 ```
 
-**`adr/ORG-NNN-<slug>.md`** — full ADR shape:
+**`architecture/adr/ORG-NNN-<slug>.md`** — full ADR shape:
 ```
 ---
 title: ...
@@ -210,10 +210,10 @@ HO (Orchestrator) is the primary drafter for most promotions per `org-012-per-ag
 
 ## Cross-references
 
-- `adr/ORG-012-information-inflow-bubble-up-methodology.md` — the governing methodology (when/why/criteria). This SOP operationalizes its execution path. Specifically: §Tier map (the two-axis model + containers), §Promotion criteria (all threshold tests), §Demotion criteria (supersedure mechanics), §Ratification gates (who ratifies what).
+- `architecture/adr/ORG-012-information-inflow-bubble-up-methodology.md` — the governing methodology (when/why/criteria). This SOP operationalizes its execution path. Specifically: §Tier map (the two-axis model + containers), §Promotion criteria (all threshold tests), §Demotion criteria (supersedure mechanics), §Ratification gates (who ratifies what).
 - `sop/standard/throughline-sweep-result-filing.md` — the two-step filing contract (greenlight ticket → build artifact → ratify ticket). Step 4 of this SOP aligns with §4 of that SOP.
 - `sop/standard/org-012-per-agent-portions.md` — who operationalizes which portions of ORG-012 per agent.
-- `adr/ORG-012-information-inflow-bubble-up-methodology.md` §Implementation arc Phase D — explicitly planned that this SOP would be authored once a few promotions had been observed (precondition met 2026-06-04 per T-0780 sweep).
+- `architecture/adr/ORG-012-information-inflow-bubble-up-methodology.md` §Implementation arc Phase D — explicitly planned that this SOP would be authored once a few promotions had been observed (precondition met 2026-06-04 per T-0780 sweep).
 - T-0832 (this SOP's authoring ticket, G-1 in the T-0780 greenlit batch).
 - T-0780 (the cross-quarter throughline sweep that surfaced the G-1 gap and provided the observed-promotions precondition).
 

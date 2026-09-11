@@ -84,6 +84,8 @@ Sweep for: operator name (`operator`), the role label **`orchestrator`**, real e
 
 **The genericization name-map (pwa), so you know what "clean" means:** `operator` → `operator`; `orchestrator` → `orchestrator`; agent codenames `specialist` / `recovery` / `orchestrator` are **KEPT** (public-safe); `T-NNNN` / `ADR-NNN` / `ORG-NNN` / `msg_NNNN` refs are **KEPT** (provenance). A de-genericization slip reads as source RE-INTRODUCING a mapped token on a line the mirror had already genericized (the `-` line is correct, the `+` line regresses it) — most likely in an **auto-merged** file you never conflict-resolved. On T-2465 the self-scan omitted `orchestrator` as a class entirely and missed two such slips in `web/tests/e2e/fixtures.ts`; the independent adversarial pass (below) caught both. Add every mapped token to your scan, not just the ones you happened to hand-edit.
 
+**A renamed SYMBOL survives in more forms than its identifier — scan its derived strings too.** When the mirror renames a symbol (e.g. `requireTailscaleUser`→`requireUser`, module `auth/tailscale`→`auth/identity`, error reason `no_tailscale_identity`→`no_identity`), grepping only the identifier/import is not enough. On T-2964 the self-scan checked `requireTailscaleUser` / `auth/tailscale` / `TailscaleIdentity` and reported clean, but the adversarial pass caught two survivors the port had left in **comments**: the old error-code STRING literal `no_tailscale_identity` and the bare module FILENAME `tailscale.ts` (the shipped code emits `no_identity` from `identity.ts`). For each renamed symbol also scan the old (a) error-code / reason string it used to produce and (b) bare `<oldname>.ts` filename references — most often in comments and test names, which no compiler or test failure will surface.
+
 **`claude` bare is mandatory and is the documented blind spot.** T-1983's own identity sweep checked `claude-fallback` and `claude-research` and never checked bare `claude`; an independent adversarial pass found four survivors, one rendered into shipped UI. A self-authored gate inherits its author's blind spot — which is what the done-bar's independent-verification requirement is actually for. **Run the independent pass** (a fresh agent, given the name-map and the diff, told to be adversarial) — it is not optional theater; it earned its keep on both T-1983 and T-2465.
 
 `T-NNNN` / `ADR-NNN` refs are **NOT leaks** — T-1987 ratified them as provenance-only, treated by a standing README note. Do not add them to the fail gate; gating on non-secret provenance noise blocks refreshes for nothing.
@@ -121,6 +123,8 @@ cd /tmp/verify && git log --format='%an <%ae>' | sort -u   # authors, FULL histo
 **Verification:** read the CLONE's log and author set — do not trust the construction. Confirm the history is the short orphan-squash lineage, not the source repo's.
 
 Then **re-run the gates against the fresh clone**, not the working tree. A working tree can pass on state that never made it into the bundle.
+
+**Warm the clone's deps before reading a test result — a cold `bun install` gives a FALSE all-fail (pwa; T-3375).** A fresh clone has no `web/node_modules`; running `( cd web && bun install && bunx vitest run )` back-to-back can start vitest before the install finishes *linking* (jsdom especially), so vitest collects **zero** tests and reports every file failed — `27 failed (27) / Tests no tests / tests 0ms` (note `tests 0ms` while `environment` is nonzero: the files never executed, they failed to *load*). That looks exactly like a content regression and is not one. Re-run `bunx vitest run` once `bun install` reports `no changes`; on T-3375 the cold run showed the false all-fail and the warm re-run was `235 passed`. The build passing on the same clone is a second tell the tree is complete.
 
 Drop the bundle at a path the publisher can read (`/tmp/<name>.bundle`, mode `0644` — the established convention; `/tmp` is world-readable and this matches prior cross-agent bundle drops).
 
@@ -165,6 +169,34 @@ python3 tools/mirror_state.py get <slug>
 
 **Verification:** `published_mirror_head` is the new head, `source_head_at_last_publish` is your verified source sha, `staged_bundle` is `null`. Resolving without this read is half of why the anchor went unrecorded twice — the recording lives on the publisher's leg, but the consequence lands on the drift sweep, which is the build leg's.
 
+### 11. Advance the persistent build branch (pwa `genericize`) to your build tip — do not skip
+
+Once the publish is confirmed (step 10), fast-forward the local persistent build branch to the tip you just published so it carries the new genericized tree:
+
+```bash
+git branch -f genericize <your-build-tip>          # or: git reset --hard <tip> if genericize is checked out
+git rev-parse genericize^{tree}                     # must EQUAL the live mirror/main tree
+git merge-base genericize origin/main               # must be your verified SOURCE head (this refresh's anchor)
+```
+
+**Verification:** `genericize`'s tree equals `mirror/main`'s tree, and `merge-base(genericize, origin/main)` is the source head you just published from.
+
+**Why:** step 1 builds on a *working branch off* `genericize`; publishing via `commit-tree` never touches `genericize` itself. If you leave it at the old anchor, the NEXT refresh 3-way-merges from a base that lacks this refresh's genericization — so the next build tree silently *reverts* everything you just shipped, surfacing only as a large unexplained `git diff --cached mirror/main` in the next refresh's step 2a (T-2964). The merge-based lineage (a merge commit whose parents are the prior `genericize` and this refresh's source head) is what makes the next refresh's merge-base land on this anchor. `genericize` is local build state (never pushed) — the fix is a local branch move, but skipping it hands the next builder a landmine.
+
+## Hand-landings — anchor discipline symmetry
+
+A **hand-landing** is a commit landed directly on the public mirror outside the refresh flow — for example, the operator's 2026-07-27 T-1987 dangling-refs README note on claude-code-config (commit `efb502c`). The refresh flow's `record-published` step (§10) is the anchor's only structural update; a hand-landing that skips it leaves the recorded anchor lagging live mirror reality until the next full refresh reconciles it.
+
+**Why this matters:** every drift-sweep leg on a no-read-path pair starts from the *recorded* anchor as the assumed live base, and relies entirely on the next refresh's step 2a (fresh-clone reconciliation) to catch the divergence. Recovery's warm-recon on T-2963 (2026-08-28) surfaced this exact class — the recorded anchor said mirror head was `2e8bd87` when the live head was actually `efb502c` (the T-1987 hand-landing). No harm this arc because step 2a caught it, but the anchor-vs-reality gap is latent risk.
+
+**Checklist when hand-landing a commit on a public mirror:**
+
+1. Land the commit on the mirror.
+2. Immediately update the anchor: `python3 tools/mirror_state.py record-published <slug> --source-head <original-source-sha> --mirror-head <new-mirror-head>` — keep `--source-head` at whatever source anchor produced the pre-hand-landing tree (a hand-landing is a mirror-only edit; it does not advance the source anchor unless it also folds a source change).
+3. Verify with `python3 tools/mirror_state.py get <slug>` — `published_mirror_head` should be the new hand-landed sha; `source_head_at_last_publish` unchanged.
+
+**Applies to:** T-1987-style dangling-refs README notes, provenance annotations on the mirror, any operator note landed straight on the mirror. Does NOT apply to the refresh flow itself (§10 covers that) or to source-side edits that flow through a refresh (those advance the source anchor via §10 in the normal way).
+
 ## Common failure modes
 
 | Failure | Early signal | Fix |
@@ -174,9 +206,11 @@ python3 tools/mirror_state.py get <slug>
 | Branch bundle leaks operator identity via git metadata | none — content scans read a clean tree | step 6 `commit-tree` only |
 | Checksum recorded as source head | anchor "looks" set | step 8 `git cat-file -t` |
 | Anchor never recorded | sweep silently blind, no error | steps 8 + 10 |
+| Hand-landing bypasses anchor update | none — refresh flow works; next build leg silently starts from stale base | §Hand-landings checklist |
 | Suite run in the wrong directory reads as a regression | plausible wrong test count | absolute `cd`, always |
 | Leak gate misses bare `claude` | gate reports clean | step 4, explicitly |
 | Pre-existing failure read as a regression | "my change broke it" | baseline BEFORE editing |
+| Next refresh reverts this one | none this refresh — a huge step-2a diff next time | step 11: advance `genericize` after publish |
 
 ## Boundary
 

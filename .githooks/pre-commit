@@ -31,6 +31,15 @@ Scoped to added lines only, so it can never block on pre-existing/legacy
 ledger content. Fail-OPEN on any infrastructural error (import/scan
 failure); fail-CLOSED on a genuinely unparseable added line.
 
+Also runs the T-3020 BT4 priority-list validation
+(`tools/ticket.py`'s `_priority_list_validate_report` via
+`_priority_list_validate_findings`) against the WORKING-TREE
+`rulebook/priority-list.md` whenever it is staged — rejects a commit that
+would land a broken (unparseable) priority-list (ORG-078 §4); a
+probably-dead-label finding is printed as a non-blocking warning. Runs
+IN-PROCESS (imports `tools.ticket`), not via subprocess, because
+`ticket.py`'s CLI entry point refuses to run from an `agent/*` branch.
+
 Activation:
     git config core.hooksPath .githooks
     (or run tools/install_hooks.sh which does this idempotently)
@@ -262,6 +271,135 @@ def _ledger_validity_findings(staged: list[str]) -> list[str] | None:
     return format_validity_lines(invalid)
 
 
+def _priority_list_validate_findings(staged: list[str]) -> list[str] | None:
+    """Staged priority-list validation (T-3020 BT4, ORG-078 §4).
+
+    When `rulebook/priority-list.md` is staged, validate the WORKING-TREE
+    file (not the staged blob — `_priority_list_validate_report` reads off
+    disk via `priority_list_parse.parse_file()`'s default path, same as
+    `ticket.py list` itself; ORG-078 §4 names the working-tree file
+    explicitly). Imports `tools.ticket` and calls its report function
+    IN-PROCESS rather than subprocessing `python3 tools/ticket.py
+    priority-list validate` — `ticket.py`'s `main()` refuses to run from any
+    `agent/*` branch (`_assert_cli_checkout_allowed`), so a subprocess
+    invocation would false-block every priority-list edit committed from an
+    agent worktree, exactly backwards for a safety gate. In-process import
+    matches this hook's existing `_main_guard_lint_findings`/
+    `_ledger_validity_findings` shape.
+
+    Returns BLOCKING finding strings (empty = clean or warn-only), or None
+    when the check itself couldn't run (fail-open — an import/scan bug here
+    must never brick an unrelated commit, mirroring the other findings
+    functions above). Cheap-skips (`[]`, no import) when priority-list.md
+    isn't staged.
+
+    A warning (exit 2 from the report — dead-label, high-volume, or
+    semantic-drift-candidate as of T-3080) is printed directly here,
+    non-blocking (mirrors `_warn_directive_drift`'s shape) — it never
+    affects `main()`'s block decision, only a parse failure (exit 1) does.
+    """
+    if "rulebook/priority-list.md" not in staged:
+        return []
+
+    try:
+        from tools.ticket import _priority_list_validate_report
+    except Exception as exc:  # fail-OPEN: module unavailable, nothing to scan
+        print(
+            "priority-list-validate WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — tools.ticket unavailable, "
+            "SKIPPING priority-list validation, commit allowed",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        code, lines = _priority_list_validate_report()
+    except Exception as exc:  # fail-OPEN: a genuine bug in the check itself
+        print(
+            "priority-list-validate WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — SKIPPING priority-list "
+            "validation, commit allowed",
+            file=sys.stderr,
+        )
+        return None
+
+    if code == 1:
+        return [f"rulebook/priority-list.md: {line}" for line in lines]
+
+    if code == 2:
+        print("", file=sys.stderr)
+        print("priority-list WARNING (non-blocking):", file=sys.stderr)
+        for line in lines:
+            print(f"  {line}", file=sys.stderr)
+        print("", file=sys.stderr)
+
+    return []
+
+
+def _instance_yaml_binding_findings(staged: list[str]) -> list[str] | None:
+    """Staged instance.yaml role-binding two-surface smoke gate (T-3281, ORG-012 §6).
+
+    When `instance.yaml` is staged (typically a role-binding edit), run
+    `tools.test_instance_role_grants` and `tools.test_agent_role_map`
+    in-process to close the procedural gap
+    `bugs/instance-yaml-role-binding-key-needs-fallback-mirror.md`
+    documents: a `roles.<role>` key in instance.yaml must be mirrored in
+    `_FALLBACK_PERSONA_TO_BINDING` (tools/agent_role_map.py), enforced by
+    `test_binding_fallback_never_contradicts_instance_yaml`. The
+    structural guard test is live (T-3210); this gate turns it into a
+    pre-commit surface instead of a post-push CI red ("nobody smokes it
+    because it is just config").
+
+    Runs in-process via unittest's TestLoader — same shape as
+    `_priority_list_validate_findings` above (imports over subprocess to
+    avoid `agent/*` branch refusal that some CLIs enforce).
+
+    Returns BLOCKING finding strings (empty = clean), or None on
+    infrastructural error (fail-OPEN, same shape as other findings).
+    Cheap-skips ([]) when instance.yaml isn't staged.
+    """
+    if "instance.yaml" not in staged:
+        return []
+
+    try:
+        import io
+        import unittest
+    except Exception as exc:  # fail-OPEN
+        print(
+            "instance-yaml-binding-smoke WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — SKIPPING, commit allowed",
+            file=sys.stderr,
+        )
+        return None
+
+    modules = ("tools.test_instance_role_grants", "tools.test_agent_role_map")
+    try:
+        loader = unittest.TestLoader()
+        suite = unittest.TestSuite()
+        for mod_name in modules:
+            suite.addTests(loader.loadTestsFromName(mod_name))
+        buf = io.StringIO()
+        runner = unittest.TextTestRunner(stream=buf, verbosity=1)
+        result = runner.run(suite)
+    except Exception as exc:  # fail-OPEN on infrastructural failure
+        print(
+            "instance-yaml-binding-smoke WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — SKIPPING, commit allowed",
+            file=sys.stderr,
+        )
+        return None
+
+    if result.wasSuccessful():
+        return []
+
+    findings: list[str] = []
+    for failed_test, tb in list(result.failures) + list(result.errors):
+        tb_lines = [ln for ln in tb.strip().splitlines() if ln.strip()]
+        last = tb_lines[-1] if tb_lines else "failure"
+        findings.append(f"{failed_test.id()}: {last}")
+    return findings
+
+
 def _hook_allowlist_drift() -> tuple[str, list[str]] | None:
     """Blocking hook<->allowlist pairing guard (T-1102).
 
@@ -303,6 +441,8 @@ def main() -> int:
 
     main_guard_findings = _main_guard_lint_findings(staged)
     ledger_validity_findings = _ledger_validity_findings(staged)
+    priority_list_findings = _priority_list_validate_findings(staged)
+    instance_yaml_findings = _instance_yaml_binding_findings(staged)
 
     if failures:
         print("", file=sys.stderr)
@@ -349,8 +489,44 @@ def main() -> int:
         print("", file=sys.stderr)
         return 1
 
+    if priority_list_findings:
+        print("", file=sys.stderr)
+        print("priority-list validation failure — commit refused.", file=sys.stderr)
+        print("", file=sys.stderr)
+        for detail in priority_list_findings:
+            print(f"  {detail}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  Fix rulebook/priority-list.md (see the failure-class prefix "
+            "above), re-stage, and retry.",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        return 1
+
+    if instance_yaml_findings:
+        print("", file=sys.stderr)
+        print("instance.yaml role-binding smoke failure — commit refused.", file=sys.stderr)
+        print("", file=sys.stderr)
+        for detail in instance_yaml_findings:
+            print(f"  {detail}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  A staged instance.yaml edit broke one of the two role-binding "
+            "consistency tests (T-3210 pattern, per "
+            "bugs/instance-yaml-role-binding-key-needs-fallback-mirror.md).",
+            file=sys.stderr,
+        )
+        print(
+            "  Mirror any new roles.<role> key into _FALLBACK_PERSONA_TO_BINDING "
+            "in tools/agent_role_map.py, re-stage, and retry.",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        return 1
+
     # Hook-allowlist pairing drift blocks the commit even with no HERMES/main-guard/
-    # ledger-validity failure.
+    # ledger-validity/priority-list/instance.yaml-binding failure.
     return 1 if drift is not None else 0
 
 

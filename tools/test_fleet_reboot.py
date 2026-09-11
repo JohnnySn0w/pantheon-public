@@ -1,7 +1,7 @@
 """Tests for tools/fleet_reboot.py — Recovery-driven coordinated fleet reboot (T-1049).
 
 The orchestration logic is exercised with every side effect injected: per-agent
-quiesce, the reboot_safety pre-sweep, the graveyard archive, and the reboot call.
+quiesce, the reboot_safety pre-sweep, the Chronicle archive, and the reboot call.
 Asserts the protocol invariants: driver quiesced last, advisory vs strict
 pre-check, a failed claude quiesce withholds the reboot, codex WARN never blocks,
 and reboot only fires under --execute (and not under --skip-reboot).
@@ -30,7 +30,7 @@ class Recorder:
         self.codex_status = codex_status
         self.driver_status = driver_status
         self.reboot_called = False
-        self.graveyard_called_with = None
+        self.chronicle_called_with = None
 
     def quiesce_handoff(self, agent, cfg, *, dry_run):
         self.calls.append(("handoff", agent, dry_run))
@@ -40,13 +40,13 @@ class Recorder:
         self.calls.append(("repo", agent, dry_run, stop_services))
         return {"agent": agent, "status": self.codex_status, "action": "repo_clean"}
 
-    def quiesce_drv(self, agent, cfg, *, graveyard_archive, dry_run):
+    def quiesce_drv(self, agent, cfg, *, chronicle_archive, dry_run):
         self.calls.append(("driver", agent, dry_run))
-        graveyard_archive(cfg["handoff_file"])  # exercise the injected archive
+        chronicle_archive(cfg["handoff_file"])  # exercise the injected archive
         return {"agent": agent, "status": self.driver_status, "action": "driver"}
 
-    def graveyard_archive(self, handoff_file):
-        self.graveyard_called_with = handoff_file
+    def chronicle_archive(self, handoff_file):
+        self.chronicle_called_with = handoff_file
         return True, "archived"
 
     def reboot(self, *, dry_run):
@@ -70,7 +70,7 @@ def _orchestrate(rec, **kw):
         quiesce_handoff=rec.quiesce_handoff,
         quiesce_repo=rec.quiesce_repo,
         quiesce_drv=rec.quiesce_drv,
-        graveyard_archive=rec.graveyard_archive,
+        chronicle_archive=rec.chronicle_archive,
         reboot=rec.reboot,
         log=_silent,
     )
@@ -96,7 +96,7 @@ class TestOrder(unittest.TestCase):
     def test_driver_archives_handoff(self):
         rec = Recorder()
         _orchestrate(rec)
-        self.assertEqual(rec.graveyard_called_with, fr.FLEET["recovery"]["handoff_file"])
+        self.assertEqual(rec.chronicle_called_with, fr.FLEET["recovery"]["handoff_file"])
 
 
 class TestDryRunVsExecute(unittest.TestCase):

@@ -139,4 +139,4 @@ Install + enable: `sudo install -m 644 ... /etc/systemd/system/ && sudo systemct
 - `tickets/done/T-0363.md` — landing of this SOP + the persistence trio (2026-05-16).
 - `tickets/active/T-0337.md` — open root-cause investigation for the serve-config-disappearance pattern. This SOP's persistence trio is the operational defense; T-0337 may render it moot.
 - `tickets/done/T-0336.md` — first production disappearance incident (2026-05-14) that motivated the defense.
-- `adr/ORG-006-kino-pwa.md` §Decision/Auth-model — backend `127.0.0.1`-only invariant rationale.
+- `architecture/adr/ORG-006-kino-pwa.md` §Decision/Auth-model — backend `127.0.0.1`-only invariant rationale.

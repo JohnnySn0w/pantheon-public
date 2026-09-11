@@ -1,0 +1,8 @@
+[Unit]
+Description=Refresh planned quota evidence for Pantheon persona %i
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec={quota_cadence_minutes}min
+RandomizedDelaySec={quota_randomized_delay_seconds}s
+Unit=pantheon-persona-quota@%i.service

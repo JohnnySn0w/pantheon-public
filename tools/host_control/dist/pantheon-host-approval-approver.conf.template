@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<!--
+  STAGED ARTIFACT TEMPLATE (T-2913, ORG-052 Unit 3b) - the T-2920
+  install leg substitutes @APPROVER_ACCOUNT@ per approver registered
+  in the root-owned approver policy and installs one fragment per
+  approver under /etc/dbus-1/system.d/.
+
+  MEMBER-LEVEL, exactly the four ratified Reviewer methods (ORG-052
+  section 5). Removing a fragment is NOT revocation by itself: the
+  service re-authorizes the bus-derived uid against approver policy on
+  every call (ORG-052 section 7 posture), and requester-only uids are
+  denied server-side even on a permissive bus.
+-->
+<busconfig>
+  <policy user="@APPROVER_ACCOUNT@">
+    <allow send_destination="org.pantheon.HostApproval1"
+           send_interface="org.pantheon.HostApproval1.Reviewer"
+           send_member="Review"/>
+    <allow send_destination="org.pantheon.HostApproval1"
+           send_interface="org.pantheon.HostApproval1.Reviewer"
+           send_member="ReviewGet"/>
+    <allow send_destination="org.pantheon.HostApproval1"
+           send_interface="org.pantheon.HostApproval1.Reviewer"
+           send_member="Decide"/>
+    <allow send_destination="org.pantheon.HostApproval1"
+           send_interface="org.pantheon.HostApproval1.Reviewer"
+           send_member="RequestHuman"/>
+  </policy>
+</busconfig>

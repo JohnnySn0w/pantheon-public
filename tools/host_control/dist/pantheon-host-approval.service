@@ -1,0 +1,60 @@
+# STAGED ARTIFACT (T-2913, ORG-052 Unit 3b) — nothing in this unit
+# installs it. Installation, service-account creation, and executable
+# materialization are owned by the T-2920 install leg (supervised root
+# bootstrap, ORG-052 "Bootstrap and self-amendment boundary").
+#
+# PROVISIONAL values pending T-2920 ratification:
+#   - the service account name  pantheon-hostapproval (reused from the
+#     name the T-2912 broker policy already introduced)
+#   - the ExecStart path        /usr/local/libexec/pantheon-host-approval
+#     (ORG-052 §7 introduces the /usr/local/libexec/ paths with "such
+#     as" — convention-consistent, not ratified)
+# The entrypoint binary, its root-owned config schema, and the
+# approver-policy file wiring are T-2920's; this unit ships the service
+# class with injected dependencies only.
+
+[Unit]
+Description=Pantheon host approval authority (org.pantheon.HostApproval1)
+Documentation=file:adr/ORG-052-harness-neutral-host-capability-broker.md
+Requires=dbus.service
+After=dbus.service
+
+[Service]
+Type=dbus
+BusName=org.pantheon.HostApproval1
+ExecStart=/usr/local/libexec/pantheon-host-approval
+User=pantheon-hostapproval
+Group=pantheon-hostapproval
+
+# The approval authority is unprivileged by design (ORG-052 §5): it
+# never runs as root, holds no capabilities, does not run executors,
+# does not hold sudo, and owns ONLY its durable review/grant journal
+# (StateDirectory below) — never the broker's.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
+StateDirectory=pantheon-host-approval
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

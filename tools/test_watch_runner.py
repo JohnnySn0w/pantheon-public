@@ -330,7 +330,10 @@ class TestCommitAndPushScopeFilter(unittest.TestCase):
         # Order matters: add → diff → commit → push (worktree mode: pull is
         # skipped since cwd is provided; T-0442 fetch+merge pair only runs
         # in legacy cwd=None mode).
-        kinds = [a[1] for a in argvs if a[0] == "git"]
+        # T-3600: push_with_retry runs a read-only symbolic-ref/log probe before
+        # pushing (branch-safety warn); exclude it from the lifecycle sequence.
+        kinds = [a[1] for a in argvs
+                 if a[0] == "git" and a[1] not in ("symbolic-ref", "log")]
         self.assertEqual(kinds, ["add", "diff", "commit", "push"])
 
     def test_pull_non_ff_refuses(self) -> None:
@@ -2323,6 +2326,50 @@ class TestParseFollowups(unittest.TestCase):
         self.assertEqual(result.rejected[0], f"title-{cap} — ask-{cap}")
         self.assertIn("follow-up cap", buf.getvalue())
 
+    def test_t3069_none_titled_line_with_prose_ask_is_no_op(self) -> None:
+        """T-3069: `- None — <explanation>` parses as (title='None', ask='<explanation>')
+        but is still a no-follow-up declaration. Pre-split sentinel-check catches
+        bare `- None` / `- No follow-ups`; post-split guard extends coverage to lines
+        where researcher wrote a None-declaration WITH a trailing explanation after
+        the em-dash separator.
+
+        Observed live 2026-08-21 (T-3057 specialist watch fire): a Follow-ups section
+        containing `- None — all findings inform existing Pantheon operational
+        posture...` produced a ticket titled 'None' with the explanation as its ask.
+        Both no-file semantics under the fix."""
+        body_bare = (
+            "## Follow-ups\n"
+            "- None\n"
+        )
+        # Pre-existing bare-sentinel behavior (regression guard) — no items filed.
+        self.assertEqual(watch_runner.parse_followups(body_bare), [])
+
+        body_with_prose = (
+            "## Follow-ups\n"
+            "- None — all findings inform existing Pantheon operational posture. "
+            "No new action items surface from this review.\n"
+        )
+        # Post-split guard (this ADR's fix) — the 'None' title is still a no-op declaration.
+        self.assertEqual(watch_runner.parse_followups(body_with_prose), [])
+
+        # And a real follow-up on the same section still files normally.
+        body_mixed = (
+            "## Follow-ups\n"
+            "- None — no items surface from this cycle.\n"
+            "- Real ask — actionable finding here.\n"
+        )
+        self.assertEqual(
+            watch_runner.parse_followups(body_mixed),
+            [("Real ask", "actionable finding here.")],
+        )
+
+        # Case-insensitive sentinel matching — 'NONE' should also be treated as no-op.
+        body_upper = (
+            "## Follow-ups\n"
+            "- NONE — explanation.\n"
+        )
+        self.assertEqual(watch_runner.parse_followups(body_upper), [])
+
 
 class TestActuatePhaseFollowups(unittest.TestCase):
     """Integration tests for follow-up filing in actuate_phase."""
@@ -2515,6 +2562,278 @@ class TestActuatePhaseFollowups(unittest.TestCase):
 
         self.assertEqual(len(file_followup_calls), 1)
         self.assertIsNone(file_followup_calls[0])
+
+
+class TestNormalizeFollowupTitle(unittest.TestCase):
+    """T-3172: unit tests for the sorted-token-bag dedup key."""
+
+    def test_exact_duplicate_normalizes_equal(self) -> None:
+        self.assertEqual(
+            watch_runner._normalize_followup_title("MCP supply-chain audit"),
+            watch_runner._normalize_followup_title("MCP supply chain audit"),
+        )
+
+    def test_reordered_words_normalize_equal(self) -> None:
+        """Word-order variance is the shape plain punctuation-strip would miss."""
+        self.assertEqual(
+            watch_runner._normalize_followup_title("MCP supply chain audit"),
+            watch_runner._normalize_followup_title("Audit MCP supply chain"),
+        )
+
+    def test_distinct_titles_normalize_different(self) -> None:
+        self.assertNotEqual(
+            watch_runner._normalize_followup_title("MCP supply chain audit"),
+            watch_runner._normalize_followup_title("Echo SDK check"),
+        )
+
+    def test_noise_words_dropped(self) -> None:
+        self.assertEqual(
+            watch_runner._normalize_followup_title("Verify the permission mode"),
+            watch_runner._normalize_followup_title("Verify permission mode"),
+        )
+
+
+class TestActuatePhaseFollowupDedup(unittest.TestCase):
+    """T-3172: cross-report follow-up dedup within a single actuate_phase() fire."""
+
+    def _make_tmp(self, reports: dict) -> Path:
+        """Build a minimal repo layout with one report file per slug."""
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        tmp_path = Path(tmp)
+        (tmp_path / "tickets" / "inbox").mkdir(parents=True)
+        for sub in ("active", "done"):
+            (tmp_path / "tickets" / sub).mkdir(parents=True)
+        date_dir = tmp_path / "watch" / "reports" / "2026-05-04"
+        date_dir.mkdir(parents=True)
+        rows = []
+        for slug, body in reports.items():
+            (date_dir / f"{slug}.md").write_text(body, encoding="utf-8")
+            rows.append(f"| [{slug}]({slug}.md) | ok | TL;DR: test finding {slug} |")
+        (date_dir / "README.md").write_text(
+            "# 2026-05-04\n\n"
+            "| Topic | Status | One-line summary |\n"
+            "|---|---|---|\n" + "\n".join(rows) + "\n",
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_duplicate_across_reports_skipped(self) -> None:
+        """A reordered-title duplicate from a second report collapses onto the first."""
+        reports = {
+            "topic-a": "# T\n\nBody.\n\n## Follow-ups\nMCP supply chain audit — ask-a\n",
+            "topic-b": "# T\n\nBody.\n\n## Follow-ups\nAudit MCP supply chain — ask-b\n",
+        }
+        tmp_path = self._make_tmp(reports)
+        file_followup_calls: list = []
+
+        def fake_file_followup(title, ask, finding, *, parent_id, **kw):
+            file_followup_calls.append(title)
+            return ("filed", f"T-{2000 + len(file_followup_calls)}", "retries=0")
+
+        with patch("tools.watch_runner.REPO_ROOT", tmp_path), \
+             patch("tools.watch_runner.REPORTS_ROOT", tmp_path / "watch" / "reports"), \
+             patch("tools.watch_runner.file_finding", return_value=("filed", "T-1001", "retries=0")), \
+             patch("tools.watch_runner.file_followup", side_effect=fake_file_followup), \
+             patch("tools.watch_runner.log_actuation_summary"), \
+             patch("tools.watch_runner.write_actuation_ledger"), \
+             patch("tools.watch_runner.git_commit_ledger_entry", return_value=(True, "ok")):
+            watch_runner.actuate_phase(date(2026, 5, 4), [], {})
+
+        self.assertEqual(file_followup_calls, ["MCP supply chain audit"])
+
+    def test_distinct_titles_both_filed(self) -> None:
+        """Genuinely different follow-up titles across reports both get filed."""
+        reports = {
+            "topic-a": "# T\n\nBody.\n\n## Follow-ups\nEcho SDK check — ask-a\n",
+            "topic-b": "# T\n\nBody.\n\n## Follow-ups\nMCP supply chain audit — ask-b\n",
+        }
+        tmp_path = self._make_tmp(reports)
+        file_followup_calls: list = []
+
+        def fake_file_followup(title, ask, finding, *, parent_id, **kw):
+            file_followup_calls.append(title)
+            return ("filed", f"T-{2000 + len(file_followup_calls)}", "retries=0")
+
+        with patch("tools.watch_runner.REPO_ROOT", tmp_path), \
+             patch("tools.watch_runner.REPORTS_ROOT", tmp_path / "watch" / "reports"), \
+             patch("tools.watch_runner.file_finding", return_value=("filed", "T-1001", "retries=0")), \
+             patch("tools.watch_runner.file_followup", side_effect=fake_file_followup), \
+             patch("tools.watch_runner.log_actuation_summary"), \
+             patch("tools.watch_runner.write_actuation_ledger"), \
+             patch("tools.watch_runner.git_commit_ledger_entry", return_value=(True, "ok")):
+            watch_runner.actuate_phase(date(2026, 5, 4), [], {})
+
+        self.assertEqual(sorted(file_followup_calls), ["Echo SDK check", "MCP supply chain audit"])
+
+    def test_skip_log_emitted(self) -> None:
+        """The duplicate-skip line names both the skipped title and its canonical."""
+        reports = {
+            "topic-a": "# T\n\nBody.\n\n## Follow-ups\nMCP supply chain audit — ask-a\n",
+            "topic-b": "# T\n\nBody.\n\n## Follow-ups\nAudit MCP supply chain — ask-b\n",
+        }
+        tmp_path = self._make_tmp(reports)
+
+        with patch("tools.watch_runner.REPO_ROOT", tmp_path), \
+             patch("tools.watch_runner.REPORTS_ROOT", tmp_path / "watch" / "reports"), \
+             patch("tools.watch_runner.file_finding", return_value=("filed", "T-1001", "retries=0")), \
+             patch("tools.watch_runner.file_followup", return_value=("filed", "T-2001", "retries=0")), \
+             patch("tools.watch_runner.log_actuation_summary"), \
+             patch("tools.watch_runner.write_actuation_ledger"), \
+             patch("tools.watch_runner.git_commit_ledger_entry", return_value=(True, "ok")), \
+             patch("sys.stderr", new_callable=io.StringIO) as err:
+            watch_runner.actuate_phase(date(2026, 5, 4), [], {})
+
+        self.assertIn("skipping duplicate", err.getvalue())
+        self.assertIn("Audit MCP supply chain", err.getvalue())
+        self.assertIn("MCP supply chain audit", err.getvalue())
+
+
+class TestFollowupFireCeiling(unittest.TestCase):
+    """T-3172: per-fire soft ceiling with overflow-to-single-summary-ticket."""
+
+    def _make_tmp(self, report_body: str) -> Path:
+        tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, tmp, True)
+        tmp_path = Path(tmp)
+        (tmp_path / "tickets" / "inbox").mkdir(parents=True)
+        for sub in ("active", "done"):
+            (tmp_path / "tickets" / sub).mkdir(parents=True)
+        date_dir = tmp_path / "watch" / "reports" / "2026-05-04"
+        date_dir.mkdir(parents=True)
+        (date_dir / "mcp-supply-chain.md").write_text(report_body, encoding="utf-8")
+        (date_dir / "README.md").write_text(
+            "# 2026-05-04\n\n"
+            "| Topic | Status | One-line summary |\n"
+            "|---|---|---|\n"
+            "| [mcp-supply-chain](mcp-supply-chain.md) | ok | TL;DR: test finding |\n",
+            encoding="utf-8",
+        )
+        return tmp_path
+
+    def test_ceiling_not_triggered_no_summary(self) -> None:
+        """Follow-up count under the ceiling never invokes the overflow filer."""
+        report_body = (
+            "# Test\n\nBody.\n\n"
+            "## Follow-ups\n"
+            "fu-title-1 — fu-ask-1\n"
+            "fu-title-2 — fu-ask-2\n"
+        )
+        tmp_path = self._make_tmp(report_body)
+        overflow_calls: list = []
+
+        with patch("tools.watch_runner.REPO_ROOT", tmp_path), \
+             patch("tools.watch_runner.REPORTS_ROOT", tmp_path / "watch" / "reports"), \
+             patch("tools.watch_runner._FOLLOWUP_FIRE_CEILING", 2), \
+             patch("tools.watch_runner.file_finding", return_value=("filed", "T-1001", "retries=0")), \
+             patch("tools.watch_runner.file_followup", return_value=("filed", "T-2001", "retries=0")), \
+             patch(
+                 "tools.watch_runner.file_followup_overflow_summary",
+                 side_effect=lambda *a, **kw: overflow_calls.append(a) or ("filed", "T-9999", "retries=0"),
+             ), \
+             patch("tools.watch_runner.log_actuation_summary"), \
+             patch("tools.watch_runner.write_actuation_ledger"), \
+             patch("tools.watch_runner.git_commit_ledger_entry", return_value=(True, "ok")):
+            watch_runner.actuate_phase(date(2026, 5, 4), [], {})
+
+        self.assertEqual(len(overflow_calls), 0)
+
+    def test_ceiling_triggered_summary_filed_with_overflow_items(self) -> None:
+        """Follow-ups beyond the ceiling stop individual filing and land in one summary call."""
+        report_body = (
+            "# Test\n\nBody.\n\n"
+            "## Follow-ups\n"
+            "fu-title-1 — fu-ask-1\n"
+            "fu-title-2 — fu-ask-2\n"
+            "fu-title-3 — fu-ask-3\n"
+            "fu-title-4 — fu-ask-4\n"
+        )
+        tmp_path = self._make_tmp(report_body)
+        file_followup_calls: list = []
+        overflow_calls: list = []
+
+        def fake_file_followup(title, ask, finding, *, parent_id, **kw):
+            file_followup_calls.append(title)
+            return ("filed", f"T-{2000 + len(file_followup_calls)}", "retries=0")
+
+        def fake_overflow(overflow, today, ceiling, **kw):
+            overflow_calls.append((list(overflow), today, ceiling))
+            return ("filed", "T-9999", "retries=0")
+
+        with patch("tools.watch_runner.REPO_ROOT", tmp_path), \
+             patch("tools.watch_runner.REPORTS_ROOT", tmp_path / "watch" / "reports"), \
+             patch("tools.watch_runner._FOLLOWUP_FIRE_CEILING", 2), \
+             patch("tools.watch_runner.file_finding", return_value=("filed", "T-1001", "retries=0")), \
+             patch("tools.watch_runner.file_followup", side_effect=fake_file_followup), \
+             patch("tools.watch_runner.file_followup_overflow_summary", side_effect=fake_overflow), \
+             patch("tools.watch_runner.log_actuation_summary"), \
+             patch("tools.watch_runner.write_actuation_ledger"), \
+             patch("tools.watch_runner.git_commit_ledger_entry", return_value=(True, "ok")):
+            watch_runner.actuate_phase(date(2026, 5, 4), [], {})
+
+        self.assertEqual(len(file_followup_calls), 2)
+        self.assertEqual(len(overflow_calls), 1)
+        overflow_items, _today_arg, ceiling_arg = overflow_calls[0]
+        self.assertEqual(ceiling_arg, 2)
+        self.assertEqual([item[0] for item in overflow_items], ["fu-title-3", "fu-title-4"])
+
+
+class TestFollowupOverflowSummary(unittest.TestCase):
+    """T-3172: unit tests for the overflow-summary ticket body and argv shape."""
+
+    def setUp(self) -> None:
+        self.finding_a = Finding(
+            slug="topic-a",
+            tldr="tldr-a",
+            report_relpath="knowledge/watch/reports/2026-05-04/topic-a.md",
+            headline_excerpt="",
+        )
+        self.finding_b = Finding(
+            slug="topic-b",
+            tldr="tldr-b",
+            report_relpath="knowledge/watch/reports/2026-05-04/topic-b.md",
+            headline_excerpt="",
+        )
+
+    def test_overflow_body_enumerates_items(self) -> None:
+        overflow = [
+            ("fu-title-1", "fu-ask-1", self.finding_a),
+            ("fu-title-2", "fu-ask-2", self.finding_b),
+        ]
+        ask_body, context_body = watch_runner.build_followup_overflow_body(
+            overflow, date(2026, 5, 4), 2
+        )
+        self.assertIn("fu-title-1", ask_body)
+        self.assertIn("fu-ask-1", ask_body)
+        self.assertIn(self.finding_a.report_relpath, ask_body)
+        self.assertIn("fu-title-2", ask_body)
+        self.assertIn("fu-ask-2", ask_body)
+        self.assertIn(self.finding_b.report_relpath, ask_body)
+        self.assertIn("2026-05-04", context_body)
+        self.assertIn("Ceiling: 2", context_body)
+        self.assertIn("Overflow count: 2", context_body)
+
+    def test_overflow_summary_argv_shape(self) -> None:
+        overflow = [("fu-title-1", "fu-ask-1", self.finding_a)]
+        captured = {}
+
+        def fake_invoke(argv, log_tag, env, **kw):
+            captured["argv"] = argv
+            return ("filed", "T-9999", "retries=0")
+
+        with patch("tools.watch_runner._invoke_ticket_file", side_effect=fake_invoke):
+            outcome, ticket_id, _detail = watch_runner.file_followup_overflow_summary(
+                overflow, date(2026, 5, 4), 2
+            )
+
+        self.assertEqual(outcome, "filed")
+        self.assertEqual(ticket_id, "T-9999")
+        argv = captured["argv"]
+        self.assertEqual(argv[argv.index("--target") + 1], "specialist")
+        labels = argv[argv.index("--labels") + 1]
+        self.assertIn("actuation-overflow", labels.split(","))
+        title = argv[argv.index("--title") + 1]
+        self.assertLessEqual(len(title), 120)
 
 
 class TestFileFollowupArgv(unittest.TestCase):

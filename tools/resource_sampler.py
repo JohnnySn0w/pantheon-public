@@ -22,6 +22,10 @@ DESIGN CONSTRAINTS, all learned from the incident it exists for:
     evidence of that event. Every failure path is swallowed and the run exits 0.
   - RECORDS SWAP, NOT JUST RSS. The 2026-07-28 spiral was a SWAP exhaustion story: RSS alone
     would have shown the fleet looking unremarkable while swap filled underneath it.
+  - RECORDS MEMORY PSI (added 2026-09-02). mem_used_pct is RAM-fullness, not stall; the box
+    routinely sits high on cache with ~0 stall. PSI is the stall signal AND the exact metric
+    systemd-oomd now sheds on (T-2241) — sampling it makes the next post-mortem and the
+    T-3399 threshold-calibration data-driven instead of blind.
 """
 from __future__ import annotations
 
@@ -49,6 +53,39 @@ def _meminfo() -> dict[str, int]:
     except OSError:
         pass
     return out
+
+
+def _parse_mem_pressure(text: str) -> dict[str, float]:
+    """Parse /proc/pressure/memory content into flat psi_mem_{some,full}_avg{10,60,300}
+    floats. Tolerant: unknown lines/fields are skipped, a malformed value is skipped
+    (never raises) — a sampler that dies mid-event destroys the evidence it exists for."""
+    out: dict[str, float] = {}
+    for line in text.splitlines():
+        kind, _, rest = line.partition(" ")  # "some" / "full"
+        if kind not in ("some", "full"):
+            continue
+        for field in rest.split():
+            k, _, v = field.partition("=")
+            if k.startswith("avg"):
+                try:
+                    out[f"psi_mem_{kind}_{k}"] = float(v)
+                except ValueError:
+                    continue
+    return out
+
+
+def _mem_pressure() -> dict[str, float]:
+    """Memory PSI (pressure stall info): the 'how much did tasks STALL waiting for
+    memory' signal that mem_used_pct/swap cannot show — a box can be 90% RAM-full
+    with ~0% PSI when the fill is cache. It is also the EXACT metric systemd-oomd
+    acts on (T-2241, live 2026-09-01: DefaultMemoryPressureLimit=60%/20s on
+    user.slice), so sampling it lets the T-3399 soak calibrate that threshold
+    against real load and lets a future oomd kill be classed real-vs-false.
+    some/full averaged over 10/60/300s. Empty on any error (no PSI kernel, EACCES)."""
+    try:
+        return _parse_mem_pressure(Path("/proc/pressure/memory").read_text())
+    except OSError:
+        return {}
 
 
 def _proc_rows() -> list[dict]:
@@ -112,6 +149,7 @@ def sample(now: float | None = None) -> dict:
         "swap_used_kb": sw_t - sw_f,
         "swap_used_pct": round((sw_t - sw_f) * 100 / sw_t, 1) if sw_t else None,
         "loadavg": os.getloadavg()[0],
+        **_mem_pressure(),
         "procs": _proc_rows(),
     }
 

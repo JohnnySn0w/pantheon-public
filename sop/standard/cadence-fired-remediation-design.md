@@ -37,4 +37,4 @@ The effectiveness signal can be **fooled**. A classifier-blocked session keeps *
 - **Memory:** Recovery's `feedback_bounded_repeating_remediation` — the operational pin this generalizes.
 - **Sibling discipline:** [`lessons/2026-06-26-ships-green-while-incomplete.md`](../../lessons/2026-06-26-ships-green-while-incomplete.md) — same spirit (a signal that *looks* like success but isn't: there smoke-green ≠ done; here loop-fired ≠ fix-worked).
 - **Principles/directives:** P1 (architecture over policy — the bound is structural, not a "remember to stop" prose rule); P6 + D10 (context/cost-frugality — the unbounded loop is the burn this prevents); D1 (a perpetually-firing remediation surfaces as operator-awkward usage waste — a bandwidth + money withdrawal).
-- **ADRs:** `adr/ORG-012` (information-inflow bubble-up — the lesson→SOP promotion mechanics this entry rode); `adr/ORG-011` (activity-monitor / cadence-poke surface where this most applies).
+- **ADRs:** `architecture/adr/ORG-012` (information-inflow bubble-up — the lesson→SOP promotion mechanics this entry rode); `architecture/adr/ORG-011` (activity-monitor / cadence-poke surface where this most applies).

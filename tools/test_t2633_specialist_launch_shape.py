@@ -63,10 +63,21 @@ class SpecialistLaunchShapeTest(unittest.TestCase):
         self.assertIn("recovery_boot_kick.sh", post_start[1]["command"][0])
         self.assertTrue(post_start[1]["background"])
 
-    def test_no_fallbacks_key(self) -> None:
-        # T-2633 brief: specialist does not get a codex quota-failover
-        # fallback -- that's a recovery-specific concern.
-        self.assertNotIn("fallbacks", self.specialist)
+    def test_codex_quota_failover_fallback(self) -> None:
+        # T-2927 (operator-directed, TG 7797/7844) SUPERSEDES the original T-2633
+        # decision that specialist gets no codex fallback. With GEPA bulk rollouts
+        # eating Max-sub quota, every claude-only consume-plane seat (specialist/
+        # specialist, sub-orchestrator-1/metis, sub-orchestrator-2/atlas) now carries a
+        # codex quota-failover fallback so the quota gate has a swap target.
+        self.assertEqual(
+            self.specialist.get("fallbacks"), ["codex/interactive-chatgpt"]
+        )
+        codex = self.specialist["codex"]
+        self.assertEqual(codex["profile"], "interactive-chatgpt")
+        self.assertEqual(codex["model"], "gpt-5.5")
+        overrides = codex["native"]["config_overrides"]
+        self.assertEqual(overrides["approval_policy"], "never")
+        self.assertEqual(overrides["model_reasoning_effort"], "high")
 
     def test_persona_binding_unchanged(self) -> None:
         # Deliverable 1 touches ONLY harness_runtime.roles.specialist -- the

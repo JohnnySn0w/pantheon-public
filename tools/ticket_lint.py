@@ -57,6 +57,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -70,7 +71,14 @@ from tools._git_utils import (  # noqa: E402
     with_worktree,
 )
 from tools.agent_role_map import resolve_instance_role, resolve_persona  # noqa: E402
+from tools import grand_project_program  # noqa: E402 — T-2426 / ORG-061 indexes
+from tools.adr_reeval_walk import (  # noqa: E402 — T-2841/ORG-065 BT1 reuse
+    _adr_id_from,
+    _load_yaml,
+    _split_frontmatter,
+)
 from tools.ticket import (  # noqa: E402
+    STATES,
     TICKET_FILENAME_RE,
     TicketError,
     _build_ticket_text,
@@ -166,6 +174,15 @@ class LintResult:
     requester: str | None = None
 
 
+@dataclass(frozen=True)
+class ProgramIndexFinding:
+    """Report-only ORG-061 stage/owned-obligation index integrity finding."""
+
+    code: str
+    record_id: str
+    description: str
+
+
 @dataclass
 class OrphanRatification:
     """A pending-ratification artifact with no open ratify ticket pulling on it.
@@ -174,7 +191,7 @@ class OrphanRatification:
     finding. No auto-fix, no auto-file — the operator either files a ratify
     ticket naming this path or updates the artifact's stale status line.
     """
-    rel_path: str        # repo-relative path to the artifact (e.g. adr/ORG-013-...md)
+    rel_path: str        # repo-relative path to the artifact (e.g. architecture/adr/ORG-013-...md)
     status_excerpt: str  # the matched status line, for operator context
 
 
@@ -182,7 +199,7 @@ class OrphanRatification:
 class DepGraphFinding:
     """A structural defect in the ticket depends_on graph (report-only; T-0975).
 
-    Two kinds, both surfaced in the digest and never auto-fixed:
+    Three kinds, all surfaced in the digest and never auto-fixed:
       - "cycle": a set of OPEN tickets whose depends_on edges form a cycle — an
         unbreakable deadlock (none can ever unblock). A human must decide which
         edge is wrong (a common cause: a deploy/carrier CHILD wrongly gated on
@@ -203,8 +220,12 @@ class DepGraphFinding:
         emitted permanent unactionable entries into the same section as the
         deadlock class — and its detail string accused cascade-unblock of a miss
         it had not made.
+      - "dropped_dep" (T-3440 / ORG-089): an OPEN ticket gated on a dep in done/
+        with `substate: dropped`. Distinct from stale_done_dep: a dropped bet
+        does NOT satisfy the dependency (D-N), so the gate is LIVE, not
+        self-healing — reopen+re-earn+ship the dep or prune it with rationale.
     """
-    kind: str          # "cycle" | "stale_done_dep"
+    kind: str          # "cycle" | "stale_done_dep" | "dropped_dep"
     detail: str        # human-readable description (ticket ids + the issue)
 
 
@@ -666,7 +687,6 @@ def warn_tickets(paths: list[Path]) -> list[LintResult]:
     """
     results: list[LintResult] = []
     for path in paths:
-        # Only warn on inbox tickets.
         if path.parent.name != "inbox":
             continue
         try:
@@ -685,9 +705,50 @@ def warn_tickets(paths: list[Path]) -> list[LintResult]:
             description=(
                 "inbox ticket missing serves: field (T-1103/ORG-034); "
                 "add --serves '<arc-intent or goals.md key>' when filing; "
-                "'goal-neutral-maintenance' is valid for housekeeping tickets"
+                "goal-neutral maintenance must name its asset with "
+                "nearest_intent_ref: maintenance:<asset-ref>"
             ),
         ))
+    return results
+
+
+def warn_ticket_purposes(paths: list[Path]) -> list[LintResult]:
+    """Return report-only structured-purpose findings for open tickets."""
+    # Lazy imports preserve ticket_lint's longstanding isolated-fixture shape:
+    # several lifecycle integration tests copy only ticket.py + ticket_lint.py
+    # into a synthetic repository to exercise the real subprocess boundary.
+    try:
+        from tools.project_catalogue import load_project_records
+        from tools.ticket_purpose import (
+            PurposeError,
+            load_ticket_purpose_index,
+            validate_intent_link,
+        )
+    except ImportError:
+        return []
+    results: list[LintResult] = []
+    if not paths:
+        return results
+    try:
+        tickets_root = paths[0].parents[1]
+        repo_root = tickets_root.parent
+        purpose_index = load_ticket_purpose_index(tickets_root)
+        project_records = load_project_records(repo_root / "projects" / "records")
+    except (PurposeError, ValueError, OSError):
+        return results
+    for path in paths:
+        purpose = purpose_index.get(path.stem)
+        if purpose is None:
+            continue
+        for issue in validate_intent_link(
+            purpose, purpose_index, project_records, frozenset()
+        ):
+            results.append(LintResult(
+                tid=path.stem,
+                path=path,
+                action=LintAction.WARN,
+                description=f"structured purpose {issue.code}: {issue.detail}",
+            ))
     return results
 
 
@@ -713,7 +774,7 @@ def warn_tickets(paths: list[Path]) -> list[LintResult]:
 _RATIFICATION_SCAN_DIRS = (
     "sop/standard",
     "sop/remediation",
-    "adr",
+    "architecture/adr",
     "rulebook",
 )
 
@@ -956,6 +1017,24 @@ def _ticket_depends_on(path: Path) -> list[str]:
     return re.findall(r"T-\d+", dm.group(1)) if dm else []
 
 
+def _ticket_substate(path: Path) -> str | None:
+    """Return the `substate:` frontmatter value for one ticket file, or None.
+
+    T-3440 / ORG-089: same light-touch frontmatter read as `_ticket_depends_on`
+    (does NOT run full parse_front_matter). Used to distinguish a DROPPED done
+    ticket from a shipped one so a dropped dep gets its own finding rather than
+    being mislabeled a stale-resolved dep.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+    fm = m.group(1) if m else text
+    sm = re.search(r"^substate:\s*(.+)$", fm, re.MULTILINE)
+    return sm.group(1).strip() if sm else None
+
+
 def detect_dep_graph_issues(tickets_root: Path) -> list[DepGraphFinding]:
     """Corpus-level depends_on-graph scan: cycles + stale done-deps.
 
@@ -964,6 +1043,7 @@ def detect_dep_graph_issues(tickets_root: Path) -> list[DepGraphFinding]:
     """
     state: dict[str, str] = {}          # tid -> directory/state
     deps: dict[str, list[str]] = {}     # tid -> depends_on (open tickets only)
+    dropped: set[str] = set()           # tid -> done/ but substate: dropped (T-3440)
     for st in _DEP_GRAPH_ALL_STATES:
         d = tickets_root / st
         if not d.exists():
@@ -973,15 +1053,40 @@ def detect_dep_graph_issues(tickets_root: Path) -> list[DepGraphFinding]:
                 continue
             tid = entry.stem
             state[tid] = st
+            if st == "done" and _ticket_substate(entry) == "dropped":
+                dropped.add(tid)
             if st in _DEP_GRAPH_OPEN_STATES:
                 deps[tid] = _ticket_depends_on(entry)
 
+    # T-3440 / ORG-089: a dep is SHIPPED (satisfies the gate) iff it is in done/
+    # AND not dropped. A dropped done/ dep is deliberately NOT satisfied (D-N).
+    def _shipped(dep: str) -> bool:
+        return state.get(dep) == "done" and dep not in dropped
+
     findings: list[DepGraphFinding] = []
+
+    # (0) Dropped deps (T-3440 / ORG-089): an OPEN ticket gated on a dep that is
+    # in done/ with `substate: dropped`. Distinct from stale-done-dep: a dropped
+    # dep is NOT satisfied, so the gate is LIVE (not self-healing) — the dep must
+    # be reopened+re-earned+shipped, or pruned with rationale. Its own finding
+    # kind so the digest does not mislabel it "stale-resolved".
+    for tid in sorted(deps):
+        for dep in deps[tid]:
+            if dep in dropped:
+                findings.append(DepGraphFinding(
+                    kind="dropped_dep",
+                    detail=(
+                        f"{tid} depends_on {dep}, which is DROPPED (in done/ but "
+                        "substate: dropped) — a dropped bet does NOT satisfy the "
+                        "dependency; reopen+re-earn+ship it or prune the dep with "
+                        "rationale"
+                    ),
+                ))
 
     # (1) Stale done-deps: an open ticket whose depends_on is ENTIRELY done.
     #
     # T-2396 — the all-done gate is load-bearing, not a tightening for neatness.
-    # ORG-013 cascade-unblock guards on _all_other_deps_done() and DELIBERATELY
+    # ORG-013 cascade-unblock guards on _all_other_deps_shipped() and DELIBERATELY
     # skips a partial resolve ("multi-dep partial-resolve; wait for the rest");
     # T-2177 then prunes EVERY done dep at once when the last one lands. So a done
     # dep sitting beside a still-open dep is expected, self-healing state with
@@ -997,7 +1102,10 @@ def detect_dep_graph_issues(tickets_root: Path) -> list[DepGraphFinding]:
     # different defect and belongs to a different check.
     for tid in sorted(deps):
         tid_deps = deps[tid]
-        if not tid_deps or any(state.get(d) != "done" for d in tid_deps):
+        # T-3440: use SHIPPED (done AND not dropped), not bare done/. A dropped
+        # dep is handled by the dropped_dep finding above and must NOT trip the
+        # "every dep is done, depends_on should be empty" stale-resolved case.
+        if not tid_deps or any(not _shipped(d) for d in tid_deps):
             continue
         for dep in tid_deps:
             findings.append(DepGraphFinding(
@@ -1052,6 +1160,1295 @@ def detect_dep_graph_issues(tickets_root: Path) -> list[DepGraphFinding]:
 
 
 # ---------------------------------------------------------------------------
+# T-2841 / ORG-065 BT1: generalized typed-edge graph (warn-only model layer).
+#
+# Extends the depends_on-only graph-builder above to the FULL typed edge set
+# named in ORG-065 §3.2/3.6, per the ADR's "What this builds on" — this is
+# explicitly the graph-builder to generalize, not a parallel implementation.
+# `detect_dep_graph_issues` above is UNCHANGED (still the depends_on-only,
+# open-ticket-liveness READINESS check its existing callers/tests depend on);
+# this section adds the separate, broader ACYCLICITY-as-graph-integrity layer
+# (ORG-065 §3.6: "graph integrity, not closure gating").
+#
+# Node model: (kind, id) pairs. `ticket` and `obligation` are the only kinds
+# this BT1 builder actually produces edges for; `adr`/`commit`/`test`/
+# `evidence`/`goal` are REGISTERED identities (kind is a first-class axis, not
+# hardcoded to "ticket") with no wiring yet — `goal` in particular is the
+# reserved, semantics-free landing zone for the goal-distance work named on
+# T-2841's own transition log (ORG-061-sequence).
+#
+# Scope note (state-independence): unlike `detect_dep_graph_issues`'s
+# depends_on check — which deliberately treats a DONE dep as a dead end
+# (satisfied, no longer a live deadlock edge; see T-2396 above) — this
+# generalized builder considers tickets in ANY state (inbox/active/done).
+# parent_of/implements/verifies/supersedes are lineage-permanent relationships
+# that do not become "satisfied and therefore inert" the way a blocking gate
+# does; a cycle through one of them is a graph defect regardless of whether
+# the tickets on it have since resolved. depends_on is included in this
+# broader scan on the same any-state basis for graph-integrity purposes —
+# a narrower reading (open-only) is left to the existing, unchanged function
+# above, which readiness/cascade code actually depends on.
+#
+# Domain note (why parent_of is exempted from the union but everything else
+# is NOT): a corpus wet-run against the live tickets/ tree surfaced 15
+# instances of a widespread, entirely legitimate idiom — a parent ticket
+# `depends_on` its own child (e.g. T-0173 depends_on T-0191; T-0191's
+# `parent_ticket` is T-0173, correctly recording lineage). A first pass here
+# unioned ALL five edges (depends_on/implements/verifies/supersedes/
+# parent_of) into one cycle check, which flagged every one of those 15 as a
+# "cycle". A second pass over-corrected the other way — checking all FOUR
+# edge types as fully independent domains — which is wrong for a different
+# reason: it misses real defects. implements/verifies/supersedes/depends_on
+# each carry the exact failure mode §3.6 names them for ("a depends_on loop
+# makes nothing ready", "an obligation/verifies loop makes closure-validation
+# non-terminating", "a supersedes loop corrupts replacement history") and a
+# MIXED loop across them is just as real a problem — e.g. A implements B,
+# B depends_on A is still a ticket whose implementation-obligation and its
+# gate point at each other, and isolating implements from depends_on would
+# leave that uncaught. `parent_of` is the ONE genuine outlier, and the ADR
+# text itself draws the line: "parent_ticket — Lineage back-reference only.
+# **no cascade, no validation.**" (§3.2) — the identical "carries no
+# behavior" framing the ADR uses to exempt `informs` ("NEVER gates"). A
+# parent_of-only cycle (A's parent is B, B's parent is A) is still nonsense
+# lineage and stays checked — it is just never unioned with the edges that
+# actually gate something.
+#
+# ACYCLICITY_DOMAINS below is that two-way split: {parent_of} as its own,
+# separately-checked, never-unioned domain (the ONE exemption with corpus
+# evidence behind it — the 15 falsifying instances, plus the ADR's own text),
+# and {depends_on, implements, verifies, supersedes} as one unioned domain.
+# Be precise about what backs the union choice: a general cycle detector run
+# over a graph finds every cycle IN that graph by construction, mixed-type or
+# not — that part isn't a claim needing evidence, it's the algorithm. What IS
+# a judgment call, not corpus-validated, is which four fields belong in that
+# one graph in the first place: only `depends_on` has a live, exercised
+# insertion path today; `implements`/`verifies`/`supersedes` have ZERO live
+# ticket usage, so there is no wet-run evidence either confirming or
+# falsifying their union with depends_on the way there was for parent_of.
+# The union rests on the ADR's own text (§3.6's rationale is single-type in
+# every failure mode it names, but names no cross-type EXEMPTION either — the
+# absence of a stated exemption is not the same evidence class as parent_of's
+# stated one) plus the test suite locking in the two concrete blind spots a
+# narrower split would have left uncaught (the 2-cycle and 3-hop cases in
+# tools/test_typed_edges.py). Reporting/lineage uses of build_typed_edge_graph
+# (e.g. a future BT3 query surface) are unaffected — they want the full union
+# and still get it via the default `edge_fields=None`.
+# ---------------------------------------------------------------------------
+
+NodeId = tuple[str, str]  # (kind, id) — kind in NODE_KINDS
+
+# T-2841 / ORG-065 §3.1: the node-kind axis. Only "ticket" and "obligation"
+# are populated by this BT1 builder; the rest are registered, semantics-free
+# extensibility hooks (see module note above). `goal` carries NO behavior in
+# this phase — do not add goal logic against this constant without a new ADR.
+NODE_KINDS = ("adr", "obligation", "ticket", "commit", "test", "evidence", "goal")
+
+# ORG-065 §3.6: the gating/structural ticket-frontmatter fields whose outbound
+# edges participate in the acyclicity invariant, taken together (the FULL
+# union — used by build_typed_edge_graph's reporting-mode default and by the
+# dangling-target scan). `informs` is deliberately excluded — advisory-only,
+# acyclicity-EXEMPT per the ADR. Mirrors ticket.py's `_GATING_LIST_FIELDS`
+# (kept independently — ticket_lint must not import a private name back out
+# of ticket.py for this). "parent_of" is a synthetic field name understood by
+# build_typed_edge_graph/edge_fields below — it is derived from the scalar
+# `parent_ticket` frontmatter key, not a list field.
+_GATING_EDGE_FIELDS = ("depends_on", "implements", "verifies", "supersedes", "ratifies", "parent_of")
+
+# T-3476 / ORG-065 Call 1: `ratifies` joins the union domain below (NOT its
+# own exempt domain like parent_of) — a mixed ratifies+implements/verifies/
+# supersedes/depends_on loop is a real graph-integrity defect by the same
+# §3.6 reasoning already applied to the original four; ratifies has no
+# falsifying wet-run evidence the way parent_of's 15-instance idiom did, so
+# it defaults to the union rather than getting a bespoke exemption. This is
+# additive to the historical wet-run-evidence note above (which predates
+# `ratifies` and is left as-written — that note documents specific corpus
+# evidence about the ORIGINAL four fields, not a claim this addition should
+# be retrofitted into).
+#
+# The TWO acyclicity domains — see the module note above for the rationale.
+# `parent_of` is NOT exempt the way `informs` is (informs participates in
+# ZERO cycle checks; a parent_of-only cycle — A's parent is B, B's parent is
+# A — is still nonsense lineage and IS checked) — it is only exempt from
+# being UNIONED with the other three, which is the ADR's own "no cascade, no
+# validation" framing for that one field. `depends_on`/`implements`/
+# `verifies`/`supersedes` share one unioned domain since a MIXED loop across
+# them is a real defect, not a false positive. Cycle detection runs once per
+# domain and never unions across domains.
+ACYCLICITY_DOMAINS: tuple[tuple[str, ...], ...] = (
+    ("parent_of",),
+    ("depends_on", "implements", "verifies", "supersedes", "ratifies"),
+)
+
+_TICKET_ID_RE = re.compile(r"^T-\d{4,}$")  # T-3215
+
+
+def edge_node_id(raw: str) -> NodeId:
+    """Classify a raw typed-edge target string into a (kind, id) node.
+
+    `T-NNNN` -> ("ticket", raw); anything else is treated as an obligation id
+    (already shape-validated upstream, at every insertion point, as
+    `ADR-NNN#E<k>[.C<m>]` / `ORG-NNN#E<k>[.C<m>]` by
+    ticket._parse_edge_targets — this function does not re-validate shape).
+    """
+    if _TICKET_ID_RE.fullmatch(raw):
+        return ("ticket", raw)
+    return ("obligation", raw)
+
+
+def build_typed_edge_graph(
+    tickets_root: Path,
+    edge_fields: tuple[str, ...] | None = None,
+) -> dict[NodeId, list[NodeId]]:
+    """Corpus-wide adjacency map over a set of typed edges.
+
+    `edge_fields` restricts which edges contribute: each entry is either a
+    list-typed frontmatter field name (depends_on/implements/verifies/
+    supersedes) or the synthetic name "parent_of" for the edge derived from
+    the scalar `parent_ticket` field. Default (None) is the FULL union —
+    `_GATING_EDGE_FIELDS` — for reporting/lineage purposes (the node universe
+    the dangling-target scan and any future lineage query need). Cycle
+    detection MUST pass exactly one domain from ACYCLICITY_DOMAINS at a time
+    — see the module note above on why the union is NOT used for cycle
+    checking. `informs` is never accepted here (acyclicity/reporting-exempt
+    by construction — it has no entry in _GATING_EDGE_FIELDS to begin with).
+
+    Scans every ticket in ANY state (inbox/active/done — see module note on
+    why this differs from `detect_dep_graph_issues`'s open-only scope). A
+    ticket file that fails to parse is skipped (best-effort — matches
+    `_ticket_depends_on`'s tolerance of a ticket malformed in some OTHER
+    field).
+    """
+    if edge_fields is None:
+        edge_fields = _GATING_EDGE_FIELDS
+    graph: dict[NodeId, list[NodeId]] = {}
+    for st in STATES:
+        d = tickets_root / st
+        if not d.exists():
+            continue
+        for entry in sorted(d.iterdir()):
+            if not entry.is_file() or not TICKET_FILENAME_RE.fullmatch(entry.name):
+                continue
+            tid = entry.stem
+            try:
+                fields, _body = parse_front_matter(entry.read_text(encoding="utf-8"))
+            except (TicketError, OSError):
+                continue
+            src: NodeId = ("ticket", tid)
+            out: list[NodeId] = []
+            for field_name in edge_fields:
+                if field_name == "parent_of":
+                    parent = fields.get("parent_ticket")
+                    if isinstance(parent, str) and parent.strip():
+                        out.append(("ticket", parent.strip()))
+                    continue
+                for raw in (fields.get(field_name) or []):
+                    out.append(edge_node_id(str(raw)))
+            graph.setdefault(src, []).extend(out)
+    return graph
+
+
+def find_path(graph: dict[NodeId, list[NodeId]], start: NodeId, goal: NodeId) -> list[NodeId] | None:
+    """BFS shortest path start -> goal over `graph`'s adjacency; None if
+    unreachable. The returned path includes both endpoints. A node absent
+    from `graph` (a leaf, e.g. an obligation with no outbound edges) is a
+    valid start with zero neighbours."""
+    if start == goal:
+        return [start]
+    seen: set[NodeId] = {start}
+    queue: list[list[NodeId]] = [[start]]
+    head = 0
+    while head < len(queue):
+        path = queue[head]
+        head += 1
+        node = path[-1]
+        for nxt in graph.get(node, []):
+            if nxt == goal:
+                return path + [nxt]
+            if nxt not in seen:
+                seen.add(nxt)
+                queue.append(path + [nxt])
+    return None
+
+
+def _find_all_cycles(graph: dict[NodeId, list[NodeId]]) -> list[list[NodeId]]:
+    """Three-color DFS cycle enumeration, generalized over any NodeId graph.
+
+    Same algorithm as `detect_dep_graph_issues`'s inline depends_on version
+    (canonicalised by rotation-minimum so each distinct cycle is reported
+    once), lifted to work over the typed (kind, id) node space.
+    """
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: dict[NodeId, int] = {n: WHITE for n in graph}
+    cycles: list[list[NodeId]] = []
+    seen_canon: set[tuple[NodeId, ...]] = set()
+
+    def _dfs(node: NodeId, stack: list[NodeId]) -> None:
+        color[node] = GRAY
+        stack.append(node)
+        for nxt in graph.get(node, []):
+            state = color.get(nxt, WHITE)
+            if state == GRAY:
+                idx = stack.index(nxt)
+                cyc = stack[idx:]
+                pivot = min(range(len(cyc)), key=lambda i: cyc[i])
+                canon = tuple(cyc[pivot:] + cyc[:pivot])
+                if canon not in seen_canon:
+                    seen_canon.add(canon)
+                    cycles.append(list(canon))
+            elif state == WHITE:
+                color.setdefault(nxt, WHITE)
+                _dfs(nxt, stack)
+        stack.pop()
+        color[node] = BLACK
+
+    for n in sorted(graph, key=str):
+        if color.get(n) == WHITE:
+            _dfs(n, [])
+    return cycles
+
+
+_ADR_ELEMENT_ID_RE = re.compile(r"^E\d+(?:\.C\d+)?$")
+
+
+@dataclass
+class ElementsLintFinding:
+    """A malformation in one ADR's `elements:` frontmatter block (T-2841 /
+    ORG-065 BT1; report-only, WARN-tier).
+
+    kinds:
+      - "malformed_id" — an element or clause id is empty or does not match
+        `E\\d+(\\.C\\d+)?`.
+      - "duplicate_id" — the same id (element or clause) appears more than
+        once within one ADR's `elements:` block.
+    """
+    kind: str
+    detail: str
+
+
+def _register_element_id(
+    local_id: str,
+    adr_id: str,
+    seen: dict[str, int],
+    known_ids: set[str],
+    findings: list[ElementsLintFinding],
+) -> None:
+    if not local_id:
+        findings.append(ElementsLintFinding(
+            kind="malformed_id",
+            detail=f"{adr_id}: elements: block has an entry with no id",
+        ))
+        return
+    if not _ADR_ELEMENT_ID_RE.fullmatch(local_id):
+        findings.append(ElementsLintFinding(
+            kind="malformed_id",
+            detail=f"{adr_id}: elements: id {local_id!r} does not match E\\d+(.C\\d+)?",
+        ))
+        return
+    seen[local_id] = seen.get(local_id, 0) + 1
+    if seen[local_id] > 1:
+        findings.append(ElementsLintFinding(
+            kind="duplicate_id",
+            detail=f"{adr_id}: duplicate elements: id {local_id!r}",
+        ))
+    known_ids.add(f"{adr_id}#{local_id}")
+
+
+# T-3477 / ORG-065 Call 2: cross-repo ADR corpus for Echo (echo-prismatic),
+# read-only per the operator's T-3206 (TG 6734) ruling — elements: blocks stay in
+# echo-prismatic, walked from here, never transcribed into Pantheon-side
+# ADRs. Mirrors ticket_grooming.py's `_default_adr_dirs()` convention (same
+# absolute path, not derived from REPO_ROOT since echo-prismatic is a
+# sibling repo, not a subdirectory) — duplicated here rather than imported,
+# to avoid a ticket_lint<->ticket_grooming import cycle (ticket_grooming
+# already imports FROM ticket_lint). Scoped to the 200+ agent-authored range
+# in echo-prismatic/adr/ only; the 001-199 vault range lives in a DIFFERENT
+# directory (`architecture/Supplementary Material/ADRs/`) with a stronger
+# "never modify directly" protection tier and is deliberately NOT included
+# here (T-3477 plan, Open Q1 — permanently excluded pending a vault-ADR
+# cross-repo policy decision).
+#
+# T-3495: this repo's OWN production `_adr_dirs` construction (the `_do_lint`
+# and `main --dry-run` call sites below) no longer UNIONS this directory in —
+# recovery (claude-fallback), the sole hourly cron runner, cannot read it
+# (EACCES), which made T-3477's echo obligation validation vacuous on the
+# only account that ever ran it. The union now lives exclusively in
+# `tools/echo_corpus_lint.py`, a companion unit run on the `claude` account
+# (native read access). This constant stays here (not moved) so that wrapper
+# can import it directly rather than re-declaring the path a third place.
+_ECHO_PRISMATIC_ADR_DIR = Path("/home/claude/echo-prismatic/adr")
+
+# T-3495: numeric-ADR-id discriminator for "does this typed-edge target (or
+# finding detail string) belong to the echo-prismatic corpus". `\d+` (not a
+# fixed 3-digit width) captures the FULL digit run, so the comparison is a
+# real numeric >=200 test, not a string-prefix match — deliberately
+# open-ended above 200 (a hypothetical future ADR-2345 is still >=200 and
+# still recognized) rather than hardcoding an upper bound at 299.
+#
+# Current-fact: echo-prismatic/adr/ is the 200+ agent-authored range only
+# (see the module note above). The pantheon-config vault's 001-199 range is
+# a DIFFERENT, today-permanently-excluded corpus. FUTURE EXTENSION SURFACE
+# (the operator TG 9250 / T-3485 close-noodle): the T-1809/T-1483 vault-ADR
+# elements-mint arc is unblocked and will eventually add cross-repo
+# obligation edges targeting vault-range 001-199 ADRs — when that lands,
+# this numeric->=200 predicate stops being sufficient (a path-based "target
+# maps to a file under echo-prismatic/..." cut would be the more robust
+# replacement, but that's a larger change than this ticket's scope). No code
+# change here yet — this comment is the anchor for that future reader.
+_ECHO_ADR_ID_TOKEN_RE = re.compile(r"ADR-(\d+)(?!\d)")
+_ECHO_ADR_MIN_NUM = 200
+
+
+def is_echo_scoped_id(text: str) -> bool:
+    """True if `text` names an ADR-<N> id (N >= 200) anywhere — the
+    echo-prismatic agent-authored range (T-3495; see the module note above
+    `_ECHO_PRISMATIC_ADR_DIR` for the range's provenance and its future-
+    extension caveat). Used both to exempt echo-targeting typed-edges from
+    recovery's dangling-target check (this module no longer scans the echo dir —
+    see `_ECHO_PRISMATIC_ADR_DIR`'s note) and, imported into
+    `tools/echo_corpus_lint.py`, to filter that companion's corpus-wide scan
+    down to the echo-scoped subset. Operates on ANY input string, not just a
+    bare edge target — `TypedGraphFinding`/`ElementsLintFinding` carry no
+    structured target field (kind + rendered `detail` string only), and
+    every finding shape scan_adr_elements / detect_typed_graph_issues /
+    detect_unverified_elements emit interpolates the raw id verbatim into
+    `detail` — so a substring search here is sufficient for both uses."""
+    return any(
+        int(n) >= _ECHO_ADR_MIN_NUM for n in _ECHO_ADR_ID_TOKEN_RE.findall(text)
+    )
+
+
+def _normalize_adr_dirs(adr_dir: Path | Iterable[Path]) -> list[Path]:
+    """Normalize the `adr_dir` parameter shared by scan_adr_elements /
+    detect_typed_graph_issues / detect_unverified_elements to a list of
+    Paths. Accepts a single bare Path (this repo's own production call
+    sites, pre-T-3477 and again post-T-3495 — see `_ECHO_PRISMATIC_ADR_DIR`'s
+    note) OR an iterable of Paths (T-3477: introduced for the cross-repo
+    union of this repo's architecture/adr/ + echo-prismatic's adr/; T-3495:
+    that union is now exercised by `tools/echo_corpus_lint.py`'s companion
+    scan on the claude account, not by this module's own production
+    pipeline). A bare Path is the common
+    case checked first via isinstance rather than a duck-typed
+    hasattr/try-except — Path itself is iterable-by-character-adjacent-API-
+    surface-free (no __iter__), so this is unambiguous."""
+    if isinstance(adr_dir, Path):
+        return [adr_dir]
+    return list(adr_dir)
+
+
+def _adr_dir_scannable(one_dir: Path, *, warn: bool = False) -> bool:
+    """True if *one_dir* exists AND is accessible enough to scan; False if it is
+    missing OR inaccessible — never raises.
+
+    `Path.exists()` RAISES `PermissionError`/`OSError` on EACCES (rather than
+    returning False) when a parent directory is 700-mode. That is exactly the
+    T-3477 cross-repo case: `_ECHO_PRISMATIC_ADR_DIR` is hardcoded under
+    `/home/claude/`, but this hourly lint runs as the recovery (`claude-fallback`)
+    account, which cannot stat into claude's 700-mode home — so a bare
+    `one_dir.exists()` crashed the whole run (reference: the pathlib-EACCES
+    gotcha; `ticket_grooming.py` already guards the identical pattern with
+    try/except OSError).
+
+    An inaccessible ADR dir is treated exactly like a missing one (skip). But
+    when `warn=True` the EACCES case is WARNED to stderr — NOT silent — because
+    recovery is the *sole* hourly lint runner: a silently-skipped echo corpus would
+    make every echo cross-repo obligation check vacuously pass, hiding the
+    coverage gap (T-3477's echo scan cannot run under an account that can't read
+    the clone)."""
+    try:
+        return one_dir.exists()
+    except OSError as exc:
+        if warn:
+            print(
+                f"[adr-scan] WARNING: ADR dir {one_dir} is INACCESSIBLE to this "
+                f"account ({type(exc).__name__}: {exc}); skipping it. Any "
+                f"cross-repo ADR obligations there are UNVALIDATED this run — "
+                f"T-3477 hardcoded echo-prismatic's adr/ under /home/claude, "
+                f"unreadable to the recovery lint runner.",
+                file=sys.stderr,
+            )
+        return False
+
+
+def scan_adr_elements(
+    adr_dir: Path | Iterable[Path],
+) -> tuple[set[str], list[ElementsLintFinding]]:
+    """Parse every ADR's optional `elements:` frontmatter block (ORG-065 §3.1
+    obligation identity) across one or more ADR directories. Reuses
+    `adr_reeval_walk`'s YAML-frontmatter helpers (the one existing precedent
+    for a structured, machine-readable ADR frontmatter key — see ORG-065
+    "What this builds on" #5) rather than hand-rolling a second parser.
+
+    `adr_dir` accepts a single Path (this repo's own architecture/adr/,
+    every pre-T-3477 call site) OR an iterable of Paths (T-3477: this repo's
+    architecture/adr/ UNIONED with echo-prismatic's adr/, so a cross-repo
+    `implements:` target resolves against both corpora as one obligation-id
+    universe). `_adr_id_from`'s filename-prefix fallback (adr_reeval_walk.py)
+    already handles Echo's `ADR-<NNN> — <title>.md` convention (spaces,
+    em-dash) identically to this repo's `ORG-<NNN>-<title>.md` — no new
+    filename-parsing logic needed for the second directory.
+
+    Returns (known_ids, findings):
+      - known_ids: the set of fully-qualified obligation ids across the
+        whole corpus (all directories), e.g. "ORG-065#E1", "ADR-232#E3.C1"
+        — the target-existence universe for the implements/verifies/
+        supersedes/informs/ratifies dangling-target check below.
+      - findings: malformed/duplicate id defects (see ElementsLintFinding).
+
+    A `README.md` in any `adr_dir` entry is skipped (index prose, not an
+    ADR). A missing directory or an ADR with no `elements:` block yields
+    nothing for that file — the block is entirely optional
+    (resolved-decision 2) and a not-yet-elementized Echo ADR (the real
+    shape of most Echo ADRs today — no YAML frontmatter at all) is silently
+    skipped the same way, not an error.
+    """
+    known_ids: set[str] = set()
+    findings: list[ElementsLintFinding] = []
+    for one_dir in _normalize_adr_dirs(adr_dir):
+        if not _adr_dir_scannable(one_dir, warn=True):
+            continue
+        for path in sorted(one_dir.glob("*.md")):
+            if path.name.upper().startswith("README"):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            fm_block, _body = _split_frontmatter(text)
+            fm = _load_yaml(fm_block, source=path.name)
+            elements = fm.get("elements")
+            if not isinstance(elements, list):
+                continue
+            adr_id = _adr_id_from(fm, path)
+            seen: dict[str, int] = {}
+            for el in elements:
+                if not isinstance(el, dict):
+                    continue
+                _register_element_id(
+                    str(el.get("id", "")).strip(), adr_id, seen, known_ids, findings,
+                )
+                clauses = el.get("clauses")
+                if isinstance(clauses, list):
+                    for cl in clauses:
+                        if isinstance(cl, dict):
+                            _register_element_id(
+                                str(cl.get("id", "")).strip(), adr_id, seen, known_ids, findings,
+                            )
+    return known_ids, findings
+
+
+@dataclass
+class TypedGraphFinding:
+    """A structural defect in the GENERALIZED typed-edge graph (T-2841 /
+    ORG-065 BT1). Report-only — this phase is warn-only for the corpus-wide
+    scan (flipping to gating is BT5); cycle REJECTION already happens at
+    insertion time in ticket.py, so a "cycle" finding here means a
+    pre-existing / hand-edited defect the insertion guard never saw.
+
+    kinds:
+      - "cycle" — the gating/structural edge set (depends_on/implements/
+        verifies/supersedes/parent_of) contains a cycle. The graph-integrity
+        defect named in ORG-065 §3.6.
+      - "dangling_target" — an implements/verifies/supersedes/informs/ratifies entry
+        names a ticket or ADR-obligation id that does not resolve in the
+        corpus (resolved-decision 1: WARN, never a refusal).
+      - "malformed_id" / "duplicate_id" — see ElementsLintFinding; folded in
+        here so callers have one report-only finding stream for the whole
+        typed-graph model.
+      - "duplicate_receipt_id" — see detect_duplicate_receipt_ids (T-2926):
+        the same receipts: id is claimed by more than one ticket, corpus-
+        wide. NOT itself a typed-edge graph defect (receipts are excluded
+        from that model) — reuses this dataclass for finding-shape/report-
+        plumbing convenience only.
+      - "unverified_element" / "implemented_unverified_element" — see
+        detect_unverified_elements (T-2843, split T-3179): an ADR-element
+        obligation with no `verifies:` edge. "unverified_element" = no
+        `implements:` edge either (true leak, nothing done). "implemented_
+        unverified_element" = >=1 `implements:` edge, no `verifies:` yet
+        (expected transitional shape — Tranche A lands implements: ahead of
+        verifies:). Same not-a-graph-defect caveat as duplicate_receipt_id.
+    """
+    kind: str
+    detail: str
+
+
+# Ticket frontmatter fields subject to the dangling-target WARN scan. All four
+# new edge fields, INCLUDING `informs` — acyclicity-exemption is orthogonal to
+# existence-checking (resolved-decision 1 covers all four uniformly). T-3476:
+# `ratifies` joins on the same basis — a well-formed-but-unresolvable ratifies
+# target (e.g. an ADR whose elements: block hasn't landed yet) is a WARN,
+# never a refusal, same as its siblings.
+_DANGLING_CHECK_FIELDS = ("implements", "verifies", "supersedes", "informs", "ratifies")
+
+
+def detect_typed_graph_issues(
+    tickets_root: Path,
+    adr_dir: Path | Iterable[Path],
+    *,
+    exempt_dangling_target: Callable[[str], bool] | None = None,
+) -> list[TypedGraphFinding]:
+    """Corpus-level scan over the generalized typed-edge graph (report-only).
+
+    `adr_dir` accepts a single Path or an iterable of Paths (T-3477 — see
+    scan_adr_elements's docstring; this function forwards unchanged).
+
+    `exempt_dangling_target` (T-3495): an OPT-IN predicate over the raw edge
+    target string. When it returns True for a target that would otherwise be
+    flagged `dangling_target`, that finding is suppressed instead. Deliberately
+    NOT a global behavior of this function — it exists for a caller that
+    KNOWINGLY scans a NARROWER `adr_dir` than the full obligation universe and
+    wants to defer judgment on a specific class of target to a different
+    scanner. This module's own production call sites (`_do_lint`, `main
+    --dry-run`) pass `is_echo_scoped_id` here (recovery's `adr_dir` no longer
+    includes echo-prismatic's corpus — see `_ECHO_PRISMATIC_ADR_DIR`'s module
+    note — so an echo-shaped target is neither confirmed nor refuted by recovery's
+    own scan). `tools/echo_corpus_lint.py`'s companion call passes NO
+    predicate (the default `None`): it unions BOTH adr dirs itself, so it can
+    and should still flag a genuinely-dangling echo target as such — an
+    unconditional exemption inside this function would blind that caller to
+    the exact defect it exists to catch.
+
+    Three checks, per ORG-065 §3.6 "at lint (corpus-wide)":
+      1. ADR `elements:` block malformations (scan_adr_elements).
+      2. Dangling implements/verifies/supersedes/informs/ratifies targets — a target
+         shaped like a ticket id that doesn't resolve to any ticket file, or
+         shaped like an obligation id that isn't in any ADR's known element
+         ids. Every ticket in ANY state is scanned (mirrors
+         build_typed_edge_graph's state-independence).
+      3. Cycles, checked PER ACYCLICITY DOMAIN (build_typed_edge_graph +
+         _find_all_cycles, once per ACYCLICITY_DOMAINS entry — never the full
+         union; see the module note above) — the corpus-wide backstop for the
+         SAME invariant ticket.py enforces at insertion.
+    """
+    findings: list[TypedGraphFinding] = []
+
+    known_obligation_ids, element_findings = scan_adr_elements(adr_dir)
+    for ef in element_findings:
+        findings.append(TypedGraphFinding(kind=ef.kind, detail=ef.detail))
+
+    for st in STATES:
+        d = tickets_root / st
+        if not d.exists():
+            continue
+        for entry in sorted(d.iterdir()):
+            if not entry.is_file() or not TICKET_FILENAME_RE.fullmatch(entry.name):
+                continue
+            tid = entry.stem
+            try:
+                fields, _body = parse_front_matter(entry.read_text(encoding="utf-8"))
+            except (TicketError, OSError):
+                continue
+            for field_name in _DANGLING_CHECK_FIELDS:
+                for raw in (fields.get(field_name) or []):
+                    raw = str(raw)
+                    if _TICKET_ID_RE.fullmatch(raw):
+                        exists = any(
+                            (tickets_root / s / f"{raw}.md").exists() for s in STATES
+                        )
+                        if not exists:
+                            findings.append(TypedGraphFinding(
+                                kind="dangling_target",
+                                detail=f"{tid} {field_name} -> {raw}, which does not "
+                                       f"resolve to any ticket",
+                            ))
+                    elif raw not in known_obligation_ids:
+                        # T-3495: an opt-in caller-supplied exemption (see
+                        # exempt_dangling_target's docstring above) — never a
+                        # global property of the target shape. Recovery's own
+                        # production call sites pass is_echo_scoped_id here
+                        # because their adr_dir no longer includes
+                        # echo-prismatic's corpus; tools/echo_corpus_lint.py's
+                        # companion call passes none, so it still flags a
+                        # genuinely-dangling echo target against the union it
+                        # explicitly scanned.
+                        if exempt_dangling_target is not None and exempt_dangling_target(raw):
+                            continue
+                        findings.append(TypedGraphFinding(
+                            kind="dangling_target",
+                            detail=f"{tid} {field_name} -> {raw}, which does not "
+                                   f"resolve to any ADR elements: id",
+                        ))
+
+    # ACYCLICITY_DOMAINS, never the full union — see the module note above
+    # (the false-positive discovery: a parent depends_on its own child).
+    for domain in ACYCLICITY_DOMAINS:
+        graph = build_typed_edge_graph(tickets_root, domain)
+        for cyc in _find_all_cycles(graph):
+            chain = " -> ".join(f"{kind}:{ident}" for kind, ident in cyc)
+            head_kind, head_id = cyc[0]
+            findings.append(TypedGraphFinding(
+                kind="cycle",
+                detail=f"typed-edge cycle in domain {domain} (deadlock/"
+                       f"non-terminating closure): {chain} -> {head_kind}:{head_id}",
+            ))
+
+    return findings
+
+
+# T-2843 / ORG-065 §3.4: element-granularity lineage leak detector — "which
+# obligations have no satisfying verifies edge", reproducing the T-2167
+# by-hand ADR-element coverage audit as a query. Standalone (not folded into
+# detect_typed_graph_issues, same shape as detect_duplicate_receipt_ids
+# above): an unverified element is not a typed-edge GRAPH defect (no cycle,
+# no dangling target) — it reuses TypedGraphFinding purely for the finding
+# shape / report plumbing, concatenated by callers alongside the other two.
+#
+# T-3179: §3.4's own text defines the query strictly as "no satisfying
+# `verifies` edge" — `implements:` is never mentioned as a covering factor,
+# in §3.4 or in the §3.5 binding refinements. So the SET this function
+# returns (every element lacking a verifies: edge) is UNCHANGED — that is
+# the ADR-mandated "unverified" membership and stays untouched. What changes
+# is severity/CLASS WITHIN that set: Tranche A (T-2946) lands `implements:`
+# edges corpus-wide ahead of `verifies:`, so an element with an `implements:`
+# edge and no `verifies:` edge is expected-transitional-shape (work exists,
+# evidence pending), not a true leak (nothing done at all). Two kinds now
+# share this function's output: "unverified_element" (no implements AND no
+# verifies — true leak) and "implemented_unverified_element" (>=1 implements,
+# no verifies — names the implementing ticket ids so an operator sees "work
+# is in flight" at a glance). Callers/call-sites are unaffected — both still
+# concatenate this function's return value into one typed_graph_findings
+# list; only the `kind` values differ.
+#
+# T-3476 / ORG-065 Call 1: the load-bearing invariant the operator ratified (T-3206
+# TG 6734) is that a `ratifies` edge must NEVER be counted as satisfying an
+# implements-obligation — `ratifies` is gathered into its OWN independent set
+# (never unioned into `verified` or `implementers` below), so a ratifies-only
+# element falls through to the SAME "unverified_element" true-leak branch it
+# would hit with no edges at all (see test_ratifies_only_element_stays_
+# unverified in test_typed_edges.py — this is the literal invariant test).
+#
+# The ONE narrow exception: the reserved whole-ADR sentinel `E0` (T-3205
+# policy, "ADR as a whole" — minted for whole-document plan/elaboration
+# tickets AND, as of T-3476, for whole-ADR ratify-class tickets). E0 is not
+# an implementation obligation in the code sense; for a ratify-class ADR, a
+# `ratifies:` edge on its E0 IS that sentinel's terminal completion signal.
+# Without this exception, minting E0 for the 4-5 passport/memory ADRs this
+# ticket ratifies would create a PERMANENT, unfixable false-positive leak —
+# nothing will ever "implement" or "verify" the abstract notion of "was this
+# ADR ratified" (the T-2896 lesson: examine what a decision pair composes
+# into before landing either alone). The exception is scoped to the LOCAL id
+# "E0" specifically, not "any ratifies target" — an ordinary content element
+# (E1, E2, ...) that is ratified-only stays a true leak; ratifying a specific
+# obligation is explicitly NOT a substitute for implementing/verifying it.
+_WHOLE_ADR_ELEMENT_ID = "E0"
+
+
+def detect_unverified_elements(
+    tickets_root: Path,
+    adr_dir: Path | Iterable[Path],
+) -> list[TypedGraphFinding]:
+    """Corpus-wide scan: every ADR `elements:` id (scan_adr_elements) that no
+    ticket, in any state, `verifies:`. Split (T-3179) into two finding kinds
+    within that same unverified set:
+
+    `adr_dir` accepts a single Path or an iterable of Paths (T-3477 — see
+    scan_adr_elements's docstring; forwarded unchanged into that call).
+
+      - "unverified_element" — no `implements:` edge either: a true leak,
+        nothing has been done against the obligation.
+      - "implemented_unverified_element" — >=1 `implements:` edge but no
+        `verifies:` edge: expected transitional shape (ORG-065 Tranche A
+        lands implements: ahead of verifies:); detail names the implementing
+        ticket id(s).
+
+    T-3476: a THIRD, narrower effect — an element whose LOCAL id is the
+    reserved whole-ADR sentinel `E0` (T-3205 policy) and which has >=1
+    `ratifies:` edge, and NO `implements:` edge, is EXCLUDED from this
+    function's output entirely (no finding of either kind). See the module
+    note directly above this function for the full rationale. This exclusion
+    never fires for a non-E0 element, and never overrides the
+    implements-priority branch (an E0 that is both implemented and ratified
+    stays "implemented_unverified_element" — implements-priority is
+    unchanged).
+
+    Reuses `build_typed_edge_graph` for the verifies-edge set, the
+    implements-edge set, AND the ratifies-edge set, via THREE SEPARATE CALLS
+    rather than one combined call — the helper flat-concatenates targets from
+    every requested field into one per-ticket adjacency list with no per-edge
+    field tag (see its body), so a single combined call can only yield a
+    unioned "covered-by-any" set and cannot distinguish which field produced
+    which target. Separate calls preserve `build_typed_edge_graph`'s existing
+    untagged-union contract (relied on elsewhere: ACYCLICITY_DOMAINS, the
+    dangling-target scan) rather than extending it for this one caller, and
+    are what makes the ratifies-never-satisfies-implements invariant possible
+    to enforce in the first place — a unioned call could not keep the three
+    edge types apart.
+
+    Element/clause ids are tracked independently, with no roll-up: verifying
+    (or implementing) `E1` does not satisfy `E1.C1` — mirrors
+    scan_adr_elements's own flat, hierarchy-free `known_ids` set (T-2841
+    precedent). A malformed element id never enters `known_ids` in the first
+    place (scan_adr_elements's own concern, surfaced separately by
+    detect_typed_graph_issues) so it is never checked here. A
+    malformed/garbage `verifies:`/`implements:`/`ratifies:` entry is
+    classified by `edge_node_id` as an ("obligation", raw) tuple that matches
+    no real element — harmless, contributes no false coverage.
+    """
+    known_ids, _element_findings = scan_adr_elements(adr_dir)
+    if not known_ids:
+        return []
+    verifies_graph = build_typed_edge_graph(tickets_root, edge_fields=("verifies",))
+    verified: set[str] = set()
+    for targets in verifies_graph.values():
+        for kind, ident in targets:
+            if kind == "obligation":
+                verified.add(ident)
+
+    # T-3179: implementing-ticket ids per obligation, for the
+    # "implemented_unverified_element" detail line — names WHICH ticket(s)
+    # implement it, so an operator sees "work exists" without a second lookup.
+    implements_graph = build_typed_edge_graph(tickets_root, edge_fields=("implements",))
+    implementers: dict[str, set[str]] = {}
+    for src, targets in implements_graph.items():
+        src_kind, src_id = src
+        if src_kind != "ticket":
+            continue
+        for kind, ident in targets:
+            if kind == "obligation":
+                implementers.setdefault(ident, set()).add(src_id)
+
+    # T-3476: ratifies-edge targets, gathered INDEPENDENTLY — never unioned
+    # into `verified` or `implementers` above (that union is the whole point
+    # of the operator's invariant). Consulted ONLY for the narrow E0 exclusion.
+    ratifies_graph = build_typed_edge_graph(tickets_root, edge_fields=("ratifies",))
+    ratified: set[str] = set()
+    for targets in ratifies_graph.values():
+        for kind, ident in targets:
+            if kind == "obligation":
+                ratified.add(ident)
+
+    findings: list[TypedGraphFinding] = []
+    for oid in sorted(known_ids - verified):
+        implementing_tids = sorted(implementers.get(oid, ()))
+        if implementing_tids:
+            findings.append(TypedGraphFinding(
+                kind="implemented_unverified_element",
+                detail=f"{oid} implemented by {', '.join(implementing_tids)} but "
+                       f"has no ticket verifies: edge — expected transitional "
+                       f"shape, ORG-065 §3.4",
+            ))
+            continue
+        # T-3476: the whole-ADR-sentinel exclusion — see module note above.
+        local_id = oid.rsplit("#", 1)[-1]
+        if local_id == _WHOLE_ADR_ELEMENT_ID and oid in ratified:
+            continue
+        findings.append(TypedGraphFinding(
+            kind="unverified_element",
+            detail=f"{oid} has no ticket verifies: edge (open or done) — "
+                   f"unverified obligation, ORG-065 §3.4",
+        ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# T-2842 / ORG-065 BT2: closure-validation gate (§3.3/§3.5) — pure detection
+# layer. ticket.py owns ENFORCEMENT (the warn/gate mode decision, the
+# resolve-time hook); everything here is a pure function returning findings,
+# mirroring the detect-vs-enforce split BT1 already draws between this
+# module's report-only corpus scans and ticket.py's insertion-time hard
+# refusals (_parse_edge_targets / _reject_if_cycle).
+#
+# What this closes: BT1's own handoff note (ticket.py ~:438-450) is explicit
+# that a bare ticket-id `verifies` target is a simplification standing in for
+# evidence, and "MUST NOT [be] treat[ed]... as satisfying the receipt/
+# evidence-authority requirements... without a real commit/test/evidence node
+# behind it." `verifies` therefore stays exactly as BT1 built it (a coarse
+# declarative edge, still feeding the acyclicity/lineage graph unchanged);
+# the NEW `receipts:` frontmatter field (ticket.py) carries the actual
+# evidence, and the closure gate below consults `receipts` ONLY — a
+# `verifies` entry with no corresponding receipt satisfies nothing. This is
+# the structural form of "a commit link is not a receipt" (§3.5.2).
+#
+# PROVENANCE IS DECLARED, NOT AUTHENTICATED (T-2842 plan addition A). A
+# receipt's `provenance` (ci/reviewer/self) is whatever string the resolving
+# actor typed — nothing here verifies it actually came from CI or a
+# reviewer. This module enforces VOCABULARY + the DENIAL RULE (a high-risk
+# clause refuses a self-asserted receipt); it does not AUTHENTICATE who
+# produced the evidence. Same trust shape as `ratifiable_files` (a filer
+# asserts a path was ratified; nothing cryptographically proves it).
+# Authenticating provenance is downstream evidence-node work, not this
+# ticket's scope — do not read the evidence-authority check below as more
+# than a scoped denial rule over a self-reported field.
+#
+# COMPOSITION: `receipts` is deliberately EXCLUDED from `_GATING_EDGE_FIELDS`
+# / `_DANGLING_CHECK_FIELDS` / `ACYCLICITY_DOMAINS` above — it is evidence-
+# attachment data, not a graph edge, and a receipt id never enters
+# `edge_node_id` classification. Non-participation is intentional, not an
+# oversight — do not add "receipts" to those constants without a new ADR
+# reading.
+#
+# `_CLAUSE_ID_RE` below duplicates ticket.py's `_EDGE_TARGET_RE` obligation
+# half (`(ADR|ORG)-\d+#E\d+(\.C\d+)?`) rather than importing it — same
+# "ticket_lint must not import a private name back out of ticket.py"
+# precedent BT1 already documents for `_GATING_EDGE_FIELDS`/
+# `_GATING_LIST_FIELDS` above. Keep the two shapes in sync by hand.
+#
+# `load_adr_obligation_index` below is a DELIBERATELY INDEPENDENT walk over
+# ADR `elements:` blocks, not a refactor of `scan_adr_elements`'s shared
+# file-walk prefix, even though the two duplicate ~15 lines of glob/
+# skip-README/frontmatter-split/YAML-load boilerplate. Refactoring BT1's
+# already-tested, landed function for the DRY gain would add regression
+# surface to code outside this ticket's brief for a benefit that changes no
+# behavior (P7 cost-asymmetry) — ratified in plan review (T-2842, HO
+# disposition 2, 2026-08-12).
+# ---------------------------------------------------------------------------
+
+# Namespaced receipt-identity prefixes (T-2842 / ORG-065 §3.5.3: "stable
+# namespaced identities... so an edge resolves to exactly one artifact").
+# Corpus-wide UNIQUENESS of a receipt id is explicitly OUT OF SCOPE for BT2
+# (HO disposition 1, 2026-08-12) — filed as a follow-up, dep-gated on
+# T-2842. This module only validates SHAPE, not corpus-wide identity.
+RECEIPT_NAMESPACES = ("ci-run", "test-result", "observable")
+_RECEIPT_ID_RE = re.compile(
+    r"^(?:" + "|".join(RECEIPT_NAMESPACES) + r"):[A-Za-z0-9._\-/]+$"
+)
+
+# Provenance vocabulary (§3.5.4). AUTHORIZED_PROVENANCE is the subset that
+# may satisfy a HIGH-RISK clause — "self" (self-asserted) is refused there,
+# per the module note above ("declared, not authenticated": this is a
+# vocabulary/denial rule, not authentication).
+PROVENANCE_VOCAB = ("ci", "reviewer", "self")
+AUTHORIZED_PROVENANCE = ("ci", "reviewer")
+
+# Mirrors ticket.py's _EDGE_TARGET_RE obligation half — see module note above
+# on why this is duplicated rather than imported.
+_CLAUSE_ID_RE = re.compile(r"^(?:ADR|ORG)-\d+#E\d+(?:\.C\d+)?$")
+
+
+@dataclass
+class ReceiptEntry:
+    """One decoded `receipts:` frontmatter entry (T-2842 / ORG-065 BT2)."""
+    clause: str
+    receipt_id: str
+    provenance: str
+
+
+def decode_receipt(raw: str) -> "ReceiptEntry | None":
+    """Decode one `<clause>=<receipt-id>=<provenance>` receipts: entry.
+
+    Returns None (never raises) on any shape defect — malformed entries are
+    a caller concern: ticket.py's `_parse_receipt_entries` raises TicketError
+    at insertion time using this as the validity check; the closure
+    evaluator below treats a None decode as a "malformed_receipt" finding
+    (defense in depth for hand-edited/fixture data that bypassed CLI
+    validation — the same posture BT1's dangling-target scan takes toward
+    hand-edited defects the insertion guard never saw).
+    """
+    parts = raw.split("=")
+    if len(parts) != 3:
+        return None
+    clause, receipt_id, provenance = (p.strip() for p in parts)
+    if not _CLAUSE_ID_RE.fullmatch(clause):
+        return None
+    if not _RECEIPT_ID_RE.fullmatch(receipt_id):
+        return None
+    if provenance not in PROVENANCE_VOCAB:
+        return None
+    return ReceiptEntry(clause=clause, receipt_id=receipt_id, provenance=provenance)
+
+
+@dataclass
+class ObligationInfo:
+    """Detail for one ADR obligation id (element or clause), T-2842 BT2."""
+    text: str
+    high_risk: bool
+
+
+@dataclass
+class ObligationIndex:
+    """Per-corpus obligation detail, keyed by fully-qualified id
+    (`ADR-NNN#E<k>` or `ADR-NNN#E<k>.C<m>`).
+
+    `details`: every element AND clause id -> ObligationInfo (text/high_risk).
+    `element_clauses`: element id -> its clause ids (possibly [] if the
+    element has no `clauses:` sub-block, in which case the element itself is
+    the atomic obligation unit — see `evaluate_closure_fields`'s expansion).
+    """
+    details: dict
+    element_clauses: dict
+
+
+def load_adr_obligation_index(adr_dir: Path | Iterable[Path]) -> ObligationIndex:
+    """Walk every ADR's optional `elements:` frontmatter block and build the
+    detail index the closure evaluator needs (text + high_risk per id, and
+    element->clause-id expansion).
+
+    `adr_dir` accepts a single bare Path (this repo's own architecture/adr/,
+    every pre-T-3578 call site) OR an iterable of Paths (T-3578 / ORG-065
+    closure-gate cross-repo fix: this repo's architecture/adr/ UNIONED with
+    echo-prismatic's adr/, so a ticket carrying a cross-repo echo obligation
+    — e.g. `implements: [ADR-216#E4]` — resolves against both corpora as one
+    obligation-id universe rather than hitting a spurious dangling_obligation).
+    Each directory is walked independently and its results UNIONED into the
+    single `details`/`element_clauses` dicts. ADR-NNN (echo) and ORG-NNN
+    (pantheon) fully-qualified ids are disjoint namespaces, so the merge is
+    collision-free; on the theoretical id collision the first directory in the
+    iterable wins (a later dir does not overwrite an id an earlier dir already
+    indexed), for deterministic behavior.
+
+    Deliberately independent of `scan_adr_elements` (see module note above)
+    — same YAML-frontmatter reuse (`_split_frontmatter`/`_load_yaml`/
+    `_adr_id_from`), different extraction: `scan_adr_elements` validates
+    id shape/duplication and returns a flat id set; this returns per-id
+    TEXT and HIGH_RISK detail plus the element->clauses mapping. Tolerant of
+    the same malformed shapes scan_adr_elements flags (an id-shape defect
+    there does not crash this walk — it just yields an entry the closure
+    evaluator's `dangling_obligation` check won't find a match for, since a
+    malformed id here still gets indexed under whatever string was given).
+    """
+    details: dict = {}
+    element_clauses: dict = {}
+    for one_dir in _normalize_adr_dirs(adr_dir):
+        # Silent guard (not warn): this is called per-ticket-with-obligations,
+        # so a per-dir warning would spam; scan_adr_elements carries the visible
+        # warn for the same inaccessible dir. The closure-gate's actor-relative
+        # warn-fallback (ticket.py _gate_echo_adr_dir / T-3578) carries the loud
+        # echo-specific warn. See _adr_dir_scannable (T-3477 EACCES).
+        if not _adr_dir_scannable(one_dir):
+            continue
+        for path in sorted(one_dir.glob("*.md")):
+            if path.name.upper().startswith("README"):
+                continue
+            text = path.read_text(encoding="utf-8", errors="replace")
+            fm_block, _body = _split_frontmatter(text)
+            fm = _load_yaml(fm_block, source=path.name)
+            elements = fm.get("elements")
+            if not isinstance(elements, list):
+                continue
+            adr_id = _adr_id_from(fm, path)
+            for el in elements:
+                if not isinstance(el, dict):
+                    continue
+                el_id = str(el.get("id", "")).strip()
+                if not el_id:
+                    continue
+                fq_el = f"{adr_id}#{el_id}"
+                el_high_risk = bool(el.get("high_risk", False))
+                # first-dir-wins on the theoretical cross-corpus id collision
+                # (disjoint namespaces make this vacuous in practice).
+                if fq_el not in details:
+                    details[fq_el] = ObligationInfo(
+                        text=str(el.get("title", "") or el.get("text", "")),
+                        high_risk=el_high_risk,
+                    )
+                clause_ids: list = []
+                clauses = el.get("clauses")
+                if isinstance(clauses, list):
+                    for cl in clauses:
+                        if not isinstance(cl, dict):
+                            continue
+                        cl_id = str(cl.get("id", "")).strip()
+                        if not cl_id:
+                            continue
+                        fq_cl = f"{adr_id}#{cl_id}"
+                        clause_ids.append(fq_cl)
+                        if fq_cl not in details:
+                            details[fq_cl] = ObligationInfo(
+                                text=str(cl.get("text", "") or cl.get("title", "")),
+                                high_risk=bool(cl.get("high_risk", el_high_risk)),
+                            )
+                element_clauses.setdefault(fq_el, clause_ids)
+    return ObligationIndex(details, element_clauses)
+
+
+@dataclass
+class ClosureFinding:
+    """A closure-validation defect (T-2842 / ORG-065 BT2, §3.3/§3.5).
+    Report-only from this module's side — ticket.py decides warn vs refuse.
+
+    kinds:
+      - "unsatisfied_clause" — a required clause (from `implements`) has no
+        `receipts` entry naming it.
+      - "evidence_authority_denied" — a required clause IS high-risk and
+        every receipts entry naming it has provenance="self" (§3.5.4: only
+        authorized ci/reviewer evidence may satisfy a high-risk obligation).
+      - "dangling_obligation" — a required id does not resolve to any known
+        ADR `elements:` entry (can't verify satisfaction against an unknown
+        obligation).
+      - "malformed_receipt" — a `receipts:` entry does not decode (see
+        decode_receipt) — defensive, for hand-edited/fixture data.
+    """
+    kind: str
+    detail: str
+
+
+def evaluate_closure_fields(fields: dict, adr_dir: Path | Iterable[Path]) -> list:
+    """The core closure-validation algorithm (T-2842 / ORG-065 §3.3), pure:
+    takes already-parsed ticket frontmatter fields + an ADR directory (or, per
+    T-3578, an iterable of ADR directories to union — this repo's
+    architecture/adr/ plus echo-prismatic's adr/ so a cross-repo echo
+    obligation resolves), no other I/O. `evaluate_closure_for_ticket` below is
+    the thin I/O wrapper that resolves a ticket id to fields and calls this.
+
+    Closure-gate scope (ADR resolved-decision 3): ONLY `implements` entries
+    shaped like an ADR obligation (`_CLAUSE_ID_RE`) participate — a bare
+    ticket-id `implements` entry ("implements parent work", per BT1's own
+    field semantics) is not an obligation edge and is skipped. `depends_on`
+    is untouched (cascade semantics unchanged, per the ADR).
+
+    Returns [] (no obligation-shaped implements entries) for the overwhelming
+    majority of existing tickets — the gate is a true no-op for any ticket
+    that never declared an ADR obligation.
+    """
+    implements = fields.get("implements") or []
+    obligation_targets = [t for t in implements if _CLAUSE_ID_RE.fullmatch(str(t))]
+    if not obligation_targets:
+        return []
+
+    index = load_adr_obligation_index(adr_dir)
+
+    # Expand each implements target to its required clause set (dedup,
+    # order-preserving). An element with no clauses: sub-block requires
+    # itself as the atomic obligation unit.
+    required: list = []
+    for target in obligation_targets:
+        clause_ids = index.element_clauses.get(target)
+        if clause_ids:
+            for c in clause_ids:
+                if c not in required:
+                    required.append(c)
+        elif target not in required:
+            required.append(target)
+
+    # Decode receipts: entries (malformed ones are their own finding, never
+    # silently dropped — same "surface, don't invent/hide" posture as §3.5.5,
+    # applied here to malformed data rather than uncertain inference).
+    receipts_raw = fields.get("receipts") or []
+    findings: list = []
+    by_clause: dict = {}
+    for raw in receipts_raw:
+        entry = decode_receipt(str(raw))
+        if entry is None:
+            findings.append(ClosureFinding(
+                kind="malformed_receipt",
+                detail=f"receipts entry {raw!r} does not decode as "
+                       f"<clause>=<receipt-id>=<provenance>",
+            ))
+            continue
+        by_clause.setdefault(entry.clause, []).append(entry)
+
+    for clause in required:
+        info = index.details.get(clause)
+        if info is None:
+            findings.append(ClosureFinding(
+                kind="dangling_obligation",
+                detail=f"{clause} does not resolve to any ADR elements: entry",
+            ))
+            continue
+        candidates = by_clause.get(clause, [])
+        if not candidates:
+            findings.append(ClosureFinding(
+                kind="unsatisfied_clause",
+                detail=f"{clause} has no satisfying receipt — {info.text!r}",
+            ))
+            continue
+        if info.high_risk and not any(
+            c.provenance in AUTHORIZED_PROVENANCE for c in candidates
+        ):
+            findings.append(ClosureFinding(
+                kind="evidence_authority_denied",
+                detail=f"{clause} is HIGH-RISK and only has self-asserted "
+                       f"receipt(s) — {info.text!r}",
+            ))
+
+    return findings
+
+
+def evaluate_closure_for_ticket(tid: str, tickets_root: Path, adr_dir: Path) -> list:
+    """The single-named-ticket validator entry point (T-2842 brief): finds
+    `tid` in ANY state (mirrors build_typed_edge_graph's state-independence —
+    a done ticket's closure is exactly what this re-checks), parses it, and
+    delegates to evaluate_closure_fields. This is the hook a disposable
+    live test ticket exercises post-flip, independent of the resolve CLI
+    path (ticket.py's `_do_transition` calls the same underlying function
+    against in-memory fields, not this wrapper, to avoid a redundant re-read
+    inside the same transition).
+
+    Raises TicketError if `tid` does not resolve to any ticket file.
+    """
+    for st in STATES:
+        p = tickets_root / st / f"{tid}.md"
+        if p.exists():
+            fields, _body = parse_front_matter(p.read_text(encoding="utf-8"))
+            return evaluate_closure_fields(fields, adr_dir)
+    raise TicketError(f"evaluate_closure_for_ticket: {tid} not found in any state")
+
+
+def detect_duplicate_receipt_ids(tickets_root: Path) -> list:
+    """Corpus-wide receipt-id uniqueness scan (T-2926 / ORG-065 §3.5.3 —
+    the follow-up T-2842 disposition 1 explicitly deferred: "Corpus-wide
+    UNIQUENESS of a receipt id is explicitly OUT OF SCOPE for BT2", see the
+    RECEIPT_NAMESPACES module note above). Analogous to scan_adr_elements's
+    duplicate_id check, but cross-ticket rather than within-one-file — a
+    receipt id names one artifact, and §3.5.3 requires it resolve to exactly
+    one; two different tickets both claiming it violates that.
+
+    Standalone (not folded into detect_typed_graph_issues): receipts are
+    deliberately NOT part of the typed-edge graph model (see the BT2 module
+    note above on why receipts stay out of _GATING_EDGE_FIELDS/
+    _DANGLING_CHECK_FIELDS/ACYCLICITY_DOMAINS) — this scan reuses
+    TypedGraphFinding only for the finding shape / report plumbing, not
+    because a duplicate receipt id is a graph defect. Callers concatenate
+    this function's output with detect_typed_graph_issues's to feed one
+    report (see the two call sites in _do_lint / --dry-run).
+
+    Reuse of the same receipt id ACROSS CLAUSES WITHIN one ticket is
+    legitimate (one CI run can satisfy several of that ticket's own
+    obligations) — only cross-ticket reuse is flagged, so ownership is
+    tracked per distinct ticket id, not per raw occurrence. Entries that
+    fail decode_receipt are skipped (not re-flagged here as
+    "malformed_receipt" — that is evaluate_closure_fields's per-ticket
+    concern; duplicating it corpus-wide is out of this scan's scope).
+    """
+    owners: dict = {}
+    for st in STATES:
+        d = tickets_root / st
+        if not d.exists():
+            continue
+        for entry in sorted(d.iterdir()):
+            if not entry.is_file() or not TICKET_FILENAME_RE.fullmatch(entry.name):
+                continue
+            tid = entry.stem
+            try:
+                fields, _body = parse_front_matter(entry.read_text(encoding="utf-8"))
+            except (TicketError, OSError):
+                continue
+            for raw in (fields.get("receipts") or []):
+                decoded = decode_receipt(str(raw))
+                if decoded is None:
+                    continue
+                owners.setdefault(decoded.receipt_id, set()).add(tid)
+
+    findings: list = []
+    for receipt_id in sorted(owners):
+        tids = owners[receipt_id]
+        if len(tids) > 1:
+            findings.append(TypedGraphFinding(
+                kind="duplicate_receipt_id",
+                detail=f"receipt id {receipt_id!r} is claimed by multiple "
+                       f"tickets: {', '.join(sorted(tids))}",
+            ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# T-2845 / ORG-065 BT5: closure-gate health monitor — the ORG-068 "health-
+# monitor" gap the T-2842 reviewer named (nothing observed gate-mode drift or
+# finding-volume trend ahead of the warn->gate flip). Pure/report-only, same
+# shape as every other corpus scan in this module — `detect_closure_gate_
+# health` takes the effective/intended mode strings as plain parameters
+# rather than importing ticket.py's `_closure_gate_mode()` itself, keeping
+# this module's detect-vs-enforce split intact (see the T-2842 banner comment
+# above); the caller that resolves the REAL env value and owns persistence/
+# CLI/printing is the standalone tools/closure_gate_health_monitor.py.
+#
+# Scans EVERY state (mirrors build_typed_edge_graph's ALL-states scope) so
+# the two named consumers are both served from one walk: `corpus_*` /
+# `by_state` track full-corpus migration-walk progress (including
+# already-closed tickets whose obligations predate a receipt), while
+# `open_*` (inbox+active only) is the slice the gate will actually re-fire
+# on once flipped — that is what a flip-readiness read should use.
+# ---------------------------------------------------------------------------
+
+_OPEN_STATES = ("inbox", "active")
+
+
+@dataclass
+class ClosureGateHealthReport:
+    """Corpus-wide closure-gate health snapshot (T-2845 flip prerequisite).
+
+    `open_*` fields (inbox+active only) are the flip-readiness signal — the
+    slice the gate will actually fire on post-flip. `corpus_*` / `by_state`
+    cover every state including `done`, tracking full-corpus migration-walk
+    progress; do not read `corpus_*` as a flip go/no-go number.
+    """
+    effective_mode: str
+    intended_mode: str
+    mode_drift: bool
+    corpus_tickets_scanned: int
+    corpus_tickets_with_obligations: int
+    corpus_tickets_with_findings: int
+    corpus_total_findings: int
+    corpus_findings_by_kind: dict
+    open_tickets_scanned: int
+    open_tickets_with_obligations: int
+    open_tickets_with_findings: int
+    open_total_findings: int
+    open_findings_by_kind: dict
+    # state -> {"scanned", "with_obligations", "with_findings", "total_findings"}
+    by_state: dict
+
+
+def detect_closure_gate_health(
+    tickets_root: Path, adr_dir: Path, *, effective_mode: str, intended_mode: str,
+) -> ClosureGateHealthReport:
+    """Walk every ticket in every state, re-evaluate each via
+    evaluate_closure_fields (a live re-derivation, never a cache — same
+    posture as evaluate_closure_for_ticket), and aggregate both the
+    full-corpus and open-only (inbox+active) rollups plus a raw per-state
+    breakdown. `effective_mode`/`intended_mode` are caller-supplied — see
+    module note above.
+    """
+    by_state: dict = {}
+    kinds_by_state: dict = {}
+    for st in STATES:
+        d = tickets_root / st
+        scanned = with_obligations = with_findings = total = 0
+        kind_counts: dict = {}
+        if d.exists():
+            for entry in sorted(d.iterdir()):
+                if not entry.is_file() or not TICKET_FILENAME_RE.fullmatch(entry.name):
+                    continue
+                scanned += 1
+                try:
+                    fields, _body = parse_front_matter(entry.read_text(encoding="utf-8"))
+                except (TicketError, OSError):
+                    continue
+                implements = fields.get("implements") or []
+                if any(_CLAUSE_ID_RE.fullmatch(str(t)) for t in implements):
+                    with_obligations += 1
+                findings = evaluate_closure_fields(fields, adr_dir)
+                if findings:
+                    with_findings += 1
+                    total += len(findings)
+                    for f in findings:
+                        kind_counts[f.kind] = kind_counts.get(f.kind, 0) + 1
+        by_state[st] = {
+            "scanned": scanned,
+            "with_obligations": with_obligations,
+            "with_findings": with_findings,
+            "total_findings": total,
+        }
+        kinds_by_state[st] = kind_counts
+
+    def _sum(states, key):
+        return sum(by_state[s][key] for s in states if s in by_state)
+
+    def _sum_kinds(states):
+        out: dict = {}
+        for s in states:
+            for k, v in kinds_by_state.get(s, {}).items():
+                out[k] = out.get(k, 0) + v
+        return out
+
+    all_states = list(STATES)
+    open_states = [s for s in _OPEN_STATES if s in STATES]
+
+    return ClosureGateHealthReport(
+        effective_mode=effective_mode,
+        intended_mode=intended_mode,
+        mode_drift=(effective_mode != intended_mode),
+        corpus_tickets_scanned=_sum(all_states, "scanned"),
+        corpus_tickets_with_obligations=_sum(all_states, "with_obligations"),
+        corpus_tickets_with_findings=_sum(all_states, "with_findings"),
+        corpus_total_findings=_sum(all_states, "total_findings"),
+        corpus_findings_by_kind=_sum_kinds(all_states),
+        open_tickets_scanned=_sum(open_states, "scanned"),
+        open_tickets_with_obligations=_sum(open_states, "with_obligations"),
+        open_tickets_with_findings=_sum(open_states, "with_findings"),
+        open_total_findings=_sum(open_states, "total_findings"),
+        open_findings_by_kind=_sum_kinds(open_states),
+        by_state=by_state,
+    )
+
+
+# ---------------------------------------------------------------------------
 # T-2833: unanchored / bad not_before date-gate scan (report-only).
 #
 # Every not_before date gate must carry a `operator:<T-NNNN|tg:MSGID>` anchor
@@ -1066,7 +2463,8 @@ def detect_dep_graph_issues(tickets_root: Path) -> list[DepGraphFinding]:
 # cycle; the shapes must stay in sync). Two legal forms: operator:<T-NNNN|tg:digits>
 # and event:<KIND>:<param> with KIND a closed enum (cert-expiry/key-expiry/
 # cadence/window) — the closed set keeps "fresh_session" out.
-_LINT_OPERATOR_ANCHOR_RE = re.compile(r"^operator:(T-\d{4}|tg:\d+)$")
+# T-3215: widened in lockstep with ticket.py's _OPERATOR_ANCHOR_RE (4+ digits).
+_LINT_OPERATOR_ANCHOR_RE = re.compile(r"^operator:(T-\d{4,}|tg:\d+)$")
 _LINT_EVENT_ANCHOR_KINDS = ("cert-expiry", "key-expiry", "cadence", "window")
 _LINT_EVENT_ANCHOR_RE = re.compile(
     r"^event:(?:" + "|".join(_LINT_EVENT_ANCHOR_KINDS) + r"):.+$"
@@ -1271,6 +2669,46 @@ def _apply_retarget(
 # ---------------------------------------------------------------------------
 
 
+def detect_program_index_findings(repo_root: Path) -> list[ProgramIndexFinding]:
+    """Run the pure ORG-061 index lint when the paired indexes are configured.
+
+    Repositories without either index retain the legacy ticket-lint behavior.
+    A one-file partial deployment or strict-load error is visible and fail-closed;
+    this adapter never edits either index or any stage/ticket state.
+    """
+    stage_path = repo_root / "tickets" / "grand-project-stage-evidence.yaml"
+    obligation_path = repo_root / "tickets" / "grand-project-reevaluation-obligations.yaml"
+    present = (stage_path.is_file(), obligation_path.is_file())
+    if present == (False, False):
+        return []
+    if present != (True, True):
+        return [
+            ProgramIndexFinding(
+                code="program-index-pair-incomplete",
+                record_id="ORG-061",
+                description="stage and owned-obligation indexes must be deployed as one pair",
+            )
+        ]
+    try:
+        findings = grand_project_program.lint_repository_indexes(repo_root)
+    except (OSError, ValueError) as exc:
+        return [
+            ProgramIndexFinding(
+                code="program-index-load-invalid",
+                record_id="ORG-061",
+                description=f"{type(exc).__name__}: {exc}",
+            )
+        ]
+    return [
+        ProgramIndexFinding(
+            code=finding.code,
+            record_id=finding.record_id,
+            description=finding.message,
+        )
+        for finding in findings
+    ]
+
+
 def build_lint_digest(
     now_iso: str,
     auto_fixed: list[LintResult],
@@ -1282,6 +2720,9 @@ def build_lint_digest(
     dep_graph_findings: list[DepGraphFinding] | None = None,
     unanchored_gates: list[UnanchoredGateFinding] | None = None,
     warned: list[LintResult] | None = None,
+    purpose_warned: list[LintResult] | None = None,
+    typed_graph_findings: list[TypedGraphFinding] | None = None,
+    program_index_findings: list[ProgramIndexFinding] | None = None,
 ) -> str:
     """Render the lint digest as plain text (no Markdown parse_mode).
 
@@ -1299,17 +2740,35 @@ def build_lint_digest(
     non-empty, a separate section is appended. When empty/None, no section is
     emitted (no empty-section noise). Warns also prevent the all-clean early-return
     (an "all clean" claim is false when there are nudges to surface).
+
+    `typed_graph_findings` (T-2841 / ORG-065 BT1, extended T-2926, T-2843,
+    T-3179): the generalized typed-edge model's report-only findings (cycles
+    / dangling targets / malformed or duplicate ADR `elements:` ids), PLUS
+    the T-2926 corpus-wide duplicate-receipt-id findings, PLUS the T-2843
+    element-lineage leak-detector findings (callers concatenate all three
+    lists — see detect_typed_graph_issues / detect_duplicate_receipt_ids /
+    detect_unverified_elements). Separate section from the legacy
+    depends_on-only `dep_graph_findings` above. T-3179 split the leak-
+    detector's own output into two kinds rendered as two sub-sections below
+    — true leaks ("unverified_element") vs implemented-but-unverified
+    ("implemented_unverified_element", expected transitional shape) — so the
+    real leak signal isn't buried under Tranche-A's expected noise.
     """
     retargeted = retargeted or []
     orphan_ratifications = orphan_ratifications or []
     dep_graph_findings = dep_graph_findings or []
     unanchored_gates = unanchored_gates or []
     warned = warned or []
+    purpose_warned = purpose_warned or []
+    typed_graph_findings = typed_graph_findings or []
+    program_index_findings = program_index_findings or []
     header = f"[Recovery · ticket-lint · {now_iso}]"
 
     if (not auto_fixed and not flagged and not retargeted
             and not orphan_ratifications and not dep_graph_findings
-            and not unanchored_gates and not warned):
+            and not unanchored_gates and not warned and not purpose_warned
+            and not typed_graph_findings
+            and not program_index_findings):
         return (
             f"{header}\n\n"
             f"All {total_scanned} ticket(s) scanned: all clean.\n"
@@ -1318,6 +2777,14 @@ def build_lint_digest(
         )
 
     lines = [header, ""]
+
+    if program_index_findings:
+        lines.append(f"Grand Project program-index findings ({len(program_index_findings)}):")
+        for finding in program_index_findings:
+            lines.append(
+                f"  - {finding.record_id} [{finding.code}]: {finding.description}"
+            )
+        lines.append("")
 
     if auto_fixed:
         lines.append(f"Auto-fixed ({len(auto_fixed)}):")
@@ -1395,6 +2862,84 @@ def build_lint_digest(
             "(or 'goal-neutral-maintenance' for housekeeping tickets)"
         )
         lines.append("")
+
+    # T-3168 / ORG-054: warn-first migration for structured purpose fields.
+    # This is separate from the legacy serves nudge so callers can distinguish
+    # compatibility debt from malformed/dangling typed graph state.
+    if purpose_warned:
+        lines.append(
+            f"Structured ticket-purpose warnings ({len(purpose_warned)}):"
+        )
+        for r in purpose_warned:
+            lines.append(f"  - {r.tid}: {r.description}")
+        lines.append(
+            "    Fix: ticket.py purpose <tid> --project-id <id|null> "
+            "--nearest-intent-ref <typed-ref> [--serves '<arc-intent>']"
+        )
+        lines.append("")
+
+    # T-2841 / ORG-065 BT1: generalized typed-edge graph findings. Report-only
+    # (warn-only phase) — cycle REJECTION already happened at insertion time;
+    # a "cycle" finding here means pre-existing/hand-edited data the
+    # insertion guard never saw.
+    if typed_graph_findings:
+        typed_cycles = [f for f in typed_graph_findings if f.kind == "cycle"]
+        typed_dangling = [f for f in typed_graph_findings if f.kind == "dangling_target"]
+        typed_elements = [f for f in typed_graph_findings
+                           if f.kind in ("malformed_id", "duplicate_id")]
+        typed_receipt_dupes = [f for f in typed_graph_findings
+                                if f.kind == "duplicate_receipt_id"]
+        typed_unverified = [f for f in typed_graph_findings
+                             if f.kind == "unverified_element"]
+        typed_implemented_unverified = [f for f in typed_graph_findings
+                                          if f.kind == "implemented_unverified_element"]
+        if typed_cycles:
+            lines.append(
+                f"Typed-edge graph CYCLES — graph-integrity defect, ORG-065 §3.6 ({len(typed_cycles)}):"
+            )
+            for f in typed_cycles:
+                lines.append(f"  - {f.detail}")
+            lines.append("")
+        if typed_dangling:
+            lines.append(
+                f"Typed-edge dangling targets — implements/verifies/supersedes/"
+                f"informs/ratifies names an unresolvable id ({len(typed_dangling)}):"
+            )
+            for f in typed_dangling:
+                lines.append(f"  - {f.detail}")
+            lines.append("")
+        if typed_elements:
+            lines.append(
+                f"ADR elements: id defects — malformed or duplicate ({len(typed_elements)}):"
+            )
+            for f in typed_elements:
+                lines.append(f"  - [{f.kind}] {f.detail}")
+            lines.append("")
+        if typed_receipt_dupes:
+            lines.append(
+                f"Duplicate receipt ids — same receipt id claimed by multiple "
+                f"tickets ({len(typed_receipt_dupes)}):"
+            )
+            for f in typed_receipt_dupes:
+                lines.append(f"  - {f.detail}")
+            lines.append("")
+        if typed_unverified:
+            lines.append(
+                f"Unverified ADR elements — TRUE LEAK, no implements: and no "
+                f"verifies: edge, ORG-065 §3.4 ({len(typed_unverified)}):"
+            )
+            for f in typed_unverified:
+                lines.append(f"  - {f.detail}")
+            lines.append("")
+        if typed_implemented_unverified:
+            lines.append(
+                f"Implemented, evidence pending — implements: edge exists, no "
+                f"verifies: edge yet (expected transitional shape, ORG-065 "
+                f"§3.4) ({len(typed_implemented_unverified)}):"
+            )
+            for f in typed_implemented_unverified:
+                lines.append(f"  - {f.detail}")
+            lines.append("")
 
     lines.append(f"Total scanned: {total_scanned} ticket(s).")
     return "\n".join(lines) + "\n"
@@ -1516,6 +3061,35 @@ def _do_lint(
     # to warn_tickets(); it self-filters to inbox-only (single source of truth
     # for that predicate). Warns never affect failures, push, or exit code.
     warn_results = warn_tickets([r.path for r in results])
+    purpose_warn_results = warn_ticket_purposes([r.path for r in results])
+
+    # T-2841 / ORG-065 BT1: generalized typed-edge graph scan — cycles +
+    # dangling targets + ADR elements: id defects (report-only; warn-only
+    # phase, no mutation). Concatenated with the T-2926 corpus-wide receipt-
+    # id uniqueness scan and the T-2843 element-lineage leak detector — all
+    # three feed the same typed_graph_findings report section (see
+    # TypedGraphFinding's kind docstring for why they are separate functions
+    # sharing one finding shape).
+    # T-3477 / ORG-065 Call 2, REVERTED T-3495: the ADR corpus here is this
+    # repo's own architecture/adr/ ONLY — recovery (the sole hourly cron runner)
+    # cannot read echo-prismatic's adr/ (EACCES), which made the cross-repo
+    # union vacuous on the only account that ran it. Echo obligation
+    # validation now runs as a companion scan on the claude account (see
+    # tools/echo_corpus_lint.py); the dangling-target check below exempts
+    # echo-shaped targets via is_echo_scoped_id rather than false-flagging
+    # them (see _ECHO_PRISMATIC_ADR_DIR's module note).
+    _adr_dirs = _repo_root / "architecture" / "adr"
+    typed_graph_findings = (
+        detect_typed_graph_issues(
+            _tickets_root, _adr_dirs, exempt_dangling_target=is_echo_scoped_id,
+        )
+        + detect_duplicate_receipt_ids(_tickets_root)
+        + detect_unverified_elements(_tickets_root, _adr_dirs)
+    )
+
+    # T-2426 / ORG-061: paired program indexes are a pure, report-only lint
+    # surface. Their findings never trigger ticket/index mutation here.
+    program_index_findings = detect_program_index_findings(_repo_root)
 
     auto_fix_results = [r for r in results if r.action == LintAction.AUTO_FIX]
     flag_results = [r for r in results if r.action == LintAction.FLAG]
@@ -1606,6 +3180,9 @@ def _do_lint(
             dep_graph_findings=dep_graph_findings,
             unanchored_gates=unanchored_gates,
             warned=warn_results,
+            purpose_warned=purpose_warn_results,
+            typed_graph_findings=typed_graph_findings,
+            program_index_findings=program_index_findings,
         )
         if failures > 0 or not commit_ok:
             digest += f"\nWARNING: ticket_lint auto-commit reported {failures} failure(s); see stderr.\n"
@@ -1717,6 +3294,20 @@ def main(argv: list[str] | None = None) -> int:
         dep_graph_findings = detect_dep_graph_issues(tickets_root_dry)
         # T-1105 / ORG-034: dry-run warn parity — same tickets as the cron digest shows.
         dry_warns = warn_tickets([r.path for r in results])
+        # T-2841 / ORG-065 BT1: dry-run parity for the generalized typed-edge graph.
+        # T-2926: dry-run parity for the corpus-wide receipt-id uniqueness scan.
+        # T-2843: dry-run parity for the element-lineage leak detector.
+        # T-3477, REVERTED T-3495: dry-run parity with the non-dry-run
+        # _adr_dirs construction above — pantheon-only, echo union moved to
+        # tools/echo_corpus_lint.py (see that call site's comment).
+        _adr_dirs_dry = repo_root_arg / "architecture" / "adr"
+        typed_graph_findings = (
+            detect_typed_graph_issues(
+                tickets_root_dry, _adr_dirs_dry, exempt_dangling_target=is_echo_scoped_id,
+            )
+            + detect_duplicate_receipt_ids(tickets_root_dry)
+            + detect_unverified_elements(tickets_root_dry, _adr_dirs_dry)
+        )
         print(f"[ticket_lint] dry-run — {now.strftime('%Y-%m-%d %H:%M UTC')}")
         print(f"  scanned: {len(results)} ticket(s)")
         if auto_fix:
@@ -1739,7 +3330,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  serves-field nudges ({len(dry_warns)}):")
             for r in dry_warns:
                 print(f"    {r.tid}: {r.description}")
-        if not auto_fix and not flags and not retargets and not dep_graph_findings and not dry_warns:
+        if typed_graph_findings:
+            print(f"  typed-edge graph findings ({len(typed_graph_findings)}):")
+            for f in typed_graph_findings:
+                print(f"    [{f.kind}] {f.detail}")
+        if (not auto_fix and not flags and not retargets and not dep_graph_findings
+                and not dry_warns and not typed_graph_findings):
             print("  all clean — no actions needed")
         return 0
 

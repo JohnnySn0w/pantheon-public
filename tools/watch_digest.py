@@ -547,6 +547,42 @@ def build_digest(
     return "\n".join(parts)
 
 
+# Telegram hard-caps a sendMessage at 4096 chars; an over-long body 400s on BOTH Markdown
+# AND plain text (the limit is LENGTH, not formatting, so the plain-text fallback can't save
+# it). A big watch day overflows — observed 2026-08-24 (T-3135 day, 20 topics fired): the
+# digest sank with "HTTP Error 400: Bad Request" on both attempts and the unit exited 1. So
+# split the digest on line boundaries into <=limit chunks and send each. The limit sits below
+# 4096 to leave headroom for the "(part i/n)" marker + UTF-8 multibyte slack.
+TELEGRAM_MAX_CHARS = 4096
+_CHUNK_LIMIT = 3800
+
+
+def _chunk_lines(text: str, limit: int = _CHUNK_LIMIT) -> list[str]:
+    """Split `text` into chunks of at most `limit` chars, breaking on line boundaries so a
+    line's Markdown stays balanced within one chunk. A single line longer than `limit` is
+    hard-split. Always returns at least one chunk."""
+    lines: list[str] = []
+    for line in text.split("\n"):
+        while len(line) > limit:
+            lines.append(line[:limit])
+            line = line[limit:]
+        lines.append(line)
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for line in lines:
+        add = len(line) + (1 if cur else 0)  # +1 for the newline that rejoins them
+        if cur and cur_len + add > limit:
+            chunks.append("\n".join(cur))
+            cur, cur_len = [line], len(line)
+        else:
+            cur.append(line)
+            cur_len += add
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks or [""]
+
+
 def _post_telegram(url: str, chat_id: str, text: str, parse_mode: str | None) -> bool:
     """POST one sendMessage. parse_mode=None sends plain text (no markdown parsing)."""
     fields = {"chat_id": chat_id, "text": text}
@@ -558,19 +594,18 @@ def _post_telegram(url: str, chat_id: str, text: str, parse_mode: str | None) ->
         return resp.status == 200
 
 
-def send_telegram(token: str, chat_id: str, text: str) -> bool:
-    """Send the digest, preferring Markdown but FALLING BACK to plain text.
+def _send_one_with_fallback(url: str, chat_id: str, text: str) -> bool:
+    """Send ONE message, preferring Markdown but FALLING BACK to plain text.
 
     The digest embeds researcher-authored headlines — arbitrary prose that can
     contain unbalanced Markdown metacharacters (a lone `_`, `*`, or backtick).
-    Legacy-Markdown parsing then 400s and the whole digest is dropped (observed
+    Legacy-Markdown parsing then 400s and the whole message is dropped (observed
     2026-06-08: a `watch_runner` underscore in one of 8 above-bar headlines sank
     the most important digest of the week). Escaping arbitrary prose for legacy
     Markdown is underspecified/fragile, so on ANY Markdown-send failure we retry
     once as plain text — losing bold formatting but GUARANTEEING delivery, which
     for an unattended alert channel is the right trade.
     """
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         return _post_telegram(url, chat_id, text, "Markdown")
     except Exception as exc:  # noqa: BLE001 — markdown parse 400 / transient / etc.
@@ -583,6 +618,26 @@ def send_telegram(token: str, chat_id: str, text: str) -> bool:
     except Exception as exc:  # noqa: BLE001
         print(f"telegram plain-text send also failed: {exc}", file=sys.stderr)
         return False
+
+
+def send_telegram(token: str, chat_id: str, text: str) -> bool:
+    """Send the digest, CHUNKED to Telegram's 4096-char limit, each chunk carrying the
+    Markdown→plain-text fallback. Returns True only if EVERY chunk delivered — an
+    incomplete send is a failure, so main() will not stamp leans on partial delivery.
+    A single-chunk digest sends exactly as before (no marker), so the common case is
+    unchanged.
+    """
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
+    chunks = _chunk_lines(text)
+    n = len(chunks)
+    all_ok = True
+    for i, chunk in enumerate(chunks, 1):
+        # Continuation marker only when actually split, so the reader knows more parts
+        # follow (sized into _CHUNK_LIMIT's headroom).
+        body = chunk if n == 1 else f"{chunk}\n\n_(part {i}/{n})_"
+        if not _send_one_with_fallback(url, chat_id, body):
+            all_ok = False
+    return all_ok
 
 
 def parse_args() -> argparse.Namespace:

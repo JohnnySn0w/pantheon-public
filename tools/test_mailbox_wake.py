@@ -250,6 +250,38 @@ class WakeTest(unittest.TestCase):
         self.assertEqual(rc2, 0)
         self.assertEqual(len(self.injected), 2, "dropped kick is retried on the next fire")
 
+    def test_failed_kick_pane_now_busy_soft_exits(self):
+        """T-3554: idle→busy RACE — pane idle at decide-time (so it wakes + injects),
+        but the agent starts a turn before submit confirms, so the kick fails 'submit
+        unconfirmed'. Re-checking finds the pane BUSY now: that is the same benign
+        collision T-2681 defers, seen one sample late — soft-exit 0, NO OnFailure alarm,
+        marker NOT advanced (mail retained, retried next fire)."""
+        mailbox.send(self.inbox, {"x": 1}, sender="orchestrator")
+        calls = {"n": 0}
+
+        def pane_idle_fn(pane):        # idle at decide (call 1), busy at re-check (call 2+)
+            calls["n"] += 1
+            return True if calls["n"] == 1 else False
+
+        rc = mw.run("recovery", inbox=self.inbox, do_inject=self._fail_inject,
+                    session_key_fn=lambda pane: "S1", now=1000.0,
+                    pane_idle_fn=pane_idle_fn)
+        self.assertEqual(rc, 0, "idle→busy race must NOT alarm — it's a live agent mid-turn")
+        self.assertGreaterEqual(calls["n"], 2, "the failure path must RE-CHECK the pane")
+        self.assertFalse(self.marker.exists(), "marker must NOT advance — mail retained for retry")
+        rc2 = self._run(self._ok_inject)  # next fire delivers; nothing was lost
+        self.assertEqual(rc2, 0)
+        self.assertEqual(len(self.injected), 2, "retried on the next fire, nothing lost")
+
+    def test_failed_kick_on_idle_pane_still_alarms(self):
+        """A pane that reads IDLE at BOTH decide-time and the failure re-check yet still
+        rejects the submit is a genuine anomaly (idle pane not accepting, or a dead/gone
+        seat) — the T-2245 send-liveness rung. Must still exit 8 so OnFailure fires."""
+        mailbox.send(self.inbox, {"x": 1}, sender="orchestrator")
+        rc = self._run(self._fail_inject, pane_idle=True)  # True at decide AND re-check
+        self.assertEqual(rc, 8, "an idle pane that rejects the submit is a real anomaly — alarm")
+        self.assertFalse(self.marker.exists(), "marker must NOT advance on a dropped kick")
+
     # --------------------------------------------------------------- malformed
     def test_malformed_message_does_not_break_waker(self):
         (self.new / "00000000000000000001.1.0.x").write_text("not json\n")

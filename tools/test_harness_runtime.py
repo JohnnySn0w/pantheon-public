@@ -11,6 +11,7 @@ import types
 
 from tools import mailbox
 from tools import persona_bringup
+from tools import runtime_controller
 from tools.harness_adapter import (
     ClaudeHarnessAdapter,
     CodexHarnessAdapter,
@@ -21,30 +22,40 @@ from tools.harness_adapter import (
     SessionHandle,
 )
 from tools.harness_adapter.types import TmuxTarget
+from tools.persona_installer import Manifest, PersonaInstaller
 from tools.persona_bringup import (
     backoff_remaining,
     build_adapter,
     clear_backoff,
+    configured_runtime_targets,
     consume_persona_mailbox,
     diagnose_persona,
     HarnessTurnTransientError,
     bump_soft_streak,
     clear_soft_streak,
+    bump_diag_streak,
+    clear_diag_streak,
+    bump_policy_skip,
+    clear_policy_skip,
     EXIT_SOFT_PERSISTENT,
     load_binding,
     load_backoff,
     load_soft_streak,
+    load_diag_streak,
+    load_policy_skip,
     SOFT_FAILURE_ALERT_STREAK,
     load_session_id,
     normalize_harness,
     orientation_prompt,
     process_mail_record,
     record_backoff_failure,
+    resolve_configured_runtime_target,
     save_session_id,
 )
 
 
 FIXTURES = Path(__file__).parent / "fixtures" / "harness_adapter"
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _events(adapter, path: Path):
@@ -266,6 +277,46 @@ class PersonaBindingTests(unittest.TestCase):
         self.assertEqual(binding.configured_harness, "claude")
         self.assertEqual(binding.selected_harness, "codex")
 
+    def test_orchestrator_manifest_selects_codex_fallback_and_live_tmux_target(self) -> None:
+        manifest_path = Path("instance.yaml")
+        primary = load_binding(manifest_path, "orchestrator")
+        targets = configured_runtime_targets(manifest_path, "orchestrator")
+        _current, fallback = resolve_configured_runtime_target(
+            manifest_path,
+            persona="orchestrator",
+            destination="codex/interactive-chatgpt",
+        )
+        self.assertEqual(primary.role, "orchestrator")
+        self.assertEqual(primary.configured_harness, "claude")
+        self.assertEqual(primary.selected_harness, "claude")
+        self.assertEqual(primary.launch.harness, "claude")
+        self.assertIn("codex/interactive-chatgpt", targets)
+        self.assertEqual(fallback.launch.harness, "codex")
+        self.assertEqual(fallback.launch.profile, "interactive-chatgpt")
+        self.assertEqual(fallback.launch.executable, Path("/usr/bin/codex"))
+        self.assertEqual(fallback.controller.tmux.session, "claude-telegram-bot")
+
+    def test_orchestrator_manifest_persona_brief_ref_resolves_account_claude_md(self) -> None:
+        binding = load_binding(REPO_ROOT / "instance.yaml", "orchestrator")
+        self.assertEqual(binding.pinned_rules, Path("/home/claude/CLAUDE.md"))
+        prompt = orientation_prompt(binding, "readiness check")
+        self.assertIn("/home/claude/CLAUDE.md", prompt)
+        self.assertNotIn("pinned-rules/orchestrator.md", prompt)
+
+    def test_default_persona_brief_ref_uses_repo_pinned_rules(self) -> None:
+        binding = load_binding(REPO_ROOT / "instance.yaml", "recovery")
+        expected = REPO_ROOT / "pinned-rules" / "recovery.md"
+        self.assertEqual(binding.pinned_rules, expected)
+        with tempfile.TemporaryDirectory() as tmp:
+            plan = PersonaInstaller(REPO_ROOT).plan(
+                Manifest.load(REPO_ROOT / "instance.yaml"),
+                "recovery",
+                root=Path(tmp) / "projection",
+            )
+        brief = next(operation for operation in plan.operations if operation.operation_id == "persona.brief")
+        self.assertEqual(Path(brief.target), expected)
+        self.assertEqual(brief.desired["source"], "repo-default")
+
     def test_manifest_native_channels_threads_through_load_binding_and_adapter(
         self,
     ) -> None:
@@ -308,7 +359,8 @@ class PersonaBindingTests(unittest.TestCase):
             )
             harness_adapter = build_adapter(binding, harness_home=root)
             command = harness_adapter.build_interactive_launch(
-                TmuxTarget(session="pantheon-recovery", window="harness", pane="0")
+                TmuxTarget(session="pantheon-recovery", window="harness", pane="0"),
+                cwd=binding.launch_cwd,
             )
         self.assertEqual(command.argv.count("--channels"), 1)
         idx = command.argv.index("--channels")
@@ -643,7 +695,7 @@ class ConsumeSoftFailureAlertStreak(unittest.TestCase):
             sd = Path(tmp)
             self.assertEqual(self._run_consume_diag_fail(sd), 3)  # streak 1
             self.assertEqual(self._run_consume_diag_fail(sd), 3)  # streak 2
-            self.assertEqual(load_soft_streak(sd, "recovery"), 2)
+            self.assertEqual(load_diag_streak(sd, "recovery"), 2)
 
     def test_sustained_soft_failure_escalates_to_paging_code(self) -> None:
         # At the threshold the SAME soft failure escalates to the hard code, which
@@ -664,9 +716,9 @@ class ConsumeSoftFailureAlertStreak(unittest.TestCase):
             sd = Path(tmp)
             for _ in range(SOFT_FAILURE_ALERT_STREAK - 1):
                 self.assertEqual(self._run_consume_diag_fail(sd), 3)
-            self.assertEqual(load_soft_streak(sd, "recovery"), SOFT_FAILURE_ALERT_STREAK - 1)
+            self.assertEqual(load_diag_streak(sd, "recovery"), SOFT_FAILURE_ALERT_STREAK - 1)
             self.assertEqual(self._run_consume_success(sd), 0)  # recovery clears
-            self.assertEqual(load_soft_streak(sd, "recovery"), 0)
+            self.assertEqual(load_diag_streak(sd, "recovery"), 0)
             # a subsequent lone failure starts a fresh streak, still below threshold
             self.assertEqual(self._run_consume_diag_fail(sd), 3)
 
@@ -760,6 +812,94 @@ class ConsumeSoftFailureAlertStreak(unittest.TestCase):
                 self._run_consume_stats_errors(sd), EXIT_SOFT_PERSISTENT
             )
 
+    def test_stale_transport_streak_file_is_honored_not_aged(self) -> None:
+        # Migration note (T-3209): the split leaves recovery.softstreak.json backing
+        # only the attempt-stage (transport/stats-errors) counter, unchanged in
+        # shape. A pre-existing count is honored as-is -- there is no time-based
+        # aging or auto-reset -- so a seat carrying a stale count accumulated
+        # under the OLD conflated single-counter semantics (e.g. from a mix of
+        # exit-3 and exit-5 bumps before this change landed) must have its state
+        # file deleted by the install leg; the code will not self-correct it.
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            for _ in range(SOFT_FAILURE_ALERT_STREAK - 1):
+                bump_soft_streak(sd, "recovery")
+            self.assertEqual(
+                self._run_consume_transport_error(sd), EXIT_SOFT_PERSISTENT
+            )
+
+    def _run_consume_viability_blocked(self, state_dir: Path) -> int:
+        """Drive main() consume through RuntimeViabilityBlocked at the wake
+        call (interactive mode, matching the paging seats' profile). This path
+        neither bumps nor clears the attempt-stage streak -- but diagnostics
+        passed this fire, so it DOES clear the gate-stage (diagnostic) streak."""
+        report = types.SimpleNamespace(
+            observations=[types.SimpleNamespace(status="ok")]
+        )
+        binding = types.SimpleNamespace(
+            persona="recovery", launch=types.SimpleNamespace(mode="interactive")
+        )
+        with mock.patch.object(persona_bringup, "load_binding", return_value=binding), \
+            mock.patch.object(
+                persona_bringup, "select_recorded_runtime_binding", return_value=binding
+            ), \
+            mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+            mock.patch.object(persona_bringup, "build_adapter", return_value=mock.Mock()), \
+            mock.patch.object(persona_bringup, "first_fallback_binding", return_value=None), \
+            mock.patch.object(persona_bringup, "runtime_reference", return_value="same"), \
+            mock.patch.object(
+                persona_bringup, "configured_runtime_bindings", return_value=[]
+            ), \
+            mock.patch.object(
+                persona_bringup,
+                "wake_persistent_runtime",
+                side_effect=runtime_controller.RuntimeViabilityBlocked(
+                    "initial-viability-state-not-selected", {}
+                ),
+            ), \
+            mock.patch.object(persona_bringup, "_print_json"):
+            return persona_bringup.main(
+                ["consume", "--persona", "recovery", "--state-dir", str(state_dir)]
+            )
+
+    def test_leaked_streak_isolated_diag_blips_do_not_page(self) -> None:
+        # T-3209: the field-observed leak. A seat perpetually stuck behind
+        # RuntimeViabilityBlocked never reaches the full-success clear, so
+        # under the OLD single shared streak, any isolated exit-3 diagnostic
+        # blip (e.g. a ~7s dangling-symlink window during a claude auto-update)
+        # accumulates permanently -- the Nth unrelated blip pages, even though
+        # each blip individually self-recovered on the very next fire. Uses
+        # only currently-existing production symbols: on unmodified code this
+        # is a genuine red (the 3rd isolated blip pages); after the T-3209
+        # split, each intervening batch of viability-blocked fires clears the
+        # gate-stage streak, so no blip ever accumulates past 1.
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            for _ in range(SOFT_FAILURE_ALERT_STREAK):
+                self.assertNotEqual(
+                    self._run_consume_diag_fail(sd), EXIT_SOFT_PERSISTENT
+                )
+                for _ in range(5):
+                    self.assertEqual(self._run_consume_viability_blocked(sd), 5)
+
+    def test_diag_streak_counter_mechanics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            self.assertEqual(load_diag_streak(sd, "recovery"), 0)
+            self.assertEqual(bump_diag_streak(sd, "recovery"), 1)
+            self.assertEqual(bump_diag_streak(sd, "recovery"), 2)
+            self.assertEqual(load_diag_streak(sd, "recovery"), 2)
+            clear_diag_streak(sd, "recovery")
+            self.assertEqual(load_diag_streak(sd, "recovery"), 0)
+            # clearing an absent streak is a no-op, not an error
+            clear_diag_streak(sd, "recovery")
+            # a corrupt state file reads as 0, never raises
+            (sd / "recovery.diagstreak.json").write_text("{not json", encoding="utf-8")
+            self.assertEqual(load_diag_streak(sd, "recovery"), 0)
+            # independent of the attempt-stage counter's file
+            self.assertEqual(bump_diag_streak(sd, "recovery"), 1)
+            self.assertEqual(load_soft_streak(sd, "recovery"), 0)
+
     def test_unit_success_exit_status_matches_soft_codes(self) -> None:
         # Guard the code<->unit contract: the template must treat exactly the soft
         # codes (3/4/5) as success and must NOT list the paging code, or the
@@ -776,6 +916,331 @@ class ConsumeSoftFailureAlertStreak(unittest.TestCase):
         codes = {int(tok) for tok in line.split("=", 1)[1].split()}
         self.assertEqual(codes, {3, 4, 5})
         self.assertNotIn(EXIT_SOFT_PERSISTENT, codes)
+
+
+class ConsumePolicySkipCounter(unittest.TestCase):
+    """T-3210: a THIRD, independent axis from bump_diag_streak (gate-stage,
+    exit-3) and bump_soft_streak (attempt-stage genuine failure, exit-4/5) --
+    consecutive fires where the attempt stage was policy-skipped (backoff /
+    RuntimeTransitionPending / ProviderQuotaExhausted / RuntimeViabilityBlocked)
+    rather than genuinely attempted. The gap T-3209 left unaddressed: a seat
+    stuck in this state for hours completes every fire (exit 0/5) and reads
+    healthy to every OTHER counter here."""
+
+    def test_policy_skip_counter_mechanics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            self.assertEqual(load_policy_skip(sd, "recovery"), {})
+            state = bump_policy_skip(sd, "recovery", "runtime_viability_blocked")
+            self.assertEqual(state["reason"], "runtime_viability_blocked")
+            self.assertEqual(state["count"], 1)
+            since = state["since"]
+            state2 = bump_policy_skip(sd, "recovery", "runtime_viability_blocked")
+            self.assertEqual(state2["count"], 2)
+            self.assertEqual(state2["since"], since)  # since is pinned to streak start
+            # a reason CHANGE resets the streak, not merely bumps it
+            state3 = bump_policy_skip(sd, "recovery", "runtime_transition")
+            self.assertEqual(state3["reason"], "runtime_transition")
+            self.assertEqual(state3["count"], 1)
+            self.assertNotEqual(state3["since"], since)
+            clear_policy_skip(sd, "recovery")
+            self.assertEqual(load_policy_skip(sd, "recovery"), {})
+            # clearing an absent streak is a no-op, not an error
+            clear_policy_skip(sd, "recovery")
+            # a corrupt state file reads as {}, never raises
+            (sd / "recovery.policyskip.json").write_text("{not json", encoding="utf-8")
+            self.assertEqual(load_policy_skip(sd, "recovery"), {})
+
+    def _run_consume_transition_pending(self, state_dir: Path) -> int:
+        """Drive main() consume through RuntimeTransitionPending at the wake call."""
+        report = types.SimpleNamespace(observations=[types.SimpleNamespace(status="ok")])
+        binding = types.SimpleNamespace(
+            persona="recovery", launch=types.SimpleNamespace(mode="interactive")
+        )
+        with mock.patch.object(persona_bringup, "load_binding", return_value=binding), \
+            mock.patch.object(
+                persona_bringup, "select_recorded_runtime_binding", return_value=binding
+            ), \
+            mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+            mock.patch.object(persona_bringup, "build_adapter", return_value=mock.Mock()), \
+            mock.patch.object(persona_bringup, "first_fallback_binding", return_value=None), \
+            mock.patch.object(persona_bringup, "runtime_reference", return_value="same"), \
+            mock.patch.object(
+                persona_bringup, "configured_runtime_bindings", return_value=[]
+            ), \
+            mock.patch.object(
+                persona_bringup,
+                "wake_persistent_runtime",
+                side_effect=runtime_controller.RuntimeTransitionPending("barrier active"),
+            ), \
+            mock.patch.object(persona_bringup, "_print_json"):
+            return persona_bringup.main(
+                ["consume", "--persona", "recovery", "--state-dir", str(state_dir)]
+            )
+
+    def _run_consume_quota_exhausted(self, state_dir: Path) -> int:
+        """Drive main() consume through ProviderQuotaExhausted at the wake call."""
+        report = types.SimpleNamespace(observations=[types.SimpleNamespace(status="ok")])
+        binding = types.SimpleNamespace(
+            persona="recovery", launch=types.SimpleNamespace(mode="interactive")
+        )
+        with mock.patch.object(persona_bringup, "load_binding", return_value=binding), \
+            mock.patch.object(
+                persona_bringup, "select_recorded_runtime_binding", return_value=binding
+            ), \
+            mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+            mock.patch.object(persona_bringup, "build_adapter", return_value=mock.Mock()), \
+            mock.patch.object(persona_bringup, "first_fallback_binding", return_value=None), \
+            mock.patch.object(persona_bringup, "runtime_reference", return_value="same"), \
+            mock.patch.object(
+                persona_bringup, "configured_runtime_bindings", return_value=[]
+            ), \
+            mock.patch.object(
+                persona_bringup,
+                "wake_persistent_runtime",
+                side_effect=runtime_controller.ProviderQuotaExhausted(
+                    "quota exhausted", profile="interactive-subscription"
+                ),
+            ), \
+            mock.patch.object(persona_bringup, "_print_json"):
+            return persona_bringup.main(
+                ["consume", "--persona", "recovery", "--state-dir", str(state_dir)]
+            )
+
+    def _run_consume_viability_blocked(self, state_dir: Path) -> int:
+        """Same shape as ConsumeSoftFailureAlertStreak's helper of the same
+        name -- re-declared locally (test-class-scoped helpers, matching this
+        file's existing convention rather than sharing across classes)."""
+        report = types.SimpleNamespace(observations=[types.SimpleNamespace(status="ok")])
+        binding = types.SimpleNamespace(
+            persona="recovery", launch=types.SimpleNamespace(mode="interactive")
+        )
+        with mock.patch.object(persona_bringup, "load_binding", return_value=binding), \
+            mock.patch.object(
+                persona_bringup, "select_recorded_runtime_binding", return_value=binding
+            ), \
+            mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+            mock.patch.object(persona_bringup, "build_adapter", return_value=mock.Mock()), \
+            mock.patch.object(persona_bringup, "first_fallback_binding", return_value=None), \
+            mock.patch.object(persona_bringup, "runtime_reference", return_value="same"), \
+            mock.patch.object(
+                persona_bringup, "configured_runtime_bindings", return_value=[]
+            ), \
+            mock.patch.object(
+                persona_bringup,
+                "wake_persistent_runtime",
+                side_effect=runtime_controller.RuntimeViabilityBlocked(
+                    "initial-viability-state-not-selected", {}
+                ),
+            ), \
+            mock.patch.object(persona_bringup, "_print_json"):
+            return persona_bringup.main(
+                ["consume", "--persona", "recovery", "--state-dir", str(state_dir)]
+            )
+
+    def _run_consume_transport_error(self, state_dir: Path) -> int:
+        report = types.SimpleNamespace(observations=[types.SimpleNamespace(status="ok")])
+        binding = types.SimpleNamespace(
+            persona="recovery", launch=types.SimpleNamespace(mode="batch")
+        )
+        with mock.patch.object(persona_bringup, "load_binding", return_value=binding), \
+            mock.patch.object(
+                persona_bringup, "select_recorded_runtime_binding", return_value=binding
+            ), \
+            mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+            mock.patch.object(persona_bringup, "build_adapter", return_value=mock.Mock()), \
+            mock.patch.object(persona_bringup, "first_fallback_binding", return_value=None), \
+            mock.patch.object(persona_bringup, "runtime_reference", return_value="same"), \
+            mock.patch.object(
+                persona_bringup,
+                "consume_persona_mailbox",
+                side_effect=OSError("connection refused"),
+            ), \
+            mock.patch.object(persona_bringup, "_print_json"):
+            return persona_bringup.main(
+                ["consume", "--persona", "recovery", "--state-dir", str(state_dir)]
+            )
+
+    def _run_consume_stats_errors(self, state_dir: Path) -> int:
+        report = types.SimpleNamespace(observations=[types.SimpleNamespace(status="ok")])
+        binding = types.SimpleNamespace(
+            persona="recovery", launch=types.SimpleNamespace(mode="batch")
+        )
+        with mock.patch.object(persona_bringup, "load_binding", return_value=binding), \
+            mock.patch.object(
+                persona_bringup, "select_recorded_runtime_binding", return_value=binding
+            ), \
+            mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+            mock.patch.object(persona_bringup, "build_adapter", return_value=mock.Mock()), \
+            mock.patch.object(persona_bringup, "first_fallback_binding", return_value=None), \
+            mock.patch.object(persona_bringup, "runtime_reference", return_value="same"), \
+            mock.patch.object(
+                persona_bringup,
+                "consume_persona_mailbox",
+                return_value=({"errors": ["boom"]}, []),
+            ), \
+            mock.patch.object(persona_bringup, "_print_json"):
+            return persona_bringup.main(
+                ["consume", "--persona", "recovery", "--state-dir", str(state_dir)]
+            )
+
+    def _run_consume_success(self, state_dir: Path) -> int:
+        report = types.SimpleNamespace(observations=[types.SimpleNamespace(status="ok")])
+        binding = types.SimpleNamespace(
+            persona="recovery", launch=types.SimpleNamespace(mode="batch")
+        )
+        with mock.patch.object(persona_bringup, "load_binding", return_value=binding), \
+            mock.patch.object(
+                persona_bringup, "select_recorded_runtime_binding", return_value=binding
+            ), \
+            mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+            mock.patch.object(persona_bringup, "build_adapter", return_value=mock.Mock()), \
+            mock.patch.object(persona_bringup, "first_fallback_binding", return_value=None), \
+            mock.patch.object(persona_bringup, "runtime_reference", return_value="same"), \
+            mock.patch.object(
+                persona_bringup, "consume_persona_mailbox", return_value=({}, [])
+            ), \
+            mock.patch.object(persona_bringup, "_print_json"):
+            return persona_bringup.main(
+                ["consume", "--persona", "recovery", "--state-dir", str(state_dir)]
+            )
+
+    def test_each_of_four_skip_paths_bumps_its_own_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            self.assertEqual(self._run_consume_transition_pending(sd), 0)
+            state = load_policy_skip(sd, "recovery")
+            self.assertEqual(state["reason"], "runtime_transition")
+            self.assertEqual(state["count"], 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            self.assertEqual(self._run_consume_quota_exhausted(sd), 0)
+            state = load_policy_skip(sd, "recovery")
+            self.assertEqual(state["reason"], "quota_breaker_open")
+            self.assertEqual(state["count"], 1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            self.assertEqual(self._run_consume_viability_blocked(sd), 5)
+            self.assertEqual(self._run_consume_viability_blocked(sd), 5)
+            state = load_policy_skip(sd, "recovery")
+            self.assertEqual(state["reason"], "runtime_viability_blocked")
+            self.assertEqual(state["count"], 2)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            # backoff-skip: the OSError fire sets backoff (streak 1, GENUINE
+            # failure -> policy_skip stays absent); the NEXT fire lands
+            # inside the backoff window and IS the policy skip.
+            self.assertEqual(self._run_consume_transport_error(sd), 5)
+            self.assertEqual(load_policy_skip(sd, "recovery"), {})
+            self.assertEqual(self._run_consume_transport_error(sd), 0)
+            state = load_policy_skip(sd, "recovery")
+            self.assertEqual(state["reason"], "backoff")
+            self.assertEqual(state["count"], 1)
+
+    def test_reason_change_resets_the_streak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            self._run_consume_viability_blocked(sd)
+            self._run_consume_viability_blocked(sd)
+            self.assertEqual(load_policy_skip(sd, "recovery")["count"], 2)
+            self._run_consume_transition_pending(sd)
+            state = load_policy_skip(sd, "recovery")
+            self.assertEqual(state["reason"], "runtime_transition")
+            self.assertEqual(state["count"], 1)
+
+    def test_success_clears_the_streak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            self._run_consume_viability_blocked(sd)
+            self.assertNotEqual(load_policy_skip(sd, "recovery"), {})
+            self.assertEqual(self._run_consume_success(sd), 0)
+            self.assertEqual(load_policy_skip(sd, "recovery"), {})
+
+    def test_transport_error_clears_the_streak(self) -> None:
+        # A genuine (non-policy) transport failure means the attempt stage
+        # was reached and reached PAST the policy gate -- the policy-skip
+        # streak no longer describes this seat, so it must clear (T-3210).
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            self._run_consume_viability_blocked(sd)
+            self.assertNotEqual(load_policy_skip(sd, "recovery"), {})
+            self.assertEqual(self._run_consume_transport_error(sd), 5)
+            self.assertEqual(load_policy_skip(sd, "recovery"), {})
+
+    def test_stats_errors_path_clears_the_streak(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            self._run_consume_viability_blocked(sd)
+            self.assertNotEqual(load_policy_skip(sd, "recovery"), {})
+            self.assertEqual(self._run_consume_stats_errors(sd), 4)
+            self.assertEqual(load_policy_skip(sd, "recovery"), {})
+
+    def test_diag_fail_leaves_the_streak_untouched(self) -> None:
+        # The diagnostics gate (exit-3) returns BEFORE the policy-skip gate
+        # is ever reached -- it must neither bump nor clear.
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            self._run_consume_viability_blocked(sd)
+            before = load_policy_skip(sd, "recovery")
+            report = types.SimpleNamespace(observations=[types.SimpleNamespace(status="fail")])
+            binding = types.SimpleNamespace(persona="recovery")
+            with mock.patch.object(persona_bringup, "load_binding", return_value=binding), \
+                mock.patch.object(
+                    persona_bringup, "select_recorded_runtime_binding", return_value=binding
+                ), \
+                mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+                mock.patch.object(persona_bringup, "_print_json"):
+                self.assertEqual(
+                    persona_bringup.main(
+                        ["consume", "--persona", "recovery", "--state-dir", str(sd)]
+                    ),
+                    3,
+                )
+            self.assertEqual(load_policy_skip(sd, "recovery"), before)
+
+    def test_payload_carries_running_count_and_since(self) -> None:
+        # T-3210 scope (a): "the journal line itself says '27 consecutive
+        # skips since <ts>'" -- assert the _print_json payload actually
+        # carries the running count + since, not just the state file.
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            report = types.SimpleNamespace(observations=[types.SimpleNamespace(status="ok")])
+            binding = types.SimpleNamespace(
+                persona="recovery", launch=types.SimpleNamespace(mode="interactive")
+            )
+            captured: dict = {}
+
+            def _capture(payload):
+                captured.update(payload)
+
+            with mock.patch.object(persona_bringup, "load_binding", return_value=binding), \
+                mock.patch.object(
+                    persona_bringup, "select_recorded_runtime_binding", return_value=binding
+                ), \
+                mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+                mock.patch.object(persona_bringup, "build_adapter", return_value=mock.Mock()), \
+                mock.patch.object(persona_bringup, "first_fallback_binding", return_value=None), \
+                mock.patch.object(persona_bringup, "runtime_reference", return_value="same"), \
+                mock.patch.object(
+                    persona_bringup, "configured_runtime_bindings", return_value=[]
+                ), \
+                mock.patch.object(
+                    persona_bringup,
+                    "wake_persistent_runtime",
+                    side_effect=runtime_controller.RuntimeViabilityBlocked(
+                        "initial-viability-state-not-selected", {}
+                    ),
+                ), \
+                mock.patch.object(persona_bringup, "_print_json", side_effect=_capture):
+                persona_bringup.main(
+                    ["consume", "--persona", "recovery", "--state-dir", str(sd)]
+                )
+            streak = captured["consume"]["policy_skip_streak"]
+            self.assertEqual(streak["count"], 1)
+            self.assertIn("since", streak)
 
 
 if __name__ == "__main__":

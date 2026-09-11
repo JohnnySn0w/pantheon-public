@@ -1,7 +1,7 @@
 # SOP — Codex planning-phase spec review (ORG-041 wiring)
 
 **Status:** Adopted 2026-07-12 (HO, below-goal per msg-3733 principles-as-ratification; prompted by the operator TG 5757 after the T-1633 arc shipped without this step and a post-hoc review found a BLOCKS-PILOT defect).
-**Backing ADR:** `adr/ORG-041-codex-planning-phase-spec-review.md` (ratified TG 5624) — the ADR names the capability; this SOP wires it into the dispatch flow.
+**Backing ADR:** `architecture/adr/ORG-041-codex-planning-phase-spec-review.md` (ratified TG 5624) — the ADR names the capability; this SOP wires it into the dispatch flow.
 
 ## When it fires (dispatcher checklist item)
 
@@ -19,6 +19,7 @@ Single bounded tickets (one file, no new component, no third-party surface) are 
 
 - Tool: `mcp__pantheon-mcp-codex__codex_second_opinion`, model per ORG-041's ratified review slug (2026-07: `gpt-5.5`).
 - Brief shape (learned T-1689): **terse, numbered, falsifiable questions** — wire shapes, ordering hazards, rollback/state gaps, OS/systemd semantics. Ask for DEFECT/OK per item + severity (BLOCKS / FIX-SOON / NOTE). Long discursive briefs time out (~120s wrapper limit); two focused questions beat ten broad ones. Pass the primary artifact via `context_path` (file, not dir).
+- **Critiques anchor to a named layer of concern** (added 2026-08-26, HO-drafted below-goal per the operator TG 8590; established through the T-3272/T-3273 germination-engine ADR arc where v8-v9 review rounds surfaced kernel/POSIX-tier and systemd-substrate-tier provider-facts that ADR-prose iteration cannot mechanically discover-in-advance even after explicit scoping each round). The dispatch brief MUST name a working layer taxonomy — typically {kernel/POSIX-tier, systemd-substrate-tier, process-state-machine-tier, interaction-protocol-tier, architectural-prose-tier, principle-purpose-tier} for infra-adjacent reviews, adjust for other domains — and require each finding to declare which layer it belongs to. Findings that surface a layer the target artifact cannot mechanically carry (e.g. kernel/POSIX-tier provider-facts against an architectural-prose-tier ADR) get an explicit `process_disposition` of `push-to-code / implementation-deferred to <reference-implementation-path>` rather than a REBOUND the prose tier cannot fold. REBOUND is reserved for findings the target artifact's native tier can actually carry (for an ADR: MUST/MUST-NOT inconsistency, responsibility partition drawn wrong, reference-to-nonexistent-authority, principle-purpose-tier conflict). Without this discipline, review is unbounded — as the operator named it: "a rhetoric engine could poke holes forever, or an engineer could polish something forever." Naming the layers bounds the review to what the artifact tier can actually resolve. See `lessons/operator-theories/2026-08-26-intuition-anchor-plus-giants-methodology.md` for the layer-methodology framing (Marr/Parnas/VSM/Dennett/Ryle/Rasmussen giants-shortlist).
 - Codex is a **detail-checker, not a decider** (see `reference_codex_second_opinion_fit`): its "could not verify" means unverified, not wrong; its DEFECT claims get verified against primary sources or empirically before acting.
 
 ## What happens with findings

@@ -62,6 +62,21 @@ MODAL_TEXT = (
 
 NOT_MODAL_TEXT = "plain text with no frame or composer glyph\n"
 
+READY_COMPOSER_0147_NO_MODAL = (
+    "╭─────────────────────────────╮\n"
+    "│ >_ OpenAI Codex (v0.147.0)  │\n"
+    "│                             │\n"
+    "│ model:     gpt-5.5          │\n"
+    "│ directory: /tmp/t2953-r25   │\n"
+    "╰─────────────────────────────╯\n"
+    "\n"
+    "› Use /skills to list available skills\n"
+    "\n"
+    "  gpt-5.5 default · /tmp/t2953-r25\n"
+)
+
+MALFORMED_READYISH_TEXT = "OpenAI Codex v0.147.0\n› prompt without frame\n"
+
 
 # --------------------------------------------------------------------------- #
 # Gate 1 -- _await_modal_present.                                            #
@@ -114,7 +129,10 @@ class AwaitModalPresentTest(unittest.TestCase):
 class CodexRcReadyStatusTest(unittest.TestCase):
     def test_real_cli_and_ready_reads_proven(self) -> None:
         self.assertEqual(
-            m.codex_rc_ready_status({"mode": "real-cli", "ready": True}), "proven",
+            m.codex_rc_ready_status(
+                {"mode": "real-cli", "ready": True, "rc_ready_outcome": "dismissal_not_needed"}
+            ),
+            "proven",
         )
 
     def test_real_cli_but_not_ready_reads_deferred(self) -> None:
@@ -278,6 +296,188 @@ class DriverRoutesThroughRealEntrypointTest(unittest.TestCase):
         self.assertFalse(evidence["dismissed_via_rc"])
         self.assertFalse(evidence["ready"])
         self.assertEqual(m.codex_rc_ready_status({**evidence, "mode": "real-cli"}), "deferred")
+
+
+class CodexRcReadyOutcomeTest(unittest.TestCase):
+    def _fake_driver_context(self, tmp: str, target: TmuxTarget, *, executable: Path) -> tuple[Path, object]:
+        work_root = Path(tmp) / "work"
+        fake_binding = SimpleNamespace(
+            controller=SimpleNamespace(tmux=target),
+            account_home=Path(tmp) / "account-home",
+            persona="fake-persona",
+            launch=SimpleNamespace(harness="codex"),
+        )
+
+        class FakeAdapter:
+            def build_interactive_launch(self, _target: TmuxTarget, *, cwd: Path) -> object:
+                return SimpleNamespace(cwd=work_root, argv=(str(executable),), env={})
+
+        return work_root, fake_binding, FakeAdapter()
+
+    def test_codex_rc_ready_accepts_real_cli_ready_composer_when_update_modal_not_offered(self) -> None:
+        target = TmuxTarget(session="s", window="w", pane="0")
+        fake_readiness = rc.RuntimeInputReadiness(
+            ready=True,
+            pane_sha256="readyhash",
+            reason="runtime input readiness confirmed",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "codex"
+            executable.write_text("#!/bin/sh\nprintf 'codex-cli 0.147.0\\n'\n", encoding="utf-8")
+            executable.chmod(0o755)
+            work_root, fake_binding, fake_adapter = self._fake_driver_context(
+                tmp, target, executable=executable,
+            )
+            with mock.patch.object(m.persona_bringup, "load_binding", return_value=fake_binding), \
+                 mock.patch.object(m.persona_bringup, "build_adapter", return_value=fake_adapter), \
+                 mock.patch.object(
+                     rc,
+                     "_start_runtime",
+                     return_value=rc.RuntimeStart(scope_unit="fake.scope", created_scope=True),
+                 ), \
+                 mock.patch.object(rc, "_verify_started_runtime", return_value=None), \
+                 mock.patch.object(
+                     rc, "_capture_visible_runtime_pane", return_value=READY_COMPOSER_0147_NO_MODAL,
+                 ), \
+                 mock.patch.object(
+                     rc, "_wait_for_runtime_input_ready", return_value=fake_readiness,
+                 ), \
+                 mock.patch.object(m, "_teardown_disposable_tmux_context", return_value=[]):
+                evidence = m.run_codex_rc_ready_bringup(
+                    work_root=work_root,
+                    account="testaccount",
+                    codex_executable=executable,
+                )
+        self.assertEqual(evidence["rc_ready_outcome"], "dismissal_not_needed")
+        self.assertTrue(evidence["ready"])
+        self.assertEqual(m.codex_rc_ready_status(evidence), "proven")
+
+    def test_codex_rc_ready_requires_rc_dismissal_when_update_modal_is_present(self) -> None:
+        target = TmuxTarget(session="s", window="w", pane="0")
+        fake_readiness = rc.RuntimeInputReadiness(
+            ready=True,
+            pane_sha256="readyhash",
+            reason="runtime input readiness confirmed",
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "codex"
+            executable.write_text("#!/bin/sh\nprintf 'codex-cli 0.148.1\\n'\n", encoding="utf-8")
+            executable.chmod(0o755)
+            work_root, fake_binding, fake_adapter = self._fake_driver_context(
+                tmp, target, executable=executable,
+            )
+            with mock.patch.object(m.persona_bringup, "load_binding", return_value=fake_binding), \
+                 mock.patch.object(m.persona_bringup, "build_adapter", return_value=fake_adapter), \
+                 mock.patch.object(
+                     rc,
+                     "_start_runtime",
+                     return_value=rc.RuntimeStart(scope_unit="fake.scope", created_scope=True),
+                 ), \
+                 mock.patch.object(rc, "_verify_started_runtime", return_value=None), \
+                 mock.patch.object(rc, "_capture_visible_runtime_pane", return_value=MODAL_TEXT), \
+                 mock.patch.object(
+                     rc, "_wait_for_runtime_input_ready", return_value=fake_readiness,
+                 ), \
+                 mock.patch.object(m, "_teardown_disposable_tmux_context", return_value=[]):
+                evidence = m.run_codex_rc_ready_bringup(
+                    work_root=work_root,
+                    account="testaccount",
+                    codex_executable=executable,
+                )
+        self.assertEqual(evidence["rc_ready_outcome"], "failed")
+        self.assertFalse(evidence["ready"])
+        self.assertEqual(m.codex_rc_ready_status(evidence), "deferred")
+
+    def test_codex_rc_ready_rejects_hidden_unknown_malformed_or_version_mismatch(self) -> None:
+        target = TmuxTarget(session="s", window="w", pane="0")
+        fake_readiness = rc.RuntimeInputReadiness(
+            ready=True,
+            pane_sha256="readyhash",
+            reason="runtime input readiness confirmed",
+        )
+        for pane_text, version_text in (
+            ("", "codex-cli 0.147.0\n"),
+            (MALFORMED_READYISH_TEXT, "codex-cli 0.147.0\n"),
+            (READY_COMPOSER_0147_NO_MODAL, "not a codex version\n"),
+        ):
+            with self.subTest(pane=repr(pane_text), version=version_text.strip()):
+                with tempfile.TemporaryDirectory() as tmp:
+                    executable = Path(tmp) / "codex"
+                    executable.write_text(
+                        f"#!/bin/sh\nprintf {version_text!r}\n", encoding="utf-8",
+                    )
+                    executable.chmod(0o755)
+                    work_root, fake_binding, fake_adapter = self._fake_driver_context(
+                        tmp, target, executable=executable,
+                    )
+                    with mock.patch.object(m.persona_bringup, "load_binding", return_value=fake_binding), \
+                         mock.patch.object(m.persona_bringup, "build_adapter", return_value=fake_adapter), \
+                         mock.patch.object(
+                             rc,
+                             "_start_runtime",
+                             return_value=rc.RuntimeStart(scope_unit="fake.scope", created_scope=True),
+                         ), \
+                         mock.patch.object(rc, "_verify_started_runtime", return_value=None), \
+                         mock.patch.object(rc, "_capture_visible_runtime_pane", return_value=pane_text), \
+                         mock.patch.object(
+                             rc, "_wait_for_runtime_input_ready", return_value=fake_readiness,
+                         ), \
+                         mock.patch.object(m, "_teardown_disposable_tmux_context", return_value=[]):
+                        evidence = m.run_codex_rc_ready_bringup(
+                            work_root=work_root,
+                            account="testaccount",
+                            codex_executable=executable,
+                        )
+                self.assertEqual(evidence["rc_ready_outcome"], "failed")
+                self.assertFalse(evidence["ready"])
+
+    def test_version_timeout_and_executable_path_mismatch_are_typed_rejections(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            executable = Path(tmp) / "codex"
+            executable.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+            executable.chmod(0o755)
+            evidence = m.collect_codex_executable_version_evidence(executable, timeout_s=0.01)
+            self.assertTrue(evidence.timed_out)
+            self.assertFalse(evidence.ok)
+            readiness = rc.RuntimeInputReadiness(
+                ready=True,
+                pane_sha256="readyhash",
+                reason="runtime input readiness confirmed",
+            )
+            outcome, reason = m._classify_rc_ready_outcome(
+                mode=m._MODE_REAL_CLI,
+                codex_executable=executable,
+                version_evidence=evidence,
+                captured_samples=[READY_COMPOSER_0147_NO_MODAL],
+                readiness=readiness,
+                update_dismiss_call_count=0,
+            )
+            self.assertEqual(outcome, "failed")
+            self.assertIn("timed out", reason)
+
+            mismatch = m.CodexExecutableVersionEvidence(
+                executable=Path(tmp) / "other-codex",
+                argv=(str(Path(tmp) / "other-codex"), "--version"),
+                returncode=0,
+                stdout_sha256="0" * 64,
+                stderr_sha256=None,
+                stdout_excerpt="codex-cli 0.148.0\n",
+                stderr_excerpt="",
+                parsed_semver="0.148.0",
+                timed_out=False,
+                ok=True,
+                reason="version evidence parsed",
+            )
+            outcome, reason = m._classify_rc_ready_outcome(
+                mode=m._MODE_REAL_CLI,
+                codex_executable=executable,
+                version_evidence=mismatch,
+                captured_samples=[READY_COMPOSER_0147_NO_MODAL],
+                readiness=readiness,
+                update_dismiss_call_count=0,
+            )
+            self.assertEqual(outcome, "failed")
+            self.assertIn("does not match", reason)
 
 
 # --------------------------------------------------------------------------- #

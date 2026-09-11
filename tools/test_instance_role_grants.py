@@ -39,11 +39,17 @@ Guard F (T-2316) — why the SYNC guards are not enough on their own:
 
 from __future__ import annotations
 
+import re
+import sys
 import unittest
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTANCE_YAML = REPO_ROOT / "instance.yaml"
+
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+from tools._snapshot_site_scan import SnapshotSiteScanner  # noqa: E402
 
 # The three bindings ruled by the T-1922 HO ruling (ORG-043 seats + ORG-042 second head).
 T1922_BINDINGS = {
@@ -255,35 +261,46 @@ class TestBindingFallbackStaysInSync(unittest.TestCase):
 
 
 class TestSupervisorField(unittest.TestCase):
-    """T-2658: specialist is marked control-plane-supervised; T-2684 adds recovery.
-    Every other bound persona stays unmarked (implicit "bespoke" default,
-    additive-only)."""
+    """T-2658: specialist is marked control-plane-supervised. T-2684 briefly marked
+    recovery control-plane too, but T-3082 reverted that (2026-08-23): recovery's
+    control-plane cutover (T-2590) covers only the consume plane -- the
+    interactive session still lives on the bespoke claude-telegram-fallback.
+    service, so the T-2684 marking made cfm/restart_drain derive a restart
+    target (the oneshot consume unit) that cannot cycle recovery's session.
+    T-3026 (the interactive-session cutover) will re-add the marking once
+    that move actually lands. T-2953 R31 briefly marked orchestrator control-plane
+    too, but T-3098 reverted that (2026-08-23) for the identical reason --
+    orchestrator's interactive session still lives on the bespoke claude-telegram.
+    service pre-cutover; T-2953's full cutover will re-add the marking once
+    it lands. Every other bound persona stays unmarked (implicit "bespoke"
+    default, additive-only)."""
 
     def test_specialist_is_control_plane(self) -> None:
         from tools.agent_role_map import instance_binding
 
         self.assertEqual(instance_binding("specialist").get("supervisor"), "control-plane")
 
-    def test_recovery_is_control_plane(self) -> None:
-        """T-2684: recovery's control-plane cutover (T-2590) is mechanically
-        complete; this makes the declaration match, closing the T-2671/
-        T-2682 landmine (restart_drain/cfm both keyed on this field and
-        missed recovery, targeting the disabled bespoke unit)."""
+    def test_recovery_is_not_control_plane_pre_t3026(self) -> None:
+        """T-3082: recovery's binding must NOT claim control-plane until T-3026's
+        interactive-session cutover actually lands -- pre-cutover the live
+        session is the bespoke claude-telegram-fallback.service, so a
+        control-plane marking makes cfm derive the oneshot consume unit as
+        the restart target, which cannot cycle that session (the T-3082
+        bug). Absence here is the truthful, pre-cutover binding."""
         from tools.agent_role_map import instance_binding
 
-        self.assertEqual(instance_binding("recovery").get("supervisor"), "control-plane")
+        self.assertIsNone(instance_binding("recovery").get("supervisor"))
 
-    def test_orchestrator_has_no_supervisor_key(self) -> None:
-        """Additive-only: seats not cut over must not gain a stray key that
-        could accidentally flip restart_drain.py / context_fill_monitor.py
-        onto the control-plane branch for a still-bespoke seat."""
+    def test_orchestrator_is_not_control_plane_pre_t2953(self) -> None:
+        """T-3098: orchestrator's binding must NOT claim control-plane until T-2953's
+        full cutover actually lands -- pre-cutover the live session is the
+        bespoke claude-telegram.service, so a control-plane marking makes cfm
+        derive the oneshot consume unit as the restart target, which cannot
+        cycle that session (the T-3098 bug, mirrors T-3082's recovery shape).
+        Absence here is the truthful, pre-cutover binding."""
         from tools.agent_role_map import instance_binding
 
-        self.assertNotIn(
-            "supervisor",
-            instance_binding("orchestrator"),
-            "orchestrator must stay bespoke (no supervisor key) until its own cutover",
-        )
+        self.assertIsNone(instance_binding("orchestrator").get("supervisor"))
 
     def test_control_plane_consume_service_derives_from_persona(self) -> None:
         from tools.agent_role_map import control_plane_consume_service
@@ -343,9 +360,23 @@ def _manifest_companion_units(binding: dict) -> str:
     return " ".join(pairs)
 
 
+_EXPECTED_POLICY_SKIP_RE = re.compile(r"^[a-z0-9_-]+$")
+
+
+def _manifest_expected_policy_skip(binding: dict) -> str | None:
+    """persona's expected_policy_skip, validated EXACTLY as agent_role_map
+    does -- a reason-match token, not a free-text label (T-3210).
+    Independently re-implemented (not imported), same reason as the rest of
+    this witness: see the module-level comment above _RESTART_KEYS."""
+    raw = binding.get("expected_policy_skip")
+    if not isinstance(raw, str) or not raw:
+        return None
+    return raw if _EXPECTED_POLICY_SKIP_RE.match(raw) else None
+
+
 def _manifest_binding_map(instance) -> dict[str, dict]:
-    """persona → {account[, restart_*, companion_units]}, read straight out of
-    a parsed instance.yaml."""
+    """persona → {account[, restart_*, companion_units, expected_policy_skip]},
+    read straight out of a parsed instance.yaml."""
     out: dict[str, dict] = {}
     for _role_key, binding in ((instance or {}).get("roles") or {}).items():
         if not isinstance(binding, dict):
@@ -361,6 +392,9 @@ def _manifest_binding_map(instance) -> dict[str, dict]:
         companion_units = _manifest_companion_units(binding)
         if companion_units:
             entry["companion_units"] = companion_units
+        expected_policy_skip = _manifest_expected_policy_skip(binding)
+        if expected_policy_skip:
+            entry["expected_policy_skip"] = expected_policy_skip
         out[persona] = entry
     return out
 
@@ -867,6 +901,805 @@ class TestManifestWasActuallyLoaded(unittest.TestCase):
 
             self.assertEqual(_load_instance_role_map(missing), _FALLBACK_PERSONA_TO_INSTANCE_ROLE)
             self.assertEqual(_load_instance_bindings(missing), _FALLBACK_PERSONA_TO_BINDING)
+
+
+# ---------------------------------------------------------------------------
+# T-2365 — the SIBLING-axis CONSUMER hop.
+#
+# Guard F above proves instance.yaml reaches agent_role_map's accessors —
+# resolve_instance_role() / instance_binding() / the account-map trio — and
+# stops there, and says so (see F6's DEAD-DELIVERY scope note). T-2334
+# (test_account_persona_map.TestConsumersFollowThePerturbedManifest) carried the
+# ACCOUNT axis one hop further, to the module constants that snapshot
+# account_persona_map() / fleet_accounts() at import. Nothing carried the
+# instance_binding() SIBLING axis that far. Two fleet monitors snapshot it AT
+# IMPORT TIME:
+#     context_fill_monitor.AGENT_CONFIG    = _build_agent_config()   (6 entries)
+#     restart_drain.DRAIN_AGENT_CONFIG     = _build_drain_config()   (grantees)
+# Re-enumerate either as a hand-written literal and the manifest genuinely stops
+# reaching the monitor with every suite green — the monitor then reads jsonl from,
+# restarts the service of, and pokes the pane of a seat the manifest no longer
+# says it should. That is the T-2313 silent-skip class with a restart attached.
+#
+# WHY A SUBPROCESS AND NOT _module_against_perturbed_manifest. That importer works
+# for agent_role_map ALONE because it has no intra-repo imports, so a single copied
+# file is the whole module. These two consumers do `from tools.agent_role_map
+# import instance_binding`, which in THIS process resolves out of sys.modules to
+# the REAL module reading the REAL manifest — copying one file cannot redirect it.
+# So this mirrors T-2334's mechanism exactly: a materialised tools/ tree plus a
+# PERTURBED copy of instance.yaml (via _write_perturbed_manifest, shared so there
+# is one definition of "perturbed"), each consumer imported in a subprocess rooted
+# there with PYTHONPATH cleared. Not a divergent mechanism — the same one, one axis
+# over. (The subprocess _run helper is re-stated here rather than imported from
+# test_account_persona_map, which already imports _write_perturbed_manifest FROM
+# this file; importing back the other way would be a circular import.)
+#
+# TWO SITES, DIFFERENT SHAPES, PER-CATEGORY ASSERTIONS — NOT one table twice.
+# WITHIN a single entry the fields split three ways (atlas's T-2365 analysis), and
+# only two of the three may follow a perturbed manifest:
+#   1. BINDING-DERIVED, ACCOUNT-CARRYING (sudo_user, jsonl_dir, handoff_file,
+#      restart_bin, supervise_script prefix) — the perturbed account MUST appear and
+#      the live account must NOT. This is the only category that proves liveness,
+#      because _write_perturbed_manifest perturbs the ACCOUNT (and role-key), and a
+#      re-enumerated literal carries the OLD, unsuffixed account.
+#   2. BINDING-DERIVED, NON-ACCOUNT (restart_service, restart_mode,
+#      restart_target_pane, supervisor) — from the binding but NOT perturbed, so
+#      asserting them proves shape/derivation, not liveness. Checked, but never
+#      leaned on for the "manifest reached it" claim, and asserted to NOT carry the
+#      probe suffix.
+#   3. MONITOR-OWNED TUNING (context_window, model_pin, observation_only, …) — keyed
+#      by PERSONA in _MONITOR_TUNING, not in the manifest at all. Asserted to be
+#      UNCHANGED under perturbation: if tuning ever started following the manifest,
+#      persona-keyed monitor config would have been wired into the identity manifest,
+#      its own defect. A positive assertion, not a tolerated gap.
+#
+# restart_drain.DRAIN_AGENT_CONFIG's ACCOUNT hop is ALSO guarded by T-2334
+# (test_restart_drain_agent_config_follows_the_manifest) — it crossed onto the
+# account axis at T-2370 when it began binding account_persona_map() at import. It
+# is re-guarded here on the SIBLING axis it also consumes (instance_binding() for
+# restart_service/mode/pane), so the axis this file owns has its own falsifiable
+# detector rather than depending on a test in the account-axis file. AGENT_CONFIG
+# is the genuinely-unguarded consumer this ticket exists for.
+# ---------------------------------------------------------------------------
+
+# Category-3 keys: monitor-owned tuning, keyed by persona in _MONITOR_TUNING, never
+# in instance.yaml. Re-stated here (not imported from context_fill_monitor) so a
+# change to the module's tuning set does not silently redefine what this guard
+# treats as "must NOT follow the manifest".
+_MONITOR_TUNING_KEYS = frozenset(
+    {"context_window", "model_pin", "observation_only", "remediate", "hook_check_via_recovery", "use_tombstone"}
+)
+
+
+def _consumer_probe_body(symbol: str) -> str:
+    """Child-process source that encodes the dict-of-dict constant *symbol* (bound to
+    `m`) as JSON, str()-ing every leaf so Path / int / bool values survive the hop."""
+    return (
+        f"value = getattr(m, {symbol!r})\n"
+        "enc = {k: {kk: str(vv) for kk, vv in v.items()} for k, v in value.items()}\n"
+        "print('@@' + json.dumps(enc, sort_keys=True))\n"
+    )
+
+
+class TestFleetMonitorConsumersFollowThePerturbedManifest(unittest.TestCase):
+    """T-2365 — instance_binding() reaches the fleet monitors' import-time snapshots.
+
+    See the block comment above for the mechanism and the three field categories.
+    One test per site, each with its own expected values written for that site's
+    shape; the mechanics (perturbed tree, subprocess probe) are shared, the
+    expectations are not.
+    """
+
+    maxDiff = None
+    _PROBE_MODES = ("package", "script")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import shutil
+        import tempfile
+
+        if not INSTANCE_YAML.exists():  # pragma: no cover - manifest-less env
+            raise unittest.SkipTest(
+                "no live instance.yaml to perturb — a manifest-less environment is supported "
+                "(the fallbacks exist for it) and this guard has nothing to compare against"
+            )
+        cls.root = Path(tempfile.mkdtemp(prefix="t2365-consumers-"))
+        cls.addClassCleanup(shutil.rmtree, cls.root, True)
+        (cls.root / "tools").mkdir(parents=True, exist_ok=True)
+        # REAL copies of every tools/*.py, not symlinks: agent_role_map locates the manifest
+        # via Path(__file__).resolve(), which follows a symlink straight back to the live tree
+        # and would un-do the redirect. A consumer may import a sibling, so copy them all.
+        for src in (REPO_ROOT / "tools").glob("*.py"):
+            shutil.copyfile(src, cls.root / "tools" / src.name)
+        cls.perturbed = _write_perturbed_manifest(cls.root)
+        # persona -> {account, restart_service?, restart_mode?, restart_pane?, supervisor?},
+        # read from the LIVE file by this file's OWN independent witness parse (NOT the accessor
+        # the consumers call). Expected perturbed accounts are this witness's account + the probe
+        # suffix, which is exactly what _write_perturbed_manifest wrote — so a consumer answering
+        # with an unsuffixed (live) account fails, and the expected value is not laundered through
+        # the code under test.
+        cls.witness = _manifest_binding_map(_load_yaml(INSTANCE_YAML))
+
+    def _run(self, module: str, symbol: str, mode: str) -> dict:
+        """Import *module* from the perturbed tree in a subprocess and decode its constant."""
+        import json
+        import os
+        import subprocess
+        import sys
+
+        prelude = (
+            f"import tools.{module} as m\n" if mode == "package" else f"import {module} as m\n"
+        )
+        cwd = self.root if mode == "package" else self.root / "tools"
+        res = subprocess.run(
+            [sys.executable, "-c", "import json\n" + prelude + _consumer_probe_body(symbol)],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            # PYTHONPATH cleared so the LIVE repo cannot leak onto sys.path and serve the real
+            # manifest — that would make every assertion below green for the wrong tree.
+            env={**os.environ, "PYTHONPATH": ""},
+        )
+        self.assertEqual(
+            res.returncode,
+            0,
+            f"{module}.{symbol} [{mode}] failed to import against the perturbed tree:\n{res.stderr}",
+        )
+        payloads = [ln for ln in res.stdout.splitlines() if ln.startswith("@@")]
+        self.assertEqual(
+            len(payloads), 1, f"{module}.{symbol} [{mode}] emitted no probe payload:\n{res.stdout}"
+        )
+        return json.loads(payloads[0][2:])
+
+    def _probe_account(self, persona: str) -> str:
+        return self.witness[persona]["account"] + _PROBE_ACCOUNT_SUFFIX
+
+    def _live_home_segment(self, persona: str) -> str:
+        return f"/home/{self.witness[persona]['account']}/"
+
+    def test_context_fill_monitor_agent_config_follows_the_manifest(self) -> None:
+        """context_fill_monitor.AGENT_CONFIG — 6 entries, three field categories.
+
+        The PERSONA SET is monitor-owned (which seats cfm watches, from _MONITOR_TUNING),
+        NOT manifest-derived, so it is asserted stable under perturbation rather than pinned
+        to the manifest — pinning it would assert a property the manifest does not own. What
+        the manifest DOES own is every entry's account, which must arrive perturbed in the
+        account-carrying paths (category 1) and be absent from them as the live string.
+
+        metis/atlas carry ONLY sudo_user + jsonl_dir + tuning (no restart config); mnemosyne
+        has handoff_file but no restart_bin (observation_only suppresses the fire path);
+        orchestrator/specialist/recovery carry the full set. jsonl_dir's project slug is
+        -home-<account>-pantheon-config for a control-plane seat (specialist) and -home-<account>
+        otherwise — asserted exactly, per the witness's supervisor field.
+        """
+        from tools.context_fill_monitor import AGENT_CONFIG as live_config
+
+        for mode in self._PROBE_MODES:
+            with self.subTest(mode=mode):
+                config = self._run("context_fill_monitor", "AGENT_CONFIG", mode)
+
+                self.assertGreater(
+                    len(config),
+                    1,
+                    "AGENT_CONFIG built one entry or none against the perturbed tree — one "
+                    "seat's answer is not the fleet (T-2324: green because of where it ran).",
+                )
+                # The persona set is monitor-owned and manifest-independent: perturbing the
+                # manifest's accounts must not add or drop a watched seat.
+                self.assertEqual(
+                    set(config),
+                    set(live_config),
+                    "perturbing instance.yaml changed WHICH seats cfm watches — the persona set "
+                    "comes from _MONITOR_TUNING, not the manifest, and must not move.",
+                )
+
+                for persona, entry in config.items():
+                    self.assertIn(
+                        persona,
+                        self.witness,
+                        f"AGENT_CONFIG carries {persona!r}, absent from instance.yaml roles:",
+                    )
+                    pa = self._probe_account(persona)
+                    live_home = self._live_home_segment(persona)
+                    control_plane = self.witness[persona].get("supervisor") == "control-plane"
+
+                    # -- category 1: binding-derived, ACCOUNT-CARRYING (the liveness proof) --
+                    self.assertEqual(
+                        entry["sudo_user"],
+                        pa,
+                        f"{persona}: sudo_user did not follow the perturbed manifest account",
+                    )
+                    slug = f"-home-{pa}-pantheon-config" if control_plane else f"-home-{pa}"
+                    self.assertEqual(
+                        entry["jsonl_dir"],
+                        f"/home/{pa}/.claude/projects/{slug}",
+                        f"{persona}: jsonl_dir did not follow the perturbed account (cfm would "
+                        "watch the wrong project dir and never fire)",
+                    )
+                    if "handoff_file" in entry:
+                        self.assertEqual(entry["handoff_file"], f"/home/{pa}/HANDOFF.md")
+                    if "restart_bin" in entry:
+                        self.assertEqual(
+                            entry["restart_bin"],
+                            f"/home/{pa}/pantheon-config/tools/handoff_and_restart.sh",
+                        )
+                    if "supervise_script" in entry:
+                        # The script NAME is monitor-owned; only the /home/<account>/ prefix is
+                        # binding-derived, so prefix + not-live is the precise statement here.
+                        self.assertTrue(
+                            entry["supervise_script"].startswith(f"/home/{pa}/.local/bin/"),
+                            f"{persona}: supervise_script prefix did not follow the account: "
+                            f"{entry['supervise_script']}",
+                        )
+                    for field in ("sudo_user", "jsonl_dir", "handoff_file", "restart_bin",
+                                  "supervise_script"):
+                        if field in entry:
+                            self.assertNotIn(
+                                live_home,
+                                entry[field],
+                                f"{persona}: {field} carries the LIVE account {live_home!r} "
+                                "against a manifest that does not contain it — the account is "
+                                "a hand-literal, not derived",
+                            )
+
+                    # -- category 2: binding-derived, NON-account — must NOT carry the probe --
+                    for field in ("restart_service", "restart_mode", "restart_target_pane",
+                                  "supervisor"):
+                        if field in entry:
+                            self.assertNotIn(
+                                _PROBE_ACCOUNT_SUFFIX,
+                                entry[field],
+                                f"{persona}: {field} absorbed the account perturbation — it is "
+                                "derived from restart_service/mode/pane/supervisor, not account",
+                            )
+
+                    # -- category 3: monitor-owned tuning — must be UNCHANGED under perturbation --
+                    for key in _MONITOR_TUNING_KEYS:
+                        if key in entry:
+                            self.assertNotIn(
+                                _PROBE_ACCOUNT_SUFFIX,
+                                entry[key],
+                                f"{persona}: tuning key {key!r} followed the manifest — "
+                                "persona-keyed monitor config must never depend on it",
+                            )
+                            self.assertEqual(
+                                entry[key],
+                                str(live_config[persona][key]),
+                                f"{persona}: tuning key {key!r} differs between the real and the "
+                                "perturbed manifest — tuning is manifest-independent and must not",
+                            )
+
+    def test_restart_drain_agent_config_follows_the_manifest(self) -> None:
+        """restart_drain.DRAIN_AGENT_CONFIG — a DIFFERENT shape: keyed by the manifest's
+        restart_service grantees only, and carrying a persona-keyed restart_lockfile that
+        AGENT_CONFIG has no analogue of.
+
+        The KEY SET is manifest-derived here (unlike AGENT_CONFIG's monitor-owned set): exactly
+        the personas instance.yaml grants restart_service, computed from the witness. mnemosyne
+        is named explicitly — it is T-2370's measured casualty, dropped by a hand-carried
+        _DRAIN_PERSONAS tuple that contradicted the manifest and had its tombstones quarantined
+        as an unknown agent. handoff_file/restart_bin carry the perturbed account (liveness);
+        restart_lockfile is persona-keyed and asserted exactly; restart_service/mode/pane are
+        binding-derived-but-unperturbed and must not absorb the probe.
+        """
+        grantees = {p for p, b in self.witness.items() if "restart_service" in b}
+        self.assertIn(
+            "mnemosyne",
+            grantees,
+            "the live manifest no longer grants mnemosyne restart_service — the witness for "
+            "this test is stale (or T-2370's fix regressed in instance.yaml)",
+        )
+
+        for mode in self._PROBE_MODES:
+            with self.subTest(mode=mode):
+                config = self._run("restart_drain", "DRAIN_AGENT_CONFIG", mode)
+
+                self.assertEqual(
+                    set(config),
+                    grantees,
+                    "DRAIN_AGENT_CONFIG's key set is not exactly the manifest's restart_service "
+                    "grantees — a persona the manifest says is restartable is uncovered, or one "
+                    "it does not is carried (T-2370's shape).",
+                )
+                self.assertIn(
+                    "mnemosyne",
+                    config,
+                    "the drain no longer covers mnemosyne — T-2370's exact defect, its restart "
+                    "tombstones quarantined as an unknown agent",
+                )
+
+                for persona, entry in config.items():
+                    pa = self._probe_account(persona)
+                    live_home = self._live_home_segment(persona)
+                    control_plane = self.witness[persona].get("supervisor") == "control-plane"
+
+                    # -- category 1: account-carrying paths (the liveness proof) --
+                    self.assertEqual(entry["handoff_file"], f"/home/{pa}/HANDOFF.md")
+                    self.assertEqual(
+                        entry["restart_bin"],
+                        f"/home/{pa}/pantheon-config/tools/handoff_and_restart.sh",
+                    )
+                    self.assertNotIn(
+                        live_home,
+                        entry["handoff_file"] + entry["restart_bin"],
+                        f"{persona}: a home-rooted path carries the LIVE account against a "
+                        "manifest that does not contain it — the account is enumerated, not derived",
+                    )
+
+                    # restart_lockfile is PERSONA-keyed, not account-derived: exact, unperturbed.
+                    self.assertEqual(
+                        entry["restart_lockfile"], f"/tmp/handoff_and_restart_{persona}.lock"
+                    )
+
+                    # -- category 2: binding-derived, NON-account — checked, never leaned on --
+                    self.assertEqual(entry["restart_mode"], self.witness[persona].get("restart_mode", "user"))
+                    if "restart_pane" in self.witness[persona]:
+                        self.assertEqual(
+                            entry["restart_target_pane"], self.witness[persona]["restart_pane"]
+                        )
+                    self.assertNotIn(
+                        _PROBE_ACCOUNT_SUFFIX,
+                        entry["restart_service"],
+                        f"{persona}: restart_service absorbed the account perturbation — it is "
+                        "the manifest's service string (or the derived consume unit), not the account",
+                    )
+                    expected_service = (
+                        f"pantheon-persona-consume@{persona}.service"
+                        if control_plane
+                        else self.witness[persona]["restart_service"]
+                    )
+                    self.assertEqual(
+                        entry["restart_service"],
+                        expected_service,
+                        f"{persona}: restart_service is not the manifest's service string",
+                    )
+
+    def _assert_agent_config_reexport(self, module: str) -> None:
+        """A module that does `from context_fill_monitor import AGENT_CONFIG` RE-EXPORTS a
+        guarded snapshot (T-3573; the account axis's session_reset_reconcile is the same shape).
+        Re-enumerating that import as a hand-literal detaches it from the manifest while cfm's
+        own AGENT_CONFIG stays perfectly derived — so the sibling drift-scan flags the re-export
+        as its OWN site, and this asserts it still tracks the source under a perturbed manifest."""
+        for mode in self._PROBE_MODES:
+            with self.subTest(module=module, mode=mode):
+                reexport = self._run(module, "AGENT_CONFIG", mode)
+                source = self._run("context_fill_monitor", "AGENT_CONFIG", mode)
+                self.assertEqual(
+                    reexport,
+                    source,
+                    f"{module}.AGENT_CONFIG diverged from context_fill_monitor.AGENT_CONFIG "
+                    "against a perturbed manifest — it is re-enumerated as a literal, not "
+                    "re-exported, so the manifest no longer reaches it.",
+                )
+                self.assertTrue(
+                    reexport and any(
+                        _PROBE_ACCOUNT_SUFFIX in entry.get("sudo_user", "")
+                        for entry in reexport.values()
+                    ),
+                    f"{module}.AGENT_CONFIG carries no perturbed account — 'equals the source' "
+                    "must not be satisfiable by two identical LIVE literals.",
+                )
+
+    def test_channel_liveness_monitor_agent_config_reexports_the_manifest(self) -> None:
+        self._assert_agent_config_reexport("channel_liveness_monitor")
+
+    def test_hook_allowlist_lint_agent_config_reexports_the_manifest(self) -> None:
+        self._assert_agent_config_reexport("hook_allowlist_lint")
+
+
+# ---------------------------------------------------------------------------
+# T-3573 — fleet_health.FLEET: a sibling-axis import-time snapshot the enumeration missed.
+#
+# The T-2365 block above enumerated TWO instance_binding() consumers
+# (context_fill_monitor.AGENT_CONFIG, restart_drain.DRAIN_AGENT_CONFIG). The
+# automated scan below (TestEverySiblingSnapshotSiteIsGuarded) re-derives the set
+# from the source rather than trusting that enumeration — and it finds THREE more:
+# two AGENT_CONFIG re-exports (channel_liveness_monitor, hook_allowlist_lint,
+# guarded on the consumer class above) and this direct one —
+# fleet_health.FLEET binds instance_binding() at import through the module-scope
+# helper _liveness_services(persona, bespoke), which reads the persona's
+# `supervisor` marker to choose the consume TIMER (control-plane seat) over the
+# bespoke unit list. That is the exact "the enumeration was a starting point, not
+# a checklist" drift the scan exists to catch (same worked example as the account
+# axis's session_reset_reconcile, its seventh entry).
+#
+# WHY A DIFFERENT PERTURBATION. AGENT_CONFIG/DRAIN_AGENT_CONFIG carry
+# account-derived paths, so _write_perturbed_manifest (which suffixes the ACCOUNT
+# and role-key) moves them and proves liveness. FLEET carries NO account-derived
+# field — its `user`/`session` are hand-literals and its only manifest hop is the
+# `supervisor` marker, which _write_perturbed_manifest does NOT touch. So the
+# account perturbation leaves FLEET byte-identical and cannot tell a derived FLEET
+# from a re-enumerated literal. This guard perturbs the SUPERVISOR marker instead:
+# it flips a currently-bespoke seat (orchestrator) to control-plane in a copied manifest
+# and asserts FLEET's services for it become the derived consume timer. A FLEET
+# re-enumerated as a literal keeps the bespoke unit and reddens here — which is the
+# drift (a completed cutover flipping a seat's supervisor while fleet_health goes
+# on probing the retired bespoke unit and reporting a false verdict).
+#
+# Same mechanism family as T-2365: a materialised tools/ tree + a perturbed copy of
+# instance.yaml, fleet_health imported in a subprocess rooted there with PYTHONPATH
+# cleared, run in both package and script sys.path shapes.
+# ---------------------------------------------------------------------------
+
+_FLEET_HEALTH_FLIP_PERSONA = "orchestrator"  # bespoke pre-T-2953; a control-plane flip is observable
+
+
+class TestFleetHealthFleetFollowsTheSupervisorMarker(unittest.TestCase):
+    """T-3573 — fleet_health.FLEET follows instance.yaml's `supervisor` marker.
+
+    See the block comment above for why this perturbs `supervisor` rather than the
+    account. One subprocess per sys.path shape; the expectation is the derived
+    consume-timer name, which a hand-literal FLEET cannot reproduce under the flip.
+    """
+
+    maxDiff = None
+    _PROBE_MODES = ("package", "script")
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        import shutil
+        import tempfile
+
+        if not INSTANCE_YAML.exists():  # pragma: no cover - manifest-less env
+            raise unittest.SkipTest(
+                "no live instance.yaml to perturb — a manifest-less environment is supported "
+                "(the fallbacks exist for it) and this guard has nothing to compare against"
+            )
+        cls.witness = _manifest_binding_map(_load_yaml(INSTANCE_YAML))
+        # The flip is only meaningful if the seat is bespoke in the LIVE manifest.
+        if cls.witness.get(_FLEET_HEALTH_FLIP_PERSONA, {}).get("supervisor") == "control-plane":
+            raise unittest.SkipTest(
+                f"{_FLEET_HEALTH_FLIP_PERSONA} is already control-plane in the live manifest — "
+                "pick a seat that is bespoke pre-cutover so flipping supervisor is observable"
+            )
+        cls.root = Path(tempfile.mkdtemp(prefix="t3573-fleet-health-"))
+        cls.addClassCleanup(shutil.rmtree, cls.root, True)
+        (cls.root / "tools").mkdir(parents=True, exist_ok=True)
+        # REAL copies (not symlinks): agent_role_map locates the manifest via
+        # Path(__file__).resolve(), which follows a symlink back to the live tree and
+        # would un-do the redirect. A consumer may import a sibling, so copy them all.
+        for src in (REPO_ROOT / "tools").glob("*.py"):
+            shutil.copyfile(src, cls.root / "tools" / src.name)
+        cls._write_supervisor_flipped_manifest(cls.root, _FLEET_HEALTH_FLIP_PERSONA)
+
+    @staticmethod
+    def _write_supervisor_flipped_manifest(root: Path, flip_persona: str) -> None:
+        """Copy the live instance.yaml under *root*, marking *flip_persona*'s role
+        `supervisor: control-plane`. Accounts/role-keys are left UNtouched — this
+        guard isolates the supervisor hop FLEET actually reads."""
+        import yaml
+
+        instance = _load_yaml(INSTANCE_YAML)
+        roles = (instance or {}).get("roles") or {}
+        flipped = None
+        new_roles = {}
+        for role_key, binding in roles.items():
+            entry = dict(binding) if isinstance(binding, dict) else binding
+            if isinstance(entry, dict) and entry.get("persona") == flip_persona:
+                entry["supervisor"] = "control-plane"
+                flipped = role_key
+            new_roles[role_key] = entry
+        if flipped is None:
+            raise AssertionError(
+                f"live instance.yaml has no role bound to persona {flip_persona!r} to flip"
+            )
+        perturbed = dict(instance)
+        perturbed["roles"] = new_roles
+        (root / "instance.yaml").write_text(
+            yaml.safe_dump(perturbed, allow_unicode=True), encoding="utf-8"
+        )
+
+    def _run(self, mode: str) -> dict:
+        """Import fleet_health from the flipped tree in a subprocess; return FLEET."""
+        import json
+        import os
+        import subprocess
+
+        prelude = (
+            "import tools.fleet_health as m\n" if mode == "package" else "import fleet_health as m\n"
+        )
+        cwd = self.root if mode == "package" else self.root / "tools"
+        body = (
+            "import json\n"
+            + prelude
+            + "print('@@' + json.dumps(m.FLEET, sort_keys=True, default=str))\n"
+        )
+        res = subprocess.run(
+            [sys.executable, "-c", body],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            timeout=180,
+            env={**os.environ, "PYTHONPATH": ""},
+        )
+        self.assertEqual(
+            res.returncode,
+            0,
+            f"fleet_health.FLEET [{mode}] failed to import against the flipped tree:\n{res.stderr}",
+        )
+        payloads = [ln for ln in res.stdout.splitlines() if ln.startswith("@@")]
+        self.assertEqual(
+            len(payloads), 1, f"fleet_health.FLEET [{mode}] emitted no probe payload:\n{res.stdout}"
+        )
+        return json.loads(payloads[0][2:])
+
+    def test_fleet_health_fleet_follows_the_supervisor_marker(self) -> None:
+        flip = _FLEET_HEALTH_FLIP_PERSONA
+        flip_timer = f"pantheon-persona-consume@{flip}.timer"
+        # A seat that is control-plane in the LIVE (unflipped) manifest — its timer
+        # must already be derived, proving the derivation is not unique to the flip.
+        live_cp = sorted(
+            p for p, b in self.witness.items() if b.get("supervisor") == "control-plane"
+        )
+        # A seat that stays bespoke under the flip — must NOT be timerised, proving
+        # `supervisor` specifically (not a blanket rule) drives the choice.
+        still_bespoke = next(
+            (
+                p
+                for p, b in self.witness.items()
+                if p != flip and b.get("supervisor") != "control-plane" and p in {
+                    "recovery", "orchestrator", "specialist", "codex", "metis", "atlas", "mnemosyne"
+                }
+            ),
+            None,
+        )
+
+        for mode in self._PROBE_MODES:
+            with self.subTest(mode=mode):
+                fleet = self._run(mode)
+
+                self.assertGreater(
+                    len(fleet), 1,
+                    "FLEET built one entry or none — one seat's answer is not the fleet "
+                    "(T-2324: green because of where it ran).",
+                )
+                self.assertIn(flip, fleet, f"FLEET dropped the flipped seat {flip!r}")
+                self.assertEqual(
+                    fleet[flip]["services"],
+                    [flip_timer],
+                    f"flipping {flip}'s supervisor to control-plane did NOT move FLEET's "
+                    "liveness target to the derived consume timer — FLEET is re-enumerated as a "
+                    "literal, so a real cutover would leave fleet_health probing the retired "
+                    "bespoke unit and reporting a false verdict.",
+                )
+                for persona in live_cp:
+                    self.assertEqual(
+                        fleet[persona]["services"],
+                        [f"pantheon-persona-consume@{persona}.timer"],
+                        f"{persona} is control-plane in the manifest but FLEET's services are not "
+                        "its derived consume timer — the supervisor marker is not reaching FLEET.",
+                    )
+                if still_bespoke is not None:
+                    self.assertNotIn(
+                        f"pantheon-persona-consume@{still_bespoke}.timer",
+                        fleet[still_bespoke]["services"],
+                        f"{still_bespoke} has no control-plane supervisor yet FLEET timerised it — "
+                        "the derivation is not keyed on the supervisor marker.",
+                    )
+
+
+# ---------------------------------------------------------------------------
+# T-3573 — the SIBLING-axis automated snapshot-site guard.
+#
+# The ACCOUNT axis has test_account_persona_map.TestEverySnapshotSiteIsGuarded,
+# which re-derives every import-time snapshot of {account_persona_map,
+# fleet_accounts, account_persona} from tools/*.py and asserts each is in that
+# file's PER_SITE_GUARDS. Its docstring STOPS at the account axis and explicitly
+# names context_fill_monitor.AGENT_CONFIG as the uncovered SIBLING example. This
+# closes exactly that: the same scan, pointed at the sibling accessors, co-located
+# with the T-2365 guards it enforces.
+# ---------------------------------------------------------------------------
+
+# SIBLING _ACCESSORS — the public accessors that read a persona-keyed map loaded
+# from instance.yaml's `roles:` bindings, re-verified against agent_role_map:
+#   instance_binding(persona)      -> _PERSONA_TO_BINDING  (account + restart-config)
+#   resolve_instance_role(persona) -> _PERSONA_TO_INSTANCE_ROLE (role-key)
+# Both are manifest-derived and both follow a perturbed manifest (Guard F6 above
+# drives them). EXCLUDED, with reason:
+#   - account_persona / account_persona_map / fleet_accounts — the ACCOUNT axis,
+#     owned by test_account_persona_map (its scan's _ACCESSORS). The two files
+#     partition the axes; DRAIN_AGENT_CONFIG sits in BOTH tables on purpose.
+#   - control_plane_consume_service — a PURE naming function (f"...@{persona}...")
+#     that reads no manifest, so a snapshot of it carries nothing that can drift.
+#   - live_session_project_slug / live_session_projects_dir — derived CONVENIENCE
+#     wrappers keyed by ACCOUNT (they call account_persona()+resolve_instance_role
+#     internally). The account-axis scan deliberately declines to chase derived
+#     wrappers (they are imported, not module-scope defs, so `reaches` stops at
+#     them); this scan mirrors that discipline. doc_traversal_report.AGENTS and
+#     keep_going.AGENT_* snapshot those wrappers and are out of BOTH scans' scope.
+#   - mailbox_hub / mailbox_group — read persona_installer.mailbox, a DIFFERENT
+#     manifest stanza, not the roles bindings; not this axis.
+_SIBLING_ACCESSORS = frozenset({"instance_binding", "resolve_instance_role"})
+
+# The hand-maintained table: each known sibling snapshot site -> its perturbed-
+# manifest guard test. GUARDED_SNAPSHOTS is DERIVED from it, so a row cannot be
+# added without naming a test (asserted below). The T-2365 block enumerated TWO
+# (context_fill_monitor.AGENT_CONFIG, restart_drain.DRAIN_AGENT_CONFIG); the scan
+# below surfaced THREE more the enumeration missed — fleet_health.FLEET (a direct
+# instance_binding() snapshot via _liveness_services), and channel_liveness_monitor
+# + hook_allowlist_lint, which RE-EXPORT context_fill_monitor.AGENT_CONFIG (a
+# snapshot of a snapshot, the same shape as the account axis's session_reset_reconcile).
+SIBLING_PER_SITE_GUARDS: dict[tuple[str, str], str] = {
+    ("context_fill_monitor", "AGENT_CONFIG"):
+        "test_context_fill_monitor_agent_config_follows_the_manifest",
+    ("restart_drain", "DRAIN_AGENT_CONFIG"):
+        "test_restart_drain_agent_config_follows_the_manifest",
+    ("fleet_health", "FLEET"):
+        "test_fleet_health_fleet_follows_the_supervisor_marker",
+    ("channel_liveness_monitor", "AGENT_CONFIG"):
+        "test_channel_liveness_monitor_agent_config_reexports_the_manifest",
+    ("hook_allowlist_lint", "AGENT_CONFIG"):
+        "test_hook_allowlist_lint_agent_config_reexports_the_manifest",
+}
+SIBLING_GUARDED_SNAPSHOTS: tuple[tuple[str, str], ...] = tuple(sorted(SIBLING_PER_SITE_GUARDS))
+
+# Classes carrying the per-site guards SIBLING_PER_SITE_GUARDS names.
+_SIBLING_GUARD_CLASSES = (
+    TestFleetMonitorConsumersFollowThePerturbedManifest,
+    TestFleetHealthFleetFollowsTheSupervisorMarker,
+)
+
+
+class TestEverySiblingSnapshotSiteIsGuarded(unittest.TestCase):
+    """The enumeration is the weak point, so it is re-derived from the source.
+
+    SIBLING_PER_SITE_GUARDS is a hand-maintained table. A module that binds
+    instance_binding() (or resolve_instance_role()) to a constant tomorrow gets no
+    coverage and nothing says so — the account axis's exact failure, one axis over.
+    This walks tools/*.py and re-derives the set; it is how fleet_health.FLEET and
+    the two AGENT_CONFIG re-exports (channel_liveness_monitor, hook_allowlist_lint)
+    came to be rows — the T-2365 block enumerated only two.
+
+    The scan CORE is shared with the account axis via tools/_snapshot_site_scan.py
+    (T-3573), parameterised here by _SIBLING_ACCESSORS + SIBLING_GUARDED_SNAPSHOTS +
+    _PLANT_HEADER. See that module's docstring for exactly what the scan detects.
+
+    WHAT IT DOES NOT DETECT — asserted, not asserted-complete: every blind-spot
+    shape is planted in test_the_documented_blind_spots_are_really_blind, so
+    widening the scan reddens that test and the list cannot silently go stale:
+      1. a binding built ACROSS statements (an empty constant then a module-level
+         loop / global-initialiser call). One statement is matched at a time.
+      2. a snapshot inside a def or class body (those do not run at import).
+      3. an accessor reached through more than two levels of module-scope helper.
+      4. an accessor reached INDIRECTLY — getattr(arm, "instance_binding")(), or a
+         module-level name bound to the accessor object then called.
+      5. a walrus used as a bare expression statement, with no assignment target.
+      6. a re-export of a constant SIBLING_PER_SITE_GUARDS does not already name.
+      7. anything outside tools/*.py.
+    """
+
+    _ACCESSORS = _SIBLING_ACCESSORS
+    _PLANT_HEADER = (
+        "from tools.agent_role_map import instance_binding, resolve_instance_role\n"
+    )
+    _scanner = SnapshotSiteScanner(_SIBLING_ACCESSORS, SIBLING_GUARDED_SNAPSHOTS, _PLANT_HEADER)
+
+    # SHAPES THE SCAN MUST FIND — the account axis's control shapes, re-pointed at
+    # the sibling accessors. The control plants the shape you FEAR (contains-anywhere:
+    # `X = dict(instance_binding(...))`), not just `X = instance_binding(...)`, because
+    # the hole the account review measured was one `dict` wide.
+    _MUST_FIND: tuple[tuple[str, str, tuple[str, ...]], ...] = (
+        ("bare call", "X = instance_binding('specialist')", ("X",)),
+        ("wrapper call", "X = dict(instance_binding('specialist'))", ("X",)),
+        ("nested wrappers", "X = tuple(sorted(resolve_instance_role('specialist')))", ("X",)),
+        ("comprehension", "X = {k: v for k, v in instance_binding('specialist').items()}", ("X",)),
+        ("binop", "X = resolve_instance_role('specialist') + '-x'", ("X",)),
+        ("ternary", "X = instance_binding('specialist') if True else {}", ("X",)),
+        ("annotated wrapper", "X: dict = dict(instance_binding('specialist'))", ("X",)),
+        (
+            "tuple unpack",
+            "X, Y = instance_binding('specialist'), resolve_instance_role('specialist')",
+            ("X", "Y"),
+        ),
+        (
+            "module-level try",
+            "try:\n    X = dict(instance_binding('specialist'))\nexcept Exception:\n    X = {}\n",
+            ("X",),
+        ),
+        (
+            "one-level helper",
+            "def _b():\n    return dict(instance_binding('specialist'))\nX = _b()",
+            ("X",),
+        ),
+        (
+            "two-level helper",
+            "def _i():\n    return instance_binding('specialist')\n"
+            "def _b():\n    return dict(_i())\nX = _b()\n",
+            ("X",),
+        ),
+    )
+
+    # SHAPES THE SCAN IS DOCUMENTED NOT TO FIND, one per numbered blind spot above.
+    _MUST_MISS: tuple[tuple[str, str], ...] = (
+        (
+            "1 across statements",
+            "X = {}\nfor k, v in instance_binding('specialist').items():\n    X[k] = v\n",
+        ),
+        (
+            "1 global initializer",
+            "def _init():\n    global X\n    X = instance_binding('specialist')\n_init()\n",
+        ),
+        ("2 class body", "class C:\n    X = instance_binding('specialist')\n"),
+        (
+            "3 three-level helper",
+            "def _a():\n    return instance_binding('specialist')\n"
+            "def _b():\n    return _a()\ndef _c():\n    return _b()\nX = _c()\n",
+        ),
+        ("4 name alias", "f = instance_binding\nX = f('specialist')\n"),
+        (
+            "4 getattr",
+            "import tools.agent_role_map as arm\nX = getattr(arm, 'instance_binding')('specialist')\n",
+        ),
+        ("5 bare walrus", "(X := instance_binding('specialist'))\n"),
+    )
+
+    def _scan_module(self, path: Path) -> set[tuple[str, str]]:
+        return self._scanner.scan_module(path)
+
+    def _scan_source(self, source: str, name: str) -> set[tuple[str, str]]:
+        return self._scanner.scan_source(source, name, self.addCleanup)
+
+    def test_the_scan_finds_every_shape_a_snapshot_can_take(self) -> None:
+        """The control: a scan that matched nothing would report a clean sweep
+        forever, so it is driven against each shape before its emptiness is believed."""
+        for label, source, expected in self._MUST_FIND:
+            with self.subTest(shape=label):
+                self.assertEqual(
+                    self._scan_source(source, "planted_site"),
+                    {("planted_site", target) for target in expected},
+                    f"the scan does not see a sibling snapshot written as {label!r}. A site "
+                    "written this way would be absent from the drift check and could be "
+                    "re-enumerated as a literal in total silence.",
+                )
+
+    def test_the_documented_blind_spots_are_really_blind(self) -> None:
+        """The other direction: each shape the docstring calls out is planted and
+        asserted MISSED. Widen the scan and this fails, forcing the list corrected."""
+        for label, source in self._MUST_MISS:
+            with self.subTest(shape=label):
+                self.assertEqual(
+                    self._scan_source(source, "blind_site"),
+                    set(),
+                    f"the scan now DETECTS {label!r}, which the class docstring lists as a "
+                    "blind spot. Good news — remove it from that list.",
+                )
+
+    def test_every_row_names_a_per_site_guard_that_exists(self) -> None:
+        """A row cannot silence the drift check without naming a real per-site test.
+        GUARDED_SNAPSHOTS is DERIVED from SIBLING_PER_SITE_GUARDS, so a row always
+        names a test; this asserts the name resolves on a guard class."""
+        missing = sorted(
+            f"{module}.{constant} -> {test_name}"
+            for (module, constant), test_name in SIBLING_PER_SITE_GUARDS.items()
+            if not any(
+                callable(getattr(cls, test_name, None)) for cls in _SIBLING_GUARD_CLASSES
+            )
+        )
+        self.assertEqual(
+            missing,
+            [],
+            "SIBLING_PER_SITE_GUARDS names per-site test(s) that do not exist on any sibling "
+            f"guard class: {missing}. A row without a test silences the drift check while "
+            "asserting nothing about the site.",
+        )
+
+    def test_every_module_level_snapshot_in_tools_is_in_the_table(self) -> None:
+        found: set[tuple[str, str]] = set()
+        for path in sorted((REPO_ROOT / "tools").glob("*.py")):
+            if path.name.startswith("test_"):
+                continue
+            found |= self._scan_module(path)
+        self.assertEqual(
+            found,
+            set(SIBLING_GUARDED_SNAPSHOTS),
+            "tools/ module-level snapshots of the SIBLING axis (instance_binding / "
+            "resolve_instance_role) have drifted from SIBLING_PER_SITE_GUARDS. An entry FOUND "
+            "BUT NOT LISTED is a site with NO perturbed-manifest coverage: re-enumerating it as "
+            "a literal would be silent — add it to SIBLING_PER_SITE_GUARDS TOGETHER with the "
+            "per-site test the row must name. An entry LISTED BUT NOT FOUND means the site moved "
+            "or was removed and its guard is now asserting nothing.",
+        )
 
 
 if __name__ == "__main__":

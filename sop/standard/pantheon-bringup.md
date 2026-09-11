@@ -512,7 +512,7 @@ Outbound-only option (no inbound DM): skip the plugin; the agent direct-curls `s
 
 ### 7b. Inter-agent mailbox (ORG-026 — optional, for multi-agent intercomms)
 
-§7 is agent↔**human** chat. This is agent↔**agent** mail: a daemonless, file-based mailbox (Maildir-style `tmp`→fsync→rename) for one running agent to deliver work/replies to another and wake it. Skip it for a single-agent instance; provision it once you have ≥2 always-on agents that need to coordinate hands-off. Canonical design + as-implemented reality: [`adr/ORG-026`](../../adr/ORG-026-inter-agent-message-passing-substrate.md). Code: `tools/{mailbox,mailbox_wake,provision_mailbox}.py/.sh`.
+§7 is agent↔**human** chat. This is agent↔**agent** mail: a daemonless, file-based mailbox (Maildir-style `tmp`→fsync→rename) for one running agent to deliver work/replies to another and wake it. Skip it for a single-agent instance; provision it once you have ≥2 always-on agents that need to coordinate hands-off. Canonical design + as-implemented reality: [`architecture/adr/ORG-026`](../../adr/ORG-026-inter-agent-message-passing-substrate.md). Code: `tools/{mailbox,mailbox_wake,provision_mailbox}.py/.sh`.
 
 **Substrate (Path A — "conditionally a shared HOME"):** a private 750 home is untraversable cross-account, so inboxes do NOT live in `~/inbox`. They live in a neutral group-accessible hub:
 - A dedicated **mail group** (reference instance: `veneration`, gid 1006 — reused from the Veneration shared-state account; pick any group). Every participating agent's Unix user ∈ this group (`usermod -aG`, root).
@@ -634,7 +634,7 @@ Run this top to bottom before declaring the system live. If anything fails, diag
 - [ ] Operator sends a test DM → it surfaces as a channel-tagged inbound in the agent's session AND the agent replies via the reply tool (both directions; outbound alone is not enough — that's the failure mode that hid the disabled plugin).
 
 **Audit chain:**
-- [ ] The ledger lives under `ledger/` as weekly-sharded JSONL (`ledger/<ISO-year>-W<NN>/<same>.jsonl`); the schema is authoritative in `adr/ORG-001-ledger-format.md`. There is **no dedicated append CLI** — a ledger write is an append-to-shard + commit, the same path every Pantheon tool uses (`tools/ledger_shard.py` is the internal helper that resolves the current write-target shard; `current_write_target(ledger_dir, now)`). Bootstrap recipe:
+- [ ] The ledger lives under `ledger/` as weekly-sharded JSONL (`ledger/<ISO-year>-W<NN>/<same>.jsonl`); the schema is authoritative in `architecture/adr/ORG-001-ledger-format.md`. There is **no dedicated append CLI** — a ledger write is an append-to-shard + commit, the same path every Pantheon tool uses (`tools/ledger_shard.py` is the internal helper that resolves the current write-target shard; `current_write_target(ledger_dir, now)`). Bootstrap recipe:
   1. Find the current shard: `ledger/<ISO-year>-W<NN>/<ISO-year>-W<NN>.jsonl` (create the dir if it's a fresh week).
   2. Append one JSON line matching the ORG-001 schema — at minimum `id` (`<ISO-8601-UTC>Z-NNN`), `ts`, `agent`, `action`, `rationale`, a **non-empty** `justifies_via` array (empty is a P4 violation — escalate instead of writing the entry), and `parent_id` to chain the entry into the audit lineage. Copy the shape of the most recent existing entry.
   3. Commit + push the shard (wrap in `sg <shared-group> -c '...'` if the repo is group-write-shared). Push the shard to origin *before* any grooming pass so the INDEX picks it up.
@@ -820,7 +820,7 @@ Covers the one-time bringup procedure. Out of scope:
 - Day-to-day operations (see SOP index).
 - Failure-mode discipline (see `sop/remediation/`).
 - Adding individual capabilities to an existing agent (see `adding-restart-capability-to-a-new-agent.md`).
-- The full ledger schema (see `adr/ORG-001-ledger-format.md`); the §9 audit-chain step gives the bootstrap append recipe.
+- The full ledger schema (see `architecture/adr/ORG-001-ledger-format.md`); the §9 audit-chain step gives the bootstrap append recipe.
 - A scripted `bringup.sh` (tracked under T-0753).
 
 ## Cross-references

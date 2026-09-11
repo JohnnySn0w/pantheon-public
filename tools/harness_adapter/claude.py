@@ -16,9 +16,14 @@ References:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import math
 import os
+import re
+import stat
 from collections.abc import Iterable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -44,12 +49,18 @@ from tools.harness_adapter.types import (
     McpDescriptor,
     MemoryDescriptor,
     ProviderBillingEvidence,
+    PostStartAssessment,
+    PostStartPaneSample,
+    ProviderCompletionAssessment,
+    ProviderCompletionProbe,
     RoleDescriptor,
     SessionHandle,
     StandingInstructionsDescriptor,
     TmuxTarget,
     Usage,
 )
+from tools.claude_statusline_capture import SCHEMA as STATUSLINE_SCHEMA
+from tools.claude_quota_probe import CAP_SENTINELS, READY_PROMPT_LINE
 from tools.harness_adapter.quota import QuotaObserver
 from tools.harness_adapter.provider_quota import (
     ClaudeAcceptanceQuotaOverlayObserver,
@@ -57,6 +68,203 @@ from tools.harness_adapter.provider_quota import (
     UnavailableQuotaObserver,
     valid_acceptance_run_id,
 )
+
+
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_COMPLETION_SCHEMA = "pantheon-harness-provider-completion/v1"
+_MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024
+_MAX_TRANSCRIPT_DELTA_BYTES = 256 * 1024
+_MAX_TRANSCRIPT_LINES = 400
+_MAX_JSONL_LINE_BYTES = 64 * 1024
+_MAX_STATUSLINE_BYTES = 1024 * 1024
+
+
+def _normalize_provider_pane(text: str) -> str:
+    return _ANSI_RE.sub("", text).replace("\r", "")
+
+
+def _claude_cap_sentinel(text: str) -> str | None:
+    normalized = _normalize_provider_pane(text)
+    for pattern in CAP_SENTINELS:
+        for line in normalized.splitlines():
+            match = pattern.match(line.strip())
+            if match:
+                return match.group(1)
+    return None
+
+
+def _has_claude_rate_limit_modal_framing(text: str) -> bool:
+    normalized = _normalize_provider_pane(text).lower()
+    required = (
+        "/rate-limit-options",
+        "what do you want to do?",
+        "stop and wait for limit to reset",
+        "upgrade your plan",
+    )
+    return all(item in normalized for item in required)
+
+
+def classify_claude_post_start_subscription_cap(
+    *,
+    baseline_text: str,
+    sample_text: str,
+) -> tuple[str | None, str | None]:
+    """Return a narrow provider cap classification for changed post-start UI."""
+    if _normalize_provider_pane(baseline_text) == _normalize_provider_pane(sample_text):
+        return None, None
+    if _claude_cap_sentinel(baseline_text):
+        return None, None
+    sentinel = _claude_cap_sentinel(sample_text)
+    if not sentinel:
+        return None, None
+    if not _has_claude_rate_limit_modal_framing(sample_text):
+        return None, None
+    return "claude-rate-limit-options-modal", "post-start-subscription-cap"
+
+
+def _sha256_text(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        raw, _st = _read_regular_file_no_follow(path, max_bytes=_MAX_STATUSLINE_BYTES)
+        return hashlib.sha256(raw).hexdigest()
+    except OSError:
+        return None
+
+
+def _parse_utc(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def _read_statusline(path: Path) -> Mapping[str, Any] | None:
+    try:
+        raw, _st = _read_regular_file_no_follow(path, max_bytes=_MAX_STATUSLINE_BYTES)
+        payload = json.loads(raw.decode("utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return None
+    if not isinstance(payload, Mapping) or payload.get("schema") != STATUSLINE_SCHEMA:
+        return None
+    return payload
+
+
+def _read_regular_file_no_follow(path: Path, *, max_bytes: int) -> tuple[bytes, os.stat_result]:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(path, flags)
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > max_bytes:
+            raise OSError("provider evidence file is not a bounded regular file")
+        chunks: list[bytes] = []
+        remaining = st.st_size
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks), st
+    finally:
+        os.close(fd)
+
+
+def _confined_transcript(account_home: Path, value: Any) -> Path | None:
+    if not isinstance(value, str) or not value:
+        return None
+    raw = Path(value)
+    if not raw.is_absolute():
+        return None
+    try:
+        projects = (account_home / ".claude" / "projects").resolve()
+        resolved = raw.resolve()
+    except OSError:
+        return None
+    if not resolved.is_relative_to(projects):
+        return None
+    try:
+        _raw, st = _read_regular_file_no_follow(resolved, max_bytes=_MAX_TRANSCRIPT_BYTES)
+    except OSError:
+        return None
+    return resolved
+
+
+def _transcript_boundary(account_home: Path, observation: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
+    if observation is None:
+        return None
+    path = _confined_transcript(account_home, observation.get("transcript_path"))
+    if path is None:
+        return None
+    try:
+        _raw, st = _read_regular_file_no_follow(path, max_bytes=_MAX_TRANSCRIPT_BYTES)
+    except OSError:
+        return None
+    relative = str(path.relative_to((account_home / ".claude" / "projects").resolve()))
+    return {
+        "path": path,
+        "offset": st.st_size,
+        "inode": st.st_ino,
+        "device": st.st_dev,
+        "relative_sha256": _sha256_text(relative),
+    }
+
+
+def _assistant_delta_has_nonce(path: Path, *, start: int, marker: str) -> tuple[bool, int, int, int]:
+    try:
+        raw_all, st = _read_regular_file_no_follow(path, max_bytes=_MAX_TRANSCRIPT_BYTES)
+    except OSError:
+        return False, start, 0, 1
+    if start < 0 or st.st_size < start or st.st_size > _MAX_TRANSCRIPT_BYTES:
+        return False, start, 0, 1
+    delta_size = st.st_size - start
+    if delta_size > _MAX_TRANSCRIPT_DELTA_BYTES:
+        return False, st.st_size, 0, 1
+    raw = raw_all[start:]
+    if raw and not raw.endswith(b"\n"):
+        raw = raw.rsplit(b"\n", 1)[0] if b"\n" in raw else b""
+    lines = [line for line in raw.splitlines() if line.strip()]
+    if len(lines) > _MAX_TRANSCRIPT_LINES:
+        return False, st.st_size, 0, 1
+    assistant_events = 0
+    malformed = 0
+    for line in lines:
+        if len(line) > _MAX_JSONL_LINE_BYTES:
+            malformed += 1
+            continue
+        try:
+            obj = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            malformed += 1
+            continue
+        if not isinstance(obj, dict) or obj.get("type") != "assistant":
+            continue
+        msg = obj.get("message")
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        if role is not None and role != "assistant":
+            continue
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        assistant_events += 1
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                continue
+            text = block.get("text")
+            if isinstance(text, str) and text.strip() == marker:
+                return True, st.st_size, assistant_events, malformed
+    return False, st.st_size, assistant_events, malformed
 
 
 class ClaudeHarnessAdapter(PantheonHarnessAdapter):
@@ -288,7 +496,7 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
                     evidence={"profile": "", "legacy": "true"},
                 ),
             )
-        allowed_native = {"permission_mode", "channels"}
+        allowed_native = {"permission_mode", "channels", "effort"}
         unknown = sorted(set(self.launch.native) - allowed_native)
         status = "fail" if unknown else "pass"
         return (
@@ -368,7 +576,7 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
             },
         )
 
-    def build_interactive_launch(self, target: TmuxTarget) -> CommandSpec:
+    def build_interactive_launch(self, target: TmuxTarget, *, cwd: Path) -> CommandSpec:
         argv = [str(self.executable)]
         channels = (
             self.launch.native.get("channels")
@@ -380,6 +588,13 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
         model = self.launch.model if self.launch else None
         if model:
             argv.extend(["--model", model])
+        effort = (
+            self.launch.native.get("effort")
+            if self.launch and isinstance(self.launch.native, dict)
+            else None
+        )
+        if isinstance(effort, str) and effort:
+            argv.extend(["--effort", effort])
         permission_mode = (
             self.launch.native.get("permission_mode")
             if self.launch and isinstance(self.launch.native, dict)
@@ -392,7 +607,7 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
         return CommandSpec(
             argv=tuple(argv),
             stdin=None,
-            cwd=Path.cwd(),
+            cwd=cwd,
             env={
                 "PANTHEON_TMUX_SESSION": target.session,
                 "PANTHEON_TMUX_WINDOW": target.window,
@@ -430,6 +645,254 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
             profile=f"claude/{profile}",
             run_id=run_id,
             state_dir=state_dir,
+        )
+
+    def assess_post_start_readiness(
+        self,
+        *,
+        harness: str,
+        profile: str,
+        baseline: PostStartPaneSample,
+        samples: Iterable[PostStartPaneSample],
+    ) -> PostStartAssessment:
+        sample_tuple = tuple(samples)
+        changed = tuple(
+            sample.capture_index
+            for sample in sample_tuple
+            if sample.sha256 != baseline.sha256
+        )
+        for sample in sample_tuple:
+            if sample.sha256 == baseline.sha256:
+                continue
+            pattern_id, cause = classify_claude_post_start_subscription_cap(
+                baseline_text=baseline.text,
+                sample_text=sample.text,
+            )
+            if pattern_id is not None:
+                return PostStartAssessment(
+                    schema="pantheon-harness-post-start-assessment/v1",
+                    harness=harness,
+                    profile=profile,
+                    status="subscription-cap",
+                    cause=cause,
+                    pattern_id=pattern_id,
+                    baseline_sha256=baseline.sha256,
+                    capture_count=len(sample_tuple),
+                    changed_capture_indices=changed,
+                )
+        ready = any(
+            sample.sha256 != baseline.sha256
+            and READY_PROMPT_LINE.search(_normalize_provider_pane(sample.text))
+            for sample in sample_tuple
+        )
+        return PostStartAssessment(
+            schema="pantheon-harness-post-start-assessment/v1",
+            harness=harness,
+            profile=profile,
+            status="ready" if ready else "unknown",
+            cause=None,
+            pattern_id=None,
+            baseline_sha256=baseline.sha256,
+            capture_count=len(sample_tuple),
+            changed_capture_indices=changed,
+        )
+
+    def prepare_interactive_provider_completion(
+        self,
+        *,
+        harness: str,
+        profile: str,
+        persona: str,
+        account_home: Path,
+        state_dir: Path,
+        pane_baseline: PostStartPaneSample,
+        submitted_at: datetime,
+        nonce_marker: str,
+        nonce_sha256: str,
+    ) -> ProviderCompletionProbe | None:
+        del persona
+        if harness != "claude":
+            return None
+        statusline_path = state_dir / "quota" / "claude-statusline.json"
+        baseline_sha = _sha256_file(statusline_path)
+        baseline_statusline = _read_statusline(statusline_path)
+        baseline_transcript = _transcript_boundary(account_home, baseline_statusline)
+        prompt = (
+            "Provider completion probe. Reply with exactly this marker and no extra text: "
+            f"{nonce_marker}"
+        )
+        return ProviderCompletionProbe(
+            prompt=prompt,
+            nonce_marker=nonce_marker,
+            nonce_sha256=nonce_sha256,
+            prompt_sha256=_sha256_text(prompt),
+            provider_state={
+                "account_home": account_home,
+                "statusline_path": statusline_path,
+                "baseline_statusline_sha256": baseline_sha,
+                "baseline_transcript": baseline_transcript,
+                "baseline_pane_text": pane_baseline.text,
+                "baseline_pane_sha256": pane_baseline.sha256,
+                "submitted_at": submitted_at,
+                "harness": harness,
+                "profile": profile,
+            },
+        )
+
+    def assess_interactive_provider_completion(
+        self,
+        *,
+        harness: str,
+        profile: str,
+        probe: ProviderCompletionProbe | None,
+        samples: Iterable[PostStartPaneSample],
+    ) -> ProviderCompletionAssessment:
+        sample_tuple = tuple(samples)
+        changed = tuple(
+            sample.capture_index
+            for sample in sample_tuple
+            if probe is not None
+            and sample.sha256 != probe.provider_state.get("baseline_pane_sha256")
+        )
+        if probe is None or harness != "claude":
+            return ProviderCompletionAssessment(
+                schema=_COMPLETION_SCHEMA,
+                harness=harness,
+                profile=profile,
+                status="not-applicable",
+                cause=None,
+                pattern_id=None,
+                nonce_sha256=None,
+                prompt_sha256=None,
+                statusline_baseline_sha256=None,
+                statusline_observed_sha256=None,
+                capture_count=len(sample_tuple),
+                changed_capture_indices=(),
+            )
+        baseline_text = str(probe.provider_state.get("baseline_pane_text") or "")
+        for sample in sample_tuple:
+            pattern_id, cause = classify_claude_post_start_subscription_cap(
+                baseline_text=baseline_text,
+                sample_text=sample.text,
+            )
+            if pattern_id is not None:
+                return ProviderCompletionAssessment(
+                    schema=_COMPLETION_SCHEMA,
+                    harness=harness,
+                    profile=profile,
+                    status="subscription-cap",
+                    cause="provider-completion-subscription-cap",
+                    pattern_id=pattern_id,
+                    nonce_sha256=probe.nonce_sha256,
+                    prompt_sha256=probe.prompt_sha256,
+                    statusline_baseline_sha256=probe.provider_state.get("baseline_statusline_sha256"),
+                    statusline_observed_sha256=_sha256_file(probe.provider_state["statusline_path"]),
+                    capture_count=len(sample_tuple),
+                    changed_capture_indices=changed,
+                )
+        statusline_path = probe.provider_state["statusline_path"]
+        current_sha = _sha256_file(statusline_path)
+        baseline_sha = probe.provider_state.get("baseline_statusline_sha256")
+        statusline = _read_statusline(statusline_path)
+        submitted_at = probe.provider_state["submitted_at"]
+        if (
+            current_sha is None
+            or current_sha == baseline_sha
+            or statusline is None
+            or _parse_utc(statusline.get("observed_at")) is None
+            or _parse_utc(statusline.get("observed_at")) < submitted_at
+            or not statusline.get("session_id")
+            or not statusline.get("transcript_path")
+        ):
+            return ProviderCompletionAssessment(
+                schema=_COMPLETION_SCHEMA,
+                harness=harness,
+                profile=profile,
+                status="unknown",
+                cause="provider-completion-waiting",
+                pattern_id=None,
+                nonce_sha256=probe.nonce_sha256,
+                prompt_sha256=probe.prompt_sha256,
+                statusline_baseline_sha256=baseline_sha,
+                statusline_observed_sha256=current_sha,
+                capture_count=len(sample_tuple),
+                changed_capture_indices=changed,
+            )
+        account_home = probe.provider_state["account_home"]
+        transcript = _confined_transcript(account_home, statusline.get("transcript_path"))
+        if transcript is None:
+            cause = "provider-completion-transcript-invalid"
+            start = None
+            rel_hash = None
+        else:
+            baseline = probe.provider_state.get("baseline_transcript")
+            rel_hash = _sha256_text(str(transcript.relative_to((account_home / ".claude" / "projects").resolve())))
+            start = 0
+            if isinstance(baseline, Mapping) and baseline.get("path") == transcript:
+                try:
+                    st = transcript.stat(follow_symlinks=False)
+                except OSError:
+                    st = None
+                if (
+                    st is None
+                    or st.st_ino != baseline.get("inode")
+                    or st.st_dev != baseline.get("device")
+                    or st.st_size < int(baseline.get("offset", 0))
+                ):
+                    cause = "provider-completion-transcript-replaced"
+                else:
+                    start = int(baseline["offset"])
+                    cause = None
+            else:
+                cause = None
+        if transcript is None or cause is not None:
+            return ProviderCompletionAssessment(
+                schema=_COMPLETION_SCHEMA,
+                harness=harness,
+                profile=profile,
+                status="operational-readiness",
+                cause=cause,
+                pattern_id=None,
+                nonce_sha256=probe.nonce_sha256,
+                prompt_sha256=probe.prompt_sha256,
+                statusline_baseline_sha256=baseline_sha,
+                statusline_observed_sha256=current_sha,
+                capture_count=len(sample_tuple),
+                changed_capture_indices=changed,
+                transcript_relative_path_sha256=rel_hash,
+                transcript_start_offset=start,
+            )
+        seen, end, assistant_count, malformed = _assistant_delta_has_nonce(
+            transcript,
+            start=start,
+            marker=probe.nonce_marker,
+        )
+        if malformed:
+            status = "operational-readiness"
+            cause = "provider-completion-transcript-malformed"
+        elif seen:
+            status = "provider-completed"
+            cause = None
+        else:
+            status = "unknown"
+            cause = "provider-completion-waiting"
+        return ProviderCompletionAssessment(
+            schema=_COMPLETION_SCHEMA,
+            harness=harness,
+            profile=profile,
+            status=status,
+            cause=cause,
+            pattern_id="claude-statusline-transcript-nonce" if seen else None,
+            nonce_sha256=probe.nonce_sha256,
+            prompt_sha256=probe.prompt_sha256,
+            statusline_baseline_sha256=baseline_sha,
+            statusline_observed_sha256=current_sha,
+            capture_count=len(sample_tuple),
+            changed_capture_indices=changed,
+            transcript_relative_path_sha256=rel_hash,
+            transcript_start_offset=start,
+            transcript_end_offset=end,
+            assistant_event_count=assistant_count,
         )
 
     # -------------------------------------------------------------------------

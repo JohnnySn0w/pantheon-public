@@ -128,6 +128,29 @@ class TestUnknown(unittest.TestCase):
                                service={"exit_epoch": None, "result": ""}, now=NOW)
         self.assertEqual(v["verdict"], clm.UNKNOWN)
 
+    def test_activation_window_race_is_live_not_unknown(self):
+        # T-3099: exit_epoch is transiently None while the oneshot is mid-cycle (systemd clears
+        # the prior ExecMainExitTimestamp during activation). A sample caught in that window is
+        # a live consumer, NOT a never-fired one — so a running ActiveState must read LIVE, not
+        # UNKNOWN. Mutation guard: revert the T-3099 branch and each running case flips to UNKNOWN.
+        for active in ("activating", "active", "reloading"):
+            v = clm.classify_agent("recovery", account="claude-fallback", enablement="enabled",
+                                   service={"exit_epoch": None, "result": "",
+                                            "active_state": active}, now=NOW)
+            self.assertEqual(v["verdict"], clm.LIVE,
+                             f"exit=None + ActiveState={active} is a mid-run sample, must be LIVE")
+
+    def test_not_running_with_no_exit_stays_unknown(self):
+        # The other half of the T-3099 split: exit=None while NOT running (inactive) is a genuine
+        # never-fired/never-completed consumer and must stay UNKNOWN — LIVE cannot mask a real
+        # stall. A hung activation that timed out to 'failed' likewise falls through to UNKNOWN.
+        for inert in ("inactive", "failed", ""):
+            v = clm.classify_agent("recovery", account="claude-fallback", enablement="enabled",
+                                   service={"exit_epoch": None, "result": "",
+                                            "active_state": inert}, now=NOW)
+            self.assertEqual(v["verdict"], clm.UNKNOWN,
+                             f"exit=None + ActiveState={inert!r} is never-fired, must stay UNKNOWN")
+
     def test_unknown_streak_gated_then_alerts(self):
         with TemporaryDirectory() as d:
             ops = FakeOps(enablement={"recovery": None})

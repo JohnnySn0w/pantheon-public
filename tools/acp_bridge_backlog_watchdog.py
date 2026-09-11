@@ -45,6 +45,13 @@ ALERT_COOLDOWN_SECONDS = int(
 
 MAILBOX_HUB = Path(os.environ.get("PANTHEON_MAILBOX_HUB", "/home/the-ancestor/mailbox"))
 
+# T-3473: auto-clear provably-resolved DLQ leftovers instead of re-alerting until a
+# human hand-moves them. DARK-SHIP default-off (same supervised-first-fire pattern as
+# the STALENESS_ENABLED flags elsewhere): the watchdog runs on specialist's account and this
+# turns a pure-read monitor into a MUTATOR of specialist's own mailbox, so it stays gated
+# behind an explicit opt-in until a first supervised fire confirms the move behaves.
+AUTOCLEAR_ENABLED = os.environ.get("PANTHEON_ACP_DLQ_AUTOCLEAR", "").lower() in ("1", "true", "yes")
+
 STATE_DIR = Path.home() / ".local" / "state" / "pantheon"
 STATE_PATH = STATE_DIR / "acp_bridge_backlog_alert_state.json"
 
@@ -187,6 +194,52 @@ def quarantine_is_leftover(inbox, failed_names: list[str]) -> bool | None:
     if not acked:
         return None
     return max(acked) > newest_q
+
+
+def auto_clear_leftovers(inbox, failed_names: list[str], *, now: float | None = None,
+                         dry_run: bool = False) -> tuple[list[str], list[str]]:
+    """Move provably-resolved DLQ leftovers into failed/.cleared-<date>-auto-resolved/.
+
+    T-3473: the DLQ alert ALREADY computes (quarantine_is_leftover is True) that a
+    non-empty failed/ is leftovers from an already-resolved fault — the drain loop has
+    acked messages since the newest quarantine. Until now a human still had to hand-move
+    them, and the alert re-fired until they did (falling back to the operator when the recovery
+    pane was unreachable). This performs the exact disposition the alert prescribes.
+
+    MUST only be called when quarantine_is_leftover(...) is True — the caller enforces
+    the fail-safe direction; this function does not re-derive resolvedness.
+
+    Returns (cleared, failed_to_clear): names successfully moved, and names whose move
+    raised. A non-empty failed_to_clear means the caller MUST still alert (never silently
+    lose a leftover — a move that races/perm-fails falls through to the normal alert).
+
+    move-not-delete (reversible; preserves message+cause for diagnostics). dry_run
+    reports what WOULD move without touching the filesystem.
+    """
+    now = time.time() if now is None else now
+    day = time.strftime("%Y-%m-%d", time.gmtime(now))
+    dest_dir = Path(inbox) / "failed" / f".cleared-{day}-auto-resolved"
+    cleared: list[str] = []
+    failed_to_clear: list[str] = []
+    if dry_run:
+        _log(f"[dry-run] would auto-clear {len(failed_names)} leftover(s) -> {dest_dir}")
+        return list(failed_names), []
+    try:
+        dest_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        _log(f"auto-clear: could not create {dest_dir} ({exc}); falling through to alert")
+        return [], list(failed_names)
+    for name in failed_names:
+        src = Path(inbox) / "failed" / name
+        try:
+            os.replace(src, dest_dir / name)
+            cleared.append(name)
+        except OSError as exc:
+            _log(f"auto-clear: move failed for {name} ({exc}); falling through to alert")
+            failed_to_clear.append(name)
+    if cleared:
+        _log(f"auto-cleared {len(cleared)} resolved leftover(s) -> {dest_dir}")
+    return cleared, failed_to_clear
 
 
 def classify(count: int, oldest_age: float | None) -> str:
@@ -403,6 +456,26 @@ def check(agent: str, inbox, *, dry_run: bool, now: float | None = None) -> int:
     if failed_count:
         _log(f"agent={agent} DLQ: {failed_count} message(s) in failed/")
         leftover = quarantine_is_leftover(inbox, failed_names)
+
+        # T-3473: when the leftovers are PROVABLY resolved (leftover is True) and
+        # auto-clear is enabled, perform the disposition the alert already prescribes
+        # — move them aside instead of nagging until a human does. The fail-safe
+        # direction is never inverted: leftover False/None (possibly-live fault) is
+        # NEVER auto-cleared, and a move that fails falls through to the normal alert.
+        if AUTOCLEAR_ENABLED and leftover is True:
+            cleared, failed_to_clear = auto_clear_leftovers(
+                inbox, failed_names, now=now, dry_run=dry_run
+            )
+            if not failed_to_clear:
+                # Every resolved leftover moved aside — log-only, no alert.
+                _log(f"agent={agent} DLQ: auto-cleared {len(cleared)} resolved "
+                     f"leftover(s); no alert")
+                return breached
+            # Some moves failed — re-alert on ONLY the ones that survived, so we
+            # never silently lose a leftover.
+            failed_names = failed_to_clear
+            failed_count = len(failed_to_clear)
+
         dlq_body = build_dlq_body(agent, failed_count, failed_names, leftover)
         _maybe_alert(
             agent, now, dlq_body, dry_run=dry_run, state_key=f"{agent}:failed",

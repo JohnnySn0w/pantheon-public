@@ -43,6 +43,9 @@ DEFAULT_BASE = Path("/home/claude")
 # Per-repo doc-dir → handler map. adr/ uses the dated-ADR table handler; every
 # other doc tree uses the flat-.md notes handler (same choice pantheon-config makes
 # for lessons/rulebook/architecture-shaped dirs).
+# (Sibling repos below still keep `adr/` at repo root; pantheon-config's ADR dir
+# moved under architecture/ on 2026-09-06, T-3472, ORG-094, but that's a
+# pantheon-config-local move — the sibling repos are unaffected.)
 #
 # echo-prismatic is INTENTIONALLY EXCLUDED from this direct-push config: its `main`
 # is a protected branch (required `ci-gate` status check + a full-Rust pre-push smoke

@@ -13,7 +13,7 @@ pointers are GOOD — link to the authoritative artifact, do not inline it"):
   - It does NOT auto-edit persona-brief PROSE. Auto-rewriting hand-curated D2 docs
     is both un-minimal and risky. Instead the application path is two static,
     cheap pieces: (1) each brief carries a one-time POINTER BLOCK to the
-    authoritative indexes (rulebook/, adr/README.md, sop/*/README.md) — those
+    authoritative indexes (rulebook/, architecture/adr/README.md, sop/*/README.md) — those
     indexes are themselves auto-maintained (spine_index_groom), so they always
     reflect the current set; (2) THIS job maintains the *recency signal* the
     static pointers lack — a generated digest of what was ratified/changed
@@ -21,7 +21,7 @@ pointers are GOOD — link to the authoritative artifact, do not inline it"):
     to everything.
 
   - OUTPUT: a GENERATED, pointer-only digest at notes/recent-policy-changes.md —
-    for each policy artifact (rulebook/ + adr/ + sop/) touched in the last
+    for each policy artifact (rulebook/ + architecture/adr/ + sop/) touched in the last
     --days window: a link, its title, the change date, and the commit subject.
     No artifact bodies are inlined (the operator's "do not inline"). Briefs point at
     this one file for "what's new."
@@ -31,11 +31,11 @@ pointers are GOOD — link to the authoritative artifact, do not inline it"):
     digest content actually changed; quiet no-op otherwise. No state file needed —
     the digest file is its own state.
 
-  - The digest lives OUTSIDE the watched dirs (notes/, not rulebook/adr/sop) so
+  - The digest lives OUTSIDE the watched dirs (notes/, not rulebook/architecture/adr/sop) so
     regenerating it never self-triggers the change it reports.
 
   - CADENCE: daily timer now (the operator's "daily for now"). The trigger-on-folder-
-    change upgrade (ORG-013-shaped git/inotify hook on rulebook/adr/sop) is a
+    change upgrade (ORG-013-shaped git/inotify hook on rulebook/architecture/adr/sop) is a
     follow-up whose hook plumbing may sub-delegate to Recovery (the operator's note).
 
   python3 tools/policy_outflow_sync.py            # regenerate; commit+push if changed
@@ -61,7 +61,7 @@ if __package__ in (None, ""):
 from tools.ledger_shard import TS_FORMAT, iter_ledger_entry_files  # noqa: E402
 
 # Authoritative policy dirs whose changes must reach briefs (the operator: P&Ds/ADRs/SOPs).
-WATCHED = ("rulebook", "adr", "sop")
+WATCHED = ("rulebook", "architecture/adr", "sop")
 # Generated digest — OUTSIDE WATCHED so regenerating it cannot self-trigger.
 DIGEST_REL = "notes/recent-policy-changes.md"
 DEFAULT_WINDOW_DAYS = 30
@@ -83,16 +83,19 @@ SIZE_WARN_BYTES = 35 * 1024
 SIZE_WARN_TOKEN = "SIZE-WARN"
 
 # T-1589 (ORG-040 tier 2): authority-claim <-> ledger corroboration warn-check.
-# Scan globs for ratification-marker prose. adr/ is flat; rulebook/**/*.md picks
-# up both rulebook/*.md and rulebook/policies/*.md (the ratifiable-class tiers
-# named in ORG-015) with one pattern. sop/ is deliberately NOT scanned — it is
-# not a ratifiable-claim substrate per ORG-015 and carries no such markers.
-AUTHORITY_MARKER_GLOBS = ("adr/*.md", "rulebook/**/*.md")
+# Scan globs for ratification-marker prose. architecture/adr/ is flat;
+# rulebook/**/*.md picks up both rulebook/*.md and rulebook/policies/*.md (the
+# ratifiable-class tiers named in ORG-015) with one pattern. sop/ is deliberately
+# NOT scanned — it is not a ratifiable-claim substrate per ORG-015 and carries no
+# such markers. (ADR path per ORG-094 architecture umbrella; adr/ moved to
+# architecture/adr/ on 2026-09-06, T-3472.)
+AUTHORITY_MARKER_GLOBS = ("architecture/adr/*.md", "rulebook/**/*.md")
 # Markers dated before this predate the msg-id/TG-id anchor convention (evidence:
 # the only anchor-less "Ratified ... by the operator" markers in the corpus are the
-# 2026-04-28 founding-week ones, adr/ORG-002 + rulebook/principles.md, both saying
-# only "(Telegram)" with no id; the first msg-id citation appears 2026-05-02,
-# adr/ORG-004). Anchor-less lines are already skipped by the anchor-presence gate
+# 2026-04-28 founding-week ones, architecture/adr/ORG-002 + rulebook/principles.md,
+# both saying only "(Telegram)" with no id; the first msg-id citation appears
+# 2026-05-02, architecture/adr/ORG-004). Anchor-less lines are already skipped by
+# the anchor-presence gate
 # in find_authority_markers, so this floor is a named, auditable belt-and-suspenders
 # for the historical case rather than the sole line of defense.
 AUTHORITY_MARKER_DATE_FLOOR = date(2026, 5, 1)
@@ -194,10 +197,25 @@ def parse_log(raw: str) -> dict[str, dict]:
 
 
 def _title_of(root: Path, rel_path: str) -> str:
-    """First markdown heading of a file, else its stem. Best-effort (file may be gone)."""
+    """First markdown heading of a file, else its stem. Best-effort (file may be gone).
+
+    Skips YAML frontmatter (delimited by opening/closing `---`) before scanning for
+    a markdown heading — otherwise YAML comment lines like `# elements: — ORG-065 ...`
+    inside the frontmatter get returned as if they were the H1.
+    """
     p = root / rel_path
     try:
-        for line in p.read_text(encoding="utf-8").splitlines():
+        lines = p.read_text(encoding="utf-8").splitlines()
+        i = 0
+        while i < len(lines) and not lines[i].strip():
+            i += 1
+        if i < len(lines) and lines[i].strip() == "---":
+            i += 1
+            while i < len(lines) and lines[i].strip() != "---":
+                i += 1
+            if i < len(lines):
+                i += 1  # skip closing ---
+        for line in lines[i:]:
             s = line.strip()
             if s.startswith("#"):
                 return s.lstrip("#").strip()
@@ -414,9 +432,14 @@ def build_digest(root: Path, changes: dict[str, dict], since_days: int) -> str:
 
     by_dir: dict[str, list[tuple[str, dict]]] = {d: [] for d in WATCHED}
     for path, meta in changes.items():
-        top = path.split("/", 1)[0]
-        if top in by_dir:
-            by_dir[top].append((path, meta))
+        # Multi-segment WATCHED entries (e.g. "architecture/adr" per ORG-094)
+        # can't be matched via first-segment split; use prefix match with a
+        # trailing "/" so "architecture/adr" matches "architecture/adr/*.md"
+        # but not a hypothetical sibling "architecture/adrs/*".
+        for d in WATCHED:
+            if path.startswith(d + "/"):
+                by_dir[d].append((path, meta))
+                break
 
     for d in WATCHED:
         entries = by_dir[d]

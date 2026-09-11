@@ -10,7 +10,7 @@ tool runs exclusively inside `with_worktree` (`run_all`, unconditional, no
 bypass), and `git worktree add` stamps every checked-out file at checkout time.
 So the mtime a fire caches is ~its own start time, and the next fire's freshly
 stamped files are always NEWER — `current <= cached` can never hold. Measured:
-a worktree's adr/*.md came out at checkout-time while the checkout's real
+a worktree's architecture/adr/*.md came out at checkout-time while the checkout's real
 mtimes were 21 days old. The cache's hit rate was structurally ZERO on every
 path the tool actually runs, however it was keyed, while it grew ~15
 permanently unreachable keys per fire into a state file nothing pruned.
@@ -929,7 +929,7 @@ def _build_handler_map(root: Path) -> dict[Path, object]:
         root / "bugs": bugs_handler,
         root / "incidents": incidents_handler,
         root / "knowledge" / "watch" / "reports": watch_reports_handler,
-        root / "adr": adr_handler,
+        root / "architecture" / "adr": adr_handler,
         root / "ledger": ledger_handler,
         # Five directories added per T-0434 (the operator msg_1523 ratification:
         # "all folders and subfolders should be part of sweep").

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import dataclasses
 import hashlib
 import json
 import os
@@ -196,7 +197,8 @@ class RuntimeProfileResolutionTests(unittest.TestCase):
                 obs for obs in report.observations if obs.check_id == "claude.executable"
             )
             command = adapter.build_interactive_launch(
-                TmuxTarget(session="pantheon-recovery", window="harness", pane="0")
+                TmuxTarget(session="pantheon-recovery", window="harness", pane="0"),
+                cwd=Path("/tmp/launch"),
             )
             self.assertEqual(executable_obs.evidence["path"], str(exe))
             self.assertEqual(command.argv[0], str(exe))
@@ -303,7 +305,8 @@ class RuntimeProfileResolutionTests(unittest.TestCase):
         )
         adapter = ClaudeHarnessAdapter("recovery", launch=launch)
         command = adapter.build_interactive_launch(
-            TmuxTarget(session="pantheon-recovery", window="harness", pane="0")
+            TmuxTarget(session="pantheon-recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
         )
         self.assertEqual(launch.profile, "interactive-subscription")
         self.assertEqual(launch.mode, "interactive")
@@ -325,7 +328,8 @@ class RuntimeProfileResolutionTests(unittest.TestCase):
         command = ClaudeHarnessAdapter(
             "recovery", launch=launch
         ).build_interactive_launch(
-            TmuxTarget(session="pantheon-recovery", window="harness", pane="0")
+            TmuxTarget(session="pantheon-recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
         )
         self.assertEqual(command.argv.count("--permission-mode"), 1)
         self.assertEqual(command.argv[-1], "acceptEdits")
@@ -357,7 +361,8 @@ class RuntimeProfileResolutionTests(unittest.TestCase):
         command = ClaudeHarnessAdapter(
             "recovery", launch=launch
         ).build_interactive_launch(
-            TmuxTarget(session="pantheon-recovery", window="harness", pane="0")
+            TmuxTarget(session="pantheon-recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
         )
         self.assertEqual(
             command.argv,
@@ -385,7 +390,8 @@ class RuntimeProfileResolutionTests(unittest.TestCase):
         command = ClaudeHarnessAdapter(
             "recovery", launch=launch
         ).build_interactive_launch(
-            TmuxTarget(session="pantheon-recovery", window="harness", pane="0")
+            TmuxTarget(session="pantheon-recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
         )
         self.assertEqual(command.argv.count("--channels"), 1)
         self.assertEqual(
@@ -409,6 +415,26 @@ class RuntimeProfileResolutionTests(unittest.TestCase):
                     "native"
                 ]["channels"] = value
                 with self.assertRaisesRegex(RuntimeProfileError, "channels"):
+                    resolve_launch_config(
+                        manifest,
+                        role="recovery",
+                        account_home=Path("/tmp/account"),
+                        selected_harness="claude",
+                    )
+
+    def test_claude_effort_must_be_non_empty_string(self) -> None:
+        # Mirrors test_claude_channels_must_be_non_empty_string: effort is a
+        # native key added alongside permission_mode/channels and must be
+        # shape-checked the same way, else a malformed value silently fails
+        # the isinstance(effort, str) and effort check in build_interactive_launch
+        # and drops --effort instead of raising at manifest resolution.
+        for value in ("", None, 7):
+            with self.subTest(value=value):
+                manifest = _manifest()
+                manifest["harness_runtime"]["roles"]["recovery"]["claude"][
+                    "native"
+                ]["effort"] = value
+                with self.assertRaisesRegex(RuntimeProfileError, "effort"):
                     resolve_launch_config(
                         manifest,
                         role="recovery",
@@ -736,7 +762,8 @@ class RuntimeLaunchAndDescriptorTests(unittest.TestCase):
     def test_claude_interactive_launch_contains_no_print_flag(self) -> None:
         adapter = ClaudeHarnessAdapter("recovery", launch=self._launch("claude"))
         command = adapter.build_interactive_launch(
-            TmuxTarget(session="pantheon-recovery", window="harness", pane="0")
+            TmuxTarget(session="pantheon-recovery", window="harness", pane="0"),
+            cwd=Path("/tmp/launch"),
         )
         self.assertNotIn("-p", command.argv)
         self.assertNotIn("--print", command.argv)
@@ -744,7 +771,7 @@ class RuntimeLaunchAndDescriptorTests(unittest.TestCase):
     def test_codex_interactive_launch_uses_same_operator_tmux_plane(self) -> None:
         adapter = CodexHarnessAdapter("recovery", launch=self._launch("codex"))
         target = TmuxTarget(session="pantheon-recovery", window="harness", pane="0")
-        command = adapter.build_interactive_launch(target)
+        command = adapter.build_interactive_launch(target, cwd=Path("/tmp/launch"))
         self.assertEqual(command.env["PANTHEON_TMUX_SESSION"], target.session)
         self.assertEqual(command.env["PANTHEON_TMUX_WINDOW"], target.window)
         self.assertNotIn("exec", command.argv)
@@ -920,6 +947,196 @@ class RuntimeManifestFileTests(unittest.TestCase):
         manifest["harness_runtime"]["controller"]["tmux"]["session"] = "{persona}-{harness}"
         with self.assertRaisesRegex(RuntimeProfileError, "must not vary"):
             resolve_controller_config(manifest, persona="recovery", role="recovery")
+
+    def test_permission_policy_orchestrator_codex_compiles_danger_full_never_without_widening_other_roles(self) -> None:
+        manifest = yaml.safe_load((REPO_ROOT / "instance.yaml").read_text(encoding="utf-8"))
+        orchestrator = resolve_launch_config(
+            manifest,
+            role="orchestrator",
+            account_home=Path("/home/claude"),
+            selected_harness="codex",
+            bound_persona="orchestrator",
+            bound_mailbox=Path("/home/the-ancestor/mailbox/orchestrator"),
+            mailbox_hub=Path("/home/the-ancestor/mailbox"),
+        )
+        self.assertEqual(orchestrator.native["permission_posture"], "full-auto")
+        self.assertEqual(orchestrator.native["execution_boundary"], "unrestricted")
+        spec = CodexHarnessAdapter("orchestrator", launch=orchestrator).build_interactive_launch(
+            TmuxTarget("claude-telegram-bot", "harness", "0"),
+            cwd=REPO_ROOT,
+        )
+        self.assertEqual(spec.argv[spec.argv.index("--sandbox") + 1], "danger-full-access")
+        self.assertIn('approval_policy="never"', spec.argv)
+
+        for role, persona, account in (
+            ("specialist", "specialist", Path("/home/claude-research")),
+            ("recovery", "recovery", Path("/home/claude-fallback")),
+        ):
+            with self.subTest(role=role):
+                launch = resolve_launch_config(
+                    manifest,
+                    role=role,
+                    account_home=account,
+                    selected_harness="codex",
+                    bound_persona=persona,
+                    bound_mailbox=Path("/home/the-ancestor/mailbox") / persona,
+                    mailbox_hub=Path("/home/the-ancestor/mailbox"),
+                )
+                self.assertNotIn("permission_posture", launch.native)
+                self.assertEqual(launch.native.get("sandbox"), "workspace-write")
+                self.assertEqual(launch.native.get("config_overrides", {}).get("approval_policy"), "never")
+
+    def test_permission_policy_rejects_unknown_duplicate_missing_or_wrong_harness_values(self) -> None:
+        manifest = copy.deepcopy(_manifest())
+        codex = manifest["harness_runtime"]["roles"]["recovery"]["codex"]
+        for key in ("sandbox",):
+            codex["native"].pop(key, None)
+        codex["native"]["config_overrides"].pop("approval_policy", None)
+
+        cases = {
+            "unknown-posture": {"permission_posture": "ask-first", "execution_boundary": "workspace"},
+            "unknown-boundary": {"permission_posture": "full-auto", "execution_boundary": "root"},
+            "missing-boundary": {"permission_posture": "full-auto"},
+            "missing-posture": {"execution_boundary": "workspace"},
+        }
+        for name, values in cases.items():
+            with self.subTest(name=name):
+                candidate = copy.deepcopy(manifest)
+                candidate["harness_runtime"]["roles"]["recovery"]["codex"].update(values)
+                with self.assertRaises(RuntimeProfileError):
+                    resolve_launch_config(
+                        candidate,
+                        role="recovery",
+                        account_home=Path("/tmp/account"),
+                        selected_harness="codex",
+                    )
+
+        dual = copy.deepcopy(manifest)
+        dual["harness_runtime"]["roles"]["recovery"]["codex"].update(
+            {"permission_posture": "full-auto", "execution_boundary": "workspace"}
+        )
+        dual["harness_runtime"]["roles"]["recovery"]["codex"]["native"]["sandbox"] = "workspace-write"
+        with self.assertRaisesRegex(RuntimeProfileError, "native.sandbox"):
+            resolve_launch_config(
+                dual,
+                role="recovery",
+                account_home=Path("/tmp/account"),
+                selected_harness="codex",
+            )
+
+        reserved_native = copy.deepcopy(manifest)
+        reserved_native["harness_runtime"]["roles"]["recovery"]["codex"]["native"]["permission_posture"] = "full-auto"
+        with self.assertRaisesRegex(RuntimeProfileError, "reserved"):
+            resolve_launch_config(
+                reserved_native,
+                role="recovery",
+                account_home=Path("/tmp/account"),
+                selected_harness="codex",
+            )
+
+        wrong_harness = copy.deepcopy(manifest)
+        wrong_harness["harness_runtime"]["roles"]["recovery"]["claude"]["permission_posture"] = "full-auto"
+        with self.assertRaisesRegex(RuntimeProfileError, "permission_posture"):
+            resolve_launch_config(
+                wrong_harness,
+                role="recovery",
+                account_home=Path("/tmp/account"),
+                selected_harness="claude",
+            )
+
+        live_shaped = yaml.safe_load((REPO_ROOT / "instance.yaml").read_text(encoding="utf-8"))
+        del live_shaped["harness_runtime"]["roles"]["orchestrator"]["codex"]["execution_boundary"]
+        with self.assertRaisesRegex(RuntimeProfileError, "execution_boundary"):
+            resolve_launch_config(
+                live_shaped,
+                role="orchestrator",
+                account_home=Path("/home/claude"),
+                selected_harness="codex",
+                bound_persona="orchestrator",
+                bound_mailbox=Path("/home/the-ancestor/mailbox/orchestrator"),
+                mailbox_hub=Path("/home/the-ancestor/mailbox"),
+            )
+        from tools.persona_installer import Manifest, ManifestError
+
+        with self.assertRaisesRegex(ManifestError, "execution_boundary"):
+            Manifest.from_bytes(
+                REPO_ROOT / "instance.yaml",
+                yaml.safe_dump(live_shaped).encode("utf-8"),
+            )
+
+    def test_codex_adapter_launch_uses_manifest_permission_policy_native_argv(self) -> None:
+        manifest = copy.deepcopy(_manifest())
+        codex = manifest["harness_runtime"]["roles"]["recovery"]["codex"]
+        codex["permission_posture"] = "full-auto"
+        codex["execution_boundary"] = "unrestricted"
+        codex["native"] = {"config_overrides": {"model_reasoning_effort": "high"}}
+        launch = resolve_launch_config(
+            manifest,
+            role="recovery",
+            account_home=Path("/tmp/account"),
+            selected_harness="codex",
+        )
+        spec = CodexHarnessAdapter("recovery", launch=launch).build_interactive_launch(
+            TmuxTarget("s", "w", "0"),
+            cwd=Path("/tmp/account"),
+        )
+        self.assertEqual(spec.argv[spec.argv.index("--sandbox") + 1], "danger-full-access")
+        self.assertIn('approval_policy="never"', spec.argv)
+        self.assertIn('model_reasoning_effort="high"', spec.argv)
+
+    def test_codex_adapter_direct_native_rejects_dual_authority_and_preserves_full_auto_green(self) -> None:
+        base = HarnessLaunchConfig(
+            harness="codex",
+            profile="interactive-chatgpt",
+            executable=Path("/usr/bin/codex"),
+            model=None,
+            mode="interactive",
+            meter="subscription",
+            quota_source="app-server",
+            native={},
+            sources=("test",),
+        )
+        target = TmuxTarget("s", "w", "0")
+        valid = dataclasses.replace(
+            base,
+            native={
+                "permission_posture": "full-auto",
+                "execution_boundary": "unrestricted",
+                "config_overrides": {"model_reasoning_effort": "high"},
+            },
+        )
+        spec = CodexHarnessAdapter("test", launch=valid).build_interactive_launch(
+            target,
+            cwd=Path("/tmp"),
+        )
+        self.assertEqual(spec.argv[spec.argv.index("--sandbox") + 1], "danger-full-access")
+        self.assertIn('approval_policy="never"', spec.argv)
+        self.assertIn('model_reasoning_effort="high"', spec.argv)
+
+        cases = (
+            {
+                "permission_posture": "full-auto",
+                "config_overrides": {"model_reasoning_effort": "high"},
+            },
+            {
+                "permission_posture": "full-auto",
+                "execution_boundary": "unrestricted",
+                "sandbox": "workspace-write",
+            },
+            {
+                "permission_posture": "full-auto",
+                "execution_boundary": "unrestricted",
+                "config_overrides": {"approval_policy": "on-request"},
+            },
+        )
+        for native in cases:
+            with self.subTest(native=native):
+                launch = dataclasses.replace(base, native=native)
+                with self.assertRaises(ValueError):
+                    CodexHarnessAdapter("test", launch=launch).build_interactive_launch(
+                        target,
+                        cwd=Path("/tmp"),
+                    )
 
 
 if __name__ == "__main__":

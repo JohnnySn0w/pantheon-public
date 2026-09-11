@@ -7,7 +7,7 @@ Covers:
   - cooldown semantics (recent / old / missing / malformed state)
   - latest_commit_ts + latest_ledger_entry_ts_for_agent
   - count_actionable_tickets frontmatter parser
-  - detect_await_state regex
+  - latest_assistant_ends_without_tool_use structural signal (T-3071)
   - operator_last_inbound_age_seconds parser
   - check_p1a + check_p1b composition
   - main flow with mocked subprocess + urlopen
@@ -41,12 +41,11 @@ from tools.activity_monitor import (
     P1D_RATE_LIMIT_AGE_SECONDS,
     P1D_COOLDOWN_SECONDS,
     ACTIVITY_MONITOR_COOLDOWN_SECONDS,
-    AWAIT_STATE_REGEX,
     RATE_LIMIT_REGEX,
     capture_pane,
     check_p1d,
     count_actionable_tickets,
-    detect_await_state,
+    _scan_actionable_tickets,
     detect_rate_limit_in_pane,
     in_cooldown,
     latest_rate_limit_assistant_ts,
@@ -54,6 +53,37 @@ from tools.activity_monitor import (
     main,
     write_poke_state,
 )
+
+# ---------------------------------------------------------------------------
+# T-3072: module-wide PANTHEON_STATE_DIR isolation.
+#
+# activity_monitor.py now writes a best-effort fire-tracking JSONL
+# (`_record_fire`) keyed off PANTHEON_STATE_DIR on every landed poke/modal-
+# confirm/escalation — including from test classes that exercise
+# `_dispatch_poke` / `_escalate_stuck` / `main()` WITHOUT setting their own
+# PANTHEON_STATE_DIR override (e.g. TestDispatchPoke, CapModalDispatchT1369,
+# TestCapPrePokeGate). Without this module-wide redirect, those tests would
+# append to the REAL account's `~/.local/state/pantheon/activity_monitor/
+# fires.jsonl` on whatever seat runs the suite. Classes that need their OWN
+# isolated state dir (TestMain, TuiWedgeMainT1369) still set/restore
+# PANTHEON_STATE_DIR in their own setUp/tearDown, which nests safely on top
+# of this module-wide default (setUp runs after setUpModule; tearDown
+# restores before tearDownModule tears down the module default).
+# ---------------------------------------------------------------------------
+
+_MODULE_STATE_TMP: tempfile.TemporaryDirectory | None = None
+
+
+def setUpModule() -> None:
+    global _MODULE_STATE_TMP
+    _MODULE_STATE_TMP = tempfile.TemporaryDirectory()
+    os.environ["PANTHEON_STATE_DIR"] = str(Path(_MODULE_STATE_TMP.name) / "state")
+
+
+def tearDownModule() -> None:
+    os.environ.pop("PANTHEON_STATE_DIR", None)
+    if _MODULE_STATE_TMP is not None:
+        _MODULE_STATE_TMP.cleanup()
 
 
 # ---------------------------------------------------------------------------
@@ -71,11 +101,43 @@ class TestAgentConfig(unittest.TestCase):
         self.assertIn("orchestrator", cfg["ticket_targets"])
         # P1.c (ORG-037 Layer 3): orchestrator must carry a teams_dir to be eligible.
         self.assertEqual(cfg["teams_dir"], Path("/home/claude/.claude/teams"))
+        # T-3557(e): orchestrator carries NO queue_states override → defaults to
+        # inbox+active. orchestrator is the always-on inbox-drainer, so an idle inbox
+        # IS a signal; this guards that the sub-orch active-only tune did not
+        # silently narrow the HO.
+        self.assertNotIn("queue_states", cfg)
 
     def test_specialist_recovery_not_yet_covered(self) -> None:
         # ORG-011 Phase B is orchestrator-only initially; specialist + recovery come post-empirical.
         self.assertNotIn("specialist", AGENT_CONFIG)
         self.assertNotIn("recovery", AGENT_CONFIG)
+
+    def test_atlas_metis_covered_narrow_scope(self) -> None:
+        # T-3555 (the operator TG 9289): the two ORG-043 sub-orchestrator seats get
+        # await/cap-modal/rate-limit coverage — NARROW scope, NO P1.c teams_dir.
+        for agent, account, pane in (("atlas", "suborch2", "suborch2-main:0"),
+                                     ("metis", "suborch1", "suborch1-main:0")):
+            cfg = AGENT_CONFIG[agent]
+            self.assertEqual(cfg["sudo_user"], account)
+            self.assertEqual(cfg["tmux_target_pane"], pane)
+            self.assertEqual(cfg["ledger_agent_id"], agent)
+            self.assertIn(agent, cfg["ticket_targets"])
+            # Active jsonl is the -pantheon-config project (consume-runtime launches
+            # cwd=<account>/pantheon-config), NOT the month-stale plain -home-<account>.
+            self.assertTrue(
+                str(cfg["jsonl_dir"]).endswith(f"-home-{account}-pantheon-config"),
+                f"{agent} jsonl_dir must point at the active -pantheon-config project",
+            )
+            self.assertEqual(cfg["pantheon_config_path"], Path(f"/home/{account}/pantheon-config"))
+            # NARROW scope (T-3555): no teams_dir → structurally excluded from the
+            # P1.c Layer-3 worker-silence witness apparatus (msg_1326 veto reversed
+            # only for these two, and only for the await/modal/rate-limit predicates).
+            self.assertNotIn("teams_dir", cfg)
+            # T-3557(e): sub-orch seats count ACTIVE tickets only — an unclaimed
+            # inbox ticket is undispatched, not work the seat is stuck on. This is
+            # the wiring guard: without it the function-level active-only tests
+            # would pass while the real monitor still counted inbox (false-fire).
+            self.assertEqual(cfg["queue_states"], ("active",))
 
 
 # ---------------------------------------------------------------------------
@@ -189,6 +251,53 @@ class TestPokeEffectivenessDecision(unittest.TestCase):
         self.assertEqual(consec, 0)
 
 
+class TestRecordFire(unittest.TestCase):
+    """T-3072 — `_record_fire`: the meta-drift alarm's producer helper."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        os.environ["PANTHEON_STATE_DIR"] = str(self.tmp / "state")
+
+    def tearDown(self) -> None:
+        os.environ.pop("PANTHEON_STATE_DIR", None)
+        self._tmp.cleanup()
+
+    def _fires_path(self) -> Path:
+        return self.tmp / "state" / "activity_monitor" / "fires.jsonl"
+
+    def test_appends_one_jsonl_line(self) -> None:
+        am._record_fire("orchestrator", "p1a")
+        lines = self._fires_path().read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        rec = json.loads(lines[0])
+        self.assertEqual(rec["agent"], "orchestrator")
+        self.assertEqual(rec["predicate"], "p1a")
+        self.assertIn("ts", rec)
+        self.assertIn("ts_iso", rec)
+
+    def test_multiple_fires_append_not_overwrite(self) -> None:
+        am._record_fire("orchestrator", "p1a")
+        am._record_fire("orchestrator", "p1b")
+        lines = self._fires_path().read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 2)
+        predicates = [json.loads(line)["predicate"] for line in lines]
+        self.assertEqual(predicates, ["p1a", "p1b"])
+
+    def test_failure_is_swallowed_and_logged_not_raised(self) -> None:
+        with patch.object(Path, "mkdir", side_effect=OSError("disk full")):
+            with redirect_stdout(io.StringIO()) as out:
+                am._record_fire("orchestrator", "p1a")  # must not raise
+        self.assertIn("_record_fire", out.getvalue())
+        self.assertFalse(self._fires_path().exists())
+
+    def test_respects_pantheon_state_dir_override(self) -> None:
+        self.assertEqual(
+            am._fires_log_path(),
+            self.tmp / "state" / "activity_monitor" / "fires.jsonl",
+        )
+
+
 class TestDispatchPoke(unittest.TestCase):
     """T-1363 — _dispatch_poke: legacy passthrough (flag off) + bounded suppress."""
 
@@ -199,26 +308,31 @@ class TestDispatchPoke(unittest.TestCase):
     def test_legacy_path_pokes_and_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sp = Path(tmp) / "state.json"
-            with patch.object(am, "send_poke", return_value=True) as poke:
+            with patch.object(am, "send_poke", return_value=True) as poke, \
+                 patch.object(am, "_record_fire") as record_fire:
                 rc = am._dispatch_poke(self._cfg(), "orchestrator", "p1a", "PROMPT", sp,
                                        bounded_enabled=False, max_ineffective=1)
             self.assertEqual(rc, 0)
             poke.assert_called_once()
             self.assertEqual(am.read_poke_state(sp)["predicate"], "p1a")
+            record_fire.assert_called_once_with("orchestrator", "p1a")  # T-3072
 
     def test_legacy_path_send_failure_returns_1(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sp = Path(tmp) / "state.json"
-            with patch.object(am, "send_poke", return_value=False):
+            with patch.object(am, "send_poke", return_value=False), \
+                 patch.object(am, "_record_fire") as record_fire:
                 rc = am._dispatch_poke(self._cfg(), "orchestrator", "p1a", "P", sp,
                                        bounded_enabled=False, max_ineffective=1)
             self.assertEqual(rc, 1)
+            record_fire.assert_not_called()  # T-3072 — a failed send is not a fire
 
     def test_bounded_first_fire_pokes_and_records_premtime(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sp = Path(tmp) / "state.json"
             with patch.object(am, "send_poke", return_value=True) as poke, \
                  patch.object(am, "_session_cyber_blocked", return_value=False), \
+                 patch.object(am, "_record_fire") as record_fire, \
                  patch.object(am, "latest_jsonl_mtime", return_value=5000):
                 rc = am._dispatch_poke(self._cfg(), "orchestrator", "p1c", "P", sp,
                                        bounded_enabled=True, max_ineffective=1)
@@ -227,6 +341,7 @@ class TestDispatchPoke(unittest.TestCase):
             data = am.read_poke_state(sp)
             self.assertEqual(data["pre_poke_jsonl_mtime"], 5000)
             self.assertEqual(data["consecutive_ineffective"], 0)
+            record_fire.assert_called_once_with("orchestrator", "p1c")  # T-3072
 
     def test_bounded_suppresses_when_prior_ineffective(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -237,6 +352,7 @@ class TestDispatchPoke(unittest.TestCase):
             with patch.object(am, "send_poke", return_value=True) as poke, \
                  patch.object(am, "_session_cyber_blocked", return_value=False), \
                  patch.object(am, "_route_failure_alert") as alert, \
+                 patch.object(am, "_record_fire") as record_fire, \
                  patch.object(am, "latest_jsonl_mtime", return_value=5000):
                 rc = am._dispatch_poke(self._cfg(), "orchestrator", "p1c", "P", sp,
                                        bounded_enabled=True, max_ineffective=1)
@@ -244,6 +360,10 @@ class TestDispatchPoke(unittest.TestCase):
             poke.assert_not_called()  # SUPPRESSED — the token-saving behavior
             self.assertTrue(am.read_poke_state(sp)["escalated"])
             alert.assert_called_once()  # escalates to Recovery instead of re-poking
+            # T-3072: escalation fire is keyed on VOCAB ("stuck-poke"), not the
+            # triggering predicate ("p1c") — each escalation class tracks drift
+            # independently.
+            record_fire.assert_called_once_with("orchestrator", "stuck-poke")
 
     def test_bounded_cyber_blocked_suppresses_even_when_jsonl_advanced(self) -> None:
         """The pre-poke gate: a cyber-blocked session emits refusals that ADVANCE
@@ -259,6 +379,7 @@ class TestDispatchPoke(unittest.TestCase):
             with patch.object(am, "send_poke", return_value=True) as poke, \
                  patch.object(am, "_session_cyber_blocked", return_value=True), \
                  patch.object(am, "_route_failure_alert") as alert, \
+                 patch.object(am, "_record_fire") as record_fire, \
                  patch.object(am, "latest_jsonl_mtime", return_value=9000):
                 rc = am._dispatch_poke(self._cfg(), "orchestrator", "p1c", "P", sp,
                                        bounded_enabled=True, max_ineffective=1)
@@ -266,6 +387,7 @@ class TestDispatchPoke(unittest.TestCase):
             poke.assert_not_called()  # gate wins over the (fooled) effectiveness signal
             self.assertTrue(am.read_poke_state(sp)["escalated"])
             alert.assert_called_once()  # cyber → escalate to Recovery for restart
+            record_fire.assert_called_once_with("orchestrator", "cyber-refusal")  # T-3072 vocab key
 
     def test_escalation_alerts_once_then_stays_quiet(self) -> None:
         """Bounded escalation: alert Recovery ONCE on the escalated transition, NOT
@@ -276,12 +398,17 @@ class TestDispatchPoke(unittest.TestCase):
             with patch.object(am, "send_poke", return_value=True), \
                  patch.object(am, "_session_cyber_blocked", return_value=True), \
                  patch.object(am, "_route_failure_alert") as alert, \
+                 patch.object(am, "_record_fire") as record_fire, \
                  patch.object(am, "latest_jsonl_mtime", return_value=9000):
                 # Three consecutive cycles, cyber-blocked the whole time.
                 for _ in range(3):
                     am._dispatch_poke(self._cfg(), "orchestrator", "p1c", "P", sp,
                                       bounded_enabled=True, max_ineffective=1)
             self.assertEqual(alert.call_count, 1, "alert fires once, then bounded-quiet")
+            # T-3072: fire-tracking is NOT bounded the same way — the underlying
+            # condition is still observably true every cycle, so it records all 3.
+            self.assertEqual(record_fire.call_count, 3)
+            record_fire.assert_called_with("orchestrator", "cyber-refusal")
 
     def test_escalation_routing_failure_does_not_raise(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -289,11 +416,15 @@ class TestDispatchPoke(unittest.TestCase):
             with patch.object(am, "send_poke", return_value=True), \
                  patch.object(am, "_session_cyber_blocked", return_value=True), \
                  patch.object(am, "_route_failure_alert", side_effect=RuntimeError("recovery down")), \
+                 patch.object(am, "_record_fire") as record_fire, \
                  patch.object(am, "latest_jsonl_mtime", return_value=9000):
                 rc = am._dispatch_poke(self._cfg(), "orchestrator", "p1c", "P", sp,
                                        bounded_enabled=True, max_ineffective=1)
             self.assertEqual(rc, 0, "escalation routing failure must not wedge the monitor")
             self.assertTrue(am.read_poke_state(sp)["escalated"])  # still marks escalated
+            # T-3072: fire-tracking runs BEFORE alert routing inside
+            # _escalate_stuck, so a routing failure must not suppress it either.
+            record_fire.assert_called_once_with("orchestrator", "cyber-refusal")
 
     def test_legacy_path_ignores_cyber_gate(self) -> None:
         """Ship-dark: with bounded off, the pre-poke gate does NOT run — legacy
@@ -301,34 +432,138 @@ class TestDispatchPoke(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sp = Path(tmp) / "state.json"
             with patch.object(am, "send_poke", return_value=True) as poke, \
-                 patch.object(am, "_session_cyber_blocked", return_value=True) as gate:
+                 patch.object(am, "_session_cyber_blocked", return_value=True) as gate, \
+                 patch.object(am, "_record_fire") as record_fire:
                 rc = am._dispatch_poke(self._cfg(), "orchestrator", "p1a", "P", sp,
                                        bounded_enabled=False, max_ineffective=1)
             self.assertEqual(rc, 0)
             poke.assert_called_once()  # legacy pokes regardless
             gate.assert_not_called()   # gate not even consulted when bounded off
+            record_fire.assert_called_once_with("orchestrator", "p1a")  # T-3072 legacy path still records
+
+
+class TestDispatchPokeBusyGuard(unittest.TestCase):
+    """T-3599 — activity_monitor must DEFER (not exit-1) when the target pane is
+    BUSY (generating / manage-view). Part B of the T-3579 fix: part A taught
+    inbox_consumer.pane_idle_state to classify the manage-view footer as BUSY
+    (False); this makes _dispatch_poke actually CONSULT it. Mirrors mailbox_wake's
+    busy-defer (T-2681/T-3554): a busy pane QUEUES an injected submit rather than
+    running it, so a poke there is doomed and a return-1 mislabels a benign busy
+    pane as a unit-failure (pantheon-activity-monitor@<seat> OnFailure -> recovery).
+
+    Every test patches `_pane_idle_probe` so the pane state is deterministic and no
+    real tmux/sudo capture happens.
+    """
+
+    def _cfg(self) -> dict:
+        return {"tmux_target_pane": "x:0", "sudo_user": "claude",
+                "jsonl_dir": Path("/x"), "pantheon_config_path": Path("/x")}
+
+    # --- Guard 1: decide-time skip -----------------------------------------
+    def test_decide_time_busy_pane_defers_without_poking_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Path(tmp) / "state.json"
+            with patch.object(am, "_pane_idle_probe", return_value=False), \
+                 patch.object(am, "send_poke") as poke, \
+                 patch.object(am, "_record_fire") as record_fire:
+                rc = am._dispatch_poke(self._cfg(), "atlas", "p1b", "P", sp,
+                                       bounded_enabled=False, max_ineffective=1)
+            self.assertEqual(rc, 0)          # deferred, NOT exit-1
+            poke.assert_not_called()          # a doomed submit is never attempted
+            record_fire.assert_not_called()   # a deferral is not a fire
+
+    def test_decide_time_busy_pane_defers_without_poking_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Path(tmp) / "state.json"
+            with patch.object(am, "_pane_idle_probe", return_value=False), \
+                 patch.object(am, "send_poke") as poke, \
+                 patch.object(am, "_record_fire") as record_fire:
+                rc = am._dispatch_poke(self._cfg(), "atlas", "p1b", "P", sp,
+                                       bounded_enabled=True, max_ineffective=1)
+            self.assertEqual(rc, 0)
+            poke.assert_not_called()
+            record_fire.assert_not_called()
+
+    def test_decide_time_unknown_pane_still_pokes(self) -> None:
+        """None = UNKNOWN must NOT skip a poke (fail-open) — a foreign/unreadable
+        pane behaves exactly as before the guard."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Path(tmp) / "state.json"
+            with patch.object(am, "_pane_idle_probe", return_value=None), \
+                 patch.object(am, "send_poke", return_value=True) as poke, \
+                 patch.object(am, "_record_fire"):
+                rc = am._dispatch_poke(self._cfg(), "atlas", "p1b", "P", sp,
+                                       bounded_enabled=False, max_ineffective=1)
+            self.assertEqual(rc, 0)
+            poke.assert_called_once()  # UNKNOWN pokes as before
+
+    def test_decide_time_idle_pane_pokes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Path(tmp) / "state.json"
+            with patch.object(am, "_pane_idle_probe", return_value=True), \
+                 patch.object(am, "send_poke", return_value=True) as poke, \
+                 patch.object(am, "_record_fire"):
+                rc = am._dispatch_poke(self._cfg(), "atlas", "p1b", "P", sp,
+                                       bounded_enabled=False, max_ineffective=1)
+            self.assertEqual(rc, 0)
+            poke.assert_called_once()  # idle pane pokes normally
+
+    # --- Guard 2: send-fail soft-defer -------------------------------------
+    def test_send_fail_on_busy_pane_soft_defers_legacy(self) -> None:
+        """TOCTOU: pane reads not-busy at decide-time (here UNKNOWN), the send then
+        FAILS and a re-probe shows the pane is now BUSY -> soft-defer (return 0),
+        not exit-1. The poke lost nothing — the mail it re-injects stays queued."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Path(tmp) / "state.json"
+            with patch.object(am, "_pane_idle_probe", side_effect=[None, False]), \
+                 patch.object(am, "send_poke", return_value=False), \
+                 patch.object(am, "_record_fire") as record_fire:
+                rc = am._dispatch_poke(self._cfg(), "atlas", "p1b", "P", sp,
+                                       bounded_enabled=False, max_ineffective=1)
+            self.assertEqual(rc, 0)
+            record_fire.assert_not_called()  # a failed send is not a fire
+
+    def test_send_fail_on_busy_pane_soft_defers_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Path(tmp) / "state.json"
+            with patch.object(am, "_pane_idle_probe", side_effect=[None, False]), \
+                 patch.object(am, "send_poke", return_value=False), \
+                 patch.object(am, "_session_cyber_blocked", return_value=False), \
+                 patch.object(am, "latest_jsonl_mtime", return_value=5000), \
+                 patch.object(am, "_record_fire") as record_fire:
+                rc = am._dispatch_poke(self._cfg(), "atlas", "p1b", "P", sp,
+                                       bounded_enabled=True, max_ineffective=1)
+            self.assertEqual(rc, 0)
+            record_fire.assert_not_called()
+
+    def test_send_fail_on_idle_pane_still_exit1(self) -> None:
+        """A genuinely IDLE pane that rejected the submit is the real T-2245
+        send-liveness anomaly — keep exit-1 so it still alarms."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Path(tmp) / "state.json"
+            with patch.object(am, "_pane_idle_probe", side_effect=[True, True]), \
+                 patch.object(am, "send_poke", return_value=False), \
+                 patch.object(am, "_record_fire"):
+                rc = am._dispatch_poke(self._cfg(), "atlas", "p1b", "P", sp,
+                                       bounded_enabled=False, max_ineffective=1)
+            self.assertEqual(rc, 1)
+
+    def test_send_fail_on_unknown_pane_still_exit1(self) -> None:
+        """UNKNOWN at re-probe is NOT proof-of-busy -> keep exit-1 (fail-safe: an
+        unreadable pane must not silently swallow a real send failure)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            sp = Path(tmp) / "state.json"
+            with patch.object(am, "_pane_idle_probe", side_effect=[None, None]), \
+                 patch.object(am, "send_poke", return_value=False), \
+                 patch.object(am, "_record_fire"):
+                rc = am._dispatch_poke(self._cfg(), "atlas", "p1b", "P", sp,
+                                       bounded_enabled=False, max_ineffective=1)
+            self.assertEqual(rc, 1)
 
 
 # ---------------------------------------------------------------------------
 # await-state regex
 # ---------------------------------------------------------------------------
-
-
-class TestDetectAwaitState(unittest.TestCase):
-    def test_matches_waiting_on(self) -> None:
-        self.assertTrue(detect_await_state("I'm waiting on your call."))
-
-    def test_matches_awaiting_your(self) -> None:
-        self.assertTrue(detect_await_state("Standing by; awaiting your ratification."))
-
-    def test_matches_ready_when_you(self) -> None:
-        self.assertTrue(detect_await_state("Ready when you say go."))
-
-    def test_no_match(self) -> None:
-        self.assertFalse(detect_await_state("Implementation landed at d4e0f4d. Tests green."))
-
-    def test_case_insensitive(self) -> None:
-        self.assertTrue(detect_await_state("WAITING ON your decision"))
 
 
 # ---------------------------------------------------------------------------
@@ -432,6 +667,30 @@ class TestCountActionableTickets(unittest.TestCase):
             count = count_actionable_tickets(Path("/r"), frozenset({"orchestrator"}), "claude")
         self.assertEqual(count, 0)
 
+    def test_scan_returns_none_on_subprocess_failure(self) -> None:
+        """T-3570: the underlying scan distinguishes a FAILED probe (None) from
+        a confirmed-empty queue (0). The count wrapper coerces None -> 0."""
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._mock_run("", returncode=1)
+            self.assertIsNone(
+                _scan_actionable_tickets(Path("/r"), frozenset({"orchestrator"}), "claude")
+            )
+
+    def test_scan_returns_none_on_timeout(self) -> None:
+        with patch("tools.activity_monitor.subprocess.run", side_effect=subprocess.TimeoutExpired("x", 1)):
+            self.assertIsNone(
+                _scan_actionable_tickets(Path("/r"), frozenset({"orchestrator"}), "claude")
+            )
+
+    def test_scan_returns_zero_int_on_confirmed_empty(self) -> None:
+        """rc=0 with no matching tickets is a CONFIRMED-empty queue: 0, not
+        None. This is the positive can't-fire signal RC2 relies on."""
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._mock_run("", returncode=0)
+            n = _scan_actionable_tickets(Path("/r"), frozenset({"orchestrator"}), "claude")
+        self.assertEqual(n, 0)
+        self.assertIsNotNone(n)
+
     def test_returns_zero_on_empty_output(self) -> None:
         with patch("tools.activity_monitor.subprocess.run") as run:
             run.return_value = self._mock_run("")
@@ -477,6 +736,46 @@ class TestCountActionableTickets(unittest.TestCase):
         with patch("tools.activity_monitor.subprocess.run") as run:
             run.return_value = self._mock_run(stdout)
             count = count_actionable_tickets(Path("/r"), frozenset({"orchestrator"}), "claude")
+        self.assertEqual(count, 1)
+
+    def test_queue_states_default_counts_inbox_and_active(self) -> None:
+        # T-3557(e) baseline / orchestrator: the DEFAULT queue_states counts BOTH inbox
+        # and active — an idle inbox is a real "why aren't you draining" signal
+        # for the always-on HO. This guards that the default is unchanged.
+        stdout = (
+            "/r/tickets/inbox/T-1000.md|orchestrator|[]||\n"
+            "/r/tickets/active/T-1001.md|orchestrator|[]||\n"
+        )
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._mock_run(stdout)
+            count = count_actionable_tickets(Path("/r"), frozenset({"orchestrator"}), "claude")
+        self.assertEqual(count, 2)
+
+    def test_queue_states_active_only_skips_inbox(self) -> None:
+        # T-3557(e) sub-orch: with queue_states=("active",) an UNCLAIMED inbox
+        # ticket does NOT count. This is exactly the metis idle-with-inbox-only
+        # false-fire (T-3457 sat unclaimed in inbox) reduced to a no-fire:
+        # queue_count 0 → p1a/p1b bail before ever escalating.
+        stdout = "/r/tickets/inbox/T-3457.md|metis|[]||[adr-088, build]\n"
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._mock_run(stdout)
+            count = count_actionable_tickets(
+                Path("/r"), frozenset({"metis"}), "suborch1", queue_states=("active",))
+        self.assertEqual(count, 0)
+
+    def test_queue_states_active_only_counts_active(self) -> None:
+        # T-3557(e): NOT vacuous — an ACTIVE (claimed, in-progress) ticket still
+        # counts under active-only, so a seat wedged MID-WORK still fires. This is
+        # the reliability property the tune must preserve (real-queue → fire); it
+        # falsifies an over-narrowing that would blanket-zero the sub-orch queue.
+        stdout = (
+            "/r/tickets/inbox/T-3457.md|metis|[]||[build]\n"
+            "/r/tickets/active/T-9000.md|metis|[]||[build]\n"
+        )
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._mock_run(stdout)
+            count = count_actionable_tickets(
+                Path("/r"), frozenset({"metis"}), "suborch1", queue_states=("active",))
         self.assertEqual(count, 1)
 
 
@@ -835,52 +1134,70 @@ class TestCheckP1b(unittest.TestCase):
             "bridge_inbound_key": "orchestrator",
         }
 
+    def setUp(self) -> None:
+        # T-3404: check_p1b now consults the terminal-state ledger ack on the
+        # fire path. Default it to None (no ack) so tests not exercising it don't
+        # hit the real ledger subprocess; the suppression tests below override it.
+        p = patch.object(am, "latest_terminal_state_ledger_ts_for_agent", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
+
     def test_all_three_predicates_fire(self) -> None:
-        with patch.object(am, "fetch_bridge_health", return_value={
-                "last_inbound_at": {"orchestrator": "2026-01-01T00:00:00+00:00"},
-             }), \
+        with patch.object(am, "latest_telegram_inbound_ts", return_value=1700000000), \
              patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")), \
-             patch.object(am, "latest_assistant_message_body",
-                          return_value="Standing by; awaiting your ratification."), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=True), \
              patch.object(am, "count_actionable_tickets", return_value=1):
             fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
         self.assertTrue(fired)
 
     def test_operator_recent_inbound_suppresses(self) -> None:
-        # Recent inbound (now)
-        now = datetime.now(timezone.utc)
-        iso = now.strftime("%Y-%m-%dT%H:%M:%S.%f%z")
-        iso = iso[:-2] + ":" + iso[-2:]
-        with patch.object(am, "fetch_bridge_health", return_value={
-                "last_inbound_at": {"orchestrator": iso},
-             }):
+        # the operator inbound = NOW → operator-present → suppress before signals evaluated.
+        import time as _time
+        with patch.object(am, "latest_telegram_inbound_ts", return_value=int(_time.time())), \
+             patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")):
             fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
         self.assertFalse(fired)
 
     def test_no_await_state_suppresses(self) -> None:
-        with patch.object(am, "fetch_bridge_health", return_value={
-                "last_inbound_at": {"orchestrator": "2026-01-01T00:00:00+00:00"},
-             }), \
+        with patch.object(am, "latest_telegram_inbound_ts", return_value=1700000000), \
              patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")), \
-             patch.object(am, "latest_assistant_message_body",
-                          return_value="Implementation landed; tests green."), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=False), \
+             patch.object(am, "latest_assistant_interactive_tool_use", return_value=None), \
              patch.object(am, "count_actionable_tickets", return_value=1):
             fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
         self.assertFalse(fired)
 
     def test_empty_queue_suppresses(self) -> None:
-        with patch.object(am, "fetch_bridge_health", return_value={
-                "last_inbound_at": {"orchestrator": "2026-01-01T00:00:00+00:00"},
-             }), \
+        with patch.object(am, "latest_telegram_inbound_ts", return_value=1700000000), \
              patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")), \
-             patch.object(am, "latest_assistant_message_body",
-                          return_value="awaiting your call"), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=True), \
              patch.object(am, "count_actionable_tickets", return_value=0):
             fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
         self.assertFalse(fired)
 
-    def test_bridge_unreachable_fail_open(self) -> None:
-        with patch.object(am, "fetch_bridge_health", return_value=None):
+    def test_operator_ts_unavailable_fail_closed_and_evaluates_downstream(self) -> None:
+        """T-3075: when latest_telegram_inbound_ts returns None (no marker in
+        jsonl, or probe error), Gate-1 fail-CLOSED — treat as operator-absent
+        AT-THRESHOLD and proceed to evaluate Signals 1-2 + queue-count.
+        Prior semantics (fail-open, silent bail) suppressed the whole poke
+        for 10 weeks after pantheon-bridge decom."""
+        # Gate-1 None → treated as absent; downstream signals decide the fire.
+        # Below: structural-await + queue-count both hit → poke fires.
+        with patch.object(am, "latest_telegram_inbound_ts", return_value=None), \
+             patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=True), \
+             patch.object(am, "count_actionable_tickets", return_value=1):
+            fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
+        self.assertTrue(fired)
+
+    def test_operator_ts_unavailable_fail_closed_still_gated_by_downstream(self) -> None:
+        """T-3075: fail-CLOSED on Gate-1 doesn't force the poke — downstream
+        signals still gate. Here no await-state + no interactive-tool → no poke."""
+        with patch.object(am, "latest_telegram_inbound_ts", return_value=None), \
+             patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=False), \
+             patch.object(am, "latest_assistant_interactive_tool_use", return_value=None), \
+             patch.object(am, "count_actionable_tickets", return_value=1):
             fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
         self.assertFalse(fired)
 
@@ -888,12 +1205,10 @@ class TestCheckP1b(unittest.TestCase):
 
     def test_tool_use_askuserquestion_fires_via_t0297(self) -> None:
         """Latest assistant turn = AskUserQuestion tool_use → P1.b fires even
-        when text-content body doesn't match the await regex (or is empty)."""
-        with patch.object(am, "fetch_bridge_health", return_value={
-                "last_inbound_at": {"orchestrator": "2026-01-01T00:00:00+00:00"},
-             }), \
+        when the structural signal is False (turn ends in tool_use, not text)."""
+        with patch.object(am, "latest_telegram_inbound_ts", return_value=1700000000), \
              patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")), \
-             patch.object(am, "latest_assistant_message_body", return_value=""), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=False), \
              patch.object(am, "latest_assistant_interactive_tool_use", return_value="AskUserQuestion"), \
              patch.object(am, "count_actionable_tickets", return_value=1):
             fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
@@ -901,41 +1216,78 @@ class TestCheckP1b(unittest.TestCase):
 
     def test_tool_use_enterplanmode_fires_via_t0297(self) -> None:
         """EnterPlanMode tool_use also triggers await-state per the allowlist."""
-        with patch.object(am, "fetch_bridge_health", return_value={
-                "last_inbound_at": {"orchestrator": "2026-01-01T00:00:00+00:00"},
-             }), \
+        with patch.object(am, "latest_telegram_inbound_ts", return_value=1700000000), \
              patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")), \
-             patch.object(am, "latest_assistant_message_body", return_value=""), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=False), \
              patch.object(am, "latest_assistant_interactive_tool_use", return_value="EnterPlanMode"), \
              patch.object(am, "count_actionable_tickets", return_value=1):
             fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
         self.assertTrue(fired)
 
-    def test_text_signal_alone_still_fires(self) -> None:
-        """Existing text-regex signal continues to work; tool_use returns None."""
-        with patch.object(am, "fetch_bridge_health", return_value={
-                "last_inbound_at": {"orchestrator": "2026-01-01T00:00:00+00:00"},
-             }), \
+    def test_structural_signal_alone_still_fires(self) -> None:
+        """Structural signal continues to work standalone; tool_use returns None."""
+        with patch.object(am, "latest_telegram_inbound_ts", return_value=1700000000), \
              patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")), \
-             patch.object(am, "latest_assistant_message_body",
-                          return_value="Standing by; awaiting your ratification."), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=True), \
              patch.object(am, "latest_assistant_interactive_tool_use", return_value=None), \
              patch.object(am, "count_actionable_tickets", return_value=1):
             fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
         self.assertTrue(fired)
 
     def test_neither_signal_does_not_fire(self) -> None:
-        """Text doesn't match + tool_use is None → no await-state → no fire."""
-        with patch.object(am, "fetch_bridge_health", return_value={
-                "last_inbound_at": {"orchestrator": "2026-01-01T00:00:00+00:00"},
-             }), \
+        """Structural signal False + tool_use is None → no await-state → no fire."""
+        with patch.object(am, "latest_telegram_inbound_ts", return_value=1700000000), \
              patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")), \
-             patch.object(am, "latest_assistant_message_body",
-                          return_value="Implementation landed; tests green."), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=False), \
              patch.object(am, "latest_assistant_interactive_tool_use", return_value=None), \
              patch.object(am, "count_actionable_tickets", return_value=1):
             fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
         self.assertFalse(fired)
+
+    # ---- T-3404: terminal-state ack suppresses P1.b (was P1.a-only) ----
+
+    def _firing_ctx(self):
+        """All P1.b fire conditions met (the operator absent + await + queue)."""
+        import contextlib
+        cm = contextlib.ExitStack()
+        cm.enter_context(patch.object(am, "latest_telegram_inbound_ts", return_value=1700000000))
+        cm.enter_context(patch.object(am, "find_latest_jsonl", return_value=Path("/x/sess.jsonl")))
+        cm.enter_context(patch.object(am, "latest_assistant_ends_without_tool_use", return_value=True))
+        cm.enter_context(patch.object(am, "count_actionable_tickets", return_value=1))
+        return cm
+
+    def test_terminal_state_ack_within_window_suppresses(self) -> None:
+        """HO logged a terminal-state ack 30min ago and it's still the latest
+        LEDGER entry → P1.b suppressed even though all fire conditions hold. This
+        is the churn fix: the 'hold stable' text turns don't write the ledger, so
+        the ack stays latest and the suppression persists across cycles."""
+        ack_ts = int(time.time()) - 30 * 60
+        with self._firing_ctx(), \
+             patch.object(am, "latest_terminal_state_ledger_ts_for_agent", return_value=ack_ts), \
+             patch.object(am, "latest_ledger_entry_ts_for_agent", return_value=ack_ts):
+            fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
+        self.assertFalse(fired)
+
+    def test_terminal_state_ack_past_window_does_fire(self) -> None:
+        """Ack was 5hr ago (past the 4hr window) → re-fire (a fresh 'still holding?'
+        check)."""
+        ack_ts = int(time.time()) - 5 * 60 * 60
+        with self._firing_ctx(), \
+             patch.object(am, "latest_terminal_state_ledger_ts_for_agent", return_value=ack_ts), \
+             patch.object(am, "latest_ledger_entry_ts_for_agent", return_value=ack_ts):
+            fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
+        self.assertTrue(fired)
+
+    def test_real_ledger_work_after_ack_supersedes_and_fires(self) -> None:
+        """A non-terminal ledger entry AFTER the ack (real new HO work) means the
+        ack is no longer the latest ledger activity → suppression lifts → fire."""
+        ack_ts = int(time.time()) - 30 * 60
+        newer_work_ts = int(time.time()) - 5 * 60
+        with self._firing_ctx(), \
+             patch.object(am, "latest_terminal_state_ledger_ts_for_agent", return_value=ack_ts), \
+             patch.object(am, "latest_ledger_entry_ts_for_agent", return_value=newer_work_ts):
+            fired = am.check_p1b(self._cfg(Path("/x")), "http://bridge", 15 * 60)
+        self.assertTrue(fired)
 
 
 class TestLatestAssistantInteractiveToolUse(unittest.TestCase):
@@ -1022,6 +1374,107 @@ class TestLatestAssistantInteractiveToolUse(unittest.TestCase):
             run.return_value = self._jsonl_result([recent_text, older_aq])
             name = am.latest_assistant_interactive_tool_use(Path("/x.jsonl"), "claude")
         self.assertIsNone(name)  # Most-recent assistant was text, not tool_use.
+
+
+class TestLatestAssistantEndsWithoutToolUse(unittest.TestCase):
+    """T-3071 structural Signal-1: True iff the latest assistant turn's final
+    content-block has type=='text'. Replaces language-regex AWAIT_STATE_REGEX."""
+
+    def _jsonl_result(self, lines, returncode=0):
+        return MagicMock(returncode=returncode, stdout="\n".join(lines), stderr="")
+
+    def test_text_only_turn_is_await(self) -> None:
+        entry = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Implementation landed."}]},
+        })
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._jsonl_result([entry])
+            result = am.latest_assistant_ends_without_tool_use(Path("/x.jsonl"), "claude")
+        self.assertTrue(result)
+
+    def test_tool_use_only_turn_is_not_await(self) -> None:
+        entry = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]},
+        })
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._jsonl_result([entry])
+            result = am.latest_assistant_ends_without_tool_use(Path("/x.jsonl"), "claude")
+        self.assertFalse(result)
+
+    def test_mixed_tool_use_last_is_not_await(self) -> None:
+        entry = json.dumps({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "text", "text": "Reading the file first."},
+                {"type": "tool_use", "name": "Read", "input": {}},
+            ]},
+        })
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._jsonl_result([entry])
+            result = am.latest_assistant_ends_without_tool_use(Path("/x.jsonl"), "claude")
+        self.assertFalse(result)
+
+    def test_mixed_text_last_is_await(self) -> None:
+        entry = json.dumps({
+            "type": "assistant",
+            "message": {"content": [
+                {"type": "tool_use", "name": "Bash", "input": {}},
+                {"type": "text", "text": "Done — smoke green."},
+            ]},
+        })
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._jsonl_result([entry])
+            result = am.latest_assistant_ends_without_tool_use(Path("/x.jsonl"), "claude")
+        self.assertTrue(result)
+
+    def test_no_assistant_turn_in_window_is_not_await(self) -> None:
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._jsonl_result([])
+            result = am.latest_assistant_ends_without_tool_use(Path("/x.jsonl"), "claude")
+        self.assertFalse(result)
+
+    def test_subprocess_failure_is_not_await(self) -> None:
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._jsonl_result([], returncode=1)
+            result = am.latest_assistant_ends_without_tool_use(Path("/x.jsonl"), "claude")
+        self.assertFalse(result)
+
+    def test_no_text_block_anywhere_is_not_await(self) -> None:
+        """Final block isn't text (thinking-only turn) → fail-closed, no fire."""
+        entry = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "thinking", "thinking": "considering..."}]},
+        })
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._jsonl_result([entry])
+            result = am.latest_assistant_ends_without_tool_use(Path("/x.jsonl"), "claude")
+        self.assertFalse(result)
+
+    def test_empty_content_list_is_not_await(self) -> None:
+        entry = json.dumps({"type": "assistant", "message": {"content": []}})
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._jsonl_result([entry])
+            result = am.latest_assistant_ends_without_tool_use(Path("/x.jsonl"), "claude")
+        self.assertFalse(result)
+
+    def test_picks_most_recent_assistant(self) -> None:
+        """tac order — first assistant entry in tac output is most-recent in
+        file order. An older tool_use-terminal turn shouldn't suppress await
+        if the most-recent assistant turn ends in text."""
+        recent_text = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "text", "text": "Standing by."}]},
+        })
+        older_tool_use = json.dumps({
+            "type": "assistant",
+            "message": {"content": [{"type": "tool_use", "name": "Bash", "input": {}}]},
+        })
+        with patch("tools.activity_monitor.subprocess.run") as run:
+            run.return_value = self._jsonl_result([recent_text, older_tool_use])
+            result = am.latest_assistant_ends_without_tool_use(Path("/x.jsonl"), "claude")
+        self.assertTrue(result)
 
 
 class TestDetectCyberRefusal(unittest.TestCase):
@@ -1480,6 +1933,15 @@ class TestMain(unittest.TestCase):
             os.environ.pop(k, None)
         self._tmp.cleanup()
 
+    def _fires(self) -> list[dict]:
+        """T-3072: read back the real fire-log this TestMain class's own
+        PANTHEON_STATE_DIR produces — `_record_fire` is NOT mocked in this
+        class, so these are end-to-end wiring assertions at the main() level."""
+        path = self.tmp / "state" / "activity_monitor" / "fires.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
     def test_cooldown_short_circuits(self) -> None:
         state = self.tmp / "state" / "activity_monitor_orchestrator_last_poke.json"
         state.parent.mkdir(parents=True)
@@ -1498,6 +1960,7 @@ class TestMain(unittest.TestCase):
         with patch.object(am, "check_p1a", return_value=True), \
              patch.object(am, "check_p1b", return_value=False), \
              patch.object(am, "check_p1d", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
              patch.object(am, "send_poke", return_value=True) as poke:
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
@@ -1505,17 +1968,20 @@ class TestMain(unittest.TestCase):
         state = self.tmp / "state" / "activity_monitor_orchestrator_last_poke.json"
         self.assertTrue(state.exists())
         self.assertEqual(json.loads(state.read_text())["predicate"], "p1a")
+        self.assertEqual([f["predicate"] for f in self._fires()], ["p1a"])  # T-3072
 
     def test_p1b_fire_pokes_and_records(self) -> None:
         with patch.object(am, "check_p1a", return_value=False), \
              patch.object(am, "check_p1b", return_value=True), \
              patch.object(am, "check_p1d", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
              patch.object(am, "send_poke", return_value=True) as poke:
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
         poke.assert_called_once()
         state = self.tmp / "state" / "activity_monitor_orchestrator_last_poke.json"
         self.assertEqual(json.loads(state.read_text())["predicate"], "p1b")
+        self.assertEqual([f["predicate"] for f in self._fires()], ["p1b"])  # T-3072
 
     def test_p1d_fire_pokes_and_records(self) -> None:
         with patch.object(am, "check_p1a", return_value=False), \
@@ -1530,6 +1996,7 @@ class TestMain(unittest.TestCase):
         self.assertIn("rate-limit", called_prompt.lower())
         state = self.tmp / "state" / "activity_monitor_orchestrator_last_poke.json"
         self.assertEqual(json.loads(state.read_text())["predicate"], "p1d")
+        self.assertEqual([f["predicate"] for f in self._fires()], ["p1d"])  # T-3072
 
     def test_p1a_takes_precedence_over_p1b(self) -> None:
         """When both fire, P1.a wins (stronger signal: completely-idle)."""
@@ -1615,6 +2082,7 @@ class TestMain(unittest.TestCase):
              patch.object(am, "check_p1b", return_value=False), \
              patch.object(am, "check_p1d", return_value=False), \
              patch.object(am, "check_p1c", return_value=True), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
              patch.object(am, "send_poke", return_value=True) as poke:
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 0)
@@ -1624,6 +2092,7 @@ class TestMain(unittest.TestCase):
         self.assertIn("liveness backstop", called_prompt.lower())
         state = self.tmp / "state" / "activity_monitor_orchestrator_last_poke.json"
         self.assertEqual(json.loads(state.read_text())["predicate"], "p1c")
+        self.assertEqual([f["predicate"] for f in self._fires()], ["p1c"])  # T-3072
 
     def test_p1c_only_reached_after_abd_false(self) -> None:
         """Precedence: P1.c is the last gate — an earlier predicate firing
@@ -1637,11 +2106,13 @@ class TestMain(unittest.TestCase):
 
     def test_poke_failure_returns_1(self) -> None:
         with patch.object(am, "check_p1a", return_value=True), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
              patch.object(am, "send_poke", return_value=False):
             rc = main(["--agent", "orchestrator"])
         self.assertEqual(rc, 1)
         state = self.tmp / "state" / "activity_monitor_orchestrator_last_poke.json"
         self.assertFalse(state.exists())
+        self.assertEqual(self._fires(), [])  # T-3072 — a failed send is not a fire
 
     def test_env_override_threshold(self) -> None:
         """ACTIVITY_MONITOR_P1A_IDLE_SECONDS env override is threaded through."""
@@ -1822,38 +2293,45 @@ class TestCapPrePokeGate(unittest.TestCase):
              patch.object(am, "_session_cap_modal", return_value=None), \
              patch.object(am, "_session_cyber_blocked", return_value=False) as cyber, \
              patch.object(am, "_route_failure_alert") as alert, \
+             patch.object(am, "_record_fire") as record_fire, \
              patch.object(am, "latest_jsonl_mtime", return_value=5000):
             rc = am._dispatch_poke(self._cfg(), "orchestrator", "p1c", "P", sp,
                                    bounded_enabled=True, max_ineffective=1)
-        return rc, poke, alert, cyber
+        return rc, poke, alert, cyber, record_fire
 
     def test_session_limit_suppresses_poke_AND_escalation(self):
         # Self-clears at the printed time — paging a human for a state with an
         # expiry is the alarm that teaches people to skip alarms.
         with tempfile.TemporaryDirectory() as tmp:
-            rc, poke, alert, _ = self._run(("session_limit", "9:40am (UTC)"),
-                                           Path(tmp) / "s.json")
+            rc, poke, alert, _, record_fire = self._run(
+                ("session_limit", "9:40am (UTC)"), Path(tmp) / "s.json")
         self.assertEqual(rc, 0)
         poke.assert_not_called()
         alert.assert_not_called()
+        # T-3072: neither a poke landed nor an escalation fired — nothing to
+        # record. Self-clearing states are deliberately invisible to the
+        # drift alarm, same as they are to the alert path.
+        record_fire.assert_not_called()
 
     def test_spend_limit_suppresses_poke_and_escalates(self):
         # Holds until a human raises it — alert + hold, exactly once.
         with tempfile.TemporaryDirectory() as tmp:
-            rc, poke, alert, _ = self._run(("spend_limit", None),
-                                           Path(tmp) / "s.json")
+            rc, poke, alert, _, record_fire = self._run(
+                ("spend_limit", None), Path(tmp) / "s.json")
         self.assertEqual(rc, 0)
         poke.assert_not_called()
         alert.assert_called_once()
         self.assertIn("spend-cap", str(alert.call_args))
+        record_fire.assert_called_once_with("orchestrator", "spend-cap")  # T-3072 vocab key
 
     def test_no_cap_falls_through_to_cyber_gate(self):
         # The gate must be a pass-through when healthy — the cyber check still runs.
         with tempfile.TemporaryDirectory() as tmp:
-            rc, poke, alert, cyber = self._run(None, Path(tmp) / "s.json")
+            rc, poke, alert, cyber, record_fire = self._run(None, Path(tmp) / "s.json")
         self.assertEqual(rc, 0)
         cyber.assert_called_once()
         poke.assert_called_once()  # healthy path still pokes
+        record_fire.assert_called_once_with("orchestrator", "p1c")  # T-3072 normal poke path
 
     def test_ship_dark_flag_off_bypasses_cap_gate(self):
         # bounded_enabled=False must reproduce legacy behaviour exactly — the
@@ -1942,6 +2420,60 @@ class CapModalDetectorT1369(unittest.TestCase):
             "You've hit your session limit · resets 2:50pm (UTC)"))
 
 
+class TestClassifyPermissionModalT3558(unittest.TestCase):
+    """T-3558(b2): the Claude Code tool-permission modal — a DISTINCT wedge class
+    from the cap modal. Fixture is a REAL capture (modal region) off atlas/suborch2
+    2026-09-07 (the Read(//tmp/**) push-gate wedge Recovery cleared), not hand-typed.
+    DETECTION/DIAGNOSTIC only — nothing answers the prompt.
+    """
+
+    PERMISSION_SPECIMEN = REPO_ROOT / "tools" / "testdata" / "atlas_permission_modal_pane.txt"
+    CAP_SPECIMEN = REPO_ROOT / "tools" / "testdata" / "orchestrator_cap_modal_pane.txt"
+
+    def _perm(self):
+        return self.PERMISSION_SPECIMEN.read_text(encoding="utf-8")
+
+    def test_specimen_still_carries_the_distinguishing_tokens(self):
+        """A fixture that quietly loses its distinguishing tokens makes the
+        assertions below tautologies (the CapModal lesson)."""
+        raw = self._perm()
+        self.assertIn("Do you want to proceed?", raw)
+        self.assertIn("Tab to amend", raw)
+        self.assertIn("don't ask again for Read(//tmp/**)", raw)
+
+    def test_real_specimen_names_the_requested_permission(self):
+        self.assertEqual(am.classify_permission_modal(self._perm()), "Read(//tmp/**)")
+
+    def test_does_not_collide_with_the_cap_modal(self):
+        # The cap modal must NOT read as a permission modal — its footer is
+        # 'Enter to confirm · Esc to cancel' (no 'Tab to amend').
+        self.assertIsNone(am.classify_permission_modal(
+            self.CAP_SPECIMEN.read_text(encoding="utf-8")))
+
+    def test_cap_classifier_does_not_match_the_permission_specimen(self):
+        # Reciprocal non-collision: the permission modal must NOT read as the cap modal.
+        self.assertIsNone(am.classify_cap_modal(self._perm()))
+
+    def test_requires_both_question_and_footer(self):
+        # 'Do you want to proceed?' without the 'Tab to amend' footer is not enough.
+        self.assertIsNone(am.classify_permission_modal(self._perm().replace("Tab to amend", "")))
+
+    def test_generic_label_when_dont_ask_line_absent(self):
+        # A permission modal with no 'don't ask again for X' line still classifies
+        # (generic label) — detection must not hinge on that one option line.
+        text = ("Do you want to proceed?\n ❯ 1. Yes\n   3. No\n\n"
+                " Esc to cancel · Tab to amend\n")
+        self.assertEqual(am.classify_permission_modal(text), am.PERMISSION_MODAL)
+
+    def test_ansi_stripped_form_classifies_identically(self):
+        self.assertEqual(am.classify_permission_modal("\x1b[1m" + self._perm()), "Read(//tmp/**)")
+
+    def test_empty_and_ordinary_pane_are_None(self):
+        self.assertIsNone(am.classify_permission_modal(""))
+        self.assertIsNone(am.classify_permission_modal(None))
+        self.assertIsNone(am.classify_permission_modal("╭─────╮\n│ > │\n╰─────╯"))
+
+
 class CapModalDispatchT1369(unittest.TestCase):
     """The dispatch branch: dismiss when safe, never touch the keyboard when not,
     and bound the repeats."""
@@ -1963,6 +2495,13 @@ class CapModalDispatchT1369(unittest.TestCase):
             patch("tools.activity_monitor.latest_jsonl_mtime", return_value=1),
             patch("tools.activity_monitor._session_cap_state", return_value=None),
             patch("tools.activity_monitor._session_cyber_blocked", return_value=False),
+            # T-3599: these tests assert send_modal_confirm/send_poke/return-code
+            # semantics, NOT busy-guard semantics — pin the guard's pane probe to
+            # None (fail-open) so it never hits the REAL seat pane. Without this the
+            # decide-time guard defers (rc 0, no send) whenever the running seat's
+            # pane reads busy, which is a non-hermetic, seat-dependent failure
+            # (orchestrator REBOUND). Busy-guard behavior has its own TestDispatchPokeBusyGuard.
+            patch("tools.activity_monitor._pane_idle_probe", return_value=None),
         ]
         with contextlib.ExitStack() as es:
             for p in stack:
@@ -1973,46 +2512,53 @@ class CapModalDispatchT1369(unittest.TestCase):
             poker = es.enter_context(patch("tools.activity_monitor.send_poke"))
             alerter = es.enter_context(
                 patch("tools.activity_monitor._route_failure_alert"))
+            record_fire = es.enter_context(
+                patch("tools.activity_monitor._record_fire"))
             rc = am._dispatch_poke(
                 self.cfg, "orchestrator", "idle", "hello", self.state,
                 bounded_enabled=True, max_ineffective=3)
-        return rc, sender, poker, alerter
+        return rc, sender, poker, alerter, record_fire
 
     def test_safe_modal_sends_a_bare_enter_and_never_a_poke(self):
-        rc, sender, poker, _ = self._dispatch(am.MODAL_SAFE)
+        rc, sender, poker, _, record_fire = self._dispatch(am.MODAL_SAFE)
         self.assertEqual(rc, 0)
         sender.assert_called_once()
         poker.assert_not_called()
+        record_fire.assert_called_once_with("orchestrator", "idle")  # T-3072
 
     def test_unsafe_modal_sends_NOTHING_and_escalates(self):
         """The load-bearing one: option 2 spends money."""
-        rc, sender, poker, alerter = self._dispatch(am.MODAL_UNSAFE)
+        rc, sender, poker, alerter, record_fire = self._dispatch(am.MODAL_UNSAFE)
         self.assertEqual(rc, 0)
         sender.assert_not_called()
         poker.assert_not_called()
         alerter.assert_called_once()
         self.assertIn("spends", alerter.call_args[0][1])
+        record_fire.assert_called_once_with("orchestrator", "cap-modal-unsafe")  # T-3072
 
     def test_dismissals_are_BOUNDED_then_escalate(self):
         for i in range(am.MAX_MODAL_DISMISSALS):
-            _, sender, _, _ = self._dispatch(am.MODAL_SAFE)
+            _, sender, _, _, record_fire = self._dispatch(am.MODAL_SAFE)
             sender.assert_called_once()
+            record_fire.assert_called_once_with("orchestrator", "idle")  # T-3072
             self.assertEqual(
                 json.loads(self.state.read_text())["modal_dismissals"], i + 1)
-        _, sender, _, alerter = self._dispatch(am.MODAL_SAFE)
+        _, sender, _, alerter, record_fire = self._dispatch(am.MODAL_SAFE)
         sender.assert_not_called()
         alerter.assert_called_once()
+        record_fire.assert_called_once_with("orchestrator", "cap-modal")  # T-3072 escalation vocab
 
     def test_no_modal_falls_through_to_the_existing_gates(self):
         """The new branch must not swallow the jsonl cap / cyber / poke paths."""
-        rc, sender, poker, _ = self._dispatch(None)
+        rc, sender, poker, _, _ = self._dispatch(None)
         sender.assert_not_called()
         poker.assert_called_once()
 
     def test_a_failed_send_reports_rc_1(self):
-        rc, sender, _, _ = self._dispatch(am.MODAL_SAFE, send_ok=False)
+        rc, sender, _, _, record_fire = self._dispatch(am.MODAL_SAFE, send_ok=False)
         self.assertEqual(rc, 1)
         sender.assert_called_once()
+        record_fire.assert_not_called()  # T-3072 — a failed modal-confirm is not a fire
 
 
 class ProductiveLivenessT2387(unittest.TestCase):
@@ -2305,6 +2851,11 @@ class TuiWedgeMainT1369(unittest.TestCase):
         p1a.assert_not_called()             # wedge pre-empts the poke predicates
         state = self.tmp / "state" / "activity_monitor_orchestrator_last_poke.json"
         self.assertTrue(json.loads(state.read_text())["escalated"])
+        # T-3072: recorded under the escalation VOCAB ("tui-wedge"), not the
+        # literal predicate string ("tui_wedge") main() passes to _escalate_stuck.
+        fires_path = self.tmp / "state" / "activity_monitor" / "fires.jsonl"
+        fires = [json.loads(line) for line in fires_path.read_text().splitlines()]
+        self.assertEqual([f["predicate"] for f in fires], ["tui-wedge"])
 
     def test_wedge_page_suppressed_when_quiet_attributable(self) -> None:
         # T-2632 PART 2 wiring: a fired wedge whose quiet is ATTRIBUTABLE to a
@@ -2413,6 +2964,219 @@ class QuietAttributionTests(unittest.TestCase):
         self.assertTrue(ok)
         self.assertIn("held", reason)
         self.assertEqual(called, [], "hold short-circuits before injected signals")
+
+
+class TestLatestTelegramInboundTs(unittest.TestCase):
+    """T-3075 helper unit tests — Gate-1 rewire from bridge to jsonl-parse."""
+
+    def _jsonl_line(self, timestamp: str, telegram_ts: str, chat_id: str = "1") -> str:
+        return json.dumps({
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "timestamp": timestamp,
+            "sessionId": "test",
+            "content": (
+                f'<channel source="plugin:telegram:telegram" chat_id="{chat_id}" '
+                f'message_id="1" user="X" user_id="{chat_id}" ts="{telegram_ts}">\n'
+                f'body\n</channel>'
+            ),
+        })
+
+    def _mock_run(self, lines, returncode=0):
+        return MagicMock(returncode=returncode, stdout="\n".join(lines), stderr="")
+
+    def test_extracts_latest_ts(self):
+        lines = [
+            self._jsonl_line("2026-08-01T00:00:00Z", "2026-08-22T18:00:00.000Z"),
+            self._jsonl_line("2026-08-01T00:00:00Z", "2026-08-22T17:00:00.000Z"),
+            self._jsonl_line("2026-08-01T00:00:00Z", "2026-08-22T18:05:00.000Z"),
+        ]
+        with patch("subprocess.run", return_value=self._mock_run(lines)):
+            ts = am.latest_telegram_inbound_ts(Path("/x"), "claude")
+        # 18:05Z should win — later than 18:00 and 17:00.
+        from datetime import datetime as _dt
+        expected = int(_dt.fromisoformat("2026-08-22T18:05:00.000+00:00").timestamp())
+        self.assertEqual(ts, expected)
+
+    def test_no_telegram_lines_returns_none(self):
+        lines = [
+            json.dumps({"type": "assistant", "message": {"content": [{"type": "text", "text": "hi"}]}}),
+            json.dumps({"type": "queue-operation", "operation": "enqueue", "content": "unrelated"}),
+        ]
+        with patch("subprocess.run", return_value=self._mock_run(lines)):
+            ts = am.latest_telegram_inbound_ts(Path("/x"), "claude")
+        self.assertIsNone(ts)
+
+    def test_subprocess_error_returns_none(self):
+        with patch("subprocess.run", return_value=self._mock_run([], returncode=1)):
+            ts = am.latest_telegram_inbound_ts(Path("/x"), "claude")
+        self.assertIsNone(ts)
+
+    def test_subprocess_timeout_returns_none(self):
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("tac", 30)):
+            ts = am.latest_telegram_inbound_ts(Path("/x"), "claude")
+        self.assertIsNone(ts)
+
+    def test_ignores_non_enqueue_and_non_queue_operation(self):
+        # Malformed but with the marker string — must NOT count (type/operation filter).
+        lines = [
+            json.dumps({
+                "type": "queue-operation", "operation": "dequeue",
+                "content": '<channel source="plugin:telegram:telegram" ts="2026-08-22T20:00:00Z">'
+            }),
+            json.dumps({
+                "type": "assistant", "operation": "enqueue",
+                "content": '<channel source="plugin:telegram:telegram" ts="2026-08-22T21:00:00Z">'
+            }),
+        ]
+        with patch("subprocess.run", return_value=self._mock_run(lines)):
+            ts = am.latest_telegram_inbound_ts(Path("/x"), "claude")
+        self.assertIsNone(ts)
+
+    def test_malformed_ts_ignored(self):
+        lines = [
+            self._jsonl_line("2026-08-01T00:00:00Z", "not-a-timestamp"),
+        ]
+        with patch("subprocess.run", return_value=self._mock_run(lines)):
+            ts = am.latest_telegram_inbound_ts(Path("/x"), "claude")
+        # Best-effort parse fails → None (rather than crash).
+        self.assertIsNone(ts)
+
+
+class TestWedgeSpecimenCapture(unittest.TestCase):
+    """T-3558(b1): fail-open, flag-gated pane-specimen capture at wedge onset."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp())
+        self._prev = os.environ.get("PANTHEON_STATE_DIR")
+        os.environ["PANTHEON_STATE_DIR"] = str(self.tmp / "state")
+
+    def tearDown(self) -> None:
+        if self._prev is None:
+            os.environ.pop("PANTHEON_STATE_DIR", None)
+        else:
+            os.environ["PANTHEON_STATE_DIR"] = self._prev
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _cfg(self) -> dict:
+        return {"tmux_target_pane": "x:0", "sudo_user": "claude"}
+
+    def test_capture_writes_specimen_with_pane_text(self) -> None:
+        with patch.object(am, "capture_pane", return_value="WEDGE PANE TEXT\n❯ x to dismiss"):
+            path, cls = am._capture_wedge_specimen(self._cfg(), "atlas", "stuck-poke")
+        self.assertIsNotNone(path)
+        self.assertTrue(path.exists())
+        self.assertIn("x to dismiss", path.read_text())
+        self.assertEqual(path.parent, self.tmp / "state" / "activity_monitor" / "specimens")
+
+    def test_capture_names_permission_modal_class_in_header(self) -> None:
+        # T-3558(b2) wiring: a captured permission-modal pane gets a
+        # '# detected-class: <perm>' header (the classifier's real caller — this
+        # is the guard that classify_permission_modal is not dead code).
+        pane = ("Do you want to proceed?\n ❯ 1. Yes\n"
+                "   2. Yes, and don't ask again for Read(//tmp/**)\n   3. No\n\n"
+                " Esc to cancel · Tab to amend\n")
+        with patch.object(am, "capture_pane", return_value=pane):
+            path, cls = am._capture_wedge_specimen(self._cfg(), "atlas", "stuck-poke")
+        body = path.read_text()
+        self.assertEqual(cls, "Read(//tmp/**)")  # returned class (for alert naming)
+        self.assertTrue(body.startswith("# detected-class: Read(//tmp/**)\n"), body[:60])
+        self.assertIn("Do you want to proceed?", body)  # raw pane still preserved
+
+    def test_capture_none_when_pane_empty(self) -> None:
+        with patch.object(am, "capture_pane", return_value=None):
+            path, cls = am._capture_wedge_specimen(self._cfg(), "atlas", "stuck-poke")
+        self.assertIsNone(path)
+        self.assertFalse((self.tmp / "state" / "activity_monitor" / "specimens").exists())
+
+    def test_capture_failopen_when_capture_raises(self) -> None:
+        with patch.object(am, "capture_pane", side_effect=RuntimeError("tmux gone")):
+            path, cls = am._capture_wedge_specimen(self._cfg(), "atlas", "stuck-poke")
+        self.assertIsNone(path)  # swallowed, never raises
+
+    def test_capture_prunes_to_keep_newest(self) -> None:
+        with patch.object(am, "_WEDGE_SPECIMEN_KEEP", 3), \
+             patch.object(am, "capture_pane", return_value="pane"):
+            for _ in range(6):
+                am._capture_wedge_specimen(self._cfg(), "metis", "stuck-poke")
+                time.sleep(0.01)  # distinct mtimes for the newest-N prune
+        d = self.tmp / "state" / "activity_monitor" / "specimens"
+        self.assertEqual(len(list(d.glob("*.txt"))), 3)
+
+    def test_escalate_captures_when_flag_on(self) -> None:
+        sp = self.tmp / "state.json"
+        os.environ["ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE"] = "1"
+        try:
+            with patch.object(am, "_route_failure_alert"), \
+                 patch.object(am, "capture_pane", return_value="live wedge pane") as cap:
+                am._escalate_stuck(self._cfg(), "atlas", "p1b", "MSG", "stuck-poke",
+                                   sp, cur_mtime=5000, consecutive=1)
+            cap.assert_called_once()
+            specimens = list((self.tmp / "state" / "activity_monitor" / "specimens").glob("*.txt"))
+            self.assertEqual(len(specimens), 1)
+        finally:
+            os.environ.pop("ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE", None)
+
+    def test_escalate_alert_names_wedge_class_when_recognised(self) -> None:
+        # T-3558(b2): when the flag is on AND the pane is a recognised permission
+        # modal, the Recovery-facing alert names the class (off the SAME capture).
+        sp = self.tmp / "state.json"
+        os.environ["ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE"] = "1"
+        pane = ("Do you want to proceed?\n ❯ 1. Yes\n"
+                "   2. Yes, and don't ask again for Read(//tmp/**)\n   3. No\n\n"
+                " Esc to cancel · Tab to amend\n")
+        try:
+            with patch.object(am, "_route_failure_alert") as alert, \
+                 patch.object(am, "capture_pane", return_value=pane):
+                am._escalate_stuck(self._cfg(), "atlas", "p1b", "MSG", "stuck-poke",
+                                   sp, cur_mtime=5000, consecutive=1)
+            alert.assert_called_once()
+            routed_msg = alert.call_args[0][1]
+            self.assertIn("detected wedge class", routed_msg)
+            self.assertIn("Read(//tmp/**)", routed_msg)
+            self.assertIn("MSG", routed_msg)  # original message preserved
+        finally:
+            os.environ.pop("ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE", None)
+
+    def test_escalate_alert_unchanged_when_class_unrecognised(self) -> None:
+        # An unrecognised pane leaves the alert message exactly as passed (no
+        # spurious "detected wedge class" suffix).
+        sp = self.tmp / "state.json"
+        os.environ["ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE"] = "1"
+        try:
+            with patch.object(am, "_route_failure_alert") as alert, \
+                 patch.object(am, "capture_pane", return_value="just an ordinary idle pane"):
+                am._escalate_stuck(self._cfg(), "atlas", "p1b", "MSG-ONLY", "stuck-poke",
+                                   sp, cur_mtime=5000, consecutive=1)
+            self.assertEqual(alert.call_args[0][1], "MSG-ONLY")
+        finally:
+            os.environ.pop("ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE", None)
+
+    def test_escalate_no_capture_when_flag_off(self) -> None:
+        # Default (flag absent): capture_pane must NOT be called — this is the
+        # guard that the existing escalation tests keep their no-tmux behavior.
+        sp = self.tmp / "state.json"
+        os.environ.pop("ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE", None)
+        with patch.object(am, "_route_failure_alert"), \
+             patch.object(am, "capture_pane") as cap:
+            am._escalate_stuck(self._cfg(), "atlas", "p1b", "MSG", "stuck-poke",
+                               sp, cur_mtime=5000, consecutive=1)
+        cap.assert_not_called()
+
+    def test_escalate_capture_only_on_transition_not_repeat(self) -> None:
+        # Capture rides the False->True escalated transition (the `not already`
+        # branch), so a persistent wedge captures ONCE, not every cycle.
+        sp = self.tmp / "state.json"
+        os.environ["ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE"] = "1"
+        try:
+            with patch.object(am, "_route_failure_alert"), \
+                 patch.object(am, "capture_pane", return_value="pane") as cap:
+                for _ in range(3):
+                    am._escalate_stuck(self._cfg(), "atlas", "p1b", "MSG", "stuck-poke",
+                                       sp, cur_mtime=5000, consecutive=1)
+            cap.assert_called_once()
+        finally:
+            os.environ.pop("ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE", None)
 
 
 if __name__ == "__main__":

@@ -173,6 +173,64 @@ fixture_bun_server_sibling_not_child() {
   ln -sf "$PLUGIN" "$PROC_FIXTURE/400/cwd"
 }
 
+fixture_bare_bun_runner_absolute_server_child() {
+  printf '%s\0' bun run --cwd "$PLUGIN" --shell=bun --silent start > "$PROC_FIXTURE/200/cmdline"
+  printf '%s\0' "$HOME_DIR/.bun/bin/bun" server.ts > "$PROC_FIXTURE/300/cmdline"
+}
+
+fixture_runner_with_plugin_path() { # <plugin-path>
+  local plugin_path="$1"
+  printf '%s\0' bun run --cwd "$plugin_path" --shell=bun --silent start > "$PROC_FIXTURE/200/cmdline"
+  printf '%s\0' "$HOME_DIR/.bun/bin/bun" server.ts > "$PROC_FIXTURE/300/cmdline"
+}
+
+fixture_runner_argv0_path() { # <argv0>
+  local argv0="$1"
+  printf '%s\0' "$argv0" run --cwd "$PLUGIN" --shell=bun --silent start > "$PROC_FIXTURE/200/cmdline"
+  printf '%s\0' "$HOME_DIR/.bun/bin/bun" server.ts > "$PROC_FIXTURE/300/cmdline"
+}
+
+fixture_bare_bun_server_child() {
+  printf '%s\0' bun run --cwd "$PLUGIN" --shell=bun --silent start > "$PROC_FIXTURE/200/cmdline"
+  printf '%s\0' bun server.ts > "$PROC_FIXTURE/300/cmdline"
+}
+
+fixture_duplicate_pair_groups() {
+  for pid in 400 500; do
+    mkdir -p "$PROC_FIXTURE/$pid"
+    : > "$PROC_FIXTURE/$pid/status"
+    : > "$PROC_FIXTURE/$pid/children"
+  done
+  echo "200 400" > "$PROC_FIXTURE/100/children"
+  echo "300" > "$PROC_FIXTURE/200/children"
+  echo "500" > "$PROC_FIXTURE/400/children"
+  fixture_bare_bun_runner_absolute_server_child
+  printf '%s\0' bun run --cwd "$PLUGIN" --shell=bun --silent start > "$PROC_FIXTURE/400/cmdline"
+  printf '%s\0' "$HOME_DIR/.bun/bin/bun" server.ts > "$PROC_FIXTURE/500/cmdline"
+}
+
+fixture_duplicate_servers_under_runner() {
+  mkdir -p "$PROC_FIXTURE/400"
+  : > "$PROC_FIXTURE/400/status"
+  : > "$PROC_FIXTURE/400/children"
+  echo "300 400" > "$PROC_FIXTURE/200/children"
+  fixture_bare_bun_runner_absolute_server_child
+  printf '%s\0' "$HOME_DIR/.bun/bin/bun" server.ts > "$PROC_FIXTURE/400/cmdline"
+}
+
+fixture_direct_and_pair_groups() {
+  for pid in 400 500; do
+    mkdir -p "$PROC_FIXTURE/$pid"
+    : > "$PROC_FIXTURE/$pid/status"
+    : > "$PROC_FIXTURE/$pid/children"
+  done
+  echo "200 400" > "$PROC_FIXTURE/100/children"
+  echo "500" > "$PROC_FIXTURE/400/children"
+  fixture_bun_direct
+  printf '%s\0' bun run --cwd "$PLUGIN" --shell=bun --silent start > "$PROC_FIXTURE/400/cmdline"
+  printf '%s\0' "$HOME_DIR/.bun/bin/bun" server.ts > "$PROC_FIXTURE/500/cmdline"
+}
+
 setup_comms_sandbox
 fixture_bun_pair 1 1
 export PATH="$FAKEBIN:$PATH"
@@ -249,6 +307,85 @@ fixture_bun_server_sibling_not_child
 export PATH="$FAKEBIN:$PATH"
 if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
 check "comms: T-2651 server.ts sibling of runner (not child) -> not present" "$r" "no"
+teardown_comms_sandbox
+
+setup_comms_sandbox
+fixture_bare_bun_runner_absolute_server_child
+export PATH="$FAKEBIN:$PATH"
+if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+check "test_cutover_telegram_poller_present_accepts_bare_bun_runner_with_absolute_bun_server_child" "$r" "ok"
+teardown_comms_sandbox
+
+setup_comms_sandbox
+fixture_runner_argv0_path "/usr/bin/bun"
+export PATH="$FAKEBIN:$PATH"
+if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+check "test_cutover_telegram_poller_present_rejects_missing_or_duplicate_plugin_groups (runner-slash-path-not-account-local)" "$r" "no"
+teardown_comms_sandbox
+
+setup_comms_sandbox
+fixture_bare_bun_server_child
+export PATH="$FAKEBIN:$PATH"
+if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+check "test_cutover_telegram_poller_present_rejects_missing_or_duplicate_plugin_groups (server-bare-bun-not-absolute)" "$r" "no"
+teardown_comms_sandbox
+
+for bad_plugin in "/tmp/not-telegram/0.0.7" "$PLUGIN/nested" "$HOME_DIR/.claude/plugins/cache/claude-plugins-official/telegram/." "$HOME_DIR/.claude/plugins/cache/claude-plugins-official/telegram/.."; do
+  setup_comms_sandbox
+  fixture_runner_with_plugin_path "$bad_plugin"
+  export PATH="$FAKEBIN:$PATH"
+  if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+  check "test_cutover_telegram_poller_present_rejects_wrong_plugin_path_version_and_unanchored_server (${bad_plugin##*/})" "$r" "no"
+  teardown_comms_sandbox
+done
+
+setup_comms_sandbox
+fixture_bun_server_sibling_not_child
+export PATH="$FAKEBIN:$PATH"
+if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+check "test_cutover_telegram_poller_present_rejects_wrong_plugin_path_version_and_unanchored_server (unanchored-server)" "$r" "no"
+teardown_comms_sandbox
+
+setup_comms_sandbox
+fixture_bun_pair 1 0
+export PATH="$FAKEBIN:$PATH"
+if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+check "test_cutover_telegram_poller_present_rejects_missing_or_duplicate_plugin_groups (missing-server)" "$r" "no"
+teardown_comms_sandbox
+
+setup_comms_sandbox
+fixture_duplicate_pair_groups
+export PATH="$FAKEBIN:$PATH"
+if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+check "test_cutover_telegram_poller_present_rejects_missing_or_duplicate_plugin_groups (duplicate-pairs)" "$r" "no"
+teardown_comms_sandbox
+
+setup_comms_sandbox
+fixture_duplicate_servers_under_runner
+export PATH="$FAKEBIN:$PATH"
+if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+check "test_cutover_telegram_poller_present_rejects_missing_or_duplicate_plugin_groups (duplicate-servers)" "$r" "no"
+teardown_comms_sandbox
+
+setup_comms_sandbox
+fixture_direct_and_pair_groups
+export PATH="$FAKEBIN:$PATH"
+if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+check "test_cutover_telegram_poller_present_rejects_missing_or_duplicate_plugin_groups (direct-plus-pair)" "$r" "no"
+teardown_comms_sandbox
+
+setup_comms_sandbox
+fixture_bun_pair 1 1
+export PATH="$FAKEBIN:$PATH"
+if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+check "test_cutover_telegram_poller_present_preserves_absolute_bun_direct_and_pair_shapes (absolute-pair)" "$r" "ok"
+teardown_comms_sandbox
+
+setup_comms_sandbox
+fixture_bun_direct
+export PATH="$FAKEBIN:$PATH"
+if cutover_telegram_poller_present "claude-telegram-bot-fallback:0" "$HOME_DIR" "$PROC_FIXTURE"; then r=ok; else r=no; fi
+check "test_cutover_telegram_poller_present_preserves_absolute_bun_direct_and_pair_shapes (absolute-direct)" "$r" "ok"
 teardown_comms_sandbox
 
 echo "----------------------------------------"

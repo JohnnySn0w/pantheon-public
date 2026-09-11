@@ -3,7 +3,7 @@
 
 Parses Claude Code session transcript jsonl files and reports how an agent
 actually traversed the repo's documentation surface: which governance docs
-(sop/, adr/, rulebook/, HANDOFF.md, repo README, notes/recent-policy-changes.md)
+(sop/, architecture/adr/, rulebook/, HANDOFF.md, repo README, notes/recent-policy-changes.md)
 were touched, whether boot-time doc adherence happened (HANDOFF + top-level
 README within the first 15 tool_use events), and whether index reads (e.g.
 sop/standard/README.md) were FOLLOWED by a read of a doc under that index —
@@ -90,6 +90,12 @@ READ_EXTS = (".md", ".py", ".sh", ".json")
 SHELL_SEPARATORS = {"|", "||", "&&", ";", "&"}
 SPAWN_TOOLS = {"Task", "Agent"}  # subagent spawns (tool named Agent on 2.1.x)
 GOV_DIR_SEGMENTS = ("sop", "adr", "rulebook")
+# Segment -> repo-relative dir path. `adr` moved under `architecture/` on
+# 2026-09-06 (T-3472, ORG-094); segment-classification still keys on "adr"
+# (both is_governance_path and is_index_path detect the segment anywhere in
+# the path), but inventory walks + canonical-key normalization use the full
+# repo-relative dir so they still find the ADRs and emit the correct key.
+_GOV_SEG_TO_REPO_PATH = {"sop": "sop", "adr": "architecture/adr", "rulebook": "rulebook"}
 
 # ---------------------------------------------------------------------------
 # Transcript parsing
@@ -197,7 +203,7 @@ def extract_bash_read_paths(command, _depth=0):
 
 
 def is_governance_path(path, repo_root):
-    """Governance doc: under sop/ adr/ rulebook/, HANDOFF.md, repo README,
+    """Governance doc: under sop/ architecture/adr/ rulebook/, HANDOFF.md, repo README,
     or notes/recent-policy-changes.md — suffix-matched so any checkout
     prefix (/home/claude/pantheon-config vs this one) classifies alike."""
     if not isinstance(path, str) or not path:
@@ -226,7 +232,7 @@ def _is_repo_readme(path, repo_root):
 def is_index_path(path):
     """Index file: any */README.md whose directory chain includes a
     sop/adr/rulebook segment (covers sop/standard/README.md,
-    sop/remediation/README.md, adr/README.md, rulebook READMEs)."""
+    sop/remediation/README.md, architecture/adr/README.md, rulebook READMEs)."""
     if not isinstance(path, str) or os.path.basename(path) != "README.md":
         return False
     parts = path.split("/")[:-1]
@@ -235,14 +241,29 @@ def is_index_path(path):
 
 def normalize_gov_key(path, repo_root):
     """Canonical repo-relative key for a governance path, so touches from
-    different checkout prefixes aggregate together in the rollup."""
+    different checkout prefixes aggregate together in the rollup.
+
+    ADR keys are returned as `architecture/adr/<file>` (T-3472, ORG-094) —
+    the pre-move `adr/<file>` form on the input path is still recognized so
+    stale transcript entries aggregate under the same canonical key.
+    """
     for seg in GOV_DIR_SEGMENTS:
-        anchor = "/%s/" % seg
-        i = path.find(anchor)
+        repo_rel_prefix = _GOV_SEG_TO_REPO_PATH[seg]
+        # Prefer the full repo-relative anchor if the path already has it.
+        full_anchor = "/%s/" % repo_rel_prefix
+        i = path.find(full_anchor)
         if i >= 0:
             return path[i + 1 :]
-        if path.startswith(seg + "/"):
+        if path.startswith(repo_rel_prefix + "/"):
             return path
+        # Fall back to the bare-segment anchor (pre-move paths, or segments
+        # whose full path is just the segment itself).
+        bare_anchor = "/%s/" % seg
+        i = path.find(bare_anchor)
+        if i >= 0:
+            return repo_rel_prefix + path[i + len(seg) + 1:]
+        if path.startswith(seg + "/"):
+            return repo_rel_prefix + path[len(seg):]
     if path.endswith("/HANDOFF.md") or path == "HANDOFF.md":
         return "HANDOFF.md"
     if path.endswith("notes/recent-policy-changes.md"):
@@ -367,12 +388,13 @@ def analyze_session(session_id, events, repo_root):
 
 
 def inventory_governance_docs(repo_root):
-    """All *.md under <repo>/sop|adr|rulebook (recursive) + README.md, as
-    repo-relative posix paths."""
+    """All *.md under <repo>/sop|architecture/adr|rulebook (recursive) +
+    README.md, as repo-relative posix paths. ADR path per ORG-094 architecture
+    umbrella (T-3472, 2026-09-06); previously `<repo>/adr/`."""
     root = Path(repo_root)
     rels = []
     for seg in GOV_DIR_SEGMENTS:
-        base = root / seg
+        base = root / _GOV_SEG_TO_REPO_PATH[seg]
         if base.is_dir():
             rels.extend(
                 p.relative_to(root).as_posix() for p in sorted(base.rglob("*.md"))

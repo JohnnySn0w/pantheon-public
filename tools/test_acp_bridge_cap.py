@@ -160,16 +160,42 @@ class CapHandlingTest(unittest.TestCase):
                          "only the first message should reach the wrapper; the breaker "
                          "short-circuits the rest of the drain")
 
-    # -- regression: a NON-cap AcpError still quarantines (unchanged) ---------
-    def test_non_cap_acp_error_still_quarantines(self):
-        mid = mailbox.send(self.inbox, "keep going", sender="keep_going", subject="nudge")
+    # -- regression: a NON-cap AcpError still quarantines for a REAL sender ----
+    def test_non_cap_acp_error_still_quarantines_for_real_sender(self):
+        # T-2981: keep_going (disposable) is now EXEMPT from dead-lettering on a
+        # non-cap AcpError (see test_keep_going_non_cap_acp_error_is_transient
+        # below), so this uses a REAL sender to keep asserting the safety invariant:
+        # a genuine non-cap error (e.g. a PERMANENT auth break) on a message that
+        # MATTERS must still dead-letter + alert, never be silently swallowed.
+        mid = mailbox.send(self.inbox, "do the thing", sender="specialist", subject="task")
         for _ in range(3):
             bridge, _ = self._make_bridge(_base_responses(**{
                 "session/prompt": acp_bridge.AcpError(-32000, "Authentication required")}))
             result = bridge.run_once()
         self.assertEqual(len(result["quarantined"]), 1,
-                         "a genuine (non-cap) error must still dead-letter after N strikes")
+                         "a genuine (non-cap) error on a REAL sender must still dead-letter")
         self.assertTrue((self.inbox / "failed" / mid).exists())
+
+    # -- T-2981: a DISPOSABLE nudge's non-cap AcpError does NOT dead-letter ----
+    def test_keep_going_non_cap_acp_error_is_transient(self):
+        # T-2981: -32000 "Authentication required" (a transient auth flap during a
+        # quota hold) dead-lettered innocent keep_going nudges and each quarantine
+        # spawned a self-echoing mailbox-dlq alert (the T-2038 loop class). A
+        # disposable nudge is superseded by its next fire (dedupe-collapsed, T-1935),
+        # so it must stay in new/ UNCOUNTED, never quarantine.
+        mid = mailbox.send(self.inbox, "keep going", sender="keep_going", subject="nudge")
+        for _ in range(6):  # far past dlq_max_attempts (3) — the worst case
+            bridge, _ = self._make_bridge(_base_responses(**{
+                "session/prompt": acp_bridge.AcpError(-32000, "Authentication required")}))
+            result = bridge.run_once()
+        self.assertEqual(result["quarantined"], [],
+                         "a disposable keep_going nudge must never dead-letter on -32000")
+        self.assertTrue(result["errors"], "the failure is still recorded for visibility")
+        self.assertTrue((self.inbox / "new" / mid).exists(),
+                        "the nudge waits in new/ (superseded by the next fire), not failed/")
+        self.assertFalse((self.inbox / "failed" / mid).exists())
+        self.assertFalse((self.inbox / ".attempts" / mid).exists(),
+                         "a transient failure must not create a DLQ attempt counter")
 
 
 class CapResetParseTest(unittest.TestCase):

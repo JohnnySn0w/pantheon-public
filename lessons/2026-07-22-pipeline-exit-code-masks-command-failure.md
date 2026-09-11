@@ -1,22 +1,23 @@
 # Pipeline exit status masks command failure — a failing command reads GREEN behind a succeeding pipe
 
-**Date authored:** 2026-07-22 (T-1948, ORG-012 sweep promotion — criterion 1, three catalogued instances + a fourth live-caught, all same mechanism)
+**Date authored:** 2026-07-22 (T-1948, ORG-012 sweep promotion — criterion 1, three catalogued instances + a fourth live-caught, all same mechanism). **Updated 2026-09-04** (T-3412, ORG-012 sweep-flagged recurrence — a fifth surface added: trailing-echo-after-subshell in a backgrounded compound).
 **Author:** Orchestrator (Orchestrator)
 **Status:** Authored (lessons/ is an Authored, non-ratifiable class per ORG-015)
-**Re-evaluate when:** a repo-script lint flags `... | tail`/`| grep`/`| head` used as a success gate (structural enforcement retires the prose rule); or a fifth instance appears in a stage this enumeration doesn't cover.
+**Re-evaluate when:** a repo-script lint flags `... | tail`/`| grep`/`| head` used as a success gate (structural enforcement retires the prose rule); or a sixth instance appears in a stage this enumeration doesn't cover.
 
 ## The mechanism
 
 A shell pipeline's exit status is the status of its **last stage only**. So when the failure-bearing command is not last — `some_command | tail`, `some_command | grep`, `some_command &`, `cmd | consumer` — a non-zero exit from the command you actually care about is **discarded**, replaced by the (usually zero) status of the tail/grep/consumer. A command that FAILED reads GREEN to any `$?` / exit-code check downstream. The proxy (the pipeline's aggregate status) and the defining signal (the command's own status) agree right up until the moment the command fails and a later stage succeeds — which is exactly the moment you needed them to disagree.
 
-## Catalogued instances (one mechanism, four surfaces)
+## Catalogued instances (one mechanism, five surfaces)
 
 1. **Mutating / build command through `tail`/`head`** — `bugs/pipe-through-tail-head-swallows-exit-code.md`: a build or state-changing command piped to `tail` reports success while it failed; `head` additionally SIGPIPEs the producer.
 2. **Backgrounded pipe** — `bugs/pipes-on-background-commands-eat-exit-codes-and-evidence.md`: a `&`-backgrounded pipeline loses both the exit code and (often) the evidence.
 3. **Test suite through a filter (2026-07-21, ×2)** — `bugs/pipeline-exit-code-masks-suite-failure.md`: `python3 -m unittest … | tail` returns `tail`'s 0 while the suite is FAILING. Hit independently by two agents the same day (Atlas's T-1922 baseline; the BT-5 implementer's first smoke) — both caught it by re-running unpiped.
 4. **`PIPESTATUS[0]` of the wrong stage (live-caught, was uncatalogued)** — measuring a guard with `echo | hook | grep`, `PIPESTATUS[0]` is the *echo*, not the hook; briefly recorded a BLOCKING guard as PASSING. Recovered only because the author had read instance 1 closely hours earlier while diagnosing an unrelated defect in that same file (T-1929) — an entry another agent had catalogued months before under T-1613. The discovery surface worked *across authors and across months*, consumed by someone who was a stranger to the entry — which is the argument *for* it, and the load-bearing thing `bugs/README` and T-1912 exist to protect.
+5. **Trailing echo after backgrounded subshell (2026-09-02)** — `bugs/trailing-command-after-subshell-masks-inner-exit-code.md`: a compound shaped `(cmd; ec=$?; ...; exit $ec) > log 2>&1; echo COMPLETE` correctly captures the inner exit inside the subshell — but the outer shell's trailing echo becomes the LAST command in the sequence, and its exit 0 is what the harness observes. Same root mechanism ("a sequence `A; B; C` has C's exit; a backgrounded command's exit is the exit of its LAST statement"), applied at the outer-shell continuation layer rather than a pipeline. Hit during a T-3391 soak run; harness's task-notification reported exit 0 while the test suite exited 1 (91 test failures inside). The three safe shapes (subshell-as-last, short-circuit `&&`/`||`, no trailing anything) are enumerated in the bug.
 
-(Counted by reading each symptom line, not by grep: `bugs/sudo-S-heredoc-stdin-collision-false-auth-failure.md` matches a naive `pipe` grep but is a DIFFERENT mechanism — a heredoc replacing sudo's stdin — so it is three instances of this class, not four.)
+(Counted by reading each symptom line, not by grep: `bugs/sudo-S-heredoc-stdin-collision-false-auth-failure.md` matches a naive `pipe` grep but is a DIFFERENT mechanism — a heredoc replacing sudo's stdin — so it is five instances of this class, not five-plus.)
 
 ## The rule
 
@@ -33,6 +34,6 @@ This is the shell-exit-status face of the same pattern as `lessons/2026-07-21-wr
 
 ## Cross-references
 
-- `bugs/pipe-through-tail-head-swallows-exit-code.md`, `bugs/pipes-on-background-commands-eat-exit-codes-and-evidence.md`, `bugs/pipeline-exit-code-masks-suite-failure.md` — the three catalogued instances.
+- `bugs/pipe-through-tail-head-swallows-exit-code.md`, `bugs/pipes-on-background-commands-eat-exit-codes-and-evidence.md`, `bugs/pipeline-exit-code-masks-suite-failure.md`, `bugs/trailing-command-after-subshell-masks-inner-exit-code.md` — the catalogued instances.
 - `lessons/2026-07-21-wrong-layer-green-liveness-checks.md` — the proxy-vs-defining-surface sibling (liveness layer).
 - T-1948 (this promotion); the smoke-discipline "grep ALL result lines" rule (`feedback_smoke_grep_all_test_result_lines`).

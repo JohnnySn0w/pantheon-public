@@ -12,10 +12,10 @@
 >    its own module and its own test), and the inbox held 2 messages for all time, both
 >    45 days old.
 > 2. **Uneconomic even if used** — per the operator, resurrecting a session costs *more tokens
->    than simply scraping the dead session from the graveyard*. The cheaper path already
+>    than simply scraping the dead session from the Chronicle*. The cheaper path already
 >    existed.
 >
-> **If you need a HANDOFF from a dead session, scrape the graveyard** (`tools/graveyard.py`).
+> **If you need a HANDOFF from a dead session, scrape the Chronicle** (`tools/chronicle.py`).
 > Retained below for history: the substrate edges and the four `--resume` gotchas remain
 > accurate about Claude Code's behaviour and may inform future headless work.
 >
@@ -29,11 +29,11 @@
 Veneration is the **fallback tier** of agent recovery. Reach for it only when the normal path is exhausted:
 
 1. An agent booted blank, or its predecessor was cut off (forced/api-health restart, crash, OOM, a handoff that was never written or got cut mid-write).
-2. `tools/graveyard.py` can't cover it — there is **no usable latest handoff** to read. (Most recovery IS just reading the graveyard handoff; do that first.)
+2. `tools/chronicle.py` can't cover it — there is **no usable latest handoff** to read. (Most recovery IS just reading the Chronicle handoff; do that first.)
 
 The dead session is not gone: its full transcript lives in its `.jsonl` on disk, and `claude --resume` reloads the entire context even though the process is dead. Veneration resurrects that dead context **under `the-ancestor` (channel-less)**, prompts it to write a fresh HANDOFF, confirms the write, and releases. The successor then reads the harvested HANDOFF.
 
-**Do NOT use veneration when:** a graveyard handoff exists (read it instead); the agent is alive-but-wedged (restart it — see `agent-self-restart-with-kick.md` / `handoff-restart-runbook.md`); or the death was api-health **poisoning** (a 400-on-request-shape session may inherit the poison on resume and 400 again — veneration reliably covers crashed/cut-off/OOM, less certainly the poisoned case).
+**Do NOT use veneration when:** a Chronicle handoff exists (read it instead); the agent is alive-but-wedged (restart it — see `agent-self-restart-with-kick.md` / `handoff-restart-runbook.md`); or the death was api-health **poisoning** (a 400-on-request-shape session may inherit the poison on resume and 400 again — veneration reliably covers crashed/cut-off/OOM, less certainly the poisoned case).
 
 ## Procedure
 
@@ -98,7 +98,7 @@ Other failure modes:
 
 ## Boundary
 
-- Covers: harvesting a HANDOFF from a **dead** session when the graveyard can't. Does NOT cover: live-but-wedged recovery (→ restart SOPs), reading an existing graveyard handoff (→ `tools/graveyard.py`), or interactive questioning of the dead session (a hypothetical v2 — when built it may re-introduce a TUI path; we do not carry one speculatively).
+- Covers: harvesting a HANDOFF from a **dead** session when the Chronicle can't. Does NOT cover: live-but-wedged recovery (→ restart SOPs), reading an existing Chronicle handoff (→ `tools/chronicle.py`), or interactive questioning of the dead session (a hypothetical v2 — when built it may re-introduce a TUI path; we do not carry one speculatively).
 - Single-holder only: the shared flock lease serializes veneration on the one `the-ancestor` substrate. A second concurrent attempt returns `skipped`.
 - Channel-less is the load-bearing safety invariant: the resume holds NO bot token (no `--channels`, and `--safe-mode` disables plugins/MCP), so it can never hijack a live agent's bridge — the whole reason veneration runs under `the-ancestor`, never on an agent's own account.
 

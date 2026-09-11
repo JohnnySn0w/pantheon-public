@@ -75,6 +75,25 @@ class TestVerifyMtlsBinding(unittest.TestCase):
     def test_accepts_bound_cert(self):
         self.assertTrue(verify_mtls_binding(self.cert_der, self.doc, self.entry))
 
+    def test_mtls3_expired_cert_with_right_key_still_binds(self):
+        # T-2867 MTLS-3: the trust anchor is DID-key POSSESSION proven by the TLS
+        # layer, NOT a PKI — so cert validity dates are DELIBERATELY unchecked. A
+        # long-expired cert that carries the DID-authenticated key still binds.
+        # This LOCKS that decision so a future reader does not add an expiry check
+        # assuming it was merely forgotten (see the module's MTLS-3 comment).
+        expired = (x509.CertificateBuilder()
+                   .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "expired")]))
+                   .issuer_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "expired")]))
+                   .public_key(self.key.public_key())
+                   .serial_number(x509.random_serial_number())
+                   .not_valid_before(datetime.datetime(2000, 1, 1))
+                   .not_valid_after(datetime.datetime(2001, 1, 1))  # long expired
+                   .sign(self.key, hashes.SHA256()))
+        expired_der = expired.public_bytes(serialization.Encoding.DER)
+        self.assertTrue(
+            verify_mtls_binding(expired_der, self.doc, self.entry),
+            "expired-but-right-key cert must still bind (trust = key possession, not PKI validity)")
+
     def test_rejects_wrong_key_cert(self):
         # THE bypass test: a cert for a DIFFERENT key must be refused even though
         # it is a perfectly valid cert.

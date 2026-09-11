@@ -960,6 +960,86 @@ class TestFullCycle(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# T-3010: concurrent state-flip race between scan + deliver.
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentStateFlip(unittest.TestCase):
+    """T-3010: ticket state flipped from inbox -> done|active|missing between
+    list_eligible_tickets (scan) and deliver(). Must skip delivery, not poke
+    a stale ticket. Vocab: concurrent_state_flip, NEVER_ALERT (benign race)."""
+
+    def _run_cycle_with_flip(self, flip_to: str | None) -> tuple[int, list, MagicMock]:
+        """Run main("orchestrator") with the ticket state flipped just before deliver.
+        Returns (result, tmux_calls, log_outcome_mock)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp) / "tickets"
+            _write_ticket(tickets_root, "T-9910", "orchestrator", title="Flip test")
+
+            send_result = MagicMock(returncode=0, stdout="", stderr="")
+
+            def flipped_state(ticket_id: str):
+                if ticket_id.strip() == "T-9910":
+                    return flip_to  # None means missing; else "done"/"active"
+                return "inbox"
+
+            with (
+                patch("tools.inbox_consumer.AUTONOMY_OFF_PATH", Path(tmp) / "autonomy_off"),
+                patch("tools.inbox_consumer.CAP_HIT_PATH", Path(tmp) / "no_cap_hit.json"),
+                patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
+                patch("tools.inbox_consumer.LOG_PATH", Path(tmp) / "inbox_consumer.log"),
+                patch("tools.inbox_consumer.TMUX_TARGET_BY_AGENT", {"orchestrator": "claude-telegram-bot"}),
+                patch("urllib.request.urlopen") as mock_urlopen,
+                patch("subprocess.run", return_value=send_result) as mock_run,
+                patch("tools.inbox_consumer.time"),
+                patch("tools.inbox_consumer.check_dispatch_locked"),
+                patch("tools.inbox_consumer._stamp_auto_delivered"),
+                patch("tools.inbox_consumer.log_outcome") as mock_log,
+                patch("tools.inbox_consumer.check_consecutive_skips"),
+                # scan (via list_eligible_tickets) still sees inbox on disk;
+                # only the pre-deliver re-check is patched to return the flipped state.
+                patch("tools.inbox_consumer._ticket_state_on_disk", side_effect=flipped_state),
+            ):
+                health_resp = MagicMock()
+                health_resp.__enter__ = lambda s: s
+                health_resp.__exit__ = MagicMock(return_value=False)
+                health_resp.read.return_value = json.dumps({
+                    "last_inbound_at": {"orchestrator": None, "specialist": None, "recovery": None}
+                }).encode()
+                mock_urlopen.return_value = health_resp
+
+                result = main("orchestrator")
+
+            inject_calls = [c for c in mock_run.call_args_list
+                            if str(c[0][0][0]).endswith("send_keys_submit.sh")]
+            return result, inject_calls, mock_log
+
+    def _assert_skip_flip(self, result, inject_calls, mock_log):
+        self.assertEqual(result, 0)
+        self.assertEqual(len(inject_calls), 0,
+                         "deliver() must not fire when ticket flipped between scan + deliver")
+        # log_outcome called with skip:concurrent_state_flip on the exception path.
+        outcomes = [call.args[1] for call in mock_log.call_args_list if len(call.args) >= 2]
+        self.assertIn("skip:concurrent_state_flip", outcomes)
+
+    def test_state_flipped_to_done_skips_deliver(self):
+        self._assert_skip_flip(*self._run_cycle_with_flip("done"))
+
+    def test_state_flipped_to_active_skips_deliver(self):
+        self._assert_skip_flip(*self._run_cycle_with_flip("active"))
+
+    def test_state_flipped_to_missing_skips_deliver(self):
+        # Ticket file disappeared entirely between scan + deliver — same treatment.
+        self._assert_skip_flip(*self._run_cycle_with_flip(None))
+
+    def test_vocab_is_never_alert(self):
+        # Regression: the skip vocab must be classified as never-alert so a
+        # benign race doesn't trigger the 6-consecutive-skip alert.
+        from tools.inbox_consumer import NEVER_ALERT_SKIP_VOCABS
+        self.assertIn("concurrent_state_flip", NEVER_ALERT_SKIP_VOCABS)
+
+
+# ---------------------------------------------------------------------------
 # Each skip vocab — assert tmux send-keys NOT called.
 # ---------------------------------------------------------------------------
 
@@ -1735,6 +1815,41 @@ class TestRouteFailureAlertT0722(unittest.TestCase):
         self.assertIn("recovery restart wedged", msg)
 
 
+class TestRouteFailureAlertMuteT2978(unittest.TestCase):
+    """ORG-076 §7 / T-2978: a MUTED persona's failure alerts are suppressed at the
+    route_failure_alert chokepoint (both the via-Recovery and the recovery-self-direct
+    paths), while an UNMUTED persona routes normally. Fail-open: is_muted default
+    is False, so pre-existing behavior is unchanged until a persona is muted."""
+
+    def test_muted_agent_alert_is_suppressed(self):
+        from tools.inbox_consumer import route_failure_alert
+        with patch("tools.inbox_consumer._persona_is_muted", return_value=True), \
+             patch("tools.inbox_consumer._send_alert_via_recovery") as via_recovery, \
+             patch("tools.inbox_consumer._send_telegram_alert") as direct:
+            route_failure_alert("mnemosyne", "mnemosyne wedged", "restart-failure (mnemosyne)")
+        via_recovery.assert_not_called()
+        direct.assert_not_called()
+
+    def test_muted_recovery_self_is_also_suppressed(self):
+        # uniform mute: muting recovery suppresses even the recovery-self direct-to-operator path.
+        from tools.inbox_consumer import route_failure_alert
+        with patch("tools.inbox_consumer._persona_is_muted", return_value=True), \
+             patch("tools.inbox_consumer._send_alert_via_recovery") as via_recovery, \
+             patch("tools.inbox_consumer._send_telegram_alert") as direct:
+            route_failure_alert("recovery", "recovery wedged", "restart-failure (recovery)")
+        via_recovery.assert_not_called()
+        direct.assert_not_called()
+
+    def test_unmuted_agent_routes_normally(self):
+        from tools.inbox_consumer import route_failure_alert
+        with patch("tools.inbox_consumer._persona_is_muted", return_value=False), \
+             patch("tools.inbox_consumer._send_alert_via_recovery") as via_recovery, \
+             patch("tools.inbox_consumer._send_telegram_alert") as direct:
+            route_failure_alert("orchestrator", "orchestrator wedged", "restart-failure (orchestrator)")
+        via_recovery.assert_called_once()
+        direct.assert_not_called()
+
+
 class TestRoutedAuditThrottleT2237Rev2(unittest.TestCase):
     """T-2237 rev2 part 2: the `[recovery routed]` AUDIT ping is throttled per vocab.
 
@@ -1752,9 +1867,13 @@ class TestRoutedAuditThrottleT2237Rev2(unittest.TestCase):
         p.start()
         self.addCleanup(p.stop)
 
-    def _route(self, vocab="mail_staleness", pane_ok=True):
+    def _route(self, vocab="mail_staleness", pane_ok=True, mailbox_ok=False):
+        # T-3474: the mailbox leg defaults False so a pane_ok=False route still
+        # exercises the operator-fallback (both legs fail); pass mailbox_ok=True to
+        # exercise the cross-account recovery-inbox routing path.
         from tools.inbox_consumer import _send_alert_via_recovery
         with patch("tools.inbox_consumer._send_to_recovery_pane", return_value=pane_ok) as pane, \
+             patch("tools.inbox_consumer._deliver_alert_to_recovery_mailbox", return_value=mailbox_ok), \
              patch("tools.inbox_consumer._send_telegram_info") as info, \
              patch("tools.inbox_consumer._send_telegram_alert") as alert:
             _send_alert_via_recovery("something is wedged", vocab)
@@ -1800,9 +1919,10 @@ class TestRoutedAuditThrottleT2237Rev2(unittest.TestCase):
         """recovery-pane unreachable means Recovery did NOT get it and the operator IS on the
         decision path. That is the one message this change must never touch."""
         self._route()  # burn the cooldown for this vocab
-        _, info, alert = self._route(pane_ok=False)
+        # T-3474: a true operator-fallback is now BOTH legs failing (mailbox_ok=False).
+        _, info, alert = self._route(pane_ok=False, mailbox_ok=False)
         self.assertEqual(alert.call_count, 1)
-        self.assertIn("[fallback: recovery-pane unreachable]", alert.call_args[0][0])
+        self.assertIn("[fallback: recovery pane+mailbox unreachable]", alert.call_args[0][0])
         info.assert_not_called()
 
     def test_a_suppressed_audit_does_not_slide_the_window(self):
@@ -2698,12 +2818,16 @@ class TestEscalateRoutingT0314(unittest.TestCase):
                        return_value=self._mock_health(payload)), \
                  patch("tools.inbox_consumer._send_to_recovery_pane",
                        return_value=False), \
+                 patch("tools.inbox_consumer._deliver_alert_to_recovery_mailbox",
+                       return_value=False), \
                  patch("tools.inbox_consumer._send_telegram_alert") as alert:
                 vocab = check_orchestrator_health()
         self.assertEqual(vocab, "pane_wedge")
         alert.assert_called_once()
         delivered = alert.call_args[0][0]
-        self.assertIn("[fallback: recovery-pane unreachable]", delivered)
+        # T-3474: operator-fallback now requires BOTH the pane AND the recovery-mailbox
+        # leg to fail (mailbox mocked False above); the prefix names both.
+        self.assertIn("[fallback: recovery pane+mailbox unreachable]", delivered)
         self.assertIn("Orchestrator's loop is blocked", delivered)
 
     def test_c_auto_resolve_does_not_call_recovery_pane(self):
@@ -3240,16 +3364,35 @@ class TestSendAlertViaWardT0364(unittest.TestCase):
         self.assertIn("[recovery routed]", audit)                 # still the routing note
         self.assertNotIn("second line of detail", audit)      # only the first line
 
-    def test_recovery_pane_failure_falls_back_with_retry_flag(self) -> None:
+    def test_recovery_pane_and_mailbox_failure_falls_back_with_retry_flag(self) -> None:
+        # T-3474: operator-fallback now requires BOTH legs to fail.
         from tools.inbox_consumer import _send_alert_via_recovery
         with patch("tools.inbox_consumer._send_to_recovery_pane",
+                   return_value=False), \
+             patch("tools.inbox_consumer._deliver_alert_to_recovery_mailbox",
                    return_value=False), \
              patch("tools.inbox_consumer._send_telegram_alert") as alert:
             _send_alert_via_recovery("[pantheon] some operational alert text", vocab="test-class")
         alert.assert_called_once()
         delivered = alert.call_args[0][0]
-        self.assertIn("[fallback: recovery-pane unreachable]", delivered)
+        self.assertIn("[fallback: recovery pane+mailbox unreachable]", delivered)
         self.assertIn("operational alert text", delivered)
+
+    def test_recovery_pane_miss_routes_via_mailbox_not_operator(self) -> None:
+        # T-3474 REGRESSION: a cross-account pane miss must reach Recovery via its INBOX
+        # (audit-ping to the operator, NOT the [fallback] bypass). Before the fix, specialist's
+        # acp-dlq alerts pane-missed and went straight to the operator (routed=0/fallback=28).
+        from tools.inbox_consumer import _send_alert_via_recovery
+        with patch("tools.inbox_consumer._send_to_recovery_pane", return_value=False), \
+             patch("tools.inbox_consumer._deliver_alert_to_recovery_mailbox",
+                   return_value=True) as mbox, \
+             patch("tools.inbox_consumer._send_telegram_info") as info, \
+             patch("tools.inbox_consumer._send_telegram_alert") as alert:
+            _send_alert_via_recovery("[pantheon] some operational alert text", vocab="acp-dlq (specialist)")
+        mbox.assert_called_once()          # the recovery-inbox leg was used
+        alert.assert_not_called()          # NOT the direct-operator bypass
+        info.assert_called_once()          # audit-only "[recovery routed]" ping
+        self.assertIn("[recovery routed]", info.call_args[0][0])
 
     def test_consecutive_skip_uses_recovery_routing(self) -> None:
         """check_consecutive_skips now routes via _send_alert_via_recovery."""
@@ -4747,6 +4890,39 @@ class TestCheckAgentHealthArgus(unittest.TestCase):
         self.assertIn("specialist", called_agents)
         self.assertIn("recovery", called_agents)
 
+    def test_t3003_lock_maintenance_ordered_before_recent_telegram_gate(self):
+        """T-3003 regression: pull_repo_or_warn must run before check_dispatch_locked,
+        and check_dispatch_locked (stale-lock release + one-in-flight enforcement) must
+        run before check_recent_inbound. With the old order (recent_telegram first,
+        dispatch-lock second, pull last) a long active conversation short-circuited every
+        cycle so the lock cleanup never ran, auto_delivered flags accumulated (>1
+        in-flight), then dumped all at once on the first lull (the 5-flag burst). Lock
+        maintenance must run every cycle independent of user activity; the mutex must
+        scan the pulled (current) tree.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            tmppath = Path(tmp)
+            manager = MagicMock()
+            with patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
+                 patch("tools.inbox_consumer.check_agent_health", return_value=None), \
+                 patch("tools.inbox_consumer.check_autonomy_off", manager.autonomy), \
+                 patch("tools.inbox_consumer.check_cap_hit", manager.cap), \
+                 patch("tools.inbox_consumer.pull_repo_or_warn", manager.pull), \
+                 patch("tools.inbox_consumer.check_dispatch_locked", manager.dispatch), \
+                 patch("tools.inbox_consumer.check_recent_inbound", manager.recent), \
+                 patch("tools.inbox_consumer.list_eligible_tickets",
+                       side_effect=SkipCycle("empty_inbox")), \
+                 patch("tools.inbox_consumer.surface_active_ticket", return_value=None):
+                main("recovery")
+            order = [c[0] for c in manager.mock_calls
+                     if c[0] in ("pull", "dispatch", "recent")]
+            self.assertEqual(
+                order, ["pull", "dispatch", "recent"],
+                f"expected pull -> dispatch_locked -> recent_inbound; got {order}. "
+                "The dispatch-lock maintenance must precede the recent_telegram gate "
+                "(else cleanup is skipped during active conversations and flags pile up).",
+            )
+
     def test_recovery_config_is_alert_only_and_not_bridge_client(self):
         """T-0559 safety constraint: recovery must NOT self-inject (alert_only=True)
         until a Layer-2 watcher-of-the-watcher backstop exists. Recovery is also
@@ -5231,15 +5407,37 @@ class TestIsAutoDeliveredStale(unittest.TestCase):
         self.assertTrue(_is_auto_delivered_stale(ticket, threshold_seconds=28800))
 
     def test_no_transition_log_returns_false(self):
-        """Skip-on-None: unparseable transition log → not stale (cannot prove staleness)."""
+        """Skip-on-None: when NEITHER a transition-log ts NOR a file mtime is
+        available (missing/fake path → stat() fails), staleness cannot be proven
+        → not stale."""
         from tools.inbox_consumer import _is_auto_delivered_stale
         ticket = TicketInfo(
             id="T-0001", title="Test", created_str="2026-06-02T08:00:00Z",
             depends_on=[], labels=[],
             body="## Ask\nDo thing.\n",  # No transition log section
-            path=Path("/fake/T-0001.md"),
+            path=Path("/fake/T-0001.md"),  # stat() fails → no mtime signal either
         )
         self.assertFalse(_is_auto_delivered_stale(ticket, threshold_seconds=28800))
+
+    def test_no_transition_log_but_old_file_mtime_is_stale(self):
+        """Regression (T-2971): a ticket with NO transition-log ts but a real file
+        whose mtime is well past the threshold IS stale. The skip-on-None early
+        return wrongly bailed BEFORE consulting mtime, so a stale no-transition-log
+        auto_delivered ticket wedged the dispatch mutex forever — T-2374 held
+        cairn's lock 19 days. Fix: fall back to file mtime (Arm 2) when log_ts is None."""
+        from tools.inbox_consumer import _is_auto_delivered_stale
+        import os
+        from datetime import datetime, timezone, timedelta
+        with tempfile.TemporaryDirectory() as tmp:
+            ticket_path = Path(tmp) / "T-2374.md"
+            ticket_path.write_text("## Ask\nDo thing.\n", encoding="utf-8")  # no transition log
+            old_epoch = (datetime.now(timezone.utc) - timedelta(hours=10)).timestamp()
+            os.utime(ticket_path, (old_epoch, old_epoch))  # mtime 10h ago (> 8h threshold)
+            ticket = TicketInfo(
+                id="T-2374", title="Test", created_str="2026-07-30T18:00:00Z",
+                depends_on=[], labels=[], body="## Ask\nDo thing.\n", path=ticket_path,
+            )
+            self.assertTrue(_is_auto_delivered_stale(ticket, threshold_seconds=28800))
 
     def test_file_mtime_extends_liveness_window(self):
         """max(transition-log ts, file mtime) — a recently-touched file is not stale
@@ -5375,7 +5573,16 @@ class TestCheckDispatchLocked(unittest.TestCase):
         not contain). Two independent defenses asserted here: the commit must be
         PATHSPEC-scoped (`-- <ticket path>`, so foreign staged files cannot be
         swallowed even by a lock-bypassing writer), and the whole add+commit+push
-        must run under git_mutation_lock (so lock-taking writers serialize)."""
+        must run under git_mutation_lock (so lock-taking writers serialize).
+
+        T-3325: this test exercises the sg-wrapped shell-string shape
+        specifically (its assertions check substrings of a shell command),
+        so `_git_direct_writable` is pinned to False here — without the pin
+        this test's branch would depend on the real repo checkout's actual
+        `.git` permission bits at run time, which is exactly the kind of
+        nondeterminism T-3325's detector introduces if left unpinned. The
+        direct-write branch has its own dedicated tests below.
+        """
         from tools.inbox_consumer import _stamp_auto_delivered, _list_auto_delivered_unresolved_for_agent
         from tools import inbox_consumer as ic
         with tempfile.TemporaryDirectory() as tmp:
@@ -5393,6 +5600,7 @@ class TestCheckDispatchLocked(unittest.TestCase):
 
             lock_cm = MagicMock()
             with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+                 patch("tools.inbox_consumer._git_direct_writable", return_value=False), \
                  patch("tools.inbox_consumer.subprocess.run", side_effect=capture_run), \
                  patch("tools.inbox_consumer.git_mutation_lock", return_value=lock_cm) as lock_fn, \
                  patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
@@ -5443,6 +5651,41 @@ class TestCheckDispatchLocked(unittest.TestCase):
             self.assertNotIn("auto_delivered:", text,
                              "auto_delivered stamp must be gone after clear")
 
+    def test_clear_uses_git_direct_when_writable_no_sg_invoked(self):
+        """T-3325 Defect 1 parity: `_clear_auto_delivered` shares the same
+        direct-vs-sg detector as `_stamp_auto_delivered` — when the process
+        can write `.git/` directly, the sg wrap must not be invoked."""
+        from tools.inbox_consumer import _clear_auto_delivered, TicketInfo
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            (repo_root / ".git").mkdir(parents=True)
+            tickets_root = repo_root / "tickets"
+            path = _write_ticket_with_auto_delivered(
+                tickets_root, "T-0001", "orchestrator", state="active",
+                auto_delivered=True, auto_delivered_at="2026-06-02T04:00:00Z",
+                last_transition="2026-06-02T04:00:00Z",
+            )
+            ticket = TicketInfo(id="T-0001", title="t", created_str="2026-06-02",
+                                 depends_on=[], labels=[], body="", path=path)
+
+            commands: list[list[str]] = []
+
+            def capture_run(cmd, **kw):
+                commands.append(cmd)
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+            with patch("tools._git_utils.REPO_ROOT", repo_root), \
+                 patch("tools.inbox_consumer.subprocess.run", side_effect=capture_run), \
+                 patch("tools.inbox_consumer.git_mutation_lock", return_value=MagicMock()), \
+                 patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
+                ok = _clear_auto_delivered(ticket)
+
+            self.assertTrue(ok)
+            self.assertTrue(commands, "expected add + commit subprocess calls")
+            for cmd in commands:
+                self.assertEqual(cmd[0], "git",
+                                  f"sg wrap must not be invoked when .git/ is directly writable: {cmd}")
+
     def test_stale_release_is_idempotent_alerts_once(self):
         """Regression (msg_3073): the staleness backstop must alert ONCE, not every
         cycle. After the first stale-detection clears the stamp, a subsequent cycle
@@ -5490,6 +5733,40 @@ class TestCheckDispatchLocked(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# T-3325: _git_direct_writable detector tests.
+# ---------------------------------------------------------------------------
+
+
+class TestGitDirectWritable(unittest.TestCase):
+    def test_returns_true_when_git_dir_owned_and_writable(self):
+        """A freshly-created, self-owned `.git/` dir is directly writable —
+        the common case (an owned checkout, e.g. codex's own worktree)."""
+        from tools.inbox_consumer import _git_direct_writable
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            (repo_root / ".git").mkdir()
+            self.assertTrue(_git_direct_writable(repo_root))
+
+    def test_returns_false_when_git_dir_not_writable(self):
+        """Removing the write bit on `.git/` must flip the detector to False
+        — the T-0514 stale-supplementary-group case looks exactly like this
+        from the calling process's point of view (a real, kernel-level
+        permission denial), even though `/etc/group` disagrees."""
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses filesystem permission checks")
+        from tools.inbox_consumer import _git_direct_writable
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp)
+            git_dir = repo_root / ".git"
+            git_dir.mkdir()
+            os.chmod(git_dir, 0o500)
+            try:
+                self.assertFalse(_git_direct_writable(repo_root))
+            finally:
+                os.chmod(git_dir, 0o700)  # restore so tempdir cleanup can remove it
+
+
+# ---------------------------------------------------------------------------
 # T-0717 (b): _stamp_auto_delivered tests.
 # ---------------------------------------------------------------------------
 
@@ -5520,11 +5797,13 @@ class TestStampAutoDelivered(unittest.TestCase):
         self.assertEqual(fields.get("auto_delivered"), "true")
         self.assertIsNotNone(fields.get("auto_delivered_at"))
 
-    def test_stamp_returns_true_on_commit_failure_inject_proceeds(self):
-        """Commit/push failure → returns True (write established local mutex; inject proceeds).
+    def test_stamp_returns_false_on_commit_failure_fails_loud(self):
+        """T-3325 Defect 2: commit/add failure → returns False (fail-loud).
 
-        The frontmatter write succeeded so this agent's consumer sees the lock
-        on the next cycle. Commit failure is best-effort; inject should happen.
+        Previously this returned True ("write established local mutex; inject
+        proceeds"). The frontmatter write still succeeds — this agent's own
+        next-cycle scan still sees the lock locally — but the stamp never
+        reached origin, so the caller must not report success.
         """
         from tools.inbox_consumer import _stamp_auto_delivered
         from tools.ticket import parse_front_matter
@@ -5545,12 +5824,106 @@ class TestStampAutoDelivered(unittest.TestCase):
 
             with patch("subprocess.run", side_effect=mock_run):
                 result = _stamp_auto_delivered(ticket)
-            # Write succeeded → returns True (inject should proceed)
-            self.assertTrue(result)
-            # Verify the stamp is on disk even though commit failed
+            # Git leg failed → returns False (fail-loud, T-3325)
+            self.assertFalse(result)
+            # The local stamp write itself still succeeded, though — the
+            # mutex is intact for THIS agent's own next-cycle reads.
             text = path.read_text(encoding="utf-8")
             fields, _ = parse_front_matter(text)
             self.assertEqual(fields.get("auto_delivered"), "true")
+
+    def test_stamp_returns_false_on_push_failure_fails_loud(self):
+        """T-3325 Defect 2: push failure (add + commit succeed) → returns False.
+
+        Previously a push failure was logged and swallowed (returned True).
+        Add/commit succeeding but push failing is exactly the "committed
+        locally, HO's ff-only pull never sees it" gap the fix closes.
+        """
+        from tools.inbox_consumer import _stamp_auto_delivered
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            (repo_root / ".git").mkdir(parents=True)
+            tickets_root = repo_root / "tickets"
+            path = _write_ticket(tickets_root, "T-0001", "orchestrator", state="active")
+            ticket = TicketInfo(
+                id="T-0001", title="Test", created_str="2026-06-02T10:00:00Z",
+                depends_on=[], labels=[], body="", path=path,
+            )
+            with patch("tools._git_utils.REPO_ROOT", repo_root), \
+                 patch("tools.inbox_consumer.subprocess.run",
+                       return_value=MagicMock(returncode=0, stdout="", stderr="")), \
+                 patch("tools.inbox_consumer.git_mutation_lock", return_value=MagicMock()), \
+                 patch("tools._git_utils.push_with_retry",
+                       return_value=(False, "non-ff, retries exhausted")):
+                result = _stamp_auto_delivered(ticket)
+            self.assertFalse(result)
+
+    def test_stamp_uses_git_direct_when_writable_no_sg_invoked(self):
+        """T-3325 Defect 1: when the process can write `.git/` directly (e.g.
+        codex on its own owned worktree, T-3324), the `sg pantheon-shared`
+        wrap must be skipped entirely — invoking it is what broke codex
+        ('Invalid password for group pantheon-shared')."""
+        from tools.inbox_consumer import _stamp_auto_delivered
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            (repo_root / ".git").mkdir(parents=True)  # real, owned, writable dir
+            tickets_root = repo_root / "tickets"
+            path = _write_ticket(tickets_root, "T-0001", "orchestrator", state="inbox")
+            ticket = TicketInfo(
+                id="T-0001", title="t", created_str="2026-06-02",
+                depends_on=[], labels=[], body="", path=path,
+            )
+
+            commands: list[list[str]] = []
+
+            def capture_run(cmd, **kw):
+                commands.append(cmd)
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+            with patch("tools._git_utils.REPO_ROOT", repo_root), \
+                 patch("tools.inbox_consumer.subprocess.run", side_effect=capture_run), \
+                 patch("tools.inbox_consumer.git_mutation_lock", return_value=MagicMock()), \
+                 patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
+                ok = _stamp_auto_delivered(ticket)
+
+            self.assertTrue(ok)
+            self.assertTrue(commands, "expected add + commit subprocess calls")
+            for cmd in commands:
+                self.assertEqual(cmd[0], "git",
+                                  f"sg wrap must not be invoked when .git/ is directly writable: {cmd}")
+
+    def test_stamp_falls_back_to_sg_when_direct_write_unavailable(self):
+        """T-3325 Defect 1 fallback: when the process cannot write `.git/`
+        directly (T-0514's stale-supplementary-group case), the `sg
+        pantheon-shared` wrap is still used — this path must keep working
+        for the case it was built for."""
+        from tools.inbox_consumer import _stamp_auto_delivered
+        with tempfile.TemporaryDirectory() as tmp:
+            repo_root = Path(tmp) / "repo"
+            (repo_root / ".git").mkdir(parents=True)
+            tickets_root = repo_root / "tickets"
+            path = _write_ticket(tickets_root, "T-0001", "orchestrator", state="inbox")
+            ticket = TicketInfo(
+                id="T-0001", title="t", created_str="2026-06-02",
+                depends_on=[], labels=[], body="", path=path,
+            )
+
+            commands: list[list[str]] = []
+
+            def capture_run(cmd, **kw):
+                commands.append(cmd)
+                return MagicMock(returncode=0, stdout="", stderr="")
+
+            with patch("tools._git_utils.REPO_ROOT", repo_root), \
+                 patch("tools.inbox_consumer._git_direct_writable", return_value=False), \
+                 patch("tools.inbox_consumer.subprocess.run", side_effect=capture_run), \
+                 patch("tools.inbox_consumer.git_mutation_lock", return_value=MagicMock()), \
+                 patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
+                ok = _stamp_auto_delivered(ticket)
+
+            self.assertTrue(ok)
+            self.assertTrue(any(cmd[0] == "sg" for cmd in commands),
+                             f"expected sg-wrapped calls, got: {commands}")
 
     def test_stamp_returns_false_on_write_error_inject_blocked(self):
         """File-write failure → returns False (fail-CLOSED; caller must not inject).
@@ -5593,6 +5966,12 @@ class TestStampAutoDelivered(unittest.TestCase):
 
         So inject IS now expected to have happened, and main() must NOT report a
         skip — that would hide a delivery that really occurred.
+
+        T-3325: main()'s exit code now DOES reflect the stamp failure (was
+        always 0 regardless). The outcome-log vocab is unchanged on purpose
+        (still "pulled <id>", never "skip:*") — the delivery happened and the
+        log must say so — but the process exit code flips to 1 so the unit's
+        OnFailure= alert fires, which is the whole point of T-3325's fix.
         """
         with tempfile.TemporaryDirectory() as tmp:
             tickets_root = Path(tmp) / "tickets"
@@ -5623,7 +6002,8 @@ class TestStampAutoDelivered(unittest.TestCase):
                  patch("tools.inbox_consumer.inject", side_effect=track_inject), \
                  patch("tools.inbox_consumer._send_telegram_alert"):
                 result = main("orchestrator")
-            self.assertEqual(result, 0)
+            # T-3325: a stamp failure now fails loud on the exit code.
+            self.assertEqual(result, 1)
             # T-2152: delivery precedes the stamp, so inject DID happen.
             self.assertEqual(
                 len(inject_called), 1,
@@ -5638,11 +6018,20 @@ class TestStampAutoDelivered(unittest.TestCase):
             )
             self.assertIn("pulled T-0002", log_content)
 
-    def test_stamp_commit_failure_still_injects(self):
-        """main(): commit failure → inject still happens (write established local mutex).
+    def test_stamp_success_injects_and_returns_zero(self):
+        """main(): stamp success (full write+add+commit+push) → inject
+        happens and the process exits 0.
 
-        A commit/push failure means _stamp_auto_delivered returns True (local
-        write succeeded). main() must proceed with inject.
+        T-3325: renamed from `test_stamp_commit_failure_still_injects`. That
+        name and docstring described a commit-failure scenario, but the test
+        body mocks `_stamp_auto_delivered` to return True directly rather
+        than exercising a real commit failure — so it was always really
+        testing "stamp succeeded → normal success path", which is what its
+        assertions check. Since a commit/push failure now returns False (see
+        `test_stamp_returns_false_on_commit_failure_fails_loud` and
+        `test_stamp_write_failure_after_delivery_warns_and_does_not_skip`
+        for that path), the old name+docstring were the stale part, not the
+        test's behavior.
         """
         with tempfile.TemporaryDirectory() as tmp:
             tickets_root = Path(tmp) / "tickets"
@@ -6106,6 +6495,44 @@ class TestPaneIdleStateThreeState(unittest.TestCase):
         """T-0716: a peer dialog or an alert quoting the sentinel must not be read
         as this pane's current state — only the bottom region counts."""
         pane = "esc to interrupt\n" + "\n".join(f"filler {i}" for i in range(20))
+        self.assertIsNone(self.ic.pane_idle_state(pane))
+
+    # --- T-3579: manage-view (background-agent/shells) → BUSY (defer, not inject) ---
+    def test_manage_view_is_False_busy(self):
+        """The real 13:17 atlas footer: background agent active, main loop
+        idle-waiting → 'N shell · ↓ to manage', NO 'esc to interrupt'. Was None
+        (waker/poker missed it → false exit-8/exit-1); now False so consumers
+        DEFER. Falsifier: background-agent-working pane → defer, not exit-8."""
+        pane = ("work\n"
+                "  ◯ general-purpose  Inserting tests  11m · ↓ 133k tokens\n"
+                "❯ \n"
+                "  ⏸ manual mode on · 1 shell · ← for agents · ↓ to manage\n")
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_generating_still_wins_over_manage_view(self):
+        """Precedence: 'esc to interrupt' (generating) is checked before the
+        manage-view; both → False anyway, but generating must not be masked."""
+        pane = "work\n❯\n  ⏸ manual mode on · esc to interrupt · ← for agents · ↓ to manage\n"
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_idle_composer_still_wakes_not_manage_view(self):
+        """Falsifier: a genuinely idle agent composer ('? for shortcuts', NO
+        '↓ to manage') must STILL classify True (wakeable) — the manage-view
+        change must not swallow the idle case."""
+        pane = "work\n❯\n  ⏸ manual mode on · ? for shortcuts · ← for agents\n"
+        self.assertIs(self.ic.pane_idle_state(pane), True)
+
+    def test_for_agents_alone_is_not_the_trigger(self):
+        """'← for agents' appears on BOTH the idle view and the manage-view, so it
+        must NOT be the busy trigger — only '↓ to manage' is. An idle view with
+        '← for agents' stays True."""
+        pane = "work\n❯\n  ? for shortcuts · ← for agents\n"
+        self.assertIs(self.ic.pane_idle_state(pane), True)
+
+    def test_manage_view_sentinel_only_in_scrollback_is_None(self):
+        """T-0716: '↓ to manage' quoted in scrollback (not the bottom region) must
+        not be read as current state."""
+        pane = "↓ to manage\n" + "\n".join(f"filler {i}" for i in range(20))
         self.assertIsNone(self.ic.pane_idle_state(pane))
 
 

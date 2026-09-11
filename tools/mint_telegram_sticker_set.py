@@ -11,8 +11,18 @@ re-running 'combined' over an existing set errors loudly — use
 'append-combined' for later additions, or deleteStickerSet / rename first.
 
 First mint: the combined `pantheon_pack_by_panethon_codex_bot` (24 stickers),
-2026-06-09. NOTE: getStickerSet file_ids are per-bot — a different sending bot
-must re-fetch the set's file_ids under its own token (T-1024 / HO).
+2026-06-09.
+
+**Cross-bot file_id note (Telegram Bot API contract + practical observation).**
+getStickerSet file_ids are formally per-bot: a different sending bot MAY have to
+re-fetch the set's file_ids under its own token (T-1024 / HO). In practice for
+this fleet (verified 2026-08-28, T-3319): c_swarm_bot successfully sent Cairn's
+pantheon_codex_bot-minted stickers using the committed manifest file_ids with
+no re-mint. So the caution above is API-contract-accurate but over-tight for
+the current bot pair — cite it correctly to anyone else, but sending off the
+committed manifest just works today. If a third bot ever joins, re-verify on
+that pair before assuming the same shortcut. See
+assets/stickers/README.md#working-invocation for the working curl pattern.
 """
 import json, os, subprocess, sys
 
@@ -24,9 +34,12 @@ OWNER = os.environ.get("OWNER_USER_ID", "456474197").strip()
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 EMOJI = {"idle": "\U0001F916", "shipped": "\U0001F680", "approved": "✅",
-         "investigating": "\U0001F50D", "thinking": "\U0001F914", "wedged": "⚠️"}
-REACTION_ORDER = ["idle", "shipped", "approved", "investigating", "thinking", "wedged"]
-AGENT_ORDER = ["orchestrator", "specialist", "recovery", "codex", "mnemosyne"]
+         "investigating": "\U0001F50D", "thinking": "\U0001F914", "wedged": "⚠️",
+         "waypoint": "\U0001F9ED", "verified": "✅", "received": "✉️",
+         "boundary": "\U0001F6E1", "waiting": "\U0001F3D5"}
+REACTION_ORDER = ["idle", "shipped", "approved", "investigating", "thinking", "wedged",
+                  "waypoint", "verified", "received", "boundary", "waiting"]
+AGENT_ORDER = ["orchestrator", "specialist", "recovery", "codex", "mnemosyne", "cairn"]
 
 
 def call(method, fields=None, files=None):

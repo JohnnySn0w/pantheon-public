@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Any, Literal, Mapping
 
 
-HarnessName = Literal["claude", "codex"]
+HarnessName = str
 EventKind = Literal[
     "session_started",
     "turn_started",
@@ -55,6 +55,14 @@ RuntimeMode = Literal["interactive", "batch"]
 RuntimeMeter = Literal["subscription", "sdk-credit", "api", "enterprise"]
 QuotaSource = Literal["app-server", "statusline", "provider-api", "unavailable"]
 QuotaFreshness = Literal["fresh", "stale", "unavailable"]
+PostStartAssessmentStatus = Literal["ready", "subscription-cap", "unknown"]
+ProviderCompletionStatus = Literal[
+    "provider-completed",
+    "subscription-cap",
+    "operational-readiness",
+    "not-applicable",
+    "unknown",
+]
 
 
 @dataclass(frozen=True)
@@ -104,6 +112,7 @@ class HarnessLaunchConfig:
     quota_source: QuotaSource
     native: Mapping[str, Any]
     sources: tuple[str, ...]
+    writable_roots: tuple[Path, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -161,9 +170,91 @@ class RuntimeControllerConfig:
 
 
 @dataclass(frozen=True)
+class RuntimeReadinessProof:
+    ready: bool
+    evidence: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class PostStartPaneSample:
+    capture_index: int
+    sha256: str
+    snippet_sha256: str | None
+    text: str
+
+
+@dataclass(frozen=True)
+class PostStartAssessment:
+    schema: str
+    harness: str
+    profile: str
+    status: PostStartAssessmentStatus
+    cause: str | None
+    pattern_id: str | None
+    baseline_sha256: str
+    capture_count: int
+    changed_capture_indices: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class ProviderCompletionProbe:
+    """Transient provider probe input.
+
+    ``prompt`` and ``nonce_marker`` are intentionally raw transient values.
+    Controller evidence must serialize only the hashes below.
+    """
+
+    prompt: str
+    nonce_marker: str
+    nonce_sha256: str
+    prompt_sha256: str
+    provider_state: Mapping[str, Any] = field(default_factory=dict, repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class ProviderCompletionAssessment:
+    schema: str
+    harness: str
+    profile: str
+    status: ProviderCompletionStatus
+    cause: str | None
+    pattern_id: str | None
+    nonce_sha256: str | None
+    prompt_sha256: str | None
+    statusline_baseline_sha256: str | None
+    statusline_observed_sha256: str | None
+    capture_count: int
+    changed_capture_indices: tuple[int, ...]
+    transcript_relative_path_sha256: str | None = None
+    transcript_start_offset: int | None = None
+    transcript_end_offset: int | None = None
+    assistant_event_count: int = 0
+
+
+@dataclass(frozen=True)
+class SuccessorEvidenceContract:
+    expected: str
+    target: str
+    evidence_kind: str
+
+
+@dataclass(frozen=True)
+class ReceiverStateProof:
+    state: Literal["present", "absent", "ambiguous", "not-applicable"]
+    evidence: Mapping[str, str]
+
+
+@dataclass(frozen=True)
+class ReceiverHookReceipt:
+    ok: bool
+    operations: tuple[str, ...]
+    evidence: Mapping[str, str]
+
+
+@dataclass(frozen=True)
 class ForcedFailoverReceipt:
     previous_session_id: str | None
-    graveyard_entry: Path
+    chronicle_entry: Path
     message_id: str
     correlation_id: str
     ticket_or_step_id: str | None

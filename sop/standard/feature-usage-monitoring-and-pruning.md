@@ -17,7 +17,7 @@ re-login that cost the operator a browser round-trip on an incident day.
 
 **Axis 2 — UNECONOMIC.** It *is* called, or could be, but a cheaper path does the same job.
 Veneration failed here too: per the operator, resurrecting a session costs **more tokens than
-simply scraping the dead session from the graveyard**. A wired caller would still have been
+simply scraping the dead session from the Chronicle**. A wired caller would still have been
 the wrong choice.
 
 Recovery's pre-decommission analysis found Axis 1 only. The operator supplied Axis 2 from memory —
@@ -152,5 +152,5 @@ downgrade it; "which capabilities exist" is his call regardless.
 - **T-2214** — the-ancestor daemon decommission; the worked example this SOP generalizes.
 - **T-2213** — the memory incident that made the 348 MB legible as a real cost.
 - `sop/standard/venerating-ancestors.md` — **RETIRED** with T-2214; kept for history only.
-- `adr/ORG-026-inter-agent-message-passing-substrate.md` — the hub that was correctly kept.
+- `architecture/adr/ORG-026-inter-agent-message-passing-substrate.md` — the hub that was correctly kept.
 - `feedback_reviewer_step_valuable_even_for_one_offs`, `feedback_verify_root_cause_before_asserting`.

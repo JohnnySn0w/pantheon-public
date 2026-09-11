@@ -505,7 +505,7 @@ postcheck_happy() {
 }
 
 # --- 1b (T-1049): pause mode (--no-restart). --------------------------------
-# Steps 1-4 + graveyard run; then STOP — no systemctl restart, no post-restart
+# Steps 1-4 + chronicle run; then STOP — no systemctl restart, no post-restart
 # steps. The fleet-reboot quiesce: agent finished + recorded + paused.
 preflight_no_restart() {
   (
@@ -639,6 +639,25 @@ postcheck_control_plane_kill_survives() {
   fi
   grep -q "survived kill-session" "$SBX/stdout" "$SBX/stderr" \
     || { echo "    expected 'survived kill-session' in stdout/stderr"; return 1; }
+  return 0
+}
+
+# --- 5cp-legacy: stale legacy service is refused before side effects. -------
+preflight_test_handoff_restart_refuses_legacy_predecessor_when_codex_receiver_present() {
+  preflight_happy
+  write_scope_fixture 777
+  echo "1" > "$SBX/session_live_after_restart"
+}
+postcheck_test_handoff_restart_refuses_legacy_predecessor_when_codex_receiver_present() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  local kills; kills=$(wc -l < "$SBX/kill_session_calls")
+  [[ "$kills" -eq 0 ]] || { echo "    kill-session must not run before service validation"; return 1; }
+  if [[ -s "$SBX/restart_args" ]]; then
+    echo "    restart must not run before service validation: $(cat "$SBX/restart_args")"
+    return 1
+  fi
+  grep -q "control-plane supervisor requires pantheon-persona-consume@.*\\.service" "$SBX/stderr" \
+    || { echo "    expected control-plane service validation error"; return 1; }
   return 0
 }
 
@@ -1064,8 +1083,8 @@ postcheck_hard_restart_on_ack_timeout() {
   # The restart actually fired despite the ack timeout.
   grep -q "restart claude.service" "$SBX/restart_args" \
     || { echo "    expected 'restart claude.service' — fallback did not restart"; return 1; }
-  # No graveyard archive of a (nonexistent) fresh handoff on this path.
-  if grep -q "\[graveyard\] " "$SBX/stdout"; then
+  # No chronicle archive of a (nonexistent) fresh handoff on this path.
+  if grep -q "\[chronicle\] " "$SBX/stdout"; then
     echo "    fallback path must NOT archive a handoff (none was written)"
     return 1
   fi
@@ -1543,11 +1562,11 @@ echo "Running handoff_and_restart.sh tests..."
 echo
 
 # ---------------------------------------------------------------------------
-# T-1636: pane time-log staging + graveyard companion.
+# T-1636: pane time-log staging + chronicle companion.
 #
 # Preflight seeds a fake timestamped pane log in the sandboxed PANE_LOG_DIR.
 # The SUT must: stage it (rename *.log -> *.log.dying) BEFORE the restart, and
-# after the (fake) restart gzip it into the sandboxed graveyard as
+# after the (fake) restart gzip it into the sandboxed chronicle as
 # <ts>-<uuid>.pane.log.gz — agent derived from the source filename (the
 # sandbox handoff path is not /home/<user>/ shaped), consumed on success.
 # ---------------------------------------------------------------------------
@@ -1574,11 +1593,11 @@ postcheck_pane_log_companion() {
   if compgen -G "$SBX/pane_logs/pane-timed-*.log.dying" >/dev/null; then
     echo "  (.dying staged file not consumed by companion archive)"; return 1
   fi
-  # Archived: exactly one .pane.log.gz under the sandbox graveyard for testagent.
+  # Archived: exactly one .pane.log.gz under the sandbox chronicle for testagent.
   local gz
-  gz=$(compgen -G "$SBX/pantheon_state/graveyard/testagent/*/*.pane.log.gz" | head -1)
+  gz=$(compgen -G "$SBX/pantheon_state/chronicle/testagent/*/*.pane.log.gz" | head -1)
   if [[ -z "$gz" ]]; then
-    echo "  (no .pane.log.gz companion in sandbox graveyard)"; return 1
+    echo "  (no .pane.log.gz companion in sandbox chronicle)"; return 1
   fi
   if ! zcat "$gz" | grep -q "hello from the dying session"; then
     echo "  (companion gz missing the staged content)"; return 1
@@ -1598,6 +1617,8 @@ run_test isactive_fail 6 "${COMMON_ARGS[@]}"
 # overrides COMMON_ARGS' claude.service (last-flag-wins arg parsing).
 run_test control_plane_happy 0 "${COMMON_ARGS[@]}" \
   --service pantheon-persona-consume@specialist.service --supervisor control-plane
+run_test test_handoff_restart_refuses_legacy_predecessor_when_codex_receiver_present 64 "${COMMON_ARGS[@]}" \
+  --service claude-telegram.service --supervisor control-plane
 run_test control_plane_kill_survives 5 "${COMMON_ARGS[@]}" \
   --service pantheon-persona-consume@specialist.service --supervisor control-plane
 run_test control_plane_scope_timeout 6 "${COMMON_ARGS[@]}" \
