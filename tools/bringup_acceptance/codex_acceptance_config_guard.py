@@ -328,16 +328,43 @@ def restore_config_snapshot_atomically(
     return restored
 
 
+def converge_worker_guard_hook(codex_home: Path, binding: object) -> None:
+    """T-5317: the ``ensure_worker_guard_hook`` call ``prepare_codex_launch`` makes
+    for ``binding``, with the same arguments, for a guard's ``converge``."""
+    from tools.harness_adapter.codex import ensure_worker_guard_hook
+
+    ensure_worker_guard_hook(
+        codex_home,
+        binding.account_home,
+        executable=Path(binding.launch.executable),
+    )
+
+
 class ReversibleAcceptanceConfigGuard:
-    def __init__(self, *, codex_home: Path, project_cwd: Path, owner: str) -> None:
+    def __init__(
+        self,
+        *,
+        codex_home: Path,
+        project_cwd: Path,
+        owner: str,
+        converge: Callable[[], object] | None = None,
+    ) -> None:
+        """``converge`` (T-5317) runs on ``__enter__`` BEFORE the snapshot, for a
+        startup writer the scratch replay can't model (it needs the real codex
+        binary). Pass the exact call the run will make: it converges the real
+        home to production state up front, so the in-run call is an idempotent
+        no-op and the post-run config still matches a modeled prefix."""
         self.codex_home = codex_home
         self.project_cwd = project_cwd
         self.owner = owner
+        self.converge = converge
         self.expectation: AcceptanceConfigExpectation | None = None
         self._restored = False
         self._teardown_residue: tuple[str, ...] = ()
 
     def __enter__(self) -> AcceptanceConfigExpectation:
+        if self.converge is not None:
+            self.converge()
         self.expectation = build_startup_config_expectation(
             codex_home=self.codex_home,
             project_cwd=self.project_cwd,

@@ -1,14 +1,14 @@
 # SOP — tap the latent corpus (before bubbling any design/methodology question)
 
 **Status:** DRAFT — operator-ratify pending (surfaced TG 8809 on 2026-08-29, HO drafted post-T-3341 bubble correction).
-**Scope:** fleet-wide — HO, project-orchestrators, Cairn (all roles), reviewers, implementers, research. Any persona/role about to bubble a design or methodology decision upward.
+**Scope:** fleet-wide — HO, project-orchestrators, Consultant (all roles), reviewers, implementers, research. Any persona/role about to bubble a design or methodology decision upward.
 **Justifies-via:** D1 (preserve the operator's bandwidth — corpus-informed proposals absorb variance the fork-to-operator pattern radiates), P3 (decisions justify upward with rationale — citations ARE the rationale), P5 (tier authority — bubble the ratify, not the option-narrowing).
 
 ## The rule
 
 Before any of the following, pause and query the corpus first:
 
-1. About to bubble a design or methodology question upward (worker → orchestrator, HO → the operator, Cairn → the operator).
+1. About to bubble a design or methodology question upward (worker → orchestrator, HO → the operator, Consultant → the operator).
 2. About to split a decision into "here are two/three directions, pick one" in a bubble.
 3. About to say "this is architectural methodology, above my tier."
 4. About to reach for a novel-feeling framing on a problem in a well-trodden domain (testing, distributed systems, concurrency, security, verification, databases, compilers, ML, software engineering practice).
@@ -21,7 +21,7 @@ The operator, 2026-08-29 (TG 8809), after HO's T-3341 Arc B methodology bubble h
 
 The load-bearing insight: a persona with access to the corpus of every senior/staff/principal engineer who wrote about a domain, and yet still bubbles the framing upward for pick-selection, is wasting the asset. The operator isn't the tie-breaker between two thin options — the operator is the ratify-tier for a corpus-informed proposal. **The corpus does the option-narrowing.** The persona brings a defensible pick.
 
-Backing case: T-3341 (T-3334 Arc B methodology bubble). Cairn's fresh-dispatch R1 hit "impl fabricates observations, tests don't catch it" 3/3 rounds. HO bubbled two candidate methodology directions to the operator as a fork ("adversarial-test-writer split" vs "mutation-testing gate"). Both were re-inventing well-known patterns. The corpus had the answer:
+Backing case: T-3341 (T-3334 Arc B methodology bubble). Consultant's fresh-dispatch R1 hit "impl fabricates observations, tests don't catch it" 3/3 rounds. HO bubbled two candidate methodology directions to the operator as a fork ("adversarial-test-writer split" vs "mutation-testing gate"). Both were re-inventing well-known patterns. The corpus had the answer:
 
 - **Meszaros 2007 (xUnit Test Patterns)** — the pathology has a name: *Overspecified Software* (test verifies impl-internal shape) + *Fragile Test* (breaks on internal shift, misses on behavior shift). ScriptedProbe was textbook Overspecified.
 - **Mutation testing** (Lipton 1971 origin; PITest, Stryker, MutMut current tooling) — formalizes the invariant Arc B was missing: "test kills mutants = test depends on code path."

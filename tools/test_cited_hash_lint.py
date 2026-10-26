@@ -113,6 +113,78 @@ class ClassificationAgainstARealRepo(unittest.TestCase):
         self.assertEqual(out["files_scanned"], 1)
 
 
+class BatchedClassificationT4529(unittest.TestCase):
+    """T-4529: the weekly run timed out at 15min. ~15k cited tokens at 2-3 git
+    subprocesses each, on a loaded 4-core host. The sweep now resolves every
+    token in one cat-file --batch-check and answers reachability from two
+    rev-list sets, so the git-call count is a constant, not a per-token cost."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.repo = pathlib.Path(self._tmp.name)
+        _git(self.repo, "init", "-q", "-b", "main")
+        _git(self.repo, "config", "user.email", "t@t")
+        _git(self.repo, "config", "user.name", "t")
+        (self.repo / "f").write_text("1")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "one")
+        self.on_main = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        self.tree = _git(self.repo, "rev-parse", "HEAD^{tree}").stdout.strip()
+        _git(self.repo, "checkout", "-q", "-b", "side")
+        (self.repo / "f").write_text("2")
+        _git(self.repo, "commit", "-qam", "two")
+        self.side = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        _git(self.repo, "checkout", "-q", "-b", "tmp")
+        (self.repo / "f").write_text("3")
+        _git(self.repo, "commit", "-qam", "three")
+        self.orphan = _git(self.repo, "rev-parse", "HEAD").stdout.strip()
+        _git(self.repo, "checkout", "-q", "main")
+        _git(self.repo, "branch", "-qD", "tmp")
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_batch_matches_the_single_token_answers(self):
+        expected = {
+            self.on_main: chl.STATUS_OK,
+            self.on_main[:9]: chl.STATUS_OK,          # short sha resolves
+            self.side: chl.STATUS_UNLANDED,
+            self.orphan: chl.STATUS_UNREACHABLE,
+            "0" * 40: chl.STATUS_MISSING,
+            self.tree: chl.STATUS_MISSING,            # an object, but not a commit
+        }
+        got = chl.classify_many(list(expected), ref="main", cwd=self.repo)
+        self.assertEqual(got, expected)
+
+    def test_sweep_git_calls_do_not_scale_with_token_count(self):
+        toks = [self.on_main, self.side, self.orphan] + [f"{i:07x}abcdef" for i in range(20)]
+        for name in ("a.md", "b.md"):
+            (self.repo / name).write_text("".join(f"landed `{t}`\n" for t in toks))
+        real_run = subprocess.run
+        calls = []
+
+        def counting_run(cmd, *a, **kw):
+            if cmd and cmd[0] == "git":
+                calls.append(cmd)
+            return real_run(cmd, *a, **kw)
+
+        with patch.object(chl.subprocess, "run", side_effect=counting_run):
+            out = chl.sweep([self.repo / "a.md", self.repo / "b.md"],
+                            ref="main", cwd=self.repo)
+        self.assertLessEqual(len(calls), 3, calls)
+        # Findings still report per (file, token): the orphan in both files.
+        self.assertEqual(sorted(p for p, t in out[chl.STATUS_UNREACHABLE]), ["a.md", "b.md"])
+        self.assertEqual(sorted(p for p, t in out[chl.STATUS_UNLANDED]), ["a.md", "b.md"])
+
+    def test_a_commit_kept_only_by_a_PR_head_is_UNLANDED(self):
+        """T-4537: squash-merge deletes agent/<ticket>, orphaning review-time
+        citations of its head. GitHub keeps refs/pull/<N>/head, which main()
+        fetches into refs/pr/*, so the reader can still verify the commit."""
+        _git(self.repo, "update-ref", "refs/pr/1", self.orphan)
+        self.assertEqual(chl.classify(self.orphan, ref="main", cwd=self.repo),
+                         chl.STATUS_UNLANDED)
+
+
 
 
 class BaselinePartitionT2401(unittest.TestCase):
@@ -159,6 +231,16 @@ class BaselinePartitionT2401(unittest.TestCase):
             {("abc1234", "tickets/done/T-1.md")})
         self.assertEqual(len(new), 1)
         self.assertEqual(stale, [("abc1234", "tickets/done/T-1.md")])
+
+    def test_a_ticket_changing_STATE_keeps_its_exemption(self):
+        """T-4537: inbox -> active -> done is the same document, not a move. A
+        baselined citation in an open ticket must not re-page when it resolves."""
+        new, standing, stale = chl.partition_baseline(
+            [("tickets/done/T-1.md", "abc1234")],
+            {("abc1234", "tickets/inbox/T-1.md")})
+        self.assertEqual(new, [])
+        self.assertEqual(len(standing), 1)
+        self.assertEqual(stale, [])
 
     def test_a_repaired_citation_leaves_a_STALE_ROW(self):
         """A dead exemption pre-authorises whatever next occupies that pair, so

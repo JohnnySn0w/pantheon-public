@@ -20,7 +20,7 @@ cross-checked against `getent passwd` (which is also asserted below, so the
 cross-check is re-run rather than remembered) — NOT from the module.
 
 DO NOT infer account names from persona names. specialist's own first scan invented
-`claude-mnemosyne` / `claude-metis` / `claude-atlas` by extending the pattern
+`claude-archivist` / `claude-mason` / `claude-artisan` by extending the pattern
 from the three accounts it knew, ran clean, and printed a confident MISSING row
 against a fix that had in fact landed. That is the error this file's literals
 exist to make impossible to repeat quietly.
@@ -65,24 +65,26 @@ from tools.test_instance_role_grants import (  # noqa: E402
 
 # --- Written out by hand. See the docstring. --------------------------------
 # The six Claude Code seats (README.md Topology: three pre-ORG-042, plus ORG-042's
-# second head and ORG-043's two sub-orchestrator seats).
+# second head and ORG-043's two sub-orchestrator seats), plus T-4884's codex-primary
+# recovery seat. Watchman is codex, not Claude Code, but it belongs HERE rather than
+# with the peer daemons because persona != account (watchman on codex-fallback), so
+# the resolves-to-itself fail-open guard below must cover it. The account is created
+# at T-4884 B7 (design note §2), not derived from the persona name.
 FLEET_ACCOUNTS: dict[str, str] = {
     "claude": "orchestrator",
     "claude-research": "specialist",
     "claude-fallback": "recovery",
-    "exocortex": "mnemosyne",
-    "suborch1": "metis",
-    "suborch2": "atlas",
+    "exocortex": "archivist",
+    "suborch1": "mason",
+    "suborch2": "artisan",
+    "codex-fallback": "watchman",
 }
 
-# The two peer daemons. persona == account for both, deliberately: agent_role_map
-# registers them with identity audit role-ids ("no separate role-id; persona ==
-# account for both, which the bringup SOP §4 explicitly permits"). So an identity
-# result is the CORRECT answer here — which is exactly why the fail-open guard
-# below is scoped to FLEET_ACCOUNTS and not to the whole map.
+# The peer daemon (codex; the-ancestor was retired, T-3421). persona == account,
+# deliberately: so an identity result is the CORRECT answer here — which is exactly why the
+# fail-open guard below is scoped to FLEET_ACCOUNTS and not to the whole map.
 PEER_DAEMON_ACCOUNTS: dict[str, str] = {
     "codex": "codex",
-    "the-ancestor": "the-ancestor",
 }
 
 ALL_ACCOUNTS: dict[str, str] = {**FLEET_ACCOUNTS, **PEER_DAEMON_ACCOUNTS}
@@ -116,24 +118,19 @@ def _probe_account(account: str) -> str:
 # answers with UNSUFFIXED account names and fails every equality below.
 PROBE_ACCOUNT_PERSONA: dict[str, str] = {_probe_account(a): p for a, p in ALL_ACCOUNTS.items()}
 
-# chronicle maps account -> AGENT NAME. That is the persona for seven of eight, and for
-# the-ancestor it is the documented override "ancestor" (its chronicle dir is already named
-# that on disk; deriving the string would orphan the archives filed under it).
-#
-# THE OVERRIDE IS KEYED ON THE LIVE ACCOUNT STRING, so against probe accounts it does not
-# fire and the correct expected value here is the persona for all eight. This test therefore
-# does NOT exercise the override branch; the override is asserted live, in
-# TestRepointedSitesStillDerive.test_chronicle_user_to_agent.
-CHRONICLE_NAME_OVERRIDES: dict[str, str] = {"the-ancestor": "ancestor"}
+# chronicle maps account -> AGENT NAME: the persona for every account. The only override ever
+# carried (the-ancestor -> "ancestor") was removed with the persona (T-3421); the override seam
+# in chronicle._AGENT_NAME_OVERRIDES is empty, so the expectation is the plain persona.
+CHRONICLE_NAME_OVERRIDES: dict[str, str] = {}
 CHRONICLE_PROBE_EXPECTED: dict[str, str] = {
     _probe_account("claude"): "orchestrator",
     _probe_account("claude-research"): "specialist",
     _probe_account("claude-fallback"): "recovery",
-    _probe_account("exocortex"): "mnemosyne",
-    _probe_account("suborch1"): "metis",
-    _probe_account("suborch2"): "atlas",
+    _probe_account("exocortex"): "archivist",
+    _probe_account("suborch1"): "mason",
+    _probe_account("suborch2"): "artisan",
     _probe_account("codex"): "codex",
-    _probe_account("the-ancestor"): "the-ancestor",  # NOT "ancestor" — see above.
+    _probe_account("codex-fallback"): "watchman",  # T-4884 B6
 }
 
 # links groups actor-strings that mean the same agent. NINE groups against EIGHT accounts,
@@ -142,14 +139,14 @@ CHRONICLE_PROBE_EXPECTED: dict[str, str] = {
 # itself: the legacy free-form role word `orchestrator`, and the audit role-ids. Written out
 # in full here so the account slot is the only thing the perturbation moves.
 LINKS_PROBE_GROUPS: list[set[str]] = [
-    {"orchestrator", "orchestrator", "orchestrator", _probe_account("claude")},
-    {"specialist", "specialist", _probe_account("claude-research")},
-    {"recovery", _probe_account("claude-fallback")},  # audit role-id IS "recovery"
-    {"mnemosyne", _probe_account("exocortex")},
-    {"metis", _probe_account("suborch1")},
-    {"atlas", _probe_account("suborch2")},
-    {"codex", _probe_account("codex")},  # persona == account by design
-    {"the-ancestor", _probe_account("the-ancestor")},
+    {"orchestrator", "head_engineering_orchestrator", "orchestrator", _probe_account("claude")},  # ORG-100 (T-3814): orchestrator's audit-id is now head_engineering_orchestrator (orchestrator retained as a legacy alias in agent_role_map, not surfaced by links — mirrors specialist)
+    {"specialist", "head_research_orchestrator", _probe_account("claude-research")},  # T-3807: specialist's audit-id is now head_research_orchestrator (specialist retained as a legacy alias in agent_role_map, not surfaced by links)
+    {"recovery", "head_system_orchestrator", _probe_account("claude-fallback")},  # ORG-100 (T-3814): recovery's audit-id is now head_system_orchestrator
+    {"archivist", "head_memory_orchestrator", _probe_account("exocortex")},  # ORG-100 (T-3814)
+    {"mason", "engineering_orchestrator", _probe_account("suborch1")},  # ORG-100 (T-3814): mason+artisan share engineering_orchestrator
+    {"artisan", "engineering_orchestrator", _probe_account("suborch2")},  # ORG-100 (T-3814)
+    {"codex", "head_auditor", _probe_account("codex")},  # ORG-100 (T-3814): codex's audit-id is now head_auditor; account == "codex" by design
+    {"watchman", "system_orchestrator", _probe_account("codex-fallback")},  # T-4884 B6: ORG-100 §1 regular in the System domain
     {"operator"},  # the ninth: a non-agent actor, no account, no role-id
 ]
 
@@ -257,7 +254,7 @@ class TestAccessorResolvesTheFleet(unittest.TestCase):
 
 
 class TestBothDirections(unittest.TestCase):
-    """metis's reviewer finding: existing coverage on this axis asserted only
+    """mason's reviewer finding: existing coverage on this axis asserted only
     registry ⊆ map, never map ⊆ registry. A one-directional completeness check
     passes on a map with an extra bogus account in it forever."""
 
@@ -449,29 +446,22 @@ class TestRepointedSitesStillDerive(unittest.TestCase):
         self.assertIs(session_reset_reconcile.KNOWN_ACCOUNTS, session_reset_log.KNOWN_ACCOUNTS)
 
     def test_chronicle_user_to_agent(self) -> None:
-        """Keys derive; ONE value is a documented override. the-ancestor's
-        chronicle dir is named "ancestor" and has archived snapshots + an
-        index.md already filed under it, so deriving that string would re-home
-        future archives and orphan the existing ones — in the tool whose job is
-        not losing dying context.
-
-        This is the ONLY test that exercises the override branch: it is keyed on the live
-        account string, so the perturbed-manifest guard below cannot reach it.
-        """
+        """Keys derive; the override seam (chronicle._AGENT_NAME_OVERRIDES) is empty
+        since the-ancestor's "ancestor" override was removed with the persona (T-3421)."""
         from tools import chronicle
 
         live = account_persona_map()
         expected = {a: CHRONICLE_NAME_OVERRIDES.get(a, p) for a, p in live.items()}
         self.assertEqual(set(chronicle._USER_TO_AGENT), set(live))
         self.assertEqual(chronicle._USER_TO_AGENT, expected)
-        self.assertEqual(chronicle._USER_TO_AGENT["the-ancestor"], "ancestor")
-        self.assertEqual(chronicle.agent_from_handoff_path("/home/exocortex/HANDOFF.md"), "mnemosyne")
-        self.assertEqual(chronicle.agent_from_handoff_path("/home/suborch2/HANDOFF.md"), "atlas")
+        self.assertNotIn("the-ancestor", chronicle._USER_TO_AGENT)
+        self.assertEqual(chronicle.agent_from_handoff_path("/home/exocortex/HANDOFF.md"), "archivist")
+        self.assertEqual(chronicle.agent_from_handoff_path("/home/suborch2/HANDOFF.md"), "artisan")
         self.assertIsNone(chronicle.agent_from_handoff_path("/home/nobody/HANDOFF.md"))
 
     def test_links_alias_groups_cover_every_account(self) -> None:
-        """The live defect T-2256 opened with: `touched-by mnemosyne` matched
-        only [mnemosyne] lines and missed all 80 [exocortex] ones, because
+        """The live defect T-2256 opened with: `touched-by archivist` matched
+        only [archivist] lines and missed all 80 [exocortex] ones, because
         alias_group() falls back to SELF and the seat had no group at all.
 
         Driven off the accessor, not off ALL_ACCOUNTS: an account instance.yaml binds and
@@ -492,11 +482,11 @@ class TestRepointedSitesStillDerive(unittest.TestCase):
         `operator` actor. Unknown tokens must still match only themselves."""
         from tools import links
 
-        self.assertEqual(links.alias_group("recovery"), {"recovery", "claude-fallback"})
+        self.assertEqual(links.alias_group("recovery"), {"recovery", "claude-fallback", "head_system_orchestrator"})
         self.assertEqual(
-            links.alias_group("orchestrator"), {"orchestrator", "orchestrator", "orchestrator", "claude"}
+            links.alias_group("orchestrator"), {"orchestrator", "head_engineering_orchestrator", "orchestrator", "claude"}
         )
-        self.assertEqual(links.alias_group("specialist"), {"specialist", "claude-research", "specialist"})
+        self.assertEqual(links.alias_group("specialist"), {"specialist", "claude-research", "head_research_orchestrator"})
         self.assertEqual(links.alias_group("operator"), {"operator"})
         self.assertEqual(links.alias_group("grooming"), {"grooming"})
         self.assertEqual(links.alias_group("auto-unblock"), {"auto-unblock"})
@@ -564,9 +554,6 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
         consumers walk /home/<account> and per-account state dirs, which a tmp tree does not
         have; a rewiring that leaves the constant derived and reads a literal in the loop is
         NOT detected. The four sites that do have a cheap pure entry point get one, below.
-      - chronicle's the-ancestor -> "ancestor" override, which is keyed on the LIVE account
-        string and therefore cannot fire against probe accounts. Asserted live, in
-        TestRepointedSitesStillDerive.test_chronicle_user_to_agent.
       - Anything outside tools/*.py.
     """
 
@@ -647,9 +634,9 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
         hand-carried `_DRAIN_PERSONAS = ("recovery", "orchestrator", "specialist")` tuple was replaced by
         a derivation over the account axis. That tuple was the pre-ORG-042 three and it
         CONTRADICTED the manifest it claimed to be built from: instance.yaml grants
-        restart_service to a fourth role (second-head/mnemosyne), the builder's own
+        restart_service to a fourth role (second-head/archivist), the builder's own
         `"restart_service" in binding` predicate already selected it, and the outer tuple
-        subtracted it back out — so a restart tombstone written for mnemosyne hit the
+        subtracted it back out — so a restart tombstone written for archivist hit the
         `agent not in DRAIN_AGENT_CONFIG` branch and was quarantined as an unknown agent,
         silently, for a seat the manifest says is restartable.
 
@@ -667,7 +654,7 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
             with self.subTest(mode=mode):
                 value = self._constant("restart_drain", "DRAIN_AGENT_CONFIG", mode, "dict")
 
-                # 1. KEY SET — exactly the manifest's restart_service grantees. mnemosyne
+                # 1. KEY SET — exactly the manifest's restart_service grantees. archivist
                 #    is named explicitly: it is the measured casualty, and a regression
                 #    that dropped it while keeping the derivation would still satisfy a
                 #    bare "keys are a subset of the fleet" check.
@@ -677,8 +664,8 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
                 }
                 self.assertEqual(set(value), grantees)
                 self.assertIn(
-                    "mnemosyne", value,
-                    "the drain no longer covers mnemosyne — T-2370's exact defect, in which "
+                    "archivist", value,
+                    "the drain no longer covers archivist — T-2370's exact defect, in which "
                     "its restart tombstones are quarantined as an unknown agent",
                 )
 
@@ -772,10 +759,7 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
     def test_chronicle_user_to_agent_follows_the_manifest(self) -> None:
         """chronicle._USER_TO_AGENT maps account -> AGENT NAME, which is the persona except
         for the one documented override. CHRONICLE_PROBE_EXPECTED is written out in full, and
-        deliberately expects the PERSONA for the-ancestor: the override is keyed on the live
-        account string and does not fire here. Fitting this site to the account -> persona
-        template would have been right by accident and wrong the moment the override key
-        changed."""
+        expects the PERSONA for every account (the override seam is empty, T-3421)."""
         for mode in _PROBE_MODES:
             with self.subTest(mode=mode):
                 value = self._constant("chronicle", "_USER_TO_AGENT", mode, "dict")
@@ -823,7 +807,7 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
                 "print('@@' + json.dumps(dict(kind='calls', value=out), sort_keys=True))\n"
             ) % probe_exocortex
             out = self._run("chronicle", body, "package")["value"]
-            self.assertEqual(out["probe"], "mnemosyne")
+            self.assertEqual(out["probe"], "archivist")
             self.assertIsNone(
                 out["live"],
                 "chronicle resolved an agent for an account the manifest it loaded does not "
@@ -832,12 +816,12 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
 
         with self.subTest(site="links.alias_group"):
             body = (
-                "out = {'persona': sorted(m.alias_group('mnemosyne')),\n"
+                "out = {'persona': sorted(m.alias_group('archivist')),\n"
                 "       'live': sorted(m.alias_group('exocortex'))}\n"
                 "print('@@' + json.dumps(dict(kind='calls', value=out), sort_keys=True))\n"
             )
             out = self._run("links", body, "package")["value"]
-            self.assertEqual(out["persona"], sorted(["mnemosyne", probe_exocortex]))
+            self.assertEqual(out["persona"], sorted(["archivist", "head_memory_orchestrator", probe_exocortex]))
             self.assertEqual(
                 out["live"],
                 ["exocortex"],
@@ -860,7 +844,7 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
                 "print('@@' + json.dumps(dict(kind='calls', value=out), sort_keys=True))\n"
             ) % probe_suborch2
             out = self._run("mailbox_mcp", body, "script")["value"]
-            self.assertEqual(out["probe"], "atlas")
+            self.assertEqual(out["probe"], "artisan")
             self.assertEqual(
                 out["live"],
                 "RAISED:ValueError",
@@ -880,7 +864,7 @@ class TestConsumersFollowThePerturbedManifest(unittest.TestCase):
                 "print('@@' + json.dumps(dict(kind='calls', value=out), sort_keys=True))\n"
             ) % probe_suborch2
             out = self._run("ticket", body, "package")["value"]
-            self.assertEqual(out["probe"], "atlas")
+            self.assertEqual(out["probe"], "artisan")
             self.assertEqual(
                 out["live"],
                 "suborch2",
@@ -1152,17 +1136,47 @@ class TestScriptInvocationKeepsTheDerivation(unittest.TestCase):
                 )
 
     def test_links_cli_expands_the_new_seats(self) -> None:
-        """The user-visible surface of the F2 defect, through the real CLI."""
+        """The user-visible surface of the F2 defect, through the real CLI.
+
+        T-4230: HERMETIC. This used to run `tools/links.py touched-by archivist`
+        against the live repo, which walks all ~4300 tickets (~10-25s at CPU
+        idle) and blew its 180s timeout on a loaded CI runner. Nothing here needs
+        the live tree: `touched-by` is the only CLI surface that exposes the
+        alias group, and what is under test is the DERIVATION (persona registry +
+        instance.yaml account bindings) reaching that CLI under script invocation.
+        So the fixture is a tmp repo root holding byte-for-byte copies of the
+        script, its one internal import (agent_role_map) and the two registries
+        it derives from, plus a single ticket whose transition log names the seat
+        only by its account (`[exocortex]`). links.py derives REPO_ROOT from its
+        own location, so the copy scans the fixture tree, not the real one.
+
+        The ticket makes the expansion observable end to end (not just the group
+        list): before T-2256 `touched-by archivist` missed every `[exocortex]`
+        line, which here would return no tickets."""
+        root = Path(tempfile.mkdtemp(prefix="t4230-links-"))
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "tools").mkdir()
+        for name in ("__init__.py", "links.py", "agent_role_map.py"):
+            shutil.copy2(REPO_ROOT / "tools" / name, root / "tools" / name)
+        for name in ("instance.yaml", "persona_roles.yaml"):
+            shutil.copy2(REPO_ROOT / name, root / name)
+        (root / "tickets" / "done").mkdir(parents=True)
+        (root / "tickets" / "done" / "T-9001.md").write_text(
+            "---\nid: T-9001\n---\n\n## Transition log\n\n"
+            "- 2026-01-01T00:00:00Z [exocortex] filed in inbox\n",
+            encoding="utf-8",
+        )
         res = subprocess.run(
-            [sys.executable, "tools/links.py", "--json", "touched-by", "mnemosyne"],
-            cwd=str(REPO_ROOT),
+            [sys.executable, "tools/links.py", "--json", "touched-by", "archivist"],
+            cwd=str(root),
             capture_output=True,
             text=True,
-            timeout=180,
+            timeout=180,  # bound for a HANG only; the hermetic run is ~0.5s CPU
         )
         self.assertEqual(res.returncode, 0, res.stderr)
         payload = json.loads(res.stdout)
-        self.assertEqual(sorted(payload["group"]), ["exocortex", "mnemosyne"])
+        self.assertEqual(sorted(payload["group"]), ["exocortex", "head_memory_orchestrator", "archivist"])
+        self.assertEqual(payload["tickets"], ["T-9001"], "the [exocortex] line must match a archivist query")
 
 
 _SEED_TOOLING = (REPO_ROOT / "tools" / "verify_seed.py", REPO_ROOT / "tools" / "seed_genericize.py")

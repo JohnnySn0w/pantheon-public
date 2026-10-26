@@ -214,6 +214,49 @@ class TestRunMailboxIntegration(unittest.TestCase):
         self._run(now=now + 10)  # same finding set, well within cooldown
         mock_alert.assert_not_called()
 
+    def _transitional(self, n: int = 207) -> None:
+        """An echo element that is implemented but not yet verified: the
+        expected-transitional shape (ORG-065 §3.4)."""
+        _write_adr(self.echo_adr_dir / f"ADR-{n}-test.md", adr_id=f"ADR-{n}",
+                   elements_block="  - id: E1\n    title: t\n")
+        _write_ticket(self.tickets / "inbox" / f"T-0{n}.md",
+                       tid=f"T-0{n}", implements=[f"ADR-{n}#E1"])
+
+    @patch("tools.echo_corpus_lint._alert_recovery")
+    def test_transitional_only_set_does_not_alert(self, mock_alert) -> None:
+        """A set made only of expected-transitional findings is not a defect,
+        so it must not mail recovery (it re-alerted every cooldown forever)."""
+        self._transitional()
+        rc = self._run()
+        self.assertEqual(rc, 0)
+        mock_alert.assert_not_called()
+
+    @patch("tools.echo_corpus_lint._alert_recovery")
+    def test_actionable_finding_alerts_and_counts_transitional(self, mock_alert) -> None:
+        self._transitional()
+        _write_adr(self.echo_adr_dir / "ADR-210-test.md", adr_id="ADR-210",
+                   elements_block="  - id: E1\n    title: t\n")  # no edge at all
+        self._run()
+        mock_alert.assert_called_once()
+        body = mock_alert.call_args[0][0]
+        self.assertIn("ADR-210#E1", body)
+        self.assertNotIn("ADR-207#E1", body)
+        self.assertIn("1 expected-transitional", body)
+
+    @patch("tools.echo_corpus_lint._alert_recovery")
+    def test_transitional_churn_does_not_bypass_cooldown(self, mock_alert) -> None:
+        """Only the actionable set is signed: a new implemented-unverified
+        element (normal work landing) must not re-alert an unchanged defect."""
+        _write_adr(self.echo_adr_dir / "ADR-210-test.md", adr_id="ADR-210",
+                   elements_block="  - id: E1\n    title: t\n")
+        now = time.time()
+        self._run(now=now)
+        mock_alert.assert_called_once()
+        mock_alert.reset_mock()
+        self._transitional()
+        self._run(now=now + 10)
+        mock_alert.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

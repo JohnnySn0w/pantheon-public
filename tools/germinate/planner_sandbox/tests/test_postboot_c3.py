@@ -5,7 +5,7 @@ Architectural-tier scope carve).
 Four tests, one per invocation-surface transport, all real primitives
 (no mocks): a subprocess argv-driven CLI shim (C3-1), a real
 ``systemd-run --user`` transient unit whose entry point bypasses any CLI
-(C3-2, the Cairn v9 BLOCK-3 witness), a bare in-process library call with
+(C3-2, the Consultant v9 BLOCK-3 witness), a bare in-process library call with
 zero CLI code loaded (C3-3), and a boot-id-staleness check exercised at
 the library tier (C3-4) -- see the T-3294 DECISIONS (ticket transition
 log) for why staleness isn't independently re-proven across all three
@@ -72,7 +72,7 @@ sys.exit(0)
 """
 
 #: Systemd-unit-surface probe (C3-2). Deliberately bypasses any CLI --
-#: imports and calls the engine internal directly, exactly the Cairn v9
+#: imports and calls the engine internal directly, exactly the Consultant v9
 #: BLOCK-3 concern (a component unit's ExecStart invoking engine
 #: internals directly, skipping a CLI-tier-only check). Proves closure
 #: is at the enforcement tier BELOW where bypass could occur (inside the

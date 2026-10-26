@@ -16,7 +16,7 @@
 # A supervisor that blocks forever after its child is gone is indistinguishable
 # from a healthy one — systemd sees a live MainPID, the unit stays `active`, no
 # alert fires anywhere, and mail simply stops moving. That is precisely what
-# mnemosyne's bridge looked like from the outside for ninety minutes: the loop
+# archivist's bridge looked like from the outside for ninety minutes: the loop
 # logged iteration lines with empty processed[] to iteration 542 and then nothing,
 # and it was invisible at BOTH ends.
 #
@@ -30,9 +30,10 @@
 # supervisor that HANGS, and an unbounded wait for a hang is itself a hang — a
 # regression would stall CI instead of failing it, which is the same
 # silence-reads-as-health defect the test is about. So the wait is a bounded
-# poll: ~15s, comfortably over the loop's own 5s poll interval and far under
-# systemd's default 90s TimeoutStopSec. Replace the poll loop with
-# `while true; do sleep 5; done` and this FAILS in 15 seconds rather than hanging.
+# poll: 30s from session death (EXIT_BOUND below), six of the loop's own 5s poll
+# intervals so it holds on a saturated runner, and far under systemd's default 90s
+# TimeoutStopSec. Replace the poll loop with `while true; do sleep 5; done` and
+# this FAILS in 30 seconds rather than hanging.
 #
 # Run after any edit to acp-bridge-supervise.sh's session/poll logic.
 # Exit 0 == passed.
@@ -89,20 +90,48 @@ PASS=0; FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
+# Wall-clock bounds (T-4348). Both waits are deadline-based on $SECONDS, not
+# iteration counts, so the bound means the same thing on an idle box and on the
+# saturated CI runner.
+#
+# STARTUP is a wait on a POSITIVE readiness signal (the stub's new-session marker),
+# so its bound only caps a broken start and never paces a healthy one: 60s. The
+# old 5s bound was a timing guess, and it lost. Before its first new-session the
+# script resolves the mailbox hub with a python3 import of agent_role_map, which
+# measured 4-5s on the loaded runner by itself, and on pve2 it did not reach
+# new-session inside 5s at all (the stub log was empty). ACP_BRIDGE_INBOX is the
+# script's own override for that lookup. Hub resolution is not what this file
+# tests, so it is set below. That removes the slow step from this test instead of
+# only outwaiting it. test_acp_bridge_supervise_batch.sh keeps the default
+# (hub-lookup) launch path covered.
+#
+# EXIT is timed from the moment of session death (the rm), never from launch. The
+# supervisor polls has-session with a fixed `sleep 5`, which has no env knob, so a
+# healthy exit takes one poll interval plus a stub-tmux exec, about 5.5s measured.
+# The bound is 30s: six poll intervals of load margin, still far under systemd's
+# 90s TimeoutStopSec, and it still FAILS on a supervisor that never exits.
+STARTUP_BOUND=60
+EXIT_BOUND=30
+
 echo "T1: supervise loop exits when its tmux session dies underneath it"
 
 PATH="$STUBDIR:$PATH" HOME="$SANDBOX" ACP_BRIDGE_AGENT="$AGENT" \
+  ACP_BRIDGE_INBOX="$SANDBOX/inbox" \
   "$SUPERVISE" &
 SCRIPT_PID=$!
 
-# Wait for the session to come up (bounded poll, not a fixed sleep).
+# Wait for the session to come up (bounded poll on the readiness marker, not a
+# fixed sleep).
 up=0
-for _ in $(seq 1 50); do
+deadline=$((SECONDS + STARTUP_BOUND))
+while (( SECONDS < deadline )); do
   if [[ -e "$STUB_TMUX_MARK" ]]; then up=1; break; fi
+  # A supervisor that died before new-session never will: fail now, not at 60s.
+  kill -0 "$SCRIPT_PID" 2>/dev/null || break
   sleep 0.1
 done
 if [[ "$up" -eq 1 ]]; then pass "session came up before killing it"
-else fail "session never came up (new-session not observed)"; fi
+else fail "session never came up within ${STARTUP_BOUND}s (new-session not observed)"; fi
 
 # The bridge's tmux session dies on its own — NOT a systemd stop, no SIGTERM.
 # This is the 2026-07-28 shape: the supervisor is untouched and its child is gone.
@@ -111,14 +140,15 @@ rm -f "$STUB_TMUX_MARK"
 # BOUNDED wait. A supervisor that hangs here is the defect; an unbounded wait for
 # it would hang too, so the guard must time out and FAIL rather than block.
 exited=0
-for _ in $(seq 1 150); do
+deadline=$((SECONDS + EXIT_BOUND))
+while (( SECONDS < deadline )); do
   if ! kill -0 "$SCRIPT_PID" 2>/dev/null; then exited=1; break; fi
   sleep 0.1
 done
 if [[ "$exited" -eq 1 ]]; then
   pass "supervise loop exited after its session died"
 else
-  fail "supervise loop did NOT exit within 15s of session death — a supervisor \
+  fail "supervise loop did NOT exit within ${EXIT_BOUND}s of session death — a supervisor \
 that outlives its child keeps the unit 'active' and nothing ever restarts it"
 fi
 

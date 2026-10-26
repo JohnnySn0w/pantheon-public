@@ -21,6 +21,10 @@
 >
 > Generalized into `sop/standard/feature-usage-monitoring-and-pruning.md`, which exists
 > because this feature ran 45 days unused without anything surfacing it.
+>
+> **Code removed 2026-10-09 (T-4741, #835):** `tools/veneration.py` and
+> `tools/ancestor_consume.py` (and their tests) are gone from the tree; the commands
+> below no longer resolve. Recover from git history if the gotchas are ever needed in code.
 
 **Status:** **RETIRED 2026-07-28 (T-2214).** Originally drafted 2026-06-14 by Recovery, authored while stepping through the T-0766 supervised first-fire (the operator watching). Documented the headless-`--print` harvest design the first-fire converged on. Adopted 2026-06-16 (Recovery, principles-as-ratification); routed by Orchestrator (T-1202).
 
@@ -41,7 +45,7 @@ The harvest is **one headless `claude --print` subprocess** — there is no tmux
 
 ### 1. Prerequisites (verify before firing)
 - **Identify the dead session id.** It is the `.jsonl` basename: `.../<uuid>.jsonl` → `<uuid>`. Find it under the target account's project dir, e.g. `sudo -u the-ancestor find ~/.claude/projects -name '<uuid>.jsonl'`. **Do NOT resume a session that is currently LIVE** — only a dead one (cross-check against running PIDs).
-- **`the-ancestor`'s clone is current:** `sudo -u the-ancestor bash -c 'cd ~/pantheon-config && git pull --rebase'`. The harvest runs `the-ancestor`'s copy of `veneration.py`, not Recovery's — a stale clone runs stale code.
+- **`the-ancestor`'s clone is current:** `sudo -u the-ancestor bash -c 'cd ~/pantheon-config && git pull --rebase'`. The harvest runs `the-ancestor`'s copy of `veneration.py`, not Recovery's — a stale clone runs stale code. It also reads the seat's pinned rules from that clone (T-4649), so a stale clone hands the dead session stale rules.
 - **`.veneration/` exists** (lease dir): `/home/the-ancestor/.veneration/` (mode 700, owned by `the-ancestor`).
 
 ### 2. Fire `resurrect()` — run it AS `the-ancestor`, with `run_as=None`
@@ -52,9 +56,9 @@ sudo -n -u the-ancestor bash -c 'XDG_RUNTIME_DIR=/run/user/$(id -u) python3 -c "
 import sys; sys.path.insert(0, \"/home/the-ancestor/pantheon-config/tools\")
 import veneration as ven
 res = ven.resurrect(
-    agent=\"<label>\",
+    agent=\"<persona>\",
     dead_jsonl=\"/home/the-ancestor/.claude/projects/-home-the-ancestor/<uuid>.jsonl\",
-    handoff_target=\"/home/the-ancestor/.veneration/<label>-HANDOFF.md\",
+    handoff_target=\"/home/the-ancestor/.veneration/<persona>-HANDOFF.md\",
     run_as=None,
 )
 print(res)
@@ -71,11 +75,12 @@ cd <the-ancestor home> && exec env XDG_RUNTIME_DIR=/run/user/<uid> \
 - `--safe-mode` → no hooks (kills competing SessionStart nudges), no plugins/MCP (reinforces channel-less), no CLAUDE.md re-priming.
 - `--permission-mode bypassPermissions` → the harvest Write lands unattended. Headless `--print` has **no** one-time consent screen (the interactive `--dangerously-skip-permissions` flag does — avoid it).
 - `cd <home>` (as `the-ancestor`, not in Recovery's process — Recovery can't enter a 700 home) → `--resume <id>` is project-scoped (cwd-hashed), so it must run in the project dir the transcript lives under.
+- **Current rules (T-4649).** `--resume` replays the dead session's start-time system prompt and `--safe-mode` skips CLAUDE.md, so the turn would otherwise write the successor's HANDOFF under rules that may be weeks old. The prompt therefore tells it to read `<the-ancestor clone>/pinned-rules/<agent>.md` first, which is why `agent` must be the persona name (recovery, specialist, archivist, mason, artisan, orchestrator-codex). A seat's own `~/CLAUDE.md` is no use here: `the-ancestor` cannot read another seat's home.
 
 **Result contract:** `Result.status ∈ {ok, skipped, failed}`. `ok` = subprocess exited 0 AND the HANDOFF exists non-empty. `skipped` = another veneration holds the lease (back off, don't block). `failed` = subprocess error/timeout, or clean exit with no file written. Default `harvest_timeout` is 300s (large-transcript reload + write).
 
 ### 3. Verify
-- `Result` is `ok`.
+- `Result` is `ok`, and its detail ends `rules: <path>`: the pinned-rules file the turn was told to re-read. `rules: none readable` means no file matched `agent` (a non-persona label, or orchestrator, whose Claude rules live in claude-config). That handoff reflects the dead session's start-time rules, so check it against the current ones before the successor relies on it.
 - `cat <handoff_target>` — confirm the content is a **real** handoff (identity, current state, in-flight work, next actions), not a stub. A good harvest also self-attests the constraints (no messages/channels/mutation).
 - Clean teardown (should be automatic — the subprocess self-exits): no `veneration-*` tmux session, no orphan `claude --resume` process (`pgrep -u the-ancestor -af claude`), and the lockfile is 0-byte + unlocked (flock released on exit).
 

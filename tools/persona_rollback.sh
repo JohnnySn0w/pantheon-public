@@ -26,6 +26,7 @@ PERSONA=""
 STAMP=""
 EXECUTE=0
 MANIFEST=""
+FORCE_BREAK_GLASS=0
 UNIT_FILE=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -36,6 +37,9 @@ while [[ $# -gt 0 ]]; do
     --execute)    EXECUTE=1 ;;
     --manifest=*) MANIFEST="${1#--manifest=}" ;;
     --manifest)   MANIFEST="${2:-}"; shift ;;
+    # T-4848: explicit recovery step when the manifest pin refuses (manifest
+    # loads but disagrees with the checkpoint). Never selected automatically.
+    --break-glass-no-manifest) FORCE_BREAK_GLASS=1 ;;
     # Operator escape hatch (also the seam tools/test_persona_cutover_verify.sh
     # uses): dry-run identity resolution against a LOCAL copy of the bespoke
     # unit file instead of the real cross-account read.
@@ -79,19 +83,20 @@ die() { echo "ROLLBACK-ABORT: $*" >&2; exit 1; }
 [[ -n "$PERSONA" ]] || die "no --persona <name> given"
 [[ -n "$STAMP" ]] || die "no --stamp <TS> given (the fire-time backup suffix)"
 
-# Rollback has ZERO manifest dependency, matching tools/t2590_recovery_rollback.sh
-# exactly (grep-verified: that script never references MANIFEST at all) --
-# it must keep working even when a target's instance.yaml is missing,
-# unreadable, or mid-incident reverted to an inert pre-cutover shape. Calls
-# `bespoke-identity`, NOT `resolve` -- the latter's manifest-precondition gate
-# (channels/model/tmux/post_start synced-shape check) is a persona_cutover.sh
-# concern this script does not share. See BespokeIdentity's docstring in
-# tools/persona_cutover_resolve.py. --manifest is accepted for CLI-shape
-# symmetry with persona_cutover.sh but unused by bespoke-identity; warn if
-# given since it's silently ignored.
-if [[ -n "$MANIFEST" ]]; then
-  echo "-- note: --manifest is accepted for symmetry with persona_cutover.sh but rollback never reads a manifest; ignoring ${MANIFEST}" >&2
-fi
+# Rollback must keep working even when a target's instance.yaml is missing,
+# unreadable, or mid-incident reverted to an inert pre-cutover shape. Identity
+# resolution therefore calls `bespoke-identity`, NOT `resolve` -- the latter's
+# manifest-precondition gate (channels/model/tmux/post_start synced-shape
+# check) is a persona_cutover.sh concern this script does not share. See
+# BespokeIdentity's docstring in tools/persona_cutover_resolve.py.
+#
+# T-4848: the STAGED-checkpoint rollback is manifest-pinned by default (its
+# allowed write roots must equal the roots derived from the trusted manifest).
+# --manifest selects the manifest (default <home>/pantheon-config/instance.yaml).
+# If that manifest is missing or does not load, the script falls back to the
+# helper's explicit break-glass mode, loudly: it skips ONLY the manifest
+# re-derivation; the receipt/plan digest tie, structural root bounds and
+# per-mutation realpath containment are still enforced.
 BESPOKE_ARGS=(bespoke-identity --persona "$PERSONA" --format env)
 [[ -n "$UNIT_FILE" ]] && BESPOKE_ARGS+=(--unit-file "$UNIT_FILE")
 if ! RESOLVE_OUTPUT="$(python3 "$RESOLVER" "${BESPOKE_ARGS[@]}" 2>&1)"; then
@@ -107,6 +112,12 @@ DBUS="$PCX_DBUS_SESSION_BUS_ADDRESS"
 [[ -n "$DBUS" ]] || die "DBUS_SESSION_BUS_ADDRESS missing — user bus unreachable; cannot drive ${PCX_ACCOUNT}'s systemctl --user"
 export XDG_RUNTIME_DIR="$XRD"
 export DBUS_SESSION_BUS_ADDRESS="$DBUS"
+
+# ORG-106 L3a (T-5526): a rollback restores the bespoke supervisor, which starts the session;
+# it must not wake a deep-sleeping seat behind the operator's back.
+_lc_rc=0
+python3 "$SCRIPT_DIR/seat_state.py" launch-check "$PERSONA" || _lc_rc=$?
+[[ $_lc_rc -ne 3 ]] || die "${PERSONA} is in deep-sleep; wake it first (harness ${PERSONA} wake)"
 
 declare -a FILES=(
   "$PCX_SERVICE_UNIT_PATH"
@@ -243,8 +254,8 @@ if [[ $EXECUTE != 1 ]]; then
   echo "  systemctl --user stop ${PCX_CONSUME_TIMER}"
   echo "  systemctl --user stop ${PCX_CONSUME_SERVICE}"
   echo "  [abort unless ${PCX_CONSUME_SERVICE} and ${PCX_CONSUME_TIMER} prove inactive/dead]"
-  echo "  PATH=${PCX_APPLY_PATH} python3 ${PCX_HOME}/pantheon-config/tools/t2611_recovery_persona_apply.py rollback-staged --persona ${PERSONA} --stamp ${STAMP} --account-home ${PCX_HOME}"
-  echo "          # R5: checkpoint rollback before bespoke restart; no manifest read"
+  echo "  PATH=${PCX_APPLY_PATH} python3 ${PCX_HOME}/pantheon-config/tools/t2611_recovery_persona_apply.py rollback-staged --persona ${PERSONA} --stamp ${STAMP} --account-home ${PCX_HOME} --manifest <manifest>   # or --break-glass-no-manifest when forced"
+  echo "          # R5: checkpoint rollback before bespoke restart; manifest-pinned (T-4848), or --break-glass-no-manifest if the manifest does not load"
   echo "  systemctl --user daemon-reload"
   echo "  [abort unless $(consume_timer_link_path) is absent and ${PCX_CONSUME_TIMER}/${PCX_CONSUME_SERVICE} prove not-found/inactive/dead]"
   echo "  systemctl --user enable ${PCX_SERVICE}   # T-2611: cutover's disable --now removed the enable symlink"
@@ -319,9 +330,25 @@ echo "confirmed: default tmux socket has no ${PCX_TMUX_SESSION} session (control
 consume_timer_service_teardown_before_staged_rollback
 
 PERSONA_APPLY_HELPER="${PCX_HOME}/pantheon-config/tools/t2611_recovery_persona_apply.py"
-if ! STAGED_ROLLBACK_OUTPUT="$(PATH="$PCX_APPLY_PATH" python3 "$PERSONA_APPLY_HELPER" rollback-staged --persona "$PERSONA" --stamp "$STAMP" --account-home "$PCX_HOME" 2>&1)"; then
+ROLLBACK_MANIFEST="${MANIFEST:-${PCX_HOME}/pantheon-config/instance.yaml}"
+ROLLBACK_PIN_ARGS=(--break-glass-no-manifest)
+RERUN_CMD="bash $0 --persona ${PERSONA} --stamp ${STAMP}"
+[[ -n "$UNIT_FILE" ]] && RERUN_CMD+=" --unit-file ${UNIT_FILE}"
+RERUN_CMD+=" --execute --break-glass-no-manifest"
+if [[ $FORCE_BREAK_GLASS == 1 ]]; then
+  echo "WARNING: BREAK-GLASS: --break-glass-no-manifest given -- staged rollback proceeds WITHOUT the manifest pin (digest tie, root bounds and realpath containment still enforced)" >&2
+elif [[ -f "$ROLLBACK_MANIFEST" ]] && PATH="$PCX_APPLY_PATH" python3 "$PERSONA_APPLY_HELPER" check-manifest --manifest "$ROLLBACK_MANIFEST" >/dev/null 2>&1; then
+  ROLLBACK_PIN_ARGS=(--manifest "$ROLLBACK_MANIFEST")
+  echo "staged rollback: pinned to manifest ${ROLLBACK_MANIFEST}"
+else
+  echo "WARNING: BREAK-GLASS: manifest ${ROLLBACK_MANIFEST} is missing or does not load -- staged rollback proceeds WITHOUT the manifest pin (digest tie, root bounds and realpath containment still enforced)" >&2
+fi
+if ! STAGED_ROLLBACK_OUTPUT="$(PATH="$PCX_APPLY_PATH" python3 "$PERSONA_APPLY_HELPER" rollback-staged --persona "$PERSONA" --stamp "$STAMP" --account-home "$PCX_HOME" "${ROLLBACK_PIN_ARGS[@]}" 2>&1)"; then
   echo "$STAGED_ROLLBACK_OUTPUT" >&2
-  die "staged checkpoint rollback failed before bespoke restart"
+  if [[ $FORCE_BREAK_GLASS != 1 && "${ROLLBACK_PIN_ARGS[0]}" == "--manifest" ]]; then
+    die "staged checkpoint rollback failed before bespoke restart. Reason: ${STAGED_ROLLBACK_OUTPUT}. If the reason is a manifest pin refusal (the manifest loads but disagrees with the checkpoint), recover EXPLICITLY (this is never automatic; it skips only the manifest pin): ${RERUN_CMD}"
+  fi
+  die "staged checkpoint rollback failed before bespoke restart. Reason: ${STAGED_ROLLBACK_OUTPUT}"
 fi
 echo "$STAGED_ROLLBACK_OUTPUT"
 echo "staged checkpoint rollback complete before bespoke restart"

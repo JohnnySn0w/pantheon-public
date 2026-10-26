@@ -1,5 +1,6 @@
-"""Unit tests for `tools/ticket.py`'s `cascade` subcommand and
-`tools/cascade_diff_scan.py` (T-3289: ORG-013 cascade-on-PR-merge trigger).
+"""Unit tests for `tools/ticket.py`'s `cascade` subcommand (T-3289: ORG-013 cascade
+trigger; T-4186: the level-triggered sweep in tools/cascade_sweep.py now drives it, and the
+diff-walk workflow + tools/cascade_diff_scan.py this file once also covered are retired).
 
 Run from repo root:
     python3 -m unittest tools.test_ticket_cascade -v
@@ -9,22 +10,18 @@ Closes T-3288 (ORG-013 cascade-unblock silently misses on PR-squash-merge):
 cascade_callback hook; a ticket resolved via a GitHub squash-merge never
 calls `ticket.py resolve`, so the cascade never fires and dependants keep
 stale `depends_on:` refs indefinitely. `ticket.py cascade --tid <T-NNNN>`
-(TestCmdCascade*) is the standalone trigger the mechanism was missing;
-`tools/cascade_diff_scan.py` (TestExtractResolvedTids / TestRunCascadeFor
-Tids) is the diff-walk `.github/workflows/cascade-on-merge.yml` uses to
-find which tids to invoke it for, on every push to main.
+(TestCmdCascade*) is the standalone trigger the mechanism was missing.
 """
 
 from __future__ import annotations
 
 import argparse
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from tools import _git_utils, cascade_diff_scan, ticket
+from tools import _git_utils, ticket
 
 
 def _write_ticket(
@@ -208,10 +205,13 @@ class TestCmdCascadeHappyPath(_CascadeCliFixture):
 
 
 class TestCmdCascadeMultiDepMixedState(_CascadeCliFixture):
-    """Acceptance 2: a dependant with a still-not-done sibling dep is left
-    untouched, and no commit is created."""
+    """Acceptance 2 (T-3933 update): a dependant with a still-not-done sibling
+    dep gets the resolved dep STRIPPED (partial-strip, always fires) but is
+    NOT fully unblocked — the still-open sibling remains as a live gate. A
+    commit IS created (the frontmatter changed), distinct from full unblock.
+    """
 
-    def test_skips_dependant_with_unresolved_sibling_dep_no_commit(self) -> None:
+    def test_partial_strip_removes_resolved_dep_leaves_sibling_gate(self) -> None:
         _write_ticket(self.root / "tickets" / "done" / "T-9199.md", tid="T-9199", state="done")
         _write_ticket(self.root / "tickets" / "inbox" / "T-9198.md", tid="T-9198", state="inbox")
         _write_ticket(
@@ -224,8 +224,84 @@ class TestCmdCascadeMultiDepMixedState(_CascadeCliFixture):
         self.assertEqual(rc, 0)
         text = (self.root / "tickets" / "inbox" / "T-9202.md").read_text(encoding="utf-8")
         fields, _ = ticket.parse_front_matter(text)
-        self.assertEqual(fields["depends_on"], ["T-9199", "T-9198"])
-        self.assertEqual(self._commit_count(), 0)
+        self.assertEqual(fields["depends_on"], ["T-9198"],
+                         "resolved dep T-9199 must be stripped even though T-9198 still gates")
+        self.assertNotIn("auto-unblock", text)
+        self.assertIn("[cascade]", text)
+        self.assertEqual(self._commit_count(), 1)
+        msgs = self._commit_messages()
+        self.assertTrue(
+            msgs[0].startswith("cascade: T-9199 → 1 dependant updated"),
+            f"unexpected commit subject: {msgs[0]!r}",
+        )
+
+
+class TestCmdCascadeLegAwareCommitMessage(_CascadeCliFixture):
+    """T-3941: cmd_cascade's commit-message BODY must distinguish partial-strip
+    (stale-done ref pruned; still gated) from auto-unblock (fully deliverable).
+    Prior wording ("Auto-unblock cascade per ORG-013") claimed unblock even
+    when only the partial-strip leg fired — cosmetic drift, not correctness.
+    """
+
+    def _body_of(self, subject_startswith: str) -> str:
+        for msg in self._commit_messages():
+            if msg.startswith(subject_startswith):
+                return msg
+        raise AssertionError(
+            f"no commit whose subject starts with {subject_startswith!r}; "
+            f"got: {self._commit_messages()!r}"
+        )
+
+    def test_message_says_partial_strip_only_when_no_full_unblock_fires(self) -> None:
+        _write_ticket(self.root / "tickets" / "done" / "T-9299.md", tid="T-9299", state="done")
+        _write_ticket(self.root / "tickets" / "inbox" / "T-9298.md", tid="T-9298", state="inbox")
+        _write_ticket(
+            self.root / "tickets" / "inbox" / "T-9302.md", tid="T-9302", state="inbox",
+            depends_on=["T-9299", "T-9298"],
+        )
+
+        rc = ticket.cmd_cascade(self._cascade_args("T-9299"))
+
+        self.assertEqual(rc, 0)
+        body = self._body_of("cascade: T-9299")
+        self.assertIn("1 partial-strip", body)
+        self.assertNotIn("auto-unblock (fully deliverable", body)
+        self.assertNotIn("Auto-unblock cascade per ORG-013", body)  # retired wording
+
+    def test_message_says_auto_unblock_only_when_all_fires_are_full(self) -> None:
+        _write_ticket(self.root / "tickets" / "done" / "T-9399.md", tid="T-9399", state="done")
+        _write_ticket(
+            self.root / "tickets" / "inbox" / "T-9402.md", tid="T-9402", state="inbox",
+            depends_on=["T-9399"],
+        )
+
+        rc = ticket.cmd_cascade(self._cascade_args("T-9399"))
+
+        self.assertEqual(rc, 0)
+        body = self._body_of("cascade: T-9399")
+        self.assertIn("1 auto-unblock (fully deliverable", body)
+        self.assertNotIn("partial-strip", body)
+
+    def test_message_lists_both_when_fires_mix_across_dependants(self) -> None:
+        _write_ticket(self.root / "tickets" / "done" / "T-9499.md", tid="T-9499", state="done")
+        # dependant 1: only depends on the resolved tid — full unblock
+        _write_ticket(
+            self.root / "tickets" / "inbox" / "T-9501.md", tid="T-9501", state="inbox",
+            depends_on=["T-9499"],
+        )
+        # dependant 2: also depends on a still-open sibling — partial-strip
+        _write_ticket(self.root / "tickets" / "inbox" / "T-9498.md", tid="T-9498", state="inbox")
+        _write_ticket(
+            self.root / "tickets" / "inbox" / "T-9502.md", tid="T-9502", state="inbox",
+            depends_on=["T-9499", "T-9498"],
+        )
+
+        rc = ticket.cmd_cascade(self._cascade_args("T-9499"))
+
+        self.assertEqual(rc, 0)
+        body = self._body_of("cascade: T-9499")
+        self.assertIn("1 partial-strip", body)
+        self.assertIn("1 auto-unblock (fully deliverable", body)
 
 
 class TestCmdCascadeFailClosed(_CascadeCliFixture):
@@ -269,193 +345,98 @@ class TestCmdCascadeIdempotent(_CascadeCliFixture):
         self.assertEqual(self._commit_count(), 1)  # unchanged — no second commit
 
 
-# ---------------------------------------------------------------------------
-# tools/cascade_diff_scan.py — GHA diff-walk (acceptance tests 5-7)
-# ---------------------------------------------------------------------------
+class TestCmdCascadeRefusesDroppedParent(_CascadeCliFixture):
+    """T-4186 ruling 3 / ORG-089: `dropped != resolved`. `cmd_cascade` used to check only that the
+    parent is in done/, and `_cascade_unblock_dependants` strips the parent from every dependant
+    UNCONDITIONALLY, so `ticket.py cascade --tid <dropped-tid>` silently removed a dropped bet
+    from its dependants' depends_on and un-gated work whose dependency never shipped."""
 
+    def _drop(self, tid: str) -> None:
+        path = self.root / "tickets" / "done" / f"{tid}.md"
+        _write_ticket(path, tid=tid, state="done")
+        text = path.read_text(encoding="utf-8")
+        path.write_text(text.replace("state: done\n", "state: done\nsubstate: dropped\n", 1),
+                        encoding="utf-8")
 
-def _run_git(args: list[str], cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=True
-    )
+    def test_dropped_parent_is_refused_and_dependants_keep_their_gate(self) -> None:
+        self._drop("T-9899")
+        dep = self.root / "tickets" / "inbox" / "T-9901.md"
+        _write_ticket(dep, tid="T-9901", state="inbox", depends_on=["T-9899"])
+        before = dep.read_text(encoding="utf-8")
 
+        with self.assertRaises(ticket.TicketError) as ctx:
+            ticket.cmd_cascade(self._cascade_args("T-9899"))
 
-def _init_repo(root: Path) -> None:
-    _run_git(["init", "-q"], root)
-    _run_git(["config", "user.email", "test@example.com"], root)
-    _run_git(["config", "user.name", "Test"], root)
+        self.assertIn("dropped", str(ctx.exception))
+        self.assertEqual(dep.read_text(encoding="utf-8"), before)  # untouched
+        self.assertEqual(self._commit_count(), 0)
 
+    # The two guards in cmd_cascade MASK EACH OTHER: with both present, the test above is green
+    # whichever one is deleted (the survivor raises the same TicketError). So each is pinned by
+    # an observable only IT can produce. (T-4186 r2, reviewer finding.)
 
-class TestExtractResolvedTids(unittest.TestCase):
-    """Acceptance 5: real tmpdir git repo, real `git log --diff-filter=R
-    --name-status --format=""` output fed into extract_resolved_tids (D11:
-    real-surface validation, not a hand-invented name-status fixture)."""
+    def test_pre_lock_guard_refuses_before_the_lock_or_the_pull_is_touched(self) -> None:
+        """A dropped tid must be refused BEFORE `git_mutation_lock` and `_pull_if_needed`: a
+        fail-fast caller error must not take the checkout-wide lock or hit the network. Deleting
+        only the pre-lock call still raises (the in-lock guard catches it) -- but only after
+        the lock was taken and the pull ran, which is what this asserts never happens."""
+        self._drop("T-9899")
+        _write_ticket(self.root / "tickets" / "inbox" / "T-9901.md", tid="T-9901", state="inbox",
+                      depends_on=["T-9899"])
+        with patch.object(ticket, "_pull_if_needed") as pull, \
+                patch.object(ticket, "git_mutation_lock") as lock:
+            with self.assertRaises(ticket.TicketError) as ctx:
+                ticket.cmd_cascade(self._cascade_args("T-9899"))
+        self.assertIn("dropped", str(ctx.exception))
+        pull.assert_not_called()
+        lock.assert_not_called()
 
-    def setUp(self) -> None:
-        self._tmp = tempfile.TemporaryDirectory()
-        self.root = Path(self._tmp.name)
-        self.addCleanup(self._tmp.cleanup)
-        _init_repo(self.root)
+    def test_in_lock_guard_catches_a_drop_that_lands_via_the_pull(self) -> None:
+        """The pre-lock check proves nothing by the time the lock is held (T-2140): the pull can
+        bring in another seat's transition of this very tid. Simulate a `substate: dropped` version
+        of the done/ file arriving mid-flight. Deleting only the in-lock call lets the cascade run
+        and strip the dropped bet, so this asserts: TicketError, dependant untouched, 0 commits."""
+        _write_ticket(self.root / "tickets" / "done" / "T-9899.md", tid="T-9899", state="done")
+        dep = self.root / "tickets" / "inbox" / "T-9901.md"
+        _write_ticket(dep, tid="T-9901", state="inbox", depends_on=["T-9899"])
+        before = dep.read_text(encoding="utf-8")
+        done = self.root / "tickets" / "done" / "T-9899.md"
 
-    def _commit_all(self, message: str) -> None:
-        _run_git(["add", "-A"], self.root)
-        _run_git(["commit", "-q", "-m", message], self.root)
+        def concurrent_drop_lands(no_push: bool) -> None:
+            text = done.read_text(encoding="utf-8")
+            done.write_text(text.replace("state: done\n", "state: done\nsubstate: dropped\n", 1),
+                            encoding="utf-8")
 
-    def _rename_git(self, old_rel: str, new_rel: str) -> None:
-        old_path = self.root / old_rel
-        new_path = self.root / new_rel
-        new_path.parent.mkdir(parents=True, exist_ok=True)
-        _run_git(["mv", old_rel, new_rel], self.root)
-        self.assertFalse(old_path.exists())
-        self.assertTrue(new_path.exists())
+        with patch.object(ticket, "_pull_if_needed", side_effect=concurrent_drop_lands) as pull:
+            with self.assertRaises(ticket.TicketError) as ctx:
+                ticket.cmd_cascade(self._cascade_args("T-9899"))
 
-    def _name_status_since(self, before_sha: str) -> str:
-        res = _run_git(
-            ["log", "--diff-filter=R", "--name-status", "--format=", f"{before_sha}..HEAD"],
-            self.root,
-        )
-        return res.stdout
+        pull.assert_called_once()  # the pre-lock guard passed: it really was shipped when checked
+        self.assertIn("dropped", str(ctx.exception))
+        self.assertEqual(dep.read_text(encoding="utf-8"), before)
+        self.assertEqual(self._commit_count(), 0)
 
-    def test_identifies_inbox_and_active_resolves_skips_others(self) -> None:
-        (self.root / "tickets" / "inbox").mkdir(parents=True)
-        (self.root / "tickets" / "active").mkdir(parents=True)
-        (self.root / "tickets" / "T-A.md").parent.mkdir(parents=True, exist_ok=True)
-        (self.root / "tickets" / "inbox" / "T-9401.md").write_text("A\n", encoding="utf-8")
-        (self.root / "tickets" / "active" / "T-9402.md").write_text("B\n", encoding="utf-8")
-        (self.root / "tickets" / "inbox" / "T-9403.md").write_text("C\n", encoding="utf-8")
-        (self.root / "notes.txt").write_text("unrelated\n", encoding="utf-8")
-        self._commit_all("seed tickets")
-        before = _run_git(["rev-parse", "HEAD"], self.root).stdout.strip()
+    def test_shipped_parent_still_cascades(self) -> None:
+        # The guard must not over-refuse: a done/ ticket with no substate is shipped.
+        _write_ticket(self.root / "tickets" / "done" / "T-9799.md", tid="T-9799", state="done")
+        _write_ticket(self.root / "tickets" / "inbox" / "T-9801.md", tid="T-9801", state="inbox",
+                      depends_on=["T-9799"])
+        self.assertEqual(ticket.cmd_cascade(self._cascade_args("T-9799")), 0)
+        self.assertEqual(self._commit_count(), 1)
 
-        # Simulate a squash-merge landing several ops in one commit:
-        #   inbox -> done   (should be captured)
-        #   active -> done  (should be captured)
-        #   inbox -> active (a claim — must be skipped, not a resolve)
-        #   an unrelated file rename (must be skipped)
-        self._rename_git("tickets/inbox/T-9401.md", "tickets/done/T-9401.md")
-        self._rename_git("tickets/active/T-9402.md", "tickets/done/T-9402.md")
-        self._rename_git("tickets/inbox/T-9403.md", "tickets/active/T-9403.md")
-        self._rename_git("notes.txt", "renamed-notes.txt")
-        self._commit_all("squash-merge: resolve T-9401, T-9402; claim T-9403")
-
-        name_status = self._name_status_since(before)
-        tids = cascade_diff_scan.extract_resolved_tids(name_status)
-
-        self.assertEqual(sorted(tids), ["T-9401", "T-9402"])
-
-    def test_empty_input_no_tids(self) -> None:
-        self.assertEqual(cascade_diff_scan.extract_resolved_tids(""), [])
-
-
-class TestRunCascadeForTids(unittest.TestCase):
-    """Acceptance 6: a single push containing a mixed inbox->done /
-    active->done batch invokes `ticket.py cascade --tid <tid>` for every
-    tid found, in order. Mocks subprocess.run for the invocation step
-    itself — a real end-to-end `ticket.py cascade` run is structurally
-    refused by `_assert_cli_checkout_allowed` from this `agent/*`-branch
-    worktree, and TestCmdCascade* above already covers cascade's real
-    logic; this only needs to verify the glue's invocation shape/order."""
-
-    def test_invokes_cascade_for_every_tid_in_order(self) -> None:
-        calls: list[list[str]] = []
-
-        def fake_run(argv, **kwargs):
-            calls.append(argv)
-            return MagicMock(returncode=0)
-
-        with patch("tools.cascade_diff_scan.subprocess.run", side_effect=fake_run):
-            results = cascade_diff_scan.run_cascade_for_tids(
-                ["T-9501", "T-9502", "T-9503"], repo_root=Path("/fake/repo")
-            )
-
-        self.assertEqual(results, [("T-9501", 0), ("T-9502", 0), ("T-9503", 0)])
-        self.assertEqual(len(calls), 3)
-        for expected_tid, argv in zip(["T-9501", "T-9502", "T-9503"], calls):
-            self.assertEqual(argv[-2:], ["--tid", expected_tid])
-            self.assertEqual(argv[-3], "cascade")
-            self.assertTrue(argv[-4].endswith("ticket.py"))
-
-    def test_one_failure_does_not_block_the_rest(self) -> None:
-        def fake_run(argv, **kwargs):
-            tid = argv[-1]
-            return MagicMock(returncode=1 if tid == "T-9602" else 0)
-
-        with patch("tools.cascade_diff_scan.subprocess.run", side_effect=fake_run):
-            results = cascade_diff_scan.run_cascade_for_tids(
-                ["T-9601", "T-9602", "T-9603"], repo_root=Path("/fake/repo")
-            )
-
-        self.assertEqual(results, [("T-9601", 0), ("T-9602", 1), ("T-9603", 0)])
-
-
-class TestCascadeDiffScanMain(unittest.TestCase):
-    """CLI entry-point exit-code contract, mirrors adr_scoping_lint's
-    TestMain shape."""
-
-    def test_main_returns_zero_when_no_tids_found(self) -> None:
-        import io
-
-        with patch("sys.stdin", io.StringIO("")):
-            rc = cascade_diff_scan.main()
-        self.assertEqual(rc, 0)
-
-    def test_main_returns_zero_when_all_cascades_succeed(self) -> None:
-        import io
-
-        def fake_run(argv, **kwargs):
-            return MagicMock(returncode=0)
-
-        text = "R094\ttickets/inbox/T-9701.md\ttickets/done/T-9701.md\n"
-        with patch("sys.stdin", io.StringIO(text)), \
-                patch("tools.cascade_diff_scan.subprocess.run", side_effect=fake_run):
-            rc = cascade_diff_scan.main()
-        self.assertEqual(rc, 0)
-
-    def test_main_returns_one_when_any_cascade_fails(self) -> None:
-        import io
-
-        def fake_run(argv, **kwargs):
-            return MagicMock(returncode=1)
-
-        text = "R094\ttickets/inbox/T-9702.md\ttickets/done/T-9702.md\n"
-        with patch("sys.stdin", io.StringIO(text)), \
-                patch("tools.cascade_diff_scan.subprocess.run", side_effect=fake_run):
-            rc = cascade_diff_scan.main()
-        self.assertEqual(rc, 1)
-
-
-class TestWorkflowNoSelfRetrigger(unittest.TestCase):
-    """Acceptance 7: the cascade subcommand's OWN commit only edits
-    depends_on frontmatter in place (no `git mv`) — a real git repo proves
-    that produces zero rename ops, so the workflow's own commit can never
-    feed itself a resolved tid (no infinite loop)."""
-
-    def test_frontmatter_only_commit_yields_zero_rename_ops(self) -> None:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        root = Path(tmp.name)
-        _init_repo(root)
-
-        (root / "tickets" / "inbox").mkdir(parents=True)
-        ticket_path = root / "tickets" / "inbox" / "T-9801.md"
-        ticket_path.write_text("depends_on: [T-9800]\n", encoding="utf-8")
-        _run_git(["add", "-A"], root)
-        _run_git(["commit", "-q", "-m", "seed"], root)
-        before = _run_git(["rev-parse", "HEAD"], root).stdout.strip()
-
-        # Cascade's own commit: content edit, no rename.
-        ticket_path.write_text("depends_on: []\n", encoding="utf-8")
-        _run_git(["add", "-A"], root)
-        _run_git(
-            ["commit", "-q", "-m", "cascade: T-9800 → 1 dependant updated"], root
-        )
-
-        res = _run_git(
-            ["log", "--diff-filter=R", "--name-status", "--format=", f"{before}..HEAD"],
-            root,
-        )
-        tids = cascade_diff_scan.extract_resolved_tids(res.stdout)
-        self.assertEqual(tids, [])
+    def test_drop_verb_never_runs_the_cascade_callback(self) -> None:
+        """The other half of the ruling: is a DROP already cascading? No -- and this pins it.
+        `cmd_drop` calls `_do_transition` without a `cascade_callback`, so dropping a ticket
+        never strips its dependants (resolve / close-noodle / close-action are the only
+        callers that pass one, and none of them can produce `substate: dropped`)."""
+        _write_ticket(self.root / "tickets" / "active" / "T-9899.md", tid="T-9899", state="active")
+        _write_ticket(self.root / "tickets" / "inbox" / "T-9901.md", tid="T-9901", state="inbox",
+                      depends_on=["T-9899"])
+        args = argparse.Namespace(ticket="T-9899", dropped_reason="not worth it", no_push=True)
+        with patch.object(ticket, "_do_transition", return_value=0) as transition:
+            self.assertEqual(ticket.cmd_drop(args), 0)
+        self.assertIsNone(transition.call_args.kwargs.get("cascade_callback"))
+        self.assertEqual(transition.call_args.kwargs["field_updates"]["substate"], "dropped")
 
 
 if __name__ == "__main__":

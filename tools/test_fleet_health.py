@@ -184,25 +184,25 @@ class RenderWithFailedUnits(unittest.TestCase):
 
 
 class ControlPlaneProbe(unittest.TestCase):
-    """T-2685: control-plane seats (specialist — T-2633 cutover) must be probed
-    via the persistently-active consume TIMER, not the disabled bespoke unit
-    and not the oneshot consume SERVICE (never is-active after it exits).
-    Recovery is NOT control-plane pre-T-3026 (T-2684 reverted T-3082, 2026-08-23)
-    -- T-2590 covers only the consume plane; the interactive session still
-    lives on the bespoke claude-telegram-fallback.service, so fleet_health
-    must probe THAT unit or it reports the consume timer as healthy while
-    the actual session is dead. T-3026 (interactive-session cutover) flips
-    recovery back onto the consume-timer probe once it lands. Orchestrator is likewise
-    NOT control-plane pre-T-2953 (T-2953 R31 reverted T-3098, 2026-08-23) --
-    the identical shape, one arc over."""
+    """T-2685: control-plane seats (specialist — T-2633 cutover; recovery — T-3026
+    cutover, 2026-09-29) must be probed via the persistently-active consume
+    TIMER, not the disabled bespoke unit and not the oneshot consume SERVICE
+    (never is-active after it exits). Recovery was NOT control-plane pre-T-3026
+    (T-2684 reverted T-3082, 2026-08-23: the consume plane alone had moved,
+    the interactive session still lived on the bespoke claude-telegram-
+    fallback.service, so a timer probe would have reported healthy while the
+    actual session was dead). T-3026 moved the interactive session onto the
+    control plane, so recovery is on the consume-timer probe, exactly as specialist.
+    T-2953 (2026-10-24): orchestrator cut over to the control plane; mirrors recovery
+    (T-3026), so orchestrator is on the consume-timer probe too."""
 
-    def test_orchestrator_fleet_health_uses_bespoke_service_pre_cutover(self):
+    def test_orchestrator_fleet_health_uses_consume_timer_post_t2953(self):
         self.assertEqual(fh.FLEET["orchestrator"]["services"],
-                         ["claude-telegram.service"])
+                         ["pantheon-persona-consume@orchestrator.timer"])
 
     def test_control_plane_services_derive_from_consume_timer(self):
         self.assertEqual(fh.FLEET["recovery"]["services"],
-                         ["claude-telegram-fallback.service"])
+                         ["pantheon-persona-consume@recovery.timer"])
         self.assertEqual(fh.FLEET["specialist"]["services"],
                          ["pantheon-persona-consume@specialist.timer"])
 
@@ -216,7 +216,7 @@ class ControlPlaneProbe(unittest.TestCase):
         r = fh.check_agent("recovery", fh.FLEET["recovery"], run=_runner(svc="inactive"))
         self.assertEqual(r["status"], fh.FAIL)
         svc = [c for c in r["checks"] if c["name"].startswith("svc:")][0]
-        self.assertIn("claude-telegram-fallback.service", svc["name"])
+        self.assertIn("pantheon-persona-consume@recovery.timer", svc["name"])
 
     def test_codex_stays_bespoke(self):
         self.assertEqual(fh.FLEET["codex"]["services"],
@@ -224,7 +224,7 @@ class ControlPlaneProbe(unittest.TestCase):
 
 
 class SubOrchSeats(unittest.TestCase):
-    """T-2690: metis (suborch1) + atlas (suborch2) are consume control-plane
+    """T-2690: mason (suborch1) + artisan (suborch2) are consume control-plane
     seats (T-2677) but their instance.yaml `roles:` binding does NOT yet carry
     `supervisor: control-plane` (a manifest gap, distinct from T-2691 —
     flagged separately), so `_liveness_services` cannot auto-derive their
@@ -235,42 +235,42 @@ class SubOrchSeats(unittest.TestCase):
     Mailbox-first, NO telegram channel (T-2677): no telegram-poller or
     mailbox-wake unit belongs in either seat's services."""
 
-    def test_metis_services_is_explicit_consume_timer(self):
-        self.assertEqual(fh.FLEET["metis"]["services"],
-                         ["pantheon-persona-consume@metis.timer"])
+    def test_mason_services_is_explicit_consume_timer(self):
+        self.assertEqual(fh.FLEET["mason"]["services"],
+                         ["pantheon-persona-consume@mason.timer"])
 
-    def test_atlas_services_is_explicit_consume_timer(self):
-        self.assertEqual(fh.FLEET["atlas"]["services"],
-                         ["pantheon-persona-consume@atlas.timer"])
+    def test_artisan_services_is_explicit_consume_timer(self):
+        self.assertEqual(fh.FLEET["artisan"]["services"],
+                         ["pantheon-persona-consume@artisan.timer"])
 
-    def test_metis_and_atlas_carry_no_telegram_or_mailbox_wake_unit(self):
-        for persona in ("metis", "atlas"):
+    def test_mason_and_artisan_carry_no_telegram_or_mailbox_wake_unit(self):
+        for persona in ("mason", "artisan"):
             for svc in fh.FLEET[persona]["services"]:
                 self.assertNotIn("telegram", svc)
                 self.assertNotIn("mailbox-wake", svc)
 
-    def test_metis_and_atlas_user_and_session(self):
-        self.assertEqual(fh.FLEET["metis"]["user"], "suborch1")
-        self.assertEqual(fh.FLEET["metis"]["session"], "suborch1-main")
-        self.assertEqual(fh.FLEET["atlas"]["user"], "suborch2")
-        self.assertEqual(fh.FLEET["atlas"]["session"], "suborch2-main")
+    def test_mason_and_artisan_user_and_session(self):
+        self.assertEqual(fh.FLEET["mason"]["user"], "suborch1")
+        self.assertEqual(fh.FLEET["mason"]["session"], "suborch1-main")
+        self.assertEqual(fh.FLEET["artisan"]["user"], "suborch2")
+        self.assertEqual(fh.FLEET["artisan"]["session"], "suborch2-main")
 
-    def test_metis_healthy_when_timer_active(self):
-        r = fh.check_agent("metis", fh.FLEET["metis"], run=_runner())
+    def test_mason_healthy_when_timer_active(self):
+        r = fh.check_agent("mason", fh.FLEET["mason"], run=_runner())
         self.assertEqual(r["status"], fh.OK)
 
-    def test_atlas_healthy_when_timer_active(self):
-        r = fh.check_agent("atlas", fh.FLEET["atlas"], run=_runner())
+    def test_artisan_healthy_when_timer_active(self):
+        r = fh.check_agent("artisan", fh.FLEET["artisan"], run=_runner())
         self.assertEqual(r["status"], fh.OK)
 
-    def test_metis_fail_when_timer_inactive(self):
-        r = fh.check_agent("metis", fh.FLEET["metis"], run=_runner(svc="inactive"))
+    def test_mason_fail_when_timer_inactive(self):
+        r = fh.check_agent("mason", fh.FLEET["mason"], run=_runner(svc="inactive"))
         self.assertEqual(r["status"], fh.FAIL)
         svc = [c for c in r["checks"] if c["name"].startswith("svc:")][0]
-        self.assertIn("pantheon-persona-consume@metis.timer", svc["name"])
+        self.assertIn("pantheon-persona-consume@mason.timer", svc["name"])
 
     def test_no_bwrap_check_for_suborch_seats(self):
-        for persona in ("metis", "atlas"):
+        for persona in ("mason", "artisan"):
             r = fh.check_agent(persona, fh.FLEET[persona], run=_runner())
             self.assertFalse(any(c["name"] == "bwrap-userns" for c in r["checks"]))
 
@@ -281,7 +281,7 @@ class PausedSeat(unittest.TestCase):
     discriminator (disabled -> paused, NOT is-active/inactive)."""
 
     def test_disabled_service_reads_paused_not_fail(self):
-        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"],
+        r = fh.check_agent("archivist", fh.FLEET["archivist"],
                            run=_runner(enabled="disabled"))
         self.assertEqual(r["status"], fh.PAUSED)
         self.assertFalse(any(c["status"] == fh.FAIL for c in r["checks"]))
@@ -290,19 +290,19 @@ class PausedSeat(unittest.TestCase):
     def test_paused_short_circuits_before_normal_checks(self):
         # Even though svc/session would read FAIL if judged normally, the
         # disabled short-circuit means they're never probed at all — one check.
-        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"],
+        r = fh.check_agent("archivist", fh.FLEET["archivist"],
                            run=_runner(enabled="disabled", svc="inactive", session="no"))
         self.assertEqual(r["status"], fh.PAUSED)
         self.assertEqual(len(r["checks"]), 1)
 
     def test_masked_service_also_reads_paused(self):
-        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"],
+        r = fh.check_agent("archivist", fh.FLEET["archivist"],
                            run=_runner(enabled="masked"))
         self.assertEqual(r["status"], fh.PAUSED)
 
     def test_enabled_but_inactive_service_still_fails(self):
         # Crash != pause: an enabled unit that's merely not active is a real FAIL.
-        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"],
+        r = fh.check_agent("archivist", fh.FLEET["archivist"],
                            run=_runner(enabled="enabled", svc="inactive"))
         self.assertEqual(r["status"], fh.FAIL)
 
@@ -316,19 +316,21 @@ class PausedSeat(unittest.TestCase):
         # ran=False means EVERY probe (including is-enabled) is unqueryable ->
         # _is_paused returns None -> falls through to the normal (WARN) path,
         # never silently reads PAUSED for a seat we simply couldn't ask.
-        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"], run=_runner(ran=False))
+        r = fh.check_agent("archivist", fh.FLEET["archivist"], run=_runner(ran=False))
         self.assertEqual(r["status"], fh.WARN)
 
 
-class MnemosyneFleetEntry(unittest.TestCase):
-    def test_mnemosyne_user_session_services(self):
-        self.assertEqual(fh.FLEET["mnemosyne"]["user"], "exocortex")
-        self.assertEqual(fh.FLEET["mnemosyne"]["session"], "claude-telegram-bot-exocortex")
-        self.assertEqual(fh.FLEET["mnemosyne"]["services"],
-                         ["claude-telegram-exocortex.service"])
+class ArchivistFleetEntry(unittest.TestCase):
+    def test_archivist_user_session_services(self):
+        self.assertEqual(fh.FLEET["archivist"]["user"], "exocortex")
+        self.assertEqual(fh.FLEET["archivist"]["session"], "claude-telegram-bot-exocortex")
+        # T-5063: cut over to the control plane (2026-10-18), so the unit fleet_health
+        # checks is the consume timer, as for specialist and recovery.
+        self.assertEqual(fh.FLEET["archivist"]["services"],
+                         ["pantheon-persona-consume@archivist.timer"])
 
-    def test_mnemosyne_healthy_when_enabled_and_active(self):
-        r = fh.check_agent("mnemosyne", fh.FLEET["mnemosyne"], run=_runner())
+    def test_archivist_healthy_when_enabled_and_active(self):
+        r = fh.check_agent("archivist", fh.FLEET["archivist"], run=_runner())
         self.assertEqual(r["status"], fh.OK)
 
 
@@ -336,23 +338,23 @@ class RenderAndExitCodeWithPaused(unittest.TestCase):
     def test_render_paused_does_not_degrade_fleet(self):
         results = [
             {"agent": "recovery", "status": fh.OK, "checks": []},
-            {"agent": "mnemosyne", "status": fh.PAUSED,
+            {"agent": "archivist", "status": fh.PAUSED,
              "checks": [{"name": "paused:x", "status": fh.PAUSED, "detail": "x disabled"}]},
         ]
         out = fh.render(results)
         self.assertNotIn("DEGRADED", out)
         self.assertIn("paused", out)
-        self.assertIn("mnemosyne", out)
+        self.assertIn("archivist", out)
 
     def test_render_paused_alongside_warn_does_not_degrade(self):
         results = [
             {"agent": "orchestrator", "status": fh.WARN, "checks": []},
-            {"agent": "mnemosyne", "status": fh.PAUSED, "checks": []},
+            {"agent": "archivist", "status": fh.PAUSED, "checks": []},
         ]
         out = fh.render(results)
         self.assertNotIn("DEGRADED", out)
         self.assertIn("healthy with warnings", out)
-        self.assertIn("mnemosyne", out)
+        self.assertIn("archivist", out)
         self.assertIn("paused", out)
 
     def test_main_exit_0_when_only_non_ok_is_paused(self):
@@ -360,7 +362,7 @@ class RenderAndExitCodeWithPaused(unittest.TestCase):
             fh, "sweep",
             return_value=[
                 {"agent": "recovery", "status": fh.OK, "checks": []},
-                {"agent": "mnemosyne", "status": fh.PAUSED, "checks": []},
+                {"agent": "archivist", "status": fh.PAUSED, "checks": []},
             ],
         ), mock.patch.object(
             fh, "failed_units_sweep",
@@ -469,6 +471,13 @@ class PolicySkipVisibility(unittest.TestCase):
         self.assertIn("unexpected", row["detail"])
         self.assertEqual(r["status"], fh.WARN)  # folds into the agent's overall status
 
+    def test_live_manifest_has_no_standing_skip_marker_for_consume_seats(self):
+        # T-5311: live-pane drift no longer blocks, so a persisted
+        # runtime_viability_blocked streak on a consume seat is a real WARN.
+        for persona in ("specialist", "recovery", "mason", "artisan", "archivist"):
+            with self.subTest(persona=persona):
+                self.assertNotIn("expected_policy_skip", fh._instance_binding(persona))
+
     def test_manifest_match_is_ok_expected(self):
         with mock.patch.object(
             fh, "_instance_binding",
@@ -482,6 +491,69 @@ class PolicySkipVisibility(unittest.TestCase):
         # an OK-status row must not itself push the agent's overall status
         # (all other checks OK) above OK.
         self.assertEqual(r["status"], fh.OK)
+
+    def test_prior_receiver_block_is_not_masked_by_expected_viability_block(self):
+        # T-4179: specialist expects runtime_viability_blocked; a prior-receiver
+        # refusal persists its own token (prior_receiver_blocked) -> WARN.
+        with mock.patch.object(
+            fh, "_instance_binding",
+            return_value={"expected_policy_skip": "runtime_viability_blocked"},
+        ):
+            r = fh.check_agent(
+                "specialist", fh.FLEET["specialist"],
+                run=_runner(policy_skip=self._skip_json(reason="prior_receiver_blocked")),
+            )
+        row = next(c for c in r["checks"] if c["name"] == "consume:policy-skip")
+        self.assertEqual(row["status"], fh.WARN)
+        self.assertIn("prior_receiver_blocked", row["detail"])
+        self.assertIn("unexpected (manifest expects runtime_viability_blocked)", row["detail"])
+
+    def _row(self, reason, *, manifest=None):
+        with mock.patch.object(fh, "_instance_binding", return_value=manifest or {}):
+            r = fh.check_agent(
+                "specialist", fh.FLEET["specialist"],
+                run=_runner(policy_skip=self._skip_json(reason=reason)),
+            )
+        return r, next(c for c in r["checks"] if c["name"] == "consume:policy-skip")
+
+    def test_seat_maintenance_is_ok_while_window_active_T5285(self):
+        with mock.patch("tools.notify_policy.in_maintenance", return_value=True):
+            r, row = self._row("seat_maintenance", manifest={"expected_policy_skip": "backoff"})
+        self.assertEqual(row["status"], fh.OK)
+        self.assertIn("expected (seat maintenance window)", row["detail"])
+        self.assertEqual(r["status"], fh.OK)
+
+    def test_seat_maintenance_stale_streak_after_window_is_warn_T5285(self):
+        with mock.patch("tools.notify_policy.in_maintenance", return_value=False):
+            _, row = self._row("seat_maintenance")
+        self.assertEqual(row["status"], fh.WARN)
+        self.assertIn("unexpected", row["detail"])
+
+    def test_seat_maintenance_unreadable_registry_is_warn_T5285(self):
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            # a directory where the registry file should be: read_text raises OSError
+            with mock.patch.dict(os.environ, {"PANTHEON_MAINTENANCE_REGISTRY": tmp}):
+                _, row = self._row("seat_maintenance")
+        self.assertEqual(row["status"], fh.WARN)
+
+    def test_seat_maintenance_check_raising_is_warn_T5285(self):
+        with mock.patch("tools.notify_policy.in_maintenance", side_effect=RuntimeError("boom")):
+            _, row = self._row("seat_maintenance")
+        self.assertEqual(row["status"], fh.WARN)
+
+    def test_all_runtimes_held_is_ok_expected_T5285(self):
+        r, row = self._row("all_runtimes_held")
+        self.assertEqual(row["status"], fh.OK)
+        self.assertIn("expected (all runtimes held)", row["detail"])
+        self.assertEqual(r["status"], fh.OK)
+
+    def test_other_reasons_unchanged_T5285(self):
+        for reason in ("backoff", "runtime_viability_blocked", "relaunch_window_exhausted"):
+            with self.subTest(reason=reason):
+                _, row = self._row(reason)
+                self.assertEqual(row["status"], fh.WARN)
+                self.assertTrue(row["detail"].endswith("unexpected"))
 
     def test_manifest_mismatch_names_the_expected_reason(self):
         with mock.patch.object(
@@ -497,7 +569,7 @@ class PolicySkipVisibility(unittest.TestCase):
 
     def test_paused_seat_short_circuits_before_policy_skip_check(self):
         r = fh.check_agent(
-            "mnemosyne", fh.FLEET["mnemosyne"],
+            "archivist", fh.FLEET["archivist"],
             run=_runner(enabled="disabled", policy_skip=self._skip_json()),
         )
         self.assertEqual(r["status"], fh.PAUSED)
@@ -516,6 +588,105 @@ class PolicySkipVisibility(unittest.TestCase):
         out = fh.render(results)
         self.assertIn("consume:policy-skip", out)
         self.assertIn("expected (manifest expected_policy_skip)", out)
+
+
+def _seat(**kw):
+    from tools.seat_state_testkit import eff
+    return mock.patch("tools.seat_state.safe_effective_for", return_value=eff(**kw))
+
+
+class SeatStateT5527(unittest.TestCase):
+    """ORG-106 L4b (T-5527): a sleeping seat is ASLEEP not FAIL; a broken sleep is a FAIL."""
+
+    def _agent(self, seat, **run_kw):
+        with seat:
+            return fh.check_agent("specialist", fh.FLEET["specialist"], run=_runner(**run_kw))
+
+    def test_asleep_and_down_is_asleep_not_fail(self):
+        r = self._agent(_seat(state="deep-sleep", asleep=True), svc="inactive", session="no")
+        self.assertEqual(r["status"], fh.ASLEEP)
+        self.assertEqual([c["name"] for c in r["checks"]], ["seat-state"])
+        self.assertIn("asleep", r["checks"][0]["detail"])
+        self.assertIn("operator", r["checks"][0]["detail"])
+
+    def test_asleep_with_live_session_is_sleep_breach_fail(self):
+        for run_kw in ({"svc": "active", "session": "no"}, {"svc": "inactive", "session": "yes"}):
+            r = self._agent(_seat(state="deep-sleep", asleep=True), **run_kw)
+            self.assertEqual(r["status"], fh.FAIL, run_kw)
+            self.assertTrue(any(c["name"] == "sleep_breach" and c["status"] == fh.FAIL
+                                for c in r["checks"]), run_kw)
+
+    def test_sleep_breach_is_not_hidden_by_oom_hold_or_maintenance(self):
+        r = self._agent(_seat(state="deep-sleep", asleep=True, oom=True, maintenance=True))
+        self.assertEqual(r["status"], fh.FAIL)
+        self.assertTrue(any(c["name"] == "sleep_breach" for c in r["checks"]))
+
+    def test_sleep_breach_beats_deliberately_paused_unit(self):
+        r = self._agent(_seat(state="deep-sleep", asleep=True), enabled="disabled", session="yes")
+        self.assertEqual(r["status"], fh.FAIL)
+
+    def test_oom_hold_with_live_session_alone_is_not_a_breach(self):
+        r = self._agent(_seat(oom=True))
+        self.assertEqual(r["status"], fh.OK)
+        self.assertFalse(any(c["name"] == "sleep_breach" for c in r["checks"]))
+
+    def test_draining_is_judged_normally_with_annotation(self):
+        r = self._agent(_seat(state="deep-sleep", asleep=False))
+        self.assertEqual(r["status"], fh.OK)
+        note = next(c for c in r["checks"] if c["name"] == "seat-state")
+        self.assertIn("draining", note["detail"])
+
+    def test_paused_intake_is_judged_normally_with_paused_annotation(self):
+        r = self._agent(_seat(state="paused-intake", expires="2026-10-27T00:00:00Z"))
+        self.assertEqual(r["status"], fh.OK)
+        note = next(c for c in r["checks"] if c["name"] == "seat-state")
+        self.assertIn("paused", note["detail"])
+        self.assertIn("2026-10-27T00:00:00Z", note["detail"])
+        down = self._agent(_seat(state="paused-intake"), svc="inactive")
+        self.assertEqual(down["status"], fh.FAIL)   # a paused seat that is down is still down
+
+    def test_unknown_reader_result_is_normal(self):
+        with mock.patch("tools.seat_state.safe_effective_for", return_value=None):
+            r = fh.check_agent("specialist", fh.FLEET["specialist"], run=_runner())
+        self.assertEqual(r["status"], fh.OK)
+        self.assertFalse(any(c["name"] == "seat-state" for c in r["checks"]))
+
+    def test_render_and_summary_show_asleep_and_paused_without_degrading(self):
+        results = [
+            {"agent": "specialist", "status": fh.ASLEEP, "checks": [
+                {"name": "seat-state", "status": fh.OK, "detail": "asleep (deep-sleep)"}]},
+            {"agent": "recovery", "status": fh.OK, "checks": [
+                {"name": "seat-state", "status": fh.OK, "detail": "paused (operator)"}]},
+        ]
+        out = fh.render(results)
+        self.assertIn("ASLEEP", out)
+        self.assertIn("seat-state: paused (operator)", out)
+        self.assertIn("FLEET: all healthy", out)
+        self.assertIn("specialist asleep", out)
+        self.assertNotIn("DEGRADED", out)
+
+    def test_main_exit_zero_for_asleep(self):
+        with mock.patch.object(fh, "sweep", return_value=[
+                {"agent": "specialist", "status": fh.ASLEEP, "checks": []}]):
+            self.assertEqual(fh.main(["--no-failed-sweep"]), 0)
+
+    def _skip_row(self, reason, seat):
+        import json as _json
+        raw = _json.dumps({"reason": reason, "count": 40, "since": "2026-10-20T00:00:00Z"})
+        with seat, mock.patch.object(fh, "_instance_binding", return_value={}):
+            r = fh.check_agent("specialist", fh.FLEET["specialist"], run=_runner(policy_skip=raw))
+        return r, next(c for c in r["checks"] if c["name"] == "consume:policy-skip")
+
+    def test_seat_paused_and_seat_sleep_skips_are_expected_only_while_state_holds(self):
+        _, row = self._skip_row("seat_paused", _seat(state="paused-intake"))
+        self.assertEqual(row["status"], fh.OK)
+        self.assertIn("seat paused", row["detail"])
+        _, row = self._skip_row("seat_sleep", _seat(state="deep-sleep", asleep=False))
+        self.assertEqual(row["status"], fh.OK)
+        _, row = self._skip_row("seat_paused", _seat())
+        self.assertEqual(row["status"], fh.WARN)
+        _, row = self._skip_row("seat_sleep", _seat(state="paused-intake"))
+        self.assertEqual(row["status"], fh.WARN)
 
 
 if __name__ == "__main__":

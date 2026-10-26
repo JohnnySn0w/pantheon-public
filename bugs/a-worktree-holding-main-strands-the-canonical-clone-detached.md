@@ -9,7 +9,7 @@ domain: "git, worktree, detached-head, fleet-sweeps, measurement-integrity, stal
 **Class:** measurement integrity via the filesystem. Not a git bug — the documented behaviour of
 `git worktree`, in a layout that makes a canonical path silently non-canonical.
 
-**Found:** 2026-07-29 (recovery measured it on the atlas seat; atlas caused it and fixed it, T-2340).
+**Found:** 2026-07-29 (recovery measured it on the artisan seat; artisan caused it and fixed it, T-2340).
 
 ## The trap, and why it is self-inflicted by a reasonable fix
 
@@ -20,8 +20,8 @@ Giving the orchestrator a side worktree pinned to `main` fixes that — and crea
 ```
 ~/pantheon-config     DETACHED HEAD, 165 commits behind, clean
                       git pull     -> "You are not currently on a branch"
-                      git checkout main -> "'main' is already used by worktree at ~/wt-atlas-main"
-~/wt-atlas-main       on main, clean, pullable — the REAL tree
+                      git checkout main -> "'main' is already used by worktree at ~/wt-artisan-main"
+~/wt-artisan-main       on main, clean, pullable — the REAL tree
 ```
 
 A worktree holding `main` means the primary clone **cannot check out `main`**, so it sits detached;

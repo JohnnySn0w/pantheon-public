@@ -301,5 +301,119 @@ class TestClearCooldown(unittest.TestCase):
         self.assertFalse(had_cooldown)
 
 
+class TestSeatStateHelpers(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_schema_constant(self):
+        self.assertEqual(hs.SCHEMA_SEAT_STATE, "pantheon-seat-state/v1")
+
+    def test_path_is_sibling_of_holds(self):
+        p = hs.seat_state_path("specialist", root=self.root)
+        self.assertEqual(p, self.root / "personas" / "specialist" / "overrides" / "seat-state.json")
+        self.assertEqual(p.parent, hs.holds_path("specialist", root=self.root).parent)
+
+    def test_path_rejects_bad_persona(self):
+        with self.assertRaises(hs.HarnessStateError):
+            hs.seat_state_path("../x", root=self.root)
+
+    def test_load_missing_is_none(self):
+        self.assertIsNone(hs.load_seat_state("specialist", root=self.root))
+
+    def test_load_roundtrip_and_corrupt(self):
+        p = hs.seat_state_path("specialist", root=self.root)
+        p.parent.mkdir(parents=True)
+        p.write_text(json.dumps({"state": "paused-intake"}))
+        self.assertEqual(hs.load_seat_state("specialist", root=self.root), {"state": "paused-intake"})
+        p.write_text("{nope")
+        with self.assertRaises(hs.HarnessStateError):
+            hs.load_seat_state("specialist", root=self.root)
+
+
+class TestSeatStateWriters(unittest.TestCase):
+    """ORG-106 L1 (T-5524): write / clear / tombstone helpers."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _doc(self, **over):
+        doc = {
+            "schema": hs.SCHEMA_SEAT_STATE, "persona": "specialist", "state": "paused-intake",
+            "phase": "set", "phase_ts": "2026-10-26T07:00:00Z", "set_ts": "2026-10-26T07:00:00Z",
+            "set_by": "operator:orchestrator", "owner": "operator", "reason": "r", "ticket": None,
+            "expires": "2026-10-26T11:00:00Z", "indefinite": False,
+            "telegram_dark_ack": False, "pre_expiry_notified": False, "ledger_entry": "x",
+        }
+        doc.update(over)
+        return doc
+
+    def test_write_roundtrip_mode_0600(self):
+        hs.write_seat_state("specialist", self._doc(), root=self.root)
+        self.assertEqual(hs.load_seat_state("specialist", root=self.root)["reason"], "r")
+        mode = hs.seat_state_path("specialist", root=self.root).stat().st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_invalid_record_refused_and_not_written(self):
+        with self.assertRaises(hs.HarnessStateError):
+            hs.write_seat_state("specialist", self._doc(reason=""), root=self.root)
+        self.assertFalse(hs.seat_state_path("specialist", root=self.root).exists())
+
+    def test_clear_reports_existence(self):
+        self.assertFalse(hs.clear_seat_state("specialist", root=self.root))
+        hs.write_seat_state("specialist", self._doc(), root=self.root)
+        self.assertTrue(hs.clear_seat_state("specialist", root=self.root))
+        self.assertIsNone(hs.load_seat_state("specialist", root=self.root))
+
+    def test_tombstones_append_lines_mode_0600(self):
+        hs.append_seat_tombstone("specialist", {"a": 1}, root=self.root)
+        hs.append_seat_tombstone("specialist", {"a": 2}, root=self.root)
+        path = hs.seat_state_tombstones_path("specialist", root=self.root)
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        self.assertEqual(rows, [{"a": 1}, {"a": 2}])
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent, hs.seat_state_path("specialist", root=self.root).parent)
+
+
+class TestSeatStateLock(unittest.TestCase):
+    """ORG-106 L5 (T-5529): the shared per-seat lock."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def test_nonblocking_busy_raises_immediately(self):
+        with hs.seat_state_lock("specialist", root=self.root):
+            with self.assertRaises(hs.SeatStateBusy):
+                with hs.seat_state_lock("specialist", root=self.root, blocking=False):
+                    pass
+
+    def test_blocking_times_out(self):
+        with hs.seat_state_lock("specialist", root=self.root):
+            with self.assertRaises(hs.SeatStateBusy):
+                with hs.seat_state_lock("specialist", root=self.root, timeout_s=0.2):
+                    pass
+
+    def test_released_after_exit_and_mode_0600(self):
+        with hs.seat_state_lock("specialist", root=self.root):
+            pass
+        with hs.seat_state_lock("specialist", root=self.root, blocking=False):
+            pass
+        self.assertEqual(hs.seat_state_lock_path("specialist", root=self.root).stat().st_mode & 0o777, 0o600)
+
+    def test_other_seat_not_blocked(self):
+        with hs.seat_state_lock("specialist", root=self.root):
+            with hs.seat_state_lock("recovery", root=self.root, blocking=False):
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()

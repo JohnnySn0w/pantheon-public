@@ -18,8 +18,13 @@ Per fire (single-shot, no subcommands):
    `tools/watch_runner.py`: HERMES guard → `git pull --ff-only` → narrow
    `git add -- tickets/active/` → strict-set scope assert →
    plain `git commit` → plain `git push`. No force, no `--no-verify`.
-6. Send a plain-text digest to Telegram via Bot API direct-curl, regardless
-   of whether anything was flagged (proof-of-life so silence ≠ crash).
+6. Emit the full plain-text digest to stdout every fire (systemd journal) as
+   the proof-of-discipline record. The operator Telegram is ACTION-ONLY
+   (the operator TG 3608-3616, 2026-09-28; T-4200): it fires ONLY when a grooming
+   finding genuinely needs the operator (a stale ticket targeted to him) and is
+   silent otherwise. Proof-of-life is the git commit + failed_unit_reconcile +
+   the journal, NOT the Telegram — this overrides ORG-003's always-send for the
+   Telegram surface only (precedent msg_1934 --no-digest).
 
 CLI:
     python3 tools/ticket_grooming.py                       # normal fire
@@ -60,12 +65,14 @@ from tools._git_utils import (  # noqa: E402  — after sys.path bootstrap.
     push_with_retry,
     with_worktree,
 )
-from tools.hermes_history_audit import run_history_audit  # noqa: E402
+from tools.hermes_history_audit import default_cache_path, run_history_audit  # noqa: E402
 from tools.ticket import (  # noqa: E402
     TICKET_FILENAME_RE,
     TicketError,
     _build_ticket_text,
+    _fm_snapshot,
     _format_transition_entry,
+    active_holdings,
     append_transition,
     parse_ticket,
 )
@@ -118,7 +125,7 @@ def _default_telegram_env() -> Path:
 TELEGRAM_ENV = Path(
     os.environ.get("PANTHEON_TELEGRAM_ENV", str(_default_telegram_env()))
 )
-TELEGRAM_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "456474197")  # the operator
+TELEGRAM_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "424242424")  # the operator
 
 GROOMING_ACTOR = "grooming"
 
@@ -476,6 +483,36 @@ _APPETITE_HEADER = "appetite"
 _RISKIEST_HEADER = "riskiest assumption"
 
 
+_ADR_ADOPTED_RE = re.compile(r"\bAdopted\b", re.IGNORECASE)
+
+
+def _is_in_force_status(status_text: str) -> bool:
+    """T-4741(6a): Ratified OR Adopted (HO-adopted under principles-as-
+    ratification) and not Superseded/Retired/Rejected/Unratified in the first
+    sentence. Local to the ORG-089 completeness check so the other ADR lints
+    (which key on _is_ratified_status) keep their existing scope."""
+    if _is_ratified_status(status_text):
+        return True
+    first_sentence = re.split(r"(?<=\.)\s+", status_text, maxsplit=1)[0]
+    if _ADR_EXCLUDE_STATUS_RE.search(first_sentence):
+        return False
+    return _ADR_ADOPTED_RE.search(status_text) is not None
+
+
+def _fm_riskiest_substantive(fm: dict) -> bool:
+    """T-4741(6b): a frontmatter `riskiest_assumption:` string that is present,
+    non-trivial and non-boilerplate satisfies the Riskiest-assumption
+    requirement (same substance bar as a body section)."""
+    val = fm.get("riskiest_assumption") if isinstance(fm, dict) else None
+    if not isinstance(val, str):
+        return False
+    text = val.strip()
+    if len(text) < 12:
+        return False
+    upper = text.upper()
+    return not any(marker in upper for marker in _BOILERPLATE_MARKERS)
+
+
 def _adr_ratify_date(status_text: str | None, fm: dict) -> datetime | None:
     """Best-effort ratify date for the grandfather test: a `Ratified YYYY-MM-DD`
     (or `Ratified YYYY-MM-DDTHH:MM...`) token in the status line, else the
@@ -548,7 +585,7 @@ def _appetite_completeness_check(
             except OSError:
                 continue
             status_text = _adr_status_snippet(text)
-            if status_text is None or not _is_ratified_status(status_text):
+            if status_text is None or not _is_in_force_status(status_text):
                 continue
             fm = _adr_frontmatter(text, source=path.name)
             ratify_dt = _adr_ratify_date(status_text, fm)
@@ -566,7 +603,8 @@ def _appetite_completeness_check(
                 findings.append(AppetiteCompletenessFinding(adr_id, "appetite-field"))
             if not _adr_section_substantive(body, _APPETITE_HEADER):
                 findings.append(AppetiteCompletenessFinding(adr_id, "appetite-section"))
-            if not _adr_section_substantive(body, _RISKIEST_HEADER):
+            if not (_adr_section_substantive(body, _RISKIEST_HEADER)
+                    or _fm_riskiest_substantive(fm)):
                 findings.append(AppetiteCompletenessFinding(adr_id, "riskiest-section"))
     return findings
 
@@ -671,30 +709,67 @@ def _appetite_overrun_check(
             claimant=claimant,
         )
         if apply:
-            _apply_overrun_flag(path, ticket, now)
-            _send_overrun_advisory(finding, send_fn=send_fn)
+            # T-4760: a registry-refused flag never landed, so the advisory
+            # ("it is now substate: appetite-overrun") would be false — skip it.
+            # Other outcomes keep the pre-T-4760 best-effort advisory.
+            if _apply_overrun_flag(path, ticket, now) != "refused":
+                _send_overrun_advisory(finding, send_fn=send_fn)
         findings.append(finding)
     return findings
 
 
-def _apply_overrun_flag(path: Path, ticket, now: datetime) -> None:
+def _apply_overrun_flag(path: Path, ticket, now: datetime) -> str:
     """Write `substate: appetite-overrun` in-place + append an overrun-flag
-    transition. Best-effort; a write failure is swallowed (the breaker must not
-    crash grooming). No git commit here — the grooming commit pass stages it, in
-    keeping with the other in-place grooming mutations."""
+    transition. No git commit here — the grooming commit pass stages it, in
+    keeping with the other in-place grooming mutations.
+
+    T-4760: RE-PARSES the file right before building (``ticket`` was parsed
+    earlier in the pass; another writer may have changed the file since), so
+    it never writes back stale fields, and hands the fresh parse to the
+    ORG-021 registry check as ``old_fields``. Returns one of:
+
+      "written"  — the flag landed;
+      "skipped"  — the re-read shows it already flagged, or the file is gone;
+      "refused"  — the frontmatter registry (refuse mode) refused the write.
+                   Nothing was written. Logged LOUDLY to stderr with the
+                   ticket id + finding (never swallowed);
+      "failed"   — any other error: best-effort, the breaker must not crash
+                   grooming (pre-T-4760 behaviour), but now logged too.
+    """
+    from tools.ticket import TicketRefusal, _build_ticket_text, _fm_snapshot
+    tid = str(ticket.fields.get("id") or path.stem)
     try:
-        from tools.ticket import _build_ticket_text
-        fields = dict(ticket.fields)
+        fresh = parse_ticket(path)
+    except FileNotFoundError:
+        return "skipped"  # moved/resolved since the scan — nothing to flag here
+    except Exception as exc:  # noqa: BLE001 — surfacing is the goal, not crashing grooming
+        print(f"[ticket_grooming] overrun-flag {tid}: re-read failed, not flagged: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return "failed"
+    if fresh.fields.get("substate") == "appetite-overrun":
+        return "skipped"  # flagged by another writer since the scan — idempotent
+    try:
+        old_fields = _fm_snapshot(fresh.fields)
+        fields = dict(fresh.fields)
         fields["substate"] = "appetite-overrun"
-        body = ticket.body
+        body = fresh.body
         if not body.endswith("\n"):
             body += "\n"
         entry = (f"- {_now_iso(now)} [{GROOMING_ACTOR}] overrun-flag: appetite "
                  f"budget exceeded; substate -> appetite-overrun (ORG-089 §Decision.4)")
         new_body = body + entry + "\n"
-        path.write_text(_build_ticket_text(fields, new_body), encoding="utf-8")
-    except Exception:  # noqa: BLE001 — surfacing is the goal, not crashing grooming
-        pass
+        path.write_text(_build_ticket_text(fields, new_body, old_fields=old_fields),
+                        encoding="utf-8")
+    except TicketRefusal as exc:
+        print(f"[ticket_grooming] REFUSED overrun-flag write for {tid} by the "
+              f"frontmatter registry (nothing written; advisory not sent): {exc}",
+              file=sys.stderr)
+        return "refused"
+    except Exception as exc:  # noqa: BLE001 — surfacing is the goal, not crashing grooming
+        print(f"[ticket_grooming] overrun-flag write failed for {tid}: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return "failed"
+    return "written"
 
 
 def _send_overrun_advisory(finding: "AppetiteOverrunFinding", *, send_fn=None) -> None:
@@ -721,6 +796,167 @@ def _send_overrun_advisory(finding: "AppetiteOverrunFinding", *, send_fn=None) -
                 pass
     except Exception:  # noqa: BLE001 — advisory is best-effort
         pass
+
+
+# ---------------------------------------------------------------------------
+# T-4881: standing detector for one-active-ticket (T-0877) drift. The cap is
+# checked only at claim time, so a time-boxed override that expires (or a
+# stale one) leaves the over-cap state silent. This measures against the
+# ratified default of 1 -- NOT the env override -- using the same predicate
+# as cmd_claim (`tools.ticket.active_holdings`).
+# ---------------------------------------------------------------------------
+
+WIP_DRIFT_VERB = "wip-drift"
+
+
+@dataclass
+class WipDriftFinding:
+    holder: str
+    primary: str          # oldest claim; left alone
+    extras: list          # ids over the cap (all newer claims)
+    newly_flagged: list   # extras that got a fresh note this run
+
+
+def _last_claim_and_flag(body: str) -> tuple[datetime | None, bool]:
+    """(ts of the most recent claim entry, whether a grooming wip-drift note
+    sits AFTER that claim). A re-claim after a flag re-arms the flag."""
+    last_claim: datetime | None = None
+    flagged = False
+    for line in _iter_transition_log_lines(body):
+        m = _LOG_BULLET_RE.match(line)
+        if not m:
+            continue
+        verb = _extract_log_verb(m.group("rest")).lower().rstrip(":")
+        if m.group("actor") == GROOMING_ACTOR and verb == WIP_DRIFT_VERB:
+            flagged = True
+        elif verb.startswith("claim"):
+            last_claim = _parse_iso(m.group("ts")) or last_claim
+            flagged = False
+    return last_claim, flagged
+
+
+def _held_since(t, far: datetime) -> datetime:
+    """When this holder started holding the ticket: the last claim entry, else
+    `delivered_at`, else `created`, else *far*. Without the fallbacks a ticket
+    lacking a parseable claim line sorted as an 'extra' even when it was the
+    oldest truly-held one (T-4881 review note 2, T-4885)."""
+    claim = _last_claim_and_flag(t.body)[0]
+    if claim is not None:
+        return claim
+    for key in ("delivered_at", "created"):
+        v = t.fields.get(key)
+        parsed = _parse_iso(v) if isinstance(v, str) else None
+        if parsed is not None:
+            return parsed
+    return far
+
+
+def _append_wip_drift_note(path: Path, holder: str, ids: list, now: datetime) -> bool:
+    """Re-parse and append the idempotent wip-drift note. True if written."""
+    try:
+        fresh = parse_ticket(path)
+    except (FileNotFoundError, TicketError):
+        return False
+    _, already = _last_claim_and_flag(fresh.body)
+    if already:
+        return False
+    detail = (f"{holder} holds {len(ids)} active ({', '.join(ids)}); the cap is 1 "
+              f"(T-0877). Resolve, unclaim, or retarget the extras")
+    entry = _format_transition_entry(_now_iso(now), GROOMING_ACTOR, WIP_DRIFT_VERB + ":", detail)
+    body = fresh.body if fresh.body.endswith("\n") else fresh.body + "\n"
+    try:
+        path.write_text(
+            _build_ticket_text(fresh.fields, body + entry + "\n",
+                               old_fields=_fm_snapshot(fresh.fields)),
+            encoding="utf-8")
+    except Exception as exc:  # noqa: BLE001 -- best-effort; never crash grooming
+        print(f"[ticket_grooming] wip-drift note failed for {path.stem}: "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def _real_mailbox_send(*args, **kwargs):
+    """The production sender. Only ever handed in by main() on a real isolated
+    worktree fire -- never a default (a default leaked test advisories into the
+    live mailbox hub on 2026-10-12)."""
+    from tools import mailbox as _mailbox
+    return _mailbox.send(*args, **kwargs)
+
+
+def _send_wip_drift_advisory(f: "WipDriftFinding", *, send_fn=None) -> None:
+    """Best-effort mailbox advisory to holder + orchestrator (first flag only).
+    SAFE BY DEFAULT: with no injected `send_fn` nothing is sent."""
+    if send_fn is None:
+        return
+    try:
+        from tools.keep_going import mailbox_inbox_for
+        send = send_fn
+        payload = (
+            f"WIP-cap drift (T-0877): {f.holder} holds {1 + len(f.extras)} active "
+            f"tickets; the cap is 1. Primary (oldest claim) {f.primary}; over cap: "
+            f"{', '.join(f.extras)}. A time-boxed PANTHEON_MAX_ACTIVE_TICKETS grant "
+            f"does not survive its expiry -- resolve, unclaim, or retarget the extras."
+        )
+        for r in {f.holder, "orchestrator"} - {""}:
+            try:
+                send(str(mailbox_inbox_for(r)), payload, sender="grooming",
+                     subject=f"wip-drift {f.holder}")
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _wip_cap_drift_check(
+    tickets_root: Path,
+    now: datetime,
+    *,
+    apply: bool = True,
+    send_fn=None,
+) -> list[WipDriftFinding]:
+    """Flag every holder with >1 active ticket. Returns one finding per holder
+    (every run, for the digest); notes + advisory are written only for extras
+    not yet flagged since their last claim (idempotent)."""
+    active_dir = tickets_root / "active"
+    if not active_dir.exists():
+        return []
+    tickets, paths = [], {}
+    for path in sorted(active_dir.iterdir()):
+        if not path.is_file() or not TICKET_FILENAME_RE.fullmatch(path.name):
+            continue
+        try:
+            t = parse_ticket(path)
+        except TicketError:
+            continue
+        tickets.append(t)
+        paths[str(t.fields.get("id") or path.stem)] = (path, t)
+    far = datetime.max.replace(tzinfo=timezone.utc)
+    findings: list[WipDriftFinding] = []
+    for holder, ids in sorted(active_holdings(tickets).items()):
+        if len(ids) < 2:
+            continue
+        ordered = sorted(ids, key=lambda i: (_held_since(paths[i][1], far), i))
+        primary, extras = ordered[0], ordered[1:]
+        finding = WipDriftFinding(holder, primary, extras, [])
+        if apply:
+            for tid in extras:
+                if _append_wip_drift_note(paths[tid][0], holder, ordered, now):
+                    finding.newly_flagged.append(tid)
+            if finding.newly_flagged:
+                _send_wip_drift_advisory(finding, send_fn=send_fn)
+        findings.append(finding)
+    return findings
+
+
+def _render_wip_drift_section(findings: list) -> str:
+    """T-4881 digest section. Empty -> ''."""
+    if not findings:
+        return ""
+    lines = [f"🚧 WIP-cap drift ({len(findings)} holder(s) over the one-active cap, T-0877):"]
+    for f in findings:
+        lines.append(f"  - {f.holder}: primary {f.primary}; over cap: {', '.join(f.extras)}")
+    return "\n".join(lines)
 
 
 def find_last_non_grooming_entry(body: str) -> tuple[datetime | None, str | None]:
@@ -988,7 +1224,9 @@ def append_grooming_stale(ticket_path: Path, last_ts: datetime, now: datetime) -
     if not body.endswith("\n"):
         body = body + "\n"
     new_body = body + entry + "\n"
-    new_text = _build_ticket_text(ticket.fields, new_body)
+    # T-4760: frontmatter unchanged (body-only append) -> old == new.
+    new_text = _build_ticket_text(ticket.fields, new_body,
+                                  old_fields=_fm_snapshot(ticket.fields))
     ticket_path.write_text(new_text, encoding="utf-8")
 
 
@@ -1280,6 +1518,16 @@ _OTHER_REPO_MARKERS = (
     "claude-config",
     "pantheon-public",
     "pantheon-pwa",
+    # T-3983: specialist's specialist seat writes deliverables into these two
+    # sibling repos (biosignal firmware/notes + supernote enrichment pipeline).
+    # Recurring false-reopen shape (T-3972 + T-3926): a resolve-note names a
+    # `notes/2026-...-...md` path that lives in sseed-presence, but the top-dir
+    # `notes/` collides with pantheon-config's own — top-dir guard fooled, and
+    # the sibling isn't named in this tuple so the line-marker guard never
+    # fired either. Naming both here closes the collision class the same way
+    # claude-config was closed for T-1443.
+    "sseed-presence",
+    "supernote-pipeline",
 )
 
 # Ticket-file paths (`tickets/<state>/T-NNNN.md`) are MOBILE: a ticket file
@@ -1822,6 +2070,7 @@ def refile_done_to_inbox(
     stages both the deletion and the addition.
     """
     ticket = parse_ticket(ticket_path)
+    old_fields = _fm_snapshot(ticket.fields)  # T-4760: explicit old for the registry check
     fields = dict(ticket.fields)
 
     # labels: append marker, creating the list if absent/null.
@@ -1847,7 +2096,7 @@ def refile_done_to_inbox(
     if not body.endswith("\n"):
         body = body + "\n"
     new_body = body + entry + "\n"
-    new_text = _build_ticket_text(fields, new_body)
+    new_text = _build_ticket_text(fields, new_body, old_fields=old_fields)
 
     inbox_dir = tickets_root / "inbox"
     inbox_dir.mkdir(parents=True, exist_ok=True)
@@ -2578,8 +2827,9 @@ def _render_ratified_unbuilt_adr_section(
 
 
 def find_ticket_integrity_issues(tickets_root: Path) -> list[str]:
-    """T-2982: read-only integrity scan for the daily digest. Surfaces two
-    addressing/notification hazards that are otherwise only found by accident:
+    """T-2982 / T-3830: read-only integrity scan for the daily digest.
+    Surfaces addressing/notification hazards that are otherwise only found
+    by accident:
 
       (a) DUPLICATE IDs — the same T-NNNN in >1 state dir (a concurrent
           cross-agent allocation collision, T-2972 class). A dup id breaks the
@@ -2588,6 +2838,13 @@ def find_ticket_integrity_issues(tickets_root: Path) -> list[str]:
           not_before. They all come due the instant that timestamp passes and
           THUNDER (the 2026-08-20 burst: 12 tickets at one timestamp -> ~9 notifs
           at once). Stagger them before they fire.
+      (c) STALE-DONE-DEPS — an open ticket carries a depends_on target that
+          is already in done/ (T-3830). ORG-013 cascade is resolve-time on
+          the PARENT, so a back-populated done-ref never auto-clears. The
+          T-3830 write-time gate in cmd_block prevents new stale-deps at
+          insertion; this backstop catches (i) historical stragglers filed
+          before the gate landed and (ii) races the write-time gate can't
+          see (e.g. dep target resolved between the check and the commit).
 
     Returns human-readable finding strings; empty list when clean. Fail-open:
     unreadable dirs/files are skipped, never raises (the digest must always send)."""
@@ -2637,6 +2894,55 @@ def find_ticket_integrity_issues(tickets_root: Path) -> list[str]:
                 f"[GATE-CLUSTER] {len(tids)} tickets share not_before={nb} — they all "
                 f"come due at once (thundering-herd); stagger: {', '.join(sorted(tids))}"
             )
+    # (c) T-3830 stale-done-deps — an open ticket's depends_on points at a done/ target.
+    done_ids: set[str] = set()
+    done_dir = tickets_root / "done"
+    if done_dir.is_dir():
+        try:
+            for f in sorted(done_dir.iterdir()):
+                m = re.match(r"(T-\d+)\.md$", f.name)
+                if m:
+                    done_ids.add(m.group(1))
+        except OSError:
+            pass
+    for state in ("inbox", "active"):
+        d = tickets_root / state
+        if not d.is_dir():
+            continue
+        try:
+            entries = sorted(d.iterdir())
+        except OSError:
+            continue
+        for f in entries:
+            if not f.name.endswith(".md"):
+                continue
+            try:
+                text = f.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            # Frontmatter parse for depends_on. Minimal shape: `depends_on: [T-X, T-Y]`
+            # inline OR a YAML block-list on subsequent lines. The block edits
+            # commit an inline list, so match that first; support the block form
+            # too for hand-edited tickets.
+            deps: list[str] = []
+            m_inline = re.search(r"^depends_on:\s*\[([^\]]*)\]", text, flags=re.MULTILINE)
+            if m_inline:
+                deps = [d.strip() for d in m_inline.group(1).split(",") if d.strip()]
+            else:
+                m_block = re.search(
+                    r"^depends_on:\s*\n((?:\s*-\s*T-\d+\s*\n)+)",
+                    text,
+                    flags=re.MULTILINE,
+                )
+                if m_block:
+                    deps = re.findall(r"T-\d+", m_block.group(1))
+            stale = [d for d in deps if d in done_ids]
+            if stale:
+                issues.append(
+                    f"[STALE-DONE-DEP] {f.stem} depends_on names done ticket(s) "
+                    f"{stale} — cascade never fires post-hoc; clear via "
+                    f"`ticket.py block {f.stem} --clear-dep {' --clear-dep '.join(stale)}`"
+                )
     return issues
 
 
@@ -2753,6 +3059,7 @@ def build_digest(
     appetite_completeness_findings: list | None = None,
     appetite_overrun_findings: list | None = None,
     dropped_this_week: list | None = None,
+    wip_drift_findings: list | None = None,
 ) -> str:
     """Render the digest as plain text (no Markdown).
 
@@ -2784,9 +3091,10 @@ def build_digest(
     appetite_overrun_section = _render_appetite_overrun_section(
         appetite_overrun_findings or [])
     dropped_this_week_section = _render_dropped_this_week_section(dropped_this_week or [])
+    wip_drift_section = _render_wip_drift_section(wip_drift_findings or [])
     _appetite_sections = "".join(
         "\n" + s + "\n" for s in (
-            appetite_overrun_section, appetite_completeness_section, dropped_this_week_section
+            wip_drift_section, appetite_overrun_section, appetite_completeness_section, dropped_this_week_section
         ) if s
     )
 
@@ -2858,6 +3166,57 @@ def build_digest(
     if hermes_line:
         result += hermes_line + "\n"
     return result
+
+
+def _operator_action_items(flagged: list["FlaggedTicket"]) -> list["FlaggedTicket"]:
+    """Stale tickets whose `target` is the operator — the operator-action subset.
+
+    This is the ONLY grooming finding class that is a genuine operator-action
+    item: a decision routed to the operator (`target: operator`) that has gone past
+    its stale threshold, i.e. one he is overdue on. Everything else grooming
+    surfaces (stale fleet-targeted tickets, ratified-but-unbuilt ADRs,
+    integrity / gate-cluster findings, appetite completeness/overrun,
+    dep-graph, reopened, stale drafts) is fleet/HO hygiene: it stays in the
+    full digest printed to stdout (systemd journal) and in the ticket
+    annotations + git commit, but it does NOT ping the operator's Telegram.
+
+    Action-only operator-digest discipline (the operator TG 3608-3616, 2026-09-28;
+    T-4200): operator digests are action-only and SILENT when nothing needs
+    him. This overrides ORG-003's "send every fire as proof-of-life" for the
+    Telegram surface only (precedent msg_1934 --no-digest); proof-of-life is
+    the git commit + failed_unit_reconcile + the journal record, not a send.
+    """
+    return [
+        f for f in flagged
+        if str(getattr(f, "target", "")).strip().lower() == "operator"
+    ]
+
+
+def build_operator_digest(
+    now_iso: str, action_items: list["FlaggedTicket"]
+) -> str | None:
+    """Render the lean, ACTION-ONLY operator Telegram message.
+
+    Returns None when nothing needs the operator, so the caller sends NOTHING
+    (silence, not a "nothing changed" placeholder). Same 🧹 header skeleton as
+    `build_digest` (per T-0018) so a Telegram reader still pattern-matches
+    Recovery's grooming sender within the first 1-2 words.
+    """
+    if not action_items:
+        return None
+    header = f"🧹 [Recovery · grooming · {now_iso}]"
+    bullets = [
+        f"  - {f.tid} ({f.state}, stale {_format_age(f.stale_age)}) - \"{f.title}\""
+        for f in action_items
+    ]
+    n = len(action_items)
+    noun = "ticket" if n == 1 else "tickets"
+    return (
+        f"{header}\n\n"
+        f"{n} {noun} targeted to you and awaiting your call (stale past threshold):\n"
+        + "\n".join(bullets)
+        + "\n"
+    )
 
 
 def _send_telegram_plain(token: str, chat_id: str, text: str) -> bool:
@@ -3248,6 +3607,7 @@ def main(argv: list[str] | None = None) -> int:
 
     # Mutable containers to capture results from inside the worktree lambda.
     _result: list[tuple[list, list, dict, int, list]] = []
+    _wip_drift_result: list = []  # T-4881
 
     def _scan_and_commit(wt_path: "Path | None") -> None:
         """Inner function: scan + append + commit. Runs inside the worktree."""
@@ -3291,6 +3651,30 @@ def main(argv: list[str] | None = None) -> int:
             )
             stream = sys.stdout if ok else sys.stderr
             print(f"[git] {gmsg}", file=stream)
+            if not ok:
+                failures_inner += 1
+
+        # T-4881: one-active-cap drift (notes on extra tickets, own commit).
+        _drift_root = _wt_tickets_root if _wt_tickets_root is not None else TICKETS_ROOT
+        # Advisory only from a real worktree fire (wt_path set); the unit-test
+        # bypass (wt_path None) and --repo-root smoke never reach the live hub.
+        wip_drift_inner = _wip_cap_drift_check(
+            _drift_root, now, apply=True,
+            send_fn=_real_mailbox_send if wt_path is not None else None)
+        _wip_drift_result.extend(wip_drift_inner)
+        _flagged_ids = [t for f in wip_drift_inner for t in f.newly_flagged]
+        if _flagged_ids:
+            ok, gmsg = git_commit_and_push(
+                [_drift_root / "active" / f"{t}.md" for t in _flagged_ids],
+                f"tickets(grooming): flag WIP-cap drift on {len(_flagged_ids)} "
+                f"ticket(s) -- {today_iso}\n\nT-4881: holders over the one-active "
+                f"cap (T-0877): " + ", ".join(_flagged_ids) + "\n\n"
+                "Auto-committed by ticket_grooming.py (Recovery unattended).\n"
+                "Scope: tickets/active/ only.\n",
+                today_iso, cwd=wt_path,
+            )
+            stream = sys.stdout if ok else sys.stderr
+            print(f"[git/wip-drift] {gmsg}", file=stream)
             if not ok:
                 failures_inner += 1
 
@@ -3339,7 +3723,8 @@ def main(argv: list[str] | None = None) -> int:
     all_stale, _to_append, counts, failures, reopened = _result[0]
 
     # HERMES whole-history audit — read-only; runs after the worktree is gone.
-    hermes_line = run_history_audit(REPO_ROOT)
+    # T-4308: the clean-verdict cache keeps this inside the 10-min unit timeout.
+    hermes_line = run_history_audit(REPO_ROOT, cache_path=default_cache_path())
 
     # T-0383: active-queue snapshot — per-agent count + oldest-ticket summary.
     active_queue_section = build_active_queue_snapshot(["orchestrator", "specialist", "recovery"])
@@ -3382,29 +3767,53 @@ def main(argv: list[str] | None = None) -> int:
     # T-3440 / ORG-089 §4b: distinct 'dropped this week' calibration surface.
     dropped_this_week = find_dropped_this_week(TICKETS_ROOT, now)
 
-    # Digest: always send (proof-of-life), unless --no-digest.
+    # Full digest: the durable proof-of-discipline record. Built every fire and
+    # printed to stdout so it lands in the systemd journal. The git commit + the
+    # journal + failed_unit_reconcile are proof-of-life now — NOT the Telegram.
+    # This keeps the always-on informational sections (ratified-unbuilt,
+    # integrity / gate-clusters, appetite completeness/overrun, dep-graph,
+    # reopened, stale drafts) on the record without pinging the operator.
+    digest = build_digest(
+        now_human, all_stale, counts,
+        hermes_line=hermes_line,
+        active_queue_section=active_queue_section,
+        reopened=reopened,
+        dep_graph_findings=dep_graph_findings,
+        unanchored_gate_findings=unanchored_gate_findings,
+        stale_draft_findings=stale_draft_findings,
+        manifest_line=check_manifest_freshness(REPO_ROOT, now),
+        ratified_unbuilt_findings=ratified_unbuilt_findings,
+        adr_coverage_gaps=adr_coverage_gaps,
+        integrity_findings=integrity_findings,
+        appetite_completeness_findings=appetite_completeness_findings,
+        appetite_overrun_findings=appetite_overrun_findings,
+        dropped_this_week=dropped_this_week,
+        wip_drift_findings=_wip_drift_result,
+    )
+    if failures > 0:
+        digest = digest + f"\nWARNING: ticket_grooming auto-commit reported {failures} failure(s); see stderr.\n"
+    print(digest)
+
+    # Operator Telegram: ACTION-ONLY (the operator TG 3608-3616, 2026-09-28; T-4200).
+    # Send ONLY when a grooming finding genuinely needs the operator — a stale ticket
+    # targeted to him. Silent otherwise (no placation, no play-by-play). The
+    # full record above is the proof-of-life. --no-digest suppresses the send
+    # entirely regardless. Overrides ORG-003 always-send for the TG surface only.
     if not args.no_digest:
-        digest = build_digest(
-            now_human, all_stale, counts,
-            hermes_line=hermes_line,
-            active_queue_section=active_queue_section,
-            reopened=reopened,
-            dep_graph_findings=dep_graph_findings,
-            unanchored_gate_findings=unanchored_gate_findings,
-            stale_draft_findings=stale_draft_findings,
-            manifest_line=check_manifest_freshness(REPO_ROOT, now),
-            ratified_unbuilt_findings=ratified_unbuilt_findings,
-            adr_coverage_gaps=adr_coverage_gaps,
-            integrity_findings=integrity_findings,
-            appetite_completeness_findings=appetite_completeness_findings,
-            appetite_overrun_findings=appetite_overrun_findings,
-            dropped_this_week=dropped_this_week,
+        operator_msg = build_operator_digest(
+            now_human, _operator_action_items(all_stale)
         )
-        if failures > 0:
-            digest = digest + f"\nWARNING: ticket_grooming auto-commit reported {failures} failure(s); see stderr.\n"
-        ok = _send_digest(digest)
-        if not ok:
-            print("warning: telegram digest send failed", file=sys.stderr)
+        if operator_msg is None:
+            print(
+                "operator digest: no operator-action items; Telegram send "
+                "suppressed (action-only discipline, T-4200). Full digest "
+                "above is the journal record.",
+                file=sys.stderr,
+            )
+        else:
+            ok = _send_digest(operator_msg)
+            if not ok:
+                print("warning: telegram digest send failed", file=sys.stderr)
 
     return 1 if failures else 0
 

@@ -131,12 +131,27 @@ EOF
 
   export PATH="$FAKEBIN:$PATH"
   export PANTHEON_VERIFY_PROC_ROOT="$PROC_FIXTURE"
+  # T-4392 2a: hermetic break-glass base (absent by default -> C10 silent).
+  export PANTHEON_BREAKGLASS_LIST_BASE="$SBX/breakglass"
 }
-teardown_sandbox() { rm -rf "$SBX"; }
+teardown_sandbox() { rm -rf "$SBX"; unset PANTHEON_AGENT_ROLE_MAP PANTHEON_BREAKGLASS_LIST_BASE; }
+# T-4159: verify_startup resolves restart-bound seats through agent_role_map.py.
+# Every case gets a FAKE resolver so the suite never reads the live instance.yaml
+# (which flips recovery/orchestrator to control-plane at their T-3650 commit B). Default:
+# unresolvable (exit 2) -> the static AGENT_SERVICE map, i.e. pre-T-4159 shape.
+fake_role_map() {  # $1 = none | control-plane
+  local f="$SBX/fake_role_map.py"
+  case "$1" in
+    none) printf '%s\n' 'import sys; sys.exit(2)' > "$f" ;;
+    control-plane) printf '%s\n' 'print("SUPERVISOR=control-plane\nSERVICE=pantheon-persona-consume@recovery.service\nMODE=user\nPANE=claude-telegram-bot-fallback:0\nSESSION_UNIT=pantheon-runtime-controller@recovery.service")' > "$f" ;;
+  esac
+  export PANTHEON_AGENT_ROLE_MAP="$f"
+}
 
 run_test() {
   local name="$1" expected="$2"; shift 2
   setup_sandbox
+  fake_role_map none
   declare -f "preflight_${name}" >/dev/null && "preflight_${name}"
   local actual=0
   # ⚠️ T-2322: --self PINS THE MODE, and it is load-bearing rather than tidy.
@@ -148,7 +163,7 @@ run_test() {
   # fake tmux on PATH cannot intercept. The capture then fails, the pane verdict
   # becomes "uncheckable", and the three cases that assert the hard-fail (exit 7)
   # get exit 0 instead. That is why this suite read 16/16 as recovery and 9/7 as
-  # metis AND orchestrator, deterministically, for 39 days: not a regression in the SUT
+  # mason AND orchestrator, deterministically, for 39 days: not a regression in the SUT
   # and not ordinary rot, but a test that never declared the mode it meant.
   # Every case below fixtures a pane into $SBX and therefore means the self path.
   # Say so, rather than inheriting it from whoever happens to run the suite.
@@ -213,6 +228,70 @@ postcheck_healthy_self() {
 }
 
 preflight_pane_not_idle() { printf '%s' "$DESTRUCTIVE_DIALOG" > "$SBX/pane_text"; }
+# T-4646: Claude Code 2.1.289's auto-mode startup nudge has the frame run and a ❯
+# option cursor but no confirm footer, so it read as idle (rc 0). Never dismissed.
+AUTO_MODE_NUDGE='────────────────────────────────────────────────────────────────────────────────
+ Make auto mode your default permission mode?
+
+ Auto mode lets Claude handle permission prompts automatically. Claude checks each
+ tool call for risky actions and prompt injection before executing, runs the ones it
+ assesses as lower-risk, and blocks the rest.
+
+ ❯ Yes, set auto mode as my default permission mode
+   No, keep manual'
+preflight_auto_mode_nudge() { printf '%s' "$AUTO_MODE_NUDGE" > "$SBX/pane_text"; }
+postcheck_auto_mode_nudge() {
+  if [[ -s "$SBX/sendkeys_args" ]]; then echo "  (violation: sent keys to the auto-mode nudge)"; return 1; fi
+  return 0
+}
+# T-4020: a manual-mode idle pane whose rotating "? for shortcuts" hint has cycled
+# to another tip ("← for agents"). Realistic full render (frame + ❯ + mode footer)
+# → idle (rc 0). Also exercises the mode-footer liveness sentinel end-to-end.
+MANUAL_MODE_IDLE_PANE='╭─────────────────────────────────────╮
+│ ❯                                   │
+╰─────────────────────────────────────╯
+  ⏸ manual mode on · ← for agents'
+preflight_manual_mode_idle() { printf '%s' "$MANUAL_MODE_IDLE_PANE" > "$SBX/pane_text"; }
+# ISOLATION case: a pane where the idle input box (frame + ❯) is NOT in the
+# captured region so pane_is_idle CANNOT fire — only the mode footer distinguishes
+# idle from wedged. Proves the T-4020 LIVENESS_SENTINELS mode-footer alternate is
+# load-bearing: WITHOUT it both idle checks fail → rc 7; WITH it → rc 0.
+MANUAL_MODE_FOOTER_ONLY_PANE='● Same steady state.
+  Holding for the operator.
+
+  ⏸ manual mode on · ← for agents'
+preflight_manual_mode_footer_only() { printf '%s' "$MANUAL_MODE_FOOTER_ONLY_PANE" > "$SBX/pane_text"; }
+# T-5465: observed Specialist control-plane idle composer after its Codex runtime
+# returned to the prompt. The Claude-only classifier called this wedged even
+# though the controller, poller, and pane process were all healthy.
+CODEX_IDLE_PANE=$'• Ran git status --short
+  └ (clean)
+
+\033[36m›\033[0m Summarize recent commits
+  \033[2mgpt-5.6-sol high · ~/pantheon-config · Main [default]\033[0m'
+preflight_codex_control_plane_idle() {
+  printf '%s' "$CODEX_IDLE_PANE" > "$SBX/pane_text"
+  fake_role_map control-plane
+}
+
+# Modal counterexample: an old composer may remain in scrollback while the live
+# bottom region is an approval dialog. The modal footer must veto the tempting
+# prompt/footer pair rather than weakening fail-closed handling.
+CODEX_MODAL_PANE='› Summarize recent commits
+  gpt-5.6-sol high · ~/pantheon-config · Main [default]
+
+  Would you like to run the following command?
+  › 1. Yes, proceed
+    2. No, cancel
+  Press enter to confirm or esc to cancel'
+preflight_codex_modal_stays_wedged() {
+  printf '%s' "$CODEX_MODAL_PANE" > "$SBX/pane_text"
+  fake_role_map control-plane
+}
+postcheck_codex_modal_stays_wedged() {
+  if [[ -s "$SBX/sendkeys_args" ]]; then echo "  (violation: sent keys to a Codex modal)"; return 1; fi
+  return 0
+}
 postcheck_pane_not_idle() {  # fail-closed: a destructive dialog must NOT be dismissed
   if grep -q -- "-l 1" "$SBX/sendkeys_args"; then echo "  (violation: pressed 1 on destructive dialog)"; return 1; fi
   return 0
@@ -325,12 +404,34 @@ preflight_at_boot_never_wedges() { printf '%s' "$DESTRUCTIVE_DIALOG" > "$SBX/pan
 postcheck_at_boot_never_wedges() {
   grep -q "pane check skipped" "$SBX/stdout" || { echo "  (pane not skipped at boot)"; return 1; }
   if grep -q -- "-l 1" "$SBX/sendkeys_args"; then echo "  (violation: sent keys at boot — no-self-inject breached)"; return 1; fi
+  if grep -q "BREAK-GLASS" "$SBX/stdout"; then echo "  (C10 spoke with no flag present)"; return 1; fi
   return 0
+}
+
+# C10 (T-4392 2a): a break-glass flag for the agent's account is a SOFT warning at boot. The
+# sandbox base is owned by the test user, so the REAL ownership check rejects it; the line
+# still surfaces (hook, owner, reason). LIVE formatting: tools/test_failclosed.py.
+preflight_at_boot_breakglass_flag() {
+  printf '%s' "$IDLE_PANE" > "$SBX/pane_text"
+  mkdir -m 755 -p "$SBX/breakglass/claude-fallback"; chmod 755 "$SBX/breakglass"
+  printf 'v1 %s mcp-list-guard\n' "$(( $(date +%s) + 3600 ))" > "$SBX/breakglass/claude-fallback/flag"
+  chmod 644 "$SBX/breakglass/claude-fallback/flag"
+}
+postcheck_at_boot_breakglass_flag() {
+  local want="WARN: BREAK-GLASS flag for claude-fallback: REJECTED claude-fallback: base is not root-owned"
+  [[ "$(id -u)" -eq 0 ]] && want="WARN: BREAK-GLASS flag for claude-fallback: REJECTED claude-fallback: "  # root owns the fixture
+  grep -qF "$want" "$SBX/stdout" \
+    || { echo "  (break-glass flag not surfaced as a SOFT warning)"; return 1; }
 }
 
 echo "=== verify_startup.sh smoke ==="
 run_test healthy_self           0 --agent recovery
 run_test pane_not_idle          7 --agent recovery
+run_test auto_mode_nudge        7 --agent recovery   # T-4646
+run_test manual_mode_idle       0 --agent recovery
+run_test manual_mode_footer_only 0 --agent recovery
+run_test codex_control_plane_idle 0 --agent recovery
+run_test codex_modal_stays_wedged 7 --agent recovery
 run_test capture_fails          0 --agent recovery
 run_test boot_dialog_dismissed  0 --agent recovery
 run_test poller_absent_ignores_unrelated_pair 7 --agent recovery
@@ -344,6 +445,7 @@ run_test telegram_token_found   0 --agent recovery
 run_test timer_healthy          0 --agent recovery
 run_test timer_stalled          0 --agent recovery
 run_test at_boot_never_wedges   0 --agent recovery --at-boot
+run_test at_boot_breakglass_flag 0 --agent recovery --at-boot
 run_test unknown_agent         64 --agent bogus
 
 
@@ -377,10 +479,35 @@ postcheck_no_service_skips() {
 run_test renderer_dialog_dismissed     0 --agent recovery
 run_test dev_dialog_still_uses_option_1 0 --agent recovery
 run_test foreign_harness_refuses       7 --agent codex
-run_test no_service_skips              0 --agent metis
+run_test no_service_skips              0 --agent mason
+# T-4159: a control-plane seat's session unit is its runtime controller.
+preflight_control_plane_session_unit() { printf '%s' "$IDLE_PANE" > "$SBX/pane_text"; fake_role_map control-plane; }
+postcheck_control_plane_session_unit() {
+  grep -q "session supervisor for recovery: pantheon-runtime-controller@recovery.service" "$SBX/stdout" \
+    || { echo "  (expected the controller as recovery's session unit)"; return 1; }
+  if grep -q "claude-telegram-fallback.service" "$SBX/stdout"; then echo "  (named the retired bespoke unit)"; return 1; fi
+  return 0
+}
+run_test control_plane_session_unit    0 --agent recovery
+
+# T-5299: a control-plane seat WITHOUT a Telegram plugin (artisan) gets a session unit from
+# restart-target, which used to be the only "has a poller" signal. The poller probe must
+# stay NOT_APPLICABLE: an ABSENT verdict there leads to poller_escalate killing a healthy
+# session. Boot dialog -> dismissed -> idle is the path that reaches the probe.
+preflight_control_plane_no_telegram_is_poller_na() {
+  printf '%s' "$BOOT_DIALOG" > "$SBX/pane_text"
+  printf '%s' "$IDLE_PANE"   > "$SBX/pane_text_after"
+  fake_role_map control-plane
+}
+postcheck_control_plane_no_telegram_is_poller_na() {
+  grep -q "no telegram poller expected for artisan" "$SBX/stdout" || { echo "  (missing NOT_APPLICABLE note)"; return 1; }
+  if grep -q "poller child is ABSENT" "$SBX/stdout"; then echo "  (artisan judged comms-dark)"; return 1; fi
+  return 0
+}
+run_test control_plane_no_telegram_is_poller_na 0 --agent artisan
 
 echo "=== T-2210: every seat is addressable ==="
-for a in recovery orchestrator specialist mnemosyne metis atlas codex; do
+for a in recovery orchestrator specialist archivist mason artisan codex; do
   if bash "$SUT" --agent "$a" --self --no-dewedge >/dev/null 2>&1 || [ $? -ne 64 ]; then
     echo "  PASS: $a is a known agent"; PASS=$((PASS+1))
   else

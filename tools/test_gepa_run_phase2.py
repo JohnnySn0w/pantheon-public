@@ -43,7 +43,10 @@ class TestParseArgsDefaults(unittest.TestCase):
 
     def test_default_seed_candidate_path_resolves_to_the_real_reviewer_persona(self):
         args = run_phase2.parse_args([])
-        self.assertEqual(Path(args.seed_candidate_path), Path("/home/claude/claude-config/agents/reviewer.md"))
+        # T-4763: the in-repo harness copy, resolved from this checkout, not a home path.
+        repo = Path(__file__).resolve().parent.parent
+        self.assertEqual(Path(args.seed_candidate_path), repo / "harness" / "claude" / "agents" / "reviewer.md")
+        self.assertTrue(Path(args.seed_candidate_path).is_file())
 
     def test_overrides_apply(self):
         args = run_phase2.parse_args(["--max-rollouts", "10", "--wall-clock-seconds", "60", "--keep-sessions"])

@@ -2,6 +2,8 @@
 
 **Status:** Ratified per T-0273 (the operator 2026-05-13T03:00:57Z). T-0238 §Pre-merge smoke addition + T-0229 §Merge step addition included in the ratification scope.
 
+**Amended 2026-09-28 (T-3079): default routing for multi-worker arcs moved to peer-orchestrator seats.** The in-session project-orchestrator this checklist spawns sits two layers below HO. The harness routes its subagents' completion notifications to the ROOT session, not to it (`bugs/nested-subagent-completion-notification-routes-to-main-not-spawner.md`, deterministic). So the default for a multi-worker arc is now a **peer orchestrator seat** (mason or artisan), handed off per `sop/standard/retask-dispatch.md`. The seat is its own session root, and its implementer and reviewer land one layer down, where notifications route correctly. The operator ratified the peer-orchestrator shape on 2026-09-07 (TG 9294-9300); it was live-proven 2026-09-27 on T-4040, T-4008, T-4044 and T-4015 via mason. Use this checklist's in-session shape only when an arc needs HO's live conversational context or iteration too tight for mailbox latency, or when neither seat holds the needed repo grant. The body below is unchanged and still governs that residual case.
+
 This is the pre-dispatch checklist for HO when spinning a team-pattern cycle (b9-shape). Captures the operational discipline that's been refined across cycles b9 → b35 → b36, including the workarounds for known team-spawn substrate gotchas (`bugs/teamcreate-orchestrator-restricted-tool-inventory.md`, `bugs/sendmessage-without-spawn-dispatch-failure.md`, `bugs/team-sendmessage-system-name-not-personal-name.md`). The checklist is what HO runs through before spawning the team (Agent-tool named teammates — the session's agent-team is implicit; no TeamCreate, removed CC 2.1.178); following it prevents the dispatch-failure patterns those bugs/ entries catalog.
 
 ## When to use this
@@ -27,6 +29,7 @@ Run through ALL items before spawning the first teammate via the Agent tool. Ski
 - [ ] **Brief-named tests pre-enumerated** — exact test names locked at brief-tier so plan↔code↔reviewer artifact binding holds per D6. The implementer cannot rename without REBOUND.
 - [ ] **Multi-ruling enumeration clause included** — if the brief carries N numbered rulings, it ends with the mandatory report contract: enumerate all rulings 1–N with per-ruling status (built / deferred-with-disclosure / unchanged-from-last-increment / infeasible-stopped). Per `sop/standard/team-orchestrator-brief-construction.md` §Locked-answers + `lessons/multi-ruling-briefs-require-per-ruling-status-enumeration.md` (T-1530: a silently-dropped ratified ruling cost a rebound cycle).
 - [ ] **Bubble-up criteria spelled out** — copy the 5 criteria from CLAUDE.md §Chain of justification verbatim into the orchestrator's brief (not by reference). Restart-fresh orchestrators may not load the file unless the brief operationalizes it.
+- [ ] **Delegation invariants explicit** — every worker/subagent brief states (a) the local authority boundary, (b) sensitive operations that require stop/escalation unless explicitly authorized, and (c) independent-verification requirements for material claims or externally visible effects.
 - [ ] **HERMES byte-sequence rule** mentioned if the cycle touches anything that might contain the trigger bytes (research, docs, anything referencing the original issue).
 - [ ] **Arc sub-ticket gating briefed** — instruct the orchestrator that any build sub-tickets it files for the arc carry a suppression gate **at file-time**: `depends_on:[T-prev]` for sequenced units (the honest gate — also cascade-unblocks per ORG-013 when the predecessor resolves), `interactive-required` for judgment/data-gated ones the auto-consumer must never fire on. The orchestrator then claims each to `active/` when its implementer picks it up. Without the gate, the inbox auto-consumer can't tell an orchestrator-driven sub-ticket from fresh work and **races the orchestrator's in-flight implementer onto the same branch** (`lessons/inbox-auto-consumer-races-orchestrator-arc-subtickets.md`).
 
@@ -77,22 +80,14 @@ Added as part of the b9-pattern close-scope discipline. Run after implementer RE
 
 **Scope**: `pantheon-pwa` only. CI integration is a separate Pantheon-wide infra ticket. Recovery-side pre-deploy gate is v1 nice-to-have.
 
-## Merge step (T-0229 extension)
+## Merge step (superseded 2026-10-08, T-4548)
 
-Runs after §Pre-merge smoke is green. Symmetric self-merge default per T-0224 verdict (the operator msg_1322).
+The merge step that used to live here (direct `git push origin main`, a branch delete chained onto the merge, a halt for the operator on vault diffs, manual PWA rsync) is retired. Every point was overtaken: push and merge go through a PR, the HO merges, a delete never chains onto the merge, the D3 amendment retired the routine vault-diff halt, and kino deploys itself via T-0316. Follow:
 
-- [ ] **Reviewer has emitted APPROVE.** No merge without that gate. T-0156 invariant: reviewer is the gate; implementer does NOT self-merge; orchestrator (or HO in HO-direct cycles) performs the merge step.
-- [ ] **Vault-file check on the diff.** If the APPROVE'd branch touches any of: `CLAUDE.md` (any path), READMEs, `principles.md`, `directives.md`, anything under `adr/` / `notes/` / `incidents/`, or the architecture vault per `rulebook/policies/trust-posture.md` — **HALT the merge step** and surface to the operator for ratification. Vault changes still gate on the operator regardless of repo.
-- [ ] **Repo-scope check.** Symmetric self-merge applies to `pantheon-pwa` and `pantheon-config` only. Other repos (revenue-project, future code repos) retain prior PR-gate discipline; default to surfacing to HO if uncertain about repo classification.
-- [ ] **Merge to origin/main.** `git checkout main && git merge --no-ff <feat-branch> && git push origin main`. The `--no-ff` preserves the feat-branch's commit topology for audit-chain traceability.
-- [ ] **Branch cleanup.** `git branch -d <feat-branch> && git push origin :<feat-branch>` (or leave the remote branch and rely on GitHub's "delete branch on merge" if configured).
-- [ ] **For pantheon-pwa**: rsync `/home/claude/pantheon-pwa/build/web/` → `/opt/pantheon-pwa/build/web/` + `sudo systemctl restart kino.service` to deploy. (Optional Recovery auto-redeploy hook is a future enhancement — T-0229 §Ask item (4) deferred sibling.)
+- [`merging-an-agent-branch-pr.md`](merging-an-agent-branch-pr.md) for push, PR, CI, the same-turn mailbox HOLD check, the merge and cleanup;
+- [`redeploy-pantheon-pwa.md`](redeploy-pantheon-pwa.md) for getting a merged pantheon-pwa change live.
 
-## DECISIONS (Merge step section, T-0229)
-
-- **Symmetric self-merge for pantheon-pwa + pantheon-config** — justifies via T-0224 (a) verdict (the operator msg_1322) + D7 (autonomy at the lowest competent tier; reviewer's APPROVE absorbs variance, no operator-PR-step needed for non-vault changes).
-- **Vault carve-out preserved** — justifies via `rulebook/policies/trust-posture.md` §Always-escalate (architecture vault is outside the auto-approve scope regardless of repo).
-- **T-0156 invariant explicit** — justifies via D6 (locked-decision deviation: T-0156 was the prior reviewer-as-gate ratification; this SOP extension preserves the invariant rather than overriding it).
+The reviewer-is-the-gate invariant (T-0156) still holds: no merge without a reviewer APPROVE, and the implementer never self-merges.
 
 ## Common dispatch pitfalls (anti-patterns this checklist prevents)
 
@@ -101,6 +96,7 @@ Runs after §Pre-merge smoke is green. Symmetric self-merge default per T-0224 v
 - **Personal-name SendMessage** — silent orphan inbox. Item 4.1 covers this.
 - **`success: true` on SendMessage assumed-equal-to-delivered** — items 2.6 (verify recipients exist) + 4.1 (correct routing) together catch this.
 - **DECISIONS-by-reference** instead of operational embedding — item 5.1 catches this.
+- **Implicit delegation boundaries** — item 1.7 catches worker briefs that leave authority, sensitive-stop conditions, or verification burden to inference.
 - **No 3-REBOUND escape hatch named** — orchestrator drifts on unsolvable unit. Item 7.2 covers this.
 - **Worker report trusted without a deliverable check** — for file-deliverable dispatches, verify files-on-disk before using the result; spot-check decision-changing claims against a primary source. Rule lives at [`research-dispatch-deliverable-standards.md`](research-dispatch-deliverable-standards.md) §Standard 5 (T-1771).
 

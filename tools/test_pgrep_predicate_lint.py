@@ -116,6 +116,14 @@ class TestAllowlistAndScan(unittest.TestCase):
         self._write("tools/test_thing.py", 'subprocess.run(["pgrep", "-f", P])\n')
         self.assertEqual(ppl.scan(self.root, allowlist=()), [])
 
+    def test_nested_agent_worktrees_are_out_of_scope(self) -> None:
+        """T-4513: a gitignored .claude/worktrees/<agent> checkout is another
+        commit, not this tree; only that exact prefix is skipped."""
+        self._write(".claude/worktrees/agent-x/tools/x.sh", 'pgrep -f "pat"\n')
+        self.assertEqual(ppl.scan(self.root, allowlist=()), [])
+        self._write("tools/worktrees/x.sh", 'pgrep -f "pat"\n')
+        self.assertEqual(len(ppl.scan(self.root, allowlist=())), 1)
+
     def test_prose_dirs_are_out_of_scope(self) -> None:
         self._write("lessons/a-lesson.sh", 'pgrep -f "pat"\n')
         self.assertEqual(ppl.scan(self.root, allowlist=()), [])

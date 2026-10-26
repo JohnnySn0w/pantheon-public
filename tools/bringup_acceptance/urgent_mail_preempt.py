@@ -74,6 +74,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from unittest import mock
 
+from tools import agent_role_map
 from tools import mailbox
 from tools import urgent_escalation
 from tools.bringup_acceptance import restore as restore_mod
@@ -95,8 +96,9 @@ COMPOSITE_ID = "urgent-mail-preempt-fully-functional"
 # The real hub this module must NEVER write to -- module-level constant, not
 # imported from mailbox.py/persona_bringup.py, mirroring mailbox_roundtrip.py's
 # own guard (see that module's DECISIONS for why this is deliberately NOT
-# shared private state across siblings).
-_REAL_HUB_DEFAULT = Path("/home/the-ancestor/mailbox")
+# shared private state across siblings). Value: instance.yaml mailbox.hub via
+# agent_role_map (T-4096), so the guard follows the real hub across ORG-087.
+_REAL_HUB_DEFAULT = Path(agent_role_map.mailbox_hub())
 
 # One shared sender identity string (never provisioned as its own inbox --
 # no leg here needs a reply route back to a sender mailbox, unlike
@@ -208,7 +210,7 @@ def _hook_injects_and_clears_leg(*, inbox: Path) -> Mapping[str, Any]:
     hso = obj.get("hookSpecificOutput", {})
     if hso.get("hookEventName") != "PreToolUse":
         raise HardStop(f"hook_injects_and_clears: unexpected hookEventName: {hso!r}")
-    if hso.get("permissionDecision") != "allow":
+    if "permissionDecision" in hso:  # T-4650: the nudge must not approve the call it lands on
         raise HardStop(f"hook_injects_and_clears: unexpected permissionDecision: {hso!r}")
     additional_context = hso.get("additionalContext")
     expected = hook_module.build_nudge(marker_before["sender"], marker_before["subject"])

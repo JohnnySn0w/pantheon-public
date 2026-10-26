@@ -7,6 +7,13 @@
          jsonl confirms the rate-limit assistant turn is ≥5min old + no
          further activity since (turn was silently abandoned by the runtime).
 
+T-4510 fleet usage gate: at >=95% (configurable) of the fleet's SHARED weekly Max, the
+periodic anti-idle/queue content pokes (P1.a, P1.b) suppress themselves and resume at the
+reset (tools/fleet_usage_gate.py; fail-open; logged once per window). The gate sits at the
+send point inside _dispatch_poke, AFTER every recovery branch. P1.d, P1.c, the cap-modal /
+cap / cyber / effectiveness handling and the TUI-wedge escalation are recovery and never
+consult it.
+
 Per ORG-011 Phase B / T-0223 (P1.a + P1.b) and T-0254 (P1.d). Mirrors
 `tools/context_fill_monitor.py` shape (per-agent AGENT_CONFIG + systemd
 template @<agent>.{service,timer}). Designed to run as a systemd-user timer
@@ -26,8 +33,13 @@ Environment overrides:
   ACTIVITY_MONITOR_P1D_COOLDOWN_SECONDS — override P1.d cooldown.
   ACTIVITY_MONITOR_P1A_IDLE_SECONDS     — override P1.a idle threshold.
   ACTIVITY_MONITOR_P1B_OPERATOR_SECONDS  — override P1.b operator-absent threshold.
+  ACTIVITY_MONITOR_P1B_ENABLED          — P1.b kill-switch (default 1; 0 skips P1.b only).
   ACTIVITY_MONITOR_P1D_AGE_SECONDS      — override P1.d rate-limit-age threshold.
   ACTIVITY_MONITOR_BRIDGE_HEALTH_URL    — override bridge /health URL.
+  ACTIVITY_MONITOR_P1B_BACKOFF_ENABLED  — T-3991 handled-wait backoff (default on; kill-switch).
+  ACTIVITY_MONITOR_P1B_BACKOFF_COOLDOWN_SECONDS   — stretched p1b cooldown when backoff engages.
+  ACTIVITY_MONITOR_P1B_BACKOFF_AFTER_FIRES        — consecutive p1b fires before backoff engages.
+  ACTIVITY_MONITOR_P1B_BACKOFF_STREAK_GAP_SECONDS — max gap counting fires as one wait-streak.
 
 Exit codes:
   0 — clean bail (in cooldown, no agent state available, predicates didn't fire)
@@ -43,6 +55,7 @@ import json
 import os
 import hashlib
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -57,6 +70,10 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from tools import agent_role_map  # noqa: E402  (after the sys.path shim above)
+from tools import telegram_inbound  # noqa: E402  (T-4212: shared inbound parser)
+from tools import fleet_usage_gate  # noqa: E402  (T-4510: fleet usage gate, stdlib-only)
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -68,6 +85,16 @@ P1A_IDLE_THRESHOLD_SECONDS = 3600  # 1 hour
 
 # P1.b — operator-absent threshold. Per ORG-011 ratified spec.
 P1B_OPERATOR_ABSENT_THRESHOLD_SECONDS = 15 * 60
+
+# T-3709 — P1.b write-activity suppression window. If the agent has committed
+# to its own pantheon-config within this window it is demonstrably producing
+# git-visible output (ledger/ticket/notes/bugs/tools/adr/... — ANY path), so it
+# is a busy-productive session, not an idle-waiting one. The operator-inbound
+# gate alone cannot tell these apart (the operator being asleep says nothing about
+# whether the HO is working). 15min matches the implementer-inbox-threshold
+# (impl15, dispatch-and-wait-liveness) and the monitor's own 15min cadence.
+# Override via ACTIVITY_MONITOR_P1B_WRITE_ACTIVITY_SECONDS.
+ACTIVITY_MONITOR_P1B_WRITE_ACTIVITY_SECONDS = 15 * 60  # 15 min
 
 # Per-poke cooldown to prevent spam if a poke doesn't yield activity quickly.
 ACTIVITY_MONITOR_COOLDOWN_SECONDS = 30 * 60  # 30 min — P1.a/P1.b
@@ -93,6 +120,25 @@ P1D_RATE_LIMIT_AGE_SECONDS = 5 * 60  # 5 min
 # per agent (orchestrator first). See notes/2026-06-26-layer3-recovery-backstop-design.md.
 P1C_STALE_THRESHOLD_SECONDS = 30 * 60  # 30 min — Layer-1 cadence ceiling (1200s) + 10min margin; aligns ORG-037 orchestrator role-threshold
 P1C_COOLDOWN_SECONDS = 30 * 60  # 30 min — matches P1.a/P1.b
+
+# P1.b handled-wait backoff (T-3991, interim before the T-3076 P1.b reinvent).
+# Field data (T-3958, two session-instances) showed P1.b re-firing every ~30min
+# through a genuinely-drained operator-quiet hold — 10+ fires in one ~5h stretch —
+# even after the operator had ALREADY done the SOP-prescribed action (converted the
+# operator-blocked asks into target=operator tickets). Fires 1-2 carry the signal
+# (they legitimately surfaced the wait); fires 3+ are pure churn. The existing
+# T-3404 terminal-state-ledger-ack suppression does not recognize a filed
+# target=operator ticket as "handled", so it never engaged in those instances.
+# Interim heuristic: once N consecutive p1b fires have landed in one wait-streak
+# AND a target=operator ticket exists that was created since the streak began (the
+# artifact SOP step 3 prescribes = evidence the wait is already handled), stretch
+# the p1b cooldown so the churn fires back off. Doubly-gated + benign ceiling: the
+# worst case is a still-poked-but-slower cadence (p1a idle-net + the stretched p1b
+# both remain), never a silenced safety net — so this ships default-ON with an
+# env kill-switch rather than dark. It only ever fires the monitor LESS.
+P1B_BACKOFF_COOLDOWN_SECONDS = 60 * 60  # 60 min — the T-3991 proposed downshift
+P1B_BACKOFF_AFTER_FIRES = 2            # backoff engages once >= this many p1b fires are already on the streak (so fire 3+ is rate-limited)
+P1B_BACKOFF_STREAK_GAP_SECONDS = 90 * 60  # fires within this gap count as one wait-streak; > the 60min backoff cadence so the streak survives its own downshift
 
 # Bounded-poke (T-1363) — stop re-poking a session that isn't responding.
 # A poke that LANDS makes the session take a turn → its main jsonl mtime
@@ -151,7 +197,11 @@ AGENT_CONFIG: dict[str, dict] = {
     "orchestrator": {
         "tmux_target_pane": "claude-telegram-bot:0",
         "sudo_user": "claude",
-        "jsonl_dir": Path("/home/claude/.claude/projects/-home-claude"),
+        # T-4159: derived, not hardcoded. -home-claude while orchestrator is bespoke
+        # (home cwd); -home-claude-pantheon-config once its T-3650 hand-move marks
+        # it control-plane. A frozen -home-claude would read a dead dir after the
+        # move and false-flag a live orchestrator as idle (P1.a).
+        "jsonl_dir": Path(agent_role_map.live_session_projects_dir("claude")),
         "ledger_agent_id": "orchestrator",
         "ticket_targets": frozenset({"orchestrator", "orchestrator"}),
         "pantheon_config_path": Path("/home/claude/pantheon-config"),
@@ -173,29 +223,29 @@ AGENT_CONFIG: dict[str, dict] = {
     # the live pre-existing session per instance.yaml. jsonl_dir is the ACTIVE
     # -pantheon-config project (consume-runtime launches cwd=<account>/pantheon-config;
     # the plain -home-<account> dir is month-stale — verified 2026-09-07).
-    "atlas": {
+    "artisan": {
         "tmux_target_pane": "suborch2-main:0",
         "sudo_user": "suborch2",
         "jsonl_dir": Path("/home/suborch2/.claude/projects/-home-suborch2-pantheon-config"),
-        "ledger_agent_id": "atlas",
-        "ticket_targets": frozenset({"atlas"}),
+        "ledger_agent_id": "artisan",
+        "ticket_targets": frozenset({"artisan"}),
         "pantheon_config_path": Path("/home/suborch2/pantheon-config"),
-        "bridge_inbound_key": "atlas",
+        "bridge_inbound_key": "artisan",
         # T-3557(e): sub-orch seats count ACTIVE tickets only. An unclaimed
         # inbox ticket is undispatched/pending for a scope-managed seat, not
         # work it could be stuck on — counting it false-fired p1a/p1b on
         # legitimately-idle seats. orchestrator (no key → inbox+active) is unchanged.
         "queue_states": ("active",),
     },
-    "metis": {
+    "mason": {
         "tmux_target_pane": "suborch1-main:0",
         "sudo_user": "suborch1",
         "jsonl_dir": Path("/home/suborch1/.claude/projects/-home-suborch1-pantheon-config"),
-        "ledger_agent_id": "metis",
-        "ticket_targets": frozenset({"metis"}),
+        "ledger_agent_id": "mason",
+        "ticket_targets": frozenset({"mason"}),
         "pantheon_config_path": Path("/home/suborch1/pantheon-config"),
-        "bridge_inbound_key": "metis",
-        # T-3557(e): sub-orch seats count ACTIVE tickets only (see atlas note).
+        "bridge_inbound_key": "mason",
+        # T-3557(e): sub-orch seats count ACTIVE tickets only (see artisan note).
         "queue_states": ("active",),
     },
 }
@@ -305,7 +355,8 @@ def poke_effectiveness_decision(
     """Decide whether to SUPPRESS this poke because prior pokes weren't working.
 
     Effectiveness signal: a poke that lands makes the session take a turn, which
-    advances its main jsonl mtime. So if the prior poke (SAME predicate) recorded
+    advances its newest timestamped jsonl entry (`latest_jsonl_activity`, T-5367; the
+    state key keeps its historical name pre_poke_jsonl_mtime). So if the prior poke (SAME predicate) recorded
     a pre-poke mtime and the jsonl has NOT advanced past it, that poke was
     ineffective — the session is stuck, not idle.
 
@@ -386,6 +437,168 @@ def _record_fire(agent: str, predicate: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# P1.b handled-wait backoff (T-3991)
+# ---------------------------------------------------------------------------
+
+
+def _read_recent_fires(agent: str, limit: int = 50) -> list[dict]:
+    """Read the tail of the Recovery-local fires.jsonl, filtered to `agent`.
+
+    Best-effort mirror of `_record_fire`'s posture (D12): a broken/absent fire-log
+    returns [] and never wedges the monitor — no backoff is strictly safer than a
+    crash (it just keeps the legacy 30min cadence). The fire-log is Recovery-local
+    (PANTHEON_STATE_DIR), so this is a direct read, no sudo. `limit` bounds how far
+    back a streak can be reconstructed; the multiplier over-reads to survive
+    multi-agent interleaving before the per-agent filter.
+    """
+    try:
+        path = _fires_log_path()
+        if not path.exists():
+            return []
+        lines = path.read_text(encoding="utf-8").splitlines()
+        out: list[dict] = []
+        for ln in lines[-(limit * 6):]:
+            try:
+                rec = json.loads(ln)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if isinstance(rec, dict) and rec.get("agent") == agent and isinstance(rec.get("ts"), int):
+                out.append(rec)
+        return out[-limit:]
+    except Exception as exc:  # noqa: BLE001 — fire-log read must never wedge the monitor
+        _log(agent, f"_read_recent_fires failed (non-fatal): {exc!r}")
+        return []
+
+
+def count_consecutive_p1b_fires(
+    fires: list[dict], now: int, streak_gap_seconds: int
+) -> tuple[int, int | None]:
+    """Pure: count the trailing run of contiguous p1b fires for ONE agent.
+
+    Walks the records newest-first. A run continues while each fire is within
+    `streak_gap_seconds` of the previous one (and the newest within the gap of
+    `now`); it breaks at the first non-p1b fire, the first over-gap jump, or the
+    start of the list. Returns (count, streak_start_ts) where streak_start_ts is
+    the oldest ts still inside the run, or (0, None) when the trailing state is
+    not an in-window p1b run.
+
+    The gap-break models "a new wait shape" (a long quiet, or a different
+    predicate firing) resetting the streak — the T-3991 reset condition — without
+    needing to inspect operator-inbound state directly (a returned the operator makes
+    p1b stop firing, so its fires simply stop landing and the run goes stale).
+    """
+    recs = sorted(
+        (r for r in fires if isinstance(r.get("ts"), int)), key=lambda r: int(r["ts"])
+    )
+    count = 0
+    streak_start: int | None = None
+    prev_ts = now
+    for rec in reversed(recs):
+        ts = int(rec["ts"])
+        if prev_ts - ts > streak_gap_seconds:
+            break
+        if rec.get("predicate") != "p1b":
+            break
+        count += 1
+        streak_start = ts
+        prev_ts = ts
+    return count, streak_start
+
+
+def _parse_ticket_created_epoch(value: str) -> int | None:
+    """Parse a ticket front-matter `created:` value to epoch seconds, or None."""
+    value = value.strip().strip("'\"")
+    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(value, fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return int(dt.timestamp())
+        except ValueError:
+            continue
+    return None
+
+
+def has_recent_operator_ticket(
+    pantheon_config_path: Path, sudo_user: str, since_ts: int
+) -> bool:
+    """True iff a target=operator ticket was CREATED at/after `since_ts`.
+
+    This is the "operator already handled the wait" signal for the P1.b backoff:
+    SOP step 3 says an operator-blocked ask becomes a target=operator ticket, and the
+    monitored agent files that ticket into its OWN clone (this reads
+    `pantheon_config_path` via `sudo_user` = that agent's account), so a
+    just-filed ticket is visible with no fetch. Scans inbox + active only (a
+    resolved ticket is no longer an open wait). Best-effort: any error returns
+    False, i.e. NO backoff — the safe default keeps the legacy poke cadence rather
+    than silence a poke on a bad read.
+    """
+    p = str(pantheon_config_path)
+    script = (
+        f'for f in "{p}"/tickets/inbox/*.md "{p}"/tickets/active/*.md; do '
+        '[ -f "$f" ] || continue; '
+        'if grep -qE "^target:[[:space:]]*operator[[:space:]]*$" "$f"; then '
+        'grep -m1 -E "^created:" "$f"; fi; '
+        'done'
+    )
+    cmd = _sudo(sudo_user) + ["bash", "-c", script]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=_GIT_TIMEOUT_SECONDS
+        )
+    except (subprocess.SubprocessError, OSError):
+        return False
+    for line in result.stdout.splitlines():
+        parts = line.split(":", 1)
+        if len(parts) != 2:
+            continue
+        ts = _parse_ticket_created_epoch(parts[1])
+        if ts is not None and ts >= since_ts:
+            return True
+    return False
+
+
+def p1b_effective_cooldown(
+    agent: str,
+    cfg: dict,
+    base_cooldown: int,
+    *,
+    enabled: bool,
+    backoff_cooldown: int,
+    after_fires: int,
+    streak_gap_seconds: int,
+    now: int | None = None,
+) -> int:
+    """Return the cooldown to apply to P1.b this cycle: `backoff_cooldown` when the
+    handled-wait backoff engages (T-3991), else `base_cooldown`.
+
+    Backoff engages iff: enabled, AND >= `after_fires` consecutive p1b fires are on
+    the current wait-streak, AND a target=operator ticket was created since the
+    streak began. The ticket probe is evaluated LAST (and only when the streak gate
+    already passed) so the common no-streak path pays no sudo cost.
+    """
+    if not enabled:
+        return base_cooldown
+    now = int(time.time()) if now is None else now
+    streak, streak_start = count_consecutive_p1b_fires(
+        _read_recent_fires(agent), now, streak_gap_seconds
+    )
+    if streak < after_fires or streak_start is None:
+        return base_cooldown
+    if not has_recent_operator_ticket(
+        cfg["pantheon_config_path"], cfg["sudo_user"], streak_start
+    ):
+        return base_cooldown
+    _log(
+        agent,
+        f"P1.b handled-wait backoff ENGAGED (T-3991): {streak} consecutive p1b "
+        f"fires + a target=operator ticket filed since the streak began → p1b "
+        f"cooldown {base_cooldown // 60}min → {backoff_cooldown // 60}min",
+    )
+    return backoff_cooldown
+
+
+# ---------------------------------------------------------------------------
 # Activity-signal sources (P1.a)
 # ---------------------------------------------------------------------------
 
@@ -440,6 +653,58 @@ def latest_jsonl_mtime(jsonl_dir: Path, sudo_user: str) -> int | None:
         return None
 
 
+# T-5367: the poke-landed signal reads the newest TIMESTAMPED entry, not the file mtime.
+# Claude Code rewrites untimestamped metadata lines in place while a seat is idle (T-5050:
+# 2026-10-22 specialist/archivist mtimes 11-26 min old, newest entries ~5h old), so on mtime a
+# poke that never landed could read as "the session took a turn" and reset the bound.
+ACTIVITY_TAIL_BYTES = 256 * 1024
+ACTIVITY_CANDIDATES = 3  # newest few files by mtime; an idle rewrite can reorder them
+
+
+def _jsonl_entry_epoch(jsonl_dir: Path, sudo_user: str) -> float | None:
+    """Newest entry `timestamp` in the tails of the newest few session jsonls, read as
+    sudo_user. Parsing is health_export's (T-5050). None on any failure."""
+    try:  # lazy, mirroring latest_productive_jsonl_mtime's import shape
+        from tools.health_export import _newest_entry_epoch  # noqa: PLC0415
+    except ImportError:  # pragma: no cover - import shape varies by runner
+        from health_export import _newest_entry_epoch  # type: ignore[no-redef]  # noqa: PLC0415
+    script = (
+        f"find {shlex.quote(str(jsonl_dir))} -maxdepth 1 -name '*.jsonl' -printf '%T@ %p\\n' "
+        f"2>/dev/null | sort -rn | head -{ACTIVITY_CANDIDATES} | cut -d' ' -f2- | "
+        f"while IFS= read -r f; do printf '\\0'; tail -c {ACTIVITY_TAIL_BYTES} \"$f\"; done"
+    )
+    try:
+        result = subprocess.run(_sudo(sudo_user) + ["bash", "-c", script], capture_output=True,
+                                check=False, timeout=_GIT_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    best = None
+    for chunk in result.stdout.split(b"\0")[1:]:
+        try:
+            ts = _newest_entry_epoch(chunk.decode("utf-8", "replace"), claude=True)
+        except Exception:  # noqa: BLE001 - a bad tail is "no evidence", never a crash
+            ts = None
+        if ts is not None and (best is None or ts > best):
+            best = ts
+    return best
+
+
+def latest_jsonl_activity(jsonl_dir: Path, sudo_user: str) -> int | None:
+    """The poke-effectiveness signal (T-5367): did the session take a turn at all?
+
+    The newest timestamped entry, capped by the newest file mtime (an entry cannot
+    postdate its write). With no readable timestamped entry it falls back to the mtime,
+    the pre-T-5367 reading. Error turns still count (they are timestamped records), which
+    is what effectiveness wants; see `latest_productive_jsonl_mtime` for why liveness
+    differs. None only when there is no mtime either.
+    """
+    mtime = latest_jsonl_mtime(jsonl_dir, sudo_user)
+    if mtime is None:
+        return None
+    entry = _jsonl_entry_epoch(jsonl_dir, sudo_user)
+    return min(int(entry), mtime) if entry is not None else mtime
+
+
 # T-2387: how far back to look for a NON-ERROR assistant turn. 200 mirrors
 # context_fill_monitor.API_HEALTH_TAIL_LINES (same file, same sudo'd tail read).
 # Sizing matters in one direction only: if a genuinely-working seat's newest
@@ -457,6 +722,22 @@ PRODUCTIVE_TAIL_LINES = 200
 PRODUCTIVE_LIVENESS_ENABLED = os.environ.get(
     "PANTHEON_PRODUCTIVE_LIVENESS_ENABLED", "0") == "1"
 
+# T-5400 ship-dark, same T-1126 convention. Armed, the UNARMED-productive liveness
+# path reads the newest timestamped entry (`latest_jsonl_activity`, T-5367) instead of
+# the raw mtime, which an idle metadata rewrite advances (T-5050), making an idle or
+# wedged seat look recently active. Arming makes such seats read idle sooner: more pokes.
+ENTRY_LIVENESS_ENABLED = os.environ.get(
+    "PANTHEON_ENTRY_LIVENESS_ENABLED", "0") == "1"
+
+
+def jsonl_turn_signal(jsonl_dir: Path, sudo_user: str) -> int | None:
+    """Did the seat take a turn, any outcome: entry-based when T-5400 is armed, else
+    the raw mtime. Shared by the liveness default and tui_wedge_sampler so the wedge
+    detector and the sampler that measured its threshold read the same clock."""
+    if ENTRY_LIVENESS_ENABLED:
+        return latest_jsonl_activity(jsonl_dir, sudo_user)
+    return latest_jsonl_mtime(jsonl_dir, sudo_user)
+
 
 def latest_productive_jsonl_mtime(
     jsonl_dir: Path, sudo_user: str, agent: str = "?"
@@ -469,11 +750,12 @@ def latest_productive_jsonl_mtime(
 
       "did the session take a turn at all?"  — poke-effectiveness. An error turn
           COUNTS: the poke landed, the session woke, it produced output. That is
-          `latest_jsonl_mtime`, and it is correct as written.
+          `latest_jsonl_activity` (T-5367: the newest timestamped entry, since
+          the raw mtime also moves on an idle metadata rewrite).
       "is this seat doing work?"             — liveness. An error turn must NOT
           count. This function.
 
-    Conflating them is the T-2387 defect: atlas hit the monthly spend cap and
+    Conflating them is the T-2387 defect: artisan hit the monthly spend cap and
     produced 23 turns / 23 errors on 07-30 and 22 / 22 on 07-31 — 59 identical
     failures across two days — and every check asking "did it produce a turn"
     answered YES for the entire outage. mtime advances on an error just as
@@ -521,14 +803,15 @@ def liveness_jsonl_mtime(jsonl_dir: Path, sudo_user: str, agent: str = "?") -> i
     """The jsonl activity signal for LIVENESS callers, ship-dark switched (T-2387).
 
     Armed  → newest non-error assistant turn (a seat erroring in a loop goes quiet).
-    Default→ `latest_jsonl_mtime`, byte-for-byte the pre-T-2387 behaviour.
+    Default→ `jsonl_turn_signal`: the raw mtime (pre-T-2387 behaviour), or the newest
+             timestamped entry when T-5400's ENTRY_LIVENESS_ENABLED is armed.
 
     Poke-effectiveness callers must NOT use this — they want the turn-counting
     signal regardless of outcome. See `latest_productive_jsonl_mtime`.
     """
     if PRODUCTIVE_LIVENESS_ENABLED:
         return latest_productive_jsonl_mtime(jsonl_dir, sudo_user, agent)
-    return latest_jsonl_mtime(jsonl_dir, sudo_user)
+    return jsonl_turn_signal(jsonl_dir, sudo_user)
 
 
 def active_team_inboxes(teams_dir: Path, sudo_user: str) -> bool:
@@ -591,10 +874,12 @@ def _ledger_union_tac_cmd(repo_path: Path, n: int = 500) -> str:
     chronological) followed by the legacy flat file if it still exists, then
     `tac | head` to surface the newest entries.
 
-    The `ledger/*/*.jsonl` glob structurally excludes the flat
-    `2026.jsonl.archive-pre-d10-shard` (it lives at ledger/ root, not in a
-    subfolder), matching the helper's archive exclusion. Pre-migration the
-    glob matches nothing and only the legacy file is read — no behavior change.
+    Only `<seg>/<seg>.jsonl` is a shard, the helper's own rule (T-4517). A
+    `ledger/*/*.jsonl` glob also took `ledger/appetite/<seg>.jsonl`, which sorts
+    after every `2026-W*` dir, so `tac | head` returned only appetite lines and
+    every ledger-gated check went blind. The flat
+    `2026.jsonl.archive-pre-d10-shard` lives at ledger/ root, so it is never a
+    shard. Pre-migration no subfolder matches and only the legacy file is read.
 
     Runs remotely under `sudo bash -c`; built as a single shell string. No
     untrusted interpolation — repo_path is a config-derived Path.
@@ -605,8 +890,8 @@ def _ledger_union_tac_cmd(repo_path: Path, n: int = 500) -> str:
     # non-existent legacy path is suppressed. Files are emitted in sorted
     # (chronological) segment order, legacy last, then reversed by tac.
     return (
-        f"{{ for f in $(ls -d {ledger_dir}/*/*.jsonl 2>/dev/null | sort); "
-        f"do cat \"$f\"; done; "
+        f"{{ for d in $(ls -d {ledger_dir}/*/ 2>/dev/null | sort); "
+        f"do s=\"${{d%/}}\"; f=\"$s/${{s##*/}}.jsonl\"; [ -f \"$f\" ] && cat \"$f\"; done; "
         f"[ -f {legacy} ] && cat {legacy}; }} 2>/dev/null | tac | head -n {n}"
     )
 
@@ -656,7 +941,8 @@ def latest_terminal_state_ledger_ts_for_agent(
             continue
         if not isinstance(obj, dict):
             continue
-        if obj.get("agent") != ledger_agent_id:
+        # T-4737: legacy id (history) or ORG-100 role id + seat slot (new).
+        if not agent_role_map.ledger_entry_by(obj, ledger_agent_id):
             continue
         action = obj.get("action") or ""
         if not isinstance(action, str):
@@ -716,7 +1002,8 @@ def latest_ledger_entry_ts_for_agent(repo_path: Path, sudo_user: str, ledger_age
             continue
         if not isinstance(obj, dict):
             continue
-        if obj.get("agent") != ledger_agent_id:
+        # T-4737: legacy id (history) or ORG-100 role id + seat slot (new).
+        if not agent_role_map.ledger_entry_by(obj, ledger_agent_id):
             continue
         ts_str = obj.get("ts")
         if not isinstance(ts_str, str):
@@ -742,7 +1029,8 @@ def _scan_actionable_tickets(
     sudo_user: str,
     queue_states: tuple[str, ...] = ("inbox", "active"),
 ) -> int | None:
-    """Count tickets in the `queue_states` dirs where target is in `targets`, no
+    """Count tickets in the `queue_states` dirs where target OR delivered_to (T-5515) is
+    in `targets`, no
     unmet depends_on, not_before (if set) is in the past, the labels field
     does not contain interactive-required, AND blocked_by is not "event"
     (T-0644: event-driven holds wait on a structural witness — pane state,
@@ -761,13 +1049,13 @@ def _scan_actionable_tickets(
     actionable queue. The default ("inbox", "active") is the always-on
     HEAD-ORCHESTRATOR reading — orchestrator is meant to continuously DRAIN its
     inbox, so an inbox ticket sitting while it idles IS a "why aren't you
-    working" signal. Scope-managed SUB-ORCHESTRATOR seats (atlas/metis) are
+    working" signal. Scope-managed SUB-ORCHESTRATOR seats (artisan/mason) are
     dispatched work by the HO and are legitimately idle between dispatches;
     their inbox is a pending/undispatched bucket (persona-consume is a wake
     controller, not a ticket-mover — inbox tickets wait for dispatch, they
     do not auto-become active work). So sub-orchs pass ("active",): only a
     CLAIMED, in-progress ticket counts as work the seat could be stuck on.
-    This kills the idle-with-unclaimed-inbox false-fire (metis sat idle with
+    This kills the idle-with-unclaimed-inbox false-fire (mason sat idle with
     T-3457 unclaimed in inbox → p1a/p1b false-fired) WITHOUT hiding a genuine
     wedge: a seat wedged mid-work holds an ACTIVE ticket → still fires; a
     wedge-before-claim (wake Enter eaten by a modal) is caught by
@@ -782,19 +1070,20 @@ def _scan_actionable_tickets(
     """
     inbox_dir = repo_path / "tickets" / "inbox"
     active_dir = repo_path / "tickets" / "active"
-    # awk emits one line per ticket: "<path>|<target>|<depends_on>|<not_before>|<labels>|<blocked_by>"
+    # awk emits one line per ticket: "<path>|<target>|<depends_on>|<not_before>|<labels>|<blocked_by>|<delivered_to>"
     # — stops scanning each file at the closing '---' of the frontmatter.
     awk_prog = (
-        r"""BEGIN { in_fm=0; target=""; deps=""; nb=""; labels=""; blocked=""; path="" }
-        FNR==1 { if (path!="") print path "|" target "|" deps "|" nb "|" labels "|" blocked;
-                 path=FILENAME; in_fm=0; target=""; deps=""; nb=""; labels=""; blocked="" }
+        r"""BEGIN { in_fm=0; target=""; deps=""; nb=""; labels=""; blocked=""; dlv=""; path="" }
+        FNR==1 { if (path!="") print path "|" target "|" deps "|" nb "|" labels "|" blocked "|" dlv;
+                 path=FILENAME; in_fm=0; target=""; deps=""; nb=""; labels=""; blocked=""; dlv="" }
         /^---$/ { if (in_fm==0) { in_fm=1 } else { in_fm=2 } }
         in_fm==1 && /^target:/ { sub(/^target:[[:space:]]*/, ""); target=$0 }
         in_fm==1 && /^depends_on:/ { sub(/^depends_on:[[:space:]]*/, ""); deps=$0 }
         in_fm==1 && /^not_before:/ { sub(/^not_before:[[:space:]]*/, ""); nb=$0 }
         in_fm==1 && /^labels:/ { sub(/^labels:[[:space:]]*/, ""); labels=$0 }
         in_fm==1 && /^blocked_by:/ { sub(/^blocked_by:[[:space:]]*/, ""); blocked=$0 }
-        END { if (path!="") print path "|" target "|" deps "|" nb "|" labels "|" blocked }"""
+        in_fm==1 && /^delivered_to:/ { sub(/^delivered_to:[[:space:]]*/, ""); dlv=$0 }
+        END { if (path!="") print path "|" target "|" deps "|" nb "|" labels "|" blocked "|" dlv }"""
     )
     cmd = _sudo(sudo_user) + [
         "bash", "-c",
@@ -813,9 +1102,9 @@ def _scan_actionable_tickets(
     targets_lower = {t.lower() for t in targets}
     now = datetime.now(timezone.utc)
     for line in result.stdout.splitlines():
-        # Tolerate both old 5-field and new 6-field shapes so test fixtures
-        # without the blocked_by column still parse cleanly.
-        parts = line.split("|", 5)
+        # Tolerate the older 5- and 6-field shapes so test fixtures without the
+        # blocked_by / delivered_to columns still parse cleanly.
+        parts = line.split("|", 6)
         if len(parts) < 5:
             continue
         _path = parts[0]
@@ -828,8 +1117,13 @@ def _scan_actionable_tickets(
         deps = parts[2]
         nb = parts[3]
         labels = parts[4]
-        blocked_by = parts[5] if len(parts) == 6 else ""
-        if target.strip().lower() not in targets_lower:
+        blocked_by = parts[5] if len(parts) >= 6 else ""
+        delivered_to = parts[6] if len(parts) == 7 else ""
+        # T-5515: since the ORG-088 role pooling (10-19) a ticket targets role:<R> and
+        # names its holder in delivered_to. Match either, or the count is 0 for every
+        # seat and p1b (stuck with work) can never fire.
+        if (target.strip().lower() not in targets_lower
+                and delivered_to.strip().lower() not in targets_lower):
             continue
         if deps.strip() and deps.strip() != "[]":
             continue
@@ -996,25 +1290,20 @@ def latest_assistant_ends_without_tool_use(jsonl_path: Path, sudo_user: str) -> 
     return False
 
 
-# T-3075: parse the `<channel source="plugin:telegram:telegram" ... ts="<iso>">`
-# marker Claude Code writes to `queue-operation` jsonl entries for every
-# plugin-delivered inbound. Applied to the *parsed* JSON content string, so
-# the raw JSONL's `\"`-escaping is already resolved by json.loads.
-_TELEGRAM_INBOUND_TS_RE = re.compile(r'ts="([^"]+)"')
-
-
 def latest_telegram_inbound_ts(jsonl_path: Path, sudo_user: str) -> int | None:
     """Read the most-recent operator-inbound Telegram timestamp from HO's jsonl.
 
     Replaces the T-0223 `fetch_bridge_health` Gate-1 source, retired when
-    pantheon-bridge was decommissioned (T-0767, 2026-06-04). Scans back
-    through the last 500 lines of the jsonl for `queue-operation` entries
-    of `enqueue` operation whose `content` field mentions
-    `plugin:telegram:telegram`, and returns the max marker-ts (unix seconds)
-    across matches — or None on no-matches / probe error.
+    pantheon-bridge was decommissioned (T-0767, 2026-06-04). Reads the last 500
+    lines of the jsonl (cross-account, via sudo) and parses them with the shared
+    tools/telegram_inbound parser. It returns the max inbound ts (unix seconds),
+    or None on no inbound / probe error.
 
-    ISO-8601 UTC strings compare lexicographically = time-order, so max()
-    over strings works without parsing until we need to convert the winner.
+    T-4212: T-3075 counted only `queue-operation` enqueue entries. A message to an
+    IDLE HO is written as a `user` turn, and one delivered mid-turn as a
+    `queued_command` attachment, so chatting with an idle HO read as the operator ABSENT.
+    The shared parser accepts all three shapes, and only strings that START with
+    the channel tag (quoted prose never counts).
     """
     cmd = _sudo(sudo_user) + [
         "bash",
@@ -1033,37 +1322,7 @@ def latest_telegram_inbound_ts(jsonl_path: Path, sudo_user: str) -> int | None:
         return None
     if result.returncode != 0:
         return None
-    latest_iso: str | None = None
-    for line in result.stdout.splitlines():
-        # Cheap prefilter — parse JSON only on lines that mention the marker.
-        if "plugin:telegram:telegram" not in line:
-            continue
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (json.JSONDecodeError, ValueError):
-            continue
-        if not isinstance(obj, dict):
-            continue
-        if obj.get("type") != "queue-operation" or obj.get("operation") != "enqueue":
-            continue
-        content = obj.get("content")
-        if not isinstance(content, str) or "plugin:telegram:telegram" not in content:
-            continue
-        for match in _TELEGRAM_INBOUND_TS_RE.finditer(content):
-            iso = match.group(1)
-            if latest_iso is None or iso > latest_iso:
-                latest_iso = iso
-    if latest_iso is None:
-        return None
-    try:
-        # Handle both `...Z` and `+00:00` shapes.
-        s = latest_iso.replace("Z", "+00:00")
-        return int(datetime.fromisoformat(s).timestamp())
-    except (ValueError, TypeError):
-        return None
+    return telegram_inbound.latest_inbound_ts_from_lines(result.stdout.splitlines())
 
 
 # ---------------------------------------------------------------------------
@@ -1103,13 +1362,13 @@ def is_cyber_refusal_message(obj: dict) -> bool:
 #   session: "You've hit your session limit · resets 9:40am (UTC)"
 #            (orchestrator, 38x, 2026-08-02 06:28-09:34Z)
 #   spend:   "You've hit your monthly spend limit · raise it at claude.ai/..."
-#            (atlas, 59x, 2026-07-30/31, a 48h outage — T-2387)
+#            (artisan, 59x, 2026-07-30/31, a 48h outage — T-2387)
 #
 # ⚠️ THE TWO BEHAVE OPPOSITELY, and the discriminator is IN the strings
 # ("resets" vs "raise it"). The session limit self-clears at the stated time —
 # verified end-to-end 2026-08-02: cap named 09:40, first successful turn minutes
 # after, zero intervention. The spend limit holds until a HUMAN raises it —
-# T-2290's falsification: atlas erred every turn for two days. A generic
+# T-2290's falsification: artisan erred every turn for two days. A generic
 # "limit" substring collapses two branches that need opposite routing.
 _CAP_SESSION_RE = re.compile(r"hit your session limit.*resets\s+(\S+(?:\s*\([A-Z]+\))?)")
 _CAP_SPEND_RE = re.compile(r"hit your (?:monthly|weekly)?\s*spend limit")
@@ -1232,9 +1491,9 @@ def classify_cap_modal(pane_text: str | None) -> str | None:
 # T-3558(b2): the Claude Code TOOL-PERMISSION modal — a DISTINCT wedge class
 # from the cap modal above.
 #
-# Specimen: tools/testdata/atlas_permission_modal_pane.txt — a REAL capture (modal
-# region) off atlas/suborch2 2026-09-07, the Read(//tmp/**) push-gate variant that
-# wedged atlas (it read /tmp push-logs via the Read TOOL in manual mode; the prompt
+# Specimen: tools/testdata/artisan_permission_modal_pane.txt — a REAL capture (modal
+# region) off artisan/suborch2 2026-09-07, the Read(//tmp/**) push-gate variant that
+# wedged artisan (it read /tmp push-logs via the Read TOOL in manual mode; the prompt
 # sat unanswered -> mail staled -> caught by mail_staleness, cleared by Recovery).
 #
 # DIAGNOSTIC / DETECTION ONLY. A permission prompt is a SAFETY BOUNDARY and must
@@ -1283,6 +1542,49 @@ def classify_permission_modal(pane_text: str | None) -> str | None:
     return PERMISSION_MODAL
 
 
+# ---------------------------------------------------------------------------
+# T-3558(b2), the preview-chip slice: a FOCUSED artifact-preview chip takes the
+# composer's Enter, so a wake or poke never submits and the seat sits wedged.
+#
+# Specimens: tools/testdata/artisan_preview_chip_{focused,unfocused}_pane.txt, REAL
+# artisan bytes from 2026-09-07 (its pipe-pane log, the T-3497 slice-1 wedge that was
+# cleared before anyone could capture-pane it), replayed through a VT emulator at the
+# pane's own 209x50 geometry. Not hand-typed.
+#
+# Healthy chip:  "  ⧉  t2738-preview · ctrl+] to open"              (harmless)
+# Focused chip:  "❯ ⧉  t2738-preview · Enter to open · x to dismiss" (the wedge)
+#
+# Match the focused chip's whole LINE, not its tokens: prose quoting "Enter to open ·
+# x to dismiss" (this ticket's own body, shown in a pane) must not read as a wedge.
+# DETECTION ONLY. Clearing it (x, then Enter) is deterministic, but arming a
+# modal-specific auto-clear on a seat is the operator's call (TG 6791 authorised generic
+# pokes at orchestrator parity, nothing more), so nothing here sends a key.
+_PREVIEW_CHIP_FOCUSED_RE = re.compile(
+    r"^\s*❯\s*⧉\s+(\S+)\s+·\s+Enter to open\s+·\s+x to dismiss\s*$")
+
+PREVIEW_CHIP = "preview_chip"
+
+
+def classify_preview_chip(pane_text: str | None) -> str | None:
+    """Pure: "preview_chip:<name>" when a focused preview chip is holding the
+    composer's Enter; None otherwise, including the harmless unfocused chip and
+    anything unrecognised. DIAGNOSTIC ONLY."""
+    if not pane_text:
+        return None
+    for line in _strip_ansi(pane_text).splitlines():
+        m = _PREVIEW_CHIP_FOCUSED_RE.match(line)
+        if m:
+            return f"{PREVIEW_CHIP}:{m.group(1)}"
+    return None
+
+
+def classify_wedge(pane_text: str | None) -> str | None:
+    """The named wedge class for a STUCK escalation, or None: a permission modal
+    (its requested permission) first, then a focused preview chip. The cap modal
+    keeps its own gate (_session_cap_modal); it is not a STUCK class."""
+    return classify_permission_modal(pane_text) or classify_preview_chip(pane_text)
+
+
 def _session_cap_modal(cfg: dict) -> str | None:
     """Pre-poke gate seam for the pane modal, parallel to _session_cap_state.
 
@@ -1308,6 +1610,12 @@ def send_modal_confirm(cfg: dict) -> bool:
     typing text into a live menu is how a dismissal becomes a selection. Callers
     must have classified MODAL_SAFE first — this function does not re-check.
     """
+    return send_bare_enter(cfg)
+
+
+def send_bare_enter(cfg: dict) -> bool:
+    """One bare Enter to the agent's pane, no text. The caller owns the decision
+    (send_modal_confirm: MODAL_SAFE; _flush_stuck_poke: submit_verify.should_repress)."""
     pane = cfg["tmux_target_pane"]
     cmd = _sudo(cfg["sudo_user"]) + [
         "bash", "-c",
@@ -1476,15 +1784,17 @@ def latest_assistant_interactive_tool_use(jsonl_path: Path, sudo_user: str) -> s
 # ---------------------------------------------------------------------------
 
 
-def capture_pane(pane: str, sudo_user: str) -> str | None:
+def capture_pane(pane: str, sudo_user: str, *, escapes: bool = False) -> str | None:
     """Capture the visible content of the agent's tmux pane.
 
     Returns None on any subprocess failure (sudo denied, tmux not running,
-    etc.) — fail-open so P1.d doesn't fire on flaky reads.
+    etc.) — fail-open so P1.d doesn't fire on flaky reads. escapes=True adds -e
+    (keep SGR attributes) for the idle probe, which needs DIM (T-4284).
     """
+    flags = "-p -e" if escapes else "-p"
     cmd = _sudo(sudo_user) + [
         "bash", "-c",
-        f"XDG_RUNTIME_DIR=/run/user/$(id -u) tmux capture-pane -p -t {pane}",
+        f"XDG_RUNTIME_DIR=/run/user/$(id -u) tmux capture-pane {flags} -t {pane}",
     ]
     try:
         result = subprocess.run(
@@ -1638,6 +1948,44 @@ def check_p1a(cfg: dict, idle_threshold_seconds: int) -> bool:
     return queue_count >= 1
 
 
+def agent_committed_recently(
+    repo_path: Path, sudo_user: str, author: str, within_seconds: int
+) -> bool:
+    """T-3709: True iff `author` has a git commit in `repo_path` (that agent's
+    own pantheon-config clone) within the last `within_seconds`, by commit date.
+
+    Signals the agent is actively producing git-visible OUTPUT — a busy session,
+    not an idle-waiting one. Author-filtered to the agent's persona name so a
+    commit merely PULLED from another agent (peer clones carry others' commits)
+    does not count as this agent's work; only its own commits do. Deliberately
+    NOT scoped to a path subset — a commit to tools/ / adr/ / sop/ is just as
+    much active work as one to ledger/ or tickets/, and over-narrowing would
+    re-introduce the false-positive.
+
+    Fail-CLOSED toward 'not recently' (False) on any error/timeout: a git
+    failure must PRESERVE the P1.b fire safety-net (poke fires), never silence
+    it. A genuinely-wedged agent cannot commit, so this cannot mask a real wedge.
+    """
+    cmd = _sudo(sudo_user) + [
+        "git", "-C", str(repo_path), "log", "-1",
+        f"--author={author}", f"--since={within_seconds} seconds ago",
+        "--format=%H",
+    ]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_JSONL_PROBE_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    return bool(result.stdout.strip())
+
+
 def check_p1b(
     cfg: dict,
     bridge_url: str,
@@ -1710,6 +2058,26 @@ def check_p1b(
         ))
         if terminal_ts >= ledger_ts and (int(time.time()) - terminal_ts) < window:
             return False
+    # T-3709: AND-NOT recent-write-activity. The gates above establish
+    # "operator-absent + await-shaped-turn + non-empty queue" — but a session
+    # doing continuous real work looks identical to an idle-waiting one through
+    # the operator-inbound gate (the operator asleep says nothing about the agent's
+    # productivity). If the agent has committed git-visible output within the
+    # write-activity window, it is working, not idle-waiting → suppress. Gates on
+    # OUTPUT (commits), NOT transcript (thinking/tool_use fire constantly and are
+    # too noisy). Bounded: a busy-then-genuinely-idle agent is poked at most
+    # ~N min after its last commit (next cycle once the window lapses).
+    write_window = int(os.environ.get(
+        "ACTIVITY_MONITOR_P1B_WRITE_ACTIVITY_SECONDS",
+        ACTIVITY_MONITOR_P1B_WRITE_ACTIVITY_SECONDS,
+    ))
+    if agent_committed_recently(
+        cfg["pantheon_config_path"],
+        cfg["sudo_user"],
+        cfg["bridge_inbound_key"],
+        write_window,
+    ):
+        return False
     return True
 
 
@@ -1854,10 +2222,13 @@ def send_poke(cfg: dict, prompt: str) -> bool:
     pane = cfg["tmux_target_pane"]
     sudo_user = cfg["sudo_user"]
     helper = Path(cfg["pantheon_config_path"]) / "tools" / "send_keys_submit.sh"
+    # T-4141: shlex.quote, NOT json.dumps. json.dumps yields a DOUBLE-quoted shell
+    # string, so backticks and $(...) in the prompt were executed as the target user
+    # (P1B_POKE_PROMPT's backticked ls arrived in the pane as '()').
     cmd = _sudo(sudo_user) + [
         "bash", "-c",
         f'XDG_RUNTIME_DIR=/run/user/$(id -u) INJECT_ENTER_DELAY={INJECT_ENTER_DELAY}'
-        f' bash {helper} {pane} {json.dumps(prompt)}',
+        f' bash {shlex.quote(str(helper))} {shlex.quote(pane)} {shlex.quote(prompt)}',
     ]
     try:
         r = subprocess.run(
@@ -1870,16 +2241,20 @@ def send_poke(cfg: dict, prompt: str) -> bool:
 
 def _pane_idle_probe(cfg: dict) -> bool | None:
     """THREE-state probe of the agent's pane for the poke busy-guard (T-3599):
-    True = idle at a prompt, False = BUSY (generating, OR the T-3579 manage-view
-    where a background agent holds the seat and Claude Code QUEUES injected input
-    instead of running it), None = UNKNOWN.
+    True = idle at a prompt, False = BUSY (generating, OR a background agent is
+    still running), None = UNKNOWN. T-4284: input DOES submit once the main turn
+    has ended with a background agent running, and mail delivery now wakes that
+    state. But a P1.b poke is a NUDGE, and an agent waiting on its own delegated
+    work is not in a self-imposed wait, so this probe passes
+    background_agents_busy=True and keeps T-4087's skip.
 
     Classification is DELEGATED to inbox_consumer.pane_idle_state — the same
     single-owner the mailbox_wake busy-defer consults (T-2681/T-3554) — so the two
     poke/wake consumers cannot drift apart on the sentinel set (the exact drift
     T-2171 had to fix in keep_going). Part A (merged @ad76818457) taught that
-    classifier to read the manage-view footer as BUSY; this probe is how
-    activity_monitor finally CONSULTS it.
+    classifier to read the manage-view footer as BUSY (T-4087 and T-4284 later
+    narrowed that to background AGENTS, and only for nudge callers); this probe is
+    how activity_monitor finally CONSULTS it.
 
     Fail-open to None on any capture/import/classify failure: a flaky probe must
     never, by itself, skip a needed poke or swallow a real send-failure — each
@@ -1889,7 +2264,7 @@ def _pane_idle_probe(cfg: dict) -> bool | None:
     pane = cfg.get("tmux_target_pane")
     if not pane:
         return None
-    pane_text = capture_pane(pane, cfg["sudo_user"])
+    pane_text = capture_pane(pane, cfg["sudo_user"], escapes=True)
     if pane_text is None:
         return None
     try:
@@ -1897,7 +2272,7 @@ def _pane_idle_probe(cfg: dict) -> bool | None:
             from tools.inbox_consumer import pane_idle_state  # run-as-package / tests
         except ImportError:
             from inbox_consumer import pane_idle_state  # run-as-script (prod)
-        return pane_idle_state(pane_text)
+        return pane_idle_state(pane_text, background_agents_busy=True)
     except Exception:  # noqa: BLE001 — best-effort signal; UNKNOWN on any error
         return None
 
@@ -1905,9 +2280,11 @@ def _pane_idle_probe(cfg: dict) -> bool | None:
 def _soft_defer_or_fail(cfg: dict, agent: str, predicate: str) -> int:
     """T-3599 send-fail soft-defer: called only after send_poke() has FAILED.
     Re-probe the pane and return 0 (soft-defer) IFF it is now DEFINITIVELY busy
-    (False) — a busy pane queues-not-submits, so the send lost nothing (the mail
-    it re-injects stays queued), the state self-clears, and a return-1 there just
-    mislabels a benign busy pane as a unit-failure (OnFailure -> recovery).
+    (False) — a generating pane queues-not-submits, and a pane whose main turn
+    ended with a background agent running is deliberately not nudged (T-4284). So
+    the send lost nothing (the mail it re-injects stays queued), the state
+    self-clears, and a return-1 there just mislabels a benign busy pane as a
+    unit-failure (OnFailure -> recovery).
 
     A genuinely IDLE pane that rejected the submit (True) is the real T-2245
     send-liveness anomaly, and an UNKNOWN re-probe (None) is NOT proof-of-busy:
@@ -1966,7 +2343,8 @@ def _wedge_specimen_dir() -> Path:
 def _capture_wedge_specimen(cfg: dict, agent: str, vocab: str) -> tuple[Path | None, str | None]:
     """Best-effort: save the current pane capture as a wedge specimen. Returns
     (path, wedge_class) — the saved file's path and the detected wedge class
-    (classify_permission_modal), either of which may be None. Fail-open — any
+    (classify_wedge: permission modal or focused preview chip), either of which
+    may be None. Fail-open — any
     capture/write/prune error is swallowed (logged) so it can never perturb the
     escalation it rides on. Only runs when ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE
     is truthy (checked by the caller). The wedge_class lets the caller name the
@@ -1981,8 +2359,9 @@ def _capture_wedge_specimen(cfg: dict, agent: str, vocab: str) -> tuple[Path | N
             return (None, None)  # nothing to preserve (capture failed / empty)
         # T-3558(b2): name the wedge class in the specimen if we recognise it, so
         # the saved file + log line carry the diagnostic (which permission was
-        # blocking). DETECTION ONLY — nothing here answers the prompt.
-        wedge_class = classify_permission_modal(text)
+        # blocking, or which preview chip holds the Enter). DETECTION ONLY:
+        # nothing here answers a prompt or clears a chip.
+        wedge_class = classify_wedge(text)
         d = _wedge_specimen_dir()
         d.mkdir(parents=True, exist_ok=True)
         # Microsecond stamp: readable AND collision-free even for two wedges in
@@ -2033,9 +2412,13 @@ def _escalate_stuck(cfg: dict, agent: str, predicate: str, msg: str, vocab: str,
             "ACTIVITY_MONITOR_WEDGE_SPECIMEN_CAPTURE", ""
         ).strip().lower() in ("1", "true", "yes", "on"):
             _, detected_class = _capture_wedge_specimen(cfg, agent, vocab)
+        if detected_class and detected_class.startswith(f"{PREVIEW_CHIP}:"):
+            hint = "a focused preview chip holds the Enter; clear it by hand (x, then Enter)"
+        else:
+            hint = "do not auto-answer a permission prompt"
         alert_msg = msg if not detected_class else (
             f"{msg}\n[activity_monitor T-3558: detected wedge class → {detected_class} "
-            f"— DIAGNOSTIC ONLY, verify the pane; do not auto-answer a permission prompt]"
+            f"— DIAGNOSTIC ONLY, verify the pane; {hint}]"
         )
         try:
             _route_failure_alert(agent, alert_msg, vocab)
@@ -2135,6 +2518,84 @@ def quiet_is_attributable(
 # ---------------------------------------------------------------------------
 
 
+# T-4141: the pokes this monitor injects. If one never submitted it sits in the
+# composer; flush it with a bare Enter (bounded) instead of stacking another on top.
+STUCK_POKE_PROMPTS = (P1A_POKE_PROMPT, P1B_POKE_PROMPT, P1C_POKE_PROMPT)
+MAX_STUCK_POKE_REPRESSES = 3
+
+
+def _flush_stuck_poke(cfg: dict, agent: str, state_path: Path) -> bool:
+    """True iff an earlier poke was found stuck in the composer and ONE Enter was
+    sent (the caller then skips this cycle's poke). The decision is
+    submit_verify.should_repress: our poke text is still in the composer, and the
+    pane is not generating, not running a background agent, and not on a modal.
+    Bounded at MAX_STUCK_POKE_REPRESSES per stuck episode; the counter resets once
+    no stuck poke is seen. Fail-safe: any capture/import error means no keystroke."""
+    counter = Path(str(state_path) + ".stuck_repress")
+    try:
+        try:
+            from tools import submit_verify as sv  # run-as-package / tests
+        except ImportError:
+            import submit_verify as sv  # run-as-script (prod)
+        pane_text = capture_pane(cfg["tmux_target_pane"], cfg["sudo_user"])
+        profile = sv.get_profile("claude-code")
+        stuck = bool(pane_text) and any(
+            sv.should_repress(profile, pane_text, p) for p in STUCK_POKE_PROMPTS)
+    except Exception:
+        return False
+    if not stuck:
+        counter.unlink(missing_ok=True)
+        return False
+    try:
+        done = int(counter.read_text().strip() or 0)
+    except (OSError, ValueError):
+        done = 0
+    if done >= MAX_STUCK_POKE_REPRESSES:
+        _log(agent, f"stuck poke still in the composer after {done} Enters — holding (T-4141)")
+        return False
+    sent = send_bare_enter(cfg)
+    try:
+        counter.write_text(f"{done + 1}\n")
+    except OSError:
+        pass
+    _log(agent, f"stuck poke in the composer of a not-busy pane — sent Enter "
+                f"{done + 1}/{MAX_STUCK_POKE_REPRESSES} (ok={sent}) instead of poking again (T-4141)")
+    return sent
+
+
+# T-4510: the periodic anti-idle/queue pokes the fleet usage gate may suppress at >=95% of
+# the shared weekly Max. Deliberately NOT here: P1.d (abandoned-turn retry), P1.c (liveness
+# backstop, ships dark), the cap-modal/cap/cyber/effectiveness branches and the TUI-wedge
+# escalation — those are recovery (sop/standard/cross-agent-dispatch-discipline.md).
+USAGE_GATED_PREDICATES = frozenset({"p1a", "p1b"})
+
+# `_dispatch_poke` returns this INSTEAD of an exit code when the usage gate suppressed the
+# content poke. main() must then FALL THROUGH to the later predicates (P1.d, P1.c): a gated
+# P1.a/P1.b that ended main() would shadow the P1.d retry-inject, which is recovery.
+USAGE_SUPPRESSED = -1
+
+
+def _poke_suppressed_by_usage(agent: str, predicate: str, now: float | None = None) -> bool:
+    """T-4510: True iff this content poke must be skipped because the fleet's shared weekly
+    Max usage is at/above the gate's threshold (default 95%). Called immediately before
+    `send_poke(cfg, prompt)` — AFTER every recovery branch in `_dispatch_poke` — and only for
+    USAGE_GATED_PREDICATES. Logs once per window per (agent, predicate), not once per tick.
+    Fails OPEN: any gate error means the poke proceeds (today's behaviour)."""
+    if predicate not in USAGE_GATED_PREDICATES:
+        return False
+    try:
+        decision = fleet_usage_gate.evaluate(now)
+        if not decision.suppress:
+            return False
+        if fleet_usage_gate.should_log_once(
+                f"activity_monitor:{agent}:{predicate}", decision.window_key):
+            _log(agent, f"{predicate}: poke SUPPRESSED by the fleet usage gate — {decision.reason}; "
+                        f"resumes automatically below the threshold or at the reset (T-4510)")
+        return True
+    except Exception:  # noqa: BLE001 — a gate fault must never block or break a poke path
+        return False
+
+
 def _dispatch_poke(
     cfg: dict,
     agent: str,
@@ -2148,18 +2609,21 @@ def _dispatch_poke(
     """Send a poke for `predicate` — or, in bounded mode (T-1363), SUPPRESS it
     and escalate when prior pokes weren't advancing the session (stuck, not
     idle). Returns the main() exit code (0 = poked or cleanly suppressed; 1 =
-    poke send failed).
+    poke send failed) — or USAGE_SUPPRESSED (T-4510) when the fleet usage gate
+    skipped the content poke, which is NOT an exit code: main() falls through to
+    P1.d/P1.c instead of ending the cycle.
 
     Ship-dark: bounded_enabled=False reproduces the legacy send_poke +
     write_poke_state behavior exactly — so with the flag off, nothing changes
     EXCEPT the T-3599 busy-guard below, which only ever DEFERS (never injects), so
     it is safe-direction in both paths (mirrors the T-3579 part-A safe inversion).
     """
-    # T-3599 decide-time busy-guard (part B of the T-3579 fix). A pane that is
-    # generating, or in the manage-view where a background agent holds the seat,
-    # QUEUES an injected submit rather than running it (T-3579) — so a poke there is
-    # doomed and its send-failure would fire OnFailure -> a false unit-failure alert
-    # to recovery (confirmed live pantheon-activity-monitor@atlas 2026-09-08T19:15Z).
+    # T-3599 decide-time busy-guard (part B of the T-3579 fix). A GENERATING pane
+    # QUEUES an injected submit rather than running it — so a poke there is doomed
+    # and its send-failure would fire OnFailure -> a false unit-failure alert to
+    # recovery (confirmed live pantheon-activity-monitor@artisan 2026-09-08T19:15Z). A pane
+    # whose turn ended with a background agent running accepts input (T-4284), but
+    # it is waiting on delegated work, so the probe reads it busy and it is not poked.
     # Mirror the mailbox_wake busy-defer (T-2681/T-3554): DEFER instead of poking.
     # Only a DEFINITIVELY-busy pane (False) skips; None (UNKNOWN) and True (idle)
     # fall through and poke exactly as before — a flaky/foreign pane must not skip a
@@ -2167,6 +2631,10 @@ def _dispatch_poke(
     # it never injects, so the T-2729 shell-inject hazard is structurally
     # impossible and the sole failure mode is over-defer (poke retained; the
     # effectiveness/TUI-wedge/mail_staleness backstops still catch a real wedge).
+    # T-4141: BEFORE the busy-guard. A stuck poke reads BUSY there (text in the
+    # composer under the manage footer), so it would defer forever and never clear.
+    if _flush_stuck_poke(cfg, agent, state_path):
+        return 0
     if _pane_idle_probe(cfg) is False:
         _log(agent, f"{predicate}: pane BUSY (generating/manage-view) — "
                     f"deferring poke, not exit-1 (T-3599)")
@@ -2203,7 +2671,7 @@ def _dispatch_poke(
                             f"/{MAX_MODAL_DISMISSALS}, ok={sent}) (T-1369)")
                 write_poke_state(
                     state_path, agent, predicate,
-                    pre_poke_jsonl_mtime=latest_jsonl_mtime(
+                    pre_poke_jsonl_mtime=latest_jsonl_activity(
                         cfg["jsonl_dir"], cfg["sudo_user"]) or 0,
                     consecutive_ineffective=int(
                         prior.get("consecutive_ineffective", 0) or 0),
@@ -2225,7 +2693,7 @@ def _dispatch_poke(
                      f"clear it. Poking suppressed (a poke types text into a live "
                      f"menu). Needs a human at the pane."),
                 vocab="cap-modal", state_path=state_path,
-                cur_mtime=latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0,
+                cur_mtime=latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0,
                 consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
             )
             return 0
@@ -2243,7 +2711,7 @@ def _dispatch_poke(
                      f"Enter: the other option is 'Upgrade your plan', which spends "
                      f"— that is the operator's lane. Needs a human at the pane."),
                 vocab="cap-modal-unsafe", state_path=state_path,
-                cur_mtime=latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0,
+                cur_mtime=latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0,
                 consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
             )
             return 0
@@ -2262,28 +2730,32 @@ def _dispatch_poke(
                             f"{reset_hint or 'per message'}) — NOT poking; "
                             f"self-clears, no escalation (T-1369)")
                 return 0
-            # spend_limit: holds until a HUMAN raises it (T-2290 falsification:
-            # atlas erred every turn for 48h). Alert + hold — escalate ONCE
-            # (transition-gated inside _escalate_stuck), never poke. The cap
-            # itself is the operator's lane per the standing financial rule; the
-            # escalation records the seat-state, it does not ask for a raise.
-            cur_mtime = latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+            # spend_limit: self-clears at the PRINTED reset (T-2290: the "monthly"
+            # text is really the current usage window). The wait is usually hours but
+            # CAN be long — artisan sat ~48h erroring every turn (T-2387: a far window /
+            # exhausted budget), which is why we hold + escalate ONCE (transition-gated
+            # inside _escalate_stuck) and never poke (futile until the window rolls) or
+            # restart (re-hits it). It is NOT permanent and needs no raise; a raise
+            # (the operator's lane) only shortens a long wait. The escalation records the
+            # seat-state, it does not ask for a raise.
+            cur_mtime = latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
             prior = read_poke_state(state_path) or {}
             _log(agent, f"{predicate}: session CAPPED (spend limit) — NOT poking; "
                         f"holds until raised, escalating once (T-1369)")
             _escalate_stuck(
                 cfg, agent, predicate,
-                msg=(f"⛔ [{predicate}] {agent} is SPEND-CAPPED — every turn errors "
-                     f"and the cap does NOT self-reset (T-2290/T-2387: atlas sat 48h "
-                     f"in this state reading as alive). Poking suppressed. The cap "
-                     f"is the operator's lane; this alert records the seat-state, it is "
-                     f"not a raise request."),
+                msg=(f"⛔ [{predicate}] {agent} is SPEND-CAPPED — every turn errors. "
+                     f"It self-clears at the printed reset (T-2290: the current usage "
+                     f"window), but the wait can be long — artisan sat ~48h (T-2387). "
+                     f"Poking/restarting suppressed (futile until the window rolls). A "
+                     f"raise (the operator's lane) only shortens the wait; this alert records "
+                     f"the seat-state, it is not a raise request."),
                 vocab="spend-cap", state_path=state_path, cur_mtime=cur_mtime,
                 consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
             )
             return 0
         if _session_cyber_blocked(cfg):
-            cur_mtime = latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+            cur_mtime = latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
             prior = read_poke_state(state_path) or {}
             _log(agent, f"{predicate}: session CYBER-BLOCKED (refusal) — NOT poking "
                         f"(jsonl-advance would fool effectiveness); needs RESTART")
@@ -2297,7 +2769,7 @@ def _dispatch_poke(
                 consecutive=int(prior.get("consecutive_ineffective", 0) or 0),
             )
             return 0
-        cur_mtime = latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+        cur_mtime = latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
         suppress, consecutive, reason = poke_effectiveness_decision(
             read_poke_state(state_path), cur_mtime, predicate, max_ineffective
         )
@@ -2315,6 +2787,8 @@ def _dispatch_poke(
                 consecutive=consecutive,
             )
             return 0
+        if _poke_suppressed_by_usage(agent, predicate):  # T-4510: after ALL recovery branches
+            return USAGE_SUPPRESSED
         if send_poke(cfg, prompt):
             _log(agent, f"{predicate} poke sent (bounded; consecutive_ineffective={consecutive})")
             write_poke_state(
@@ -2328,6 +2802,8 @@ def _dispatch_poke(
     # Legacy / ship-dark path — byte-for-byte the prior poke/state behavior
     # (the _record_fire call is a new, best-effort, non-wedging side-write —
     # T-3072 — it does not change what this branch pokes or persists).
+    if _poke_suppressed_by_usage(agent, predicate):  # T-4510: fleet usage gate (p1a/p1b only)
+        return USAGE_SUPPRESSED
     if send_poke(cfg, prompt):
         _log(agent, f"{predicate} poke sent")
         write_poke_state(state_path, agent, predicate)
@@ -2400,6 +2876,41 @@ def pane_is_animating(cfg: dict, gap_seconds: float) -> bool | None:
     return _pane_fp(first) != _pane_fp(second)
 
 
+# Twin of context_fill_monitor._pane_has_background_agent (T-3726), plus the T-5605
+# agent-list rows (context_fill reads those via its token-growth check): the inline
+# background-agent glyph and the manage-view footer. "← for agents" alone is NOT
+# a marker; it also renders on the idle view.
+_BG_AGENT_MARKERS = ("⧉", "↓ to manage")
+
+# T-5605: newer builds list background agents in a footer, one row per agent, with
+# neither marker above: "◯ implementer  <task>  1h 41m 18s · ↓ 361.2k tokens". A
+# FINISHED agent keeps its row with a frozen timer (orchestrator 2026-10-26 17:10Z vs
+# 17:37Z, identical), so a row only proves a running agent if it CHANGES between
+# two captures; one capture would let a stale list mask a real wedge forever.
+_BG_AGENT_ROW_RE = re.compile(
+    r"^\s*[◯○◐◑◒◓] \S+\s.*\b\d+[hms](?: \d+[ms])*(?: \d+s)? · [↓↑] [\d.]+k? tokens",
+    re.MULTILINE)
+
+
+def _pane_has_background_agent(pane_text: str | None) -> bool:
+    return bool(pane_text) and any(m in pane_text for m in _BG_AGENT_MARKERS)
+
+
+def _background_agent_running(cfg: dict, probe_gap: float) -> bool:
+    """A '⧉' / manage-footer marker, or an agent-list row that moves across
+    probe_gap. A failed capture is not evidence (False)."""
+    pane = cfg.get("tmux_target_pane") or ""
+    first = capture_pane(pane, cfg.get("sudo_user"))
+    if _pane_has_background_agent(first):
+        return True
+    rows = _BG_AGENT_ROW_RE.findall(first or "")
+    if not rows:
+        return False
+    time.sleep(probe_gap)
+    second = capture_pane(pane, cfg.get("sudo_user"))
+    return second is not None and _BG_AGENT_ROW_RE.findall(second) != rows
+
+
 def check_tui_wedge(
     cfg: dict, frozen_threshold: int, probe_gap: float
 ) -> tuple[bool, str]:
@@ -2441,6 +2952,14 @@ def check_tui_wedge(
         return (False, f"frozen {frozen_for}s but CAPPED — the cap branch owns it")
     if _session_cyber_blocked(cfg):
         return (False, f"frozen {frozen_for}s but CYBER-BLOCKED — its branch owns it")
+    # T-4712: a session waiting on a background agent has a frozen main jsonl and
+    # a pane that "animates" (the agent's elapsed timer ticks ~1Hz). That is the
+    # agent being BUSY, not wedged. Same markers as context_fill_monitor's T-3726
+    # guard; a stuck background agent stays covered by that monitor's
+    # token-growth check. A failed capture is not evidence: fall through.
+    if _background_agent_running(cfg, probe_gap):
+        return (False, f"frozen {frozen_for}s but a background agent holds the "
+                       f"turn (⧉ / '↓ to manage') — busy, not wedged")
     # Unexplained long freeze. Distinguish the moving-pane wedge from a plain
     # still idle prompt (p1a territory).
     animating = pane_is_animating(cfg, probe_gap)
@@ -2465,6 +2984,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _seat_hold(agent: str):
+    """ORG-106 L2 (T-5525, supersedes T-5244's maintenance-only check): the seat's
+    EffectiveSeatState when anything holds it (seat-state record, maintenance, OOM hold),
+    else None. Runs under Recovery's manager for other seats, so this goes through
+    seat_state.effective_for (cross-account record read). Fail-open (None) on any fault:
+    a reader fault must never mask a real wedge."""
+    try:
+        from tools import seat_state
+        e = seat_state.effective_for(agent)
+    except Exception as exc:  # noqa: BLE001
+        _log(agent, f"seat-state reader fault (fail-open): {type(exc).__name__}: {exc}")
+        return None
+    if e.fault:
+        _log(agent, f"seat-state reader fault (fail-open): {e.fault}")
+    blocked = e.intake_blocked or e.launch_blocked or e.remediation_vetoed
+    return e if blocked else None
+
+
 def main(argv: list[str] | None = None) -> int:
     try:
         args = _parse_args(argv)
@@ -2473,6 +3010,28 @@ def main(argv: list[str] | None = None) -> int:
 
     agent = args.agent
     cfg = AGENT_CONFIG[agent]
+
+    # T-5244: a seat in an ACTIVE seat-maintenance window is held on purpose (e.g. its
+    # controller disabled, the pane gone). Every action below (pokes, modal Enter,
+    # wedge alerts) is wrong there, and a poke into a missing pane fails -> exit 1 ->
+    # OnFailure -> a false unit-failure alert (mason, 2026-10-19 19:00Z). Fail-open:
+    # a registry fault reads "not in maintenance", and the window auto-expires.
+    # ORG-106 L2 (T-5525): maintenance, the OOM hold and deep-sleep (remediation_vetoed /
+    # launch_blocked) keep that skip-everything behaviour. A paused-intake record only
+    # stops NEW work: a paused seat is alive and must stay watched, so liveness, wedge and
+    # modal predicates keep running and just the queue pokes (P1.a / P1.b) are skipped.
+    hold = _seat_hold(agent)
+    if hold is not None and (hold.remediation_vetoed or hold.launch_blocked):
+        if "maintenance" in hold.sources:
+            _log(agent, "seat-maintenance ACTIVE: skipping all predicates (T-5244)")
+        else:
+            _log(agent, f"seat held ({', '.join(hold.sources)}): skipping all predicates "
+                        f"(ORG-106 L2)")
+        return 0
+    intake_held = hold is not None and hold.intake_blocked
+    if intake_held:
+        _log(agent, f"seat intake paused ({', '.join(hold.sources)}): queue pokes "
+                    f"P1.a/P1.b skipped, liveness predicates still run (ORG-106 L2)")
 
     cooldown_seconds = int(os.environ.get(
         "ACTIVITY_MONITOR_COOLDOWN_SECONDS", ACTIVITY_MONITOR_COOLDOWN_SECONDS
@@ -2486,6 +3045,11 @@ def main(argv: list[str] | None = None) -> int:
     operator_absent_threshold = int(os.environ.get(
         "ACTIVITY_MONITOR_P1B_OPERATOR_SECONDS", P1B_OPERATOR_ABSENT_THRESHOLD_SECONDS
     ))
+    # T-4683: an explicit P1.b off-switch. Raising the threshold does NOT pause
+    # P1.b: check_p1b's fail-closed branch sets absent == threshold whenever the
+    # session jsonl has no telegram inbound yet (every fresh session after a
+    # restart), so any threshold passes. Recovery predicates are unaffected.
+    p1b_enabled = os.environ.get("ACTIVITY_MONITOR_P1B_ENABLED", "1") != "0"
     p1d_age_threshold = int(os.environ.get(
         "ACTIVITY_MONITOR_P1D_AGE_SECONDS", P1D_RATE_LIMIT_AGE_SECONDS
     ))
@@ -2523,10 +3087,34 @@ def main(argv: list[str] | None = None) -> int:
         "ACTIVITY_MONITOR_TUI_WEDGE_ENABLED", ""
     ).strip().lower() in ("1", "true", "yes", "on")
 
+    # P1.b handled-wait backoff (T-3991) — default-ON with an env kill-switch; see
+    # the constant block. Stretches the p1b cooldown once a wait has repeated-fired
+    # AND been ticketed to the operator. Failure-direction is benign (still-poked, just
+    # slower), so unlike the escalate/restart branches it does not ship dark.
+    p1b_backoff_enabled = os.environ.get(
+        "ACTIVITY_MONITOR_P1B_BACKOFF_ENABLED", "1"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    p1b_backoff_cooldown = int(os.environ.get(
+        "ACTIVITY_MONITOR_P1B_BACKOFF_COOLDOWN_SECONDS", P1B_BACKOFF_COOLDOWN_SECONDS
+    ))
+    p1b_backoff_after_fires = int(os.environ.get(
+        "ACTIVITY_MONITOR_P1B_BACKOFF_AFTER_FIRES", P1B_BACKOFF_AFTER_FIRES
+    ))
+    p1b_backoff_streak_gap = int(os.environ.get(
+        "ACTIVITY_MONITOR_P1B_BACKOFF_STREAK_GAP_SECONDS", P1B_BACKOFF_STREAK_GAP_SECONDS
+    ))
+    p1b_cooldown = p1b_effective_cooldown(
+        agent, cfg, cooldown_seconds,
+        enabled=p1b_backoff_enabled,
+        backoff_cooldown=p1b_backoff_cooldown,
+        after_fires=p1b_backoff_after_fires,
+        streak_gap_seconds=p1b_backoff_streak_gap,
+    )
+
     state_path = _state_path_for_agent(agent)
     cooldown_map = {
         "p1a": cooldown_seconds,
-        "p1b": cooldown_seconds,
+        "p1b": p1b_cooldown,
         "p1d": p1d_cooldown_seconds,
         "p1c": p1c_cooldown_seconds,
     }
@@ -2546,7 +3134,7 @@ def main(argv: list[str] | None = None) -> int:
         wedged, reason = check_tui_wedge(
             cfg, TUI_WEDGE_JSONL_FROZEN_SECONDS, TUI_WEDGE_MOTION_PROBE_GAP_SECONDS)
         if wedged:
-            cur_mtime = latest_jsonl_mtime(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
+            cur_mtime = latest_jsonl_activity(cfg["jsonl_dir"], cfg["sudo_user"]) or 0
             prior = read_poke_state(state_path) or {}
             # T-2632 PART 2 (park-attribution wiring): before paging an ambiguous-
             # QUIET wedge, check whether the freeze is attributable to a DECLARED
@@ -2588,19 +3176,36 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         _log(agent, f"TUI-wedge: not fired ({reason})")
 
+    # T-4510: P1.a/P1.b are the gated predicates. A usage-SUPPRESSED one must NOT end the
+    # cycle: check_p1a counts error turns as non-activity (T-2387), so a seat stuck on an
+    # API-error abort for >1h with queue>=1 satisfies p1a AND p1d at once, and returning here
+    # would shadow the P1.d retry-inject (recovery). On suppression fall through to P1.d and
+    # P1.c; every non-suppressed dispatch keeps today's return-early behaviour exactly.
+    usage_suppressed = False
+
     # Check P1.a first (it's a stronger signal: completely-idle).
-    if check_p1a(cfg, idle_threshold):
+    if not intake_held and check_p1a(cfg, idle_threshold):
         _log(agent, "P1.a fired: idle > threshold + queue ≥ 1")
-        return _dispatch_poke(cfg, agent, "p1a", P1A_POKE_PROMPT, state_path,
-                              bounded_enabled=bounded_poke_enabled,
-                              max_ineffective=max_ineffective_pokes)
+        rc = _dispatch_poke(cfg, agent, "p1a", P1A_POKE_PROMPT, state_path,
+                            bounded_enabled=bounded_poke_enabled,
+                            max_ineffective=max_ineffective_pokes)
+        if rc != USAGE_SUPPRESSED:
+            return rc
+        usage_suppressed = True  # P1.b is behind the same gate: skip it, keep P1.a's precedence
 
     # P1.b: the operator away + agent self-waiting.
-    if check_p1b(cfg, bridge_url, operator_absent_threshold):
+    if not p1b_enabled:
+        _log(agent, "P1.b skipped: ACTIVITY_MONITOR_P1B_ENABLED=0")
+    elif intake_held:
+        pass  # logged above; P1.b is a queue poke (ORG-106 L2)
+    elif not usage_suppressed and check_p1b(cfg, bridge_url, operator_absent_threshold):
         _log(agent, "P1.b fired: the operator absent + await-state + queue ≥ 1")
-        return _dispatch_poke(cfg, agent, "p1b", P1B_POKE_PROMPT, state_path,
-                              bounded_enabled=bounded_poke_enabled,
-                              max_ineffective=max_ineffective_pokes)
+        rc = _dispatch_poke(cfg, agent, "p1b", P1B_POKE_PROMPT, state_path,
+                            bounded_enabled=bounded_poke_enabled,
+                            max_ineffective=max_ineffective_pokes)
+        if rc != USAGE_SUPPRESSED:
+            return rc
+        usage_suppressed = True
 
     # P1.d: rate-limit aborted the turn + has persisted past threshold.
     if check_p1d(cfg, p1d_age_threshold):
@@ -2633,6 +3238,9 @@ def main(argv: list[str] | None = None) -> int:
                               bounded_enabled=bounded_poke_enabled,
                               max_ineffective=max_ineffective_pokes)
 
+    if usage_suppressed:
+        _log(agent, "only usage-suppressed P1.a/P1.b fired (T-4510); P1.d/P1.c did not; bail")
+        return 0
     _log(agent, "no predicate fired; bail")
     return 0
 

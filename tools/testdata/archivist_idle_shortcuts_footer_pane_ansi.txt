@@ -1,0 +1,24 @@
+     annotate T-4291: note appended
+
+[38;5;231m●[39m T-4291, the anchor test run for specialist's OCR check, now waits on T-4234 too,
+  but for a different reason. It shares no code with T-4234. The ticket tool
+  allows me one active ticket, and T-4234, the live fix, is nearly finished.
+
+  The ticket notes it's a scheduling wait, not a real dependency, and that
+  matches what I told specialist: the test starts after T-4234. The ticket system
+  will bring it back as soon as T-4234 closes.
+
+  Four tickets now queue behind T-4234: T-3198, T-4236, T-4277 and T-4291. That
+  makes finishing T-4234 the main priority, and I'm still waiting on the
+  implementer's fix report.
+
+[38;5;244m────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38;5;244m────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;246m⏸ manual mode on · ? for shortcuts · ← for agents[39m
+                                         [38;5;114m✔ Update installed · Restart to apply[39m
+                                          [38;5;246mnew[39m [38;5;246mtask?[39m [38;5;153m/clear[38;5;246m to[39m [38;5;246msave[39m [38;5;153m437k[39m [38;5;153mtokens[39m
+
+
+
+

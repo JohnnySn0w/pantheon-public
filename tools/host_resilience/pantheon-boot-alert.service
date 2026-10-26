@@ -1,0 +1,17 @@
+[Unit]
+Description=Pantheon boot alert (T-5237): tell the operator on Telegram that the VPS booted (and whether it is in a reboot loop)
+Documentation=file:///home/claude/pantheon-config/tools/host_resilience/pantheon_reboot_backoff.py
+Wants=network-online.target
+After=network-online.target pantheon-reboot-backoff.service
+ConditionPathExists=/etc/pantheon/boot-alert.env
+
+[Service]
+# Type=simple: the unit counts as started immediately, so the ~2min of retries never holds up boot.
+# The script always exits 0, even when it gave up (it logs that loudly to the journal).
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/sbin/pantheon_reboot_backoff.py alert
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

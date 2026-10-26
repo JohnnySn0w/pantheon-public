@@ -1,12 +1,24 @@
-"""Deterministic + LM-judge-assisted scoring for GEPA reviewer rollouts (T-2809 Phase 2).
+"""Deterministic + LM-judge-assisted scoring for GEPA reviewer rollouts (T-2809 Phase 2 + T-3837 v2).
 
-Scoring formula (documented plainly, no P/D cite — empirical PoC
-calibration, explicitly tunable at the eventual ratify review):
+Scoring formula (v2 per T-3837 specialist design 2026-09-20, adopted per D3
+principles-as-ratification, replaces v1's recall-only findings term):
 
-    score = clip(0.4 * verdict_match + 0.6 * findings_recall
+    score = clip(0.45 * verdict_match + 0.55 * F1_findings
                  - 0.25 * count(must_not_flag hits), 0.0, 1.0)
 
-    findings_recall = caught / len(findings) if findings else 1.0
+    recall    = caught / len(findings)            if findings else 1.0
+    precision = caught / (caught + wrongly_flagged) if (caught + wrongly_flagged) > 0 else 1.0
+    F1        = 2*P*R/(P+R)                        if (P + R) > 0 else 0.0
+
+Edge cases (the precision teeth the v1 recall term lacked):
+  - no findings expected + no must_not_flag hit  -> R=1, P=1, F1=1 (clean APPROVE — correct)
+  - no findings expected + must_not_flag hit(s)  -> R=1, P=0, F1=0 (over-flag on clean diff — the fix)
+  - findings expected + none caught              -> R=0, P=0/1, F1=0 (missed everything — correct)
+
+V1's pure-recall shape rewarded "flag more" (recall term precision-blind, general false positives
+unpenalized outside the fixed must_not_flag list). GEPA R1 exploited this — the accepted mutation
+added prose pushing "catch more categories," raising train recall but over-flagging into holdout
+collapse. F1 makes over-flagging directly counterproductive without an additional tunable knob.
 
 Category matching is deterministic-first (kebab-case category tokens
 present in the review text) with an OPTIONAL `judge_fn` assist consulted
@@ -31,14 +43,27 @@ from typing import Callable
 
 from tools.gepa.case_loader import Case, Finding
 
-VERDICT_MATCH_WEIGHT = 0.4
-FINDINGS_RECALL_WEIGHT = 0.6
+VERDICT_MATCH_WEIGHT = 0.45
+F1_FINDINGS_WEIGHT = 0.55
 MUST_NOT_FLAG_PENALTY = 0.25
 
 # Category tokens shorter than this are too generic to match on alone
 # ("of", "in", "vs") — mirrors the org's own kebab-case category convention
 # seen throughout knowledge/eval/reviewer-v1/cases/*.json.
 _MIN_TOKEN_LEN = 3
+
+
+@dataclass(frozen=True)
+class ScoreBreakdown:
+    """Component-level score breakdown, exposed for per-mutant response analysis (T-3837).
+    Makes it possible to classify a zero-score mutant as verdict-drift vs. recall-miss vs.
+    over-flag rather than treating all zeros as equivalent."""
+
+    verdict_match: float  # 1.0 if verdict correct, else 0.0
+    findings_recall: float  # caught / expected, 1.0 if none expected
+    findings_precision: float  # caught / (caught + wrongly_flagged), 1.0 if none raised
+    findings_f1: float  # harmonic mean of precision + recall
+    must_not_flag_hits: int  # count of categories on must_not_flag list that were raised
 
 
 @dataclass(frozen=True)
@@ -50,20 +75,22 @@ class ScoredRollout:
     missed_categories: tuple[str, ...]
     wrongly_flagged_categories: tuple[str, ...]
     feedback: str
+    breakdown: ScoreBreakdown | None = None  # None only from legacy fallback construction (run_phase2 placeholder)
 
 
 def parse_verdict(review_text: str) -> str | None:
-    """Uppercase-literal APPROVE/REBOUND search (org convention: case-sensitive).
+    """Uppercase-literal APPROVE/REBOUND/ESCALATE search (org convention: case-sensitive).
 
-    Returns None when neither or both are present — an ambiguous/malformed
-    rollout output, not a guess.
+    Returns None when zero or more-than-one distinct verdict literal appears — an
+    ambiguous/malformed rollout output, not a guess. ESCALATE added in T-3837 v2 to
+    unblock the escalate-class holdout cases (v1's parse ignored ESCALATE, so
+    escalate cases could never score above the recall+must_not_flag terms).
     """
-    has_approve = "APPROVE" in review_text
-    has_rebound = "REBOUND" in review_text
-    if has_approve and not has_rebound:
-        return "APPROVE"
-    if has_rebound and not has_approve:
-        return "REBOUND"
+    present = [
+        v for v in ("APPROVE", "REBOUND", "ESCALATE") if v in review_text
+    ]
+    if len(present) == 1:
+        return present[0]
     return None
 
 
@@ -146,14 +173,26 @@ def score_rollout(
             wrongly_flagged.append(finding.category)
 
     total_findings = len(case.expected.findings)
-    findings_recall = (len(caught) / total_findings) if total_findings else 1.0
+    recall = (len(caught) / total_findings) if total_findings else 1.0
+    denom_p = len(caught) + len(wrongly_flagged)
+    precision = (len(caught) / denom_p) if denom_p > 0 else 1.0
+    denom_f1 = precision + recall
+    f1 = (2.0 * precision * recall / denom_f1) if denom_f1 > 0 else 0.0
 
     raw_score = (
         VERDICT_MATCH_WEIGHT * (1.0 if verdict_correct else 0.0)
-        + FINDINGS_RECALL_WEIGHT * findings_recall
+        + F1_FINDINGS_WEIGHT * f1
         - MUST_NOT_FLAG_PENALTY * len(wrongly_flagged)
     )
     score = max(0.0, min(1.0, raw_score))
+
+    breakdown = ScoreBreakdown(
+        verdict_match=1.0 if verdict_correct else 0.0,
+        findings_recall=recall,
+        findings_precision=precision,
+        findings_f1=f1,
+        must_not_flag_hits=len(wrongly_flagged),
+    )
 
     feedback = _feedback_for(
         case=case,
@@ -171,4 +210,5 @@ def score_rollout(
         missed_categories=tuple(missed),
         wrongly_flagged_categories=tuple(wrongly_flagged),
         feedback=feedback,
+        breakdown=breakdown,
     )

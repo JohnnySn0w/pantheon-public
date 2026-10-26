@@ -11,16 +11,22 @@ OnFailure=pantheon-unit-failure-alert@%n.service
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
 # ARMED 2026-07-23 (T-1994): ownership map blessed by the operator (TG 3988) + supervised
 # first-run verified. --commit-prod makes the sweep auto-file refresh tickets on real
 # drift (routed to the pair's refresh_target=recovery); the proof-of-life digest sends
 # every fire regardless. Gated pairs remain detect-but-never-file. To revert to dark,
 # drop --commit-prod; to disarm entirely, `systemctl --user disable --now pantheon-mirror-drift.timer`.
 ExecStart=/usr/bin/python3 %h/pantheon-config/tools/mirror_drift_sweep.py --commit-prod
+# T-4768 PR5 exit table (recovery W6/D-W1, B1): 0 ok, 10 drift / built-but-unpushed and
+# 13 STALE shadow are routine weekly outcomes (the ticket is the remediation), so they
+# do NOT fire OnFailure. 2 (config / run / ticket-filing / digest failure, all pairs
+# errored) and 4 (LEAK, alert only) page recovery, and so does 1: Python's own exit on an
+# uncaught exception or import failure must never read as success.
+SuccessExitStatus=10 13
 StandardOutput=journal
 StandardError=journal
-# ls-remote of 3 sources + a cache fetch + rev-list; 10min is generous headroom.
+# ls-remote of the ssh sources + a cache fetch + rev-list, plus one payload build per
+# generator pair (T-4768 PR5, seconds each); 10min is generous headroom.
 TimeoutStartSec=10min
 
 [Install]

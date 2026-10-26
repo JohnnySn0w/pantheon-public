@@ -1,0 +1,10 @@
+# self_sudo_guard_lint baseline (T-4032; triaged to ZERO T-4058) — GRANDFATHERED pre-gate instances.
+#
+# EMPTY: the T-4058 triage drove the baseline to zero. Every pre-gate per-seat `sudo -u <var>`
+# was resolved — fixed with the own-account-direct guard (doc_traversal_report, session_reset_
+# reconcile), or moved to the curated ALLOWLIST in self_sudo_guard_lint.py (fixed-foreign /
+# $USER-guarded / dispatch-safe / fail-safe-None). The gate now blocks ALL new unguarded
+# constructions with nothing grandfathered. Do NOT add entries here to silence a finding —
+# add a real guard, or an ALLOWLIST entry with a justification meeting the bar.
+#
+# Line-independent key (relpath::enclosing-func). (currently empty)

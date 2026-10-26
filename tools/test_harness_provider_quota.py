@@ -121,6 +121,57 @@ class ClaudeStatuslineQuotaObservationTest(unittest.TestCase):
         self.assertEqual(weekly.remaining_percent, 5.0)
         self.assertEqual(decide_failover(snapshot, FailoverPolicy()), "planned-failover")
 
+    def test_live_claude_statusline_capture_shape_yields_both_windows(self) -> None:
+        # Exact shape of a real capture (T-4729): snake_case used_percentage
+        # plus epoch-seconds resets_at under top-level rate_limits.
+        payload = {
+            "model": {"display_name": "Opus 4.8", "id": "claude-opus-4-8"},
+            "observed_at": _iso(NOW),
+            "rate_limits": {
+                "five_hour": {
+                    "resets_at": int((NOW + timedelta(hours=2)).timestamp()),
+                    "used_percentage": 9,
+                },
+                "seven_day": {
+                    "resets_at": int((NOW + timedelta(days=3)).timestamp()),
+                    "used_percentage": 54,
+                },
+            },
+            "schema": "pantheon-claude-statusline-quota/v1",
+        }
+
+        snapshot = parse_claude_statusline_observation(
+            payload,
+            profile="claude/interactive-subscription",
+            now=NOW,
+        )
+
+        self.assertEqual([window.name for window in snapshot.windows], ["5h", "weekly"])
+        self.assertEqual(snapshot.windows[0].remaining_percent, 91.0)
+        self.assertEqual(snapshot.windows[1].remaining_percent, 46.0)
+        self.assertEqual(decide_failover(snapshot, FailoverPolicy()), "stay")
+
+    def test_statusline_remaining_percentage_snake_case_is_accepted(self) -> None:
+        payload = {
+            "observed_at": _iso(NOW),
+            "rate_limits": {
+                "seven_day": {
+                    "resets_at": int((NOW + timedelta(days=3)).timestamp()),
+                    "remaining_percentage": 4,
+                },
+            },
+        }
+
+        snapshot = parse_claude_statusline_observation(
+            payload,
+            profile="claude/interactive-subscription",
+            now=NOW,
+        )
+
+        self.assertEqual([window.name for window in snapshot.windows], ["weekly"])
+        self.assertEqual(snapshot.windows[0].used_percent, 96.0)
+        self.assertEqual(decide_failover(snapshot, FailoverPolicy()), "planned-failover")
+
     def test_stale_statusline_evidence_is_unknown_not_zero(self) -> None:
         payload = {
             "observed_at": _iso(NOW - timedelta(minutes=16)),

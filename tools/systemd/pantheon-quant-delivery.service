@@ -1,0 +1,25 @@
+[Unit]
+Description=Pantheon ORG-102 delivery quantification collector (T-4780)
+Documentation=file:///home/%u/pantheon-config/architecture/adr/ORG-102-fleet-quantification-judgment-calls-and-delivery.md
+
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# Step 1 ships this inert unit template only. Recovery chooses the timer host later.
+# The collector is read-only against GitHub/git/tickets and writes rebuildable JSONL exhaust under
+# /var/lib/pantheon/quant. Missing GitHub auth is recorded as insufficient-source, not a unit failure.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/quant_delivery_collect.py backfill --days 60 --out /var/lib/pantheon/quant --config %h/pantheon-config/tools/quant_delivery_repos.json
+
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=default.target

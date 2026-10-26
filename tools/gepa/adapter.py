@@ -106,6 +106,15 @@ class ReviewerGEPAAdapter:
 
     PERSONA_KEY = "reviewer_persona"
 
+    # gepa 0.1.4 reflective_mutation.py:176 checks `adapter.propose_new_texts is
+    # not None` — if the attribute is missing, that check AttributeErrors before
+    # falling through to the built-in reflection_lm path. Declaring it here as
+    # None satisfies the check AND routes GEPA to reflection_lm (which
+    # run_phase2 wires via `reflection_lm=make_claude_plain_lm(...)`). Adopting
+    # `propose_new_texts` as a method here would be for adapter-owned proposal;
+    # we deliberately use GEPA's built-in reflection instead.
+    propose_new_texts = None
+
     def __init__(
         self,
         *,

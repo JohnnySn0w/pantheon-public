@@ -1,0 +1,29 @@
+[Unit]
+Description=Pantheon claude.exe sync for %i: root-owned per-version copy under /opt/pantheon/claude/%i + unstick allowlist (T-5038)
+Documentation=file:///home/claude-fallback/pantheon-config/notes/2026-10-15-t5038-root-owned-claude-exe-build.md
+
+[Service]
+Type=oneshot
+# Installed root:root 0755 from tools/claude_exe_sync.py. Root never runs code
+# from a seat's clone, and every read of the seat's npm tree is done as %i.
+# The manifest baseline is set ONCE by an operator: ... --manifest ... --rebaseline
+ExecStart=/usr/bin/python3 -I /usr/local/sbin/pantheon-claude-exe-sync --account %i --dest /opt/pantheon/claude/%i --manifest /etc/codex-recovery/manifest.json
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=300s
+# Sandbox (orchestrator review finding 3). Writes only the copy tree, the manifest dir and its own state.
+ProtectSystem=strict
+ReadWritePaths=/opt/pantheon/claude /etc/codex-recovery
+StateDirectory=pantheon-claude-exe-sync
+StateDirectoryMode=0700
+ProtectHome=read-only
+PrivateTmp=yes
+NoNewPrivileges=yes
+# Headroom over the 1 GiB read cap plus interpreter (orchestrator follow-up).
+MemoryMax=2560M
+RestrictAddressFamilies=AF_UNIX
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes

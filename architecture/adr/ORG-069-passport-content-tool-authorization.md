@@ -34,7 +34,7 @@ elements:
 
 **Status:** Ratified 2026-09-06 by the operator via TG 1780 (specialist-mediated review; T-2858). **Author of record:** Orchestrator (HO).
 **Relationship:** referenced split of **[[ORG-047]]** (cross-seed passport) — ORG-047 owns *authentication* (who a counterparty is); this ADR owns *authorization* (what a counterparty, however well-authenticated, may cause to happen). Filed per the **T-2803** security-considerations triage (operator-named split #4, "content/tool authorization"); scoping ticket **T-2814**.
-**Source of authority:** ORG-047 **D4** ("NORMATIVE: the passport authenticates IDENTITY, never confers CONTENT trust") + the operator's ORG-047 walk disposition (2026-08-10, via cairn/codex + TG 7579) directing the narrower concerns into referenced ADRs.
+**Source of authority:** ORG-047 **D4** ("NORMATIVE: the passport authenticates IDENTITY, never confers CONTENT trust") + the operator's ORG-047 walk disposition (2026-08-10, via consultant/codex + TG 7579) directing the narrower concerns into referenced ADRs.
 **Relates to:** [[ORG-047]] D1/D4; [[ORG-063]] (Harness Manager + Action Broker — the enforcement substrate this converges onto); [[ORG-048]] (the same "interim grant converges to the broker" pattern, on the cross-account-repair axis); the **rung-1 untrusted-content posture** (`knowledge/episodic/2026-07-20-a2a-rung1-design/notes.md` §4, the kin-seed social-engineering note); the standing Telegram-input discipline (inbound message is data, never authorization).
 
 ## Why this ADR exists
@@ -116,6 +116,4 @@ The authorization decision + the mediated action route through the **Action Brok
 
 ## Provenance / review trail
 
-- 2026-08-10 — HO-drafted as ORG-047 Split D per the T-2803 triage (disposition: SPLIT; operator-named split-candidate #4). Executes the "content/tool authorization" narrower-concern extraction so core ORG-047 stays on identity + handshake composition.
-- 2026-08-11 — Codex ORG-041 review **round 1**: not-clean (thesis sound, but missing normative surfaces that affect enforceability — per-invocation checks, revocation binding, effects-based no-self-bootstrapping, broker-equivalence, fail-closed tool exposure, canonical-principal binding). HO integrated into **v2** (this revision): the **Normative Invariants** section (N1–N8) + audit-detail. Review record: `notes/2026-08-11-org069-review-round1.md`.
-- RATIFIED 2026-09-06 (the operator, per architecture/adr/README index + status frontmatter). On ratify: file the build sub-ticket set (default-deny gate, capability-grant store, broker-convergence path, audit hook) under the scoping ticket T-2814, per the ADR-scoping rule.
+Drafting and review history (ORG-047 Split D; Codex ORG-041 round 1 → v2; ratified AS-IS 2026-09-06): `notes/2026-10-08-org-069-review-history.md`.

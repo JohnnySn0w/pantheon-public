@@ -9,18 +9,18 @@ domain: pantheon, monitoring, systemd, timer, false-alarm, liveness, cron
 ## Symptom
 
 You are building "detect if periodic job X silently stopped" (the T-1871 failure class:
-mnemosyne's memory snapshots quietly ceased ~2026-07-29 and nobody noticed for ~12 days —
+archivist's memory snapshots quietly ceased ~2026-07-29 and nobody noticed for ~12 days —
 a stopped periodic job reads as healthy to every process/liveness check; the only witness
 is that its output stopped landing). The obvious check — "alert if the newest output
 (commit / mtime / row) is older than N days" — is WRONG, because the mechanism emits only
 on change:
 
 - **False-alarm (the trap):** a healthy timer on an idle seat produces no output, so its
-  output-recency ages indefinitely. **Live proof 2026-08-11:** mnemosyne's in-place memory
-  git HEAD was **13 days old** while its `mnemosyne-state-snapshot.timer` was firing
+  output-recency ages indefinitely. **Live proof 2026-08-11:** archivist's in-place memory
+  git HEAD was **13 days old** while its `archivist-state-snapshot.timer` was firing
   **hourly and healthy** (last fire 44 min prior) — the seat simply hadn't changed its
   memory since 07-29. A commit-age check at the ticket's suggested N=3 would have paged on
-  a non-problem. Same shape for atlas/metis (memory-only snapshot seats) whenever quiet.
+  a non-problem. Same shape for artisan/mason (memory-only snapshot seats) whenever quiet.
 
 ## The correct signal — scheduler liveness, not output recency
 
@@ -37,7 +37,7 @@ systemctl --user show <timer> -p ActiveState -p UnitFileState -p NextElapseUSecR
   absent or far-past → the real "it stopped" signal, with zero idle-seat false-positive.
 - **Do NOT key on `LastTriggerUSec`** ("when did it last fire"): it RESETS to empty when
   the account's user-manager restarts, so it reads empty for a long-healthy timer
-  (observed empty for specialist + atlas 2026-08-11 despite both firing fine). `ActiveState`
+  (observed empty for specialist + artisan 2026-08-11 despite both firing fine). `ActiveState`
   / `UnitFileState` / `NextElapseUSecRealtime` survive manager restarts; key on those.
 - Keep output-recency (last commit age) as **corroboration** in the log and as the
   **fallback** signal only when the scheduler can't be read at all (fail-open: WARN, don't
@@ -47,14 +47,14 @@ systemctl --user show <timer> -p ActiveState -p UnitFileState -p NextElapseUSecR
 ## Verification
 
 `tools/memory_snapshot_coverage_monitor.py --all` (T-2838) → 6/6 seats HEALTHY including
-mnemosyne (timer healthy, HEAD 13d) — the exact case output-recency would false-fire. Its
+archivist (timer healthy, HEAD 13d) — the exact case output-recency would false-fire. Its
 `test_a...` sibling `tools/test_memory_snapshot_coverage_monitor.py` pins
 `test_idle_seat_stale_head_but_healthy_timer_is_HEALTHY`.
 
 ## Related
 
 - T-2838 (this monitor), T-2736/T-2424 (the snapshot mechanism it covers), T-1871 (the
-  mnemosyne rot that motivated it).
+  archivist rot that motivated it).
 - `tools/credential_expiry_monitor.py` — the structural template (per-item classify +
   throttle + always-exit-0), and itself an instance of the same principle: it deliberately
   does NOT alert on access-token near/post-expiry (routine auto-renew, would page nightly)

@@ -1,0 +1,22 @@
+[Unit]
+Description=Pantheon mailbox traffic — who sends mail to whom, and how often (kino /stats/mailbox)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+After=network-online.target
+Wants=network-online.target
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:%h/.npm-global/bin
+# Default-safe contract: the script refuses (exit 64) without an explicit mode;
+# --commit-prod is the ONLY prod-writing path. Lists the hub AS its owner (Recovery's
+# NOPASSWD grant), writes knowledge/stats/mailbox/, scope-guarded commit + push from
+# a throwaway worktree. A failed listing exits 2 and commits nothing. Kino serves the
+# committed snapshot read-only (--format json).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/mailbox_traffic_report.py --collect --commit-prod
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

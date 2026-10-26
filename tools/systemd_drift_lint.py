@@ -56,6 +56,19 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _UNIT_DIR = _REPO_ROOT / "tools" / "systemd"
+# T-2235 (archivist 2026-09-21): her 6 hand-made instance units (exocortex.*,
+# claude-telegram-exocortex, archivist-state-snapshot.*, exocortex-data-snapshot.*)
+# are versioned separately at hosts/swarm/systemd/ — scoped to HER units (not org
+# pantheon-*, which live at tools/systemd/), placed at a new top-level to avoid
+# tools/systemd/ glob-cross-contamination. Same failure-mode this lint catches:
+# a repo edit that looks applied while the installed copy on-box says something
+# else. Include it in the default sweep so a archivist unit going stale surfaces
+# here too. `check()` retains its single-dir semantics for CI + cross-account
+# callers; only the default-sweep list is wider.
+_HOST_UNIT_DIRS: tuple[Path, ...] = (
+    _REPO_ROOT / "hosts" / "swarm" / "systemd",
+)
+_DEFAULT_UNIT_DIRS: tuple[Path, ...] = (_UNIT_DIR,) + _HOST_UNIT_DIRS
 
 # Unit-file suffixes this lint compares. Widened past .service/.timer after a
 # tracked `.path` unit turned out to be invisible to the first version (T-2179 r1).
@@ -111,25 +124,54 @@ _UNIT_EXPECTED_DRIFT: dict[str, frozenset[str]] = {
     # T-2846: the T-2424/T-2736 memory-snapshot unit is installed per-account
     # with a distinct Environment=PANTHEON_MEMORY_DIR (each seat's real memory
     # slug; the repo template defaults to orchestrator's) and, on the HANDOFF-less
-    # sub-orchestrators (metis/atlas), Environment=PANTHEON_SNAPSHOT_REQUIRE_
+    # sub-orchestrators (mason/artisan), Environment=PANTHEON_SNAPSHOT_REQUIRE_
     # HANDOFF=0. Those overrides are REQUIRED for the guard to snapshot the
     # right dir — syncing them to the template breaks the protection (wrong dir
     # + re-enabled HANDOFF hard-fail). Verified 2026-08-11 that all 4 installs
-    # (recovery/specialist/metis/atlas) differ from the template ONLY in Environment +
+    # (recovery/specialist/mason/artisan) differ from the template ONLY in Environment +
     # Description, with a byte-identical ExecStart. An ExecStart/logic drift on
     # this unit still classifies substantive and pages.
     "pantheon-agent-state-snapshot.service": frozenset({"Environment"}),
-    # T-3097 (Cat D): the repo copy of this timer is a TEMPLATE, not a unit —
-    # OnUnitInactiveSec/RandomizedDelaySec carry Python .format() placeholder
-    # tokens ({quota_cadence_minutes}, {quota_randomized_delay_seconds}) that
-    # persona_installer.py's _render_quota_timer_template substitutes at
-    # install time. Repo bytes can never be byte-identical to an installed
-    # copy on those two directives BY DESIGN — that is not staleness, it is
-    # the template doing its job. Scoped to exactly these two keys, not the
-    # whole unit: any other directive (OnBootSec, Unit=, a new/removed line)
-    # still classifies substantive, same guarantee as the T-2846 precedent.
-    "pantheon-persona-quota@.timer": frozenset({"OnUnitInactiveSec", "RandomizedDelaySec"}),
+    # T-3097's blanket OnUnitInactiveSec/RandomizedDelaySec exemption for
+    # pantheon-persona-quota@.timer was REMOVED in T-4731: check() now renders the
+    # template with the installer's own substitution, so those two keys are
+    # compared on their rendered values and a genuine mismatch is substantive.
 }
+
+
+_QUOTA_TIMER = "pantheon-persona-quota@.timer"
+
+
+def _quota_values_from_manifest() -> tuple[int, int] | None:
+    """(cadence_minutes, randomized_delay_seconds) exactly as the installer would
+    resolve them from the repo's instance.yaml, or None if that cannot be done
+    (then the template is compared raw, as before). Reuses persona_installer's own
+    manifest loader and _quota_check_install_config so defaults/validation cannot
+    drift from what actually gets installed (T-4731)."""
+    try:
+        if str(_REPO_ROOT) not in sys.path:
+            sys.path.insert(0, str(_REPO_ROOT))
+        from tools import persona_installer as pi
+        manifest = pi.Manifest.load(_REPO_ROOT / "instance.yaml")
+        cfg = pi._quota_check_install_config(manifest, repo_root=_REPO_ROOT)
+        return cfg.cadence_minutes, cfg.randomized_delay_seconds
+    except Exception:  # noqa: BLE001 - fail open to raw compare, never to a false clean
+        return None
+
+
+def _render_repo_unit(name: str, text: str,
+                      quota_values: tuple[int, int] | None) -> str:
+    """Render install-time placeholders in a repo template the way the installer
+    does, so the diff is rendered-vs-installed rather than template-vs-installed.
+    Only the quota timer is a template today."""
+    if name != _QUOTA_TIMER or "{quota_" not in text:
+        return text
+    values = quota_values if quota_values is not None else _quota_values_from_manifest()
+    if values is None:
+        return text
+    from tools import persona_installer as pi
+    return pi._render_quota_timer_template(
+        text, cadence_minutes=values[0], randomized_delay_seconds=values[1])
 
 
 @dataclass
@@ -320,7 +362,8 @@ def _resolve_source(dest: Path | None, installed: InstalledSource | None) -> Ins
 
 
 def check(unit_dir: Path = _UNIT_DIR, dest: Path | None = None,
-          installed: InstalledSource | None = None) -> list[Finding]:
+          installed: InstalledSource | None = None,
+          quota_values: tuple[int, int] | None = None) -> list[Finding]:
     """Compare every repo unit against its installed copy.
 
     Returns findings for BOTH drift and skips. A caller that reports only the
@@ -387,7 +430,7 @@ def check(unit_dir: Path = _UNIT_DIR, dest: Path | None = None,
                 f"NOT verified clean",
             ))
             continue
-        a = _semantic_lines(repo_text)
+        a = _semantic_lines(_render_repo_unit(name, repo_text, quota_values))
         b = _semantic_lines(inst_text)
         if a != b:
             findings.append(Finding(name, "drift", _describe(a, b),
@@ -421,11 +464,28 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args(argv)
 
-    findings = check()
+    # T-2235: sweep the default org dir (tools/systemd/) AND any registered
+    # host-specific dirs (hosts/<host>/systemd/, archivist's instance units).
+    # check() keeps its single-dir contract for CI + cross-account callers;
+    # aggregation happens here so the default CLI covers the full committed set.
+    findings: list[Finding] = []
+    compared = 0
+    for unit_dir in _DEFAULT_UNIT_DIRS:
+        if not unit_dir.is_dir():
+            # A missing host-scoped dir on a checkout that doesn't have it yet is
+            # a legitimate skip (e.g. before archivist's PR lands); NOT a silent
+            # nothing — surface it so an all-clear can never be mistaken for an
+            # all-checked (the same discipline this module's docstring names).
+            findings.append(Finding(
+                f"[{unit_dir.relative_to(_REPO_ROOT)}]*", "skipped",
+                f"unit dir not present at {unit_dir} — no units to compare from this scope",
+            ))
+            continue
+        findings.extend(check(unit_dir=unit_dir))
+        compared += _comparable_count(unit_dir=unit_dir)
     drift = [f for f in findings if f.kind == "drift"]
     skipped = [f for f in findings if f.kind == "skipped"]
     # "checked 35, clean" and "checked 1, clean" must not read the same (r1).
-    compared = _comparable_count()
 
     if args.json:
         print(json.dumps({"drift": [f.to_dict() for f in drift],

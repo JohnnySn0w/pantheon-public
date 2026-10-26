@@ -1,0 +1,24 @@
+● I'm setting up a read-only capture experiment on my own pane: a background
+  haiku agent that stays active for ~150s to keep a streamed-token row live,
+  plus a poller that waits until my turn ends before saving the pane capture.
+  Nothing will be injected into my pane.
+
+  Ran 1 shell command
+
+● Agent(Hold 150s for pane capture) Haiku 4.5
+  ⎿  Backgrounded agent (↓ to manage · ctrl+o to expand)
+
+  Ran 1 shell command
+
+● Both are running. I'm ending this turn so the poller can capture the
+  idle-with-agent state, and I'll pick up the capture when it reports back.
+
+✻ Waiting for 1 background agent to finish
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · 1 shell · ← for agents · ↓ to manage
+
+  ● main
+  ◯ general-purpose  Hold 150s for pane capture            8s · ↓ 33.2k tokens

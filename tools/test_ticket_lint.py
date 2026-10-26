@@ -19,6 +19,7 @@ ticket ids and prose that don't contain the trigger.
 from __future__ import annotations
 
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -161,7 +162,7 @@ class TestLintDetect(unittest.TestCase):
     def test_autofix_non_operator_target_with_intent(self) -> None:
         """target=recovery, intent=action → AUTO-FIX (drop intent)."""
         p = self.root / "active" / "T-0003.md"
-        _make_ticket(p, tid="T-0003", target="recovery", intent="action")
+        _make_ticket(p, tid="T-0003", target="role:system_orchestrator", intent="action")
         result = self._run_detect(p)
         self.assertEqual(result.action, ticket_lint.LintAction.AUTO_FIX)
         self.assertIn("drop", result.description.lower())
@@ -173,6 +174,45 @@ class TestLintDetect(unittest.TestCase):
         result = self._run_detect(p)
         self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
         self.assertIn("ratifiable", result.description.lower())
+
+    # -- T-3761 / ORG-088 Plane-A: unknown-role FLAG (FALSIFIER 3) -------------
+
+    def test_flag_role_target_unknown_role(self) -> None:
+        """FALSIFIER 3: a `target: role:<R>` ticket whose R is NOT a declared
+        functional role_id → FLAG (fail-closed WRITE-class vocab check, same
+        known_role_ids() source as the CLI file/retarget refusal).
+
+        RED-mutation (proves non-vacuity): drop the `if role not in vocab:` branch
+        (the lint vocab check) in detect_malformations → this ticket classifies CLEAN
+        instead of FLAG → RED."""
+        p = self.root / "inbox" / "T-0100.md"
+        _make_ticket(p, tid="T-0100", target="role:bogus_role", requester="orchestrator")
+        result = self._run_detect(p)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
+        self.assertIn("unknown functional role", result.description.lower())
+
+    def test_known_role_target_is_clean(self) -> None:
+        """Complement to FALSIFIER 3: a KNOWN role (head_auditor) passes — proving the FLAG
+        above is the vocab check firing, not an unconditional role:<R> reject."""
+        p = self.root / "inbox" / "T-0101.md"
+        _make_ticket(p, tid="T-0101", target="role:head_auditor", requester="orchestrator")
+        result = self._run_detect(p)
+        self.assertEqual(result.action, ticket_lint.LintAction.CLEAN)
+
+    def test_flag_role_target_when_membership_unverifiable(self) -> None:
+        """Fail-closed on an unverifiable vocabulary: even a syntactically-known role
+        FLAGs when known_role_ids() cannot be verified (a WRITE-class check must not
+        pass a role it cannot confirm). RED-mutation: swallow the
+        PersonaRoleMembershipError and treat the vocab as unrestricted → CLEAN → RED."""
+        p = self.root / "inbox" / "T-0102.md"
+        _make_ticket(p, tid="T-0102", target="role:head_auditor", requester="orchestrator")
+        with patch.object(
+            ticket_lint, "known_role_ids",
+            side_effect=ticket_lint.PersonaRoleMembershipError("digest mismatch"),
+        ):
+            result = self._run_detect(p)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
+        self.assertIn("unverifiable", result.description.lower())
 
     def test_flag_ratify_stale_path(self) -> None:
         """target=operator, intent=ratify, pantheon-config path absent, requester=operator → FLAG.
@@ -211,7 +251,7 @@ class TestLintDetect(unittest.TestCase):
     def test_clean_non_operator_ticket_no_intent_noop(self) -> None:
         """target=recovery, no intent → CLEAN."""
         p = self.root / "active" / "T-0008.md"
-        _make_ticket(p, tid="T-0008", target="recovery")
+        _make_ticket(p, tid="T-0008", target="role:system_orchestrator")
         result = self._run_detect(p)
         self.assertEqual(result.action, ticket_lint.LintAction.CLEAN)
 
@@ -229,6 +269,106 @@ class TestLintDetect(unittest.TestCase):
             ratifiable_files=["pantheon-config:architecture/adr/ORG-TEST.md"],
         )
         result = ticket_lint.detect_malformations(p, repo_root=self.root)
+        self.assertEqual(result.action, ticket_lint.LintAction.CLEAN)
+
+    # -- T-4119: substate: awaiting-merge / awaiting_merge_ref consistency --
+
+    def test_flag_awaiting_merge_substate_without_ref(self) -> None:
+        p = self.root / "active" / "T-0020.md"
+        _make_ticket(p, tid="T-0020", target="role:system_orchestrator",
+                     extra_fields={"substate": "awaiting-merge"})
+        result = self._run_detect(p)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
+        self.assertIn("awaiting_merge_ref", result.description)
+
+    def test_flag_awaiting_merge_ref_without_substate(self) -> None:
+        p = self.root / "active" / "T-0021.md"
+        _make_ticket(p, tid="T-0021", target="role:system_orchestrator",
+                     extra_fields={"awaiting_merge_ref": "echo-prismatic#365"})
+        result = self._run_detect(p)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
+        self.assertIn("awaiting_merge_ref", result.description)
+
+    def test_flag_awaiting_merge_ref_with_wrong_substate(self) -> None:
+        p = self.root / "active" / "T-0022.md"
+        _make_ticket(p, tid="T-0022", target="role:system_orchestrator",
+                     extra_fields={"substate": "appetite-overrun",
+                                   "awaiting_merge_ref": "echo-prismatic#365"})
+        result = self._run_detect(p)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
+        self.assertIn("appetite-overrun", result.description)
+
+    def test_clean_well_formed_awaiting_merge_pair(self) -> None:
+        p = self.root / "active" / "T-0023.md"
+        _make_ticket(p, tid="T-0023", target="role:system_orchestrator",
+                     extra_fields={"substate": "awaiting-merge",
+                                   "awaiting_merge_ref": "echo-prismatic#365"})
+        result = self._run_detect(p)
+        self.assertEqual(result.action, ticket_lint.LintAction.CLEAN)
+
+    # -- T-4119 REBOUND-1 finding #6: state-aware check — a well-formed pair
+    #    is only valid while the ticket sits in active/. Lint was verified by
+    #    the reviewer to lint CLEAN on this leaked shape before this fix. --
+
+    def test_flag_well_formed_awaiting_merge_pair_in_inbox(self) -> None:
+        """A pair that unclaim/retarget failed to strip (or a hand-edit) —
+        leaked into inbox/ — must FLAG, not lint CLEAN. RED-mutation (proves
+        non-vacuity): remove the `path.parent.name != "active"` branch → this
+        ticket classifies CLEAN instead of FLAG → RED."""
+        p = self.root / "inbox" / "T-0024.md"
+        _make_ticket(p, tid="T-0024", target="role:system_orchestrator",
+                     extra_fields={"substate": "awaiting-merge",
+                                   "awaiting_merge_ref": "echo-prismatic#365"})
+        result = self._run_detect(p)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
+        self.assertIn("inbox", result.description)
+
+    def test_flag_well_formed_awaiting_merge_pair_in_done(self) -> None:
+        """Same leaked-marker shape, done/ side (e.g. a resolve that bypassed
+        the strip helper)."""
+        (self.root / "done").mkdir()
+        p = self.root / "done" / "T-0025.md"
+        _make_ticket(p, tid="T-0025", target="role:system_orchestrator",
+                     extra_fields={"substate": "awaiting-merge",
+                                   "awaiting_merge_ref": "echo-prismatic#365"})
+        result = self._run_detect(p)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
+        self.assertIn("done", result.description)
+
+    # -- Duplicate `## Transition log` header FLAG (T-3851/T-3852 body-fill class) --
+
+    def test_flag_duplicate_transition_log_header(self) -> None:
+        """A ticket whose body contains two `## Transition log` headers →
+        FLAG. Produced by an operator body-fill Edit that included a second
+        `## Transition log` section on top of the template's built-in one.
+        ticket.py append_transition cannot detect the duplication because it
+        only verifies the header EXISTS, then appends at the tail.
+
+        RED-mutation (proves non-vacuity): remove the `text.count("## Transition
+        log") > 1` branch → this ticket classifies CLEAN instead of FLAG → RED.
+        """
+        p = self.root / "inbox" / "T-0010.md"
+        _make_ticket(p, tid="T-0010", target="role:system_orchestrator")
+        # Inject a second `## Transition log` section (simulate the body-fill
+        # Edit's operator error).
+        existing = p.read_text(encoding="utf-8")
+        p.write_text(
+            existing + "\n## Transition log\n\n- extra header from bad Edit\n",
+            encoding="utf-8",
+        )
+        result = self._run_detect(p)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
+        self.assertIn("transition log", result.description.lower())
+        self.assertIn("multiple", result.description.lower())
+
+    def test_clean_single_transition_log_header(self) -> None:
+        """Control case: template shape (one `## Transition log` header) → CLEAN
+        (no false-fire from the dup-header check on a normal ticket)."""
+        p = self.root / "inbox" / "T-0011.md"
+        _make_ticket(p, tid="T-0011", target="role:system_orchestrator")
+        # Sanity: fixture writes exactly one header.
+        self.assertEqual(p.read_text().count("## Transition log"), 1)
+        result = self._run_detect(p)
         self.assertEqual(result.action, ticket_lint.LintAction.CLEAN)
 
 
@@ -260,15 +400,15 @@ class TestReposFieldGate(unittest.TestCase):
             "schema_version: 1\n"
             "repos:\n"
             "  - name: pantheon-config\n"
-            "    grants: {orchestrator: rw, specialist: rw, recovery: rw}\n"
+            "    grants: {head-engineering-orchestrator: rw, specialist: rw, recovery: rw}\n"
             "  - name: revenue-project\n"
-            "    grants: {orchestrator: rw, specialist: ro}\n"
+            "    grants: {head-engineering-orchestrator: rw, specialist: ro}\n"
             "  - name: pantheon-pwa\n"
-            "    grants: {orchestrator: rw}\n",
+            "    grants: {head-engineering-orchestrator: rw}\n",
             encoding="utf-8",
         )
 
-    def _ticket(self, tid: str, repos: str, target: str = "specialist") -> Path:
+    def _ticket(self, tid: str, repos: str, target: str = "role:research_orchestrator") -> Path:
         p = self.root / "active" / f"{tid}.md"
         _make_ticket(
             p, tid=tid, target=target, state="active",
@@ -323,7 +463,7 @@ class TestReposFieldGate(unittest.TestCase):
 
     def test_no_repos_field_clean(self) -> None:
         p = self.root / "active" / "T-0009.md"
-        _make_ticket(p, tid="T-0009", target="specialist", state="active")
+        _make_ticket(p, tid="T-0009", target="role:research_orchestrator", state="active")
         r = ticket_lint.detect_malformations(p, repo_root=self.root)
         self.assertEqual(r.action, ticket_lint.LintAction.CLEAN)
 
@@ -331,19 +471,19 @@ class TestReposFieldGate(unittest.TestCase):
 
     def test_role_key_grant_lookup_clean(self) -> None:
         """target=specialist resolves to specialist; registry has specialist:rw → CLEAN."""
-        p = self._ticket("T-0010", "[pantheon-config:rw]", target="specialist")
+        p = self._ticket("T-0010", "[pantheon-config:rw]", target="role:research_orchestrator")
         r = ticket_lint.detect_malformations(p, repo_root=self.root)
         self.assertEqual(r.action, ticket_lint.LintAction.CLEAN)
 
-    def test_orchestrator_target_resolves_to_orchestrator_role_clean(self) -> None:
-        """target=orchestrator resolves to orchestrator; registry has orchestrator:rw → CLEAN."""
-        p = self._ticket("T-0011", "[pantheon-config:rw]", target="orchestrator")
+    def test_orchestrator_target_resolves_to_head_engineering_orchestrator_role_clean(self) -> None:
+        """target=orchestrator resolves to head-engineering-orchestrator; registry has head-engineering-orchestrator:rw → CLEAN."""
+        p = self._ticket("T-0011", "[pantheon-config:rw]", target="role:engineering_orchestrator")
         r = ticket_lint.detect_malformations(p, repo_root=self.root)
         self.assertEqual(r.action, ticket_lint.LintAction.CLEAN)
 
     def test_no_role_grant_flag(self) -> None:
-        """target=specialist (→specialist); repo has only orchestrator:rw → FLAG no grant."""
-        p = self._ticket("T-0012", "[pantheon-pwa:ro]", target="specialist")
+        """target=specialist (→specialist); repo has only head-engineering-orchestrator:rw → FLAG no grant."""
+        p = self._ticket("T-0012", "[pantheon-pwa:ro]", target="role:research_orchestrator")
         r = ticket_lint.detect_malformations(p, repo_root=self.root)
         self.assertEqual(r.action, ticket_lint.LintAction.FLAG)
         self.assertIn("no grant", r.description.lower())
@@ -390,7 +530,7 @@ class TestAutoFix(unittest.TestCase):
     def test_fix_drops_intent_for_non_operator_target(self) -> None:
         """target=recovery, intent=action → intent field removed from frontmatter."""
         p = self.root / "inbox" / "T-0012.md"
-        _make_ticket(p, tid="T-0012", target="recovery", intent="action")
+        _make_ticket(p, tid="T-0012", target="role:system_orchestrator", intent="action")
         # Verify intent is present before fix.
         self.assertIn("intent: action", p.read_text(encoding="utf-8"))
         ticket_lint.apply_auto_fix(p)
@@ -629,7 +769,7 @@ class TestScanTickets(unittest.TestCase):
         p1 = self.root / "inbox" / "T-0030.md"
         p2 = self.root / "active" / "T-0031.md"
         _make_ticket(p1, tid="T-0030", target="operator")
-        _make_ticket(p2, tid="T-0031", target="recovery")
+        _make_ticket(p2, tid="T-0031", target="role:system_orchestrator")
         results = ticket_lint.scan_tickets(self.root)
         tids = {r.tid for r in results}
         self.assertIn("T-0030", tids)
@@ -850,7 +990,7 @@ class TestOrphanRatifications(unittest.TestCase):
         _make_ticket(
             self.tickets / "active" / "T-0905.md",
             tid="T-0905",
-            target="recovery",
+            target="role:system_orchestrator",
             state="active",
         )
         orphans = self._detect()
@@ -934,7 +1074,7 @@ class TestTicketLintInteg(unittest.TestCase):
     def test_clean_ticket_not_modified(self) -> None:
         """Well-formed ticket is left unchanged."""
         p = self._env.repo_path / "tickets" / "active" / "T-0052.md"
-        _make_ticket(p, tid="T-0052", target="recovery")
+        _make_ticket(p, tid="T-0052", target="role:system_orchestrator")
         original = p.read_text()
 
         rc, stdout, stderr = self._run_lint(["--no-digest"])
@@ -1217,7 +1357,12 @@ class TestRetargetDetachedHeadPush(unittest.TestCase):
         # Add a done/ dir too — ticket.py scans across states.
         (self._env.repo_path / "tickets" / "done").mkdir(exist_ok=True)
         (self._env.repo_path / "tickets" / "done" / ".gitkeep").touch()
-        _run(["git", "add", "tickets/", "tools/"], cwd=self._env.repo_path)
+        # T-5239: the retarget bounce routes to a ROLE, so the worktree's ticket.py
+        # needs the L3 role-membership source + its instance projection to validate it.
+        for yname in ("instance.yaml", "persona_roles.yaml"):
+            shutil.copy2(repo_tools.parent / yname, self._env.repo_path / yname)
+        _run(["git", "add", "tickets/", "tools/", "instance.yaml", "persona_roles.yaml"],
+             cwd=self._env.repo_path)
         _run(["git", "commit", "-m", "seed tickets + tools"], cwd=self._env.repo_path)
         _run(["git", "push", "origin", "main"], cwd=self._env.repo_path)
 
@@ -1280,7 +1425,7 @@ class TestRetargetDetachedHeadPush(unittest.TestCase):
         # Confirm the ticket's frontmatter target flipped to its requester.
         # Re-read from the worktree since that's where the mutation landed.
         text = p.read_text(encoding="utf-8")
-        self.assertIn("target: orchestrator", text)
+        self.assertIn("target: role:engineering_orchestrator", text)  # T-5239: role, not persona
         self.assertNotIn("target: operator", text)
 
 
@@ -1359,7 +1504,7 @@ class TestUnanchoredGates(unittest.TestCase):
     def test_valid_event_anchor_not_flagged(self):
         # T-2833(b): a closed-enum real-world-event anchor is compliant.
         self._mk("T-0001", "inbox", not_before="2026-09-10T00:00:00Z",
-                 anchor="event:cert-expiry:snowis.me")
+                 anchor="event:cert-expiry:your-domain.example")
         self.assertEqual(self._detect(), [])
 
     def test_bad_event_kind_flagged_malformed(self):
@@ -1405,7 +1550,7 @@ class TestDepGraphIssues(unittest.TestCase):
         fm = (
             "---\n"
             f"id: {tid}\n"
-            "target: recovery\n"
+            "target: role:system_orchestrator\n"
             f"state: {state}\n"
             f"depends_on: [{', '.join(deps)}]\n"
             "---\n\n"
@@ -1544,7 +1689,7 @@ class TestServesWarn(unittest.TestCase):
     def test_inbox_ticket_missing_serves_emits_warn(self) -> None:
         """inbox ticket without serves: → WARN result."""
         p = self.root / "inbox" / "T-0001.md"
-        _make_ticket(p, tid="T-0001", target="orchestrator")
+        _make_ticket(p, tid="T-0001", target="role:engineering_orchestrator")
         results = self._warn(p)
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].action, ticket_lint.LintAction.WARN)
@@ -1553,14 +1698,14 @@ class TestServesWarn(unittest.TestCase):
     def test_inbox_ticket_with_serves_no_warn(self) -> None:
         """inbox ticket with serves: present → no WARN."""
         p = self.root / "inbox" / "T-0002.md"
-        _make_ticket(p, tid="T-0002", target="orchestrator", extra_fields={"serves": "ORG-034 arc-intent"})
+        _make_ticket(p, tid="T-0002", target="role:engineering_orchestrator", extra_fields={"serves": "ORG-034 arc-intent"})
         results = self._warn(p)
         self.assertEqual(results, [])
 
     def test_goal_neutral_maintenance_value_is_valid(self) -> None:
         """serves: goal-neutral-maintenance is an accepted value → no WARN."""
         p = self.root / "inbox" / "T-0003.md"
-        _make_ticket(p, tid="T-0003", target="orchestrator",
+        _make_ticket(p, tid="T-0003", target="role:engineering_orchestrator",
                      extra_fields={"serves": "goal-neutral-maintenance"})
         results = self._warn(p)
         self.assertEqual(results, [])
@@ -1568,7 +1713,7 @@ class TestServesWarn(unittest.TestCase):
     def test_warn_action_is_not_flag_or_autofix(self) -> None:
         """WARN must be softer than FLAG — action is LintAction.WARN specifically."""
         p = self.root / "inbox" / "T-0004.md"
-        _make_ticket(p, tid="T-0004", target="orchestrator")
+        _make_ticket(p, tid="T-0004", target="role:engineering_orchestrator")
         results = self._warn(p)
         self.assertEqual(len(results), 1)
         self.assertNotEqual(results[0].action, ticket_lint.LintAction.FLAG)
@@ -1578,7 +1723,7 @@ class TestServesWarn(unittest.TestCase):
     def test_active_ticket_missing_serves_no_warn(self) -> None:
         """active tickets are NOT warned (warn targets filers, not in-flight workers)."""
         p = self.root / "active" / "T-0005.md"
-        _make_ticket(p, tid="T-0005", target="orchestrator", state="active")
+        _make_ticket(p, tid="T-0005", target="role:engineering_orchestrator", state="active")
         results = self._warn(p)
         self.assertEqual(results, [])
 
@@ -1587,10 +1732,10 @@ class TestServesWarn(unittest.TestCase):
         p1 = self.root / "inbox" / "T-0010.md"
         p2 = self.root / "inbox" / "T-0011.md"
         p3 = self.root / "inbox" / "T-0012.md"
-        _make_ticket(p1, tid="T-0010", target="orchestrator")
-        _make_ticket(p2, tid="T-0011", target="orchestrator",
+        _make_ticket(p1, tid="T-0010", target="role:engineering_orchestrator")
+        _make_ticket(p2, tid="T-0011", target="role:engineering_orchestrator",
                      extra_fields={"serves": "some-arc"})
-        _make_ticket(p3, tid="T-0012", target="orchestrator")
+        _make_ticket(p3, tid="T-0012", target="role:engineering_orchestrator")
         results = ticket_lint.warn_tickets([p1, p2, p3])
         warned_ids = {r.tid for r in results}
         self.assertIn("T-0010", warned_ids)
@@ -1701,7 +1846,7 @@ class TestDoLintWarn(unittest.TestCase):
         """--repo-root mode: inbox ticket without serves: appears in the digest warn section."""
         # No serves: field → should trigger warn
         p = self.root / "tickets" / "inbox" / "T-0030.md"
-        _make_ticket(p, tid="T-0030", target="orchestrator")
+        _make_ticket(p, tid="T-0030", target="role:engineering_orchestrator")
 
         captured_digest: list[str] = []
 
@@ -1721,7 +1866,7 @@ class TestDoLintWarn(unittest.TestCase):
     def test_digest_has_no_warn_section_when_serves_present(self) -> None:
         """--repo-root mode: ticket with serves: present → no warn section in digest."""
         p = self.root / "tickets" / "inbox" / "T-0031.md"
-        _make_ticket(p, tid="T-0031", target="orchestrator",
+        _make_ticket(p, tid="T-0031", target="role:engineering_orchestrator",
                      extra_fields={"serves": "some-arc"})
 
         captured_digest: list[str] = []
@@ -1742,7 +1887,7 @@ class TestDoLintWarn(unittest.TestCase):
         # Multiple inbox tickets all missing serves:
         for i in range(3):
             p = self.root / "tickets" / "inbox" / f"T-00{80 + i}.md"
-            _make_ticket(p, tid=f"T-00{80 + i}", target="orchestrator")
+            _make_ticket(p, tid=f"T-00{80 + i}", target="role:engineering_orchestrator")
 
         with patch.object(ticket_lint, "_send_lint_digest", return_value=True):
             rc = ticket_lint.main(["--repo-root", str(self.root)])
@@ -1752,7 +1897,7 @@ class TestDoLintWarn(unittest.TestCase):
     def test_no_digest_mode_suppresses_warn_send(self) -> None:
         """--no-digest bypasses warn emission (same as it bypasses rest of digest)."""
         p = self.root / "tickets" / "inbox" / "T-0040.md"
-        _make_ticket(p, tid="T-0040", target="orchestrator")
+        _make_ticket(p, tid="T-0040", target="role:engineering_orchestrator")
 
         with patch.object(ticket_lint, "_send_lint_digest") as mock_send:
             rc = ticket_lint.main(["--repo-root", str(self.root), "--no-digest"])
@@ -1872,6 +2017,133 @@ class IsEchoScopedIdTests(unittest.TestCase):
 
     def test_three_digit_id_below_200_out_of_scope(self) -> None:
         self.assertFalse(ticket_lint.is_echo_scoped_id("ADR-199#E1"))
+
+
+class TestOperatorUnattachedAsk(unittest.TestCase):
+    """T-5014: STALE-PATH widened beyond intent=ratify + unattached-ask WARN."""
+
+    def setUp(self) -> None:
+        _require_lint(self)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "inbox").mkdir()
+        (self.root / "active").mkdir()
+        (self.root / "done").mkdir()
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _t(self, tid: str, ask: str, *, state: str = "inbox", target: str = "operator",
+           extra: dict | None = None, files: list[str] | None = None,
+           intent: str = "action") -> Path:
+        p = self.root / state / f"{tid}.md"
+        _make_ticket(p, tid=tid, state=state, target=target, intent=intent,
+                     ratifiable_files=files, extra_fields=extra)
+        p.write_text(
+            p.read_text(encoding="utf-8").replace("Do the thing.", ask), encoding="utf-8"
+        )
+        return p
+
+    def test_stale_path_flags_intent_action_ticket(self) -> None:
+        p = self._t("T-0001", "Look at it.", files=["pantheon-config:gone/missing.md"])
+        with patch.object(ticket_lint, "ratifiable_path_status", return_value=False):
+            r = ticket_lint.detect_malformations(p, repo_root=self.root)
+        # requester=operator has no bounceable originator -> FLAG (else RETARGET).
+        self.assertIn(r.action, (ticket_lint.LintAction.FLAG, ticket_lint.LintAction.RETARGET))
+        self.assertIn("STALE-PATH", r.description)
+
+    def test_stale_path_unresolvable_is_not_flagged(self) -> None:
+        p = self._t("T-0002", "Look at it.", files=["pantheon-config:x/y.md"])
+        with patch.object(ticket_lint, "ratifiable_path_status", return_value=None):
+            r = ticket_lint.detect_malformations(p, repo_root=self.root)
+        self.assertEqual(r.action, ticket_lint.LintAction.CLEAN)
+
+    def test_warns_on_home_path(self) -> None:
+        p = self._t("T-0003", "See /home/suborch2/artisan-drafts/x for the plan.")
+        res = ticket_lint.warn_operator_unattached([p])
+        self.assertEqual(len(res), 1)
+        self.assertEqual(res[0].action, ticket_lint.LintAction.WARN)
+        self.assertIn("/home/suborch2/artisan-drafts/x", res[0].description)
+
+    def test_warns_on_md_yaml_json_and_tmp_and_repo_path(self) -> None:
+        for i, ask in enumerate([
+            "Review notes/plan.md please.", "Edit instance.yaml", "see cfg.json",
+            "output in /tmp/foo/bar.txt", "pantheon-config:sop/standard/x",
+        ]):
+            with self.subTest(ask=ask):
+                p = self._t(f"T-01{i:02d}", ask)
+                self.assertEqual(len(ticket_lint.warn_operator_unattached([p])), 1)
+
+    def test_warns_on_adr_id_near_draft_either_order(self) -> None:
+        for i, ask in enumerate([
+            "ADR-253 draft is ready for you.",
+            "The draft of the new ADR-253 awaits.",
+            "Please review the Amendment to ORG-022 today.",
+        ]):
+            with self.subTest(ask=ask):
+                p = self._t(f"T-02{i:02d}", ask)
+                self.assertEqual(len(ticket_lint.warn_operator_unattached([p])), 1)
+
+    def test_adr_id_far_from_draft_does_not_warn(self) -> None:
+        ask = "ADR-253 is ratified. " + "word " * 10 + "a draft elsewhere."
+        p = self._t("T-0301", ask)
+        self.assertEqual(ticket_lint.warn_operator_unattached([p]), [])
+
+    def test_plain_prose_does_not_warn(self) -> None:
+        p = self._t("T-0302", "Please approve the spend.")
+        self.assertEqual(ticket_lint.warn_operator_unattached([p]), [])
+
+    def test_attached_ticket_does_not_warn(self) -> None:
+        p = self._t("T-0303", "See notes/plan.md", files=["pantheon-config:notes/plan.md"])
+        self.assertEqual(ticket_lint.warn_operator_unattached([p]), [])
+
+    def test_warns_even_with_no_file_reason(self) -> None:
+        p = self._t("T-0304", "See /tmp/x/draft.md",
+                    extra={"no_file_reason": "none needed per filer"})
+        res = ticket_lint.warn_operator_unattached([p])
+        self.assertEqual(len(res), 1)
+        self.assertIn("no_file_reason is set", res[0].description)
+
+    def test_active_scanned_done_and_other_targets_skipped(self) -> None:
+        a = self._t("T-0305", "See /tmp/x/y.md", state="active")
+        d = self._t("T-0306", "See /tmp/x/y.md", state="done")
+        o = self._t("T-0307", "See /tmp/x/y.md", target="role:engineering_orchestrator")
+        res = ticket_lint.warn_operator_unattached([a, d, o])
+        self.assertEqual([r.tid for r in res], ["T-0305"])
+
+    def test_transition_log_is_not_scanned(self) -> None:
+        p = self._t("T-0308", "Please approve.")
+        p.write_text(p.read_text(encoding="utf-8") + "- note: see /tmp/q/r.md\n",
+                     encoding="utf-8")
+        self.assertEqual(ticket_lint.warn_operator_unattached([p]), [])
+
+    def test_digest_section_and_not_all_clean(self) -> None:
+        p = self._t("T-0309", "See /tmp/x/y.md")
+        res = ticket_lint.warn_operator_unattached([p])
+        msg = ticket_lint.build_lint_digest(
+            now_iso="2026-10-15 10:00 UTC", auto_fixed=[], flagged=[],
+            total_scanned=1, unattached_warned=res,
+        )
+        self.assertIn("T-0309", msg)
+        self.assertIn("none attached", msg)
+        self.assertNotIn("all clean", msg)
+
+    def test_warning_never_fails_dry_run_exit(self) -> None:
+        # Legacy tickets must not red CI: a warned corpus still exits 0.
+        repo = self.root / "repo"
+        for st in ("inbox", "active", "done"):
+            (repo / "tickets" / st).mkdir(parents=True)
+        p = repo / "tickets" / "inbox" / "T-0311.md"
+        _make_ticket(p, tid="T-0311", target="operator", intent="action")
+        p.write_text(p.read_text(encoding="utf-8").replace("Do the thing.", "See /tmp/x/y.md"),
+                     encoding="utf-8")
+        proc = subprocess.run(
+            [sys.executable, str(Path(ticket_lint.__file__)), "--dry-run",
+             "--repo-root", str(repo)],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("T-0311", proc.stdout)
 
 
 if __name__ == "__main__":

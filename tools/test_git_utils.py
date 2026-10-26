@@ -187,6 +187,103 @@ class TestWithWorktreeAddFails(unittest.TestCase):
         # (No path.exists assert here because Path.exists is patched to False.)
 
 
+class TestWithWorktreeFailedAddIsTornDown(unittest.TestCase):
+    """T-5076: a timed-out or failed `worktree add` leaves no registered, locked worktree."""
+
+    def _calls_for(self, add_behaviour):
+        seen = []
+
+        def _run(cmd, **kwargs):
+            seen.append(list(cmd))
+            if "worktree" in cmd and "add" in cmd:
+                return add_behaviour(cmd, kwargs)
+            return _make_cp(0)
+
+        with (
+            patch("tools._git_utils.os.getpid", return_value=44444),
+            patch("tools._git_utils.subprocess.run", side_effect=_run),
+            patch("tools._git_utils.Path.exists", return_value=False),
+        ):
+            with self.assertRaises(WorktreeError):
+                with_worktree(lambda _wt: None)
+        return seen
+
+    def _assert_torn_down(self, seen):
+        self.assertIn(["git", "worktree", "remove", "-f", "-f", f"/tmp/{os.path.basename(sys.argv[0])}-44444"], seen)
+        self.assertIn(["git", "worktree", "prune"], seen)
+
+    def test_timeout_is_torn_down(self):
+        import subprocess as sp
+
+        def add(cmd, kw):
+            raise sp.TimeoutExpired(cmd, kw.get("timeout"))
+        self._assert_torn_down(self._calls_for(add))
+
+    def test_nonzero_add_is_torn_down(self):
+        self._assert_torn_down(self._calls_for(lambda cmd, kw: _make_cp(128, stderr="fatal: boom")))
+
+    def test_add_timeout_is_wider_than_the_old_30s(self):
+        captured = {}
+
+        def add(cmd, kw):
+            captured["timeout"] = kw.get("timeout")
+            return _make_cp(128)
+        self._calls_for(add)
+        self.assertGreaterEqual(captured["timeout"], 120)
+
+
+class TestWithWorktreeTimedOutAddRealGit(unittest.TestCase):
+    """T-5076 against real git: the add is killed mid-way (simulated by a real
+    `worktree add --lock --reason initializing` and then TimeoutExpired, the 2026-10-17
+    state). Afterwards no worktree but the main one is registered and the dir is gone."""
+
+    def setUp(self):
+        if not shutil.which("git"):
+            self.skipTest("git not installed")
+        import subprocess as sp
+        self.sp = sp
+        self.tmp = Path(tempfile.mkdtemp())
+        env = {**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "HOME": str(self.tmp)}
+        self.env = env
+        origin, clone = self.tmp / "origin.git", self.tmp / "clone"
+        sp.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True, env=env)
+        sp.run(["git", "clone", "-q", str(origin), str(clone)], check=True, env=env, capture_output=True)
+        (clone / "f").write_text("x\n")
+        for argv in (["add", "f"], ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "c"],
+                     ["push", "-q", "origin", "HEAD:main"]):
+            sp.run(["git", *argv], cwd=clone, check=True, env=env, capture_output=True)
+        self.clone = clone
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_no_locked_worktree_is_left_registered(self):
+        real_run = self.sp.run
+        sp = self.sp
+
+        def _run(cmd, **kwargs):
+            if "worktree" in cmd and "add" in cmd:
+                path = cmd[cmd.index("--detach") + 1]
+                real_run(["git", "worktree", "add", "--lock", "--reason", "initializing",
+                          "--detach", path, "origin/main"], cwd=kwargs.get("cwd"),
+                         capture_output=True, check=True)
+                raise sp.TimeoutExpired(cmd, kwargs.get("timeout"))
+            return real_run(cmd, **kwargs)
+
+        with (
+            patch("tools._git_utils.REPO_ROOT", self.clone),
+            patch("tools._git_utils.os.getpid", return_value=33333 + os.getpid()),
+            patch("tools._git_utils.subprocess.run", side_effect=_run),
+        ):
+            with self.assertRaises(WorktreeError):
+                with_worktree(lambda _wt: None)
+        listing = real_run(["git", "worktree", "list", "--porcelain"], cwd=self.clone,
+                           capture_output=True, text=True, check=True).stdout
+        self.assertEqual(listing.count("worktree "), 1, listing)
+        self.assertNotIn("locked", listing)
+        self.assertFalse(Path(f"/tmp/{os.path.basename(sys.argv[0])}-{33333 + os.getpid()}").exists())
+
+
 class TestWithWorktreeCleanupFails(unittest.TestCase):
     """fn returns sentinel; git worktree remove fails → return value propagated; stderr logged."""
 

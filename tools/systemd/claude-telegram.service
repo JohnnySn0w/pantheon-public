@@ -2,7 +2,7 @@
 # T-2271: WIRED. Measured 0 failed-state transitions in 14 days across 19 start
 # events, so seat restarts (handoff, context-fill) demonstrably do NOT produce a
 # failed state and cannot trigger this. The feared storm — OnFailure firing
-# per-failure under Restart=always (metis) — is bounded here by the existing
+# per-failure under Restart=always (mason) — is bounded here by the existing
 # StartLimitIntervalSec=600 / StartLimitBurst=20: a crash-loop hits the limit and
 # enters a terminal failed state instead of alerting forever.
 # Recovery has a direct interest in learning that this seat FAILED: it is the one it

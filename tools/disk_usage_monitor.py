@@ -83,7 +83,7 @@ CPU_LOAD15_WARN_MULT = float(os.environ.get("PANTHEON_CPU_LOAD15_WARN_MULT", "2.
 # breakdown with nothing marking their absence. That is the signature this
 # ticket exists to remove: a disk alert naming the biggest home is worth exactly
 # as much as the enumeration behind it.
-from tools.agent_role_map import fleet_accounts  # noqa: E402
+from tools.agent_role_map import fleet_accounts, mailbox_hub  # noqa: E402
 
 AGENT_HOMES = fleet_accounts()
 
@@ -96,8 +96,24 @@ AGENT_HOMES = fleet_accounts()
 # actionable signal. (The actual 2026-09-06 miss — T-3441 — was NOT a timeout but a
 # nonzero-du-exit drop; see the rc handling in _top_consumers. This budget is the
 # defensive companion so a genuinely slow home also stays visible within budget.)
-DU_PER_HOME_TIMEOUT_SEC = int(os.environ.get("PANTHEON_DISK_DU_PER_HOME_TIMEOUT_SEC", "30"))
+#
+# T-4678 (the operator TG 8080/8081): the sweep was SEQUENTIAL with a 30s per-home cap,
+# and /home/claude alone takes ~42s (24G), so the biggest home was ?timeout on
+# every fire and the homes after it starved into ?timeout/?skipped. The du calls
+# now run CONCURRENTLY, so each gets (almost) the whole budget instead of a slice.
+DU_PER_HOME_TIMEOUT_SEC = int(os.environ.get("PANTHEON_DISK_DU_PER_HOME_TIMEOUT_SEC", "80"))
 DU_TOTAL_BUDGET_SEC = int(os.environ.get("PANTHEON_DISK_DU_TOTAL_BUDGET_SEC", "90"))
+
+# Non-home consumers sized in the same breakdown (as the running user; label = path).
+# T-4678: the 2026-10-07 disk-warn listed homes only, while the single biggest
+# consumer on the box was the shared echo cargo target (21G), which no home owns.
+# T-4796: the 2026-10-09 91% warn missed the evidence-build targets the same way
+# (two 8.3G orphans), so both echo target roots are sized.
+DEFAULT_EXTRA_PATHS = ("/var/lib/pantheon/echo-target:/var/lib/pantheon/echo-evidence-targets"
+                       ":/tmp")
+EXTRA_PATHS = [
+    p for p in os.environ.get("PANTHEON_DISK_EXTRA_PATHS", DEFAULT_EXTRA_PATHS).split(":") if p
+]
 
 STATE_DIR = Path.home() / ".local" / "state" / "pantheon"
 STATE_PATH = STATE_DIR / "disk_usage_alert_state.json"
@@ -175,7 +191,7 @@ def _top_processes(sort_key: str, limit: int = 3) -> str:
         return ""
 
 
-def _top_consumers(limit: int = 4) -> str:
+def _top_consumers(limit: int = 12) -> str:
     """Per-home sizes, largest first, followed by any home that could NOT be sized —
     each MARKED (?timeout / ?err / ?skipped), never silently dropped. A home the
     sweep cannot measure is the actionable signal, not noise: on 2026-09-06 the
@@ -185,20 +201,38 @@ def _top_consumers(limit: int = 4) -> str:
     and the whole sweep is bounded by DU_TOTAL_BUDGET_SEC so it always fits inside
     the service TimeoutStartSec."""
     import getpass
+    from concurrent.futures import ThreadPoolExecutor, wait
     me = getpass.getuser()
     measured: list[tuple[str, str]] = []
     unmeasured: list[tuple[str, str]] = []
-    deadline = time.monotonic() + DU_TOTAL_BUDGET_SEC
+
+    targets: list[tuple[str, list[str]]] = []
     for home in AGENT_HOMES:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            unmeasured.append((home, "?skipped"))
-            continue
         path = f"/home/{home}"
         cmd = ["du", "-sh", path] if home == me else ["sudo", "-n", "-u", home, "du", "-sh", path]
+        targets.append((home, cmd))
+    for path in EXTRA_PATHS:
+        targets.append((path, ["du", "-sh", path]))
+    if not targets:
+        return ""
+
+    def _du(cmd: list[str]):
+        return subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=DU_PER_HOME_TIMEOUT_SEC)
+
+    # Concurrent sweep (T-4678). A du still running at the budget deadline is marked
+    # ?timeout; its own per-home timeout (<= the budget) reaps the child, so no
+    # worker thread outlives the service window.
+    pool = ThreadPoolExecutor(max_workers=len(targets))
+    futures = [(label, pool.submit(_du, cmd)) for label, cmd in targets]
+    wait([f for _, f in futures], timeout=DU_TOTAL_BUDGET_SEC)
+    pool.shutdown(wait=False)
+    for home, fut in futures:
+        if not fut.done():
+            unmeasured.append((home, "?timeout"))
+            continue
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True,
-                                 timeout=min(DU_PER_HOME_TIMEOUT_SEC, remaining))
+            res = fut.result()
         except subprocess.TimeoutExpired:
             unmeasured.append((home, "?timeout"))
             continue
@@ -269,7 +303,7 @@ def _wake_recovery(kind: str, body: str) -> None:
     try:
         from tools import mailbox
         mailbox.send(
-            "/home/the-ancestor/mailbox/recovery",
+            f"{mailbox_hub()}/recovery",  # T-4096: hub from instance.yaml
             body
             + "\nAction (recovery): triage per the 2026-07-04 pattern — locate the growth "
             "(du -sh /tmp/* + per-home breakdown), clean only regenerable caches after "
@@ -303,7 +337,7 @@ def check(*, dry_run: bool, now: float | None = None) -> int:
             f"({_gib(used)}/{_gib(total)}, {_gib(free)} free)."
         )
         if consumers:
-            body += f"\nTop homes: {consumers}"
+            body += f"\nTop consumers: {consumers}"
         body += (
             f"\nReclaim: build/venv caches are usually the bulk (Rust target/, "
             f".venv, .npm, .cache) — safe to clean, regenerate from source. "

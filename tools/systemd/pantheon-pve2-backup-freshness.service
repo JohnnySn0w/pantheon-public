@@ -1,0 +1,19 @@
+[Unit]
+Description=Pantheon home-lab backup freshness — every pve2 and boxon guest's newest vzdump and the pve2 git-data copy are <30h old and clean (T-4998, T-5301)
+Documentation=file:///home/%u/pantheon-config/tools/pve2_backup_freshness.py
+After=network-online.target
+
+# The backup jobs run as root on pve2/boxon and cannot alert anyone; this check failing IS the alert.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/pve2_backup_freshness.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=default.target

@@ -18,7 +18,6 @@ Documentation=file:///home/%u/pantheon-config/tools/unit_failure_alert.py
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
 # `sg pantheon-mailbox -c` REQUIRED (T-1015): the ORG-026 hub is mode-2770 group
 # pantheon-mailbox and user-mode systemd cannot grant supplementary groups — without
 # the wrap the mailbox write dies with PermissionError and every alert would

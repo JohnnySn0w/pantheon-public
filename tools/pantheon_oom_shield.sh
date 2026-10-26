@@ -41,7 +41,12 @@ TARGETS=(
   "exocortex:npm-global/bin/claude"
   "suborch1:npm-global/bin/claude"
   "suborch2:npm-global/bin/claude"
-  "the-ancestor:npm-global/bin/claude"
+  # Control-plane seats run a pinned binary at /opt/pantheon/claude/<acct>/current/
+  # claude.exe (T-5222: recovery sat at +200 and was the kernel's FIRST kill on
+  # 2026-10-19 because only the npm-global path was listed). The tmux server's
+  # cmdline carries the same path, so one entry covers both.
+  "claude:/opt/pantheon/claude/claude/current/claude.exe"
+  "claude-fallback:/opt/pantheon/claude/claude-fallback/current/claude.exe"
   "codex:vendor/x86_64-unknown-linux-musl/bin/codex"
   # tmux SERVERS are session-critical too, but need no separate entries: a tmux
   # server's cmdline retains its launch command, so the claude-path pattern

@@ -533,6 +533,56 @@ class EvaluationAndDedup(unittest.TestCase):
             self.assertEqual(len(report.proposed_ticket_args), 1)
 
 
+class ConcurrentTicketMoves(unittest.TestCase):
+    """T-4165: the scans glob the LIVE ticket tree and parse each file afterwards. A
+    ticket moved in between (the inbox-consumer, another agent's ticket.py, or a
+    parallel xdist worker in CI) must not crash the scan with FileNotFoundError.
+    Main run 36457036198 failed exactly so on tickets/active/T-4137.md."""
+
+    LABELS = ("adr-reeval", "reeval:ORG-061:R1")
+
+    def _moving(self, tickets: Path, src_state: str, dst_state: str, ticket_id: str):
+        """parse_ticket that moves `ticket_id` from src to dst just before parsing it."""
+        from unittest import mock
+        real = program.ticket.parse_ticket
+        moved = []
+
+        def parse(path, *a, **kw):
+            path = Path(path)
+            if not moved and path.parent.name == src_state and path.stem == ticket_id:
+                path.rename(tickets / dst_state / path.name)
+                moved.append(path)
+            return real(path, *a, **kw)
+
+        return mock.patch.object(program.ticket, "parse_ticket", side_effect=parse)
+
+    def test_ticket_resolved_mid_scan_is_skipped_not_raised(self) -> None:
+        with TemporaryDirectory() as td:
+            tickets = _tickets(Path(td))
+            _ticket(tickets, "T-9001", state="active", labels=self.LABELS)
+            with self._moving(tickets, "active", "done", "T-9001"):
+                # Now done, so no longer an open review ticket.
+                self.assertIsNone(program.existing_review_ticket("ORG-061:R1", tickets))
+
+    def test_ticket_claimed_mid_scan_is_counted_once(self) -> None:
+        with TemporaryDirectory() as td:
+            tickets = _tickets(Path(td))
+            _ticket(tickets, "T-9001", state="inbox", labels=self.LABELS)
+            with self._moving(tickets, "inbox", "active", "T-9001"):
+                self.assertEqual(program.existing_review_ticket("ORG-061:R1", tickets), "T-9001")
+
+    def test_ticket_listed_in_two_states_counts_once(self) -> None:
+        # A move between the per-state globs can list one ticket under both states.
+        from unittest import mock
+        with TemporaryDirectory() as td:
+            tickets = _tickets(Path(td))
+            live = _ticket(tickets, "T-9001", state="active", labels=self.LABELS)
+            both = [tickets / "inbox" / "T-9001.md", live]
+            with mock.patch.object(program, "_ticket_paths",
+                                   side_effect=lambda root, tid=None: both if tid is None else [live]):
+                self.assertEqual(program.existing_review_ticket("ORG-061:R1", tickets), "T-9001")
+
+
 class TicketRootDiscovery(unittest.TestCase):
     def test_real_ticket_discovery_paths_ignore_root_indexes(self) -> None:
         from tools import ticket, ticket_grooming, ticket_lint

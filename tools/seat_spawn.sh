@@ -5,7 +5,7 @@
 #   sudo -u suborch1 /home/suborch1/pantheon-config/tools/seat_spawn.sh
 #
 # WHY THIS EXISTS: seats were spawned ad hoc (`sudo -u suborchN bash -lc
-# 'tmux new-session ...'` — metis and atlas even differed in shape), and a
+# 'tmux new-session ...'` — mason and artisan even differed in shape), and a
 # sudo-spawned tmux SERVER bakes SUDO_USER/SUDO_UID/SUDO_GID/SUDO_COMMAND
 # into its environment — inherited by the agent process and EVERY tool it
 # ever runs. Seat tool runs then diverge from a normal login on any
@@ -29,6 +29,15 @@ esac
 if tmux has-session -t "$SESSION" 2>/dev/null; then
   echo "[seat_spawn] session $SESSION already exists — no-op (idempotent)"
   exit 0
+fi
+
+# ORG-106 L3a (T-5526): a deep-sleeping seat is never launched. Fail-open on a fault.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_lc_rc=0
+python3 "$SCRIPT_DIR/seat_state.py" launch-check --account "$SEAT_USER" || _lc_rc=$?
+if [[ $_lc_rc -eq 3 ]]; then
+  echo "[seat_spawn] refusing: $SEAT_USER is in deep-sleep; wake it first (harness <seat> wake)" >&2
+  exit 75   # EX_TEMPFAIL: ORG-106 deep-sleep, nothing touched
 fi
 
 # The scrub. env -u removes the vars for the tmux SERVER this command forks,

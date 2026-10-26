@@ -11,9 +11,12 @@ drift between the runner's expectations and the source document.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
+import io
 import json
 import os
+import re
 import shlex
 import subprocess
 import tempfile
@@ -177,9 +180,21 @@ def _finding_block(
 """
 
 
-def _findings_file_text(*blocks: str, slot="weekly-narrow", when="2026-07-06") -> str:
+def _sentinel_line(n: int) -> str:
+    """T-4314: the closing sentinel, written literally (NOT via the runner's
+    template) so this file pins the wire format independently of the runner."""
+    return f"s3star-audit-end: findings={n}"
+
+
+def _findings_file_text(
+    *blocks: str, slot="weekly-narrow", when="2026-07-06", sealed=True
+) -> str:
+    """Frontmatter + `blocks`. T-4314: `sealed=True` (the default) appends the
+    closing sentinel with N = the number of `## Finding` sections in `blocks`,
+    i.e. what a complete, well-behaved auditor run writes. `sealed=False` is
+    the pre-T-4314 / truncated-run shape."""
     body = "\n".join(blocks)
-    return f"""---
+    text = f"""---
 slot: {slot}
 date: {when}
 auditor: codex
@@ -187,6 +202,40 @@ auditor: codex
 
 {body}
 """
+    if sealed:
+        n = len(re.findall(r"^## Finding\b", body, flags=re.MULTILINE))
+        text += "\n" + _sentinel_line(n) + "\n"
+    return text
+
+
+def _zero_finding_file_text(
+    *, slot="weekly-narrow", when="2026-07-06", frontmatter=True, sealed=True
+) -> str:
+    """T-4307: a legitimate zero-finding audit file. Shape modeled on the real
+    2026-09-28 weekly-narrow output (frontmatter, preamble, verification summary,
+    retest verdicts, an explicit no-new-finding line, DECISIONS) -- text is
+    original, and deliberately carries NO `## Finding` heading (the brief tells
+    the auditor to omit that section when nothing is actionable).
+
+    T-4314: `sealed=True` (default) ends with `s3star-audit-end: findings=0`;
+    `sealed=False` is the real pre-sentinel shape -- indistinguishable, by
+    structure alone, from a run that crashed after writing its DECISIONS."""
+    fm = f"---\nslot: {slot}\ndate: {when}\nauditor: codex\n---\n\n" if frontmatter else ""
+    text = fm + (
+        "## Audit Preamble\n\n"
+        "Coverage selected for this rotation: file permissions and ledger sampling.\n\n"
+        "## Verification Summary\n\n"
+        "- `permission_boundary_check`: PASS. All three write probes returned status 1.\n"
+        "- `manifest_hashes_match`: PASS. Every artifact hash matched the manifest.\n\n"
+        "## Retest Verdicts\n\n"
+        "- T-0001: pass.\n\n"
+        "No new actionable finding is filed this cycle.\n\n"
+        "## DECISIONS\n\n"
+        "- Recorded verdicts only, no remediation; justified-via P5.\n"
+    )
+    if sealed:
+        text += "\n" + _sentinel_line(0) + "\n"
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +411,37 @@ class ComposeAuditBriefSnapshotSectionTests(unittest.TestCase):
         self.assertEqual(b1, b2)
 
 
+class ComposeAuditBriefSeatEvidenceTests(unittest.TestCase):
+    """T-4928: the snapshot section points at Recovery's per-seat bundle, or says it is absent."""
+
+    def _brief(self, latest):
+        slot = runner.get_slot("weekly-narrow")
+        with patch.object(runner, "SEAT_EVIDENCE_LATEST", latest):
+            return runner.compose_audit_brief(
+                slot, date(2026, 7, 6), Path("/tmp/x.md"),
+                proposal_text=_FIXTURE_PROPOSAL, snapshot_path=Path("/tmp/x/runtime-snapshot.md"))
+
+    def test_present_bundle_is_cited_with_its_timestamp(self):
+        with tempfile.TemporaryDirectory() as td:
+            latest = Path(td)
+            (latest / "MANIFEST.md").write_text("---\ngenerated_at: 2026-10-20T08:20:00Z\n---\n")
+            brief = self._brief(latest)
+        self.assertIn("### Per-seat evidence (Recovery-captured)\n", brief)
+        self.assertIn("generated_at 2026-10-20T08:20:00Z", brief)
+        self.assertIn("never content", brief)
+
+    def test_absent_bundle_is_stated_not_silent(self):
+        brief = self._brief(Path("/nonexistent/seat-evidence/latest"))
+        self.assertIn("Per-seat evidence (Recovery-captured): ABSENT this cycle", brief)
+        self.assertIn("absence-of-channel", brief)
+
+    def test_no_snapshot_no_seat_section(self):
+        slot = runner.get_slot("weekly-narrow")
+        brief = runner.compose_audit_brief(slot, date(2026, 7, 6), Path("/tmp/x.md"),
+                                           proposal_text=_FIXTURE_PROPOSAL)
+        self.assertNotIn("Per-seat evidence", brief)
+
+
 class ComposeAuditBriefIsolationProfileSectionTests(unittest.TestCase):
     """T-1598: compose_audit_brief always carries the s3star-audit isolation
     profile note (unconditional -- unlike the optional snapshot section)."""
@@ -396,7 +476,7 @@ class ComposeAuditBriefIsolationProfileSectionTests(unittest.TestCase):
         )
         self.assertIn("test -w /home/codex/pantheon-config", brief)
         self.assertIn("test -w /home/codex/codex-config", brief)
-        self.assertIn("test -w /home/the-ancestor/mailbox/orchestrator", brief)
+        self.assertIn("test -w /home/post-office/mailbox/orchestrator", brief)
 
     def test_section_instructs_findings_written_inside_workspace(self):
         slot = runner.get_slot("weekly-narrow")
@@ -882,7 +962,7 @@ class DispatchTicketTests(unittest.TestCase):
         mock_capture.assert_called_once()
         argv = mock_invoke.call_args[0][0]
         self.assertIn("--target", argv)
-        self.assertEqual(argv[argv.index("--target") + 1], "orchestrator")
+        self.assertEqual(argv[argv.index("--target") + 1], "role:engineering_orchestrator")
         self.assertIn("--labels", argv)
         self.assertIn("s3star-audit,audit-dispatch", argv)
         ask = argv[argv.index("--ask") + 1]
@@ -945,6 +1025,130 @@ class DispatchTicketTests(unittest.TestCase):
         self.assertIn("T-1583", str(ctx.exception))
 
 
+class DispatchTicketLandAfterExitTextTests(unittest.TestCase):
+    """T-4307: the dispatch ticket must tell HO to land only after the CODEX
+    PROCESS has exited in the codex-audit pane. On 2026-09-28 Codex rewrote
+    verdicts.jsonl ~40s after the file first appeared, so retest verdicts
+    landed twice; 'when findings.md first appears' is the wrong trigger.
+
+    The gate is the Codex process, NOT the tmux session: the session is
+    `tmux new-session -d` and Codex is typed into its interactive bash pane,
+    so when Codex exits the pane returns to a shell prompt and the session
+    lives on until --teardown-audit. A "session has EXITED" gate can never
+    become true (review REBOUND B2)."""
+
+    def _ask(self):
+        slot = runner.get_slot("weekly-narrow")
+        today = date(2026, 7, 6)
+        ask, _ctx = runner.build_dispatch_ticket_bodies(
+            slot, today, "BRIEF", Path("/tmp/s3star/2026-07-06/findings.md")
+        )
+        return slot, today, ask
+
+    def test_ask_gates_landing_on_codex_process_exit(self):
+        slot, today, ask = self._ask()
+        session = runner.codex_audit_session_name(slot.slug, today)
+        self.assertIn("Codex process has EXITED", ask)
+        self.assertIn(f"in the `{session}` pane", ask)
+        self.assertIn("not when", ask)  # explicitly rules out landing on first appearance
+        self.assertNotIn("confirm Codex's findings landed", ask)
+
+    def test_ask_does_not_gate_on_the_tmux_session_exiting(self):
+        # B2 regression pin: the session stays alive after Codex exits (it is
+        # only killed by --teardown-audit), so a "session has EXITED" gate is
+        # unsatisfiable. The text must say so explicitly.
+        _slot, _today, ask = self._ask()
+        self.assertNotIn("session has EXITED", ask)
+        self.assertIn("stays alive until --teardown-audit", ask)
+
+    def test_ask_gives_a_concrete_process_exit_check(self):
+        _slot, _today, ask = self._ask()
+        self.assertIn(
+            f"pgrep -u {runner.CODEX_AUDIT_USER} -af 'codex --profile {runner.AUDIT_PROFILE}'",
+            ask,
+        )
+        # T-4314 (scope item 3): the claude account cannot read that pane, so
+        # the "pane's last line is a shell prompt" alternative check is gone;
+        # pgrep is the one check.
+        self.assertNotIn("equivalently", ask)
+        self.assertNotIn("last line is a shell prompt", ask)
+
+    def test_exit_gate_precedes_both_landing_commands(self):
+        _slot, _today, ask = self._ask()
+        gate = ask.index("Codex process has EXITED")
+        self.assertLess(gate, ask.index("--land-findings"))
+        self.assertLess(gate, ask.index("--land-verdicts"))
+
+    def test_ask_names_the_verdicts_landing_command(self):
+        slot, today, ask = self._ask()
+        verdicts_path = runner.run_workspace_dir(slot.slug, today) / "verdicts.jsonl"
+        self.assertIn(f"--land-verdicts --slot {slot.slug}", ask)
+        self.assertIn(f"--verdicts-file {verdicts_path}", ask)
+
+    # -- T-4314 (scope item 2, wording approved by Orchestrator on plan Q4) --
+
+    def test_ask_says_what_ho_does_with_a_land_findings_rc1(self):
+        _slot, _today, ask = self._ask()
+        self.assertIn("rc 1 means the cycle is NOT clean; read the printed problem lines.", ask)
+        # T-4368 (item 4): worded PER CAUSE. This replaced the T-4314 sentence
+        # "A sentinel problem (missing, mismatched, duplicated, or content after
+        # it) means the run was truncated or crashed.", which overclaimed for the
+        # duplicate and content-after causes (more likely a rewrite or append).
+        self.assertIn(
+            "A missing sentinel, or an N that does not match the number of "
+            "`## Finding` sections, means the run was truncated or crashed.",
+            ask,
+        )
+        self.assertIn(
+            "A duplicated sentinel, or content after it, means the file was "
+            "rewritten or appended to after sealing.",
+            ask,
+        )
+        self.assertIn("Nothing was filed in any of these cases. Re-run the audit.", ask)
+        self.assertIn(
+            "A shape problem in a sealed file files the parseable findings and returns "
+            "rc 1 on every re-land by design. Hand-file the rest instead of looping.",
+            ask,
+        )
+        self.assertIn("Either way, do not close the dispatch ticket as a clean cycle.", ask)
+
+    def test_ask_does_not_blame_truncation_for_a_rewrite_or_append(self):
+        # T-4368 (item 4): each cause is attributed to ITS mechanism, never the
+        # other's, and the old lumped list is gone.
+        _slot, _today, ask = self._ask()
+        sentences = ask.split(". ")
+        missing_all = [s for s in sentences if "A missing sentinel" in s]
+        rewrite_all = [s for s in sentences if "A duplicated sentinel" in s]
+        self.assertEqual(len(missing_all), 1, "no per-cause sentence for a missing sentinel")
+        self.assertEqual(len(rewrite_all), 1, "no per-cause sentence for a duplicated sentinel")
+        missing, rewrite = missing_all[0], rewrite_all[0]
+        self.assertIn("truncated or crashed", missing)
+        self.assertNotIn("rewritten", missing)
+        self.assertIn("rewritten or appended to after sealing", rewrite)
+        self.assertNotIn("truncated", rewrite)
+        self.assertNotIn("crashed", rewrite)
+        self.assertNotIn("(missing, mismatched, duplicated, or content after it)", ask)
+
+    def test_rc1_guidance_sits_between_the_two_landing_commands(self):
+        _slot, _today, ask = self._ask()
+        guidance = ask.index("rc 1 means the cycle is NOT clean")
+        self.assertGreater(guidance, ask.index("--land-findings"))
+        self.assertLess(guidance, ask.index("--land-verdicts"))
+
+    def test_ask_only_promises_a_clean_landing_for_a_sealed_zero_finding_audit(self):
+        _slot, _today, ask = self._ask()
+        self.assertIn("one ending in its closing sentinel", ask)
+        self.assertIn("lands clean, rc 0, filed 0", ask)
+
+    def test_teardown_still_last(self):
+        _slot, _today, ask = self._ask()
+        # the teardown COMMAND (the flag is also mentioned earlier, in the
+        # explanation of why the session never exits on its own)
+        teardown_cmd = "python3 tools/s3star_audit_runner.py --teardown-audit"
+        self.assertIn(teardown_cmd, ask)
+        self.assertGreater(ask.index(teardown_cmd), ask.index("--land-verdicts"))
+
+
 class FindingsStructuralCheckTests(unittest.TestCase):
     def test_missing_file_not_landed(self):
         self.assertFalse(runner.findings_landed_ok(Path("/nonexistent/path.md")))
@@ -961,14 +1165,39 @@ class FindingsStructuralCheckTests(unittest.TestCase):
             p.write_text(_finding_block() * 5, encoding="utf-8")
             self.assertFalse(runner.findings_landed_ok(p))
 
-    def test_missing_finding_heading_not_landed(self):
+    def test_zero_finding_file_with_valid_frontmatter_is_landed(self):
+        # T-4307: the brief tells Codex to omit the `## Finding` section when
+        # nothing is actionable, so a valid zero-finding file must count as
+        # landed-ok (this reverses the old test_missing_finding_heading_not_landed
+        # pin).
+        text = _zero_finding_file_text()
+        self.assertGreaterEqual(len(text.encode("utf-8")), runner.FINDINGS_MIN_BYTES)
+        self.assertNotIn("## Finding", text)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "f.md"
+            p.write_text(text, encoding="utf-8")
+            self.assertTrue(runner.findings_landed_ok(p))
+
+    def test_zero_finding_file_without_frontmatter_not_landed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "f.md"
+            p.write_text(_zero_finding_file_text(frontmatter=False), encoding="utf-8")
+            self.assertFalse(runner.findings_landed_ok(p))
+
+    def test_zero_finding_file_frontmatter_missing_date_not_landed(self):
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "f.md"
             p.write_text(
-                "---\nslot: weekly-narrow\ndate: 2026-07-06\nauditor: codex\n---\n\n"
-                + "no findings this cycle, all clear, nothing to report here at all.\n" * 5,
+                _zero_finding_file_text().replace("date: 2026-07-06\n", ""),
                 encoding="utf-8",
             )
+            self.assertFalse(runner.findings_landed_ok(p))
+
+    def test_too_small_zero_finding_file_not_landed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "f.md"
+            p.write_text("---\nslot: x\ndate: y\n---\nAll clear.\n", encoding="utf-8")
+            self.assertLess(p.stat().st_size, runner.FINDINGS_MIN_BYTES)
             self.assertFalse(runner.findings_landed_ok(p))
 
     def test_well_formed_findings_file_is_landed(self):
@@ -1005,6 +1234,19 @@ class ParseFindingsTests(unittest.TestCase):
         findings = runner.parse_findings(text)
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].finding_id, "F-1")
+
+    def test_strict_heading_regex_is_the_one_constant_the_parser_uses(self):
+        # T-4307 B1: land_findings' guard counts headings with the SAME module
+        # constant parse_findings splits on, so the two cannot drift.
+        text = _findings_file_text(
+            _finding_block(finding_id="F-1"), _finding_block(finding_id="F-2", title="Second")
+        )
+        self.assertEqual(len(runner._FINDING_HEADING_RE.findall(text)), 2)
+        self.assertEqual(len(runner.parse_findings(text)), 2)
+        # a near-miss is invisible to both
+        near = text.replace("## Finding 1: Sample finding", "### Finding 1: Sample finding")
+        self.assertEqual(len(runner._FINDING_HEADING_RE.findall(near)), 1)
+        self.assertEqual(len(runner.parse_findings(near)), 1)
 
     def test_no_findings_section_returns_empty(self):
         text = "---\nslot: x\ndate: y\nauditor: codex\n---\n\nAll clear this cycle.\n"
@@ -1076,7 +1318,7 @@ class FileFindingTests(unittest.TestCase):
             outcome, tid, _detail = runner.file_finding(finding, "weekly-narrow", date(2026, 7, 6))
         self.assertEqual(outcome, "filed")
         argv = mock_invoke.call_args[0][0]
-        self.assertEqual(argv[argv.index("--target") + 1], "recovery")
+        self.assertEqual(argv[argv.index("--target") + 1], "role:system_orchestrator")
         self.assertIn("severity-high", argv[argv.index("--labels") + 1])
         self.assertIn("authorship-flagged", argv[argv.index("--labels") + 1])
         context = argv[argv.index("--context") + 1]
@@ -1094,10 +1336,63 @@ class FileFindingTests(unittest.TestCase):
             mock_invoke.return_value = ("filed", "T-1235", "retries=0")
             runner.file_finding(finding, "weekly-narrow", date(2026, 7, 6))
         argv = mock_invoke.call_args[0][0]
-        self.assertEqual(argv[argv.index("--target") + 1], "specialist")
+        self.assertEqual(argv[argv.index("--target") + 1], "role:research_orchestrator")
         context = argv[argv.index("--context") + 1]
         self.assertIn("no codex-authored", context)
         self.assertNotIn("AUTHORSHIP FLAG", context)
+
+
+def _land_text(text):
+    """Land `text` from a temp dir with filing/push mocked. Returns
+    (rc, mock_invoke, mock_push, runner_log_text)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        (cwd / "tickets" / "inbox").mkdir(parents=True)
+        log_path = cwd / "runner.log"
+        findings_file = cwd / "findings.md"
+        findings_file.write_text(text, encoding="utf-8")
+        with patch.object(runner, "RUNNER_LOG", log_path), \
+             patch.object(runner, "authorship_flag", return_value=False), \
+             patch.object(runner, "push_claude_tier_queue") as mock_push, \
+             patch.object(runner, "_invoke_ticket_file") as mock_invoke:
+            mock_invoke.return_value = ("filed", "T-0001", "retries=0")
+            rc = runner.land_findings(
+                "weekly-narrow", findings_file, date(2026, 7, 6), cwd=cwd
+            )
+        log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    return rc, mock_invoke, mock_push, log
+
+
+def _run_land_cli(text):
+    """T-4368: drive the real CLI entry, `main(["--land-findings", ...])`, on
+    `text`. Every side effect is patched out: ticket filing (`_invoke_ticket_file`),
+    the claude-tier queue push, the authorship git-log lookup, the on-disk
+    duplicate scan, the runner log, and `subprocess.run` itself (a fail-loud
+    trip-wire: no git and no ticket CLI may run). Returns
+    (rc, mock_invoke, mock_push, mock_subprocess_run, runner_log, stderr)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        log_path = tmp_path / "runner.log"
+        findings_file = tmp_path / "findings.md"
+        findings_file.write_text(text, encoding="utf-8")
+        stderr = io.StringIO()
+        with patch.object(runner, "RUNNER_LOG", log_path), \
+             patch.object(runner, "authorship_flag", return_value=False), \
+             patch.object(runner, "finding_already_filed", return_value=False), \
+             patch.object(runner, "push_claude_tier_queue") as mock_push, \
+             patch.object(runner, "_invoke_ticket_file") as mock_invoke, \
+             patch.object(
+                 runner.subprocess, "run",
+                 side_effect=AssertionError("the CLI test must not spawn a subprocess"),
+             ) as mock_run, \
+             contextlib.redirect_stderr(stderr):
+            mock_invoke.return_value = ("filed", "T-0001", "retries=0")
+            rc = runner.main([
+                "--land-findings", "--slot", "weekly-narrow",
+                "--findings-file", str(findings_file),
+            ])
+        log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+    return rc, mock_invoke, mock_push, mock_run, log, stderr.getvalue()
 
 
 class LandFindingsTests(unittest.TestCase):
@@ -1142,6 +1437,192 @@ class LandFindingsTests(unittest.TestCase):
                 rc = runner.land_findings("weekly-narrow", findings_file, today, cwd=cwd)
             self.assertEqual(rc, 0)
             mock_invoke.assert_not_called()
+
+    # -- T-4307: a clean (zero-finding) cycle must land as clean, distinguishable
+    # from a broken audit. --
+
+    def test_land_findings_zero_finding_file_is_clean_rc0_and_files_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "tickets" / "inbox").mkdir(parents=True)
+            log_path = cwd / "runner.log"
+            findings_file = cwd / "findings.md"
+            findings_file.write_text(_zero_finding_file_text(), encoding="utf-8")
+            with patch.object(runner, "RUNNER_LOG", log_path), \
+                 patch.object(runner, "_invoke_ticket_file") as mock_invoke:
+                rc = runner.land_findings("weekly-narrow", findings_file, date(2026, 7, 6), cwd=cwd)
+            self.assertEqual(rc, 0)
+            mock_invoke.assert_not_called()
+            log = log_path.read_text(encoding="utf-8")
+            self.assertIn("filed 0, skipped 0, errored 0", log)
+            self.assertNotIn("not landed-ok", log)
+
+    def test_land_findings_missing_file_still_rc1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            with patch.object(runner, "RUNNER_LOG", cwd / "runner.log"):
+                rc = runner.land_findings(
+                    "weekly-narrow", cwd / "does-not-exist.md", date(2026, 7, 6), cwd=cwd
+                )
+            self.assertEqual(rc, 1)
+
+    def test_land_findings_zero_finding_file_without_frontmatter_still_rc1(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            findings_file = cwd / "findings.md"
+            findings_file.write_text(_zero_finding_file_text(frontmatter=False), encoding="utf-8")
+            with patch.object(runner, "RUNNER_LOG", cwd / "runner.log"), \
+                 patch.object(runner, "_invoke_ticket_file") as mock_invoke:
+                rc = runner.land_findings("weekly-narrow", findings_file, date(2026, 7, 6), cwd=cwd)
+            self.assertEqual(rc, 1)
+            mock_invoke.assert_not_called()
+
+    def test_land_findings_headings_present_but_none_parse_is_error_not_clean(self):
+        # A file that HAS `## Finding` headings but none parse means the
+        # auditor's output was malformed -- "the audit broke", not "found
+        # nothing". Must not be a silent rc 0 now that zero findings is legal.
+        bad = "## Finding 1: Broken\n- **ID:** F-1\n- **Severity:** Low\n"  # missing required fields
+        with tempfile.TemporaryDirectory() as tmp:
+            cwd = Path(tmp)
+            (cwd / "tickets" / "inbox").mkdir(parents=True)
+            log_path = cwd / "runner.log"
+            findings_file = cwd / "findings.md"
+            findings_file.write_text(
+                _findings_file_text(bad + "padding to clear the minimum size. " * 8),
+                encoding="utf-8",
+            )
+            with patch.object(runner, "RUNNER_LOG", log_path), \
+                 patch.object(runner, "_invoke_ticket_file") as mock_invoke:
+                rc = runner.land_findings("weekly-narrow", findings_file, date(2026, 7, 6), cwd=cwd)
+            self.assertEqual(rc, 1)
+            mock_invoke.assert_not_called()
+            self.assertIn("none parsed", log_path.read_text(encoding="utf-8"))
+
+    # -- T-4307 REBOUND B1: with the structural check no longer requiring a
+    # heading, a real finding under a near-miss heading would otherwise land
+    # as a silent "clean" rc 0. Guards live in land_findings; they change only
+    # the return code + message, never what gets filed. --
+
+    def _run_land(self, text):
+        return _land_text(text)
+
+    _CANONICAL_HEADING = "## Finding 1: Sample finding"
+
+    def _block_with_heading(self, heading, **kw):
+        block = _finding_block(**kw)
+        self.assertIn(self._CANONICAL_HEADING, block)
+        return block.replace(self._CANONICAL_HEADING, heading, 1)
+
+    def test_near_miss_finding_headings_are_errors_not_clean(self):
+        # Every shape here was rc 1 on main (the old structural check needed the
+        # exact heading) and must stay loud. Each block carries all 11 required
+        # bullets, so only the heading is wrong.
+        near_miss = [
+            "### Finding 1: t", "# Finding 1: t",
+            "## finding 1: t", "## FINDING 1: t",
+            "## Findings", "## Finding1: t", "##Finding 1: t", " ## Finding 1: t",
+            "## 1. Finding: t",
+        ]
+        for heading in near_miss:
+            with self.subTest(heading=heading):
+                text = _findings_file_text(self._block_with_heading(heading))
+                rc, mock_invoke, _push, log = self._run_land(text)
+                self.assertEqual(rc, 1)
+                mock_invoke.assert_not_called()
+                self.assertIn("near-miss", log)
+
+    def test_bold_and_id_style_finding_blocks_are_errors_not_clean(self):
+        # No '#' + 'finding' heading line to catch, so the severity-bullet
+        # count guard is what catches these.
+        for heading in ("**Finding 1: t**", "## F-1: t"):
+            with self.subTest(heading=heading):
+                text = _findings_file_text(self._block_with_heading(heading))
+                rc, mock_invoke, _push, log = self._run_land(text)
+                self.assertEqual(rc, 1)
+                mock_invoke.assert_not_called()
+                self.assertIn("Severity", log)
+
+    def test_mixed_good_and_near_miss_files_the_good_one_but_rc1(self):
+        good = _finding_block(finding_id="F-1", owner="recovery")
+        near = self._block_with_heading("### Finding 2: t", finding_id="F-2")
+        rc, mock_invoke, _push, log = self._run_land(_findings_file_text(good, near))
+        self.assertEqual(rc, 1)
+        self.assertEqual(mock_invoke.call_count, 1)  # the parseable block is still filed
+        self.assertIn("near-miss", log)
+
+    def test_partly_malformed_files_the_good_ones_but_rc1(self):
+        # T-4307 (Orchestrator's call, closes the silent-drop gap): a malformed block
+        # is still skipped and the parseable ones are still filed, but the run
+        # is no longer a silent rc 0.
+        good = _finding_block(finding_id="F-1", owner="recovery")
+        bad = "## Finding 2: Broken\n- **ID:** F-2\n- **Severity:** Low\n"
+        rc, mock_invoke, _push, log = self._run_land(_findings_file_text(good, bad))
+        self.assertEqual(rc, 1)
+        self.assertEqual(mock_invoke.call_count, 1)
+        self.assertIn("1 of 2", log)
+
+    def test_partly_malformed_block_with_no_severity_bullet_is_still_rc1(self):
+        # The severity-bullet guard alone would miss this; the heading-vs-parsed
+        # count catches it.
+        good = _finding_block(finding_id="F-1", owner="recovery")
+        bad = "## Finding 2: Broken\nJust prose, no bullets at all.\n"
+        rc, mock_invoke, _push, log = self._run_land(_findings_file_text(good, bad))
+        self.assertEqual(rc, 1)
+        self.assertEqual(mock_invoke.call_count, 1)
+        self.assertIn("1 of 2", log)
+
+    def test_over_the_soft_cap_files_the_cap_but_rc1(self):
+        # 31 well-formed findings: parse_findings files the first 30. The
+        # dropped one used to be a silent rc 0; it is now surfaced.
+        blocks = [_finding_block(finding_id=f"F-{i}") for i in range(31)]
+        rc, mock_invoke, _push, _log = self._run_land(_findings_file_text(*blocks))
+        self.assertEqual(rc, 1)
+        self.assertEqual(mock_invoke.call_count, 30)
+
+    def test_well_formed_file_with_other_sections_trips_no_guard(self):
+        # No false positive: prose that mentions "finding" outside a heading
+        # line, and non-Finding '##' sections, must not trip either guard.
+        preamble = (
+            "## Audit Preamble\n\nCoverage notes. Nothing here is a finding heading; "
+            "every finding is filed below.\n"
+        )
+        rc, mock_invoke, _push, log = self._run_land(
+            _findings_file_text(preamble, _finding_block(finding_id="F-1", owner="recovery"))
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(mock_invoke.call_count, 1)
+        self.assertNotIn("near-miss", log)
+
+    # -- T-4307 REBOUND T1: pin when the claude-tier queue push runs. The push
+    # reads the currently-open authorship-flagged retests off disk and is
+    # independent of this cycle's findings (no-op when none are flagged), so a
+    # clean or error cycle must still reach it exactly once. --
+
+    def test_clean_zero_finding_cycle_pushes_queue_exactly_once(self):
+        rc, _invoke, mock_push, _log = self._run_land(_zero_finding_file_text())
+        self.assertEqual(rc, 0)
+        mock_push.assert_called_once()
+
+    def test_none_parsed_cycle_pushes_queue_exactly_once(self):
+        bad = "## Finding 1: Broken\n- **ID:** F-1\n- **Severity:** Low\n"
+        rc, _invoke, mock_push, _log = self._run_land(
+            _findings_file_text(bad + "padding to clear the minimum size. " * 8)
+        )
+        self.assertEqual(rc, 1)
+        mock_push.assert_called_once()
+
+    def test_near_miss_cycle_pushes_queue_exactly_once(self):
+        text = _findings_file_text(self._block_with_heading("### Finding 1: t"))
+        rc, _invoke, mock_push, _log = self._run_land(text)
+        self.assertEqual(rc, 1)
+        mock_push.assert_called_once()
+
+    def test_structurally_rejected_file_does_not_push_queue(self):
+        # Unchanged pre-existing behaviour: a not-landed-ok file returns before
+        # anything else runs.
+        rc, _invoke, mock_push, _log = self._run_land("not structured")
+        self.assertEqual(rc, 1)
+        mock_push.assert_not_called()
 
     # -- T-2801: land_findings is the one prod-mode step every supervised
     # audit cycle runs (per the module docstring's dispatch -> launch ->
@@ -1221,6 +1702,490 @@ class LandFindingsTests(unittest.TestCase):
                 mock_invoke.return_value = ("filed", "T-9999", "retries=0")
                 runner.land_findings("weekly-narrow", findings_file, today, cwd=cwd)
             mock_push.assert_called_once_with(cwd=cwd)
+
+
+class SplitClosingSentinelTests(unittest.TestCase):
+    """T-4314: `_split_closing_sentinel(text) -> (body, problems)`. Pure. `body`
+    is `text` minus valid sentinel lines (what gets parsed and shape-checked);
+    `problems` is empty iff the file carries exactly one well-formed sentinel,
+    as its last non-blank line, whose N equals the number of strict
+    `## Finding` headings."""
+
+    def test_sealed_file_has_no_problems_and_body_drops_the_sentinel(self):
+        text = _findings_file_text(_finding_block(finding_id="F-1"))
+        body, problems = runner._split_closing_sentinel(text)
+        self.assertEqual(problems, [])
+        self.assertNotIn("s3star-audit-end", body)
+        self.assertIn("## Finding 1: Sample finding", body)
+
+    def test_trailing_blank_lines_after_the_sentinel_are_fine(self):
+        text = _findings_file_text(_finding_block()) + "\n\n   \n"
+        _body, problems = runner._split_closing_sentinel(text)
+        self.assertEqual(problems, [])
+
+    def test_horizontal_whitespace_around_the_sentinel_is_tolerated(self):
+        text = _findings_file_text(_finding_block(), sealed=False)
+        text += "\n  s3star-audit-end:   findings = 1 \t\n"
+        _body, problems = runner._split_closing_sentinel(text)
+        self.assertEqual(problems, [])
+
+    def test_missing_sentinel_is_one_problem_naming_truncation_or_crash(self):
+        _body, problems = runner._split_closing_sentinel(_zero_finding_file_text(sealed=False))
+        self.assertEqual(len(problems), 1)
+        self.assertIn("no closing sentinel", problems[0])
+        self.assertIn("truncated or crashed", problems[0])
+
+    def test_token_and_key_are_case_sensitive(self):
+        for variant in ("S3STAR-AUDIT-END: findings=0", "s3star-audit-end: Findings=0"):
+            with self.subTest(variant=variant):
+                text = _zero_finding_file_text(sealed=False) + "\n" + variant + "\n"
+                _body, problems = runner._split_closing_sentinel(text)
+                self.assertTrue(any("no closing sentinel" in p for p in problems))
+
+    # -- T-4368: line-ending and end-of-file pins (already-correct behaviour) --
+
+    def test_crlf_line_endings_are_accepted(self):
+        text = _findings_file_text(_finding_block(finding_id="F-1")).replace("\n", "\r\n")
+        self.assertIn("\r\n", text)
+        body, problems = runner._split_closing_sentinel(text)
+        self.assertEqual(problems, [])
+        self.assertNotIn("s3star-audit-end", body)
+
+    def test_a_sentinel_with_no_final_newline_is_accepted(self):
+        text = _findings_file_text(_finding_block(finding_id="F-1")).rstrip("\n")
+        self.assertTrue(text.endswith("findings=1"))
+        _body, problems = runner._split_closing_sentinel(text)
+        self.assertEqual(problems, [])
+
+    # -- T-4368 items 1 and 2: N is a bounded run of ASCII digits --
+
+    def test_huge_n_is_a_malformed_sentinel_problem_and_raises_nothing(self):
+        # 5000 digits is above int()'s default 4300-digit limit; on the T-4314
+        # code this raised ValueError out of the split (a traceback, no problem
+        # line). It must be an ordinary "malformed sentinel" problem instead, and
+        # the quoted line must not echo the whole numeral.
+        text = _zero_finding_file_text(sealed=False) + "\ns3star-audit-end: findings=" + "1" * 5000 + "\n"
+        _body, problems = runner._split_closing_sentinel(text)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("no closing sentinel", problems[0])
+        self.assertIn("malformed", problems[0])
+        self.assertLess(len(problems[0]), 1000)
+
+    def test_non_ascii_digits_are_not_a_valid_n(self):
+        for label, digit in (("fullwidth", "０"), ("arabic-indic", "٠")):
+            with self.subTest(digit=label):
+                text = _zero_finding_file_text(sealed=False) + "\ns3star-audit-end: findings=" + digit + "\n"
+                _body, problems = runner._split_closing_sentinel(text)
+                self.assertTrue(any("no closing sentinel" in p for p in problems))
+
+    def test_duplicate_and_content_after_problems_do_not_claim_truncation(self):
+        # T-4368 item 4 (runner side): the problem lines were already hedged per
+        # cause; only the missing-sentinel line names truncation or a crash.
+        sealed = _findings_file_text(_finding_block(finding_id="F-1"))
+        _b, dup = runner._split_closing_sentinel(sealed + "\n" + _sentinel_line(1) + "\n")
+        _b, after = runner._split_closing_sentinel(sealed + "\n## Appendix\n\nLate text.\n")
+        self.assertEqual(len(dup), 1)
+        self.assertEqual(len(after), 1)
+        for problem in (dup[0], after[0]):
+            self.assertNotIn("truncated", problem)
+            self.assertNotIn("crashed", problem)
+        self.assertIn("rewrite", dup[0])
+        self.assertIn("rewritten or appended", after[0])
+
+
+class LandFindingsClosingSentinelTests(unittest.TestCase):
+    """T-4314: a crashed or truncated Codex run must not land as a clean
+    zero-finding audit. A missing/mismatched/misplaced/duplicated closing
+    sentinel is FAIL-CLOSED: rc 1 and NOTHING filed (Orchestrator ruling on plan Q2:
+    the run is untrustworthy as a whole, and partial filing plus a later-day
+    re-land would duplicate tickets since markers key on the landing date).
+    Shape problems inside a correctly sealed file keep T-4307's contract:
+    parseable findings filed, rc 1."""
+
+    def _assert_sentinel_rejected(self, text, *, needle):
+        rc, invoke, mock_push, log = _land_text(text)
+        self.assertEqual(rc, 1)
+        self.assertEqual(invoke.call_count, 0, "a sentinel problem must file NOTHING")
+        mock_push.assert_not_called()
+        self.assertIn(needle, log)
+        self.assertIn("nothing filed", log)
+        return log
+
+    # -- missing sentinel / truncated run --
+
+    def test_missing_sentinel_with_findings_is_rc1_and_files_zero_tickets(self):
+        text = _findings_file_text(
+            _finding_block(finding_id="F-1"),
+            _finding_block(finding_id="F-2", title="Second"),
+            sealed=False,
+        )
+        log = self._assert_sentinel_rejected(text, needle="no closing sentinel")
+        self.assertIn("truncated or crashed", log)
+
+    def test_missing_sentinel_on_zero_finding_file_is_not_a_clean_cycle(self):
+        # The exact false-assurance shape: valid frontmatter, no Finding
+        # sections, ends on DECISIONS -- what the real 2026-09-07/-14/-28 files
+        # look like, and what a crash after DECISIONS looks like.
+        self._assert_sentinel_rejected(
+            _zero_finding_file_text(sealed=False), needle="no closing sentinel"
+        )
+
+    def test_truncated_after_frontmatter_and_preamble_is_rc1(self):
+        text = (
+            "---\nslot: weekly-narrow\ndate: 2026-07-06\nauditor: codex\n---\n\n"
+            "## Audit Preamble\n\n"
+            "Coverage selected for this rotation: file permissions, ledger sampling, "
+            "and the mailbox hub boundary. Beginning the evidence read now.\n"
+        )
+        self.assertGreaterEqual(len(text.encode("utf-8")), runner.FINDINGS_MIN_BYTES)
+        self._assert_sentinel_rejected(text, needle="no closing sentinel")
+
+    def test_pre_sentinel_legacy_file_is_not_accepted_and_message_says_so(self):
+        # No legacy path (plan decision): a file shaped like the 12 real
+        # pre-T-4314 findings files (findings, no sentinel) is rc 1, ever.
+        text = _findings_file_text(_finding_block(finding_id="F-1"), sealed=False)
+        log = self._assert_sentinel_rejected(text, needle="no closing sentinel")
+        self.assertIn("before T-4314", log)
+
+    def test_malformed_sentinel_like_line_alone_is_rc1_and_is_quoted(self):
+        text = _findings_file_text(_finding_block(), sealed=False)
+        text += "\ns3star-audit-end: findings=two\n"
+        log = self._assert_sentinel_rejected(text, needle="no closing sentinel")
+        self.assertIn("findings=two", log)
+
+    def test_prose_mention_of_the_sentinel_is_not_a_false_positive(self):
+        preamble = (
+            "## Audit Preamble\n\nI will end this file with "
+            "`s3star-audit-end: findings=1` as instructed.\n"
+        )
+        rc, invoke, _push, _log = _land_text(
+            _findings_file_text(preamble, _finding_block(finding_id="F-1"))
+        )
+        self.assertEqual(rc, 0)
+        self.assertEqual(invoke.call_count, 1)
+
+    # -- N mismatch --
+
+    def test_n_mismatch_is_rc1_and_files_zero_tickets(self):
+        blocks = (_finding_block(finding_id="F-1"), _finding_block(finding_id="F-2", title="B"))
+        for n in (0, 1, 3):  # too low, too low, too high (file has 2)
+            with self.subTest(n=n):
+                text = _findings_file_text(*blocks, sealed=False) + "\n" + _sentinel_line(n) + "\n"
+                log = self._assert_sentinel_rejected(text, needle=f"claims {n}")
+                self.assertIn("2 '## Finding' heading(s)", log)
+
+    def test_clean_claim_on_a_file_that_has_findings_is_rc1(self):
+        text = _findings_file_text(_finding_block(), sealed=False) + "\n" + _sentinel_line(0) + "\n"
+        self._assert_sentinel_rejected(text, needle="claims 0")
+
+    # -- correct files land --
+
+    def test_correct_zero_finding_file_with_zero_sentinel_is_clean_rc0(self):
+        text = _zero_finding_file_text()
+        self.assertTrue(text.rstrip().endswith("s3star-audit-end: findings=0"))
+        rc, invoke, mock_push, log = _land_text(text)
+        self.assertEqual(rc, 0)
+        self.assertEqual(invoke.call_count, 0)
+        mock_push.assert_called_once()
+        self.assertIn("filed 0, skipped 0, errored 0", log)
+
+    def test_correct_n_finding_files_land_rc0_and_file_n_tickets(self):
+        for n in (1, 3):
+            with self.subTest(n=n):
+                blocks = [_finding_block(finding_id=f"F-{i}", title=f"T{i}") for i in range(n)]
+                text = _findings_file_text(*blocks)
+                self.assertTrue(text.rstrip().endswith(f"s3star-audit-end: findings={n}"))
+                rc, invoke, mock_push, _log = _land_text(text)
+                self.assertEqual(rc, 0)
+                self.assertEqual(invoke.call_count, n)
+                mock_push.assert_called_once()
+
+    def test_sentinel_directly_after_last_bullet_does_not_leak_into_the_ticket(self):
+        # parse_findings folds a non-blank line after a bullet into that field;
+        # the sentinel must be stripped BEFORE parsing or it is filed inside the
+        # last finding's Justification.
+        text = _findings_file_text(_finding_block(finding_id="F-1"), sealed=False).rstrip("\n")
+        text += "\n" + _sentinel_line(1) + "\n"
+        rc, invoke, _push, _log = _land_text(text)
+        self.assertEqual(rc, 0)
+        self.assertEqual(invoke.call_count, 1)
+        argv = invoke.call_args[0][0]
+        self.assertNotIn("s3star-audit-end", argv[argv.index("--context") + 1])
+        self.assertNotIn("s3star-audit-end", argv[argv.index("--ask") + 1])
+
+    # -- misplaced / duplicated sentinel --
+
+    def test_content_after_the_sentinel_is_rc1_and_files_zero_tickets(self):
+        text = _findings_file_text(_finding_block(finding_id="F-1"))
+        text += "\n## Appendix\n\nA late addition written after the file was sealed.\n"
+        self._assert_sentinel_rejected(text, needle="follow the closing sentinel")
+
+    def test_sentinel_mid_file_is_rc1_and_files_zero_tickets(self):
+        early = _findings_file_text(_finding_block(finding_id="F-1")).rstrip("\n")
+        text = early + "\n\n" + _finding_block(finding_id="F-2", title="Second")
+        self._assert_sentinel_rejected(text, needle="follow the closing sentinel")
+
+    def test_two_sentinels_is_rc1_and_files_zero_tickets(self):
+        text = _findings_file_text(_finding_block(finding_id="F-1"))
+        text += "\n" + _sentinel_line(1) + "\n"
+        self._assert_sentinel_rejected(text, needle="2 closing sentinels")
+
+    def test_quoted_sentinel_in_a_fence_plus_the_real_one_is_rc1(self):
+        # Documented loud false positive: the brief tells the auditor to write
+        # the sentinel once and never quote it.
+        preamble = "## Audit Preamble\n\n```\n" + _sentinel_line(0) + "\n```\n"
+        text = _findings_file_text(preamble, _finding_block(finding_id="F-1"))
+        self._assert_sentinel_rejected(text, needle="2 closing sentinels")
+
+    # -- T-4368 items 1 and 2: bounded, ASCII-only N --
+
+    def _with_sentinel(self, sentinel_line):
+        return (
+            _findings_file_text(_finding_block(finding_id="F-1"), sealed=False)
+            + "\n" + sentinel_line + "\n"
+        )
+
+    def test_huge_n_is_rc1_with_a_log_line_and_no_traceback(self):
+        # 7 digits is just past the cap; 5000 is past int()'s 4300-digit limit,
+        # where the T-4314 code raised ValueError out of land_findings (fail
+        # closed, but a traceback and no runner-log line). Both must be an
+        # ordinary malformed-sentinel problem: rc 1, nothing filed, logged, and
+        # the log must not echo the whole numeral.
+        for digits in (7, 5000):
+            with self.subTest(digits=digits):
+                text = self._with_sentinel("s3star-audit-end: findings=" + "1" * digits)
+                log = self._assert_sentinel_rejected(text, needle="no closing sentinel")
+                self.assertNotIn("claims", log)
+                self.assertLess(len(log), 2000)
+
+    def test_six_digit_n_is_still_an_ordinary_mismatch(self):
+        # The cap boundary: 6 digits parse and are compared to the count.
+        text = self._with_sentinel("s3star-audit-end: findings=999999")
+        self._assert_sentinel_rejected(text, needle="claims 999999")
+
+    def test_non_ascii_digit_n_is_rejected_even_when_its_value_matches(self):
+        # `\d` accepts Unicode digits, and int() parses them, so a count-matching
+        # fullwidth or Arabic-Indic "1" used to seal a one-finding file.
+        for label, digit in (("fullwidth", "１"), ("arabic-indic", "١")):
+            with self.subTest(digit=label):
+                text = self._with_sentinel("s3star-audit-end: findings=" + digit)
+                self._assert_sentinel_rejected(text, needle="no closing sentinel")
+
+    # -- T-4368: line-ending and end-of-file pins through land_findings --
+
+    def test_a_crlf_file_lands_like_an_lf_file(self):
+        text = _findings_file_text(
+            _finding_block(finding_id="F-1"), _finding_block(finding_id="F-2", title="B")
+        ).replace("\n", "\r\n")
+        rc, invoke, mock_push, _log = _land_text(text)
+        self.assertEqual(rc, 0)
+        self.assertEqual(invoke.call_count, 2)
+        mock_push.assert_called_once()
+        # ...and no carriage return leaks into the filed ticket text.
+        for call in invoke.call_args_list:
+            argv = call[0][0]
+            self.assertNotIn("\r", argv[argv.index("--ask") + 1])
+            self.assertNotIn("\r", argv[argv.index("--context") + 1])
+
+    def test_a_crlf_zero_finding_file_is_clean(self):
+        rc, invoke, _push, _log = _land_text(_zero_finding_file_text().replace("\n", "\r\n"))
+        self.assertEqual(rc, 0)
+        self.assertEqual(invoke.call_count, 0)
+
+    def test_a_crlf_unsealed_file_is_still_rejected(self):
+        text = _findings_file_text(_finding_block(finding_id="F-1"), sealed=False)
+        self._assert_sentinel_rejected(text.replace("\n", "\r\n"), needle="no closing sentinel")
+
+    def test_a_file_with_no_final_newline_lands(self):
+        text = _findings_file_text(_finding_block(finding_id="F-1")).rstrip("\n")
+        self.assertTrue(text.endswith("findings=1"))
+        rc, invoke, _push, _log = _land_text(text)
+        self.assertEqual(rc, 0)
+        self.assertEqual(invoke.call_count, 1)
+
+    def test_a_zero_finding_file_with_no_final_newline_is_clean(self):
+        text = _zero_finding_file_text().rstrip("\n")
+        self.assertTrue(text.endswith("findings=0"))
+        rc, invoke, _push, _log = _land_text(text)
+        self.assertEqual(rc, 0)
+        self.assertEqual(invoke.call_count, 0)
+
+    # -- ordering / T-4307 contract --
+
+    def test_sealed_file_with_a_malformed_block_still_files_the_good_ones_rc1(self):
+        # T-4307 regression pin: shape problems INSIDE a correctly sealed file
+        # keep the old contract (parseable findings filed, rc 1). The fail-closed
+        # short-circuit is for sentinel problems only.
+        good = _finding_block(finding_id="F-1", owner="recovery")
+        bad = "## Finding 2: Broken\n- **ID:** F-2\n- **Severity:** Low\n"
+        text = _findings_file_text(good, bad)
+        self.assertTrue(text.rstrip().endswith("s3star-audit-end: findings=2"))
+        rc, invoke, mock_push, log = _land_text(text)
+        self.assertEqual(rc, 1)
+        self.assertEqual(invoke.call_count, 1)
+        self.assertIn("1 of 2", log)
+        self.assertNotIn("sentinel", log)
+        mock_push.assert_called_once()
+
+    def test_sentinel_check_short_circuits_before_any_parse_or_filing(self):
+        text = _findings_file_text(_finding_block(finding_id="F-1"), sealed=False)
+        with patch.object(runner, "parse_findings") as mock_parse, \
+             patch.object(runner, "file_finding") as mock_file:
+            rc, _invoke, _push, _log = _land_text(text)
+        self.assertEqual(rc, 1)
+        mock_parse.assert_not_called()
+        mock_file.assert_not_called()
+
+    def test_over_cap_sealed_file_reports_one_problem_line_for_one_cause(self):
+        # T-4307 round-2 scope item 5: 31 sealed findings -> parse caps at 30;
+        # the cap is ONE problem ("only 30 of 31"), not that plus a redundant
+        # severity-bullet line.
+        text = _findings_file_text(*[_finding_block(finding_id=f"F-{i}") for i in range(31)])
+        body, sentinel_problems = runner._split_closing_sentinel(text)
+        self.assertEqual(sentinel_problems, [])
+        problems = runner._findings_shape_problems(body, 30)
+        self.assertEqual(len(problems), 1, problems)
+        self.assertIn("30 of 31", problems[0])
+
+
+class LandFindingsCliTests(unittest.TestCase):
+    """T-4368: the sentinel gate holds through the real CLI entry,
+    `main(["--land-findings", ...])`, not just `land_findings` called directly.
+    Everything with a side effect is patched (see `_run_land_cli`), and the
+    subprocess trip-wire must never fire."""
+
+    def test_unsealed_file_is_rc1_with_nothing_filed_and_nothing_pushed(self):
+        for label, text in (
+            ("findings", _findings_file_text(_finding_block(finding_id="F-1"), sealed=False)),
+            ("zero-finding", _zero_finding_file_text(sealed=False)),
+        ):
+            with self.subTest(file=label):
+                rc, invoke, push, run, log, err = _run_land_cli(text)
+                self.assertEqual(rc, 1)
+                self.assertEqual(invoke.call_count, 0, "an unsealed file must file NOTHING")
+                push.assert_not_called()
+                self.assertEqual(run.call_count, 0)
+                self.assertIn("no closing sentinel", err)
+                self.assertIn("nothing filed", log)
+
+    def test_n_mismatch_is_rc1_with_nothing_filed_and_nothing_pushed(self):
+        text = _findings_file_text(_finding_block(finding_id="F-1"), sealed=False)
+        text += "\n" + _sentinel_line(2) + "\n"
+        rc, invoke, push, run, _log, err = _run_land_cli(text)
+        self.assertEqual(rc, 1)
+        self.assertEqual(invoke.call_count, 0)
+        push.assert_not_called()
+        self.assertEqual(run.call_count, 0)
+        self.assertIn("claims 2", err)
+
+    def test_sealed_file_with_n_findings_is_rc0_and_files_n(self):
+        for n in (1, 3):
+            with self.subTest(n=n):
+                blocks = [_finding_block(finding_id=f"F-{i}", title=f"T{i}") for i in range(n)]
+                rc, invoke, push, run, _log, err = _run_land_cli(_findings_file_text(*blocks))
+                self.assertEqual(rc, 0)
+                self.assertEqual(invoke.call_count, n)
+                push.assert_called_once()
+                self.assertEqual(run.call_count, 0)
+                self.assertEqual(err, "")
+
+    def test_sealed_zero_finding_file_is_clean_rc0(self):
+        rc, invoke, push, run, log, err = _run_land_cli(_zero_finding_file_text())
+        self.assertEqual(rc, 0)
+        self.assertEqual(invoke.call_count, 0)
+        push.assert_called_once()
+        self.assertEqual(run.call_count, 0)
+        self.assertIn("filed 0, skipped 0, errored 0", log)
+        self.assertEqual(err, "")
+
+    def test_huge_n_through_the_cli_is_rc1_not_a_traceback(self):
+        text = _zero_finding_file_text(sealed=False) + "\ns3star-audit-end: findings=" + "9" * 5000 + "\n"
+        rc, invoke, push, _run, log, err = _run_land_cli(text)
+        self.assertEqual(rc, 1)
+        self.assertEqual(invoke.call_count, 0)
+        push.assert_not_called()
+        self.assertIn("no closing sentinel", err)
+        self.assertIn("closing-sentinel check failed", log)
+
+
+class ComposeAuditBriefClosingSentinelTests(unittest.TestCase):
+    """T-4314: the brief tells Codex to end the file with the sentinel, and the
+    literal it shows is the one land_findings accepts."""
+
+    def _brief(self):
+        return runner.compose_audit_brief(
+            runner.get_slot("weekly-narrow"), date(2026, 7, 6),
+            Path("/tmp/s3star-test/findings.md"), proposal_text=_FIXTURE_PROPOSAL,
+        )
+
+    def test_brief_shows_the_sentinel_literal_once_on_its_own_line(self):
+        brief = self._brief()
+        self.assertEqual(
+            len(re.findall(r"^s3star-audit-end: findings=N$", brief, flags=re.MULTILINE)), 1
+        )
+
+    def test_brief_says_last_line_exactly_once_nothing_after(self):
+        brief = self._brief()
+        self.assertIn("as the LAST line of the file", brief)
+        self.assertIn("exactly once", brief)
+        self.assertIn("Nothing may follow it", brief)
+        self.assertIn("0 for a clean cycle", brief)
+
+    def test_sentinel_instruction_comes_after_the_finding_sections_instruction(self):
+        brief = self._brief()
+        self.assertLess(
+            brief.index("one `## Finding <n>: <title>` section per finding"),
+            brief.index("s3star-audit-end: findings=N"),
+        )
+
+    # -- T-4368 item 3: the sentinel is shown bare, and the brief says so --
+
+    def test_brief_shows_the_sentinel_bare_not_inside_a_code_fence(self):
+        # An auditor that copies a fenced example writes the fence too, and the
+        # closing ``` counts as content after the sentinel: rc 1 and a wasted
+        # Codex run. So the literal must sit OUTSIDE any fence in the brief.
+        brief = self._brief()
+        in_fence = False
+        seen = False
+        for line in brief.split("\n"):
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
+            elif line == "s3star-audit-end: findings=N":
+                seen = True
+                self.assertFalse(in_fence, "the sentinel literal is shown inside a code fence")
+        self.assertTrue(seen)
+        self.assertFalse(in_fence, "unbalanced code fences in the brief")
+
+    def test_brief_says_the_sentinel_is_a_plain_line_not_in_a_code_fence(self):
+        flat = " ".join(self._brief().split())
+        self.assertIn("It is a plain line of text, NOT inside a code fence", flat)
+        # ...and names the consequence, so the auditor sees why it matters.
+        self.assertIn("counts as content after the sentinel and fails the run", flat)
+
+    def test_brief_pins_the_zero_finding_heading_wording(self):
+        # T-4307 round-2 scope item 1: any other heading containing "finding"
+        # trips the near-miss guard (rc 1), so the brief must say so.
+        brief = self._brief()
+        self.assertIn('ONLY for the `## Finding <n>: <title>` sections', brief)
+        self.assertIn("No findings this cycle", brief)
+
+    def test_the_briefs_own_sentinel_literal_round_trips_through_land_findings(self):
+        # Drift guard: extract the literal FROM the brief, substitute N, and
+        # land it. If the brief's example and the parser ever disagree, this
+        # fails instead of the next live audit.
+        brief = self._brief()
+        line = re.search(r"^s3star-audit-end: findings=N$", brief, flags=re.MULTILINE).group(0)
+        for n in (0, 2):
+            with self.subTest(n=n):
+                blocks = [_finding_block(finding_id=f"F-{i}", title=f"T{i}") for i in range(n)]
+                text = (
+                    _findings_file_text(*blocks, sealed=False)
+                    if blocks else _zero_finding_file_text(sealed=False)
+                )
+                text = text.rstrip("\n") + "\n\n" + line.replace("N", str(n)) + "\n"
+                rc, invoke, _push, _log = _land_text(text)
+                self.assertEqual(rc, 0)
+                self.assertEqual(invoke.call_count, n)
 
 
 class PushClaudeTierQueueTests(unittest.TestCase):
@@ -1432,8 +2397,10 @@ class RuntimeSnapshotCommandsTests(unittest.TestCase):
         cmds = runner._snapshot_commands()
         ls_cmd = next(c for c in cmds if c.argv[:2] == ["ls", "-ld"])
         self.assertIn(str(runner._SNAPSHOT_MAILBOX_HUB), ls_cmd.argv)
-        for agent in ("codex", "orchestrator", "specialist", "recovery", "the-ancestor"):
+        for agent in ("codex", "orchestrator", "specialist", "recovery"):
             self.assertIn(str(runner._SNAPSHOT_MAILBOX_HUB / agent), ls_cmd.argv)
+        # T-3421: the-ancestor is retired from the fleet; its hub dir is no longer audited.
+        self.assertNotIn(str(runner._SNAPSHOT_MAILBOX_HUB / "the-ancestor"), ls_cmd.argv)
 
     def test_identity_users_command_covers_five_unix_accounts(self):
         # T-1596: `id` must target real unix ACCOUNT names, not the mailbox-dir
@@ -1442,8 +2409,9 @@ class RuntimeSnapshotCommandsTests(unittest.TestCase):
         cmds = runner._snapshot_commands()
         id_cmd = next(c for c in cmds if c.argv[0] == "id")
         self.assertEqual(id_cmd.argv[1:], list(runner._SNAPSHOT_UNIX_USERS))
-        for account in ("claude", "claude-research", "claude-fallback", "codex", "the-ancestor"):
+        for account in ("claude", "claude-research", "claude-fallback", "codex"):
             self.assertIn(account, runner._SNAPSHOT_UNIX_USERS)
+        self.assertNotIn("the-ancestor", runner._SNAPSHOT_UNIX_USERS)  # T-3421 retired
         self.assertNotIn("orchestrator", runner._SNAPSHOT_UNIX_USERS)
         self.assertNotIn("recovery", runner._SNAPSHOT_UNIX_USERS)
 
@@ -2118,7 +3086,7 @@ class SudoUserOverrideInertnessTests(unittest.TestCase):
         # the attacker path, since that's the legitimate resolved arg).
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(
-            "outside workspace root (/home/the-ancestor/s3star-workspace):",
+            "outside workspace root (/var/lib/pantheon/s3star-workspace):",
             result.stderr,
         )
 
@@ -2395,6 +3363,33 @@ class FindOpenRetestTicketsAcrossStatesTests(unittest.TestCase):
             ids = {r.ticket_id for r in runner.find_open_retest_tickets(Path(tmp))}
         self.assertNotIn("T-9105", ids)
 
+    def test_inbox_ticket_verified_excluded(self) -> None:
+        """T-3849 defect 2 repro shape: T-2795/T-2796 stayed in inbox/ past
+        their PASS verdict (2026-09-13 governance-ambiguity), and the
+        pre-fix code only ever gated on retest_status for done/ -- so a
+        verified inbox finding kept getting re-enumerated as "open" every
+        cycle."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp, "inbox", "T-9111", retest_status="verified")
+            ids = {r.ticket_id for r in runner.find_open_retest_tickets(Path(tmp))}
+        self.assertNotIn("T-9111", ids)
+
+    def test_active_ticket_overridden_excluded(self) -> None:
+        """Uniformity check: active/ is the other previously-ungated state."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp, "active", "T-9112", retest_status="overridden")
+            ids = {r.ticket_id for r in runner.find_open_retest_tickets(Path(tmp))}
+        self.assertNotIn("T-9112", ids)
+
+    def test_inbox_ticket_pending_still_included(self) -> None:
+        """The uniform closed-status gate must not swallow the normal
+        still-open case: an explicit retest_status: pending in inbox/
+        (e.g. written by a fail/partial re-verdict) stays routed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            self._seed(tmp, "inbox", "T-9113", retest_status="pending")
+            ids = {r.ticket_id for r in runner.find_open_retest_tickets(Path(tmp))}
+        self.assertIn("T-9113", ids)
+
     def test_malformed_frontmatter_in_done_is_skipped_not_raised(self) -> None:
         """This scan runs inside an unattended brief-compose path — one bad
         ticket file must not blank the whole section (fail open)."""
@@ -2589,6 +3584,112 @@ class RecordRetestVerdictTests(unittest.TestCase):
             runner.record_retest_verdict("T-9209", verdict="pass", note="x")
         self.assertIn("not an s3star finding ticket", str(cm.exception))
 
+    def test_fail_verdict_downgrades_from_verified(self) -> None:
+        """T-3849 scenario (d): a fail/partial re-verdict on a prior PASS
+        must still land -- downgrade is the whole point of independent
+        re-test (a next-cycle FAIL must be able to re-open a prior PASS)."""
+        path = self._seed_finding("T-9210", retest_status="verified")
+        new_status = runner.record_retest_verdict(
+            "T-9210", verdict="fail", note="regression reproduces again"
+        )
+        self.assertEqual(new_status, "pending")
+        fields, body = ticket_mod.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields["retest_status"], "pending")
+        self.assertIn("fail: regression reproduces again", body)
+
+
+class RecordRetestVerdictReplayGuardTests(unittest.TestCase):
+    """T-3849 (remediates T-2795 Codex FAIL, defect 1): record_retest_verdict
+    refuses to silently re-write a ticket that already carries a structural
+    retest_status closure marker (verified/overridden), while the verified
+    -> pending downgrade path (a next-cycle fail/partial re-verdict) stays
+    legal. Same fixture shape as RecordRetestVerdictTests."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        for s in ticket_mod.STATES:
+            (self.root / s).mkdir(parents=True)
+        self._tickets_patch = patch.object(ticket_mod, "TICKETS_ROOT", self.root)
+        self._tickets_patch.start()
+        self._gu_repo_patch = patch.object(_git_utils, "REPO_ROOT", self.root)
+        self._gu_repo_patch.start()
+        self._repo_patch = patch.object(ticket_mod, "REPO_ROOT", self.root)
+        self._repo_patch.start()
+        self._commit_patch = patch.object(ticket_mod, "_commit_and_push")
+        self.mock_commit = self._commit_patch.start()
+        self._pull_patch = patch.object(ticket_mod, "_pull_if_needed")
+        self.mock_pull = self._pull_patch.start()
+
+    def tearDown(self) -> None:
+        self._pull_patch.stop()
+        self._commit_patch.stop()
+        self._repo_patch.stop()
+        self._gu_repo_patch.stop()
+        self._tickets_patch.stop()
+        self._tmp.cleanup()
+
+    def _seed_finding(self, ticket_id, state="done", retest_status="pending") -> Path:
+        path = self.root / state / f"{ticket_id}.md"
+        path.write_text(
+            _wrap_ticket_text(
+                ticket_id, "Sample finding",
+                "s3star-audit-finding: weekly-narrow:2026-08-01:S3STAR-X-003\n\n"
+                "Re-test criteria: File mode is 0600.\n",
+                state=state, retest_status=retest_status,
+            ),
+            encoding="utf-8",
+        )
+        return path
+
+    def test_duplicate_pass_after_verified_refused(self) -> None:
+        """T-3849 scenario (a), unit-level: the same PASS verdict landed
+        twice on a ticket that's already verified must refuse the second
+        call outright, independent of any caller-side open-set check."""
+        path = self._seed_finding("T-9601", retest_status="verified")
+        with self.assertRaises(ticket_mod.TicketError) as cm:
+            runner.record_retest_verdict("T-9601", verdict="pass", note="re-landed")
+        self.assertIn("already retest_status: verified", str(cm.exception))
+        fields, body = ticket_mod.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields["retest_status"], "verified")
+        self.assertNotIn("re-landed", body)
+        self.mock_commit.assert_not_called()
+
+    def test_overridden_refuses_new_pass(self) -> None:
+        path = self._seed_finding("T-9602", retest_status="overridden")
+        with self.assertRaises(ticket_mod.TicketError) as cm:
+            runner.record_retest_verdict("T-9602", verdict="pass", note="x")
+        self.assertIn("already retest_status: overridden", str(cm.exception))
+        fields, _ = ticket_mod.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields["retest_status"], "overridden")
+        self.mock_commit.assert_not_called()
+
+    def test_overridden_refuses_new_fail(self) -> None:
+        """overridden blocks EVERY subsequent call, not just pass -- it is
+        a terminal administrative closure, not a re-test-verdict outcome."""
+        self._seed_finding("T-9603", retest_status="overridden")
+        with self.assertRaises(ticket_mod.TicketError):
+            runner.record_retest_verdict("T-9603", verdict="fail", note="x")
+        self.mock_commit.assert_not_called()
+
+    def test_overridden_refuses_new_override(self) -> None:
+        self._seed_finding("T-9604", retest_status="overridden")
+        with self.assertRaises(ticket_mod.TicketError):
+            runner.record_retest_verdict("T-9604", override=True, note="x")
+        self.mock_commit.assert_not_called()
+
+    def test_verified_can_still_be_overridden(self) -> None:
+        """Scope boundary: only the pass-replay case is blocked on
+        `verified` -- overriding an already-verified finding is a distinct,
+        unblocked administrative action (not asked to be blocked by T-3849)."""
+        path = self._seed_finding("T-9605", retest_status="verified")
+        new_status = runner.record_retest_verdict(
+            "T-9605", override=True, note="the operator call: override anyway"
+        )
+        self.assertEqual(new_status, "overridden")
+        fields, _ = ticket_mod.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields["retest_status"], "overridden")
+
 
 class RecordRetestVerdictAuthorshipGateTests(unittest.TestCase):
     """T-2796: record_retest_verdict fails closed on an authorship-flagged
@@ -2762,17 +3863,17 @@ class LandVerdictsTests(unittest.TestCase):
         self._tickets_patch.stop()
         self._tmp.cleanup()
 
-    def _seed_finding(self, ticket_id, *, flagged=False) -> Path:
+    def _seed_finding(self, ticket_id, *, flagged=False, state="done") -> Path:
         labels = "[s3star-audit, audit-finding, severity-medium]"
         if flagged:
             labels = "[s3star-audit, audit-finding, severity-medium, authorship-flagged]"
-        path = self.tickets_root / "done" / f"{ticket_id}.md"
+        path = self.tickets_root / state / f"{ticket_id}.md"
         path.write_text(
             _wrap_ticket_text(
                 ticket_id, "Sample finding",
                 "s3star-audit-finding: weekly-narrow:2026-08-01:S3STAR-X-003\n\n"
                 "Re-test criteria: File mode is 0600.\n",
-                state="done", retest_status="pending", labels=labels,
+                state=state, retest_status="pending", labels=labels,
             ),
             encoding="utf-8",
         )
@@ -2870,6 +3971,33 @@ class LandVerdictsTests(unittest.TestCase):
         ids = {r.ticket_id for r in runner.find_open_retest_tickets(self.tickets_root)}
         self.assertIn("T-9409", ids)  # never dropped from routing
         self.mock_commit.assert_not_called()
+
+    def test_second_invocation_replays_same_artifact_refused(self) -> None:
+        """T-3849 scenario (a), end-to-end repro shape: the same 2026-09-07
+        workspace PASS artifact was landed twice, 24s apart (T-2795
+        transitions @4e50d8cf04 and @a6e8b4c33a), and both invocations
+        succeeded. Landing the identical verdicts-artifact object a second
+        time must now refuse -- only the first invocation lands.
+
+        Seeded in inbox/ specifically (not done/): that's where T-2795/
+        T-2796 actually sat past their PASS verdict (2026-09-13
+        governance-ambiguity), and where the pre-fix find_open_retest_
+        tickets never gated on retest_status at all -- a done/-seeded
+        ticket would already refuse the replay via done/'s pre-existing
+        gate, without exercising this fix."""
+        self._seed_finding("T-9411", state="inbox")
+        vp = self._verdicts_path(
+            {"ticket": "T-9411", "verdict": "pass", "evidence_note": "fixed"},
+        )
+        rc1 = runner.land_verdicts("weekly-narrow", vp, date(2026, 8, 10), cwd=self.root)
+        self.assertEqual(rc1, 0)
+        rc2 = runner.land_verdicts("weekly-narrow", vp, date(2026, 8, 10), cwd=self.root)
+        self.assertEqual(rc2, 1)
+        fields, _ = ticket_mod.parse_front_matter(
+            (self.tickets_root / "inbox" / "T-9411.md").read_text()
+        )
+        self.assertEqual(fields["retest_status"], "verified")  # unchanged by 2nd call
+        self.assertEqual(self.mock_commit.call_count, 1)  # only the first landed
 
     def test_no_network_dependency_in_land_verdicts_round_trip(self) -> None:
         self._seed_finding("T-9410")
@@ -3093,6 +4221,28 @@ class LiveRepoOpenRetestsRoutingTests(unittest.TestCase):
                 f"{tid} should route into Open re-tests (remediated, not yet "
                 f"independently re-verified per its own transition log)",
             )
+
+
+class WorkspaceRootOffTheAncestor(unittest.TestCase):
+    """T-5514: the audit workspace moves off /home/the-ancestor before that account is
+    deleted. The runner, the seat-evidence writer and the root-installed tmux wrapper
+    must name the SAME root (the wrapper refuses any run_dir outside it), and it must
+    not live under the-ancestor."""
+
+    def _wrapper_default(self) -> str:
+        text = (runner.REPO_ROOT / "tools" / "sudoers.d" / "pantheon-s3star-tmux").read_text()
+        m = re.search(r'WORKSPACE_ROOT="\$\{S3STAR_WORKSPACE_ROOT:-([^}]+)\}"', text)
+        self.assertIsNotNone(m, "wrapper default WORKSPACE_ROOT not found")
+        return m.group(1)
+
+    def test_all_three_name_the_same_root(self):
+        from tools import s3star_seat_evidence as seat_evidence
+        roots = {str(runner.AUDIT_WORKSPACE_ROOT), str(seat_evidence.WORKSPACE_ROOT), self._wrapper_default()}
+        self.assertEqual(len(roots), 1, roots)
+
+    def test_root_is_not_under_the_ancestor(self):
+        self.assertEqual(str(runner.AUDIT_WORKSPACE_ROOT), "/var/lib/pantheon/s3star-workspace")
+        self.assertNotIn("the-ancestor", self._wrapper_default())
 
 
 if __name__ == "__main__":

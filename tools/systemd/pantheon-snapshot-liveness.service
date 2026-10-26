@@ -1,0 +1,20 @@
+[Unit]
+Description=Pantheon snapshot-timer liveness monitor — per-persona snapshot-durability probe; detect a disabled/dead snapshot timer BEFORE data goes silently uncaptured (T-3791; exocortex-data 49d-dead precedent T-3790)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-3791.md
+After=network.target
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# sg pantheon-mailbox: the alert leg writes orchestrator's ORG-026 mailbox (mirrors
+# pantheon-mail-staleness). Cross-account reads use Recovery's NOPASSWD sudo -u,
+# which the wrapper preserves. --check = one sweep + alert-on-failure (exit 0 always).
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/fleet_snapshot_liveness_check.py --check"
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=3min
+
+[Install]
+WantedBy=default.target

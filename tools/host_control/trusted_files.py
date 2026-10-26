@@ -36,7 +36,8 @@ def _normalized_absolute(path: Path) -> Path:
     if not os.path.isabs(raw):
         raise RegistryError("trusted path must be absolute")
     normalized = os.path.normpath(raw)
-    if normalized != raw or ".." in Path(raw).parts:
+    # "//"-prefixed paths survive normpath unchanged (POSIX); refused (D32)
+    if raw.startswith("//") or normalized != raw or ".." in Path(raw).parts:
         raise RegistryError("trusted path must be normalized")
     return Path(normalized)
 
@@ -272,6 +273,49 @@ class RootOwnedFileLoader:
         finally:
             if file_descriptor is not None:
                 os.close(file_descriptor)
+            os.close(parent)
+
+    def entry_kind(self, path: Path) -> str:
+        """Classify a trusted descendant WITHOUT reading it (T-2917 5b, for
+        the executor's policy-check over the root-owned framework copy):
+        ``"file"``, ``"directory"`` or ``"absent"``. Same descriptor walk
+        and owner/mode validation as ``read_bytes``; a symlink anywhere
+        (including the final component) or any other object type raises."""
+
+        normalized = _normalized_absolute(path)
+        _, root_descriptor, components = self._select_root(normalized)
+        parent = os.dup(root_descriptor)
+        try:
+            for component in components[:-1]:
+                try:
+                    next_descriptor = os.open(component, _DIRECTORY_FLAGS, dir_fd=parent)
+                except FileNotFoundError:
+                    return "absent"
+                try:
+                    _validate_stat(
+                        os.fstat(next_descriptor),
+                        expected_owner_uid=self._expected_owner_uid,
+                        kind="directory",
+                    )
+                except BaseException:
+                    os.close(next_descriptor)
+                    raise
+                os.close(parent)
+                parent = next_descriptor
+            try:
+                value = os.stat(components[-1], dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                return "absent"
+            if stat.S_ISDIR(value.st_mode):
+                _validate_stat(value, expected_owner_uid=self._expected_owner_uid, kind="directory")
+                return "directory"
+            if stat.S_ISREG(value.st_mode):
+                _validate_stat(value, expected_owner_uid=self._expected_owner_uid, kind="file")
+                return "file"
+            raise RegistryError("trusted path is neither a file nor a directory")
+        except (OSError, ValueError) as exc:
+            raise RegistryError("cannot classify trusted path") from exc
+        finally:
             os.close(parent)
 
     def read_json(

@@ -8,6 +8,7 @@ only and say so in their comments.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import itertools
@@ -32,12 +33,14 @@ from tools.host_control.contracts import (
     HostControlError,
     IdempotencyConflict,
     InvalidTransition,
+    JournalBusy,
     MigrationRequired,
     OperationRecord,
     ReconcileOutcome,
     RecoveryRefused,
     SubjectMismatch,
     UnknownHandle,
+    Unsupported,
     canonical_json,
 )
 from tools.host_control import journal as journal_module
@@ -165,7 +168,7 @@ class FakeReconciler:
 
 class OperationCaseBase(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.manifest_path = self.root / "instance.yaml"
@@ -269,9 +272,9 @@ class OperationCaseBase(unittest.TestCase):
             "schema": "pantheon-host-seat-registry/v1",
             "seats": [
                 {
-                    "seat_id": "cairn",
+                    "seat_id": "consultant",
                     "uid": 1003,
-                    "persona": "cairn",
+                    "persona": "consultant",
                     "role": "worker",
                     "instance": "test-instance",
                     "account": "codex",
@@ -315,7 +318,7 @@ class OperationCaseBase(unittest.TestCase):
 
     def policy_dict(self) -> dict:
         grants = []
-        for subject in ("cairn", "peer"):
+        for subject in ("consultant", "peer"):
             grants.append(
                 {
                     "subject_seat_id": subject,
@@ -332,7 +335,7 @@ class OperationCaseBase(unittest.TestCase):
             "grants": grants,
         }
 
-    def prepare(self, key: str = "op-1", approval: str = "approval-1"):
+    def prepare(self, key: str = "op-1", approval: str = "a1" * 32):
         record, _ = self.service.prepare_apply(
             1003,
             self.plan_result.plan_handle,
@@ -504,7 +507,7 @@ class OperationLifecycleTests(OperationCaseBase):
                 self.plan_result.plan_handle,
                 self.plan_result.plan_digest,
                 "t1-bad-handle",
-                "approval-1",
+                "a1" * 32,
             )
         self.assertEqual(self.op_count(), 1)
 
@@ -515,7 +518,7 @@ class OperationLifecycleTests(OperationCaseBase):
                 self.plan_result.plan_handle,
                 "a" * 64,
                 "t2-wrong-digest",
-                "approval-1",
+                "a1" * 32,
             )
         with self.assertRaises(UnknownHandle):
             self.service.prepare_apply(
@@ -523,7 +526,7 @@ class OperationLifecycleTests(OperationCaseBase):
                 "b" * 64,
                 self.plan_result.plan_digest,
                 "t2-unknown-plan",
-                "approval-1",
+                "a1" * 32,
             )
         with self.assertRaises(SubjectMismatch):
             self.service.prepare_apply(
@@ -531,7 +534,7 @@ class OperationLifecycleTests(OperationCaseBase):
                 self.plan_result.plan_handle,
                 self.plan_result.plan_digest,
                 "t2-foreign-subject",
-                "approval-1",
+                "a1" * 32,
             )
         expired_clock = lambda: FIXED_NOW + timedelta(hours=2)  # noqa: E731
         expired_service = self.build_service(clock=expired_clock)
@@ -541,7 +544,7 @@ class OperationLifecycleTests(OperationCaseBase):
                 self.plan_result.plan_handle,
                 self.plan_result.plan_digest,
                 "t2-expired-plan",
-                "approval-1",
+                "a1" * 32,
             )
         # every refusal above happened BEFORE journaling
         self.assertEqual(self.op_count(), 0)
@@ -553,7 +556,23 @@ class OperationLifecycleTests(OperationCaseBase):
         self.assertEqual(record.owner, self.subject)
 
     def test_rollback_operation_binds_exact_receipt_handle_and_digest(self) -> None:
-        completed = self.to_completed("t3-src")
+        # T-2917 5d.2: a rollback needs a RESTORABLE receipt (a changed
+        # mutation matching a write-ahead intent of the source apply)
+        dispatched = self.to_dispatched("t3-src")
+        intent = next(
+            item for item in self.journal.intents_for(dispatched.operation_handle) if item.kind == "mkdir"
+        )
+        completed = self.service.append_result(
+            dispatched.operation_handle,
+            ok=True,
+            mutations=(
+                MutationRecord(
+                    intent.operation_id, intent.kind, intent.target, intent.owner, True, {"state": "absent"}, "directory"
+                ),
+            ),
+            evidence=(self.sample_evidence(),),
+            detail="done",
+        )
         complete_handle = self.receipt_handle_for(
             completed.operation_handle,
             "complete",
@@ -566,7 +585,7 @@ class OperationLifecycleTests(OperationCaseBase):
             1003,
             complete_handle,
             "t3-rollback",
-            "approval-rb",
+            "ab" * 32,
         )
         self.assertFalse(replayed)
         self.assertEqual(record.kind, "rollback")
@@ -587,31 +606,31 @@ class OperationLifecycleTests(OperationCaseBase):
                 1003,
                 "e" * 64,
                 "t3-unknown",
-                "approval-rb",
+                "ab" * 32,
             )
         with self.assertRaises(HostControlError):
             self.service.prepare_rollback(
                 1003,
                 staged_handle,
                 "t3-staged",
-                "approval-rb",
+                "ab" * 32,
             )
         with self.assertRaises(SubjectMismatch):
             self.service.prepare_rollback(
                 1004,
                 complete_handle,
                 "t3-foreign",
-                "approval-rb",
+                "ab" * 32,
             )
 
     def test_operation_idempotency_replays_identical_and_refuses_conflict(self) -> None:
-        first = self.prepare("t4-same", "approval-A")
+        first = self.prepare("t4-same", "aa" * 32)
         replay, replayed = self.service.prepare_apply(
             1003,
             self.plan_result.plan_handle,
             self.plan_result.plan_digest,
             "t4-same",
-            "approval-A",
+            "aa" * 32,
         )
         self.assertTrue(replayed)
         self.assertEqual(first.operation_handle, replay.operation_handle)
@@ -622,10 +641,10 @@ class OperationLifecycleTests(OperationCaseBase):
                 self.plan_result.plan_handle,
                 self.plan_result.plan_digest,
                 "t4-same",
-                "approval-B",
+                "bb" * 32,
             )
         self.assertEqual(self.op_count(), 1)
-        other = self.prepare("t4-other", "approval-A")
+        other = self.prepare("t4-other", "aa" * 32)
         self.assertNotEqual(other.operation_handle, first.operation_handle)
         self.assertEqual(self.op_count(), 2)
         # database constraint, not only service checks
@@ -731,7 +750,7 @@ class OperationLifecycleTests(OperationCaseBase):
             self.plan_result.plan_handle,
             self.plan_result.plan_digest,
             "t6-park",
-            "approval-1",
+            "a1" * 32,
         )
         self.assertTrue(replayed)
         self.assertEqual(replay.operation_handle, record.operation_handle)
@@ -757,7 +776,7 @@ class OperationLifecycleTests(OperationCaseBase):
         state, phases, intent_rows = peek.observed
         self.assertEqual(state, "dispatch_intent")
         self.assertEqual(phases, [("staged",)])
-        self.assertEqual(len(intent_rows), 14)
+        self.assertEqual(len(intent_rows), 15)  # D6 (T-2917 5c): +1 broker-synthesized timer-enable intent
         self.assertTrue(all(resolved == 0 for _, resolved in intent_rows))
         self.assertEqual(dispatched.state, "dispatched")
         # natural crash cut: executor dies AFTER the durable write; the
@@ -768,7 +787,7 @@ class OperationLifecycleTests(OperationCaseBase):
         self.assertEqual(staged.phase, "staged")
         self.assertEqual(
             len(self.journal.unresolved_intents(crashed.operation_handle)),
-            14,
+            15,  # D6 (T-2917 5c): +1 broker-synthesized timer-enable intent
         )
 
     def test_executor_seam_cannot_write_journal(self) -> None:
@@ -805,7 +824,7 @@ class OperationLifecycleTests(OperationCaseBase):
             self.plan_result.plan_handle,
             self.plan_result.plan_digest,
             "t9",
-            "approval-1",
+            "a1" * 32,
         )
         with self.assertRaises(ApprovalUnavailable):
             service.authorize(record.operation_handle)
@@ -829,7 +848,7 @@ class OperationLifecycleTests(OperationCaseBase):
             self.plan_result.plan_handle,
             self.plan_result.plan_digest,
             "t10",
-            "approval-x",
+            "ac" * 32,
         )
         with self.assertRaises(ApprovalUnavailable):
             service.authorize(record.operation_handle)
@@ -839,7 +858,7 @@ class OperationLifecycleTests(OperationCaseBase):
         self.assertEqual(
             binder.calls[0],
             (
-                "approval-x",
+                "ac" * 32,
                 record.plan_handle,
                 record.plan_digest,
                 record.operation_handle,
@@ -855,7 +874,7 @@ class OperationLifecycleTests(OperationCaseBase):
             self.plan_result.plan_handle,
             self.plan_result.plan_digest,
             "t10-denied",
-            "approval-y",
+            "ad" * 32,
         )
         refused = denied_service.authorize(denied.operation_handle)
         self.assertEqual(refused.state, "refused")
@@ -902,7 +921,7 @@ class RecoveryCutTests(OperationCaseBase):
             self.plan_result.plan_handle,
             self.plan_result.plan_digest,
             "t12",
-            "approval-1",
+            "a1" * 32,
         )
         outcome = service.recover(record.operation_handle)
         self.assertEqual(outcome.action, "authorized")
@@ -953,7 +972,7 @@ class RecoveryCutTests(OperationCaseBase):
                 self.plan_result.plan_handle,
                 self.plan_result.plan_digest,
                 "t13",
-                "approval-1",
+                "a1" * 32,
             )
         self.assertEqual(self.op_count(), count_before)
         with self.assertRaises(HostControlError):
@@ -973,7 +992,7 @@ class RecoveryCutTests(OperationCaseBase):
         self.assertEqual(self.db_state(record.operation_handle), "dispatched")
         self.assertEqual(
             len(self.journal.unresolved_intents(record.operation_handle)),
-            14,
+            15,  # D6 (T-2917 5c): +1 broker-synthesized timer-enable intent
         )
 
     def test_recovery_dispatch_intent_without_result_reconciles_before_proceeding(self) -> None:
@@ -1057,7 +1076,7 @@ class RecoveryCutTests(OperationCaseBase):
         # operator, loudly
         self.assertEqual(
             len(self.journal.unresolved_intents(stuck.operation_handle)),
-            14,
+            15,  # D6 (T-2917 5c): +1 broker-synthesized timer-enable intent
         )
 
     def test_recovery_dispatched_without_result_follows_same_reconciliation(self) -> None:
@@ -1115,6 +1134,250 @@ class RecoveryCutTests(OperationCaseBase):
             self.db_state(stuck.operation_handle),
             "manual_recovery",
         )
+
+
+@contextlib.contextmanager
+def held_write_lock(path: Path):
+    """Hold a journal's write lock from a second connection.
+
+    ``BEGIN IMMEDIATE`` returns only once the lock is actually held, so any
+    journal write attempted inside the with-block is guaranteed to contend
+    for as long as the block lasts: a deterministic handshake with no
+    sleeps and no dependence on host load.
+    """
+
+    holder = sqlite3.connect(path, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        yield
+    finally:
+        try:
+            holder.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        holder.close()
+
+
+class LockContentionTests(OperationCaseBase):
+    """Broker write-lock contention refuses with JournalBusy, never a raw
+    sqlite error (T-4334). Contention is forced deterministically: a second
+    connection HOLDS the write lock (BEGIN IMMEDIATE has returned) while the
+    journal under test has a 50 ms busy timeout. The shared classifier and
+    the approval journal's sites are proven in test_host_control_approval.
+    """
+
+    BUSY_MS = 50
+
+    def setUp(self) -> None:
+        super().setUp()
+        # setup work runs through self.service / self.planner (default 5 s
+        # timeout); only the act under contention uses the short journal
+        self.short = BrokerJournal.open(
+            self.journal_path, busy_timeout_ms=self.BUSY_MS
+        )
+        self.short_service = OperationService(
+            registry=self.registry,
+            journal=self.short,
+            binder=self.binder,
+            reconciler=self.reconciler,
+            clock=lambda: FIXED_NOW,
+            handle_factory=self.next_handle,
+        )
+        self.short_planner = HostPlanService(
+            registry=self.registry,
+            policy=self.policy,
+            journal=self.short,
+            installer=self.installer,
+            clock=lambda: FIXED_NOW,
+            handle_factory=self.next_handle,
+            plan_ttl=timedelta(hours=1),
+            contract_version="org.pantheon.HostBroker1/v1",
+            broker_revision="unit-test",
+            host_operation_families=frozenset(
+                ("persona.install", "persona.verify")
+            ),
+            health_check=lambda: "ready",
+        )
+
+    def tearDown(self) -> None:
+        self.short.close()
+        super().tearDown()
+
+    def plan_count(self) -> int:
+        with sqlite3.connect(self.journal_path) as connection:
+            return connection.execute(
+                "SELECT count(*) FROM plans"
+            ).fetchone()[0]
+
+    def assert_busy(self, caught, site: str) -> None:
+        error = caught.exception
+        self.assertIsInstance(error, HostControlError)
+        self.assertIn(site, str(error))
+        self.assertIn("lock contention", str(error))
+        self.assertIn(f"{self.BUSY_MS} ms", str(error))
+        # The message is the wire body (bounded but verbatim): it must
+        # never name where the journal lives. The root check also catches
+        # a parent-dir leak.
+        self.assertNotIn(str(self.journal_path), str(error))
+        self.assertNotIn(str(self.root), str(error))
+        self.assertIsInstance(error.__cause__, sqlite3.OperationalError)
+        self.assertEqual(error.__cause__.sqlite_errorcode & 0xFF, 5)
+
+    def test_open_applies_the_injected_busy_timeout_to_the_connection(self) -> None:
+        # Pins the seam itself: the injected value must reach the live
+        # connection. Wall time alone cannot prove it (a hard-coded 5000
+        # would still lose the lock, only slower), so read the PRAGMA back
+        # on the journal's own connection (busy_timeout is per-connection).
+        self.assertEqual(
+            self.short._connection.execute(
+                "PRAGMA busy_timeout"
+            ).fetchone()[0],
+            self.BUSY_MS,
+        )
+        # the fixture's default-opened journal keeps the documented 5 s
+        self.assertEqual(
+            self.journal._connection.execute(
+                "PRAGMA busy_timeout"
+            ).fetchone()[0],
+            5000,
+        )
+
+    def test_plan_refuses_with_journal_busy_and_writes_nothing(self) -> None:
+        plans_before = self.plan_count()
+        with held_write_lock(self.journal_path):
+            with self.assertRaises(JournalBusy) as caught:
+                self.short_planner.plan(
+                    1003, "recovery", "manifest-r1", "busy-plan"
+                )
+        self.assert_busy(caught, "put_plan_or_replay")
+        self.assertEqual(self.plan_count(), plans_before)
+        # retryable once the lock frees
+        result = self.short_planner.plan(
+            1003, "recovery", "manifest-r1", "busy-plan"
+        )
+        self.assertEqual(self.plan_count(), plans_before + 1)
+        self.assertTrue(result.plan_handle)
+
+    def test_prepare_refuses_with_journal_busy_and_writes_nothing(self) -> None:
+        with held_write_lock(self.journal_path):
+            with self.assertRaises(JournalBusy) as caught:
+                self.short_service.prepare_apply(
+                    1003,
+                    self.plan_result.plan_handle,
+                    self.plan_result.plan_digest,
+                    "op-busy",
+                    "a1" * 32,
+                )
+        self.assert_busy(caught, "put_operation_or_replay")
+        self.assertEqual(self.op_count(), 0)
+        record, replayed = self.short_service.prepare_apply(
+            1003,
+            self.plan_result.plan_handle,
+            self.plan_result.plan_digest,
+            "op-busy",
+            "a1" * 32,
+        )
+        self.assertFalse(replayed)
+        self.assertEqual(record.state, "prepared")
+
+    def test_authorize_refuses_with_journal_busy_and_stays_prepared(self) -> None:
+        record = self.prepare("op-auth")
+        with held_write_lock(self.journal_path):
+            with self.assertRaises(JournalBusy) as caught:
+                self.short_service.authorize(record.operation_handle)
+        self.assert_busy(caught, "transition_operation[bound]")
+        self.assertEqual(self.db_state(record.operation_handle), "prepared")
+        events = self.event_rows(record.operation_handle)
+        authorized = self.short_service.authorize(record.operation_handle)
+        self.assertEqual(authorized.state, "authorized")
+        self.assertEqual(len(self.event_rows(record.operation_handle)), len(events) + 1)
+
+    def test_dispatch_never_invokes_the_executor_without_the_durable_intent(self) -> None:
+        # ORG-052 section 6 ordering: the write-ahead intent transaction is
+        # the gate to the executor. A lost lock must stop BEFORE the call.
+        record = self.to_authorized("op-dispatch")
+        executor = FakeExecutor()
+        with held_write_lock(self.journal_path):
+            with self.assertRaises(JournalBusy) as caught:
+                self.short_service.dispatch(record.operation_handle, executor)
+        self.assert_busy(caught, "record_dispatch_intent")
+        self.assertEqual(executor.calls, [])
+        self.assertEqual(self.db_state(record.operation_handle), "authorized")
+        dispatched = self.short_service.dispatch(
+            record.operation_handle, executor
+        )
+        self.assertEqual(dispatched.state, "dispatched")
+        self.assertEqual(len(executor.calls), 1)
+
+    def test_append_result_refuses_with_journal_busy_and_stays_dispatched(self) -> None:
+        record = self.to_dispatched("op-result")
+        with held_write_lock(self.journal_path):
+            with self.assertRaises(JournalBusy) as caught:
+                self.short_service.append_result(
+                    record.operation_handle,
+                    ok=True,
+                    mutations=(self.sample_mutation(),),
+                    evidence=(self.sample_evidence(),),
+                    detail="done",
+                )
+        self.assert_busy(caught, "record_terminal")
+        self.assertEqual(self.db_state(record.operation_handle), "dispatched")
+
+    def test_journal_level_sites_refuse_with_journal_busy(self) -> None:
+        record = self.prepare("op-sites")
+        sites = {
+            "append_event[note]": lambda: self.short.append_event(
+                current=record,
+                event_kind="note",
+                payload={},
+                created_at=FIXED_NOW.isoformat(),
+            ),
+            "mark_manual_recovery": lambda: self.short.mark_manual_recovery(
+                record.operation_handle,
+                "lock contention probe",
+                marked_at=FIXED_NOW.isoformat(),
+            ),
+        }
+        events_before = self.event_rows(record.operation_handle)
+        for site, act in sites.items():
+            with self.subTest(site=site):
+                with held_write_lock(self.journal_path):
+                    with self.assertRaises(JournalBusy) as caught:
+                        act()
+                self.assert_busy(caught, site)
+        # nothing was written, and a busy park never became manual_recovery
+        self.assertEqual(self.db_state(record.operation_handle), "prepared")
+        self.assertEqual(
+            self.event_rows(record.operation_handle), events_before
+        )
+
+    def test_non_lock_operational_errors_surface_as_is(self) -> None:
+        class BeginFails:
+            """A connection whose BEGIN IMMEDIATE fails for a non-lock
+            reason; every other statement mimics 'no transaction'."""
+
+            def __init__(self, error: sqlite3.OperationalError) -> None:
+                self.error = error
+
+            def execute(self, sql: str, *args: object) -> None:
+                if sql == "BEGIN IMMEDIATE":
+                    raise self.error
+                raise sqlite3.OperationalError(
+                    "cannot rollback - no transaction is active"
+                )
+
+        record = self.prepare("op-nonlock")
+        error = sqlite3.OperationalError("unable to open database file")
+        journal = BrokerJournal(self.journal_path, BeginFails(error))
+        with self.assertRaises(sqlite3.OperationalError) as caught:
+            journal.append_event(
+                current=record,
+                event_kind="note",
+                payload={},
+                created_at=FIXED_NOW.isoformat(),
+            )
+        self.assertIs(caught.exception, error)
+        self.assertNotIsInstance(caught.exception, HostControlError)
 
 
 class DurabilityTests(OperationCaseBase):
@@ -1180,7 +1443,8 @@ class NoBinder:
 class PoststateReconciler:
     def reconcile(self, operation, staged_receipt, unresolved_intents):
         assert staged_receipt.phase == "staged"
-        assert len(unresolved_intents) == 14
+        # D6 (T-2917 5c): +1 broker-synthesized timer-enable intent
+        assert len(unresolved_intents) == 15
         return ReconcileOutcome(
             "complete_poststate", (), (), "recovered cross-process"
         )
@@ -1399,13 +1663,13 @@ class JournalV2SchemaTests(OperationCaseBase):
                         "apply",
                         "obsoleted",
                         1003,
-                        "cairn",
+                        "consultant",
                         "recovery",
                         self.plan_result.plan_handle,
                         self.plan_result.plan_digest,
                         None,
                         None,
-                        "approval-1",
+                        "a1" * 32,
                         None,
                         "schema-check",
                         "9" * 64,
@@ -1415,8 +1679,9 @@ class JournalV2SchemaTests(OperationCaseBase):
                     ),
                 )
             connection.rollback()
-        # "verify" is ACCEPTED at the schema tier (T-2917 will not need a
-        # migration) while the service tier refuses it
+        # "verify" is ACCEPTED at the schema tier (T-2917 needed no
+        # migration); the service tier now serves it (5b) but refuses a
+        # plan it cannot verify read-only
         with sqlite3.connect(self.journal_path) as connection:
             connection.execute(
                 "INSERT INTO operations VALUES "
@@ -1426,13 +1691,13 @@ class JournalV2SchemaTests(OperationCaseBase):
                     "verify",
                     "prepared",
                     1003,
-                    "cairn",
+                    "consultant",
                     "recovery",
                     self.plan_result.plan_handle,
                     self.plan_result.plan_digest,
                     None,
                     None,
-                    "approval-1",
+                    "a1" * 32,
                     None,
                     "schema-accepts-verify",
                     "8" * 64,
@@ -1442,13 +1707,25 @@ class JournalV2SchemaTests(OperationCaseBase):
                 ),
             )
             connection.rollback()
-        with self.assertRaises(HostControlError) as caught:
+        # T-2917 5b ruling B3: a plan holding a class this revision does not
+        # execute makes verify Unsupported BEFORE any operation record is
+        # written. T-2917 5d.3 re-points it at the PRE-flip table: the real
+        # fixture plan is fully implemented since the mailbox.probe flip.
+        from tools.test_host_control_driver import pre_flip_table
+
+        with sqlite3.connect(self.journal_path) as connection:
+            before = connection.execute("SELECT COUNT(*) FROM operations").fetchone()[0]
+        with pre_flip_table(), self.assertRaises(Unsupported) as caught:
             self.service.prepare_verify(
                 1003,
+                "recovery",
                 self.plan_result.plan_handle,
                 "verify-key",
             )
-        self.assertIn("T-2917", str(caught.exception))
+        self.assertIn("verify not implemented in this revision", str(caught.exception))
+        with sqlite3.connect(self.journal_path) as connection:
+            after = connection.execute("SELECT COUNT(*) FROM operations").fetchone()[0]
+        self.assertEqual(before, after)
 
 
 class MigrationTests(OperationCaseBase):

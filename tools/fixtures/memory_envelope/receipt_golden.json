@@ -1,0 +1,42 @@
+{
+  "adjudication_id": "adj-1",
+  "adjudicator_ref": "reviewer",
+  "after_effective_floor": "reviewed",
+  "authority_ref": "auth:goal-relationship",
+  "before_effective_floor": "untrusted",
+  "before_inherited_floor": "untrusted",
+  "canonicalization_ref": "pantheon-canonical-json/v1",
+  "claim_ids": [
+    "c1"
+  ],
+  "decision": "raise",
+  "derived_payload_digest": "sha256:pd-1",
+  "expires_at": "2026-12-01T00:00:00Z",
+  "input_evidence_bindings": [
+    {
+      "digest": "sha256:sd-e1",
+      "evidence_ref": "e1",
+      "source_revision": "srev-1"
+    },
+    {
+      "digest": "sha256:sd-e2",
+      "evidence_ref": "e2",
+      "source_revision": "srev-2"
+    }
+  ],
+  "issued_at": "2026-08-01T00:00:00Z",
+  "memory_id": "m-1",
+  "proposer_ref": "consolidator",
+  "purpose_scope": [
+    "assertion"
+  ],
+  "rationale": "independent goal-authority review",
+  "receipt_digest": "sha256:7c4a9d1fe7726ff78f4b26018358d9867a54e051b5491299bbd827d1a138d0a7",
+  "receipt_id": "R-1",
+  "receipt_schema_version": "org058-trust-adjudication-receipt/v1",
+  "supersedes_receipt_ref": null,
+  "trust_policy_digest": "sha256:policy-lattice-digest",
+  "trust_policy_ref": "P-lattice",
+  "trust_policy_revision": "rev-2026-08-30",
+  "version_id": "v-1"
+}

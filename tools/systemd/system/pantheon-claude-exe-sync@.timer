@@ -1,0 +1,9 @@
+[Unit]
+Description=Pantheon claude.exe sync for %i every 15 min (T-5038)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=15min
+
+[Install]
+WantedBy=timers.target

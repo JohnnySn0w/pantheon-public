@@ -1,7 +1,7 @@
 ---
 id: ORG-079
 title: Persona-stack L1 install-completeness contract — the harness-generic provision list + adapter-qualified verify-invariants
-status: "Ratified 2026-08-26 by the operator via Telegram 8632 — direct ratify after read of rev-2 (ac507d611b). Ratify condition the operator named: \"as long as the installer allows for contractual variation\" — met by the L1 (mechanisms, fleet-wide) vs L2 (values, role-specific-via-roles.<role-key>-bindings) partition rev-2 establishes. Cairn round-2 review (T-3111) not consumed — subsumed by direct-ratify. Content is rev-2 (Cairn T-3091 rev-1 blockers applied 2026-08-23 @ ac507d611b: terminology-collision, contract-completeness, values-vs-mechanisms L2 partition, plan-abort trap + per-dimension V-invariant refinements)."
+status: "Ratified 2026-08-26 by the operator via Telegram 8632 — direct ratify after read of rev-2 (ac507d611b). Ratify condition the operator named: \"as long as the installer allows for contractual variation\" — met by the L1 (mechanisms, fleet-wide) vs L2 (values, role-specific-via-roles.<role-key>-bindings) partition rev-2 establishes. Consultant round-2 review (T-3111) not consumed — subsumed by direct-ratify. Content is rev-2 (Consultant T-3091 rev-1 blockers applied 2026-08-23 @ ac507d611b: terminology-collision, contract-completeness, values-vs-mechanisms L2 partition, plan-abort trap + per-dimension V-invariant refinements)."
 date: 2026-08-23
 deciders: [operator, orchestrator]
 supersedes: []
@@ -13,7 +13,7 @@ scoping_ticket: T-3030
 
 # ORG-079 — Persona-stack L1 install-completeness contract
 
-> **STATUS: RATIFIED 2026-08-26** by the operator via Telegram 8632 — direct ratify after read of rev-2. Ratify condition: the L1 (mechanisms, fleet-wide) vs L2 (values, role-specific-via-`roles.<role-key>`-bindings) partition allows contractual variation per persona while keeping the install mechanism generic; the operator's TG 8632 ("Yeah then its ratified") confirmed the seam meets the gate. Content is rev-2 (Cairn T-3091 rev-1 blockers applied 2026-08-23 @ ac507d611b: terminology-collision, contract-completeness, values-vs-mechanisms L2 partition, plan-abort trap + per-dimension V-invariant refinements). Cairn round-2 review (T-3111) not consumed — subsumed by direct-ratify. Two open dispositions remain (Q3 chronicle-emit-per-supervisor + Q_new V11 rollout pacing) as optional future v2 refinements; neither blocks the v1 ratification.
+> **STATUS: RATIFIED 2026-08-26** by the operator via Telegram 8632 — direct ratify after read of rev-2. Ratify condition: the L1 (mechanisms, fleet-wide) vs L2 (values, role-specific-via-`roles.<role-key>`-bindings) partition allows contractual variation per persona while keeping the install mechanism generic; the operator's TG 8632 ("Yeah then its ratified") confirmed the seam meets the gate. Content is rev-2 (Consultant T-3091 rev-1 blockers applied 2026-08-23 @ ac507d611b: terminology-collision, contract-completeness, values-vs-mechanisms L2 partition, plan-abort trap + per-dimension V-invariant refinements). Consultant round-2 review (T-3111) not consumed — subsumed by direct-ratify. Two open dispositions remain (Q3 chronicle-emit-per-supervisor + Q_new V11 rollout pacing) as optional future v2 refinements; neither blocks the v1 ratification.
 
 ## Terminology alignment (rev-2 correction, load-bearing)
 
@@ -33,7 +33,7 @@ Common shape: **the HC installer does not provision things the bespoke superviso
 
 operator-directed via TG msg 8178 (2026-08-21): file an umbrella ADR that defines what persona-stack L1 must provision to fully install a persona.
 
-The 7/7-persona audit sweep (T-3031 specialist + T-3034 orchestrator + T-3033 recovery + T-3035 atlas + T-3036 metis + T-3037 mnemosyne + T-3038 codex) delivered the cross-referenced aggregation matrix at `knowledge/episodic/2026-08-21-l1-install-completeness-sweep/aggregation-matrix.md` (commit `7622d21661`). This ADR codifies the contract the matrix implies.
+The 7/7-persona audit sweep (T-3031 specialist + T-3034 orchestrator + T-3033 recovery + T-3035 artisan + T-3036 mason + T-3037 archivist + T-3038 codex) delivered the cross-referenced aggregation matrix at `knowledge/episodic/2026-08-21-l1-install-completeness-sweep/aggregation-matrix.md` (commit `7622d21661`). This ADR codifies the contract the matrix implies.
 
 **Composes with (not duplicates):**
 - **ORG-049** (manifest-driven installation) — defined the contract SHAPE (four modes: plan/apply/verify/rollback + Layer-1/Layer-2 connective-substrate partition). This ADR fills persona-stack L1's provision-list + `verify` invariants.
@@ -45,13 +45,13 @@ The 7/7-persona audit sweep (T-3031 specialist + T-3034 orchestrator + T-3033 re
 
 **Persona-stack L1** = the harness-generic install MECHANISM set (identical shape fleet-wide). **Persona-stack L2** = role-specific VALUES + role-only mechanisms.
 
-**Critical distinction (rev-2, per Cairn T-3091 blocker 3):** mechanisms may be L1 (fleet-wide), but VALUES are role-specific. L1 defines **generic evaluators**; the VALUES those evaluators check against come from role/persona bindings in the manifest.
+**Critical distinction (rev-2, per Consultant T-3091 blocker 3):** mechanisms may be L1 (fleet-wide), but VALUES are role-specific. L1 defines **generic evaluators**; the VALUES those evaluators check against come from role/persona bindings in the manifest.
 
 The manifest carries the seam:
 - **L1** = `persona_installer.*` (evaluator mechanisms) + `harness_runtime.controller.*` + `harness_runtime.harnesses.<adapter>.*` (per-adapter mechanism specifics)
 - **L2** = `roles.<role-key>.*` (role values incl. UID blast-radius, credential_refs, autoMemoryDirectory) + `harness_runtime.roles.<role-key>.*` (role-specific overlays) + `pinned-rules/<persona>.md` (persona-content)
 
-Example (from Cairn): Recovery's direct-sudo means her declared UID blast-radius is role-specific (ORG-063:34-42). L1 provides the cordon-audit **evaluator**; the **declared envelope value** comes from `roles.recovery.uid_cordon.declared_blast_radius` (L2).
+Example (from Consultant): Recovery's direct-sudo means her declared UID blast-radius is role-specific (ORG-063:34-42). L1 provides the cordon-audit **evaluator**; the **declared envelope value** comes from `roles.recovery.uid_cordon.declared_blast_radius` (L2).
 
 The 7/7 audit confirmed the seam holds empirically: role-specific mechanisms (telegram wiring, supervisor mode, companion units) cluster cleanly under `roles.<role-key>`; harness-generic mechanisms (systemd base units, storage roots, session-continuity, HANDOFF, chronicle-emit) are identical shape across all seven personas.
 
@@ -122,7 +122,7 @@ For clarity — the following live under persona-stack L2, NOT L1:
 
 - Telegram wiring (own-bot vs plugin-channel vs none).
 - Bespoke supervisor scripts (`recovery-bot-supervise.sh`, `exo-bot-supervise.sh`, `claude-bot-supervise.sh`).
-- Companion units (`acp-bridge@specialist`, mnemosyne ACP bridge, codex-daemon).
+- Companion units (`acp-bridge@specialist`, archivist ACP bridge, codex-daemon).
 - Persona pinned-rules file at `pinned-rules/<persona>.md` (file-based-via-symlink is the canonical pattern; see §Resolved Q1 below).
 - Role-specific `harness_runtime.roles.<role-key>` overlays (model, effort, fallback chain).
 - Role-specific credential requirements (declared conditionally per `roles.<role-key>.credential_refs`; not universal — see §L1 credential-refs correction below).
@@ -137,13 +137,13 @@ Three mechanisms surfaced in the audit but are intentionally NOT persona-stack L
 - **tmux pane/session creation** — NOT L1. Correctly `runtime_controller`'s job (ORG-020 / ORG-057 runtime-binding). L1 names `runtime_controller` as the owner of first-pane creation but does not take that responsibility. L1 verify DOES include ORG-049 bounded-boot smoke to prove the wired path reaches a working session.
 - **Chronicle emit content** — NOT re-authored by L1. The mechanism is present + wired at runtime. L1's assertions: `chronicle.py` binary presence + emit-hook reachability + role-qualified emit-invariant (L1.d + V7).
 
-### 4. Credential-refs correction (rev-2, per Cairn T-3091 blocker 3)
+### 4. Credential-refs correction (rev-2, per Consultant T-3091 blocker 3)
 
 Rev-1 §Manifest §Already-present said L1 "asserts credential_refs presence" — this contradicted §L2's placement of credential_refs as role-specific. **Rev-2 correction**: L1 validates the credential_refs SCHEMA (manifest-field format is correct IF present); the DECISION of whether a role has credential_refs at all is L2, per-role. A role with no external credential dependencies has no credential_refs and this is not a completeness gap.
 
 ## Verification contract — adapter-qualified invariants
 
-**Per-invariant applicability**: each V<n> below names the adapter(s) it applies to. Where a seat's adapter is not in the applicable set, the invariant vacuously holds. This is the "adapter/capability-qualified invariant set" Cairn's T-3091 review required (rev-2 fix for the unconditional-Claude-only V1-V4 trap).
+**Per-invariant applicability**: each V<n> below names the adapter(s) it applies to. Where a seat's adapter is not in the applicable set, the invariant vacuously holds. This is the "adapter/capability-qualified invariant set" Consultant's T-3091 review required (rev-2 fix for the unconditional-Claude-only V1-V4 trap).
 
 L1 install-completeness = ORG-049 `verify()` mode enforces the following. Each maps to an L1.x row above.
 
@@ -169,7 +169,7 @@ L1 install-completeness = ORG-049 `verify()` mode enforces the following. Each m
 | V18 (new) | ORG-049:107-111 disabled-first-fire evidence bound to apply receipt for each enabled unit | all adapters with systemd runtime | Apply-receipt cross-check |
 | V19 (new) | Adapter-config schema conformance (V1's schema check extended to fully-typed manifest-derived schema, not just JSON-well-formed) | per-adapter | Adapter-specific schema |
 
-**L1 ↔ V mapping** (Cairn T-3091 blocker 2: every L1 provision has at least one V-invariant covering it; every V-invariant traces to an L1 provision):
+**L1 ↔ V mapping** (Consultant T-3091 blocker 2: every L1 provision has at least one V-invariant covering it; every V-invariant traces to an L1 provision):
 
 | L1 provision | Covered by V-invariants |
 |---|---|
@@ -183,7 +183,7 @@ L1 install-completeness = ORG-049 `verify()` mode enforces the following. Each m
 
 Additionally: V10 covers ORG-049 apply-receipt semantics (not a single L1 provision but the receipt for all provisions completing); V12 covers ORG-035 autoMemoryDirectory (L2-declared, L1-verified).
 
-## Fail-behavior — plan/apply/verify/rollback split (rev-2, per Cairn T-3091 blocker 4)
+## Fail-behavior — plan/apply/verify/rollback split (rev-2, per Consultant T-3091 blocker 4)
 
 Rev-1 conflated the ORG-049 four modes and made plan abort on absent postconditions — which would make a clean-seat plan structurally impossible (nothing installed yet ⇒ V<n> absent ⇒ plan aborts before it can propose the install). Rev-2 splits per ORG-049:
 
@@ -218,7 +218,7 @@ L1 items map to `persona_installer` + `harness_runtime.controller`/`harnesses` t
 
 **Already-present fields (contract asserts, does not add):** `mailbox_root`, `state_roots`, `role`, `harness`, `persona`, per-adapter systemd base template paths.
 
-## Resolved questions (rev-2 in-draft, per Cairn T-3091 dimension 7)
+## Resolved questions (rev-2 in-draft, per Consultant T-3091 dimension 7)
 
 **Resolved Q1 (was Q1 skills baseline)** — Provision an adapter-scoped skills DIRECTORY (mechanism at L1); skill CONTENT stays optional and role-bound (L2). L1 mandates `harness_runtime.harnesses.<adapter>.config.skills_baseline` as a manifest field that names the directory path; L1 verifies directory presence + ownership (V2). Whether a specific persona has any skills installed is L2, per-role, per-adapter.
 
@@ -234,7 +234,7 @@ L1 items map to `persona_installer` + `harness_runtime.controller`/`harnesses` t
 
 ## Open questions for the operator (rev-2 trimmed set)
 
-**Q3 (retained) — Chronicle-emit invariant per supervisor mode.** HC-driven specialist emit-quiet (regression); bespoke recovery emits; sub-orch atlas / mnemosyne empty. Either L1 requires chronicle-emit on ALL restart-events regardless of supervisor mode (add a V-invariant), or HC-driven's emit-quiet is an accepted trait (document in ADR). If required → T-3030 sub-ticket; if accepted → the ADR carries the rationale + amends V7.
+**Q3 (retained) — Chronicle-emit invariant per supervisor mode.** HC-driven specialist emit-quiet (regression); bespoke recovery emits; sub-orch artisan / archivist empty. Either L1 requires chronicle-emit on ALL restart-events regardless of supervisor mode (add a V-invariant), or HC-driven's emit-quiet is an accepted trait (document in ADR). If required → T-3030 sub-ticket; if accepted → the ADR carries the rationale + amends V7.
 
 **Q_new — V11 runtime-response rollout pacing choice.** The V11 security-drift response (escalate-to-operator + Recovery-audit + optionally auto-tombstone) is architecturally clear. Rollout choice: (a) auto-tombstone on first V11 runtime failure (strictest), (b) escalate + Recovery-audit + auto-tombstone-only-if-review-times-out (default), (c) escalate + Recovery-audit + never-auto-tombstone (most conservative). The operator's disposition binds default rollout shape.
 
@@ -262,7 +262,7 @@ Child tickets to file post-ratify:
 | Chronicle-emit invariant per supervisor mode | Latent | Specify emit-contract per supervisor mode | Open Q3 |
 | V11 security-drift response implementation | Blocker | Auto-tombstone plumbing + Recovery-audit routing | pending Q_new disposition |
 
-## DECISIONS (rev-2, per Cairn T-3091 proposed set)
+## DECISIONS (rev-2, per Consultant T-3091 proposed set)
 
 1. **Rename ADR-wide vocabulary to persona-stack L1** + explicit ORG-049 Layer-N cross-reference; V-invariants are adapter/capability-qualified — justifies-via P1 (structural: terminology precision prevents readers conflating the two axes) + P6 (traceability: every reader of ORG-079 sees the two-axis distinction upfront).
 2. **Convergence marker is the apply receipt** bound to the full verify result (V10) — justifies-via P4 (truthful gate: presence-of-past-pass ≠ current PASS) + D5 (evidence discipline: hash-bound, immutable, post-verify-only).
@@ -292,6 +292,6 @@ Child tickets to file post-ratify:
 - T-3030 (this scoping-ticket, umbrella arc).
 - T-3026 (recovery-cutover, blocked on convergence-marker retrofit).
 - T-3039 (graveyard → chronicle rename, merged 2026-08-23) — updates V6 + L1.c reference to `chronicle/`.
-- T-3091 (Cairn ORG-041 spec-review) — rev-1 BLOCK-WITH-REASON; rev-2 applies all 4 blockers + per-dimension refinements.
+- T-3091 (Consultant ORG-041 spec-review) — rev-1 BLOCK-WITH-REASON; rev-2 applies all 4 blockers + per-dimension refinements.
 - Audit deliverables: `knowledge/episodic/2026-08-21-l1-install-completeness-sweep/{report.md,aggregation-matrix.md}`.
-- Revision-prep notes: `notes/2026-08-23-org-079-revision-prep-from-cairn-review.md`.
+- Revision-prep notes: `notes/2026-08-23-org-079-revision-prep-from-consultant-review.md`.

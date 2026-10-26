@@ -1,5 +1,5 @@
 [Unit]
-Description=Pantheon metrics — regenerate + push JSON to CT103 (pantheon-metrics.snowis.me) (T-3625)
+Description=Pantheon metrics — regenerate + push JSON to CT103 (pantheon-metrics.your-domain.example) (T-3625)
 Documentation=file:///home/%u/pantheon-config/tickets/done/T-3625.md
 After=network-online.target
 Wants=network-online.target
@@ -13,6 +13,10 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# T-4222: a failed cross-account probe publishes state 'unknown' (grey '?' on the
+# panel) instead of a fabricated 'down'. The site accepts it (T-4221 @7cf912e).
+# Revert = drop this line (the generator then maps 'unknown' back to 'down').
+Environment=PANTHEON_METRICS_EMIT_UNKNOWN=1
 ExecStart=%h/pantheon-config/tools/pantheon_metrics_push.sh
 StandardOutput=journal
 StandardError=journal

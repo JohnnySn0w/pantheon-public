@@ -1,0 +1,36 @@
+# host-substrate component contract (ORG-080 §2 / §Build plan (c); T-5084, tranche GE).
+#
+# The ORG-052 narrow root helper (T-2918) and supervised root bootstrap (T-2920)
+# generalized behind the component contract. Root ops are exactly the ORG-082 §1
+# substrate families, all bootstrap_root (never seat, never broker_runtime).
+# The handler (host-substrate_handlers.py) runs them through
+# tools/germinate/host_substrate/ RootHelper over the SIMULATED port; the host
+# port lands dark. Gates and the invariant list are CURRENT (co-author recovery;
+# D15 approved at 71fd484cc). The sudoers gate is independent-agent, so a sudoers apply
+# refuses through the engine until grant consumption lands (T-5135 S2).
+component:
+  id: host-substrate
+  steward: orchestrator
+  version: 1
+  planner_kind: python
+  contract_digest: sha256:98d0a1e8ab665e1a39bbd9e045a616cc7d4049eb1620768c77dcef1cf3099b0c
+  handlers_digest: sha256:5a8d41a602145bd4cee953b7a1bc113a1d8e891ff9ef87b0ac3e4278d0e48687
+  depends_on: []
+  scopes: [system]
+  invariant_list_id: org.pantheon.host-substrate/v1
+  invariant_list_digest: sha256:19f1b0321b5ccb3b5977cb880978d5e4696c0cb94fcccd036c93860434dd29c9
+  privilege:
+    bootstrap_root: [account.ensure, account.retire, group.ensure, group.member, acl.converge, owner_mode.set, sudoers_fragment.ensure, sudoers_fragment.retire, unit.system.install, unit.system.enable, dbus_policy.install, dbus_policy.retire, mailbox_dir.ensure, mailbox_dir.retire, linger.enable, linger.disable]
+  legs:
+    install: plan_install
+    configure: plan_configure
+    update: plan_update(source_rev_from, source_rev_to)
+    remove: plan_remove
+    repair: plan_repair(verify_result)
+    verify:
+      invariant_list_ref: org.pantheon.host-substrate/v1@sha256:19f1b0321b5ccb3b5977cb880978d5e4696c0cb94fcccd036c93860434dd29c9
+  gates:
+    - {id: sudoers-self-lockout, irreversible: true, note: "visudo -cf + sudo -l evidence before commit", approval: {class: independent-agent, grant_source: action-broker-approval-registry}}
+    - {id: substrate-retire, irreversible: false, note: "retire locks and disables; never deletes a home or mailbox (ORG-052 gate 34)", approval: {class: operator}}
+  receipts:
+    schema: pantheon-receipt/v1

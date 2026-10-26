@@ -500,6 +500,77 @@ class TestDeliverBeforeRecording(unittest.TestCase):
 
 
 
+class TestOperatorDigestActionOnly(unittest.TestCase):
+    """T-4200: the operator watch Telegram is ACTION-ONLY (above-bar / label
+    disagreement / parked lean); routine days send nothing, full digest still
+    prints to stdout/journal."""
+
+    LEAN = [("T-1", "Decide X", 5, Path("/tmp/T-1.md"), None)]
+
+    def test_none_when_all_routine(self):
+        rows = [("t1", False, "routine one", None), ("t2", False, "routine two", None)]
+        self.assertIsNone(watch_digest.build_operator_digest("2026-09-28", rows, []))
+
+    def test_none_when_no_reports_no_leans(self):
+        self.assertIsNone(watch_digest.build_operator_digest("2026-09-28", [], []))
+
+    def test_sends_on_above_the_bar(self):
+        rows = [("t1", True, "big finding", None), ("t2", False, "routine two", None)]
+        msg = watch_digest.build_operator_digest("2026-09-28", rows, [])
+        self.assertIsNotNone(msg)
+        self.assertIn("Above the bar", msg)
+        self.assertIn("big finding", msg)
+        self.assertNotIn("routine two", msg)  # below-bar row stripped from operator TG
+
+    def test_sends_on_label_disagreement(self):
+        rows = [("t1", False, "sneaky summary", "exploit")]  # declared routine, kw tripped
+        msg = watch_digest.build_operator_digest("2026-09-28", rows, [])
+        self.assertIsNotNone(msg)
+        self.assertIn("Label disagreements", msg)
+        self.assertIn("exploit", msg)
+
+    def test_sends_on_lean_alone(self):
+        msg = watch_digest.build_operator_digest("2026-09-28", [], self.LEAN)
+        self.assertIsNotNone(msg)
+        self.assertIn("Parked on you", msg)
+        self.assertIn("T-1", msg)
+
+    def test_main_suppresses_send_on_routine_day(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(watch_digest, "TICKETS_ROOT", Path(tmp)), \
+                 patch.object(watch_digest, "pull_repo_or_warn"), \
+                 patch.object(watch_digest, "collect_today",
+                              return_value=[("t1", False, "routine", None)]), \
+                 patch.object(watch_digest, "collect_operator_leans", return_value=[]), \
+                 patch.object(watch_digest, "collect_day_index_drift", return_value=None), \
+                 patch.object(watch_digest, "read_telegram_token", return_value="tok"), \
+                 patch.object(watch_digest, "send_telegram", return_value=True) as mock_send, \
+                 patch("sys.argv", ["watch_digest.py"]), \
+                 patch("sys.stdout", new_callable=io.StringIO), \
+                 patch("sys.stderr", new_callable=io.StringIO):
+                rc = watch_digest.main()
+        self.assertEqual(rc, 0)
+        mock_send.assert_not_called()
+
+    def test_main_sends_on_above_bar_day(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(watch_digest, "TICKETS_ROOT", Path(tmp)), \
+                 patch.object(watch_digest, "pull_repo_or_warn"), \
+                 patch.object(watch_digest, "collect_today",
+                              return_value=[("t1", True, "big finding", None)]), \
+                 patch.object(watch_digest, "collect_operator_leans", return_value=[]), \
+                 patch.object(watch_digest, "collect_day_index_drift", return_value=None), \
+                 patch.object(watch_digest, "read_telegram_token", return_value="tok"), \
+                 patch.object(watch_digest, "send_telegram", return_value=True) as mock_send, \
+                 patch("sys.argv", ["watch_digest.py"]), \
+                 patch("sys.stdout", new_callable=io.StringIO), \
+                 patch("sys.stderr", new_callable=io.StringIO):
+                rc = watch_digest.main()
+        self.assertEqual(rc, 0)
+        mock_send.assert_called_once()
+        self.assertIn("Above the bar", mock_send.call_args.args[2])
+
+
 class TestReceiptIsSegmentAnchoredNotSubstring(unittest.TestCase):
     """T-2202. A prose MENTION of lean-surfacing must not read as having DONE it —
     that is T-2199's own thesis (a record asserting something that did not happen)

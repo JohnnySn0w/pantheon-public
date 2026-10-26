@@ -167,5 +167,82 @@ out="$(run_hook "$S")"
 grep -q 'DIFFER from canonical' <<<"$out" \
   && pass "trailing-newline drift detected" || fail "trailing-newline drift invisible"
 
+# --- cases 15-16 (T-4392 phase 2a): a break-glass flag for this account is surfaced as a
+# SOFT warning; no flag stays silent. The sandbox base is owned by the test user, so the flag
+# lists as REJECTED (the real ownership checks run); LIVE formatting is covered in
+# tools/test_failclosed.py with an injected owner policy. ---
+HELPER="$(cd "$(dirname "$0")" && pwd)/_failclosed.py"
+S="$(make_sandbox)"
+cp "$HELPER" "$S/pantheon-config/tools/hooks/_failclosed.py"
+BG="$(mktemp -d)"; chmod 755 "$BG"; mkdir -m 755 "$BG/$(id -un)"
+out="$(HOME="$S" PANTHEON_BREAKGLASS_LIST_BASE="$BG" bash "$HOOK_SRC" </dev/null 2>/dev/null)"; rc=$?
+[[ $rc -eq 0 && -z "$out" ]] && pass "break-glass: no flag -> silent, exit 0" || fail "break-glass no flag: rc=$rc out='$out'"
+printf 'v1 %s mcp-list-guard\n' "$(( $(date +%s) + 3600 ))" > "$BG/$(id -un)/flag"; chmod 644 "$BG/$(id -un)/flag"
+out="$(HOME="$S" PANTHEON_BREAKGLASS_LIST_BASE="$BG" bash "$HOOK_SRC" </dev/null 2>/dev/null)"; rc=$?
+[[ $rc -eq 0 ]] && pass "break-glass flag: exit 0" || fail "break-glass flag: exit $rc"
+grep -q 'BREAK-GLASS flag present' <<<"$out" && pass "break-glass flag: surfaced" || fail "break-glass flag: not surfaced ('$out')"
+if [[ "$(id -u)" -ne 0 ]]; then   # as root the fixture base IS root-owned
+  grep -q "REJECTED $(id -un): base is not root-owned" <<<"$out" \
+    && pass "break-glass flag: real ownership check named" || fail "break-glass flag: reason missing ('$out')"
+fi
+rm -rf "$BG"
+
+# --- cases 17-22 (T-4473): a drifted copy that NO settings file executes is DORMANT, so it
+# gets one INFO line, not the alarm. The decision reuses deploy_hook.py's registration
+# resolver, which is linked into the sandbox clone the same way the real hook finds it. Every
+# case without positive dormant evidence keeps the full alarm. ---
+DEPLOY_HOOK="$(cd "$(dirname "$0")/.." && pwd)/deploy_hook.py"
+dormant_sandbox() {   # $1 = settings.json command for foo.sh (@HOME@ = the sandbox); stale copy
+  local d; d="$(make_sandbox)"
+  ln -s "$DEPLOY_HOOK" "$d/pantheon-config/tools/deploy_hook.py"
+  printf 'echo hi\n' > "$d/pantheon-config/tools/hooks/foo.sh"
+  printf 'echo old\n' > "$d/.claude/hooks/foo.sh"
+  printf '{"hooks":{"PreToolUse":[{"matcher":"Bash","hooks":[{"type":"command","command":"%s"}]}]}}\n' \
+    "${1//@HOME@/$d}" > "$d/.claude/settings.json"
+  echo "$d"
+}
+
+# 17: THE PIN. Registered from the clone (ELSEWHERE), stale copy in ~/.claude/hooks -> no alarm.
+S="$(dormant_sandbox "python3 @HOME@/pantheon-config/tools/hooks/foo.sh")"
+out="$(run_hook "$S")"; rc=$?
+[[ $rc -eq 0 ]] && pass "dormant: exit 0" || fail "dormant: exit $rc"
+grep -q 'DIFFER from canonical' <<<"$out" && fail "dormant: still raised the alarm ('$out')" || pass "dormant: no alarm"
+grep -q 'foo.sh: dormant copy, not executed' <<<"$out" && pass "dormant: one INFO line names the file" \
+  || fail "dormant: INFO line missing ('$out')"
+grep -q "$S/pantheon-config/tools/hooks/foo.sh" <<<"$out" && pass "dormant: names where it IS registered" \
+  || fail "dormant: registered path missing ('$out')"
+[[ $(grep -c 'dormant copy' <<<"$out") -eq 1 ]] && pass "dormant: exactly one line" || fail "dormant: not one line ('$out')"
+
+# 18: registered AT the deployed path (tilde form, resolved against this HOME) -> still the alarm.
+S="$(dormant_sandbox "bash ~/.claude/hooks/foo.sh")"
+out="$(run_hook "$S")"
+grep -q 'DIFFER from canonical' <<<"$out" && pass "executed copy: alarm kept" || fail "executed copy: alarm lost ('$out')"
+grep -q 'dormant copy' <<<"$out" && fail "executed copy: misfiled as dormant" || pass "executed copy: not called dormant"
+
+# 19: registered NOWHERE -> alarm kept (a copy another hook imports is registered nowhere yet runs).
+S="$(dormant_sandbox "bash /opt/other/bar.sh")"
+out="$(run_hook "$S")"
+grep -q 'DIFFER from canonical' <<<"$out" && pass "unregistered copy: alarm kept" || fail "unregistered copy: alarm lost ('$out')"
+
+# 20: ELSEWHERE in settings.json but settings.local.json runs the deployed path -> alarm kept.
+S="$(dormant_sandbox "bash /x/pantheon-config/tools/hooks/foo.sh")"
+printf '{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"bash %s"}]}]}}\n' \
+  "$S/.claude/hooks/foo.sh" > "$S/.claude/settings.local.json"
+out="$(run_hook "$S")"
+grep -q 'DIFFER from canonical' <<<"$out" && pass "local settings runs it: alarm kept" || fail "local settings runs it: alarm lost ('$out')"
+
+# 21: ELSEWHERE, but another settings file is unparseable (UNKNOWN) -> alarm kept.
+S="$(dormant_sandbox "bash /x/pantheon-config/tools/hooks/foo.sh")"
+mkdir -p "$S/pantheon-config/.claude"; printf '{not json\n' > "$S/pantheon-config/.claude/settings.json"
+out="$(run_hook "$S")"
+grep -q 'DIFFER from canonical' <<<"$out" && pass "unparseable settings: alarm kept" || fail "unparseable settings: alarm lost ('$out')"
+
+# 22: ELSEWHERE, but the resolver is missing from the clone -> alarm kept (fail-safe).
+S="$(dormant_sandbox "bash /x/pantheon-config/tools/hooks/foo.sh")"
+rm "$S/pantheon-config/tools/deploy_hook.py"
+out="$(run_hook "$S")"; rc=$?
+[[ $rc -eq 0 ]] && pass "no resolver: exit 0" || fail "no resolver: exit $rc"
+grep -q 'DIFFER from canonical' <<<"$out" && pass "no resolver: alarm kept" || fail "no resolver: alarm lost ('$out')"
+
 echo
 if [[ $fails -eq 0 ]]; then echo "PASS — all cases green"; exit 0; else echo "FAIL — $fails case(s) failed"; exit 1; fi

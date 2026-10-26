@@ -10,7 +10,7 @@ domain: "python, config-loading, fallback, sync-guard, testing, silent-failure, 
 making a fallback complete. Not specific to any one project — it appears wherever a config loader has a
 fail-safe fallback and a test asserts the loaded result against a second computation of the same thing.
 
-**Found:** 2026-07-29 (atlas, T-2316; surfaced by the T-2281 review). Generalisation prompted by orchestrator.
+**Found:** 2026-07-29 (artisan, T-2316; surfaced by the T-2281 review). Generalisation prompted by orchestrator.
 
 ## The defect
 

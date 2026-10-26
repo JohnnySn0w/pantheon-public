@@ -38,13 +38,24 @@ from tools.host_control.approval.contracts import (
     ReviewRecord,
     StaleAuthorityState,
 )
+from tools.host_control.approval.human import (
+    HUMAN_REQUEST_TRANSITIONS,
+    AttestationRecord,
+    HumanRequestRecord,
+)
 from tools.host_control.contracts import (
     HostControlError,
+    IdempotencyConflict,
     InvalidTransition,
+    JournalBusy,
     UnknownHandle,
     canonical_json,
 )
 
+
+# Default write-lock wait. Injectable through ApprovalJournal.open so a test
+# can force lock contention without depending on host load.
+BUSY_TIMEOUT_MS = 5000
 
 # 0x50484341 ("PHCA" — Pantheon Host Control Approval). The broker journal
 # is 0x50484342 ("PHCB", = 1346913090, verified at source in
@@ -340,13 +351,68 @@ CREATE TABLE grant_events (
     PRIMARY KEY (approval_handle, seq)
 ) STRICT;
 
+CREATE TABLE human_requests (
+    request_handle TEXT PRIMARY KEY
+        CHECK (
+            length(request_handle) = 64
+            AND request_handle NOT GLOB '*[^0-9a-f]*'
+        ),
+    review_handle TEXT NOT NULL UNIQUE REFERENCES reviews(review_handle),
+    requested_by TEXT NOT NULL CHECK (length(requested_by) BETWEEN 1 AND 128),
+    request_idempotency_key TEXT NOT NULL CHECK (
+        length(request_idempotency_key) BETWEEN 1 AND 128
+    ),
+    plan_digest TEXT NOT NULL CHECK (
+        length(plan_digest) = 64
+        AND plan_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    target_seat_id TEXT NOT NULL CHECK (length(target_seat_id) BETWEEN 1 AND 128),
+    operation_families TEXT NOT NULL CHECK (
+        length(operation_families) BETWEEN 2 AND 4096
+    ),
+    redacted_summary TEXT NOT NULL CHECK (
+        length(redacted_summary) BETWEEN 1 AND 4096
+    ),
+    nonce TEXT NOT NULL UNIQUE CHECK (
+        length(nonce) = 64
+        AND nonce NOT GLOB '*[^0-9a-f]*'
+    ),
+    state TEXT NOT NULL CHECK (
+        state IN ('pending', 'presented', 'decided', 'expired', 'withdrawn')
+    ),
+    provider_message_ref TEXT CHECK (
+        provider_message_ref IS NULL
+        OR length(provider_message_ref) BETWEEN 1 AND 32
+    ),
+    created_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL,
+    presented_at TEXT,
+    updated_at TEXT NOT NULL,
+    CHECK ((provider_message_ref IS NULL) = (presented_at IS NULL)),
+    CHECK (state != 'pending' OR provider_message_ref IS NULL),
+    CHECK (
+        state NOT IN ('presented', 'decided')
+        OR provider_message_ref IS NOT NULL
+    )
+) STRICT;
+
+CREATE UNIQUE INDEX human_requests_key_idx
+    ON human_requests(requested_by, request_idempotency_key);
+
 CREATE TABLE provider_attestations (
     attestation_handle TEXT PRIMARY KEY
         CHECK (
             length(attestation_handle) = 64
             AND attestation_handle NOT GLOB '*[^0-9a-f]*'
         ),
-    review_handle TEXT NOT NULL REFERENCES reviews(review_handle),
+    review_handle TEXT NOT NULL UNIQUE REFERENCES reviews(review_handle),
+    request_handle TEXT NOT NULL UNIQUE
+        REFERENCES human_requests(request_handle),
+    decision TEXT NOT NULL CHECK (decision IN ('granted', 'denied')),
+    human_subject TEXT NOT NULL CHECK (length(human_subject) BETWEEN 1 AND 128),
+    idempotency_key TEXT NOT NULL CHECK (
+        length(idempotency_key) BETWEEN 1 AND 128
+    ),
     provider TEXT NOT NULL CHECK (provider IN ('telegram')),
     provider_user_id TEXT NOT NULL CHECK (
         length(provider_user_id) BETWEEN 1 AND 128
@@ -365,13 +431,14 @@ CREATE TABLE provider_attestations (
     attestation_json TEXT NOT NULL CHECK (
         length(attestation_json) BETWEEN 2 AND 1048576
     ),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    UNIQUE (human_subject, idempotency_key)
 ) STRICT;
 """
 
 # Literal pin of the compiled DDL text (AB-1 idiom): a drifted DDL string
 # fails loudly at open() before any file is touched.
-SCHEMA_DIGEST = "205a8628d7090f62cb291a62eda97a98cf0dccd2e81a6f41b84b7334bfdbc4e5"
+SCHEMA_DIGEST = "bf169e0452fd0d1ccc3c012afdd2f12de8acda58ae8131545e878023b03617ff"
 
 def _schema_objects(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
     return tuple(
@@ -491,6 +558,93 @@ _INSERT_GRANT = (
 )
 
 
+HUMAN_COLUMNS = (
+    "request_handle",
+    "review_handle",
+    "requested_by",
+    "request_idempotency_key",
+    "plan_digest",
+    "target_seat_id",
+    "operation_families",
+    "redacted_summary",
+    "nonce",
+    "state",
+    "provider_message_ref",
+    "created_at",
+    "expires_at",
+    "presented_at",
+    "updated_at",
+)
+_SELECT_HUMAN = f"SELECT {', '.join(HUMAN_COLUMNS)} FROM human_requests"
+_INSERT_HUMAN = (
+    f"INSERT INTO human_requests ({', '.join(HUMAN_COLUMNS)}) "
+    f"VALUES ({','.join('?' * len(HUMAN_COLUMNS))})"
+)
+
+ATTESTATION_COLUMNS = (
+    "attestation_handle",
+    "review_handle",
+    "request_handle",
+    "decision",
+    "human_subject",
+    "idempotency_key",
+    "provider",
+    "provider_user_id",
+    "provider_chat_id",
+    "provider_message_id",
+    "callback_nonce",
+    "source_event",
+    "attestation_json",
+    "created_at",
+)
+_SELECT_ATTESTATION = (
+    f"SELECT {', '.join(ATTESTATION_COLUMNS)} FROM provider_attestations"
+)
+_INSERT_ATTESTATION = (
+    f"INSERT INTO provider_attestations ({', '.join(ATTESTATION_COLUMNS)}) "
+    f"VALUES ({','.join('?' * len(ATTESTATION_COLUMNS))})"
+)
+
+
+def _human_row_values(record: HumanRequestRecord) -> tuple:
+    return (
+        record.request_handle,
+        record.review_handle,
+        record.requested_by,
+        record.request_idempotency_key,
+        record.plan_digest,
+        record.target_seat_id,
+        canonical_json(list(record.operation_families)),
+        record.redacted_summary,
+        record.nonce,
+        record.state,
+        record.provider_message_ref,
+        record.created_at,
+        record.expires_at,
+        record.presented_at,
+        record.updated_at,
+    )
+
+
+def _attestation_row_values(record: AttestationRecord) -> tuple:
+    return (
+        record.attestation_handle,
+        record.review_handle,
+        record.request_handle,
+        record.decision,
+        record.human_subject,
+        record.idempotency_key,
+        record.provider,
+        record.provider_user_id,
+        record.provider_chat_id,
+        record.provider_message_id,
+        record.callback_nonce,
+        record.source_event,
+        canonical_json({"plan_digest": record.plan_digest}),
+        record.created_at,
+    )
+
+
 def _handoff_columns(record: ReviewRecord | GrantRecord) -> tuple:
     handoff = record.handoff
     if handoff is None:
@@ -567,13 +721,70 @@ def _grant_row_values(record: GrantRecord) -> tuple:
     )
 
 
+# sqlite primary result codes for lock contention (sqlite3.h).
+_SQLITE_BUSY = 5
+_SQLITE_LOCKED = 6
+_LOCK_CONTENTION_MESSAGES = frozenset(
+    ("database is locked", "database table is locked")
+)
+
+
+def _is_lock_contention(exc: sqlite3.OperationalError) -> bool:
+    """True when sqlite reports lock contention (SQLITE_BUSY / LOCKED).
+
+    The primary result code (low byte of ``sqlite_errorcode``, present on
+    Python 3.11+; extended codes such as BUSY_RECOVERY reduce to it)
+    decides. Only when the interpreter attached no code does the exact
+    message text stand in. Every other OperationalError is not contention.
+    Duplicated in the sibling journal on purpose (L3: no import edge across
+    the authority boundary); a parity test drives both copies.
+    """
+
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 0xFF) in (_SQLITE_BUSY, _SQLITE_LOCKED)
+    return str(exc) in _LOCK_CONTENTION_MESSAGES
+
+
 class ApprovalJournal:
     """Durable, fail-closed approval truth. Never opened by the broker."""
 
-    def __init__(self, path: Path, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        path: Path,
+        connection: sqlite3.Connection,
+        busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+    ) -> None:
         self.path = path
         self._connection = connection
+        self._busy_timeout_ms = busy_timeout_ms
         self._closed = False
+
+    def _begin_immediate(
+        self,
+        connection: sqlite3.Connection,
+        operation: str,
+    ) -> None:
+        """Take the write lock up front; map lock contention here.
+
+        Every runtime write transaction opens through this one seam. A
+        lock still held by another connection past the busy timeout
+        refuses with ``JournalBusy`` (a HostControlError) naming the
+        operation that lost, instead of leaking the raw sqlite error; the
+        transaction never began, so nothing was written. Any other
+        OperationalError surfaces unchanged.
+        """
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_contention(exc):
+                raise
+            raise JournalBusy(
+                f"{operation}: journal write lock busy after "
+                f"{self._busy_timeout_ms} ms (lock contention); "
+                "nothing was written; retry later"
+            ) from exc
 
     @staticmethod
     def _check_compiled_digest() -> None:
@@ -583,8 +794,19 @@ class ApprovalJournal:
             )
 
     @classmethod
-    def open(cls, path: Path) -> "ApprovalJournal":
+    def open(
+        cls,
+        path: Path,
+        *,
+        busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+    ) -> "ApprovalJournal":
         cls._check_compiled_digest()
+        if (
+            not isinstance(busy_timeout_ms, int)
+            or isinstance(busy_timeout_ms, bool)
+            or busy_timeout_ms < 0
+        ):
+            raise HostControlError("invalid journal busy timeout")
         if not path.is_absolute():
             path = path.resolve()
         parent = path.parent
@@ -595,10 +817,10 @@ class ApprovalJournal:
         try:
             connection = sqlite3.connect(
                 path,
-                timeout=5.0,
+                timeout=busy_timeout_ms / 1000,
                 isolation_level=None,
             )
-            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             connection.execute("PRAGMA foreign_keys=ON")
             objects = _schema_objects(connection)
             application_id = connection.execute(
@@ -620,7 +842,7 @@ class ApprovalJournal:
             connection.execute("PRAGMA synchronous=FULL")
             if created:
                 _fsync_dir(parent)
-            return cls(path, connection)
+            return cls(path, connection, busy_timeout_ms)
         except (OSError, sqlite3.Error) as exc:
             try:
                 connection.close()
@@ -711,7 +933,7 @@ class ApprovalJournal:
             else record.handoff.request_plan_handle
         )
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(connection, "put_review_or_replay")
             row = connection.execute(
                 f"{_SELECT_REVIEW} WHERE requested_by=? AND plan_handle=? "
                 "AND plan_digest=? AND handoff_kind=? "
@@ -806,7 +1028,7 @@ class ApprovalJournal:
             if grant.state != "issued":
                 raise HostControlError("new grants must be issued")
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(connection, "record_decision")
             self._insert_event(
                 connection,
                 table="review_events",
@@ -860,7 +1082,10 @@ class ApprovalJournal:
         connection = self._require_open()
         self._check_review_pair(current, new)
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(
+                connection,
+                f"transition_review[{event_kind}]",
+            )
             self._insert_event(
                 connection,
                 table="review_events",
@@ -950,7 +1175,10 @@ class ApprovalJournal:
         connection = self._require_open()
         self._check_grant_pair(current, new)
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(
+                connection,
+                f"transition_grant[{event_kind}]",
+            )
             self._insert_event(
                 connection,
                 table="grant_events",
@@ -1010,7 +1238,10 @@ class ApprovalJournal:
 
         connection = self._require_open()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(
+                connection,
+                f"append_grant_event[{event_kind}]",
+            )
             row = connection.execute(
                 "SELECT state FROM grants WHERE approval_handle=?",
                 (current.approval_handle,),
@@ -1039,8 +1270,333 @@ class ApprovalJournal:
             raise
 
     # ------------------------------------------------------------------
+    # human authority ingress (T-2919)
+    # ------------------------------------------------------------------
+
+    def put_human_request_or_replay(
+        self,
+        *,
+        record: HumanRequestRecord,
+    ) -> tuple[HumanRequestRecord, bool]:
+        """Insert the ONE human request for a review, or return the stored
+        one (replay). Same (requester, key) for a different review is an
+        idempotency conflict; any second request for the same review —
+        whatever its key — returns the existing record (exactly one card
+        and one nonce per review, ever)."""
+
+        connection = self._require_open()
+        if record.state != "pending":
+            raise HostControlError("new human requests must be pending")
+        try:
+            self._begin_immediate(connection, "put_human_request_or_replay")
+            row = connection.execute(
+                f"{_SELECT_HUMAN} WHERE requested_by=? "
+                "AND request_idempotency_key=?",
+                (record.requested_by, record.request_idempotency_key),
+            ).fetchone()
+            if row is not None:
+                stored = self._decode_human_row(row)
+                connection.execute("COMMIT")
+                if stored.review_handle != record.review_handle:
+                    raise IdempotencyConflict(
+                        "human request key reused for a different review"
+                    )
+                return stored, True
+            row = connection.execute(
+                f"{_SELECT_HUMAN} WHERE review_handle=?",
+                (record.review_handle,),
+            ).fetchone()
+            if row is not None:
+                stored = self._decode_human_row(row)
+                connection.execute("COMMIT")
+                return stored, True
+            connection.execute(_INSERT_HUMAN, _human_row_values(record))
+            connection.execute("COMMIT")
+            return record, False
+        except sqlite3.IntegrityError as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise HostControlError(
+                "human request uniqueness constraint failed"
+            ) from exc
+        except BaseException:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def get_human_request(self, request_handle: str) -> HumanRequestRecord:
+        connection = self._require_open()
+        row = connection.execute(
+            f"{_SELECT_HUMAN} WHERE request_handle=?",
+            (request_handle,),
+        ).fetchone()
+        if row is None:
+            raise UnknownHandle("unknown human request handle")
+        return self._decode_human_row(row)
+
+    def get_human_request_for_review(
+        self,
+        review_handle: str,
+    ) -> HumanRequestRecord | None:
+        connection = self._require_open()
+        row = connection.execute(
+            f"{_SELECT_HUMAN} WHERE review_handle=?",
+            (review_handle,),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._decode_human_row(row)
+
+    def transition_human_request(
+        self,
+        *,
+        current: HumanRequestRecord,
+        new: HumanRequestRecord,
+    ) -> None:
+        """State-guarded human-request transition (never to ``decided``:
+        nonce consumption is ``consume_human_nonce_and_decide`` only)."""
+
+        connection = self._require_open()
+        self._check_human_pair(current, new)
+        if new.state == "decided":
+            raise InvalidTransition(
+                "decided is reachable only through nonce consumption"
+            )
+        try:
+            self._begin_immediate(connection, "transition_human_request")
+            cursor = connection.execute(
+                "UPDATE human_requests SET state=?, provider_message_ref=?, "
+                "presented_at=?, updated_at=? "
+                "WHERE request_handle=? AND state=?",
+                (
+                    new.state,
+                    new.provider_message_ref,
+                    new.presented_at,
+                    new.updated_at,
+                    current.request_handle,
+                    current.state,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleAuthorityState("stale human request state")
+            connection.execute("COMMIT")
+        except BaseException:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def _after_human_nonce_consumed(
+        self,
+        connection: sqlite3.Connection,
+    ) -> None:
+        """No-op seam between the nonce-consuming UPDATE and the rest of
+        the decision transaction. Production never overrides it; the
+        T-2919 crash test overrides it in a TEST SUBCLASS to kill the
+        process mid-transaction (no production fault flag exists)."""
+
+    def consume_human_nonce_and_decide(
+        self,
+        *,
+        request: HumanRequestRecord,
+        review_current: ReviewRecord,
+        review_new: ReviewRecord,
+        grant: GrantRecord | None,
+        attestation: AttestationRecord,
+        payload: dict[str, object],
+    ) -> None:
+        """ONE durable transaction (ORG-052 §6): consume the nonce
+        (state-guarded ``presented -> decided`` keyed on the nonce),
+        record the provider attestation (UNIQUE nonce / review / request /
+        subject+key), transition the review, and issue the grant if
+        granted. All or nothing: a crash anywhere before COMMIT leaves
+        the nonce unconsumed and no decision; after COMMIT the decision
+        stands and the nonce is never reusable."""
+
+        connection = self._require_open()
+        self._check_review_pair(review_current, review_new)
+        if review_new.state not in ("granted", "denied"):
+            raise InvalidTransition("human decision targets granted/denied")
+        if (review_new.state == "granted") != (grant is not None):
+            raise HostControlError(
+                "a granted decision requires exactly one grant record"
+            )
+        if grant is not None:
+            if not grant.validate_digest():
+                raise HostControlError("invalid grant record digest")
+            if grant.review_handle != review_current.review_handle:
+                raise HostControlError("grant review handle mismatch")
+        if (
+            attestation.review_handle != review_current.review_handle
+            or attestation.request_handle != request.request_handle
+            or attestation.callback_nonce != request.nonce
+        ):
+            raise HostControlError("attestation does not match request")
+        try:
+            self._begin_immediate(connection, "consume_human_nonce_and_decide")
+            cursor = connection.execute(
+                "UPDATE human_requests SET state='decided', updated_at=? "
+                "WHERE request_handle=? AND state='presented' AND nonce=?",
+                (
+                    attestation.created_at,
+                    request.request_handle,
+                    attestation.callback_nonce,  # presented nonce (defense in depth)
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleAuthorityState("human nonce already consumed")
+            self._after_human_nonce_consumed(connection)
+            connection.execute(
+                _INSERT_ATTESTATION,
+                _attestation_row_values(attestation),
+            )
+            self._insert_event(
+                connection,
+                table="review_events",
+                handle_column="review_handle",
+                handle=review_current.review_handle,
+                from_state=review_current.state,
+                to_state=review_new.state,
+                event_kind="human_decided",
+                payload=payload,
+                created_at=review_new.decided_at or review_new.created_at,
+            )
+            self._guarded_review_update(
+                connection, current=review_current, new=review_new
+            )
+            if grant is not None:
+                connection.execute(_INSERT_GRANT, _grant_row_values(grant))
+                self._insert_event(
+                    connection,
+                    table="grant_events",
+                    handle_column="approval_handle",
+                    handle=grant.approval_handle,
+                    from_state="none",
+                    to_state="issued",
+                    event_kind="issued",
+                    payload={"review_handle": grant.review_handle},
+                    created_at=grant.issued_at,
+                )
+            connection.execute("COMMIT")
+        except sqlite3.IntegrityError as exc:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise StaleAuthorityState(
+                "human decision uniqueness constraint failed"
+            ) from exc
+        except BaseException:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def find_attestation_by_key(
+        self,
+        human_subject: str,
+        idempotency_key: str,
+    ) -> AttestationRecord | None:
+        connection = self._require_open()
+        row = connection.execute(
+            f"{_SELECT_ATTESTATION} WHERE human_subject=? "
+            "AND idempotency_key=?",
+            (human_subject, idempotency_key),
+        ).fetchone()
+        return None if row is None else self._decode_attestation_row(row)
+
+    def get_attestation_for_review(
+        self,
+        review_handle: str,
+    ) -> AttestationRecord | None:
+        connection = self._require_open()
+        row = connection.execute(
+            f"{_SELECT_ATTESTATION} WHERE review_handle=?",
+            (review_handle,),
+        ).fetchone()
+        return None if row is None else self._decode_attestation_row(row)
+
+    @staticmethod
+    def _check_human_pair(
+        current: HumanRequestRecord,
+        new: HumanRequestRecord,
+    ) -> None:
+        if current.request_handle != new.request_handle:
+            raise HostControlError("human request handle mismatch")
+        immutable = (
+            "review_handle",
+            "requested_by",
+            "request_idempotency_key",
+            "plan_digest",
+            "target_seat_id",
+            "operation_families",
+            "redacted_summary",
+            "nonce",
+            "created_at",
+            "expires_at",
+        )
+        for name in immutable:
+            if getattr(current, name) != getattr(new, name):
+                raise HostControlError("human request immutable field changed")
+        if new.state not in HUMAN_REQUEST_TRANSITIONS[current.state]:
+            raise InvalidTransition(
+                f"illegal human request transition {current.state} -> "
+                f"{new.state}"
+            )
+
+    @staticmethod
+    def _decode_human_row(row: tuple[object, ...]) -> HumanRequestRecord:
+        values = dict(zip(HUMAN_COLUMNS, row))
+        try:
+            families = json.loads(values["operation_families"])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HostControlError("corrupt human request families") from exc
+        if not isinstance(families, list):
+            raise HostControlError("corrupt human request families")
+        values["operation_families"] = tuple(families)
+        return HumanRequestRecord(**values)
+
+    @staticmethod
+    def _decode_attestation_row(row: tuple[object, ...]) -> AttestationRecord:
+        values = dict(zip(ATTESTATION_COLUMNS, row))
+        raw = values.pop("attestation_json")
+        try:
+            body = json.loads(raw)
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HostControlError("corrupt attestation JSON") from exc
+        if not isinstance(body, dict) or set(body) != {"plan_digest"}:
+            raise HostControlError("corrupt attestation shape")
+        return AttestationRecord(plan_digest=body["plan_digest"], **values)
+
+    # ------------------------------------------------------------------
     # maintenance / monitor
     # ------------------------------------------------------------------
+
+    def pending_human_request_handles(
+        self,
+        now_iso: str,
+        *,
+        limit: int,
+    ) -> tuple[str, ...]:
+        """Still-undelivered, unexpired human requests (T-5518: the
+        service re-arms their ``Present`` on start). Read-only."""
+
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise HostControlError("invalid pending human request limit")
+        connection = self._require_open()
+        rows = connection.execute(
+            "SELECT request_handle FROM human_requests "
+            "WHERE state='pending' AND expires_at > ? "
+            "ORDER BY created_at, request_handle LIMIT ?",
+            (now_iso, limit),
+        ).fetchall()
+        return tuple(row[0] for row in rows)
 
     def due_for_expiry(
         self,

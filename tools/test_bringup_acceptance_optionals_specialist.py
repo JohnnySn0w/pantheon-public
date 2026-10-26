@@ -11,8 +11,8 @@ from pathlib import Path
 from tools.bringup_acceptance.optionals.specialist import (
     MODULE_ID_AUTOCOMMIT,
     MODULE_ID_WATCH_RUNNER,
-    ArgusWatchAutocommitModule,
-    ArgusWatchRunnerModule,
+    SpecialistWatchAutocommitModule,
+    SpecialistWatchRunnerModule,
     build_optional_modules,
 )
 from tools.bringup_acceptance.recorder import validate_token
@@ -76,33 +76,33 @@ class RegistryIntegrationTest(unittest.TestCase):
 
 class DeclareTest(unittest.TestCase):
     def test_watch_runner_declares_applies_for_specialist_persona(self) -> None:
-        module = ArgusWatchRunnerModule()
+        module = SpecialistWatchRunnerModule()
         declaration = module.declare(_SPECIALIST_TARGET)
         self.assertTrue(declaration.applies)
         self.assertEqual(declaration.module_id, MODULE_ID_WATCH_RUNNER)
         self.assertEqual(declaration.tier, "optional")
 
     def test_watch_runner_declares_absent_for_non_specialist_persona(self) -> None:
-        module = ArgusWatchRunnerModule()
+        module = SpecialistWatchRunnerModule()
         declaration = module.declare(_OTHER_TARGET)
         self.assertFalse(declaration.applies)
         self.assertIn("recovery", declaration.reason)
 
     def test_autocommit_declares_applies_for_specialist_persona(self) -> None:
-        module = ArgusWatchAutocommitModule()
+        module = SpecialistWatchAutocommitModule()
         declaration = module.declare(_SPECIALIST_TARGET)
         self.assertTrue(declaration.applies)
         self.assertEqual(declaration.module_id, MODULE_ID_AUTOCOMMIT)
 
     def test_autocommit_declares_absent_for_non_specialist_persona(self) -> None:
-        module = ArgusWatchAutocommitModule()
+        module = SpecialistWatchAutocommitModule()
         declaration = module.declare(_OTHER_TARGET)
         self.assertFalse(declaration.applies)
 
 
-class ArgusWatchRunnerProveTest(unittest.TestCase):
+class SpecialistWatchRunnerProveTest(unittest.TestCase):
     def test_prove_verifies_unit_wiring_and_brief_contract_then_restores(self) -> None:
-        module = ArgusWatchRunnerModule()
+        module = SpecialistWatchRunnerModule()
         with _tmp_evidence_root() as evidence_root:
             ctx = _make_ctx(evidence_root)
             declaration = module.declare(_SPECIALIST_TARGET)
@@ -127,7 +127,7 @@ class ArgusWatchRunnerProveTest(unittest.TestCase):
             self.assertEqual(row.module_id, MODULE_ID_WATCH_RUNNER)
 
     def test_prove_hard_stops_on_missing_service_wiring(self) -> None:
-        module = ArgusWatchRunnerModule()
+        module = SpecialistWatchRunnerModule()
         from tools.bringup_acceptance.optionals import specialist as specialist_mod
         from tools import watch_runner
 
@@ -150,9 +150,9 @@ class ArgusWatchRunnerProveTest(unittest.TestCase):
                 watch_runner.REPO_ROOT = original_root
 
 
-class ArgusWatchAutocommitProveTest(unittest.TestCase):
+class SpecialistWatchAutocommitProveTest(unittest.TestCase):
     def test_prove_lands_clean_report_and_refuses_hermes_tripping_report(self) -> None:
-        module = ArgusWatchAutocommitModule()
+        module = SpecialistWatchAutocommitModule()
         with _tmp_evidence_root() as evidence_root:
             ctx = _make_ctx(evidence_root)
             declaration = module.declare(_SPECIALIST_TARGET)
@@ -184,8 +184,16 @@ class ArgusWatchAutocommitProveTest(unittest.TestCase):
     def test_prove_never_touches_the_real_repo_lock_env(self) -> None:
         import os
 
-        module = ArgusWatchAutocommitModule()
+        module = SpecialistWatchAutocommitModule()
         env_key = "PANTHEON_GIT_MUTATION_LOCKFILE"
+        # T-4040: the conftest `_isolate_git_mutation_lockfile` autouse fixture
+        # sets this env suite-wide. This test asserts that prove()/restore()
+        # leave the env exactly as they found it (no leak) — so establish the
+        # clean-env precondition it is written against, then restore the
+        # fixture's value on teardown.
+        _prev = os.environ.pop(env_key, None)
+        if _prev is not None:
+            self.addCleanup(os.environ.__setitem__, env_key, _prev)
         self.assertNotIn(env_key, os.environ)
         with _tmp_evidence_root() as evidence_root:
             ctx = _make_ctx(evidence_root)

@@ -116,7 +116,7 @@ The cron no longer calls `claude -p`. After the 2026-06-13 billing change, headl
 **New flow:**
 1. `pantheon-weekly-ticket-summary.timer` fires Monday 09:00 UTC → runs `weekly_ticket_summary.py --file-request`.
 2. `--file-request` builds the full generation prompt and writes it to `reports/.pending/<YYYY>-W<NN>-prompt.md`.
-3. A generation-request ticket (`target=orchestrator`, `labels=weekly-summary,in-session-gen`) is filed pointing at that prompt file.
+3. A generation-request ticket (`target=role:head_engineering_orchestrator`, `labels=weekly-summary,in-session-gen`) is filed pointing at that prompt file.
 4. An interactive Orchestrator session picks up the ticket, reads the prompt file, generates the report in-session, writes `reports/<YYYY>-W<NN>.md`, refreshes the README spine-index, commits+pushes, removes the pending prompt, and resolves the ticket.
 
 **Backfill / manual:** `python3 tools/weekly_ticket_summary.py --file-request --week 2026-W21` files a request for any named week. `--dry-run` shows what would be filed without writing or filing.

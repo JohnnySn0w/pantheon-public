@@ -96,14 +96,14 @@ class CheckLoop(unittest.TestCase):
         wake.assert_not_called()
 
 
-class WakeWard(unittest.TestCase):
+class WakeRecovery(unittest.TestCase):
     def test_wake_sends_to_recovery_mailbox(self):
         with mock.patch.object(dum, "_log"), \
              mock.patch("tools.mailbox.send") as send:
             dum._wake_recovery("disk-warn", "body text")
         send.assert_called_once()
         args, kwargs = send.call_args
-        self.assertEqual(args[0], "/home/the-ancestor/mailbox/recovery")
+        self.assertEqual(args[0], "/home/post-office/mailbox/recovery")
         self.assertIn("body text", args[1])
         self.assertEqual(args[2], "recovery")
         self.assertIn("disk-warn", kwargs["subject"])
@@ -117,6 +117,69 @@ class WakeWard(unittest.TestCase):
 
 
 class TopConsumers(unittest.TestCase):
+    def setUp(self):
+        # These cases size homes only; the non-home paths have their own tests.
+        p = mock.patch.object(dum, "EXTRA_PATHS", [])
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_homes_are_sized_concurrently(self):
+        # T-4678: the sweep was sequential, so one slow home (claude, ~42s live)
+        # ate the budget and every later home went ?timeout/?skipped. Four homes
+        # each taking 0.6s must all be measured inside a 1s budget.
+        import time as _t
+
+        def fake_run(cmd, **kw):
+            _t.sleep(0.6)
+            return mock.Mock(returncode=0, stdout="1.0G\t" + cmd[-1] + "\n")
+
+        with mock.patch.object(dum, "AGENT_HOMES", ["a", "b", "c", "d"]), \
+             mock.patch.object(dum, "DU_TOTAL_BUDGET_SEC", 1), \
+             mock.patch.object(dum.subprocess, "run", side_effect=fake_run):
+            out = dum._top_consumers(limit=10)
+        self.assertNotIn("?", out)
+        for h in ("a", "b", "c", "d"):
+            self.assertIn(f"{h}:1.0G", out)
+
+    def test_du_running_past_budget_is_timeout_marked(self):
+        # A du still running when the shared budget expires is marked, not waited on.
+        import time as _t
+
+        def fake_run(cmd, **kw):
+            if cmd[-1].endswith("/slow"):
+                _t.sleep(1.5)
+            return mock.Mock(returncode=0, stdout="2.0G\t" + cmd[-1] + "\n")
+
+        with mock.patch.object(dum, "AGENT_HOMES", ["slow", "fast"]), \
+             mock.patch.object(dum, "DU_TOTAL_BUDGET_SEC", 0.5), \
+             mock.patch.object(dum.subprocess, "run", side_effect=fake_run):
+            out = dum._top_consumers()
+        self.assertIn("fast:2.0G", out)
+        self.assertIn("slow:?timeout", out)
+
+    def test_extra_paths_are_in_the_breakdown(self):
+        # T-4678: the shared echo cargo target (21G on 2026-10-07) belongs to no
+        # home, so a homes-only breakdown could never name it.
+        def fake_run(cmd, **kw):
+            size = "21G" if cmd[-1] == "/var/lib/pantheon/echo-target" else "1.0G"
+            return mock.Mock(returncode=0, stdout=size + "\t" + cmd[-1] + "\n")
+
+        with mock.patch.object(dum, "AGENT_HOMES", ["claude"]), \
+             mock.patch.object(dum, "EXTRA_PATHS", ["/var/lib/pantheon/echo-target"]), \
+             mock.patch.object(dum.subprocess, "run", side_effect=fake_run) as run:
+            out = dum._top_consumers()
+        self.assertTrue(out.startswith("/var/lib/pantheon/echo-target:21G"), out)
+        extra_cmd = [c.args[0] for c in run.call_args_list
+                     if c.args[0][-1] == "/var/lib/pantheon/echo-target"][0]
+        self.assertEqual(extra_cmd[0], "du")  # sized as the running user, no sudo
+
+    def test_default_extra_paths_cover_both_echo_target_roots(self):
+        # T-4796: the 10-09 warn's breakdown omitted echo-evidence-targets, which
+        # held the 16.6G that caused it.
+        defaults = dum.DEFAULT_EXTRA_PATHS.split(":")
+        self.assertIn("/var/lib/pantheon/echo-target", defaults)
+        self.assertIn("/var/lib/pantheon/echo-evidence-targets", defaults)
+
     def test_never_raises_on_failure(self):
         # Even if every du subprocess errors, must not propagate (fail-soft: the core
         # df check never depends on cross-account du). Post-T-3441 the errored homes

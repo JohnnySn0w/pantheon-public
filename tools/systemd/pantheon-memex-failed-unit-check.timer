@@ -1,0 +1,12 @@
+[Unit]
+Description=memex failed-unit check — 4x daily at 05:52/11:52/17:52/23:52 UTC (05:52 lands ~35 min after the 05:17 UTC nightly drop)
+Documentation=file:///home/%u/pantheon-config/tools/memex_failed_unit_check.py
+
+[Timer]
+OnCalendar=*-*-* 05,11,17,23:52:00 UTC
+# Deliberately NOT Persistent=: the next slot is at most 6h away, and a boot-time
+# catch-up fire would race tailscale and page Recovery with a false exit 3.
+Unit=pantheon-memex-failed-unit-check.service
+
+[Install]
+WantedBy=timers.target

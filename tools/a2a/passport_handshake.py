@@ -13,7 +13,8 @@ T-2018 / ORG-047).
 
 Scope — Layer A is the reversible, exposure-free, value-free security core:
 
-  * PURE-LOCAL. No network, no a2a-sdk, no clock, no filesystem in the core.
+  * PURE-LOCAL. No network, no a2a-sdk, no filesystem in the core; the only
+    clock is the injected one inside the ORG-071 D3 timeout policy.
     Every side-effecting dependency (DNSSEC-validated TXT resolution, Agent
     Card fetch, the local allowlist, the per-endpoint downgrade memory, the
     scheme adapters) is INJECTED, so the whole state machine is hermetically
@@ -42,9 +43,32 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum, IntEnum
-from typing import Protocol, runtime_checkable
+from functools import partial
+from typing import Callable, Protocol, Sequence, runtime_checkable
+
+from tools.a2a.netcaps import (
+    PEER_ABORT,
+    AuditEvent,
+    AuditEventType,
+    AuditSink,
+    LoggingAuditSink,
+)
+from tools.a2a.netcaps_admission import (
+    AdmissionContext,
+    AdmissionGate,
+    AdmissionPhase,
+)
+from tools.a2a.did_web import ParsedDidDocument
+from tools.a2a.netcaps_breach import NetcapsBreach
+from tools.a2a.netcaps_ratelimit import UNKNOWN_SOURCE
+from tools.a2a.netcaps_timeouts import (
+    FETCH_STEPS,
+    StepTimeout,
+    TimeoutPolicy,
+    TimeoutStep,
+)
 
 logger = logging.getLogger("pantheon.a2a.passport_handshake")
 
@@ -180,7 +204,7 @@ class AllowlistEntry:
 
 @runtime_checkable
 class TxtResolver(Protocol):
-    """Resolves endpoint_id (e.g. "did:web:snowis.me") -> TxtResolution. The
+    """Resolves endpoint_id (e.g. "did:web:your-domain.example") -> TxtResolution. The
     concrete DNSSEC/SRV-walking resolver is network-touching and lives outside
     Layer A; the core only ever calls this interface."""
 
@@ -266,6 +290,27 @@ class SchemeAdapter(Protocol):
     ) -> bool: ...
 
 
+@runtime_checkable
+class DidDocAdapter(SchemeAdapter, Protocol):
+    """A SchemeAdapter that needs the counterparty's DID document at step 3 and
+    can take the one PassportHandshake resolves INSIDE run() (T-5399 PR-b), under
+    the run's total deadline and the RESOLVE admission gate.
+
+    `needs_did_doc` is True only while the adapter holds no pre-parsed document
+    of its own. When it is True and the handshake has a `did_resolver`, step 3
+    calls verify_with_doc() with the resolved document; otherwise plain verify()
+    runs (an adapter without a document must refuse there, fail-closed).
+    verify_with_doc() is stateless, so one adapter instance is safe to share."""
+
+    @property
+    def needs_did_doc(self) -> bool: ...
+
+    def verify_with_doc(
+        self, endpoint_id: str, allowlist_entry: AllowlistEntry,
+        did_doc: ParsedDidDocument,
+    ) -> bool: ...
+
+
 # ---------------------------------------------------------------------------
 # Result type.
 # ---------------------------------------------------------------------------
@@ -293,6 +338,42 @@ class AbortReason(Enum):
     NO_COMMON_SCHEME = "no_common_security_scheme"
     DOWNGRADE_DETECTED = "stronger_prior_scheme_now_absent"
     PRESENTATION_FAILED = "scheme_adapter_verify_failed"
+    # ORG-071 bound breaches (T-2857). Same enum: these are the INTERNAL reasons
+    # for the audit/log side; the peer sees only PEER_ABORT (D6). Declared here
+    # in PR1 so the parallel D1/D2/D4 builds share one vocabulary.
+    STEP_TIMEOUT = "network_step_timeout"
+    TOTAL_DEADLINE_EXCEEDED = "total_handshake_deadline_exceeded"
+    RATE_LIMITED = "rate_limit_rejected"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+    UNKNOWN_DID_BUDGET_EXCEEDED = "unknown_did_budget_exceeded"
+    STATUS_FETCH_FAILED = "status_fetch_failed"
+    NEGATIVE_CACHE_HIT = "negative_cache_hit"
+    STALE_DENIED = "stale_material_denied"
+    CIRCUIT_OPEN = "anchor_circuit_breaker_open"
+    DID_RESOLUTION_FAILED = "did_resolution_failed"
+    # T-5411: the injected DowngradeStore raised (seen/record). Fail-closed.
+    DOWNGRADE_STORE_FAILED = "downgrade_store_failed"
+
+
+# ORG-071 D6: every bound-breach reason emits exactly one named ORG-070 audit
+# event. Both timeout reasons map to resolver_timeout (the ADR's only timeout
+# event); the step that blew rides in the event detail. That includes the
+# presentation round-trip (TimeoutStep.ROUNDTRIP): its timeouts also surface
+# as resolver_timeout, with "handshake_roundtrip" in the detail. The ORG-047 D1
+# auth reasons above are absent: they are logged as before and emit no ORG-071 event.
+BOUND_BREACH_EVENTS: dict[AbortReason, AuditEventType] = {
+    AbortReason.STEP_TIMEOUT: AuditEventType.RESOLVER_TIMEOUT,
+    AbortReason.TOTAL_DEADLINE_EXCEEDED: AuditEventType.RESOLVER_TIMEOUT,
+    AbortReason.RATE_LIMITED: AuditEventType.RATE_LIMIT_REJECTED,
+    AbortReason.QUOTA_EXHAUSTED: AuditEventType.QUOTA_EXHAUSTED,
+    AbortReason.UNKNOWN_DID_BUDGET_EXCEEDED: AuditEventType.UNKNOWN_DID_BUDGET_EXCEEDED,
+    AbortReason.STATUS_FETCH_FAILED: AuditEventType.STATUS_FETCH_FAILED,
+    AbortReason.NEGATIVE_CACHE_HIT: AuditEventType.NEGATIVE_CACHE_HIT,
+    AbortReason.STALE_DENIED: AuditEventType.STALE_DENIED,
+    AbortReason.CIRCUIT_OPEN: AuditEventType.CIRCUIT_BREAKER_OPEN,
+    AbortReason.DID_RESOLUTION_FAILED: AuditEventType.DID_RESOLUTION_FAILED,
+    AbortReason.DOWNGRADE_STORE_FAILED: AuditEventType.DOWNGRADE_STORE_FAILED,
+}
 
 
 class Outcome(Enum):
@@ -335,6 +416,13 @@ class HandshakeResult:
     def admitted(self) -> bool:
         return self.outcome is Outcome.ADMITTED
 
+    @property
+    def peer_error(self) -> str | None:
+        """What the PEER may be told: PEER_ABORT for every ABORT, whatever the
+        reason (ORG-071 D6 anti-oracle — a bound breach must read exactly like
+        an auth failure), None on admit. `abort_reason` stays internal."""
+        return None if self.admitted else PEER_ABORT
+
 
 # ---------------------------------------------------------------------------
 # The handshake state machine.
@@ -352,11 +440,25 @@ class PassportHandshake:
       allowlist       — endpoint_id -> AllowlistEntry (the local manual allowlist)
       adapters        — {Scheme: SchemeAdapter} we support ("our supported adapters")
       downgrade_store — per-endpoint prior-advertised memory (defaults in-memory)
+      timeout_policy  — ORG-071 D3 step timeouts + total deadline (defaults to
+                        the provisional NetcapsParams on the monotonic clock —
+                        timeouts are always on, never opt-in)
+      audit_sink      — ORG-071 D6 audit events (defaults to LoggingAuditSink)
+      admission       — ORG-071 load gates (rate limiter; later the PR4 quota
+                        enforcer), consulted at the START / RESOLVE / PRESENT /
+                        POST_AUTH phases; see netcaps_admission for the seam and
+                        the release contract. Default none: no gating.
+      did_resolver    — optional `(did, *, source, deadline) -> ParsedDidDocument`
+                        (what ResolutionCache.did_documents(fetcher) returns).
+                        When set, an adapter declaring `needs_did_doc` has the
+                        counterparty DID document resolved inside run() under the
+                        run's deadline and the RESOLVE gate (resource="did_doc");
+                        see DidDocAdapter. Default none: today's behaviour.
 
-    `run(endpoint_id)` returns a HandshakeResult; it never raises for a policy
+    `run(endpoint_id, *, source=None)` returns a HandshakeResult; it never raises for a policy
     failure (only for a programming error in an injected dependency the caller
     controls). Each ABORT is logged both to the module logger and into the
-    result's `log`.
+    result's `log`; a bound-breach ABORT also emits its audit event.
     """
 
     def __init__(
@@ -367,6 +469,10 @@ class PassportHandshake:
         allowlist: dict[str, AllowlistEntry],
         adapters: dict[Scheme, SchemeAdapter],
         downgrade_store: DowngradeStore | None = None,
+        timeout_policy: TimeoutPolicy | None = None,
+        audit_sink: AuditSink | None = None,
+        admission: Sequence[AdmissionGate] = (),
+        did_resolver: Callable[..., ParsedDidDocument] | None = None,
     ) -> None:
         self._resolve = txt_resolver
         self._fetch = card_fetcher
@@ -389,8 +495,116 @@ class PassportHandshake:
                 )
         self._adapters = adapters
         self._downgrade = downgrade_store or InMemoryDowngradeStore()
+        self._timeouts = timeout_policy or TimeoutPolicy()
+        self._audit = audit_sink or LoggingAuditSink()
+        self._gates = tuple(admission)
+        self._did_resolver = did_resolver
 
     # -- helpers -----------------------------------------------------------
+
+    def _breach(
+        self,
+        result_log: list[str],
+        state: HandshakeState,
+        reason: AbortReason,
+        detail: str,
+        endpoint_id: str,
+        source: str | None = None,
+    ) -> HandshakeResult:
+        """ABORT for an ORG-071 bound breach: the normal ABORT (logged, internal
+        reason kept) plus the reason's named audit event (D6).
+
+        The ABORT is returned whatever the audit sink does: a sink (or clock)
+        raising an Exception is logged at ERROR and noted in the result log,
+        never propagated and never an admit. KeyboardInterrupt / SystemExit are
+        not Exceptions and propagate."""
+        try:
+            self._audit.emit(AuditEvent(
+                type=BOUND_BREACH_EVENTS[reason], endpoint_id=endpoint_id,
+                reason=reason.value, detail=f"at {state.value}: {detail}",
+                at=self._timeouts.clock.monotonic(), source=source))
+        except Exception as exc:  # noqa: BLE001 - fail-closed, see docstring
+            note = (f"AUDIT SINK FAILED ({type(exc).__name__}) for "
+                    f"{reason.value} at {state.value}; ABORT still returned")
+            result_log.append(note)
+            logger.error("passport-handshake %s", note, exc_info=True)
+        return self._abort(result_log, state, reason, detail)
+
+    def _gate_abort(
+        self,
+        result_log: list[str],
+        state: HandshakeState,
+        breach: NetcapsBreach,
+        ctx: AdmissionContext,
+    ) -> HandshakeResult:
+        """ABORT for a NetcapsBreach, whether a gate returned it or a wrapped
+        resolver/fetcher (PR3 cache, PR5 breaker) raised it. This is the single
+        audit emitter for a refusal: _breach() emits exactly one event, and the
+        components emit only their own state-change events.
+
+        `reason` maps to AbortReason; the event is always the one
+        BOUND_BREACH_EVENTS names for it, so a mismatched `event` cannot cause
+        a wrong or second emission. A reason that is not a known bound-breach
+        value fails closed as RATE_LIMITED (the generic bound breach), never
+        an admit; the original value rides in the detail."""
+        try:
+            reason = AbortReason(breach.reason)
+        except ValueError:
+            reason = None
+        detail = breach.detail
+        if reason not in BOUND_BREACH_EVENTS:
+            detail = f"unmapped breach reason {breach.reason!r}: {detail}"
+            reason = AbortReason.RATE_LIMITED
+        return self._breach(result_log, state, reason, detail,
+                            ctx.endpoint_id, ctx.source)
+
+    def _resolve_did_doc(
+        self,
+        log: list[str],
+        st: HandshakeState,
+        endpoint_id: str,
+        gates: _GateRun,
+        deadline,
+    ) -> tuple[ParsedDidDocument | None, HandshakeResult | None]:
+        """Resolve the counterparty DID doc inside the run (T-5399 PR-b): RESOLVE
+        gate first (resource="did_doc"), then the resolver under the run's
+        deadline, a late result discarded. Returns (doc, None) or (None, ABORT).
+        Every failure is exactly one audited ABORT."""
+        if (breach := gates.check(AdmissionPhase.RESOLVE,
+                                  resource="did_doc")) is not None:
+            return None, self._gate_abort(log, st, breach, gates.ctx)
+        source = gates.ctx.source if gates.ctx.source is not None else UNKNOWN_SOURCE
+        try:
+            doc = deadline.call(
+                FETCH_STEPS,
+                partial(self._did_resolver, endpoint_id, source=source,
+                        deadline=deadline))
+        except StepTimeout as exc:
+            return None, self._timeout_abort(log, st, exc, endpoint_id)
+        except NetcapsBreach as exc:
+            return None, self._gate_abort(log, st, exc, gates.ctx)
+        except Exception as exc:  # noqa: BLE001 - DidResolutionError or anything
+            return None, self._breach(
+                log, st, AbortReason.DID_RESOLUTION_FAILED,
+                f"DID document resolution failed: {type(exc).__name__}",
+                endpoint_id, gates.ctx.source)
+        if not isinstance(doc, ParsedDidDocument) or doc.did != endpoint_id:
+            return None, self._breach(
+                log, st, AbortReason.DID_RESOLUTION_FAILED,
+                "resolver returned no document for the claimed DID",
+                endpoint_id, gates.ctx.source)
+        return doc, None
+
+    def _timeout_abort(
+        self,
+        result_log: list[str],
+        state: HandshakeState,
+        exc: StepTimeout,
+        endpoint_id: str,
+    ) -> HandshakeResult:
+        reason = (AbortReason.TOTAL_DEADLINE_EXCEEDED if exc.total
+                  else AbortReason.STEP_TIMEOUT)
+        return self._breach(result_log, state, reason, str(exc), endpoint_id)
 
     def _abort(
         self,
@@ -411,12 +625,96 @@ class PassportHandshake:
 
     # -- the sequence ------------------------------------------------------
 
-    def run(self, endpoint_id: str) -> HandshakeResult:
+    def run(self, endpoint_id: str, *, source: str | None = None) -> HandshakeResult:
+        """Run one handshake. `source` is the counterparty's transport identity
+        (IP/subnet) for the ORG-071 per-source bounds; None means unknown, which
+        the gates key as one shared unknown-source pool (fail-closed)."""
+        try:
+            known = endpoint_id in self._allowlist
+        except TypeError:
+            # T-5411 (5h): an unhashable endpoint_id is a caller programming error.
+            # Refuse before any gate keys on it; log only the type (the value may
+            # be unprintable or hostile). ORG-047 reason, so no ORG-071 event.
+            return self._abort(
+                [f"handshake start: endpoint of type {type(endpoint_id).__name__}"],
+                HandshakeState.RESOLVE_ENDPOINT,
+                AbortReason.ENDPOINT_NOT_ALLOWLISTED,
+                f"endpoint_id is unhashable ({type(endpoint_id).__name__})")
+        gates = _GateRun(self._gates, AdmissionContext(
+            phase=AdmissionPhase.START, endpoint_id=endpoint_id, source=source,
+            known=known))
+        try:
+            result = self._run(endpoint_id, gates)
+        except BaseException:
+            # The in-flight BaseException wins over an ordinary release error
+            # (logged by type only); a BaseException from release itself still
+            # propagates.
+            try:
+                gates.release()
+            except Exception as rel_exc:  # noqa: BLE001
+                logger.error("passport-handshake gate release failed (%s) "
+                             "while unwinding; original exception kept",
+                             type(rel_exc).__name__)
+            raise
+        try:
+            gates.release()
+        except Exception as exc:  # noqa: BLE001 - T-5411 (3): fail-closed + audited
+            return self._release_failed(result, exc, endpoint_id, source)
+        return result
+
+    def _release_failed(
+        self,
+        result: HandshakeResult,
+        exc: Exception,
+        endpoint_id: str,
+        source: str | None,
+    ) -> HandshakeResult:
+        """A gate.release raised (T-5411). Every gate was still released. Only the
+        exception type is recorded (the message may be hostile). If the run had
+        already ABORTED, its result (and reason) stands and the release failure is
+        audited alongside it; if it ADMITTED, the admit is withdrawn (fail-closed:
+        a leaked admission slot is a bound failure) as one RATE_LIMITED ABORT."""
+        detail = f"gate release failed: {type(exc).__name__}"
+        if result.outcome is Outcome.ABORTED:
+            result.log.append(detail)
+            logger.error("passport-handshake %s (original abort %s kept)",
+                         detail, result.abort_reason.value if result.abort_reason
+                         else None)
+            try:
+                self._audit.emit(AuditEvent(
+                    type=BOUND_BREACH_EVENTS[AbortReason.RATE_LIMITED],
+                    endpoint_id=endpoint_id,
+                    reason=AbortReason.RATE_LIMITED.value, detail=detail,
+                    at=self._timeouts.clock.monotonic(), source=source))
+            except Exception as sink_exc:  # noqa: BLE001 - never mask the abort
+                logger.error("passport-handshake AUDIT SINK FAILED (%s) for "
+                             "release failure", type(sink_exc).__name__,
+                             exc_info=True)
+            return result
+        return self._breach(result.log, result.state, AbortReason.RATE_LIMITED,
+                            detail, endpoint_id, source)
+
+    def _run(self, endpoint_id: str, gates: _GateRun) -> HandshakeResult:
         log: list[str] = [f"handshake start: endpoint={endpoint_id!r}"]
+        st = HandshakeState.RESOLVE_ENDPOINT
+        if (breach := gates.check(AdmissionPhase.START)) is not None:
+            return self._gate_abort(log, st, breach, gates.ctx)
+        # ORG-071 D3: one total deadline per run; every network seam below runs
+        # through it, and a late result is discarded (StepTimeout -> ABORT).
+        deadline = self._timeouts.start()
 
         # === Step 1 — Resolve endpoint (card-auth). ADR lines 37. ==========
-        st = HandshakeState.RESOLVE_ENDPOINT
-        txt = self._resolve(endpoint_id)
+        if (breach := gates.check(AdmissionPhase.RESOLVE)) is not None:
+            return self._gate_abort(log, st, breach, gates.ctx)
+        try:
+            txt = deadline.call((TimeoutStep.DNS,), self._resolve, endpoint_id)
+        except StepTimeout as exc:
+            return self._timeout_abort(log, st, exc, endpoint_id)
+        except NetcapsBreach as exc:
+            return self._gate_abort(log, st, exc, gates.ctx)
+        except Exception as exc:  # noqa: BLE001 - a misbehaving resolver
+            return self._abort(log, st, AbortReason.NO_TXT,
+                               f"resolver raised {type(exc).__name__}")
         if not isinstance(txt, TxtResolution) or not txt.present:
             return self._abort(log, st, AbortReason.NO_TXT,
                                "no DNSSEC-signed TXT record for endpoint")
@@ -433,8 +731,16 @@ class PassportHandshake:
 
         # Fetch the Agent Card and verify its hash against BOTH the TXT pin and
         # the allowlist pin (two independent pins; any disagreement -> ABORT).
-        card_bytes = self._fetch(txt.card_url)
-        if not card_bytes:
+        try:
+            card_bytes = deadline.call(FETCH_STEPS, self._fetch, txt.card_url)
+        except StepTimeout as exc:
+            return self._timeout_abort(log, st, exc, endpoint_id)
+        except NetcapsBreach as exc:
+            return self._gate_abort(log, st, exc, gates.ctx)
+        except Exception as exc:  # noqa: BLE001 - a misbehaving fetcher
+            return self._abort(log, st, AbortReason.CARD_FETCH_FAILED,
+                               f"card fetcher raised {type(exc).__name__}")
+        if not card_bytes or not isinstance(card_bytes, (bytes, bytearray)):
             return self._abort(log, st, AbortReason.CARD_FETCH_FAILED,
                                f"could not fetch Agent Card at {txt.card_url!r}")
         computed = compute_card_hash(card_bytes)
@@ -448,7 +754,7 @@ class PassportHandshake:
         # Parse the (now hash-verified) card to read its advertised schemes.
         try:
             card = json.loads(card_bytes)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             return self._abort(log, st, AbortReason.CARD_UNPARSEABLE,
                                "hash-verified card is not valid JSON")
         log.append("step 1 ok: DNSSEC + allowlist + dual-pinned card hash verified")
@@ -470,7 +776,13 @@ class PassportHandshake:
 
         # Downgrade rejection: a scheme advertised on a PRIOR handshake that is
         # STRONGER than the one we are about to select, now absent, is suspicious.
-        prior = self._downgrade.seen(endpoint_id)
+        try:
+            prior = self._downgrade.seen(endpoint_id)
+        except Exception as exc:  # noqa: BLE001 - T-5411: fail-closed, type only
+            return self._breach(
+                log, st, AbortReason.DOWNGRADE_STORE_FAILED,
+                f"downgrade store seen() raised {type(exc).__name__}",
+                endpoint_id, gates.ctx.source)
         stronger_now_absent = {
             s for s in prior if s > selected and s not in advertised
         }
@@ -485,16 +797,59 @@ class PassportHandshake:
         # === Step 3 — Present identity in the selected scheme. ADR line 39. =
         st = HandshakeState.PRESENT_IDENTITY
         adapter = self._adapters[selected]  # guaranteed present: selected ∈ keys
+        did_doc = None
         try:
-            verified = bool(adapter.verify(endpoint_id, entry))
+            # Attribute lookups on an injected adapter can raise (a property, a
+            # __getattr__): a malformed adapter is a refused presentation, never
+            # an exception escaping run().
+            needs_doc = (self._did_resolver is not None
+                         and bool(getattr(adapter, "needs_did_doc", False)))
+        except Exception as exc:  # noqa: BLE001 - fail-closed, type only logged
+            logger.warning("passport-handshake %s adapter raised %s",
+                           selected.name, type(exc).__name__)
+            return self._abort(log, st, AbortReason.PRESENTATION_FAILED,
+                               f"{selected.name} adapter raised "
+                               f"{type(exc).__name__}")
+        if needs_doc:
+            did_doc, failed = self._resolve_did_doc(log, st, endpoint_id, gates, deadline)
+            if failed is not None:
+                return failed
+        if (breach := gates.check(AdmissionPhase.PRESENT,
+                                  scheme=selected.name)) is not None:
+            return self._gate_abort(log, st, breach, gates.ctx)
+        try:
+            if did_doc is not None:
+                call = (adapter.verify_with_doc, endpoint_id, entry, did_doc)
+            else:
+                call = (adapter.verify, endpoint_id, entry)
+            verified = bool(deadline.call((TimeoutStep.ROUNDTRIP,), *call))
+        except StepTimeout as exc:
+            return self._timeout_abort(log, st, exc, endpoint_id)
+        except NetcapsBreach as exc:
+            # e.g. a legacy adapter resolving the DID doc inside verify() through
+            # the PR3 cache, which raises on a refusal.
+            return self._gate_abort(log, st, exc, gates.ctx)
         except NotImplementedError:
             # A declared-but-unimplemented adapter (e.g. Layer A's structural
             # mTLS skeleton) cannot admit — fail-closed, never a false pass.
             verified = False
+        except Exception as exc:  # noqa: BLE001 - fail-closed net, type only logged
+            # An adapter bug or hostile-input crash is a refused presentation,
+            # never an escaping exception. Only the type is logged: the message
+            # may carry counterparty-controlled text.
+            logger.warning("passport-handshake %s adapter raised %s",
+                           selected.name, type(exc).__name__)
+            return self._abort(log, st, AbortReason.PRESENTATION_FAILED,
+                               f"{selected.name} adapter raised "
+                               f"{type(exc).__name__}")
         if not verified:
             return self._abort(log, st, AbortReason.PRESENTATION_FAILED,
                                f"{selected.name} adapter verify() did not pass")
         log.append(f"step 3 ok: {selected.name} presentation verified")
+        if (breach := gates.check(AdmissionPhase.POST_AUTH, scheme=selected.name,
+                                  principal=endpoint_id)) is not None:
+            return self._gate_abort(log, HandshakeState.ADMIT_UNTRUSTED, breach,
+                                    gates.ctx)
 
         # T-2867 HANDSHAKE-1: fold the advertised set into the endpoint's downgrade
         # memory ONLY after a fully-verified presentation. Recording it earlier (right
@@ -503,7 +858,14 @@ class PassportHandshake:
         # legitimate one as a downgrade. An ABORT at ANY step now records nothing; the
         # union stays monotonic (stricter-only, never a false-admit). The downgrade
         # CHECK above already read `prior` before this record, so its logic is unchanged.
-        self._downgrade.record(endpoint_id, advertised)
+        try:
+            self._downgrade.record(endpoint_id, advertised)
+        except Exception as exc:  # noqa: BLE001 - T-5411: never admit unrecorded
+            return self._breach(
+                log, HandshakeState.ADMIT_UNTRUSTED,
+                AbortReason.DOWNGRADE_STORE_FAILED,
+                f"downgrade store record() raised {type(exc).__name__}",
+                endpoint_id, gates.ctx.source)
 
         # === Step 4 — Admit as UNTRUSTED content (D4, lines 61-62). ========
         st = HandshakeState.ADMIT_UNTRUSTED
@@ -517,6 +879,62 @@ class PassportHandshake:
             content_trusted=False,  # invariant.
             log=log,
         )
+
+
+class _GateRun:
+    """One run()'s view of the admission gates: consults them per phase and
+    tracks which passed START, so exactly those are released at the end."""
+
+    def __init__(self, gates: tuple[AdmissionGate, ...],
+                 ctx: AdmissionContext) -> None:
+        self._gates = gates
+        self.ctx = ctx
+        self._started: list[AdmissionGate] = []
+
+    def check(self, phase: AdmissionPhase, **fields) -> NetcapsBreach | None:
+        ctx = replace(self.ctx, phase=phase, **fields)
+        start = phase is AdmissionPhase.START
+        for gate in (self._gates if start else tuple(self._started)):
+            try:
+                breach = gate.check(ctx)
+            except NetcapsBreach as exc:
+                breach = exc
+            except Exception as exc:  # noqa: BLE001 - fail-closed belt
+                # A gate that raises must not escape run() unaudited: it is a
+                # generic bound breach (RATE_LIMITED via _gate_abort). Its START
+                # failure leaves it out of _started, so it is not released.
+                breach = NetcapsBreach(
+                    AbortReason.RATE_LIMITED.value,
+                    AuditEventType.RATE_LIMIT_REJECTED.value,
+                    f"gate {type(gate).__name__}.check raised "
+                    f"{type(exc).__name__} (fail-closed)")
+            if breach is not None:
+                return breach
+            if start:
+                self._started.append(gate)
+        return None
+
+    def release(self) -> None:
+        """Release every started gate, even if an earlier release raises. Then
+        re-raise: the first non-Exception BaseException if any was raised (a
+        KeyboardInterrupt/SystemExit must never be dropped in favour of an
+        ordinary error), else the first Exception."""
+        started, self._started = self._started, []
+        first_exc: Exception | None = None
+        first_base: BaseException | None = None
+        for gate in reversed(started):
+            try:
+                gate.release(self.ctx)
+            except Exception as exc:  # noqa: BLE001 - re-raised below
+                if first_exc is None:
+                    first_exc = exc
+            except BaseException as exc:  # noqa: BLE001 - re-raised below
+                if first_base is None:
+                    first_base = exc
+        if first_base is not None:
+            raise first_base
+        if first_exc is not None:
+            raise first_exc
 
 
 def _names(schemes: set[Scheme]) -> str:

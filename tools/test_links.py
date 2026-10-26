@@ -133,7 +133,7 @@ class LinksTest(unittest.TestCase):
         self.assertEqual(files888, ["tickets/inbox/T-0003.md"])
 
     def test_alias_group_unknown_self(self):
-        self.assertEqual(links.alias_group("recovery"), {"recovery", "claude-fallback"})
+        self.assertEqual(links.alias_group("recovery"), {"recovery", "claude-fallback", "head_system_orchestrator"})
         self.assertEqual(links.alias_group("grooming"), {"grooming"})
 
     # --- rebuild-index snapshot ---

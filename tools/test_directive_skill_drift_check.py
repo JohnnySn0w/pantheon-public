@@ -188,5 +188,30 @@ class MainTest(unittest.TestCase):
         self.assertIn("OK", out)
 
 
+class InRepoHarnessTest(unittest.TestCase):
+    """T-4763 (ORG-091): the in-repo harness/claude skill is the FIRST fallback, ahead of
+    the frozen ~/claude-config clone, and it is present and in sync in this repo."""
+
+    def test_in_repo_harness_is_first_fallback(self):
+        self.assertEqual(
+            Path(dsd.SKILL_FALLBACKS[0]),
+            REPO_ROOT / "harness" / "claude" / "skills" / "pantheon-org-discipline" / "SKILL.md")
+        frozen = os.path.expanduser("~/claude-config/skills/pantheon-org-discipline/SKILL.md")
+        self.assertGreater(dsd.SKILL_FALLBACKS.index(frozen), 0)
+
+    def test_unconfigured_run_resolves_the_in_repo_skill(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("ORG_SKILL_PATH", None)
+            self.assertEqual(dsd.resolve_skill(None), (dsd.SKILL_FALLBACKS[0], None))
+
+    def test_real_directives_are_covered_by_the_in_repo_skill(self):
+        buf = io.StringIO()
+        with patch.object(sys, "argv", ["prog", f"--skill={dsd.SKILL_FALLBACKS[0]}"]), \
+             redirect_stdout(buf):
+            rc = dsd.main()
+        self.assertEqual(rc, 0, buf.getvalue())
+        self.assertIn("OK", buf.getvalue())
+
+
 if __name__ == "__main__":
     unittest.main()

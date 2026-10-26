@@ -8,9 +8,14 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Final, Literal, Mapping
 
-from tools.persona_installer import InstallPlan, MutationRecord, OperationEvidence
+from tools.persona_installer_contracts import (
+    FRAMEWORK_CODE_ARTIFACTS,
+    InstallPlan,
+    MutationRecord,
+    OperationEvidence,
+)
 
 
 ApprovalClass = Literal["none", "agent", "human"]
@@ -82,6 +87,28 @@ OPERATION_TRANSITIONS: Mapping[str, frozenset[str]] = {
 _HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
 _APPROVAL_CLASSES = frozenset(("none", "agent", "human"))
 
+# T-2917 5b ruling B2: Verify is policy-authorized (approval class none,
+# ORG-052 section 5 binds ValidateAndBind to apply and rollback only), so a
+# verify operation carries these CLOSED sentinels instead of an approval
+# handle and an approval authority record. They are server constants: no
+# caller input can supply them (Verify takes no approval argument), they
+# are not 64-hex so no approval path accepts them, and the record shape
+# check below refuses them on any apply/rollback record.
+VERIFY_APPROVAL_SENTINEL = "none:read-only-verify"
+VERIFY_AUTHORITY_SENTINEL = "broker:read-only-verify"
+
+# T-4964 (ORG-052 section 5 "may"; ruling T-2917:D15 follow-up): automatic
+# broker compensation of a failed apply. The compensation is a ROLLBACK
+# operation the broker creates itself, atomically with the failed apply's
+# terminal receipt; it carries this CLOSED approval sentinel and inherits the
+# failed apply's authority record at authorize (no second grant). Not 64-hex,
+# so no caller-facing prepare path (which requires a 64-hex approval handle)
+# can mint one; the record shape check admits it on rollback records only.
+# Its idempotency key lives in a reserved namespace containing a space, which
+# every caller key (printable ASCII 33..126) excludes. PROVISIONAL names.
+COMPENSATION_APPROVAL_SENTINEL = "broker:apply-compensation"
+COMPENSATION_KEY_PREFIX = "broker compensation "
+
 
 class HostControlError(RuntimeError):
     """Base class for bounded host-control failures."""
@@ -129,6 +156,95 @@ class RecoveryRefused(HostControlError):
     """Recovery refuses loudly; any bound grant remains consumed."""
 
 
+class RateLimited(HostControlError):
+    """The bus-derived caller exceeded its per-uid request budget
+    (T-2917 ruling i1). Availability control, not authority: nothing was
+    read or written; retry later."""
+
+
+class Unsupported(HostControlError):
+    """The request is well formed but this broker/executor revision does
+    not implement it (T-2917 5b rulings B3/B4). Raised BEFORE any operation
+    record is written or any approval grant is bound; fail closed."""
+
+
+#: ORG-082 §2 ``pantheon-broker-error/v1`` constants (T-2918).
+ORG082_AMENDMENT = "ORG-082"
+ORG082_RETRY_BOOTSTRAP = "bootstrap-in-process-root"
+ORG082_NOT_RETRYABLE = "not-retryable"
+_ORG082_FAMILY = re.compile(r"[a-z][a-z0-9_.-]{0,63}\Z")
+
+
+class Org082Refusal(HostControlError):
+    """An ORG-082 §2 refusal: a closed code plus a structured payload that
+    crosses the wire verbatim as canonical JSON (signature ``s``)."""
+
+    code = ""
+    retry_context = ORG082_NOT_RETRYABLE
+
+    def __init__(self, message: str, *, manifest_revision: str | None = None) -> None:
+        super().__init__(message)
+        self.manifest_revision = manifest_revision
+
+    def payload(self) -> dict[str, str]:
+        body = {"code": self.code, "amendment": ORG082_AMENDMENT, "retry_context": self.retry_context}
+        if self.manifest_revision is not None:
+            body["manifest_revision"] = self.manifest_revision
+        return body
+
+
+class SubstrateFamilyNotExposed(Org082Refusal):
+    """ORG-082 §1/§2: a substrate family is structurally absent from the
+    broker daemon's dispatch table. Same payload as the GE root helper's
+    ``SubstrateFamilyNotExposed`` (parity asserted by a test)."""
+
+    code = "SUBSTRATE_FAMILY_NOT_EXPOSED"
+    retry_context = ORG082_RETRY_BOOTSTRAP
+
+    def __init__(self, family: str, *, manifest_revision: str | None = None) -> None:
+        if not isinstance(family, str) or _ORG082_FAMILY.fullmatch(family) is None:
+            family = "invalid-family"
+        super().__init__(
+            f"{family} is a substrate family; the broker daemon does not expose it (ORG-082 §1)",
+            manifest_revision=manifest_revision,
+        )
+        self.family = family
+
+    def payload(self) -> dict[str, str]:
+        body = super().payload()
+        body["family"] = self.family
+        return body
+
+
+class RegistryDigestMismatch(Org082Refusal):
+    """ORG-082 gate 32a: the two invocation contexts loaded different op registries."""
+
+    code = "REGISTRY_DIGEST_MISMATCH"
+
+
+class RuntimeSubsetMismatch(Org082Refusal):
+    """ORG-082 gate 32a / §2a: the daemon's dispatch table is not the
+    authoritative runtime subset (caught at daemon start, before any plan)."""
+
+    code = "RUNTIME_SUBSET_MISMATCH"
+
+
+class JournalBusy(HostControlError):
+    """A journal write lock was not acquired within the busy timeout.
+
+    Raised at the journal boundary when sqlite reports lock contention
+    (SQLITE_BUSY / SQLITE_LOCKED) on a write transaction, in place of the
+    raw ``sqlite3.OperationalError``. Nothing was written: the transaction
+    never began. Retry later; fail closed.
+
+    Deliberately NOT a ``StaleAuthorityState``: the loser lost the LOCK,
+    not a state-guarded conditional UPDATE, so no winner has committed yet
+    and there is nothing to re-read and classify against. The wire needs
+    no new name: it resolves through its nearest mapped ancestor
+    (``HostControlError`` -> ``Failed``).
+    """
+
+
 def canonical_json(value: object) -> str:
     """Return the one canonical JSON representation used by this package."""
 
@@ -165,10 +281,23 @@ def _closed_hex(value: object, field_name: str) -> str:
     return value
 
 
-def _closed_string(value: object, field_name: str, *, maximum: int = 128) -> str:
+def closed_record_string(value: object, field_name: str, *, maximum: int = 128) -> str:
+    """The closed record-string predicate (T-2917 5d.1, carry-in N1): a
+    ``str`` of 1..``maximum`` characters. ONE predicate serves the broker's
+    record decoders and the executor's spec parser, so an identifier the
+    executor accepts is exactly one the broker can decode back."""
+
     if not isinstance(value, str) or not 1 <= len(value) <= maximum:
         raise HostControlError(f"invalid {field_name}")
     return value
+
+
+# the historical private name, kept for the existing decoders
+_closed_string = closed_record_string
+# the bounds the record decoders apply (mutation/intent/evidence ids, kinds
+# and owners; targets get the longer bound)
+RECORD_STRING_MAX: Final = 128
+RECORD_TARGET_MAX: Final = 1024
 
 
 @dataclass(frozen=True)
@@ -369,7 +498,7 @@ def effect_digest_payload(
     if len(source_operations) != 1:
         raise HostControlError("framework source operation missing")
     registered_artifacts = (
-        "tools/persona_installer.py",
+        *FRAMEWORK_CODE_ARTIFACTS,
         *manifest.template_ids,
     )
     if (
@@ -465,7 +594,7 @@ def _mutation_from_dict(raw: object) -> MutationRecord:
     return MutationRecord(
         operation_id=_closed_string(raw["operation_id"], "mutation id"),
         kind=_closed_string(raw["kind"], "mutation kind"),
-        target=_closed_string(raw["target"], "mutation target", maximum=1024),
+        target=_closed_string(raw["target"], "mutation target", maximum=RECORD_TARGET_MAX),
         owner=_closed_string(raw["owner"], "mutation owner"),
         changed=raw["changed"],
         before=_string_mapping(raw["before"], "mutation before"),
@@ -559,7 +688,7 @@ class RollbackIntent:
             seq=seq,
             operation_id=_closed_string(raw["operation_id"], "intent id"),
             kind=_closed_string(raw["kind"], "intent kind"),
-            target=_closed_string(raw["target"], "intent target", maximum=1024),
+            target=_closed_string(raw["target"], "intent target", maximum=RECORD_TARGET_MAX),
             owner=_closed_string(raw["owner"], "intent owner"),
             inverse={str(key): value for key, value in inverse.items()},
             created_at=str(raw["created_at"]),
@@ -671,7 +800,26 @@ class OperationRecord:
             _closed_string(family, "operation family")
         _closed_string(self.target_seat_id, "operation target")
         _closed_string(self.approval_handle, "approval handle")
+        if self.kind == "verify":
+            if self.approval_handle != VERIFY_APPROVAL_SENTINEL:
+                raise HostControlError("verify carries no approval handle")
+            if self.authority_record_id not in (None, VERIFY_AUTHORITY_SENTINEL):
+                raise HostControlError("verify authority must be the read-only sentinel")
+        elif (
+            self.approval_handle == VERIFY_APPROVAL_SENTINEL
+            or self.authority_record_id == VERIFY_AUTHORITY_SENTINEL
+        ):
+            raise HostControlError("read-only verify sentinel on a mutating operation")
+        if (
+            self.approval_handle == COMPENSATION_APPROVAL_SENTINEL
+            and self.kind != "rollback"
+        ):
+            raise HostControlError("compensation sentinel on a non-rollback operation")
         _closed_string(self.idempotency_key, "operation idempotency key")
+        if (self.approval_handle == COMPENSATION_APPROVAL_SENTINEL) != (
+            self.idempotency_key.startswith(COMPENSATION_KEY_PREFIX)
+        ):
+            raise HostControlError("compensation sentinel and key must pair")
         _closed_hex(self.request_digest, "operation request digest")
         if self.state in ("prepared", "refused"):
             if self.authority_record_id is not None:

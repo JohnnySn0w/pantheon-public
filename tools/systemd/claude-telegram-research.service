@@ -24,7 +24,7 @@
 # T-2271: WIRED. Measured 0 failed-state transitions in 14 days across 11 start
 # events. StartLimit* added at the same time for parity with claude-telegram.service
 # — without it a crash-loop under Restart=always would alert every 5s indefinitely,
-# which is the storm metis measured. The bound is what makes wiring safe, so it is
+# which is the storm mason measured. The bound is what makes wiring safe, so it is
 # added HERE rather than assumed.
 OnFailure=pantheon-unit-failure-alert@%n.service
 StartLimitIntervalSec=600

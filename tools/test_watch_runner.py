@@ -51,6 +51,37 @@ from tools.watch_runner import Finding, Topic
 # the poisoned cache and crashes on `path.parent.mkdir()`.
 _GIT_MUTATION_LOCK_ENV = "PANTHEON_GIT_MUTATION_LOCKFILE"
 
+# T-4597: tests drive actuation paths that append to RUNNER_LOG. Without this redirect they
+# wrote fake "HERMES guard refused" ERROR lines into the live ~/.local/log/pantheon log of
+# whichever seat ran the suite, which reads as a real guard refusal during triage. Tests that
+# assert on the log still patch RUNNER_LOG to their own path on top of this.
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover - run from tools/
+    import _seat_state_isolation  # type: ignore[no-redef]
+
+_LIVE_RUNNER_LOG = watch_runner.RUNNER_LOG
+_runner_log_dir: tempfile.TemporaryDirectory | None = None
+_runner_log_patch = None
+
+
+def setUpModule() -> None:
+    global _runner_log_dir, _runner_log_patch
+    _seat_state_isolation.start()  # T-4940 (see tools/_seat_state_isolation.py)
+    _runner_log_dir = tempfile.TemporaryDirectory()
+    _runner_log_patch = patch.object(
+        watch_runner, "RUNNER_LOG", Path(_runner_log_dir.name) / "watch_runner.log"
+    )
+    _runner_log_patch.start()
+
+
+def tearDownModule() -> None:
+    _seat_state_isolation.stop()  # T-4940
+    if _runner_log_patch is not None:
+        _runner_log_patch.stop()
+    if _runner_log_dir is not None:
+        _runner_log_dir.cleanup()
+
 
 def _topic(slug: str) -> Topic:
     """Minimal Topic instance for tests; only `slug` is read by the commit path."""
@@ -586,6 +617,31 @@ class TestTopicPolicy(unittest.TestCase):
     def test_default_policy_surfaces(self) -> None:
         self.assertTrue(watch_runner._DEFAULT_POLICY["interactive_required"])
 
+    def test_every_active_topic_has_policy_entry(self) -> None:
+        """T-3890: land-time structural guard — every ACTIVE topic in topics.md
+        must have a TOPIC_POLICY entry. The runtime _warn_unregistered_topic
+        warning is a pin, not a floor; a landed-topic-without-policy silently
+        routes to _DEFAULT_POLICY (unknown-topic + interactive-required) and
+        inbox_consumer skips those, dropping findings for a full cycle.
+        T-3853 (glop-it-blog + free-frontier-adjacent-models) is the class
+        instance this test catches at CI-time before any cycle silently drops.
+        Keyed on cadence != paused, matching the runtime warning shape."""
+        topics = watch_runner.parse_topics(watch_runner.TOPICS_FILE)
+        missing = [
+            t.slug
+            for t in topics
+            if t.cadence != "paused"
+            and t.cadence in watch_runner.VALID_CADENCES
+            and t.slug not in watch_runner.TOPIC_POLICY
+        ]
+        self.assertFalse(
+            missing,
+            f"ACTIVE topics missing TOPIC_POLICY entry in tools/watch_runner.py: "
+            f"{missing}. Each such topic falls through to _DEFAULT_POLICY and "
+            "its findings are silently undelivered. Add a TOPIC_POLICY entry "
+            "(target / labels / interactive_required) for each.",
+        )
+
 
 class TestExtractFindings(unittest.TestCase):
     def setUp(self) -> None:
@@ -627,6 +683,21 @@ class TestExtractFindings(unittest.TestCase):
         self.assertEqual(findings[0].slug, "alpha")
         self.assertEqual(findings[0].tldr, "alpha finding line one")
         self.assertIn("Body paragraph for alpha", findings[0].headline_excerpt)
+
+    def test_readback_marker_is_stripped_from_tldr(self) -> None:
+        # T-5500: the day-index marker is for humans; it must not leak into the
+        # tldr that actuation turns into ticket titles.
+        index = self.date_dir / "README.md"
+        index.write_text(
+            index.read_text(encoding="utf-8").replace(
+                "TL;DR: alpha finding line one",
+                "TL;DR: alpha finding line one" + watch_runner.READBACK_MISSING_MARK,
+            ),
+            encoding="utf-8",
+        )
+        with patch("sys.stderr", io.StringIO()):
+            findings = watch_runner.extract_findings(self.date_dir, {})
+        self.assertEqual(findings[0].tldr, "alpha finding line one")
 
     def test_skip_reasons_to_stderr(self) -> None:
         buf = io.StringIO()
@@ -695,7 +766,7 @@ class TestFileFindingArgv(unittest.TestCase):
         argv = mock_run.call_args.args[0]
         self.assertIn("file", argv)
         self.assertEqual(argv[argv.index("--requester") + 1], "specialist")
-        self.assertEqual(argv[argv.index("--target") + 1], "recovery")
+        self.assertEqual(argv[argv.index("--target") + 1], "role:system_orchestrator")
         labels_csv = argv[argv.index("--labels") + 1]
         labels = labels_csv.split(",")
         self.assertEqual(labels[0], "b11")
@@ -748,6 +819,10 @@ class TestFileFindingRetryThenFail(unittest.TestCase):
 
 
 class TestFileFindingNoRetryOnHermesFail(unittest.TestCase):
+    def test_runner_log_is_redirected_away_from_the_live_log(self) -> None:
+        """T-4597: the module-level redirect is in force for every test here."""
+        self.assertNotEqual(watch_runner.RUNNER_LOG, _LIVE_RUNNER_LOG)
+
     def test_hermes_failure_no_retry(self) -> None:
         finding = Finding(
             slug="mcp-supply-chain",
@@ -892,7 +967,9 @@ class TestLedgerWrite(unittest.TestCase):
         lines = ledger_path.read_text(encoding="utf-8").strip().splitlines()
         self.assertEqual(len(lines), 1)
         entry = json.loads(lines[0])
-        self.assertEqual(entry["agent"], "specialist")
+        # T-4737: ORG-001 role id + seat slot, not the persona name.
+        self.assertEqual(entry["agent"], "head_research_orchestrator")
+        self.assertEqual(entry["executor"], "specialist")
         self.assertEqual(entry["action"], "actuation_2026-05-04")
         self.assertIn("P1", entry["justifies_via"])
         refs = [link["ref"] for link in entry["links"]]
@@ -905,7 +982,7 @@ class TestLedgerWrite(unittest.TestCase):
         self.assertEqual(
             set(entry.keys()),
             {"id", "ts", "agent", "action", "rationale", "justifies_via",
-             "links", "cost_usd", "parent_id", "supersedes"},
+             "links", "cost_usd", "parent_id", "supersedes", "executor"},
         )
         self.assertIsNone(entry["cost_usd"])
         self.assertIsNone(entry["parent_id"])
@@ -1252,6 +1329,49 @@ class TestBuildBrief(unittest.TestCase):
         # Instructs the researcher not to self-edit topics.md.
         self.assertIn("do NOT edit `knowledge/watch/topics.md`", brief)
 
+    def test_recovery_metric_pilot_only_attaches_to_failure_modes_lane(self) -> None:
+        pilot_topic = _topic("llm-agent-failure-modes-research")
+        pilot_brief = watch_runner.build_brief(pilot_topic, Path("/tmp/out.md"))
+        self.assertIn("Recovery metric pilot (T-4904)", pilot_brief)
+        self.assertIn("task_success", pilot_brief)
+        self.assertIn("decisive_file_acquisition", pilot_brief)
+        self.assertIn("early / late / missed / not-applicable / unknown", pilot_brief)
+        self.assertIn("ultimately edited or test-relevant files/context", pilot_brief)
+        self.assertIn("recovery_outcome", pilot_brief)
+        self.assertIn("cascade_radius", pilot_brief)
+        self.assertIn("failure_event: none", pilot_brief)
+
+        ordinary_brief = watch_runner.build_brief(_topic("context-management"), Path("/tmp/out.md"))
+        self.assertNotIn("Recovery metric pilot (T-4904)", ordinary_brief)
+
+    def test_hn_recipe_is_url_encoded_with_runner_computed_window(self) -> None:
+        """T-5593: two 2026-10-26 researchers lost their HN pass to hand-built
+        Algolia URLs (HTTP 400). The brief hands them the encoded form and a
+        window start the runner computed, so nobody shells out to `date`.
+        """
+        topic = _topic("context-management")  # cadence daily -> 2-day window
+        brief = watch_runner.build_brief(topic, Path("/tmp/out.md"), today=date(2026, 10, 26))
+        self.assertIn("curl -sG 'https://hn.algolia.com/api/v1/search'", brief)
+        self.assertIn("--data-urlencode 'query=", brief)
+        self.assertIn("-w '%{http_code}'", brief)
+        # 2026-10-24T00:00:00Z == 1792800000
+        self.assertIn("created_at_i>1792800000", brief)
+        self.assertIn("report the status", brief)
+
+    def test_hn_window_follows_cadence(self) -> None:
+        weekly = Topic(slug="w", cadence="weekly", budget=300, scope="s", seed_sources=[], notes="")
+        brief = watch_runner.build_brief(weekly, Path("/tmp/out.md"), today=date(2026, 10, 26))
+        # 8-day window: 2026-10-18T00:00:00Z == 1792281600
+        self.assertIn("created_at_i>1792281600", brief)
+
+    def test_hn_window_is_stable_within_a_day(self) -> None:
+        # The byte-identical checks above call build_brief twice; a clock read
+        # finer than a day would make them flaky across a second boundary.
+        topic = _topic("due-weekly")
+        a = watch_runner.build_brief(topic, Path("/tmp/out.md"), today=date(2026, 10, 26))
+        b = watch_runner.build_brief(topic, Path("/tmp/out.md"), today=date(2026, 10, 26))
+        self.assertEqual(a, b)
+
 
 class TestParseReportBriefCorrections(unittest.TestCase):
     """T-2614: extract the `brief_corrections:` frontmatter list — the
@@ -1554,6 +1674,57 @@ class TestLandReports(unittest.TestCase):
             rc = watch_runner.land_reports(date(2026, 6, 5), topic_filter="ghost")
         self.assertEqual(rc, 2)
 
+    # T-5500: an above-bar report that skipped the T-5213 readback step gets a
+    # stderr WARN and a day-index marker, but still lands (warn, never refuse).
+    def _write_fm_report(self, slug: str, fm_lines: str) -> None:
+        (self.date_dir / f"{slug}.md").write_text(
+            "---\n" + fm_lines + "headline: Alpha line.\n---\n\n# Test report\n\n## Findings\n\n"
+            + ("Filler body text to cross the substantive-report size floor. " * 10)
+            + "\n\n## Sources\n\n- (test)\n",
+            encoding="utf-8",
+        )
+
+    def _land_capturing_stderr(self) -> tuple[int, str, str]:
+        stderr = io.StringIO()
+        with patch.object(watch_runner, "git_commit_and_push",
+                          return_value=(True, "ok")), \
+             patch.object(watch_runner, "actuate_phase"), \
+             patch("sys.stderr", stderr):
+            rc = watch_runner.land_reports(date(2026, 6, 5), force=True)
+        index = (self.date_dir / "README.md").read_text(encoding="utf-8")
+        return rc, stderr.getvalue(), index
+
+    def test_above_bar_without_readback_warns_and_marks_but_lands(self) -> None:
+        self._write_fm_report("alpha", "surface: above-bar\n")
+        rc, err, index = self._land_capturing_stderr()
+        self.assertEqual(rc, 0)
+        self.assertIn("WARN", err)
+        self.assertIn("alpha.md", err)
+        self.assertIn(
+            "| [alpha](alpha.md) | ok | TL;DR: Alpha line." + watch_runner.READBACK_MISSING_MARK + " |",
+            index,
+        )
+        self.assertEqual(self._saved_state["topics"]["alpha"]["last_outcome"], "ok")
+
+    def test_above_bar_with_readback_is_silent(self) -> None:
+        self._write_fm_report("alpha", "surface: above-bar\nreadback: confirmed: https://nvd.nist.gov/x\n")
+        rc, err, index = self._land_capturing_stderr()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("readback", err)
+        self.assertNotIn(watch_runner.READBACK_MISSING_MARK, index)
+
+    def test_above_bar_with_empty_readback_still_warns(self) -> None:
+        self._write_fm_report("alpha", "surface: above-bar\nreadback:\n")
+        _rc, err, index = self._land_capturing_stderr()
+        self.assertIn("alpha.md", err)
+        self.assertIn(watch_runner.READBACK_MISSING_MARK, index)
+
+    def test_routine_without_readback_is_silent(self) -> None:
+        self._write_fm_report("alpha", "surface: routine\n")
+        _rc, err, index = self._land_capturing_stderr()
+        self.assertNotIn("readback", err)
+        self.assertNotIn(watch_runner.READBACK_MISSING_MARK, index)
+
     def test_landed_report_with_corrections_accumulates_into_state(self) -> None:
         rp = self.date_dir / "alpha.md"
         rp.write_text(
@@ -1643,12 +1814,18 @@ class TestFileWatchTicket(unittest.TestCase):
         argv = mock_file.call_args.args[0]
         # target=specialist, requester=specialist, carries due slug + recipe + marker.
         self.assertIn("--target", argv)
-        self.assertEqual(argv[argv.index("--target") + 1], "specialist")
+        self.assertEqual(argv[argv.index("--target") + 1], "role:research_orchestrator")
         self.assertEqual(argv[argv.index("--requester") + 1], "specialist")
         ask = argv[argv.index("--ask") + 1]
         self.assertIn("alpha", ask)
         self.assertIn("--emit-due-briefs", ask)
         self.assertIn("--land-commit", ask)
+        # T-5213: above-bar headline claims get a guarded primary-source readback
+        # before land; routine reports skip it.
+        self.assertIn("surface: above-bar", ask)
+        self.assertIn("readback:", ask)
+        self.assertLess(ask.index("readback:"), ask.index("--land-commit"))
+        self.assertIn("web-research-isolation", ask)
         self.assertNotIn("paused-one", ask)
         context = argv[argv.index("--context") + 1]
         self.assertIn("watch-dispatch-for: 2026-06-05", context)
@@ -1743,7 +1920,11 @@ class TestWatchTicketArgvAcceptedByRealTicketPy(unittest.TestCase):
                         self._staged.add(p)
                 return MagicMock(returncode=0, stdout="", stderr="")
             if argv[:2] == ["git", "diff"]:
-                out = "\n".join(sorted(self._staged))
+                # T-4885: the file verb also asks `--name-status` (ADD assertion).
+                out = "\n".join(
+                    (f"A\t{x}" if "--name-status" in argv else x)
+                    for x in sorted(self._staged)
+                )
                 return MagicMock(
                     returncode=0, stdout=out + ("\n" if out else ""), stderr=""
                 )
@@ -1794,7 +1975,7 @@ class TestWatchTicketArgvAcceptedByRealTicketPy(unittest.TestCase):
         bad = tail[:i] + ["--intent", "action"] + tail[i:]
         with patch("sys.stderr", new_callable=io.StringIO) as err:
             rc = ticket.main(bad + ["--no-push"])
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, ticket.EXIT_REFUSAL)  # T-4496: a caller refusal, not a fault
         self.assertIn("--intent is target=operator-specific", err.getvalue())
 
 
@@ -2371,6 +2552,129 @@ class TestParseFollowups(unittest.TestCase):
         self.assertEqual(watch_runner.parse_followups(body_upper), [])
 
 
+class TestParseFollowupsHeadingShapes(unittest.TestCase):
+    """T-4302: numbered / section-sign follow-up headings must parse (not silently drop),
+    and any follow-ups-like heading that yields nothing must fail LOUDLY.
+
+    Before this fix ``parse_followups_detailed`` matched only the exact heading
+    ``## Follow-ups``; real reports also use ``## 5. Follow-ups`` (numbered) and
+    ``## § Follow-ups`` (section-sign). Those sections were dropped silently — no
+    parsed item, no rejected entry, no trace (7 items lost from the 2026-09-29
+    context-management report; 13 numbered/section reports since 2026-08-09).
+
+    Invariant: every follow-up reaches a ticket (parsed) or fails loudly
+    (rejected) — never a silent drop.
+    """
+
+    def test_t4302_plain_heading_two_items_preserved(self) -> None:
+        """Existing behavior preserved: bare ``## Follow-ups`` still parses both items."""
+        body = (
+            "## Follow-ups\n"
+            "title-a — ask-a\n"
+            "title-b — ask-b\n"
+        )
+        result = watch_runner.parse_followups_detailed(body)
+        self.assertEqual(result.parsed, (("title-a", "ask-a"), ("title-b", "ask-b")))
+        self.assertEqual(result.rejected, ())
+
+    def test_t4302_numbered_heading_parsed(self) -> None:
+        """``## 5. Follow-ups`` and its ``5``/``5)`` variants parse (was silently dropped)."""
+        for heading in ("## 5. Follow-ups", "## 5 Follow-ups", "## 5) Follow-ups"):
+            with self.subTest(heading=heading):
+                body = (
+                    f"{heading}\n"
+                    "title-a — ask-a\n"
+                    "title-b — ask-b\n"
+                )
+                result = watch_runner.parse_followups_detailed(body)
+                self.assertEqual(
+                    result.parsed,
+                    (("title-a", "ask-a"), ("title-b", "ask-b")),
+                )
+                self.assertEqual(result.rejected, ())
+
+    def test_t4302_section_sign_heading_parsed(self) -> None:
+        """``## § Follow-ups`` and its ``§5``/``§5.`` variants parse (was silently dropped)."""
+        for heading in ("## § Follow-ups", "## §5 Follow-ups", "## §5. Follow-ups"):
+            with self.subTest(heading=heading):
+                body = (
+                    f"{heading}\n"
+                    "title-a — ask-a\n"
+                    "title-b — ask-b\n"
+                )
+                result = watch_runner.parse_followups_detailed(body)
+                self.assertEqual(
+                    result.parsed,
+                    (("title-a", "ask-a"), ("title-b", "ask-b")),
+                )
+                self.assertEqual(result.rejected, ())
+
+    def test_t4302_resolved_from_heading_ignored_quietly(self) -> None:
+        """``## Follow-ups Resolved From ...`` (trailing words) is a non-filing section:
+        zero parsed AND zero rejected, and it must NOT trip the loud path.
+
+        mcp-supply-chain 2026-09-21 uses that heading legitimately. The ``\\s*$``
+        end-anchor excludes it from the strict regex; the ``resolved`` guard excludes
+        it from the loose fail-loud detector.
+        """
+        body = (
+            "## Follow-ups Resolved From last week\n"
+            "- item-a — done last cycle\n"
+            "- item-b — also done\n"
+        )
+        buf = io.StringIO()
+        with patch("sys.stderr", buf):
+            result = watch_runner.parse_followups_detailed(body)
+        self.assertEqual(result.parsed, ())
+        self.assertEqual(result.rejected, ())
+        self.assertNotIn("[actuation] followup:", buf.getvalue())
+
+    def test_t4302_empty_or_sentinel_section_not_loud(self) -> None:
+        """A legitimately empty or sentinel-only ``## Follow-ups`` is intentional absence:
+        zero parsed, zero rejected, and NOT loud."""
+        body_empty = (
+            "## Follow-ups\n"
+            "## Sources\n"
+            "source-line — ignored\n"
+        )
+        body_sentinel = (
+            "## Follow-ups\n"
+            "- None\n"
+        )
+        for body in (body_empty, body_sentinel):
+            with self.subTest(body=body):
+                buf = io.StringIO()
+                with patch("sys.stderr", buf):
+                    result = watch_runner.parse_followups_detailed(body)
+                self.assertEqual(result.parsed, ())
+                self.assertEqual(result.rejected, ())
+                self.assertNotIn("[actuation] followup:", buf.getvalue())
+
+    def test_t4302_unparsed_heading_fails_loud(self) -> None:
+        """A follow-ups-like heading the strict regex declines but the loose detector
+        flags (content present) must produce at least one LOUD rejected entry —
+        never a silent zero/zero drop."""
+        for heading in ("## Follow-up items:", "## Followups (misc)"):
+            with self.subTest(heading=heading):
+                body = (
+                    f"{heading}\n"
+                    "- something actionable that would otherwise vanish\n"
+                )
+                buf = io.StringIO()
+                with patch("sys.stderr", buf):
+                    result = watch_runner.parse_followups_detailed(body)
+                self.assertEqual(result.parsed, ())
+                self.assertGreaterEqual(len(result.rejected), 1)
+                self.assertTrue(
+                    any(
+                        r.startswith("[unparsed-heading]") and heading in r
+                        for r in result.rejected
+                    ),
+                    result.rejected,
+                )
+                self.assertIn("[actuation] followup:", buf.getvalue())
+
+
 class TestActuatePhaseFollowups(unittest.TestCase):
     """Integration tests for follow-up filing in actuate_phase."""
 
@@ -2829,7 +3133,7 @@ class TestFollowupOverflowSummary(unittest.TestCase):
         self.assertEqual(outcome, "filed")
         self.assertEqual(ticket_id, "T-9999")
         argv = captured["argv"]
-        self.assertEqual(argv[argv.index("--target") + 1], "specialist")
+        self.assertEqual(argv[argv.index("--target") + 1], "role:research_orchestrator")
         labels = argv[argv.index("--labels") + 1]
         self.assertIn("actuation-overflow", labels.split(","))
         title = argv[argv.index("--title") + 1]
@@ -2868,7 +3172,7 @@ class TestFileFollowupArgv(unittest.TestCase):
         # T-1217: follow-ups route to specialist (the watch-loop owner triages its own
         # inflow + routes domain ones onward), NOT orchestrator — the
         # target-mis-route orchestrator flagged via mailbox 2026-06-16.
-        self.assertEqual(argv[argv.index("--target") + 1], "specialist")
+        self.assertEqual(argv[argv.index("--target") + 1], "role:research_orchestrator")
         self.assertNotIn("orchestrator", argv)
         labels_csv = argv[argv.index("--labels") + 1]
         labels = labels_csv.split(",")
@@ -3399,6 +3703,162 @@ class TestActuatePhaseCrossReference(unittest.TestCase):
         self._run_with([secondary], calls)  # primary absent from the run
         self.assertIn(("finding", "voice-as-interface"), calls)
         self.assertFalse([c for c in calls if c[0] == "xref"])
+
+
+class TestTopicProbes(unittest.TestCase):
+    """T-4543: a due topic with a change probe skips its researcher only when
+    the probe sees no change inside the quiet window; every failure fails open.
+    """
+
+    TODAY = date(2026, 10, 6)
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.reports_root = self.tmp / "reports"
+        self._patches = [
+            patch.object(watch_runner, "STATE_DIR", self.tmp / "state"),
+            patch.object(watch_runner, "PROBE_STATE_FILE", self.tmp / "state" / "probes.json"),
+            patch.object(watch_runner, "REPORTS_ROOT", self.reports_root),
+            patch.object(watch_runner, "_append_runner_log"),
+            patch.dict(watch_runner.TOPIC_PROBES, {
+                "cvp": {"kind": "json_ld_date_modified", "url": "https://example.test/a",
+                        "baseline": "B0", "max_quiet_days": 7},
+            }, clear=True),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self) -> None:
+        for p in reversed(self._patches):
+            p.stop()
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _html(value: str) -> str:
+        return f'<script type="application/ld+json">{{"@type":"Article","dateModified":"{value}"}}</script>'
+
+    def _state(self, days_ago: int | None) -> dict:
+        topics = {}
+        if days_ago is not None:
+            last = date.fromordinal(self.TODAY.toordinal() - days_ago)
+            topics["cvp"] = {"last_fire": last.isoformat(), "last_outcome": "ok"}
+        return {"schema_version": 1, "topics": topics}
+
+    def _skip(self, state: dict, fetch, today: date | None = None) -> tuple[bool, str]:
+        return watch_runner.probe_skip("cvp", state, today or self.TODAY, fetch=fetch)
+
+    def test_unchanged_inside_quiet_window_skips(self) -> None:
+        skip, reason = self._skip(self._state(1), lambda url: self._html("B0"))
+        self.assertTrue(skip)
+        self.assertIn("unchanged", reason)
+
+    def test_changed_value_dispatches(self) -> None:
+        skip, reason = self._skip(self._state(1), lambda url: self._html("B1"))
+        self.assertFalse(skip)
+        self.assertIn("B0 -> B1", reason)
+
+    def test_fetch_error_fails_open(self) -> None:
+        def boom(url):
+            raise OSError("network down")
+        skip, reason = self._skip(self._state(1), boom)
+        self.assertFalse(skip)
+        self.assertIn("fail-open", reason)
+
+    def test_missing_or_ambiguous_date_modified_fails_open(self) -> None:
+        for page in ("<html>no metadata</html>", self._html("B0") + self._html("B9")):
+            with self.subTest(page=page[:20]):
+                watch_runner.PROBE_STATE_FILE.unlink(missing_ok=True)
+                skip, reason = self._skip(self._state(1), lambda url, page=page: page)
+                self.assertFalse(skip)
+                self.assertIn("fail-open", reason)
+
+    def test_quiet_ceiling_dispatches_even_when_unchanged(self) -> None:
+        skip, reason = self._skip(self._state(7), lambda url: self._html("B0"))
+        self.assertFalse(skip)
+        self.assertIn("no full fire in 7d", reason)
+
+    def test_never_fired_topic_dispatches(self) -> None:
+        skip, _ = self._skip(self._state(None), lambda url: self._html("B0"))
+        self.assertFalse(skip)
+
+    def test_decision_is_cached_for_the_day(self) -> None:
+        fetch = MagicMock(return_value=self._html("B0"))
+        self.assertTrue(self._skip(self._state(1), fetch)[0])
+        self.assertTrue(self._skip(self._state(1), fetch)[0])
+        self.assertEqual(fetch.call_count, 1)
+        # The next day probes afresh.
+        next_day = date.fromordinal(self.TODAY.toordinal() + 1)
+        self._skip(self._state(2), fetch, today=next_day)
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_unprobed_topic_never_skips_and_writes_nothing(self) -> None:
+        self.assertEqual(watch_runner.probe_skip("other", self._state(1), self.TODAY),
+                         (False, "no probe"))
+        self.assertFalse(watch_runner.PROBE_STATE_FILE.exists())
+
+    def test_baseline_advances_only_after_an_observed_fire(self) -> None:
+        self._skip(self._state(1), lambda url: self._html("B1"))
+        watch_runner.advance_probe_baseline("cvp", self.TODAY)
+        next_day = date.fromordinal(self.TODAY.toordinal() + 1)
+        skip, _ = self._skip(self._state(1), lambda url: self._html("B1"), today=next_day)
+        self.assertTrue(skip)
+
+    def test_fail_open_fire_does_not_move_baseline(self) -> None:
+        def boom(url):
+            raise OSError("down")
+        self._skip(self._state(1), boom)
+        watch_runner.advance_probe_baseline("cvp", self.TODAY)
+        self.assertEqual(watch_runner.load_probe_state()["cvp"]["baseline"], "B0")
+
+    def _topics(self) -> list[Topic]:
+        return [Topic(slug=s, cadence="daily", budget=150, scope="s", seed_sources=[], notes="")
+                for s in ("cvp", "other")]
+
+    def test_compute_due_briefs_drops_unchanged_probe_topic(self) -> None:
+        state = {"schema_version": 1, "topics": {
+            "cvp": {"last_fire": "2026-10-05", "last_outcome": "ok"},
+            "other": {"last_fire": "2026-10-05", "last_outcome": "ok"},
+        }}
+        with patch.object(watch_runner, "parse_topics", return_value=self._topics()), \
+             patch.object(watch_runner, "load_state", return_value=state), \
+             patch.object(watch_runner, "_fetch_url", return_value=self._html("B0")) as fetch, \
+             patch("sys.stderr", new_callable=io.StringIO):
+            recs = watch_runner.compute_due_briefs(self.TODAY)
+            self.assertEqual([r["slug"] for r in recs], ["other"])
+            forced = watch_runner.compute_due_briefs(self.TODAY, force=True)
+            self.assertEqual([r["slug"] for r in forced], ["cvp", "other"])
+        self.assertEqual(fetch.call_count, 1)  # force never probes
+
+    def test_land_reports_treats_probe_skip_as_no_fire(self) -> None:
+        state = {"schema_version": 1, "topics": {
+            "cvp": {"last_fire": "2026-10-05", "last_outcome": "ok"}}}
+        topics = [Topic(slug="cvp", cadence="daily", budget=150, scope="s", seed_sources=[], notes="")]
+        with patch.object(watch_runner, "parse_topics", return_value=topics), \
+             patch.object(watch_runner, "load_state", return_value=state), \
+             patch.object(watch_runner, "save_state") as save, \
+             patch.object(watch_runner, "_fetch_url", return_value=self._html("B0")), \
+             patch.object(watch_runner, "git_commit_and_push") as gcp, \
+             patch("sys.stdout", new_callable=io.StringIO) as out:
+            rc = watch_runner.land_reports(self.TODAY)
+        self.assertEqual(rc, 0)
+        self.assertIn("skipped (probe", out.getvalue())
+        gcp.assert_not_called()
+        save.assert_not_called()
+        self.assertEqual(state["topics"]["cvp"]["last_fire"], "2026-10-05")
+
+    def test_registered_probe_matches_a_real_topic(self) -> None:
+        # Guards the live registry (setUp swaps in a test registry).
+        for p in reversed(self._patches[-1:]):
+            p.stop()
+        try:
+            slugs = {t.slug for t in watch_runner.parse_topics(watch_runner.TOPICS_FILE)}
+            for slug, spec in watch_runner.TOPIC_PROBES.items():
+                self.assertIn(slug, slugs)
+                self.assertEqual(spec["kind"], "json_ld_date_modified")
+                self.assertTrue(spec["url"].startswith("https://"))
+        finally:
+            self._patches[-1].start()
 
 
 if __name__ == "__main__":

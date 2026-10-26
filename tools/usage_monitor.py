@@ -34,7 +34,7 @@ STATE_FILE = STATE_DIR / "usage.jsonl"
 ALERT_COOLDOWN_FILE = STATE_DIR / "alert_cooldown"
 HOURLY_STATE_FILE = STATE_DIR / "usage_hourly.json"
 TELEGRAM_ENV = Path.home() / ".claude" / "channels" / "telegram" / ".env"
-OPERATOR_CHAT_ID = "456474197"  # from access.json allowFrom
+OPERATOR_CHAT_ID = "424242424"  # from access.json allowFrom
 
 WINDOWS_HOURS = (1, 5, 24, 168)  # 1h, 5h, 24h, 7d
 ALERT_COOLDOWN_HOURS = 4

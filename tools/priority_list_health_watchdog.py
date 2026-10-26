@@ -50,6 +50,11 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+try:  # T-4096: the mailbox hub path comes from instance.yaml, never a literal.
+    from tools.agent_role_map import mailbox_hub  # noqa: E402
+except ImportError:  # bare run with cwd=tools/
+    from agent_role_map import mailbox_hub  # type: ignore  # noqa: E402
+
 STATE_DIR = Path.home() / ".local" / "state" / "pantheon"
 STATE_PATH = STATE_DIR / "priority_list_health_alert_state.json"
 
@@ -59,7 +64,7 @@ STATE_PATH = STATE_DIR / "priority_list_health_alert_state.json"
 # overridable for tests without touching ticket.py's own module state.
 HEALTH_LOG_PATH = Path.home() / ".local" / "log" / "pantheon" / "priority_list_health.jsonl"
 
-RECOVERY_INBOX = os.environ.get("PANTHEON_RECOVERY_INBOX", "/home/the-ancestor/mailbox/recovery")
+RECOVERY_INBOX = os.environ.get("PANTHEON_RECOVERY_INBOX") or f"{mailbox_hub()}/recovery"
 
 # Persistent-broken window: N most-recent telemetry entries, ALL parse_ok=false
 # with the SAME parse_fail_class (ORG-078 §4). The health log is written per

@@ -9,7 +9,7 @@
 # essentially identical (OnUnitInactiveSec=2min handles ongoing cadence).
 #
 # Affected seats: claude-research (specialist), claude-fallback (recovery),
-# suborch1 (metis), suborch2 (atlas). Orchestrator's seat (claude) is already
+# suborch1 (mason), suborch2 (artisan). Orchestrator's seat (claude) is already
 # correct — not touched.
 #
 # Full audit evidence + rationale: T-3277 annotations.

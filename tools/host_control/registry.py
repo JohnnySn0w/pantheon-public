@@ -64,7 +64,8 @@ def _identifier(value: object, context: str) -> str:
 def _absolute_normalized(value: object, context: str) -> Path:
     if not isinstance(value, str) or not os.path.isabs(value):
         raise RegistryError(f"{context} must be absolute")
-    if os.path.normpath(value) != value or ".." in Path(value).parts:
+    # "//"-prefixed paths survive normpath unchanged (POSIX); refused (D32)
+    if value.startswith("//") or os.path.normpath(value) != value or ".." in Path(value).parts:
         raise RegistryError(f"{context} must be normalized")
     return Path(value)
 
@@ -195,6 +196,12 @@ class SeatRegistry:
             return self._subjects[authenticated_uid]
         except KeyError as exc:
             raise RegistryError("authenticated uid is not registered") from exc
+
+    def seat_ids(self) -> tuple[str, ...]:
+        """Every registered seat id, sorted (T-2917 5d.4: the broker's
+        executor-reachability health leg covers each registered seat)."""
+
+        return tuple(sorted(self._seats))
 
     def seat(self, seat_id: str) -> SeatRecord:
         try:

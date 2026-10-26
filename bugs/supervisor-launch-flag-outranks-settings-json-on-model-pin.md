@@ -101,8 +101,8 @@ cap class with a different signal shape** and cost ~3.5h of Recovery silence bef
    pending a live fire (tracked in T-1980's detector-hardening scope).
 
 4. **Coverage void.** The detector (`context_fill_monitor`) runs only as per-agent
-   instances `@specialist/@orchestrator/@recovery`. **Mnemosyne/exocortex and the seats have no instance**,
-   so they wedge entirely unseen — which is why a human caught Mnemosyne's ~4h wedge before
+   instances `@specialist/@orchestrator/@recovery`. **Archivist/exocortex and the seats have no instance**,
+   so they wedge entirely unseen — which is why a human caught Archivist's ~4h wedge before
    any monitor. Detection/alert and the auto-*step*/restart are **separable**: an account
    can be (correctly) excluded from auto-restart yet still want cap-detection+alert. The
    two were bundled; decoupling them is part of the T-1980 fix.

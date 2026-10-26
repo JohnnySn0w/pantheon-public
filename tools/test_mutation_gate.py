@@ -22,12 +22,16 @@ tests fail.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import textwrap
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tools import mutation_gate  # noqa: E402
 
 
 MUTATION_GATE_PY = Path(__file__).parent / "mutation_gate.py"
@@ -173,6 +177,69 @@ class TestBulkModeMatchesLinesMode(unittest.TestCase):
                 f"lines said {lines_verdicts[line_num]}, auto said {auto_verdicts[line_num]}. "
                 f"This is the T-3462 pycache-staleness regression class.",
             )
+
+
+class TestDiffModeTargeting(unittest.TestCase):
+    """T-4202: --diff targets come from the shared structural diff framing
+    (hermes_diff_scan.iter_added_lines), and the source is split on "\\n"
+    only, so targets match git's line numbers. Each case failed on the old
+    `+++`-skip / splitlines() parser."""
+
+    def setUp(self) -> None:
+        tmp = TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.repo = Path(tmp.name)
+        self._git("init", "-q")
+        cwd = os.getcwd()
+        os.chdir(self.repo)  # load_line_numbers runs `git diff` in the cwd
+        self.addCleanup(os.chdir, cwd)
+
+    def _git(self, *args: str) -> str:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e.com",
+               "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e.com",
+               "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "commit.gpgsign=false", *args],
+            cwd=self.repo, env=env, capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    def _commit(self, src: Path, text: str) -> str:
+        src.write_bytes(text.encode("utf-8"))
+        self._git("add", "-A")
+        self._git("commit", "-q", "-m", "c")
+        return self._git("rev-parse", "HEAD")
+
+    def test_plus_plus_added_line_keeps_line_numbers(self) -> None:
+        src = self.repo / "m.py"
+        base = self._commit(src, "def f():\n    return 1\n")
+        self._commit(src, "def f():\n    return 1\nx = 1\n++x\ny = 2\nz = 3\n")
+        # `++x` renders `+++x`: the old parser skipped it without counting, so
+        # y/z were targeted as lines 4/5 instead of 5/6.
+        self.assertEqual(mutation_gate.load_line_numbers(src, "diff", base), [3, 4, 5, 6])
+
+    def test_form_feed_and_u2028_do_not_drift_targets(self) -> None:
+        src = self.repo / "m.py"
+        head_text = (
+            "s = 'a\x0cb'\n"          # 1: form feed inside a line
+            "t = 'c d'\n"        # 2: U+2028 inside a line
+            "# comment\n"             # 3: not mutable
+            "v = 3\n"                 # 4: mutable
+        )
+        base = self._commit(src, "s = 'a\x0cb'\nt = 'c d'\n")
+        self._commit(src, head_text)
+        self.assertEqual(mutation_gate.load_line_numbers(src, "diff", base), [4])
+        self.assertEqual(mutation_gate.load_line_numbers(src, "auto", ""), [1, 2, 4])
+
+    def test_mutate_line_hits_the_git_numbered_line(self) -> None:
+        src = self.repo / "m.py"
+        src.write_bytes("s = 'a\x0cb'\nt = 'c d'\nv = 3\n".encode("utf-8"))
+        backup = self.repo / "m.py.bak"
+        original, kind = mutation_gate.mutate_line(src, 3, backup)
+        self.assertEqual((original, kind), ("v = 3\n", "commented-out"))
+        self.assertEqual(
+            src.read_bytes().decode("utf-8"),
+            "s = 'a\x0cb'\nt = 'c d'\n# MUTATED-OUT: v = 3\n",
+        )
 
 
 if __name__ == "__main__":

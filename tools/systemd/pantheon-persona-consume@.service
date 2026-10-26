@@ -8,7 +8,7 @@ WorkingDirectory=%h/pantheon-config
 Environment=PANTHEON_INSTANCE_MANIFEST=%h/pantheon-config/instance.yaml
 Environment=PANTHEON_HARNESS_HOME=%h
 Environment=PANTHEON_PERSONA_CWD=%h/pantheon-config
-Environment=PANTHEON_MAILBOX_HUB=/home/the-ancestor/mailbox
+Environment=PANTHEON_MAILBOX_HUB=/home/post-office/mailbox
 Environment=PANTHEON_PERSONA_STATE_DIR=%h/.local/state/pantheon/personas
 # The stable unit invokes Pantheon code only. The manifest selects the harness,
 # runtime profile, model, native permissions, quota source, and tmux target.

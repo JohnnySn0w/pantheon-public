@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon echo-target prune — every 4h at :40 UTC (T-4852, T-5249)
+
+[Timer]
+OnCalendar=*-*-* 00/4:40:00 UTC
+Persistent=true
+RandomizedDelaySec=10min
+Unit=pantheon-echo-target-prune.service
+
+[Install]
+WantedBy=timers.target

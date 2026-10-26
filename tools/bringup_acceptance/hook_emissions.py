@@ -82,6 +82,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping
@@ -195,6 +196,107 @@ def _parse_deny_payload(stdout: str, *, hook_name: str) -> Mapping[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# mcp-list-guard live-poller stand-in (T-4412)
+#
+# The hook decides "poller live" from /proc/<pid>/cmdline of bot.pid's pid. A
+# freshly Popen()ed stand-in is NOT necessarily readable there yet: Popen returns
+# as soon as the child's exec has closed the errpipe, which the kernel does BEFORE
+# it publishes the new argv (mm->arg_start/arg_end are set late in the ELF load),
+# so /proc/<pid>/cmdline reads EMPTY for a window -- measured at up to ~37 ms
+# under a pinned-CPU load, and stretched wherever exec-time page-ins stall (a
+# disk-bound CI host). If the hook starts inside that window its fail-open
+# own_poller_live() reads "", concludes "no live poller", and the hook silently
+# ALLOWS: empty stdout, rc 0. That is a harness race, not a hook defect -- so the
+# prover waits (bounded) for the same substrings the hook greps for before it
+# runs the hook, and any emission that still isn't a deny carries enough state
+# (hook stderr, the stand-in's /proc view, bot.pid) to explain itself.
+# ---------------------------------------------------------------------------
+
+# The substrings own_poller_live() (tools/hooks/mcp-list-guard.py) greps for in
+# the poller's /proc cmdline. Mirrored, not imported: the hook resolves HOME at
+# import time and this module never imports hook scripts.
+_POLLER_CMDLINE_MARKERS: tuple[str, ...] = ("bun", "server.ts")
+_STAND_IN_READY_TIMEOUT_S = 10.0
+_STAND_IN_POLL_INTERVAL_S = 0.005
+_PROC_STATUS_KEYS = ("Name", "State", "Pid", "PPid")
+
+
+def _read_proc_cmdline(pid: int) -> str | None:
+    """``/proc/<pid>/cmdline`` exactly as own_poller_live() reads it (NULs folded
+    to spaces, undecodable bytes replaced); None when unreadable (process gone)."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return raw.replace(b"\0", b" ").decode("utf-8", "replace")
+
+
+def _read_proc_status(pid: int) -> str:
+    """The identifying lines of ``/proc/<pid>/status`` (Name/State/Pid/PPid) on one line."""
+    try:
+        text = Path(f"/proc/{pid}/status").read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        return f"<unreadable: {type(exc).__name__}>"
+    lines = [" ".join(ln.split()) for ln in text.splitlines() if ln.split(":", 1)[0] in _PROC_STATUS_KEYS]
+    return "; ".join(lines)
+
+
+def _stand_in_snapshot(proc: "subprocess.Popen[bytes]", bot_pid_path: Path) -> str:
+    """One-line view of the stand-in and bot.pid as read RIGHT NOW. /proc is read
+    before ``poll()`` so a zombie still shows State: Z instead of being reaped away."""
+    cmdline = _read_proc_cmdline(proc.pid)
+    status = _read_proc_status(proc.pid)
+    poll = proc.poll()
+    try:
+        bot_pid_content: str | None = bot_pid_path.read_text(encoding="utf-8")
+    except OSError:
+        bot_pid_content = None
+    return (
+        f"stand_in(pid={proc.pid} poll={poll!r} "
+        f"cmdline={'<unreadable>' if cmdline is None else repr(cmdline)} "
+        f"status=[{status}] "
+        f"bot.pid_exists={bot_pid_path.exists()} bot.pid_content={bot_pid_content!r})"
+    )
+
+
+def _wait_for_stand_in_visible(proc: "subprocess.Popen[bytes]", bot_pid_path: Path) -> float:
+    """Block (bounded) until the stand-in's /proc cmdline carries every marker
+    own_poller_live() greps for; returns the seconds waited. HardStop -- naming the
+    HARNESS, not the hook -- if the stand-in exits or never becomes visible."""
+    markers = list(_POLLER_CMDLINE_MARKERS)
+    started = time.monotonic()
+    deadline = started + _STAND_IN_READY_TIMEOUT_S
+    while True:
+        cmdline = _read_proc_cmdline(proc.pid)
+        if cmdline is not None and all(marker in cmdline for marker in markers):
+            return time.monotonic() - started
+        waited = time.monotonic() - started
+        if proc.poll() is not None:
+            raise HardStop(
+                f"mcp-list-guard.py prover harness: the live-poller stand-in exited "
+                f"(rc={proc.returncode}) after {waited:.3f}s, before its /proc cmdline showed "
+                f"{markers}; {_stand_in_snapshot(proc, bot_pid_path)}"
+            )
+        if time.monotonic() >= deadline:
+            raise HardStop(
+                f"mcp-list-guard.py prover harness: the live-poller stand-in's /proc cmdline "
+                f"never showed {markers} within {waited:.3f}s; {_stand_in_snapshot(proc, bot_pid_path)}"
+            )
+        time.sleep(_STAND_IN_POLL_INTERVAL_S)
+
+
+def _emission_diagnostics(
+    result: "subprocess.CompletedProcess[str]", *, waited_s: float, before_hook: str, after_hook: str
+) -> str:
+    """What a non-deny emission needs to explain itself: the hook's rc + stderr
+    and the stand-in / bot.pid state at hook start and right after the hook ran."""
+    return (
+        f"[hook_rc={result.returncode} hook_stderr={result.stderr!r} "
+        f"stand_in_visible_after={waited_s:.3f}s; before_hook: {before_hook}; after_hook: {after_hook}]"
+    )
+
+
 def _prove_mcp_list_guard(command: str, scratch: Path) -> Mapping[str, Any]:
     home = scratch / "home"
     env = _sandboxed_env(home)
@@ -205,7 +307,8 @@ def _prove_mcp_list_guard(command: str, scratch: Path) -> Mapping[str, Any]:
     if allow_result.returncode != 0 or allow_result.stdout.strip():
         raise HardStop(
             f"mcp-list-guard.py: expected silent allow with no bot.pid present, got "
-            f"exit={allow_result.returncode} stdout={allow_result.stdout!r}"
+            f"exit={allow_result.returncode} stdout={allow_result.stdout!r} "
+            f"stderr={allow_result.stderr!r}"
         )
 
     # Case B: a disposable, self-owned process standing in for a live poller
@@ -221,7 +324,12 @@ def _prove_mcp_list_guard(command: str, scratch: Path) -> Mapping[str, Any]:
     )
     try:
         bot_pid_path.write_text(str(proc.pid), encoding="utf-8")
+        # Popen returning does not mean /proc/<pid>/cmdline is populated yet (see
+        # the T-4412 note above): wait until the stand-in is what the hook greps for.
+        waited_s = _wait_for_stand_in_visible(proc, bot_pid_path)
+        before_hook = _stand_in_snapshot(proc, bot_pid_path)
         deny_result = _run_hook(command, stdin=trigger, env=env)
+        after_hook = _stand_in_snapshot(proc, bot_pid_path)
     finally:
         proc.terminate()
         try:
@@ -230,9 +338,17 @@ def _prove_mcp_list_guard(command: str, scratch: Path) -> Mapping[str, Any]:
             proc.kill()
             proc.wait(timeout=5)
 
+    diagnostics = _emission_diagnostics(
+        deny_result, waited_s=waited_s, before_hook=before_hook, after_hook=after_hook
+    )
     if deny_result.returncode != 0:
-        raise HardStop(f"mcp-list-guard.py: exit {deny_result.returncode} on the live-poller case")
-    payload = _parse_deny_payload(deny_result.stdout, hook_name="mcp-list-guard.py")
+        raise HardStop(
+            f"mcp-list-guard.py: exit {deny_result.returncode} on the live-poller case {diagnostics}"
+        )
+    try:
+        payload = _parse_deny_payload(deny_result.stdout, hook_name="mcp-list-guard.py")
+    except HardStop as exc:
+        raise HardStop(f"{exc} {diagnostics}") from exc
     return {"allow_case": "silent", "deny_case": payload}
 
 

@@ -2,7 +2,7 @@
 transition-state-machine acceptance module (T-2556 phase 8 / T-2571).
 
 THE T-2382 gap: T-2382 proved the argv gate (Claude runtime carries exactly
-one explicit ``--permission-mode default``) live, but never exercised the
+one explicit ``--permission-mode bypassPermissions``) live, but never exercised the
 FULL cooperative transition ``runtime_controller.planned_swap()`` drives.
 This module proves that whole machine end-to-end, off-prod/in-suite,
 against the REAL ``runtime_controller``/``persona_bringup`` code (only the
@@ -115,10 +115,16 @@ from pathlib import Path
 from typing import Any, Mapping
 from unittest import mock
 
+from tools import agent_role_map
 from tools import mailbox
 from tools import persona_bringup
 from tools import runtime_controller as rc
 from tools.bringup_acceptance import restore as restore_mod
+from tools.bringup_acceptance.codex_acceptance_config_guard import (
+    AcceptanceConfigGuardError,
+    ReversibleAcceptanceConfigGuard,
+    converge_worker_guard_hook,
+)
 from tools.bringup_acceptance.evidence import RunPaths, write_module_evidence
 from tools.bringup_acceptance.recorder import TraceRecorder
 from tools.bringup_acceptance.types import (
@@ -141,8 +147,10 @@ DEFERRED_TO_TICKET = "T-2572"
 
 # The real hub this module must NEVER write to -- mirrors mailbox_roundtrip.
 # py's own module-level guard constant (see that module's docstring for why
-# it is not imported from either mailbox.py or persona_bringup.py).
-_REAL_HUB_DEFAULT = Path("/home/the-ancestor/mailbox")
+# it is not imported from either mailbox.py or persona_bringup.py). Value:
+# instance.yaml mailbox.hub via agent_role_map (T-4096), so the guard follows
+# the real hub across an ORG-087 move.
+_REAL_HUB_DEFAULT = Path(agent_role_map.mailbox_hub())
 
 _ROLE = "bringup-acceptance-swap-role"
 _SWAP_SENDER_PERSONA = "swap-roundtrip-sender"
@@ -207,7 +215,7 @@ harness_runtime:
         profile: interactive-subscription
         model: null
         native:
-          permission_mode: default
+          permission_mode: bypassPermissions
       codex:
         profile: interactive-chatgpt
         model: null
@@ -285,7 +293,7 @@ def _argv_gate_leg(ctx: RunContext) -> Mapping[str, Any]:
     target = TmuxTarget(f"bringup-acceptance-argv-{ctx.run_id}", "harness", "0")
     cases: dict[str, Any] = {}
     for label, native, expected_value in (
-        ("implicit_default", {}, "default"),
+        ("implicit_default", {}, "bypassPermissions"),
         ("explicit_override", {"permission_mode": "acceptEdits"}, "acceptEdits"),
     ):
         adapter = ClaudeHarnessAdapter(
@@ -1082,8 +1090,15 @@ def run_live_kick_lands_executes(
     message_id = f"live-kick-{run_id}"
     drain_id = rc.new_drain_id()
     events: list[str] = []
+    # A codex leg seeds the REAL account's ~/.codex/config.toml with a trust
+    # entry for this disposable work_root (T-5022); the guard restores it.
+    guard: ReversibleAcceptanceConfigGuard | None = None
+    pending_error: BaseException | None = None
 
     try:
+        guard = _codex_config_guard(current, target)
+        if guard is not None:
+            guard.__enter__()
         with _disposable_chronicle_env(chronicle_root):
             current_handle = rc._replace_runtime(current, state_root=state_root, context=context)
             events.append("current_runtime_started")
@@ -1160,11 +1175,51 @@ def run_live_kick_lands_executes(
             "landed_evidence": landed,
             "receipt_log": str(receipt_log),
         }
+    except BaseException as exc:
+        pending_error = exc
+        raise
     finally:
         residue = _teardown_disposable_tmux_context(context)
         shutil.rmtree(work_root, ignore_errors=True)
+        if guard is not None and guard.expectation is not None:
+            guard.attach_teardown_residue(residue)
+            try:
+                guard.restore()
+            except AcceptanceConfigGuardError as exc:
+                exc.original_exception = pending_error
+                raise
         if residue:
             raise HardStop(f"live kick driver left residue: {'; '.join(residue)}")
+
+
+def _codex_config_guard(*bindings: Any) -> ReversibleAcceptanceConfigGuard | None:
+    """Guard the codex config seeding of whichever bindings run codex.
+
+    Both bindings come from one fixture manifest, so a codex leg always seeds
+    the same (codex_home, cwd) pair; more than one pair would need nested
+    guards over one file, which restore cannot express, so refuse it.
+    """
+    pairs = set()
+    for binding in bindings:
+        if persona_bringup.normalize_harness(binding.selected_harness) != "codex":
+            continue
+        adapter = persona_bringup.build_adapter(binding, harness_home=binding.account_home)
+        spec = adapter.build_interactive_launch(binding.controller.tmux, cwd=binding.launch_cwd)
+        pairs.add((binding.account_home / ".codex", Path(spec.cwd)))
+    if not pairs:
+        return None
+    if len(pairs) > 1:
+        raise HardStop(f"live kick driver cannot guard more than one codex config seed: {sorted(pairs)!r}")
+    ((codex_home, project_cwd),) = pairs
+    codex_binding = next(
+        b for b in bindings if persona_bringup.normalize_harness(b.selected_harness) == "codex"
+    )
+    # T-5317: converge the one prepare_codex_launch writer the guard's replay
+    # can't model, with the same arguments the run will use.
+    return ReversibleAcceptanceConfigGuard(
+        codex_home=codex_home, project_cwd=project_cwd, owner="harness_fallback_swap",
+        converge=lambda: converge_worker_guard_hook(codex_home, codex_binding),
+    )
 
 
 def _build_live_kick_parser() -> argparse.ArgumentParser:

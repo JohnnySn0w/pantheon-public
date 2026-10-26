@@ -18,7 +18,7 @@
     },
     {
       "id": "clear-set-content-dependent",
-      "count": 11,
+      "count": 13,
       "targets": [
         {
           "module": "tools/test_policy_outflow_sync.py",
@@ -27,6 +27,53 @@
         {
           "module": "tools/test_s3star_audit_runner.py",
           "count": 9
+        },
+        {
+          "module": "tools/test_operator_stickers.py",
+          "test_class": "OperatorStickerAssets",
+          "count": 2
+        }
+      ]
+    },
+    {
+      "id": "neutralized-test-inputs",
+      "count": 6,
+      "targets": [
+        {
+          "module": "tools/test_ticket.py",
+          "test_class": "TestCloseNoodleAndAction",
+          "test": "test_close_action_review_still_says_operator_for_a_kino_close",
+          "count": 1
+        },
+        {
+          "module": "tools/test_ticket_grooming.py",
+          "test_class": "TestOperatorActionOnlyHelpers",
+          "test": "test_operator_action_items_filters_target",
+          "count": 1
+        },
+        {
+          "module": "tools/test_ticket_ratify_lift.py",
+          "test_class": "TestRatifyLiftStatusLine",
+          "test": "test_org065_exact_shape_fully_cleaned",
+          "count": 1
+        },
+        {
+          "module": "tools/test_ticket_refusal_exit_codes.py",
+          "test_class": "TestFileTimeInputValidation",
+          "test": "test_persona_target_variants_are_refused_in_any_case",
+          "count": 1
+        },
+        {
+          "module": "tools/test_ticket_refusal_exit_codes.py",
+          "test_class": "TestFileTimeInputValidation",
+          "test": "test_requester_case_and_whitespace_variants_are_stored_as_the_persona",
+          "count": 1
+        },
+        {
+          "module": "tools/test_ticket_refusal_exit_codes.py",
+          "test_class": "TestFileTimeInputValidation",
+          "test": "test_resolve_requester_normalizes_before_lookup",
+          "count": 1
         }
       ]
     }

@@ -1,7 +1,7 @@
 # ⚠️ DEPRECATED / NOT INSTALLED under Path A (T-1015, 2026-06-09). This inotify
 # watch is set up by the agent's user-systemd MANAGER, which carries only the
 # account's primary group (user systemd can't grant supplementary groups), so it
-# cannot traverse the 0710 veneration hub home (/home/the-ancestor) to watch the
+# cannot traverse the 0710 veneration hub home (then /home/the-ancestor, now /home/post-office) to watch the
 # subdir — the watch never fires (confirmed hands-off). provision_mailbox.sh no
 # longer installs this; the clock-driven pantheon-mailbox-wake@.timer is the wake
 # mechanism (its sg-wrapped .service gets veneration at run time). Kept for history.
@@ -16,11 +16,12 @@ Documentation=file:///home/%u/pantheon-config/adr/ORG-026-inter-agent-message-pa
 # a hint, per ORG-026 REQ2.
 #
 # Path A (2026-06-09): inboxes co-locate in the neutral group-accessible
-# /home/the-ancestor hub (ORG-026 "Conditionally a shared HOME"), NOT each agent's
+# /home/post-office hub (ORG-026 "Conditionally a shared HOME"; moved from
+# /home/the-ancestor by T-2693), NOT each agent's
 # own mode-750 home — a private home can't be traversed cross-account to deliver.
 # %i (the persona) watches its own hub subdir; works because each agent ∈ veneration
 # can rwx its 2770 subdir + traverse the 0710 hub home.
-PathModified=/home/the-ancestor/mailbox/%i/new
+PathModified=/home/post-office/mailbox/%i/new
 Unit=pantheon-mailbox-wake@%i.service
 
 [Install]

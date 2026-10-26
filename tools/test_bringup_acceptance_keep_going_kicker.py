@@ -91,17 +91,17 @@ class FleetFiringSnapshotTest(unittest.TestCase):
         self.assertEqual(snapshot["orchestrator"].observation.verdict, "confirmed-firing")
         self.assertEqual(snapshot["specialist"].observation.verdict, "confirmed-firing")
 
-    def test_recovery_metis_atlas_not_firing_but_framed_as_non_defect(self) -> None:
+    def test_recovery_mason_artisan_not_firing_but_framed_as_non_defect(self) -> None:
         snapshot = {e.agent: e for e in kgk.capture_fleet_firing_snapshot()}
-        for agent in ("recovery", "metis", "atlas"):
+        for agent in ("recovery", "mason", "artisan"):
             self.assertEqual(snapshot[agent].observation.verdict, "not-firing-observed")
             self.assertNotIn("is broken", snapshot[agent].framing.lower())
         self.assertIn("quiet", snapshot["recovery"].framing.lower())
         self.assertIn("not a regression", snapshot["recovery"].framing.lower())
-        self.assertIn("on-demand", snapshot["metis"].framing.lower())
-        self.assertIn("not asserted broken", snapshot["metis"].framing.lower())
-        self.assertIn("on-demand", snapshot["atlas"].framing.lower())
-        self.assertIn("not asserted broken", snapshot["atlas"].framing.lower())
+        self.assertIn("on-demand", snapshot["mason"].framing.lower())
+        self.assertIn("not asserted broken", snapshot["mason"].framing.lower())
+        self.assertIn("on-demand", snapshot["artisan"].framing.lower())
+        self.assertIn("not asserted broken", snapshot["artisan"].framing.lower())
 
     def test_snapshot_is_dated_not_asserted_live(self) -> None:
         self.assertTrue(kgk.FLEET_FIRING_SNAPSHOT_OBSERVED_AT.startswith("2026-08-05"))

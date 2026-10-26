@@ -24,6 +24,20 @@ def _result(stdout: str = "", returncode: int = 0, stderr: str = "") -> subproce
 
 
 class TestPantheonConfigSync(unittest.TestCase):
+    def setUp(self) -> None:
+        # T-4388: these tests script subprocess.run call-by-call; the push path's
+        # rebase-state probes are tested against real git in TestPushMainNeverStrands.
+        p = patch.object(sync, "_rebase_in_progress", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+        # push_main takes the git mutation lock; with subprocess.run scripted, the
+        # lockfile must not be resolved through git (pytest's conftest also sets this).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        e = patch.dict(os.environ, {"PANTHEON_GIT_MUTATION_LOCKFILE": str(Path(tmp.name) / "lock")})
+        e.start()
+        self.addCleanup(e.stop)
+
     def _patch_subprocess(self, results_by_call: list):
         """Patch subprocess.run to return a sequence of results matched by call order."""
         mock = MagicMock(side_effect=results_by_call)
@@ -186,6 +200,20 @@ class TestPantheonConfigSync(unittest.TestCase):
 class TestPantheonConfigSyncAlertState(unittest.TestCase):
     """T-0213: alert-state file lifecycle on each non-clean exit + rotation on clean."""
 
+    def setUp(self) -> None:
+        # T-4388: these tests script subprocess.run call-by-call; the push path's
+        # rebase-state probes are tested against real git in TestPushMainNeverStrands.
+        p = patch.object(sync, "_rebase_in_progress", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
+        # push_main takes the git mutation lock; with subprocess.run scripted, the
+        # lockfile must not be resolved through git (pytest's conftest also sets this).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        e = patch.dict(os.environ, {"PANTHEON_GIT_MUTATION_LOCKFILE": str(Path(tmp.name) / "lock")})
+        e.start()
+        self.addCleanup(e.stop)
+
     def _patch_subprocess(self, results_by_call: list):
         mock = MagicMock(side_effect=results_by_call)
         return patch.object(subprocess, "run", mock), mock
@@ -294,6 +322,144 @@ class TestPantheonConfigSyncAlertState(unittest.TestCase):
             self.assertEqual(len(payload["stderr_excerpt"]), sync._STDERR_EXCERPT_MAX)
 
 
+
+class TestPushMainNeverStrands(unittest.TestCase):
+    """T-4388, real git: push_main never pushes over a rebase found at entry, and aborts
+    a rebase that appears during the push (the pre-push freshness hook's)."""
+
+    def _git(self, cwd, *args):
+        return subprocess.run(["git", *args], cwd=str(cwd), check=True, capture_output=True, text=True)
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        self.bare = base / "bare.git"
+        self._git(base, "init", "-q", "--bare", "-b", "main", str(self.bare))
+        self.repo = base / "repo"
+        self._git(base, "clone", "-q", str(self.bare), str(self.repo))
+        for k, v in (("user.email", "t@example"), ("user.name", "T"), ("core.hooksPath", "/dev/null")):
+            self._git(self.repo, "config", k, v)
+        (self.repo / "f.txt").write_text("base\n")
+        self._git(self.repo, "add", "f.txt")
+        self._git(self.repo, "commit", "-q", "-m", "base")
+        self._git(self.repo, "push", "-q", "origin", "main")
+        p = patch.object(sync, "REPO", self.repo)
+        p.start()
+        self.addCleanup(p.stop)
+        # Hermetic outside pytest's conftest too: never take the real repo's lockfile.
+        e = patch.dict(os.environ, {"PANTHEON_GIT_MUTATION_LOCKFILE": str(base / "lock")})
+        e.start()
+        self.addCleanup(e.stop)
+        self.addCleanup(self._tmp.cleanup)
+
+    def _head(self, cwd):
+        return self._git(cwd, "rev-parse", "HEAD").stdout.strip()
+
+    def test_rebase_at_entry_refuses_without_pushing(self) -> None:
+        (self.repo / "f.txt").write_text("local\n")
+        self._git(self.repo, "commit", "-q", "-am", "local")
+        (Path(self._git(self.repo, "rev-parse", "--absolute-git-dir").stdout.strip()) / "rebase-merge").mkdir()
+        before = self._head(self.bare)
+        with self.assertRaises(sync.SyncError) as cm:
+            sync.push_main()
+        self.assertIn("already in progress", str(cm.exception))
+        self.assertEqual(self._head(self.bare), before, "nothing may be pushed")
+        self.assertTrue(sync._rebase_in_progress(), "the rebase is left as found")
+
+    def test_rebase_left_by_the_push_is_aborted(self) -> None:
+        (self.repo / "f.txt").write_text("local\n")
+        self._git(self.repo, "commit", "-q", "-am", "local")
+        local = self._head(self.repo)
+        real_run = sync.run
+
+        def run(cmd, check=True):
+            if cmd[:2] == ["git", "push"]:
+                # What the hook does on a conflict: start a rebase and exit 1.
+                self._git(self.repo, "checkout", "-q", "--detach", "HEAD~1")
+                (self.repo / "f.txt").write_text("theirs\n")
+                self._git(self.repo, "commit", "-q", "-am", "theirs")
+                theirs = self._head(self.repo)
+                self._git(self.repo, "checkout", "-q", "main")
+                r = subprocess.run(["git", "rebase", theirs], cwd=str(self.repo), capture_output=True, text=True)
+                assert r.returncode != 0 and sync._rebase_in_progress(), "fixture: conflicted rebase"
+                return subprocess.CompletedProcess(cmd, 1, "", "pre-push: rebase conflict\nerror: failed to push some refs")
+            return real_run(cmd, check=check)
+
+        with patch.object(sync, "run", run):
+            with self.assertRaises(sync.SyncError) as cm:
+                sync.push_main()
+        self.assertIn("aborted", str(cm.exception))
+        self.assertFalse(sync._rebase_in_progress(), "the hook's rebase must not be left behind")
+        self.assertEqual(self._head(self.repo), local, "main is back at the local commit")
+
+    def test_push_runs_inside_the_git_mutation_lock(self) -> None:
+        import contextlib
+        state = {"held": False, "pushed_while_held": None}
+
+        @contextlib.contextmanager
+        def lock(**k):
+            state["held"] = True
+            try:
+                yield
+            finally:
+                state["held"] = False
+
+        real_run = sync.run
+
+        def run(cmd, check=True):
+            if cmd[:2] == ["git", "push"]:
+                state["pushed_while_held"] = state["held"]
+            return real_run(cmd, check=check)
+
+        (self.repo / "f.txt").write_text("local\n")
+        self._git(self.repo, "commit", "-q", "-am", "local")
+        with patch("tools._git_utils.git_mutation_lock", lock), patch.object(sync, "run", run):
+            sync.push_main()
+        self.assertTrue(state["pushed_while_held"], "probe/push/clean-up must hold the shared lock")
+
+    def test_busy_lock_is_a_sync_error_without_pushing(self) -> None:
+        from tools._git_utils import GitMutationLockTimeout
+
+        def lock(**k):
+            raise GitMutationLockTimeout("busy")
+
+        before = self._head(self.bare)
+        (self.repo / "f.txt").write_text("local\n")
+        self._git(self.repo, "commit", "-q", "-am", "local")
+        with patch("tools._git_utils.git_mutation_lock", lock):
+            with self.assertRaises(sync.SyncError) as cm:
+                sync.push_main()
+        self.assertIn("lock busy", str(cm.exception))
+        self.assertEqual(self._head(self.bare), before)
+
+    def test_clean_push_lands(self) -> None:
+        (self.repo / "f.txt").write_text("local\n")
+        self._git(self.repo, "commit", "-q", "-am", "local")
+        sync.push_main()
+        self.assertEqual(self._head(self.bare), self._head(self.repo))
+
+    def test_clean_push_dual_writes_to_the_mirror(self) -> None:
+        """T-4691: after origin accepts, the ORG-101 mirror leg runs for the same ref."""
+        (self.repo / "f.txt").write_text("local\n")
+        self._git(self.repo, "commit", "-q", "-am", "local")
+        with patch("tools._git_utils.mirror_push_after_origin", return_value="mirror pushed") as m:
+            sync.push_main()
+        m.assert_called_once_with(self.repo, "main")
+
+    def test_failed_push_never_touches_the_mirror(self) -> None:
+        real_run = sync.run
+
+        def run(cmd, check=True):
+            if cmd[:2] == ["git", "push"]:
+                return subprocess.CompletedProcess(cmd, 1, "", "error: failed to push some refs")
+            return real_run(cmd, check=check)
+
+        with patch.object(sync, "run", run), \
+             patch("tools._git_utils.mirror_push_after_origin") as m:
+            with self.assertRaises(sync.SyncError):
+                sync.push_main()
+        m.assert_not_called()
+
 class TestDefaultSafeContractT0262AdditiveVariant(unittest.TestCase):
     """T-0262 (additive variant per the operator msg_1412): --commit-prod is no-op
     additive (default still commits + pushes); --dry-run skips push/pull;
@@ -349,6 +515,22 @@ class TestDefaultSafeContractT0262AdditiveVariant(unittest.TestCase):
                 self.assertEqual(sync.main(["--commit-prod"]), 0)
         finally:
             os.environ.pop("PANTHEON_SYNC_STRICT_DEFAULT_SAFE", None)
+
+
+# T-4940: isolate the seat's state dir for plain-unittest runs (pytest's conftest
+# _isolate_state_dir already does this per test). See tools/_seat_state_isolation.py.
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover - run from tools/
+    import _seat_state_isolation  # type: ignore[no-redef]
+
+
+def setUpModule() -> None:
+    _seat_state_isolation.start()
+
+
+def tearDownModule() -> None:
+    _seat_state_isolation.stop()
 
 
 if __name__ == "__main__":

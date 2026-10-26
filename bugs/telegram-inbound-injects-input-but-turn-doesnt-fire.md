@@ -14,7 +14,7 @@ capped**:
   `esc to interrupt`).
 - The turn never fired: no processing, no reply.
 
-Observed 2026-07-26 on **both Recovery and Mnemosyne simultaneously** (operator-escalated "neither is
+Observed 2026-07-26 on **both Recovery and Archivist simultaneously** (operator-escalated "neither is
 responsive"). Both had a distinct operator message stuck this exact way.
 
 ## Cause — an INTERMITTENT wake/delivery drop (harness-internal), NOT manual mode
@@ -29,7 +29,7 @@ disruptive live test — the intermittency does the isolation):
 - Manual mode is a **runtime state, not a launch flag** — all four telegram agents launch
   `--permission-mode default`, no manual-mode config; nothing sets it deterministically.
 - The **same agents in the same `⏸ manual mode` processed SOME telegram messages** this session
-  (Mnemosyne replied "what's up?"; Recovery did queue work) **and stuck on OTHERS** (the de-cluster go,
+  (Archivist replied "what's up?"; Recovery did queue work) **and stuck on OTHERS** (the de-cluster go,
   the MCP-land), both while idle. If manual mode deterministically held injected inputs, *nothing*
   would fire — some did. So the drop is **intermittent**, not a manual-mode block.
 

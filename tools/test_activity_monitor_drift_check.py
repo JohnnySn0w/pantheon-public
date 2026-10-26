@@ -48,6 +48,17 @@ class _DriftCheckBase(unittest.TestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+        # T-5439: default the quiescence seams to "not in maintenance" and
+        # "holds unknown" so no test reads the live registry or sudo-cats a
+        # real holds.json; the T-5439 tests override them per case.
+        for attr, kwargs in (
+            ("_seat_in_maintenance", {"return_value": False}),
+            ("_read_persona_holds", {"return_value": None}),
+        ):
+            patcher = mock.patch.object(dc, attr, **kwargs)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _write_fires(self, entries: list[dict]) -> None:
         dc.FIRES_PATH.parent.mkdir(parents=True, exist_ok=True)
         with dc.FIRES_PATH.open("w", encoding="utf-8") as f:
@@ -403,10 +414,10 @@ class TestComputeDriftFirstSeen(unittest.TestCase):
 class TestSeedFirstSeen(unittest.TestCase):
     def test_seeds_unseen_armed_pairs_to_now(self) -> None:
         store: dict[str, int] = {}
-        changed = dc._seed_first_seen(store, NOW, ["orchestrator", "metis"])
+        changed = dc._seed_first_seen(store, NOW, ["orchestrator", "mason"])
         self.assertTrue(changed)
         self.assertEqual(store["orchestrator:p1b"], int(NOW))
-        self.assertEqual(store["metis:p1b"], int(NOW))
+        self.assertEqual(store["mason:p1b"], int(NOW))
 
     def test_does_not_overwrite_existing(self) -> None:
         store = {"orchestrator:p1b": 111}
@@ -437,7 +448,7 @@ class TestPredicateCanCurrentlyFire(unittest.TestCase):
 
     def test_p1b_queue_confirmed_empty_cannot_fire(self) -> None:
         with mock.patch.object(dc, "_scan_actionable_tickets", return_value=0):
-            self.assertIs(dc._predicate_can_currently_fire("metis", "p1b"), False)
+            self.assertIs(dc._predicate_can_currently_fire("mason", "p1b"), False)
 
     def test_p1b_probe_failure_is_unknown_not_no(self) -> None:
         """A failed cross-account probe (None) must NOT read as confirmed-empty
@@ -458,7 +469,7 @@ class TestPredicateCanCurrentlyFire(unittest.TestCase):
         default inbox+active — else an unclaimed inbox ticket would read as
         'can fire' and wrongly un-suppress (T-3557e)."""
         with mock.patch.object(dc, "_scan_actionable_tickets", return_value=0) as mscan:
-            dc._predicate_can_currently_fire("metis", "p1b")
+            dc._predicate_can_currently_fire("mason", "p1b")
         self.assertEqual(mscan.call_args.kwargs["queue_states"], ("active",))
 
 
@@ -468,10 +479,10 @@ class TestCheckSuppression(_DriftCheckBase):
         dc.FIRST_SEEN_PATH.write_text(json.dumps(mapping), encoding="utf-8")
 
     def test_suborch_quiet_never_fired_suppressed(self) -> None:
-        """FALSIFIER 3 (sub-orch-p1b-quiet -> no alarm): a never-fired metis p1b
+        """FALSIFIER 3 (sub-orch-p1b-quiet -> no alarm): a never-fired mason p1b
         that has drifted is suppressed when it provably cannot currently fire
         (confirmed-empty queue)."""
-        self._write_first_seen({"metis:p1b": int(NOW - 30 * DAY)})  # drifted
+        self._write_first_seen({"mason:p1b": int(NOW - 30 * DAY)})  # drifted
         with mock.patch.object(dc, "_predicate_can_currently_fire", return_value=False), \
              mock.patch.object(dc, "_alert") as malert:
             rc = dc.check(dry_run=False, now=NOW)
@@ -479,10 +490,10 @@ class TestCheckSuppression(_DriftCheckBase):
         malert.assert_not_called()
 
     def test_suborch_would_alarm_if_queue_loaded(self) -> None:
-        """Same drifted never-fired metis p1b, but the queue is loaded (can
+        """Same drifted never-fired mason p1b, but the queue is loaded (can
         fire) -> NOT suppressed -> alarms. The suppression is queue-gated, not
         a blanket sub-orch mute."""
-        self._write_first_seen({"metis:p1b": int(NOW - 30 * DAY)})
+        self._write_first_seen({"mason:p1b": int(NOW - 30 * DAY)})
         with mock.patch.object(dc, "_predicate_can_currently_fire", return_value=True), \
              mock.patch.object(dc, "_alert") as malert:
             rc = dc.check(dry_run=False, now=NOW)
@@ -491,7 +502,7 @@ class TestCheckSuppression(_DriftCheckBase):
 
     def test_probe_failure_does_not_suppress(self) -> None:
         """An unknown probe (None) never suppresses -> the drift still alarms."""
-        self._write_first_seen({"metis:p1b": int(NOW - 30 * DAY)})
+        self._write_first_seen({"mason:p1b": int(NOW - 30 * DAY)})
         with mock.patch.object(dc, "_predicate_can_currently_fire", return_value=None), \
              mock.patch.object(dc, "_alert") as malert:
             rc = dc.check(dry_run=False, now=NOW)
@@ -518,6 +529,152 @@ class TestCheckSuppression(_DriftCheckBase):
         store = json.loads(dc.FIRST_SEEN_PATH.read_text())
         for agent in dc.AGENT_CONFIG:
             self.assertEqual(store[f"{agent}:p1b"], int(NOW))
+
+
+# ---------------------------------------------------------------------------
+# T-5439 — skip a persona in seat-maintenance or with every runtime held
+# ---------------------------------------------------------------------------
+
+_BOTH = ("claude/interactive-subscription", "codex/interactive-chatgpt")
+
+
+class TestQuiescedPersonaSkipped(_DriftCheckBase):
+    """A held seat has no pane, so p1b cannot match: its silence is an
+    authorised no, not a stale detector (mason p1b paged daily 10-24)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        p = mock.patch.object(dc, "_configured_runtimes", return_value=_BOTH)
+        p.start()
+        self.addCleanup(p.stop)
+        # mason FIRED p1b 9d ago: the has-fired path, which RC2 never suppresses.
+        self._write_fires([_fire("mason", "p1b", NOW - 9 * DAY),
+                           _fire("orchestrator", "p1b", NOW - 1 * DAY),
+                           _fire("artisan", "p1b", NOW - 1 * DAY)])
+        p = mock.patch.object(dc, "_predicate_can_currently_fire", return_value=None)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _alerted_agents(self) -> list[str]:
+        with mock.patch.object(dc, "_alert") as malert:
+            dc.check(dry_run=False, now=NOW)
+        return [c.args[0] for c in malert.call_args_list]
+
+    def test_control_unquiesced_mason_still_alerts(self) -> None:
+        self.assertEqual(self._alerted_agents(), ["mason"])
+
+    def test_seat_in_maintenance_is_skipped(self) -> None:
+        with mock.patch.object(dc, "_seat_in_maintenance", side_effect=lambda a: a == "mason"):
+            self.assertEqual(self._alerted_agents(), [])
+
+    def _seat(self, **kw):
+        from tools.seat_state_testkit import eff
+        return mock.patch("tools.seat_state.safe_effective_for", return_value=eff(**kw))
+
+    def test_deep_sleep_seat_is_skipped_T5527(self) -> None:
+        for asleep in (True, False):
+            with self._seat(state="deep-sleep", asleep=asleep):
+                self.assertEqual(self._alerted_agents(), [])
+
+    def test_paused_intake_seat_is_skipped_T5527(self) -> None:
+        # L2 stops the activity monitor's pokes for a paused seat, so no fires is expected.
+        with self._seat(state="paused-intake"):
+            self.assertEqual(self._alerted_agents(), [])
+
+    def test_quiesce_reasons_name_the_seat_state_T5527(self) -> None:
+        with self._seat(state="deep-sleep", asleep=True):
+            self.assertEqual(dc._persona_quiesced("mason"), "seat-sleep")
+        with self._seat(state="paused-intake"):
+            self.assertEqual(dc._persona_quiesced("mason"), "seat-paused")
+        with self._seat():
+            self.assertIsNone(dc._persona_quiesced("mason"))
+        with self._seat(oom=True):          # an OOM hold alone is not a quiet declaration
+            self.assertIsNone(dc._persona_quiesced("mason"))
+        with mock.patch("tools.seat_state.safe_effective_for", return_value=None):
+            self.assertIsNone(dc._persona_quiesced("mason"))
+
+    def test_live_oom_shape_oom_hold_plus_maintenance_rearm_is_skipped_T5527(self) -> None:
+        with self._seat(oom=True, maintenance=True), \
+                mock.patch.object(dc, "_seat_in_maintenance", side_effect=lambda a: a == "mason"):
+            self.assertEqual(self._alerted_agents(), [])
+            self.assertEqual(dc._persona_quiesced("mason"), "seat-maintenance")
+
+    def test_maintenance_fault_still_logs_its_own_line_T5527(self) -> None:
+        with mock.patch("tools.notify_policy.in_maintenance", side_effect=RuntimeError("boom")), \
+                mock.patch.object(dc, "_log") as log:
+            self.assertFalse(_real_seat_in_maintenance("mason"))
+        self.assertTrue(any("seat-maintenance check failed open for mason" in str(c)
+                            for c in log.call_args_list))
+
+    def test_every_runtime_held_is_skipped(self) -> None:
+        holds = {r: {"set_by": "operator:orchestrator"} for r in _BOTH}
+        with mock.patch.object(dc, "_read_persona_holds",
+                               side_effect=lambda a: holds if a == "mason" else {}):
+            self.assertEqual(self._alerted_agents(), [])
+
+    def test_partial_hold_still_alerts(self) -> None:
+        holds = {_BOTH[0]: {"set_by": "operator:orchestrator"}}
+        with mock.patch.object(dc, "_read_persona_holds", return_value=holds):
+            self.assertEqual(self._alerted_agents(), ["mason"])
+
+    def test_unknown_holds_still_alerts(self) -> None:
+        """An unreadable holds probe must not stand in for a confirmed hold."""
+        with mock.patch.object(dc, "_read_persona_holds", return_value=None):
+            self.assertEqual(self._alerted_agents(), ["mason"])
+
+    def test_no_configured_runtimes_still_alerts(self) -> None:
+        """all() over an empty runtime list is vacuously true; it must not quiet a seat."""
+        with mock.patch.object(dc, "_configured_runtimes", return_value=()), \
+             mock.patch.object(dc, "_read_persona_holds", return_value={}):
+            self.assertEqual(self._alerted_agents(), ["mason"])
+
+
+
+# the base class patches dc._seat_in_maintenance; keep a handle on the real function
+_real_seat_in_maintenance = dc._seat_in_maintenance
+
+
+class TestSeatInMaintenance(unittest.TestCase):
+    def test_probe_fault_fails_open(self) -> None:
+        with mock.patch("tools.notify_policy.in_maintenance", side_effect=RuntimeError("boom")):
+            self.assertFalse(dc._seat_in_maintenance("mason"))
+
+    def test_delegates_to_notify_policy(self) -> None:
+        with mock.patch("tools.notify_policy.in_maintenance", return_value=True) as m:
+            self.assertTrue(dc._seat_in_maintenance("mason"))
+        m.assert_called_once_with("mason")
+
+
+class TestReadPersonaHolds(unittest.TestCase):
+    def _run(self, rc: int, out: str):
+        res = mock.Mock(returncode=rc, stdout=out, stderr="")
+        with mock.patch.object(dc.subprocess, "run", return_value=res) as mrun:
+            got = dc._read_persona_holds("mason")
+        return got, mrun
+
+    def test_reads_holds_mapping_as_the_seat_user(self) -> None:
+        doc = {"holds": {_BOTH[0]: {}}, "schema": "pantheon-persona-runtime-holds/v1"}
+        got, mrun = self._run(0, json.dumps(doc))
+        self.assertEqual(got, {_BOTH[0]: {}})
+        argv = mrun.call_args.args[0]
+        self.assertEqual(argv[:4], ["sudo", "-n", "-u", "suborch1"])
+        self.assertIn("/home/suborch1/.local/state/pantheon/personas/mason/overrides/holds.json",
+                      " ".join(argv))
+
+    def test_absent_file_is_no_holds(self) -> None:
+        got, _ = self._run(3, "")
+        self.assertEqual(got, {})
+
+    def test_malformed_is_unknown(self) -> None:
+        got, _ = self._run(0, "{not json")
+        self.assertIsNone(got)
+
+    def test_sudo_failure_is_unknown(self) -> None:
+        got, _ = self._run(1, "")
+        self.assertIsNone(got)
+
+    def test_unknown_agent_is_unknown(self) -> None:
+        self.assertIsNone(dc._read_persona_holds("nobody"))
 
 
 # ---------------------------------------------------------------------------

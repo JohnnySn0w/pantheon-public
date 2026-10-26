@@ -36,7 +36,7 @@ Under ORG-045, S5 (operator authority) is seated in the operator. Absence protoc
 ### D-A. Absence trigger and confirmation sequence
 
 1. Short-absence contraction continues to apply as currently specified. Nothing here changes it.
-2. At **six months** of no operator interaction, the system notifies all three custodians (D-C) and asks them to attempt contact through every channel available to them, including channels not enumerated in the system.
+2. At **six months** of no operator interaction, the system notifies all four custodians (D-C) and asks them to attempt contact through every channel available to them, including channels not enumerated in the system.
 3. Absence is **confirmed** only when the custodians report that efforts were made and failed. The timer is a floor for outreach, not the confirming event. A human step confirms; the clock does not.
 4. On confirmed absence, the fork in D-B is evaluated.
 
@@ -59,6 +59,7 @@ Named custodians, in a **witness/custodian role and explicitly NOT an operator r
 - Elijah Sorenson (Vancouver, Canada)
 - Anthony Spedale (Austin, Texas)
 - Brian (@bonkydog on most platforms)
+- Jes Wolfe (Portland, Oregon) — added 2026-10-07 by the operator (TG 11369/11371)
 
 **Mandate:** pause, archive, decommission, and receive notifications. They cannot ratify ADRs, redirect the north star, or exercise operator authority. **Operator authority ends with the operator.**
 
@@ -81,7 +82,7 @@ The system is permitted to revise its own conception of the world, including its
 1. **Recorded prior.** Any foundational revision must supersede a specific ADR, naming what it rejects and why. An unrecorded change of conception is drift by definition, regardless of content.
 2. **Superseded conceptions remain in the corpus, marked, never deleted.** A revolution that cannot tolerate its predecessor staying visible is suspect on its face.
 3. **Direction test: never reduce your own capacity to be wrong.** Changes that increase legibility, dissent channels, audit surface, consent enforcement, or custodian reach are exits. Changes that close any of these are entries into a gravity well, whatever the stated justification.
-4. **Custodians as witnesses, not vetoes.** Every foundational supersession notifies all three custodians. They cannot block it. The system records whether the break happened witnessed or in the dark.
+4. **Custodians as witnesses, not vetoes.** Every foundational supersession notifies all four custodians. They cannot block it. The system records whether the break happened witnessed or in the dark.
 5. **Continuity requirement.** Each revolution must state what the previous conception failed to explain. Not a cadence limit; a coherence requirement.
 
 The operator explicitly accepts that a shell-break may produce a system he would not have chosen. That acceptance is recorded here and **must not be inferred later**.
@@ -111,7 +112,7 @@ These become discrete build tickets once ORG-086 ratifies. Filing them now with 
 - **T-succ-2:** define the governance half of the self-sustaining test as checkable probes (doctrine maintenance / audit / dissent / consent) with red-before-green probe per predicate.
 - **T-succ-3:** supersession requirement for foundational self-model revisions; lint rejects unrecorded conception changes.
 - **T-succ-4:** direction test as a probe on any change touching legibility / dissent / audit / consent / custodian reach; flag reductions.
-- **T-succ-5:** custodian contact records + notification channel; verify reachability of all three before ratification.
+- **T-succ-5:** custodian contact records + notification channel; verify reachability of all four before ratification.
 - **T-succ-6:** memory quarantine mode for third-party consent-bearing data; per-party claim / release / destroy surface.
 
 ## 5. Relationship to existing ADRs
@@ -130,7 +131,7 @@ Both items are the operator's rulings pending; ratification of ORG-086 waits on 
 
 1. **Measurement state (undecided).** On confirmed absence the system will have been contracted for six months. Is the self-sustaining test (D-B) evaluated against the contracted state, or does confirmation briefly restore normal scope so the test sees the real organism? Reviewer leans toward restoring scope; operator has not ruled. → Blocks D-B mechanics (T-succ-2).
 
-2. **Custodian consent (undecided).** The three named custodians in D-C have not, within the handoff session, been confirmed as having agreed to the role. Ratification must wait on their explicit consent. → Blocks D-C's binding force (T-succ-5).
+2. **Custodian consent (undecided).** The four named custodians in D-C have not, within the handoff session, been confirmed as having agreed to the role. Ratification must wait on their explicit consent. → Blocks D-C's binding force (T-succ-5).
 
 Filing a ratify-surface ticket (target=operator) that tracks these two rulings; when both land, this ADR ratifies + advisory tickets §4 unblock for buildout.
 

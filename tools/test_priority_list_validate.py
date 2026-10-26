@@ -214,6 +214,99 @@ class TestValidateHighVolume(_PriorityListValidateTestBase):
         self.assertNotIn("high-volume", err)
 
 
+class TestValidateSemanticDrift(_PriorityListValidateTestBase):
+    """T-3429 / ORG-078 §Priority-list-drift-hygiene fourth heuristic:
+    novel-arc-attach event detector.
+
+    Fires ONLY when (recent novel-arc-attach >= 1) AND (historical arc-count
+    <= arc_threshold). The threshold structurally excludes cross-cutting
+    design labels from firing.
+    """
+
+    _OLD = "2026-05-01T00:00:00Z"    # >30 days before RECENT_NOW → historical
+    _NEW = "2026-09-01T00:00:00Z"    # within 30 days of RECENT_NOW → recent
+    _RECENT_NOW = "2026-09-15T00:00:00Z"
+
+    def _now(self):
+        from datetime import datetime as _dt
+        return _dt.fromisoformat(self._RECENT_NOW.replace("Z", "+00:00"))
+
+    def test_narrow_arc_plus_novel_recent_fires(self) -> None:
+        # Historical: T-1000 root, T-1001 child. One arc, one label.
+        # Recent: T-2000 with same label but NO parent → new root = new arc.
+        self._set_priority_list("priority-1:\n  - narrow-label\n")
+        self._seed(tid="T-1000", labels=["narrow-label"], created=self._OLD)
+        self._seed(tid="T-1001", labels=["narrow-label"], created=self._OLD, parent_ticket="T-1000")
+        self._seed(tid="T-2000", labels=["narrow-label"], created=self._NEW)
+        with patch("tools.ticket.datetime") as dt:
+            dt.now.return_value = self._now()
+            dt.fromisoformat = __import__("datetime").datetime.fromisoformat
+            rc, _, err = self._run_validate()
+        self.assertEqual(rc, 2)
+        self.assertIn("narrow-label", err)
+        self.assertIn("semantic-drift", err)
+        self.assertIn("T-2000", err)
+
+    def test_wide_arc_set_never_fires_even_with_novel_recent(self) -> None:
+        # Historical: 4 distinct arc-roots (above default arc_threshold=3).
+        # Recent: novel arc attaches — but should NOT fire because the label
+        # is empirically cross-cutting (this is the T-3424 false-fire case).
+        self._set_priority_list("priority-1:\n  - broad-label\n")
+        for tid in ("T-1000", "T-1001", "T-1002", "T-1003"):
+            self._seed(tid=tid, labels=["broad-label"], created=self._OLD)
+        self._seed(tid="T-2000", labels=["broad-label"], created=self._NEW)
+        with patch("tools.ticket.datetime") as dt:
+            dt.now.return_value = self._now()
+            dt.fromisoformat = __import__("datetime").datetime.fromisoformat
+            rc, _, err = self._run_validate()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("semantic-drift", err)
+
+    def test_narrow_arc_with_no_recent_novel_does_not_fire(self) -> None:
+        # Historical: 1 arc (root T-1000).
+        # Recent: T-2000 whose parent is T-1000 → same arc-root as historical.
+        # No novel attach → no warning.
+        self._set_priority_list("priority-1:\n  - stable-label\n")
+        self._seed(tid="T-1000", labels=["stable-label"], created=self._OLD)
+        self._seed(tid="T-2000", labels=["stable-label"], created=self._NEW, parent_ticket="T-1000")
+        with patch("tools.ticket.datetime") as dt:
+            dt.now.return_value = self._now()
+            dt.fromisoformat = __import__("datetime").datetime.fromisoformat
+            rc, _, err = self._run_validate()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("semantic-drift", err)
+
+    def test_narrow_arc_with_only_historical_never_fires(self) -> None:
+        # Historical: 1 arc; NO recent tickets carry the label. Zero novel.
+        self._set_priority_list("priority-1:\n  - dormant-label\n")
+        self._seed(tid="T-1000", labels=["dormant-label"], created=self._OLD)
+        # A recent ticket exists but doesn't carry the label.
+        self._seed(tid="T-2000", labels=[], created=self._NEW)
+        with patch("tools.ticket.datetime") as dt:
+            dt.now.return_value = self._now()
+            dt.fromisoformat = __import__("datetime").datetime.fromisoformat
+            rc, _, err = self._run_validate()
+        self.assertEqual(rc, 0)
+        self.assertNotIn("semantic-drift", err)
+
+    def test_dangling_parent_ref_clusters_under_named_ancestor(self) -> None:
+        # T-1000 historical, references parent T-999 which is NOT on disk.
+        # _parent_chain_root returns "T-999" as the root (dangling but named).
+        # T-2000 recent, same dangling parent → same root → NOT novel.
+        # T-2001 recent, no parent → different root → NOVEL.
+        self._set_priority_list("priority-1:\n  - orphan-label\n")
+        self._seed(tid="T-1000", labels=["orphan-label"], created=self._OLD, parent_ticket="T-999")
+        self._seed(tid="T-2000", labels=["orphan-label"], created=self._NEW, parent_ticket="T-999")
+        self._seed(tid="T-2001", labels=["orphan-label"], created=self._NEW)
+        with patch("tools.ticket.datetime") as dt:
+            dt.now.return_value = self._now()
+            dt.fromisoformat = __import__("datetime").datetime.fromisoformat
+            rc, _, err = self._run_validate()
+        self.assertEqual(rc, 2)
+        self.assertIn("T-2001", err)
+        self.assertNotIn("T-2000", err)
+
+
 class TestValidateSampleMatching(_PriorityListValidateTestBase):
     def test_sample_output_includes_ids_and_titles(self) -> None:
         self._set_priority_list("priority-1:\n  - alpha\n")
@@ -264,7 +357,8 @@ class TestValidateThresholdConfigurability(_PriorityListValidateTestBase):
 # Pre-commit hook integration (T-3020 BT4): load .githooks/pre-commit as a
 # module (mirrors test_hermes_hook.py's _load_pre_commit_hook_module) and
 # exercise its _priority_list_validate_findings wiring directly, mocking
-# _staged_files() rather than spinning up a real git repo.
+# _staged_changes() (main()'s single source for the staged list, T-4451) rather
+# than spinning up a real git repo.
 # ---------------------------------------------------------------------------
 
 
@@ -317,7 +411,7 @@ class TestPreCommitHookWiring(_PriorityListValidateTestBase):
 
     def test_main_refuses_commit_on_parse_failure(self) -> None:
         self._set_priority_list_raw("# no sentinels\n")
-        with patch.object(self.hook, "_staged_files", return_value=["rulebook/priority-list.md"]), \
+        with patch.object(self.hook, "_staged_changes", return_value=[("rulebook/priority-list.md", None)]), \
              patch.object(self.hook, "_read_staged_blob", return_value=b""), \
              patch.object(self.hook, "_warn_directive_drift"), \
              patch.object(self.hook, "_hook_allowlist_drift", return_value=None), \
@@ -332,7 +426,7 @@ class TestPreCommitHookWiring(_PriorityListValidateTestBase):
     def test_main_allows_commit_on_dead_label_warning_only(self) -> None:
         self._set_priority_list("priority-1:\n  - alpha\n  - ghost\n")
         self._seed(tid="T-0001", labels=["alpha"])
-        with patch.object(self.hook, "_staged_files", return_value=["rulebook/priority-list.md"]), \
+        with patch.object(self.hook, "_staged_changes", return_value=[("rulebook/priority-list.md", None)]), \
              patch.object(self.hook, "_read_staged_blob", return_value=b""), \
              patch.object(self.hook, "_warn_directive_drift"), \
              patch.object(self.hook, "_hook_allowlist_drift", return_value=None), \

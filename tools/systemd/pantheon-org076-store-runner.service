@@ -1,0 +1,32 @@
+[Unit]
+Description=Pantheon ORG-076 single-store runner -- ingests seat quota-probe samples into the ONE episode store from recovery's dedicated clone (T-4720 / BT3a)
+Documentation=file://%h/.local/state/pantheon/org076/pantheon-config/tools/systemd/README.md
+
+# SHIPS DARK (ORG-076 section 4 / T-4720): this pair is NOT installed or enabled anywhere and is in no
+# installer's template list or expected-units manifest. Recovery installs it for the supervised
+# first-fire. Runs under RECOVERY's systemd --user manager only.
+#
+# Silent-failure guard (T-1868): on failure (including a guard refusal, exit 3) wake Recovery via the
+# ORG-026 mailbox. unit_failure_alert.py has its own per-unit cooldown (6h), so a wedged store is a
+# persistently failed unit rather than an alert storm.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+# The runner runs from ITS OWN dedicated clone, so _git_utils.REPO_ROOT == that clone and the
+# runner refuses to start otherwise. The clone is the store's only writer.
+WorkingDirectory=%h/.local/state/pantheon/org076/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Deliberately NO PANTHEON_STATE_DIR: the store uses the default state dir
+# (~/.local/state/pantheon/episode-store/); setting it would relocate the manifest pin.
+# The heartbeat lives outside recovery's 750 home so other accounts (codex) can read it.
+# sg systemd-journal (T-4709, recovery steward check): the per-seat freshness detector reads other seats'
+# user journals, which needs the systemd-journal group. Recovery's user manager does not carry it and
+# user-mode systemd cannot set SupplementaryGroups, so sg is the only route (same pattern as
+# sg pantheon-mailbox). Without it the positive control reads 0 records and every enrolled seat stays
+# Unknown. Files the runner creates take systemd-journal as their group unless the dir is setgid;
+# the /var/lib/pantheon/org076 dirs are 2775, so heartbeat and samples still inherit pantheon-shared.
+ExecStart=/usr/bin/sg systemd-journal -c "/usr/bin/python3 %h/.local/state/pantheon/org076/pantheon-config/tools/org076_store_runner.py --run --heartbeat-path /var/lib/pantheon/org076/heartbeat/org076-episode-store.json"
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

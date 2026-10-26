@@ -1,6 +1,6 @@
 # MCP adoption + allowlist policy
 
-**Status:** PROPOSED — HO-landed 2026-08-26 from Specialist's draft at commit `9637847cc` (T-3137). Awaiting the operator ratification per §7 of this policy (adoption is an account-and-access grant — the operator's ratifying tier). **Author:** Specialist (draft) → Orchestrator (Orchestrator, landed under D2 policy-authorship). **Date:** 2026-08-26 **Re-evaluate when:** the next `mcp-supply-chain` watch report flags a new malware namespace; OR any seat gains a network-transport MCP server; OR any allowlisted server changes version; OR the codex harness's inactive plugin-marketplace templates (T-3171) are activated; OR the follow-up tripwire proposed in §8 lands, shifting §2's enforcement from procedural to structural. **Justifies via:** P1 (architecture over policy — the gate is structural: an unlisted server cannot be adopted, not "remember to audit"), D3 (autonomy bar — MCP *adoption* is goal-level/reserved; this policy is the below-goal methodology that governs the reserved decision when it arises), D11 (third-party surface verification — read the source, validate against the real transport), P4 (traceability — every allowlist entry carries its audit trail).
+**Status:** Ratified 2026-10-07 by the operator (Telegram 11297/11299, T-3276 ticket walk: "looks stringent. good for mcp, external servers aren't to be blindly trusted" / "it reads well enough, i say it'll work"). It was ratified together with the `sticker` allowlist row (§2) and yes to both §8 questions: build the tripwire as a follow-up, and the policy covers the codex harness (§0). Previously: PROPOSED, HO-landed 2026-08-26 from Specialist's draft at commit `9637847cc` (T-3137). **Author:** Specialist (draft) → Orchestrator (Orchestrator, landed under D2 policy-authorship). **Date:** 2026-08-26 **Re-evaluate when:** the next `mcp-supply-chain` watch report flags a new malware namespace; OR any seat gains a network-transport MCP server; OR any allowlisted server changes version; OR the codex harness's inactive plugin-marketplace templates (T-3171) are activated; OR the follow-up tripwire proposed in §8 lands, shifting §2's enforcement from procedural to structural. **Justifies via:** P1 (architecture over policy — the gate is structural: an unlisted server cannot be adopted, not "remember to audit"), D3 (autonomy bar — MCP *adoption* is goal-level/reserved; this policy is the below-goal methodology that governs the reserved decision when it arises), D11 (third-party surface verification — read the source, validate against the real transport), P4 (traceability — every allowlist entry carries its audit trail).
 
 **Ticket:** T-3137 (target=specialist, resolved 2026-08-26) → T-3275 (target=orchestrator, this landing). **Driver:** `knowledge/watch/reports/2026-08-24/mcp-supply-chain.md` (§Follow-ups: "Establish MCP allowlist policy — require (1) security audit of source, (2) sandboxed execution / no STDIO passthrough, (3) OAuth/auth enforcement, (4) monitoring of tool invocations"). **Prior art (done, clean):** T-3135 + T-3136 + T-3171 — fleet-wide MCP-exposure audit; posture CONFIRMED structurally-minimal, zero exposure to the six named Aug-2026 threats, zero supply-chain compromise. This policy makes that already-true posture a *standing gate* so it stays true.
 
@@ -8,7 +8,7 @@
 
 ## 0. Scope + what this policy is NOT
 
-**This policy governs:** the criteria and process under which any new MCP server (or MCP-distributed tool) may be added to any Pantheon seat's config.
+**This policy governs:** the criteria and process under which any new MCP server (or MCP-distributed tool) may be added to any Pantheon seat's config. **It covers the codex harness too** (`~/.codex/config.toml` MCP entries, and enabling any of the inactive plugin-marketplace templates under `~/.codex/.tmp/plugins/`), as ratified 2026-10-07.
 
 **This policy does NOT authorize adopting MCP.** Per the watch report's own framing and the trust-posture floor, *the decision to adopt any new MCP server is a reserved (goal-level) / account-and-access-grant action — the operator's ratification, not an orchestrator's.* This policy is the **gate the reserved decision passes through**, not a delegation of it. It exists so that when adoption IS considered, the answer to "what must be true first" is written down and structural, rather than reconstructed under time pressure against a live threat.
 
@@ -32,9 +32,10 @@ This posture is **structurally minimal by design**, and the April-2026 STDIO-RCE
 
 | Server | Seats | Transport | Command / source | Vetted |
 |---|---|---|---|---|
-| `mailbox` | orchestrator, specialist, mnemosyne, metis, atlas | stdio | `python3 tools/mailbox_mcp.py` (org-internal) | ✓ standing |
+| `mailbox` | orchestrator, specialist, archivist, mason, artisan | stdio | `python3 tools/mailbox_mcp.py` (org-internal) | ✓ standing |
 | `pantheon-mcp-codex` | orchestrator | stdio | org-internal codex wrapper | ✓ standing |
-| `telegram` | specialist (+ plugin cache on orchestrator/recovery/mnemosyne) | outbound poll, no listener | official `claude-plugins-official` | ✓ standing |
+| `telegram` | every Telegram-connected Claude seat (orchestrator, specialist, recovery, archivist), each with its own bot | outbound poll, no listener | official `claude-plugins-official` plugin, which bundles its MCP server and installs into each seat's `~/.claude/plugins/cache` | ✓ standing |
+| `sticker` | orchestrator, specialist, recovery, archivist | stdio | `python3 tools/sticker_mcp.py` (org-internal, T-1024 #734) | ✓ ratified 2026-10-07. Audit: org-internal source with no new deps (the `mcp` SDK already used by `mailbox`); fixed command; outbound sendSticker only, never getUpdates; the token comes from the seat's existing telegram `.env` and is never returned; codex-reviewed (R1 REBOUND fixed, R2 APPROVE). |
 
 Anything not on this table is **not adopted**. Adding a row is the reserved action gated by §3–§6.
 

@@ -1,0 +1,21 @@
+[Unit]
+Description=Pantheon cap-mute driver — every 5 min: reconcile each seat's cap-mute against its usage-cap breaker (T-3844)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# 5min matches the flood monitors' own cadence (mail-staleness, context-fill,
+# activity) so a cap is muted within one cycle of the first cap-collateral alert —
+# and a cap-lift is unmuted within one cycle so real alerts resume promptly. The
+# driver is level-triggered + idempotent, so cadence is a latency knob only, not a
+# correctness one; the 8-day stuck-breaker backstop bounds the failure direction.
+OnUnitActiveSec=5min
+OnBootSec=2min
+OnActiveSec=1min
+
+# Deliberately NOT Persistent=true: a missed window is not a missed job — the next
+# fire reads the current breaker + current mute and fully reconciles. Replaying a
+# stale window would just re-run the same reconcile against now-current state.
+Unit=pantheon-cap-mute-driver.service
+
+[Install]
+WantedBy=timers.target

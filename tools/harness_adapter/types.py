@@ -167,6 +167,39 @@ class RuntimeControllerConfig:
     tmux: TmuxTarget
     policy: FailoverPolicy
     post_start: tuple[PostStartCommand, ...] = ()
+    # T-4037: the mid-session-cap SWAP action (kill the capped runtime + let
+    # reselection pick the fallback). Detection+publish (read-only, cheap) is
+    # unconditional; the swap action is gated by this flag, which T-5446 made
+    # fleet policy (default True, not hand-settable).
+    #
+    # T-4047 NOTE (shared-flag safety): this resolves per ROLE, not per
+    # harness -- `persona_bringup.load_binding` -> `resolve_controller_config`
+    # is keyed by `(persona, role)` only (no harness parameter), so a
+    # persona's claude AND codex bindings for the same role get the
+    # byte-identical flag value. This is harmless by construction, not by
+    # convention: the swap action requires BOTH this flag AND a CONFIRMED
+    # modal (`_observe_and_publish_mid_session_cap` classifies ONLY when
+    # `binding.launch.harness == "claude"` -- structurally never true for a
+    # codex binding, whatever this flag says; see
+    # `test_non_claude_harness_never_classifies_a_modal` and
+    # `test_shared_flag_on_codex_binding_never_swaps_even_with_cap_shaped_pane_text`
+    # in tools/test_runtime_controller.py).
+    # T-5446: ON by default for every seat; the per-role manifest key is retired
+    # (rejected by the validator), so production always resolves True.
+    mid_session_cap_swap_enabled: bool = True
+    # T-4046: the fallback-RETURN action (the opposite direction of
+    # mid_session_cap_swap_enabled above -- end a running LOWER-priority
+    # runtime once a strictly higher-priority one becomes viable again).
+    # T-5446: fleet policy, default True, not hand-settable.
+    #
+    # T-4047 NOTE (shared-flag safety): same per-ROLE resolution as
+    # mid_session_cap_swap_enabled above, harmless for the same reason but a
+    # DIFFERENT gate: `_fallback_return_eligible` returns None outright for
+    # whichever binding is currently first (`own_index == 0`) in manifest
+    # order, regardless of this flag's value -- there is nothing
+    # higher-priority to fail back TO. See
+    # `test_none_when_already_first_choice` in tools/test_runtime_controller.py.
+    fallback_return_enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -194,6 +227,13 @@ class PostStartAssessment:
     baseline_sha256: str
     capture_count: int
     changed_capture_indices: tuple[int, ...]
+    # T-4047: DERIVED, typed values parsed from the classifying pane sample --
+    # never raw pane text (consistent with this module's existing hash-only
+    # evidence convention). Both default None -- every status other than
+    # "subscription-cap" leaves them unset; only ClaudeHarnessAdapter's
+    # subscription-cap branch populates them today.
+    reset_at: datetime | None = None
+    cap_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -229,6 +269,16 @@ class ProviderCompletionAssessment:
     transcript_start_offset: int | None = None
     transcript_end_offset: int | None = None
     assistant_event_count: int = 0
+    # T-4321: how many times the controller re-typed a probe that never
+    # reached the harness's prompt history (swallowed during boot).
+    probe_resubmit_count: int = 0
+    # T-4362: why each re-type check did not re-type, as "reason=count" pairs
+    # in first-seen order, and the private file holding the last raw pane
+    # captures of a probe that was never proven (evidence keeps hashes only).
+    probe_resubmit_skips: str = ""
+    pane_captures_path: str | None = None
+    pane_captures_sha256: str | None = None
+    pane_captures_error: str | None = None
 
 
 @dataclass(frozen=True)

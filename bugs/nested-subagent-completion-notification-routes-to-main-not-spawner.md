@@ -36,6 +36,13 @@ never sees the completion unless it polls or HO forwards.
   flaky wake-drop: a second fire on the *same task-id* to the *same wrong
   destination* within one session. The two-sided compensation in `fix:` held
   both times.
+- 2026-10-08 (HO session cc5c6bc3): this happened in all three ORG-076 project-orchestrator arcs
+  (bt1-episode-store, bt2-quota-detector, bt3a-single-store). Every implementer and
+  reviewer completion landed in HO main. The BT1 arc stalled twice, about 30 and about 85 minutes,
+  because the brief left out the orchestrator half of the fix and the HO forwarded late.
+  The BT2/BT3a briefs said "poll your workers when idle", the HO forwarded each completion at
+  once, and neither arc stalled. The orchestrator half is now in the dispatch-staging SOP
+  §4 (T-4716).
 
 ## Unknown: design or bug
 

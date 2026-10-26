@@ -35,7 +35,7 @@ Both generalize the same way: the chain dissolved by changing the *substrate*, n
 
 - **Source lesson:** `lessons/stacking-mechanisms-may-mean-the-substrate-is-the-problem.md` (full timelines + both instances).
 - **Related lesson:** `lessons/structural-enforcement-retires-the-prose-rule.md` (architecture > policy — retire the prose rule when structure absorbs it).
-- **First-instance artifacts:** `architecture/adr/ORG-019` (blocked-state retirement). **Second-instance artifacts:** `sop/standard/venerating-ancestors.md` + `tools/veneration.py` (commit `524aed73`).
+- **First-instance artifacts:** `architecture/adr/ORG-019` (blocked-state retirement). **Second-instance artifacts:** `sop/standard/venerating-ancestors.md` (retired) + `tools/veneration.py` (commit `524aed73`; removed T-4741 #835, in git history).
 - **Principles + directives:** P1 (architecture over policy — the substrate-level question IS the P1 question); D10 (don't scatter mechanisms where one stronger surface does the job).
 
 ## Authoring discipline

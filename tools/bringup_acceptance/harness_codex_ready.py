@@ -70,7 +70,7 @@ home (persist ``dismissed_version`` + pre-trust every launch cwd) so no
 modal ever appears there.
 
 Manifest fidelity: the disposable fixture manifest's codex native config
-(``sandbox: workspace-write`` + ``config_overrides: {approval_policy:
+(``sandbox: danger-full-access`` + ``config_overrides: {approval_policy:
 never}``) matches the REAL production ``instance.yaml`` byte-for-byte
 (``recovery`` role, instance.yaml:201-204; ``peer-daemon-codex``
 role, instance.yaml:209-212).
@@ -92,12 +92,14 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
+from tools import agent_role_map
 from tools import codex_modal
 from tools import persona_bringup
 from tools import runtime_controller as rc
 from tools.bringup_acceptance.codex_acceptance_config_guard import (
     AcceptanceConfigGuardError,
     ReversibleAcceptanceConfigGuard,
+    converge_worker_guard_hook,
 )
 from tools.bringup_acceptance.types import HardStop
 from tools.submit_verify import ready_for_submission
@@ -122,13 +124,14 @@ _MODAL_NAV_POLL_S = 0.3
 _MAX_MODAL_NAV_ATTEMPTS = 4
 
 # The real hub this module must NEVER write to (mirrors harness_fallback_
-# swap.py's own module-level guard constant).
-_REAL_HUB_DEFAULT = Path("/home/the-ancestor/mailbox")
+# swap.py's own module-level guard constant). Value: instance.yaml mailbox.hub
+# via agent_role_map (T-4096), so the guard follows the real hub across ORG-087.
+_REAL_HUB_DEFAULT = Path(agent_role_map.mailbox_hub())
 
 _ROLE = "bringup-acceptance-codex-ready-role"
 
 # Faithful to instance.yaml's real codex roles (see module docstring for
-# citations) -- sandbox=workspace-write + config_overrides.approval_policy=
+# citations) -- sandbox=danger-full-access + config_overrides.approval_policy=
 # never. Session templated on {persona} ONLY (mirrors harness_fallback_
 # swap.py's _fixture_manifest_text / _validate_stable_tmux_template).
 _MANIFEST_TEMPLATE = """\
@@ -157,7 +160,7 @@ harness_runtime:
         profile: interactive-chatgpt
         model: null
         native:
-          sandbox: workspace-write
+          sandbox: danger-full-access
           config_overrides:
             approval_policy: never
 
@@ -573,6 +576,9 @@ def run_codex_ready_bringup(
                     codex_home=codex_home,
                     project_cwd=acceptance_project_cwd,
                     owner="harness_codex_ready",
+                    # T-5317: the one prepare_codex_launch writer the replay
+                    # can't model; converge it before the snapshot.
+                    converge=lambda: converge_worker_guard_hook(codex_home, binding),
                 )
                 guard.__enter__()
             # A fresh disposable target has never existed before -- always a

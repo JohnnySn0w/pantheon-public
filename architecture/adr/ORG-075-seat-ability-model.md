@@ -21,7 +21,7 @@ elements:
 
 ## Why this ADR exists
 
-ORG-043 established the sub-orchestrator seats (Metis, Atlas) as subordinate daemon reports under the HO. It did not model their **ability** — what a seat can be trusted to do, and what it means to grow one into a full HO the operator can hand a project off to.
+ORG-043 established the sub-orchestrator seats (Mason, Artisan) as subordinate daemon reports under the HO. It did not model their **ability** — what a seat can be trusted to do, and what it means to grow one into a full HO the operator can hand a project off to.
 
 In practice the HO drifted into a wrong-shaped mental model: treating the seats like junior hires who *earn* capability by *proving out*. The operator flagged this directly (TG 2026-08-11): the seats run the **same model** as the HO, so a competence-based trust ladder is the wrong frame. This ADR replaces it with the correct model and names the three mechanisms that follow.
 

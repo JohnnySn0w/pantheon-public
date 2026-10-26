@@ -1,0 +1,15 @@
+[Unit]
+Description=SuperNote ingest selector check (T-4593) — fail when stale-set pages have no P2 png, or no ingest ran, or gpu-ml is unreachable
+Documentation=file:///home/%u/pantheon-config/knowledge/episodic/2026-10-05-t4593-supernote-shared-page-png/note.md
+After=network-online.target
+Wants=network-online.target
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/supernote_selector_check.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

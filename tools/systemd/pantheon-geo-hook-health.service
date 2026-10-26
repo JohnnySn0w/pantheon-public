@@ -1,0 +1,18 @@
+[Unit]
+Description=Recovery-side geo-hook liveness monitor — poll geo-hook /health over the tailnet (T-3647)
+Documentation=file:///home/%u/pantheon-config/tools/geo_hook_health_monitor.py
+After=network-online.target
+Wants=network-online.target
+
+# Silent-failure guard (T-1868): on a genuine CRASH of this monitor (not a poll
+# failure — those are handled in-tool and exit 0), wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/geo_hook_health_monitor.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2min

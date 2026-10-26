@@ -1,0 +1,20 @@
+# T-5342 fixture: repos.yaml shape captured from pantheon-config/repos.yaml on 2026-10-22,
+# trimmed to the repos the inbox-consumer grant tests use. Grants are verbatim.
+schema_version: 1
+
+repos:
+  - name: pantheon-config
+    description: orchestration hub (principles, directives, ADRs, ledger, tickets, tooling)
+    grants: { head-engineering-orchestrator: rw, specialist: rw, head-system-orchestrator: rw, engineering-orchestrator-1: rw, engineering-orchestrator-2: rw, head-memory-orchestrator: rw, system-orchestrator-1: rw }
+  - name: echo-prismatic
+    description: Echo voice-agent stack (project-tier ADR-201+)
+    grants: { head-engineering-orchestrator: rw, engineering-orchestrator-1: rw, engineering-orchestrator-2: rw }
+  - name: echo_vault
+    description: echo architecture vault
+    grants: { head-engineering-orchestrator: rw, engineering-orchestrator-1: ro, engineering-orchestrator-2: ro }
+  - name: pantheon-pwa
+    description: operator-facing PWA (kino)
+    grants: { head-engineering-orchestrator: rw }
+  - name: codex-config
+    description: codex agent config + telegram bridge (poller/daemon, MAILBOX.md runbook); LIVE repo
+    grants: { peer-daemon-codex: rw, head-system-orchestrator: rw }

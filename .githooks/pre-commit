@@ -40,6 +40,28 @@ probably-dead-label finding is printed as a non-blocking warning. Runs
 IN-PROCESS (imports `tools.ticket`), not via subprocess, because
 `ticket.py`'s CLI entry point refuses to run from an `agent/*` branch.
 
+Also runs the T-4402 content-drift gate (`tools/staged_content_gate.py` via
+`_content_gate_findings`) when a staged path is a `tickets/{inbox,active}/T-*.md`
+file or `knowledge/watch/topics.md`: the two content-coupled invariants that turned
+the nightly CI run red for 20 days (a non-done ticket's `project_id` with no
+justifying label / ticket-chain hop; an ACTIVE watch topic with no TOPIC_POLICY
+entry) are evaluated against the STAGED blobs, so the commit that would break them
+is refused at the writer. Blocks only a violation INTRODUCED by the commit
+(compared with HEAD, following a rename to its source), so a pre-existing red
+never locks unrelated ticket operations. Fail-OPEN on any infrastructural error;
+fail-CLOSED on an introduced finding.
+
+Renames are checked like any other staged file (T-4451). A `git mv` plus an edit is
+status R -- what `ticket.py claim` / `unclaim` / `resolve` commit -- and used to be
+dropped by the staged-list filter, so the renamed blob skipped every check above.
+`_staged_changes()` now lists the DESTINATION path together with its rename source.
+Whole-blob checks (the byte-sequence scan, the main-guard lint) scan the destination
+blob exactly as for an added or modified file. Checks with a baseline (the content
+gate, the self-sudo guard, the ledger validity check) compare against the file's
+pre-rename identity, so a pure rename of a pre-existing finding is not newly blocked
+while a rename that ADDS a violation still is. Copies are never given that credit:
+the hook pins `-M`, which lists a copy as an added file (see `_staged_changes`).
+
 Activation:
     git config core.hooksPath .githooks
     (or run tools/install_hooks.sh which does this idempotently)
@@ -47,6 +69,7 @@ Activation:
 
 from __future__ import annotations
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -63,8 +86,30 @@ sys.path.insert(0, str(_REPO_ROOT))
 from tools._git_utils import _HERMES_PATTERN  # noqa: E402
 
 
-def _staged_files() -> list[str]:
-    """Return list of staged file paths (added/modified, not deleted).
+def _staged_changes() -> list[tuple[str, str | None]]:
+    """Return `(path, rename_source)` for every staged file (added / copied /
+    modified / renamed; not deleted). `path` is what the commit CREATES, so a
+    renamed file is listed under its DESTINATION and `rename_source` is the path
+    it was renamed from; every other entry has `rename_source` None.
+
+    T-4451: renames are included. A `git mv` plus an edit is status R, which the
+    former `--diff-filter=ACM` dropped, so the renamed blob skipped the byte-
+    sequence scan and every staged-content gate (`ticket.py claim` / `unclaim` /
+    `resolve` commit exactly that shape). Whole-blob checks now scan the
+    destination like any A/M path; baselined checks use `rename_source` to compare
+    against the file's HEAD blob under its OLD name.
+
+    Rename detection is pinned on (`-M`) rather than left to the seat's
+    `diff.renames` config. It also pins copies OFF: `-M` overrides
+    `diff.renames=copies`, so a copy is listed as an ADDED file with no source. That
+    is deliberate -- a copy leaves its source in place, so its findings are
+    duplicated, not relocated, and it gets no pre-existing-finding credit. (`C` stays
+    in the filter letters only so a future `-C` cannot silently drop it.)
+
+    Parsed from `--name-status -z`: `<status>\\0<path>\\0` for most statuses,
+    `<R|C><score>\\0<old>\\0<new>\\0` for renames and copies. A truncated tail is
+    dropped rather than guessed at. Fail-OPEN like the rest of the hook: a failing
+    `git` yields `[]`.
 
     T-2325: uses `-z` (NUL-separated, no quoting) rather than the default
     line-based output. With `core.quotePath` at its default, a path git
@@ -85,21 +130,110 @@ def _staged_files() -> list[str]:
     POSIX, so `git show :<path>` in `_read_staged_blob` still resolves.
     """
     result = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--diff-filter=ACM", "-z"],
+        ["git", "diff", "--cached", "-M", "--name-status", "--diff-filter=ACMR", "-z"],
         capture_output=True,
         check=False,
     )
     if result.returncode != 0:
         return []
-    decoded = result.stdout.decode("utf-8", "surrogateescape")
-    return [path for path in decoded.split("\0") if path]
+    tokens = result.stdout.decode("utf-8", "surrogateescape").split("\0")
+    changes: list[tuple[str, str | None]] = []
+    i = 0
+    while i < len(tokens) and tokens[i]:
+        if tokens[i][0] in "RC":
+            if i + 2 >= len(tokens) or not tokens[i + 1] or not tokens[i + 2]:
+                break
+            changes.append((tokens[i + 2], tokens[i + 1] if tokens[i][0] == "R" else None))
+            i += 3
+        else:
+            if i + 1 >= len(tokens) or not tokens[i + 1]:
+                break
+            changes.append((tokens[i + 1], None))
+            i += 2
+    return changes
+
+
+# `\Z`, not `$` (T-4541): `$` also matches before a trailing newline, and `T-N.md\n` is
+# not a ticket (the corpus globs `T-*.md`).
+_TICKET_PATH_RE = re.compile(r"^tickets/[^/]+/(T-\d+)\.md\Z")
+
+
+def _ticket_id_sources(changes: list[tuple[str, str | None]]) -> dict[str, str]:
+    """T-4470: `{dest: source}` for staged ticket files `-M` left unpaired, resolved by
+    ticket id from the staged deletions.
+
+    `-M` only pairs a move at >=50% similarity. A `ticket.py claim` / `resolve` that
+    rewrites enough of the file (a long log section replacing a short one) falls under
+    that, so git reports an A plus a D and the destination has no `rename_source`: the
+    baselined checks then read a legitimate claim of a pre-existing-red ticket as
+    INTRODUCING its finding and refuse it. A ticket's file name is its id (`T-N.md`)
+    and the id is unique, so the one staged deletion carrying the same id IS the file
+    this addition moved from.
+
+    Credit only when unambiguous: exactly one staged ADDED and exactly one staged
+    DELETED `tickets/*/T-N.md` carry the id (two deletions leave the baseline
+    undecidable; two additions would be a copy, which the hook never credits -- see
+    `_staged_changes`). Every staged ticket git did not pair (`source is None`) runs
+    the lookup: a moved-and-rewritten A, but also an M and a brand-new A, which get no
+    credit (an M is not among the listed additions -- its baseline is its own HEAD
+    blob -- and a new A has no same-id deletion). That costs those commits one extra
+    git call, kept for simplicity. Fail-CLOSED (`{}`, i.e. no credit, today's behaviour) on any git error or malformed
+    output, unlike the fail-open rest of the hook: this lookup can only WIDEN what a
+    commit is allowed, so a doubt must not widen it.
+    """
+    unpaired = {
+        path: match.group(1)
+        for path, source in changes
+        if source is None and (match := _TICKET_PATH_RE.match(path))
+    }
+    if not unpaired:
+        return {}
+    result = subprocess.run(
+        ["git", "diff", "--cached", "-M", "--name-status", "--diff-filter=AD", "-z"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return {}
+    tokens = result.stdout.decode("utf-8", "surrogateescape").split("\0")
+    if tokens and tokens[-1] == "":
+        tokens.pop()
+    if len(tokens) % 2:
+        return {}
+    added: dict[str, list[str]] = {}
+    deleted: dict[str, list[str]] = {}
+    for status, path in zip(tokens[0::2], tokens[1::2]):
+        match = _TICKET_PATH_RE.match(path)
+        if status not in ("A", "D") or not match:
+            continue
+        (added if status == "A" else deleted).setdefault(match.group(1), []).append(path)
+    return {
+        path: deleted[tid][0]
+        for path, tid in unpaired.items()
+        if len(added.get(tid, ())) == 1 and added[tid][0] == path and len(deleted.get(tid, ())) == 1
+    }
+
+
+def _rename_map(changes: list[tuple[str, str | None]]) -> dict[str, str]:
+    """The `{destination: baseline source}` map every baselined check compares against:
+    git's `-M` renames, plus (T-4470) the ticket-id sources of `_ticket_id_sources`."""
+    sources = {path: source for path, source in changes if source is not None}
+    for path, source in _ticket_id_sources(changes).items():
+        sources.setdefault(path, source)
+    return sources
+
+
+def _staged_files() -> list[str]:
+    """Staged file paths (added / copied / modified / renamed -- a rename is listed
+    under its destination; deleted paths are not). See `_staged_changes`."""
+    return [path for path, _source in _staged_changes()]
 
 
 def _read_staged_blob(path: str) -> bytes | None:
     """Read the staged (index) blob for `path` via `git show :<path>`.
 
     Returns None if the path is not in the index (should not happen after
-    --diff-filter=ACM, but defensive).
+    --diff-filter=ACMR, but defensive).
     """
     result = subprocess.run(
         ["git", "show", f":{path}"],
@@ -125,10 +259,10 @@ def _warn_directive_drift(staged: list[str]) -> None:
 
     When rulebook/directives.md is staged, run the directive<->skill drift guard
     and surface any drift as a WARNING. The canonical pantheon-org-discipline
-    skill lives cross-repo (claude-config), so a pantheon-config commit usually
-    can't fix the drift in the same change — hence warn, not block. The blocking
-    gate is claude-config CI; this local hook just makes the staleness loud at
-    the moment directives.md moves.
+    skill lives in harness/claude/ since ORG-091 (T-4750; a fork may keep it in a
+    separate harness-config repo), and a directives.md change may land before its
+    skill update — hence warn, not block. This local hook just makes the
+    staleness loud at the moment directives.md moves.
     """
     if "rulebook/directives.md" not in staged:
         return
@@ -148,8 +282,8 @@ def _warn_directive_drift(staged: list[str]) -> None:
             if line.strip():
                 print(f"  {line}", file=sys.stderr)
         print(
-            "  -> update the pantheon-org-discipline skill in your harness-config repo "
-            "(e.g. claude-code-config) before workers rely on the new D-id. Commit is allowed. "
+            "  -> update the pantheon-org-discipline skill (harness/claude/skills/ in this repo, "
+            "or your fork's harness-config repo) before workers rely on the new D-id. Commit is allowed. "
             "(A fork without a harness-config repo gets a clean SKIP, not this warning — ORG-039 §4.)",
             file=sys.stderr,
         )
@@ -214,6 +348,83 @@ def _main_guard_lint_findings(staged: list[str]) -> list[str] | None:
                 "main-guard lint WARNING (non-blocking, fail-open): "
                 f"{path}: {exc.__class__.__name__}: {exc} — SKIPPING "
                 "main-guard lint for this file, commit allowed for it",
+                file=sys.stderr,
+            )
+            continue
+    return findings
+
+
+def _self_sudo_guard_findings(
+    staged: list[str], rename_sources: dict[str, str] | None = None
+) -> list[str] | None:
+    """Staged-blob self-sudo-guard lint (T-4032).
+
+    Flags a NEW per-seat `sudo -u <var>` construction that lacks an own-account
+    (getpass.getuser()/os.getuid()) guard — the self-sudo-to-own-account false-null class
+    (bugs/sudo-u-to-runners-own-account-fails-per-seat-cross-account-tool-false-null.md).
+    Pre-gate instances are grandfathered by the module's baseline, so only genuinely NEW
+    unguarded constructions block. Same fail-OPEN posture as `_main_guard_lint_findings`
+    (whole-module unavailable -> None; per-file error -> skip that file, keep real
+    findings on siblings), because this gates every seat's commits fleet-wide.
+
+    Only scans STAGED `tools/*.py` + `tools/*.sh` (the shell half, T-4066; never test_*
+    — the detector's own tests carry synthetic bad samples), via `_read_staged_blob`, so
+    a dirty tree can't block an unrelated commit.
+
+    T-4451: the baseline and ALLOWLIST are keyed by PATH, so a renamed file is
+    judged under the path it was renamed FROM (`rename_sources`, {dest: source}) --
+    otherwise a pure `git mv` of a grandfathered construction would read as a
+    brand-new unguarded one. Findings are still reported under the destination
+    path, and a construction the rename ADDS (a function not in the baseline) is
+    still flagged. No map (None) means no renames are known: every path is judged
+    under its own name.
+    """
+    targets = [p for p in staged
+               if p.startswith("tools/") and p.endswith((".py", ".sh"))
+               and not Path(p).name.startswith("test_")
+               and "tests" not in Path(p).parts[1:-1]]  # same test-dir skip as scan()
+    if not targets:
+        return []
+
+    try:
+        from tools.self_sudo_guard_lint import (
+            ALLOWLIST, lint_shell_source, lint_source, load_baseline)
+    except Exception as exc:  # fail-OPEN: whole module unavailable, nothing to scan
+        print(
+            "self-sudo-guard lint WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — self_sudo_guard_lint unavailable, "
+            "SKIPPING self-sudo-guard lint entirely, commit allowed",
+            file=sys.stderr,
+        )
+        return None
+
+    allowed = {rel for rel, _reason in ALLOWLIST}
+    try:
+        baseline = load_baseline(_REPO_ROOT)
+    except Exception:
+        baseline = frozenset()
+
+    sources = rename_sources or {}
+    findings: list[str] = []
+    for path in targets:
+        origin = sources.get(path, path)  # the path the baseline knows this file by
+        if path in allowed or origin in allowed:
+            continue
+        try:
+            blob = _read_staged_blob(path)
+            if blob is None:
+                continue
+            src = blob.decode("utf-8")
+            linter = lint_shell_source if path.endswith(".sh") else lint_source
+            for f in linter(src, origin, baseline=baseline):
+                findings.append(
+                    f"{path}:{f.lineno}  {f.func} — {f.detail}"
+                )
+        except Exception as exc:  # fail-OPEN per file
+            print(
+                "self-sudo-guard lint WARNING (non-blocking, fail-open): "
+                f"{path}: {exc.__class__.__name__}: {exc} — SKIPPING "
+                "self-sudo-guard lint for this file, commit allowed for it",
                 file=sys.stderr,
             )
             continue
@@ -400,6 +611,84 @@ def _instance_yaml_binding_findings(staged: list[str]) -> list[str] | None:
     return findings
 
 
+def _read_head_blob(path: str) -> bytes | None:
+    """HEAD's blob for `path` via `git show HEAD:<path>`; None if absent at HEAD
+    (a new file, or an unborn HEAD)."""
+    result = subprocess.run(
+        ["git", "show", f"HEAD:{path}"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return None
+    return result.stdout
+
+
+def _rename_source(path: str) -> str | None:
+    """The path `path` was renamed FROM in the staged diff, or None.
+
+    A fresh per-lookup `_staged_changes()` (never a module-level cache, which would
+    go stale across repos in a single test process). `main()` does NOT use this: it
+    computes the `{dest: source}` map once and threads it to the checks that need
+    it; this is the fallback for a caller that passes no map."""
+    return _rename_map(_staged_changes()).get(path)
+
+
+def _content_gate_findings(
+    staged: list[str], rename_sources: dict[str, str] | None = None
+) -> list[str] | None:
+    """Writer-side gate for the two content-coupled nightly invariants (T-4402).
+
+    When a staged path is a ticket file or `knowledge/watch/topics.md`, run the same
+    predicates the nightly's live-corpus tests use (ticket `project_id` justification;
+    active-topic TOPIC_POLICY registration) against the STAGED blobs, and refuse only a
+    violation INTRODUCED by this commit (compared with HEAD, following a rename to its
+    source). The logic lives in `tools/staged_content_gate.py`; this is the thin adapter.
+
+    `rename_sources` is the `{dest: source}` map `main()` computed once from the
+    staged diff (T-4451); None falls back to a per-lookup `_rename_source`.
+
+    Returns finding strings (empty = clean), or None when the gate itself could not
+    run (import failure or an unexpected crash) -- fail-OPEN, mirroring the other
+    findings functions: this hook gates every seat's commits, and a bug here must
+    never brick filing (T-1102 blast radius). Cheap-skips (`[]`, no import) when no
+    staged path is a ticket file or topics.md -- the overwhelmingly common commit.
+    """
+    if not any(
+        p == "knowledge/watch/topics.md" or (p.startswith("tickets/") and p.endswith(".md"))
+        for p in staged
+    ):
+        return []
+
+    try:
+        from tools.staged_content_gate import content_gate_findings
+    except Exception as exc:  # fail-OPEN: module unavailable, nothing to evaluate
+        print(
+            "content-drift gate WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — staged_content_gate unavailable, "
+            "SKIPPING the content-drift gate, commit allowed",
+            file=sys.stderr,
+        )
+        return None
+
+    try:
+        return content_gate_findings(
+            staged,
+            read_staged=_read_staged_blob,
+            read_head=_read_head_blob,
+            rename_source=_rename_source if rename_sources is None else rename_sources.get,
+            tickets_root=_REPO_ROOT / "tickets",
+        )
+    except Exception as exc:  # fail-OPEN: a genuine bug in the gate itself
+        print(
+            "content-drift gate WARNING (non-blocking, fail-open): "
+            f"{exc.__class__.__name__}: {exc} — SKIPPING the content-drift gate, "
+            "commit allowed",
+            file=sys.stderr,
+        )
+        return None
+
+
 def _hook_allowlist_drift() -> tuple[str, list[str]] | None:
     """Blocking hook<->allowlist pairing guard (T-1102).
 
@@ -419,10 +708,38 @@ def _hook_allowlist_drift() -> tuple[str, list[str]] | None:
         return None
 
 
+def _bugs_verification_findings() -> list[str]:
+    """T-4562: a bugs/*.md the commit ADDS must carry a `## Verification` section
+    (template-forward: modified legacy entries are not checked). The rule lives in
+    tools/bugs_entry_lint.py; this is the thin adapter. Fail-open on a git error."""
+    result = subprocess.run(
+        ["git", "diff", "--cached", "--name-only", "--diff-filter=A", "-z"],
+        capture_output=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return []
+    added = [p for p in result.stdout.decode("utf-8", "surrogateescape").split("\0") if p]
+    from tools.bugs_entry_lint import findings, is_entry
+
+    entries = {}
+    for path in added:
+        if not is_entry(path):
+            continue
+        blob = _read_staged_blob(path)
+        if blob is not None:
+            entries[path] = blob.decode("utf-8", "replace")
+    return findings(entries)
+
+
 def main() -> int:
     failures: list[str] = []
 
-    staged = _staged_files()
+    changes = _staged_changes()
+    staged = [path for path, _source in changes]
+    # {destination: rename source}, computed once (T-4451) for the checks that
+    # compare a renamed blob against its pre-rename identity.
+    rename_sources = _rename_map(changes)
     for path in staged:
         blob = _read_staged_blob(path)
         if blob is None:
@@ -440,9 +757,12 @@ def main() -> int:
         print(format_failure(drift[0], drift[1]), file=sys.stderr)
 
     main_guard_findings = _main_guard_lint_findings(staged)
+    self_sudo_guard_findings = _self_sudo_guard_findings(staged, rename_sources)
     ledger_validity_findings = _ledger_validity_findings(staged)
     priority_list_findings = _priority_list_validate_findings(staged)
     instance_yaml_findings = _instance_yaml_binding_findings(staged)
+    content_gate_findings = _content_gate_findings(staged, rename_sources)
+    bugs_verification_findings = _bugs_verification_findings()
 
     if failures:
         print("", file=sys.stderr)
@@ -471,6 +791,31 @@ def main() -> int:
             file=sys.stderr,
         )
         print("  Fix the file(s), re-stage, and retry.", file=sys.stderr)
+        print("", file=sys.stderr)
+        return 1
+
+    if self_sudo_guard_findings:
+        print("", file=sys.stderr)
+        print("self-sudo-guard lint violation — commit refused.", file=sys.stderr)
+        print("", file=sys.stderr)
+        for detail in self_sudo_guard_findings:
+            print(f"  {detail}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  A NEW per-seat `sudo -u <var>` construction lacks an own-account guard, so "
+            "it false-nulls on the runner's OWN seat. Special-case it:",
+            file=sys.stderr,
+        )
+        print(
+            "    Python: from seat_exec import seat_argv; argv = seat_argv(account, base)\n"
+            '    shell:  if [ "$(whoami)" = "$acct" ]; then cmd...; else sudo -n -u "$acct" cmd...; fi',
+            file=sys.stderr,
+        )
+        print(
+            "  (see bugs/sudo-u-to-runners-own-account-fails-per-seat-cross-account-tool-"
+            "false-null.md). Fix the file(s), re-stage, and retry.",
+            file=sys.stderr,
+        )
         print("", file=sys.stderr)
         return 1
 
@@ -525,8 +870,35 @@ def main() -> int:
         print("", file=sys.stderr)
         return 1
 
+    if content_gate_findings:
+        print("", file=sys.stderr)
+        print("content-drift gate — commit refused.", file=sys.stderr)
+        print("", file=sys.stderr)
+        for detail in content_gate_findings:
+            print(f"  {detail}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print(
+            "  This commit would turn the nightly CI run red (a content-coupled test "
+            "reads this data live). Fix the content, re-stage, and retry. For a ticket: "
+            "`python3 tools/ticket.py label add <id> <project_id>`.",
+            file=sys.stderr,
+        )
+        print("", file=sys.stderr)
+        return 1
+
+    if bugs_verification_findings:
+        print("", file=sys.stderr)
+        print("bugs/ entry lint — commit refused.", file=sys.stderr)
+        print("", file=sys.stderr)
+        for detail in bugs_verification_findings:
+            print(f"  {detail}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("  Add a '## Verification' section (T-4562), re-stage, and retry.", file=sys.stderr)
+        print("", file=sys.stderr)
+        return 1
+
     # Hook-allowlist pairing drift blocks the commit even with no HERMES/main-guard/
-    # ledger-validity/priority-list/instance.yaml-binding failure.
+    # ledger-validity/priority-list/instance.yaml-binding/content-drift failure.
     return 1 if drift is not None else 0
 
 

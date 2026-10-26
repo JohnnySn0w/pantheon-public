@@ -1,9 +1,13 @@
 [Unit]
-Description=Pantheon disk-usage monitor — hourly root-FS capacity probe (fleet-wedge-on-full prevention)
+Description=Pantheon disk-usage monitor — 15-min root-FS capacity probe (fleet-wedge-on-full prevention)
 Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
 
 [Timer]
-OnCalendar=*-*-* *:50:00
+# T-4850: every 15 min, not hourly. On 2026-10-10 / went 89% (01:50 check) -> 95%
+# (~02:40) -> back to 89% before the 02:50 check: a build can fill the last
+# headroom between hourly probes. Alerts stay throttled per class (6h cooldown),
+# so this shortens time-to-detect without adding pages. :05/:20/:35/:50 slots.
+OnCalendar=*-*-* *:05/15:00
 Persistent=true
 Unit=pantheon-disk-usage.service
 

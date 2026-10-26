@@ -127,6 +127,32 @@ def tearDownModule():
 '''
 
 
+CLEAN_ENTER_CONTEXT = '''
+import tempfile, unittest
+class TestX(unittest.TestCase):
+    def setUp(self):
+        self.tmp = self.enterContext(tempfile.TemporaryDirectory())
+'''
+
+CLEAN_ENTER_CLASS_CONTEXT = '''
+import tempfile, unittest
+class TestX(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = cls.enterClassContext(tempfile.TemporaryDirectory())
+'''
+
+LEAKY_ENTER_CONTEXT_ELSEWHERE = '''
+import tempfile, unittest
+class TestX(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+class TestY(unittest.TestCase):
+    def setUp(self):
+        self.ok = self.enterContext(tempfile.TemporaryDirectory())
+'''
+
+
 class TestLintSource(unittest.TestCase):
     def _scopes(self, src):
         return {(f.scope, f.factory) for f in thl.lint_source(src, "test_fix.py")}
@@ -145,6 +171,17 @@ class TestLintSource(unittest.TestCase):
 
     def test_teardown_rmtree_is_clean(self):
         self.assertEqual(thl.lint_source(CLEAN_TEARDOWN_RMTREE, "test_fix.py"), [])
+
+    def test_entercontext_is_clean(self):
+        # T-5312: orchestrator's #1096 REBOUND form failed the lint; addCleanup(tmp.cleanup) passed.
+        self.assertEqual(thl.lint_source(CLEAN_ENTER_CONTEXT, "test_fix.py"), [])
+
+    def test_enterclasscontext_is_clean(self):
+        self.assertEqual(thl.lint_source(CLEAN_ENTER_CLASS_CONTEXT, "test_fix.py"), [])
+
+    def test_entercontext_in_another_class_does_not_clear_a_leak(self):
+        f = thl.lint_source(LEAKY_ENTER_CONTEXT_ELSEWHERE, "test_fix.py")
+        self.assertEqual([x.scope for x in f], ["TestX"])
 
     def test_with_context_manager_is_clean(self):
         self.assertEqual(thl.lint_source(CLEAN_WITH_CONTEXT, "test_fix.py"), [])

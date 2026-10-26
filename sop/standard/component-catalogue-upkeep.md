@@ -1,6 +1,6 @@
 # Component catalogue upkeep — bounded periodic validation of the catalogue's records
 
-**Status:** Drafted 2026-08-26 by Orchestrator (HO) per T-3180 D2-writer contract; implements ORG-055 (`architecture/adr/ORG-055-project-repository-realization-and-compatibility-catalogue.md`) alongside the T-3181-landed component catalogue substrate. Rev-2 addresses T-3180 REBOUND (codex 2026-08-26). Awaiting the operator ratification.
+**Status:** Ratified 2026-10-07 by the operator (Telegram 11307, T-3282 walk: "as long as the sops read well and seem functionally correct, I have no objections"). Drafted 2026-08-26 by Orchestrator (HO) per T-3180 D2-writer contract; implements ORG-055 (`architecture/adr/ORG-055-project-repository-realization-and-compatibility-catalogue.md`) alongside the T-3181-landed component catalogue substrate. Rev-2 addresses T-3180 REBOUND (codex 2026-08-26).
 
 ## When to use this
 

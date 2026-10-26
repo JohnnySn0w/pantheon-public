@@ -43,7 +43,7 @@ proc = subprocess.Popen(
 
 `stdin=None` in Popen means "inherit parent stdin," which for the MCP server IS the stdio channel talking to Claude Code — codex reads it and blocks forever. Fixed in claude-config commit `ba38d9d` (T-3174) with `stdin=subprocess.DEVNULL` in the no-context path.
 
-Empirical evidence pre-fix: three consecutive `codex_second_opinion` health probes with no context_path timed out at 60s, 180s, 300s from the claude seat, while Cairn's direct codex probe from the codex seat (bash-child, stdin naturally closed) returned in 17.16s.
+Empirical evidence pre-fix: three consecutive `codex_second_opinion` health probes with no context_path timed out at 60s, 180s, 300s from the claude seat, while Consultant's direct codex probe from the codex seat (bash-child, stdin naturally closed) returned in 17.16s.
 
 ## Relation
 

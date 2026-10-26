@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from math import isfinite
 from typing import Literal, Mapping, Protocol
 from zoneinfo import ZoneInfo
@@ -24,6 +25,35 @@ class QuotaWindow:
     resets_at: datetime
 
 
+BalanceBand = Literal["ok", "low", "exhausted", "unknown"]
+
+
+@dataclass(frozen=True)
+class BalanceReading:
+    """A prepaid provider balance (T-4924 plan D-7): no reset, so not a window.
+
+    Amounts are ``Decimal`` parsed from the provider's string values; a reading
+    is per currency, and the observer picks the one its thresholds name.
+    """
+
+    is_available: bool
+    currency: str
+    total: Decimal
+    granted: Decimal
+    topped_up: Decimal
+    observed_at: datetime
+
+
+@dataclass(frozen=True)
+class BalanceThresholds:
+    """Absolute, per-currency thresholds from the manifest (plan §4.3)."""
+
+    currency: str
+    low_water: Decimal
+    hard_floor: Decimal
+    burn_alarm_24h: Decimal | None = None
+
+
 @dataclass(frozen=True)
 class QuotaSnapshot:
     profile: str
@@ -31,6 +61,8 @@ class QuotaSnapshot:
     observed_at: datetime
     freshness: QuotaFreshness
     evidence: Mapping[str, str] = field(default_factory=dict)
+    # T-5005 (T-4924 H1): optional prepaid balance; None for windowed providers.
+    balance: BalanceReading | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +82,35 @@ class PrimaryHealthProbe:
 class QuotaObserver(Protocol):
     def read(self) -> QuotaSnapshot:
         ...
+
+
+def classify_balance(
+    reading: BalanceReading | None,
+    thresholds: BalanceThresholds | None,
+) -> BalanceBand:
+    """Band a prepaid balance against absolute thresholds (T-4924 plan §3.2 gap 1).
+
+    exhausted: ``is_available`` false, or total at/below ``hard_floor``.
+    low: below ``low_water``. ok: otherwise. unknown: no reading, no
+    thresholds, a currency mismatch, or a non-finite/inconsistent amount.
+    Pure: the H2 ``classify_snapshot`` balance branch maps the band to a
+    usability verdict.
+    """
+
+    if reading is None or thresholds is None:
+        return "unknown"
+    if reading.currency != thresholds.currency:
+        return "unknown"
+    values = (reading.total, thresholds.low_water, thresholds.hard_floor)
+    if not all(isinstance(v, Decimal) and v.is_finite() for v in values):
+        return "unknown"
+    if thresholds.hard_floor > thresholds.low_water:
+        return "unknown"
+    if not reading.is_available or reading.total <= thresholds.hard_floor:
+        return "exhausted"
+    if reading.total < thresholds.low_water:
+        return "low"
+    return "ok"
 
 
 _WEEKLY_WINDOW_NAMES = frozenset(
@@ -192,3 +253,31 @@ def next_weekly_reset(
     if candidate <= local_now:
         candidate += timedelta(days=7)
     return candidate.astimezone(timezone.utc)
+
+
+#: T-5011 PR-B (T-4924 plan §3.2 gap 2, artisan ruling 2): a prepaid-balance
+#: harness has no weekly reset. Its cap ceiling is a re-probe interval, so a
+#: top-up is noticed within it (a 402 every 15 min costs nothing). The usability
+#: re-probe ceiling (subscription_usability.REPROBE_CEILING_SECONDS) uses the
+#: same value.
+PREPAID_REPROBE_CEILING_SECONDS: Mapping[HarnessName, float] = {"hermes": 15 * 60.0}
+
+
+def cap_reset_ceiling(
+    harness: HarnessName,
+    *,
+    now: datetime,
+    schedule: Mapping[HarnessName, WeeklyResetSchedule] = HARNESS_WEEKLY_RESET_SCHEDULE,
+) -> datetime:
+    """The latest instant a subscription cap on ``harness`` can still hold.
+
+    A scheduled harness (claude, codex) returns ``next_weekly_reset`` unchanged.
+    A prepaid harness (hermes) returns ``now`` plus its re-probe ceiling. Any
+    other harness raises ``KeyError``, as ``next_weekly_reset`` always did.
+    """
+
+    if harness in schedule:
+        return next_weekly_reset(harness, now=now, schedule=schedule)
+    if harness in PREPAID_REPROBE_CEILING_SECONDS:
+        return _as_aware_utc(now) + timedelta(seconds=PREPAID_REPROBE_CEILING_SECONDS[harness])
+    raise KeyError(harness)

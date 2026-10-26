@@ -1,0 +1,11 @@
+[Unit]
+Description=Headless billing canary — daily 06:23 UTC (one tiny Haiku turn plus the zero-cost /usage read)
+Documentation=file:///home/%u/pantheon-config/knowledge/episodic/2026-09-21-billing-quota-anomaly-cluster.md
+
+[Timer]
+OnCalendar=*-*-* 06:23:00 UTC
+Persistent=true
+Unit=pantheon-headless-billing-canary.service
+
+[Install]
+WantedBy=timers.target

@@ -7,7 +7,7 @@ The goal-anchored rule framework: goals + principles + directives + policies. OR
 | File / Folder | Tier | Owns | Amendment authority |
 |---|---|---|---|
 | `goals.md` | Tier 0 (north stars) | What the org is FOR — terminal goals, few, slow-moving. Layer-2 arc-intents live on work artifacts, not here (ORG-034). | North-star lines: the operator's verbatim. Structure/phase lines: HO-maintained operational fact. |
-| `principles.md` | Tier 1 (durable) | Org-level identity rules — what we *are*; rare amendment. | Amendment via ADR; post-msg-3733: Adopted under justification, the operator digested (goal-level changes stay his). |
+| `principles.md` | Tier 1 (durable) | Org-level identity rules — what we *are*; rare amendment. | Amendment via ADR, which the operator reviews before adoption (D3's ADR human-review gate, TG 1887). Principles are goal-level: "my personal taste IS the principles" (msg 3733). |
 | `directives.md` | Tier 2 (scoped) | Project-calibrated rules — what we *do*; amend when scope shifts (D-N entries dated + scoped). | Post-msg-3733: HO adopts amendments under P/D justification with digest; pre-3733 entries were operator-ratified. |
 | `policies/` | Tier 3 (operational) | Operational calibrations of directives — concrete enforceable ops-tier rules. | HO-authored under D2; Adopted-with-digest per msg-3733. |
 
@@ -21,9 +21,9 @@ The goal-anchored rule framework: goals + principles + directives + policies. OR
 
 | You want to add… | Where it lives | Authoring |
 |---|---|---|
-| A new durable rule defining what Pantheon *is* | `principles.md` (new `P<N>` entry) | Drafted; the operator ratification required. |
-| A new project-calibrated rule with scope/date | `directives.md` (new `D<N>` entry) | Drafted; the operator ratification required. |
-| A new operational calibration of an existing directive | `policies/<name>.md` (new file per policy) | HO drafts under D2; surface for ratification when ready. |
+| A new durable rule defining what Pantheon *is* | `principles.md` (new `P<N>` entry) | Drafted as an ADR; the operator reviews before adoption (goal-level, D3). |
+| A new project-calibrated rule with scope/date | `directives.md` (new `D<N>` entry) | HO adopts under P/D justification, ledgered and reported in the operator's digest (D3 as amended 2026-06-11, msg 3733). A directive that sets a goal-level rule (D3's reserved list) goes to the operator. |
+| A new operational calibration of an existing directive | `policies/<name>.md` (new file per policy) | HO authors under D2 and adopts with a digest line (msg 3733); status reads Adopted. |
 
 ## Per-policy file shape
 
@@ -41,7 +41,7 @@ Sections: Context → Policy → Boundary → Re-evaluate when → Related.
 
 ## Founding policies (migrated from `notes/` per T-0191)
 
-- `policies/autonomy.md` — inbox auto-consumer gating + activity-digest cadence.
+- `policies/autonomy.md` — inbox auto-consumer gating (activity-digest cadence retired 2026-09-29, T-4289).
 - `policies/trust-posture.md` — HO direct-action calibration of D3.
 
 ## Auto-index

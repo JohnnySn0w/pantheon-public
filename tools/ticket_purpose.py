@@ -40,10 +40,12 @@ class AppetiteError(PurposeError):
 # positive sub-scores, per D-E). Bounds are inclusive.
 APPETITE_MIN = 1
 APPETITE_MAX = 10
-# The two ORG-021-frontmatter substates this ADR adds. `None`/absent is the
-# normal case; any other value is refused (fail-loud on an unknown substate so
-# a typo cannot silently disable the enforcement gate).
-VALID_SUBSTATES = frozenset({"appetite-overrun", "dropped"})
+# The frontmatter substates registered so far: `appetite-overrun` and `dropped`
+# from this ORG-021/ORG-089 ADR, plus `awaiting-merge` (T-4119 — a work-complete
+# ticket parked awaiting the HO-exclusive merge; see sop/standard/ticket-flow.md).
+# `None`/absent is the normal case; any other value is refused (fail-loud on an
+# unknown substate so a typo cannot silently disable the enforcement gate).
+VALID_SUBSTATES = frozenset({"appetite-overrun", "dropped", "awaiting-merge"})
 # §Decision.4e applicability: hygiene labels + the goal-neutral maintenance
 # serves marker that route a ticket to the medium-default rather than a refusal.
 HYGIENE_LABELS = frozenset({"hygiene", "chore", "cleanup", "noodle", "noop"})
@@ -125,6 +127,14 @@ def validate_appetite_fields(fields: Mapping[str, object]) -> None:
             raise AppetiteError("substate: dropped requires a non-empty dropped_reason")
 
 
+# The canonical `role:<RoleId>` target shape. RETAINED after the ORG-088 D-4
+# work_domain/delegation routing-validation was removed (rev-2 filter-at-pull-time,
+# T-3789): rev-2 KEEPS role:<R> targets, so this shape is still the single source
+# of truth for the role-target syntax. Lazily imported at runtime by ticket_lint
+# (role-target detection) and mirrored byte-for-byte by ticket._ROLE_TARGET_RE.
+ROLE_TARGET_RE = re.compile(r"^role:[a-z][a-z0-9_]*$")
+
+
 # ADR id shapes. ORG-NNN is always agent-authored (non-vault). ADR-NNN is
 # vault (operator-authored) below the agent floor; the default grooming/file
 # scan scope (pantheon-config + echo-prismatic) uses 200 (Q4-confirmed; the
@@ -182,9 +192,13 @@ class PurposeIssue:
 
 AUTOMATED_FILER_EXPECTATIONS: Mapping[str, int] = {
     "tools/adr_reeval_walk.py": 1,
+    "tools/episode_store.py": 1,  # T-4707 / ORG-076 BT1: runtime repair-ticket emission
     "tools/grand_project_program.py": 1,
     "tools/knowledge_sweep.py": 1,
+    "tools/operator_decision_sweep.py": 1,  # T-5015 phase 2
+    "tools/operator_decision_throughline.py": 1,  # T-5015 phase 3
     "tools/mirror_drift_sweep.py": 1,
+    "tools/parity_audit_runner.py": 1,
     "tools/s3star_audit_runner.py": 2,
     "tools/soak_filer.py": 1,
     "tools/watch_runner.py": 5,
@@ -225,22 +239,41 @@ def parse_intent_ref(raw: str) -> IntentRef:
 
 
 def _load_frontmatter(path: Path) -> Mapping[str, object]:
-    text = path.read_text(encoding="utf-8")
+    return _parse_frontmatter_text(path.read_text(encoding="utf-8"), str(path))
+
+
+def _parse_frontmatter_text(text: str, label: str) -> Mapping[str, object]:
+    """Parse ticket frontmatter from TEXT; `label` names the source in errors.
+
+    Split out of `_load_frontmatter` (T-4402) so a caller that holds the text
+    but no file (a staged blob in the pre-commit content gate) runs the SAME
+    parser the live-corpus loader does."""
     if not text.startswith("---\n"):
-        raise PurposeError(f"{path}: missing frontmatter")
+        raise PurposeError(f"{label}: missing frontmatter")
     end = text.find("\n---", 4)
     if end < 0:
-        raise PurposeError(f"{path}: missing closing frontmatter delimiter")
+        raise PurposeError(f"{label}: missing closing frontmatter delimiter")
     fields: dict[str, object] = {}
-    for raw_line in text[4:end].splitlines():
+    fm_lines = text[4:end].splitlines()
+    idx = 0
+    while idx < len(fm_lines):
+        raw_line = fm_lines[idx]
+        idx += 1
         if not raw_line.strip():
             continue
         match = re.match(r"^([a-z_][a-z0-9_]*):\s*(.*)$", raw_line.rstrip())
         if match is None:
-            raise PurposeError(f"{path}: cannot parse frontmatter line {raw_line!r}")
+            raise PurposeError(f"{label}: cannot parse frontmatter line {raw_line!r}")
         key, raw = match.group(1), match.group(2).strip()
         if key in fields:
-            raise PurposeError(f"{path}: duplicate frontmatter key {key!r}")
+            raise PurposeError(f"{label}: duplicate frontmatter key {key!r}")
+        if raw == "|" and key == "evidence_snapshot":
+            # T-4707 / RFC-004 section 3(a): ORG-076 runtime repair tickets carry a YAML `|`
+            # block scalar. Purpose does not use it; consume the indented continuation lines.
+            while idx < len(fm_lines) and (not fm_lines[idx].strip() or fm_lines[idx].startswith("  ")):
+                idx += 1
+            fields[key] = "<block>"
+            continue
         if raw == "" or raw.lower() == "null":
             value: object = None
         elif raw.startswith("[") and raw.endswith("]"):
@@ -299,30 +332,85 @@ def load_ticket_purpose_index(tickets_root: Path) -> dict[str, TicketPurpose]:
         if not state_root.is_dir():
             continue
         for path in sorted(state_root.glob("T-*.md")):
-            fields = _load_frontmatter(path)
-            ticket_id = _optional_scalar(fields, "id")
-            if ticket_id is None or not TICKET_ID_RE.fullmatch(ticket_id):
-                raise PurposeError(f"{path}: invalid ticket id")
-            if ticket_id in purposes:
-                raise PurposeError(f"duplicate ticket id: {ticket_id}")
-            raw_labels = fields.get("labels") or []
-            if not isinstance(raw_labels, list) or any(
-                not isinstance(label, str) for label in raw_labels
-            ):
-                raise PurposeError(f"{path}: labels must be a string list")
-            project_id = _optional_scalar(fields, "project_id")
-            if project_id is not None and not PROJECT_ID_RE.fullmatch(project_id):
-                raise PurposeError(f"{path}: invalid project_id {project_id!r}")
-            purposes[ticket_id] = TicketPurpose(
-                ticket_id=ticket_id,
-                project_id=project_id,
-                project_id_present="project_id" in fields,
-                nearest_intent_ref=_optional_scalar(fields, "nearest_intent_ref"),
-                serves=_optional_scalar(fields, "serves"),
-                labels=frozenset(label.strip() for label in raw_labels if label.strip()),
-                state=str(fields.get("state") or state),
-            )
+            purpose = _purpose_from_fields(_load_frontmatter(path), str(path), state)
+            if purpose.ticket_id in purposes:
+                raise PurposeError(f"duplicate ticket id: {purpose.ticket_id}")
+            purposes[purpose.ticket_id] = purpose
     return purposes
+
+
+def _purpose_from_fields(
+    fields: Mapping[str, object], label: str, default_state: str
+) -> TicketPurpose:
+    ticket_id = _optional_scalar(fields, "id")
+    if ticket_id is None or not TICKET_ID_RE.fullmatch(ticket_id):
+        raise PurposeError(f"{label}: invalid ticket id")
+    raw_labels = fields.get("labels") or []
+    if not isinstance(raw_labels, list) or any(
+        not isinstance(item, str) for item in raw_labels
+    ):
+        raise PurposeError(f"{label}: labels must be a string list")
+    project_id = _optional_scalar(fields, "project_id")
+    if project_id is not None and not PROJECT_ID_RE.fullmatch(project_id):
+        raise PurposeError(f"{label}: invalid project_id {project_id!r}")
+    return TicketPurpose(
+        ticket_id=ticket_id,
+        project_id=project_id,
+        project_id_present="project_id" in fields,
+        nearest_intent_ref=_optional_scalar(fields, "nearest_intent_ref"),
+        serves=_optional_scalar(fields, "serves"),
+        labels=frozenset(item.strip() for item in raw_labels if item.strip()),
+        state=str(fields.get("state") or default_state),
+    )
+
+
+def purpose_from_text(text: str, *, source: str, default_state: str) -> TicketPurpose:
+    """Parse ONE ticket file's text into a `TicketPurpose`, with the same parser
+    and field rules as `load_ticket_purpose_index` (T-4402).
+
+    For callers that hold ticket text but no file: the pre-commit content gate
+    reads a staged blob (and the HEAD blob) rather than the working tree.
+    `source` only labels errors; `default_state` applies when the frontmatter
+    carries no `state` (the loader passes the directory name).
+    """
+    return _purpose_from_fields(_parse_frontmatter_text(text, source), source, default_state)
+
+
+def project_id_justified(
+    purpose: TicketPurpose, index: Mapping[str, TicketPurpose]
+) -> bool:
+    """True iff `purpose.project_id` is None, appears in `purpose.labels`
+    (exact match), or a `ticket:`-chain walk via `nearest_intent_ref` reaches
+    an ancestor ticket carrying the same `project_id`.
+
+    This is the single source of truth for T-4080/T-4090's project_id
+    justification rule: shared by the live-corpus test
+    (test_initial_backfill_never_infers_project_from_repo_or_persona) and by
+    ticket.py's file-time / purpose-set / label-remove enforcement, so the
+    two paths never drift into disagreement the way they did in T-4080 (a
+    filing landed project_id without either justification path holding, and
+    only the test caught it -- after main was already red).
+
+    Pure; no I/O. `index` is caller-supplied so a not-yet-persisted
+    candidate ticket can be checked against the live on-disk corpus.
+    """
+    if purpose.project_id is None:
+        return True
+    if purpose.project_id in purpose.labels:
+        return True
+    seen: set[str] = set()
+    current = purpose
+    while current.nearest_intent_ref and current.nearest_intent_ref.startswith(
+        "ticket:"
+    ):
+        parent_id = current.nearest_intent_ref.split(":", 1)[1]
+        if parent_id in seen or parent_id not in index:
+            return False
+        seen.add(parent_id)
+        current = index[parent_id]
+        if current.project_id == purpose.project_id:
+            return True
+    return False
 
 
 def _chain_issue(

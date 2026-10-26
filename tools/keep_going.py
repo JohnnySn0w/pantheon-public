@@ -36,7 +36,7 @@ Disable with KEEP_GOING_ADAPTIVE=0 (reverts to legacy nudge-every-idle-cycle).
 QUEUE-AWARE FLOOR (T-1926). This docstring used to justify the hard backoff by asserting
 "real *queued* work is already covered by activity_monitor P1.a" — that premise was FALSE
 for the ORG-043 seats and is removed rather than reworded: activity_monitor.AGENT_CONFIG
-enumerates ONLY orchestrator, so no P1.a net exists for metis/atlas (nor specialist/recovery, who are not
+enumerates ONLY orchestrator, so no P1.a net exists for mason/artisan (nor specialist/recovery, who are not
 exposed because their ledger cadence keeps this module's own signal live). A seat parked
 mid-arc produced no ledger entries, so every nudge scored ineffective, the wait doubled to
 the 2^cap ceiling (~8 h), and the net that supposedly justified that ceiling did not cover
@@ -52,6 +52,13 @@ three is a separate call, not a side effect of T-1926).
 The idle/busy sentinels mirror inbox_consumer._WEDGE_* (T-0716) — kept as a small local
 copy so this script stays self-contained and import-side-effect-free (parallel + separate,
 per the directive). If those sentinels drift, update both.
+
+FLEET USAGE GATE (T-4510, the operator TG 10709). T-2024's cap check above only fires AFTER a
+cap is hit. At >=95% (configurable) of the fleet's SHARED weekly Max the periodic nudge
+pauses BEFORE the cap and resumes by itself at the reset, so the last slice is not burned on
+make-work and the fleet is not left capped for days. It rides the same `do_cap_check` seam
+(default `cap_or_usage_gate`), reads tools/fleet_usage_gate.py, fails open on every unknown,
+and logs each suppression once per window. Recovery pokes never consult it.
 
 DELIVERY FLAG (T-1827 R1, per knowledge/episodic/2026-07-20-producer-repoint-mailbox-design/
 notes.md §5 R1): the nudge's DECISION logic (idle-gate + adaptive backoff) is unchanged for
@@ -80,13 +87,19 @@ try:  # run-as-script (python3 tools/keep_going.py): tools/ on sys.path[0]
 except ImportError:  # run-as-package (import tools.keep_going)
     from tools import agent_role_map
 
-# Dual-identity-safe import (mirrors acp_bridge.py / ancestor_consume.py / mailbox.py's
+# Dual-identity-safe import (mirrors acp_bridge.py / mailbox.py's
 # own _lease import): `python -m unittest discover tools` (package identity
 # tools.mailbox) and a bare run from inside tools/ both resolve to ONE module object.
 try:
     from tools import mailbox
 except ImportError:  # bare run with cwd=tools/
     import mailbox  # type: ignore
+
+# ORG-106 L2 (T-5525): the one seat-state reader.
+try:
+    from tools import seat_state as _seat_state
+except ImportError:  # bare run with cwd=tools/
+    import seat_state as _seat_state  # type: ignore
 
 # T-2024: reuse T-1980's cap detectors (detect_capability_cap +
 # detect_consent_fallback) so the injector can SKIP nudging a usage/capability-
@@ -96,6 +109,13 @@ try:
     from tools import context_fill_monitor as _cfm
 except ImportError:  # bare run with cwd=tools/
     import context_fill_monitor as _cfm  # type: ignore
+
+# T-4510: fleet usage gate (>=95% of the shared weekly Max => periodic nudges pause until
+# the reset). Stdlib-only module; same dual-import shape as the imports above.
+try:
+    from tools import fleet_usage_gate as _fug
+except ImportError:  # bare run with cwd=tools/
+    import fleet_usage_gate as _fug  # type: ignore
 
 AGENT_PANE = {
     "orchestrator": {
@@ -121,8 +141,8 @@ AGENT_PANE = {
         "ledger_agent_id": "recovery",
         "projects_dir": agent_role_map.live_session_projects_dir("claude-fallback"),
     },
-    # Metis + Atlas (ORG-043 sub-orchestrator seats), added 2026-07-21: their
-    # bringup armed pantheon-keep-going@{metis,atlas}.timer (T-1896) but this map
+    # Mason + Artisan (ORG-043 sub-orchestrator seats), added 2026-07-21: their
+    # bringup armed pantheon-keep-going@{mason,artisan}.timer (T-1896) but this map
     # never gained the seats, so every fire died at argparse choices= — heartbeat
     # dead since bringup, silently (no OnFailure wiring on the seat units either).
     # Pane targets mirror mailbox_wake.AGENT_PANE; plain claude TUIs, no bridge.
@@ -132,21 +152,21 @@ AGENT_PANE = {
     # behaviour. `ticket_targets` mirrors activity_monitor.AGENT_CONFIG's key of the same
     # name — a ticket may address either the persona or the audit role-id, so both forms
     # are listed (identical for the seats, which is why each set has one member).
-    "metis": {
+    "mason": {
         "pane_target": "suborch1-main:0", "unix_user": "suborch1",
         "pantheon_config_path": "/home/suborch1/pantheon-config",
-        "ledger_agent_id": "metis",
+        "ledger_agent_id": "mason",
         "projects_dir": agent_role_map.live_session_projects_dir("suborch1"),
         "queue_aware_backoff": True,
-        "ticket_targets": frozenset({"metis"}),
+        "ticket_targets": frozenset({"mason"}),
     },
-    "atlas": {
+    "artisan": {
         "pane_target": "suborch2-main:0", "unix_user": "suborch2",
         "pantheon_config_path": "/home/suborch2/pantheon-config",
-        "ledger_agent_id": "atlas",
+        "ledger_agent_id": "artisan",
         "projects_dir": agent_role_map.live_session_projects_dir("suborch2"),
         "queue_aware_backoff": True,
-        "ticket_targets": frozenset({"atlas"}),
+        "ticket_targets": frozenset({"artisan"}),
     },
 }
 
@@ -154,29 +174,34 @@ AGENT_PANE = {
 #
 # MAPPED-OR-EXEMPT. Keep in lockstep with AGENT_PANE: the coverage test fails if a
 # registry persona is in neither, or in both. Same shape as
-# `mailbox_mcp._NO_MCP_RECIPIENT` (T-2285), `ancestor_consume._NO_REPLY_INBOX`
-# (T-2252) and `inbox_consumer.DELIVERY_EXEMPT` (T-2144). The defect class this
-# closes is SILENCE, not absence: before this, AGENT_PANE simply lacked mnemosyne
+# `mailbox_mcp._NO_MCP_RECIPIENT` (T-2285) and `inbox_consumer.DELIVERY_EXEMPT`
+# (T-2144). The defect class this
+# closes is SILENCE, not absence: before this, AGENT_PANE simply lacked archivist
 # and nothing in the code could tell a deliberate exclusion from the stale omission
-# that had already cost metis and atlas a dead heartbeat from bringup (see the
+# that had already cost mason and artisan a dead heartbeat from bringup (see the
 # comment above their entries). An exclusion is fine; an unexplained one is not.
 _NO_KEEP_GOING: dict[str, str] = {
-    "mnemosyne": (
-        "EXEMPT, not stale — checked at T-2370 rather than assumed. Three "
-        "independent reasons, any one sufficient: (1) NO pantheon-keep-going@"
-        "mnemosyne.timer is armed anywhere on the box — the only armed instance is "
-        "@orchestrator — so an AGENT_PANE entry would assert a coverage that nothing "
-        "delivers, which is worse than the honest absence. (2) ORG-042 puts the "
-        "second head in a SEPARATE instance under the `exocortex` user, and their "
-        "wake/inbox-consumer timers install in THEIR user manager during their own "
-        "harness bringup — hub-side maps only ready their config (see "
-        "mailbox_wake.AGENT_PANE's mnemosyne note). (3) They are spawn-gated, so "
-        "their pane is legitimately ABSENT much of the time; mailbox_wake documents "
-        "that 'mnemosyne's absent pane' returns UNKNOWN and must not trigger a wake. "
-        "REVISIT THIS if a keep-going timer is ever armed for them — at that point "
-        "the metis/atlas failure (timer armed, map missing the seat, every fire "
-        "dying at argparse choices=) is reproduced exactly, and the fix is to move "
-        "her from here into AGENT_PANE."
+    "archivist": (
+        "EXEMPT — re-affirmed T-3811 (2026-09-19) and T-3832 (2026-09-20), both "
+        "operator-directed + orchestrator-designed, not assumed. (1) keep-going anti-idle "
+        "nudging is REDUNDANT for her: she is an event-driven second head whose "
+        "wake/liveness comes on new mail, not from an idle timer. As of T-3832 that "
+        "wake is the standalone pantheon-mailbox-wake@archivist.timer (2min) — the "
+        "SAME mailbox_wake->main-seat path the now-retired ACP bridge used in its "
+        "--prefer-main-seat mode (T-3811); the wake TOPOLOGY is unchanged, only its "
+        "trigger (a timer, not a poll-loop-plus-2nd-claude). That IS the ORG-042 "
+        "second-head heartbeat, not a keep-going timer. (2) ORG-042 puts the second "
+        "head in a SEPARATE instance under the `exocortex` user; her wake/"
+        "inbox-consumer units install in HER user manager during her own harness "
+        "bringup — hub-side maps only ready her config. (3) HISTORY (do not re-arm): "
+        "archivist MANUALLY armed pantheon-keep-going@archivist on 2026-09-19 trying "
+        "to get a heartbeat flowing; it exit-2'd at argparse choices= (this map "
+        "lacks her), tripped OnFailure, and she reverted it — the exact mason/artisan "
+        "failure this registry documents. She is a persistent, capturable "
+        "claude-code session (the old 'spawn-gated ABSENT pane' reason was retired "
+        "T-3811). REVISIT (move her here -> AGENT_PANE) ONLY under a real "
+        "wakeability-topology change, which is operator-ratify per orchestrator; the "
+        "mailbox-wake timer is her heartbeat."
     ),
     "codex": (
         "EXEMPT — different harness, not a different opinion. codex is an OpenAI "
@@ -188,12 +213,13 @@ _NO_KEEP_GOING: dict[str, str] = {
         "so a codex entry here would silently report success while nudging nothing. "
         "Supporting it means teaching this module the harness profile first."
     ),
-    "the-ancestor": (
-        "EXEMPT — not a ticket-working seat. It is the mailbox hub (ORG-026): a "
-        "channel-less standing session that consumes its own mailbox in-session. It "
-        "holds no ticket queue and files no ledger entries, so both this module's "
-        "idle-gate signal and its queue-aware floor are undefined for it. Nothing "
-        "to keep going."
+    "watchman": (
+        "EXEMPT — same harness reason as codex (T-4884 B6): watchman is a codex-CLI "
+        "seat (codex-fallback), and this module's delivery path assumes the Claude "
+        "Code submit profile, so a nudge would false-pass. Also by design: it takes "
+        "only recovery tickets and is woken by its deterministic watcher and its "
+        "mailbox, not an anti-idle timer (design note §3/§4: Claude-coupled monitors "
+        "are not armed on this seat)."
     ),
 }
 
@@ -204,14 +230,16 @@ _NO_KEEP_GOING: dict[str, str] = {
 # call site — never KeyError. Rollback = flip the entry back.
 DELIVERY_MODE = {
     "orchestrator": "send-keys",
-    "specialist": "mailbox",
+    # specialist consolidated to send-keys 2026-09-20 (T-3832, the operator TG 7231): the ACP
+    # second-claude was drift; specialist is claude + delivered via persona-consume into
+    # its own pane. Rollback = flip back to "mailbox" + restart pantheon-acp-bridge@specialist.
+    "specialist": "send-keys",
     "recovery": "send-keys",
 }
 
-# Mirrors mailbox_wake.MAILBOX_HUB (ORG-026 Path A hub convention) — kept as a small
-# local copy for the same self-contained-import reason as the idle/busy sentinels
-# above; if the hub path drifts, update both.
-MAILBOX_HUB = Path("/home/the-ancestor/mailbox")
+# ORG-026 Path A hub — instance.yaml's mailbox.hub via agent_role_map (T-4096), the
+# same value mailbox_wake.MAILBOX_HUB resolves, so an ORG-087 move is a manifest flip.
+MAILBOX_HUB = Path(agent_role_map.mailbox_hub())
 
 # Adaptive-backoff knobs (env-overridable). Default ON per the operator's TG 3508.
 ADAPTIVE = os.environ.get("KEEP_GOING_ADAPTIVE", "1") != "0"
@@ -245,25 +273,17 @@ _DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "pantheon"
 
 _SEND_KEYS_HELPER = Path(__file__).resolve().parent / "send_keys_submit.sh"
 
-# Mirrors inbox_consumer._WEDGE_LIVENESS_SENTINELS / _WEDGE_DIALOG_FOOTERS (T-0716).
+# Originally mirrored inbox_consumer._WEDGE_LIVENESS_SENTINELS / _WEDGE_DIALOG_FOOTERS
+# (T-0716). The liveness source was retired in T-4203, so these local tokens are now
+# canonical; _WEDGE_DIALOG_FOOTERS still lives in inbox_consumer.
 _BUSY = "esc to interrupt"                                   # actively generating
-# Parked-at-prompt footer hints. Claude Code shows DIFFERENT footers depending on
-# whether a task list exists and is shown/hidden:
-#   - no task list           → "? for shortcuts"
-#   - task list shown         → "ctrl+t to hide tasks"
-#   - task list HIDDEN        → "ctrl+t to show tasks"   ← was MISSING (T-1364 follow-up)
-# The missing "show tasks" variant made an idle orchestrator (which keeps a hidden task
-# list) read as inconclusive every cycle, so keep_going never nudged it — the gap
-# that left orchestrator parked after the 2026-06-28 weekly-cap reset until the operator
-# manually re-prompted. Busy is checked FIRST, so a "ctrl+t to … tasks" footer that
-# coexists with "esc to interrupt" still correctly reads as busy.
-_IDLE_HINTS = ("? for shortcuts", "ctrl+t to hide tasks", "ctrl+t to show tasks")
-_DIALOG_FOOTERS = (
-    "Esc to cancel · Tab to amend",
-    "Enter to confirm · Esc to cancel",
-    "Enter to confirm · Esc to exit",
-)
-_BOTTOM_REGION_LINES = 6  # Claude Code's working-status block height (inbox_consumer)
+_BOTTOM_REGION_LINES = 6  # Claude Code's working-status block height (is_generating only)
+
+# T-4432: after a failed send-keys nudge, re-read the pane this many times, this far apart,
+# before calling it a failure. Same numbers and reasoning as mailbox_wake's T-4120 re-check:
+# one sample can land in the brief unclassifiable submit->generate transition.
+RECHECK_SAMPLES = 4
+RECHECK_INTERVAL_SECS = 1.0
 
 DEFAULT_PROMPT = (
     "Please keep going. Continue the next step of your in-flight task or pick up your "
@@ -276,30 +296,46 @@ DEFAULT_PROMPT = (
 
 
 # ----------------------------------------------------------------------- idle gate
+def _inbox_consumer():
+    """Lazy import of the canonical pane classifier (package vs script, as
+    activity_monitor._pane_idle_probe does)."""
+    try:
+        from tools import inbox_consumer as ic  # run-as-package / tests
+    except ImportError:
+        import inbox_consumer as ic  # run-as-script (prod)
+    return ic
+
+
 def is_idle_at_prompt(pane: str) -> bool | None:
-    """Tri-state on the pane's live bottom region:
+    """Tri-state on the pane's live bottom region (T-5435: delegated).
       True  — parked idle prompt (safe to nudge),
-      False — busy ("esc to interrupt") or a modal footer owns the bottom (skip),
-      None  — inconclusive / empty capture (fail safe → skip).
-    """
-    non_blank = [ln for ln in pane.splitlines() if ln.strip()]
-    if not non_blank:
-        return None
-    bottom = "\n".join(non_blank[-_BOTTOM_REGION_LINES:])
-    if any(f in bottom for f in _DIALOG_FOOTERS):
-        return False  # a modal owns the pane — keep-going is the wrong tool
-    if _BUSY in bottom:
-        return False  # actively generating — never interrupt
-    if any(h in bottom for h in _IDLE_HINTS):
-        return True   # parked at the idle prompt
-    return None        # can't tell — fail safe
+      False — generating / background agent running / focused panel (skip),
+      None  — inconclusive, empty capture, or a modal footer (fail safe → skip).
+
+    Classification is owned by inbox_consumer.pane_idle_state, the same single owner
+    activity_monitor's poke consults. A private hint list here missed the bypass-mode
+    footer, so every idle seat read as inconclusive and was never nudged. keep_going is
+    a NUDGE caller, so a running background agent counts as busy. `pane` may be a
+    `capture-pane -e` capture (the classifier needs the DIM attribute)."""
+    return _inbox_consumer().pane_idle_state(pane, background_agents_busy=True)
+
+
+def is_generating(pane: str) -> bool:
+    """True only when the live bottom region shows active generation. Narrower than
+    is_idle_at_prompt() != True, which also covers a modal footer (T-4432). Escapes are
+    stripped first so a `-e` capture's escape-only lines don't shift the region."""
+    plain = _inbox_consumer()._ESCAPE_RE.sub("", pane)
+    non_blank = [ln for ln in plain.splitlines() if ln.strip()]
+    return _BUSY in "\n".join(non_blank[-_BOTTOM_REGION_LINES:])
 
 
 # ------------------------------------------------------------------ pane I/O (stubbable)
 def capture_pane(pane_target: str, unix_user: str) -> str | None:
     """Capture the agent's pane. Same-account (the @.service runs as the agent) → no
-    sudo; cross-account wraps sudo -n -u with that user's XDG_RUNTIME_DIR."""
-    inner = f"XDG_RUNTIME_DIR=/run/user/$(id -u) tmux capture-pane -t {pane_target} -p"
+    sudo; cross-account wraps sudo -n -u with that user's XDG_RUNTIME_DIR.
+    `-e` keeps SGR attributes: pane_idle_state needs DIM to tell ghost suggestions
+    from input."""
+    inner = f"XDG_RUNTIME_DIR=/run/user/$(id -u) tmux capture-pane -t {pane_target} -p -e"
     if unix_user == getpass.getuser():
         argv = ["bash", "-lc", inner]
     else:
@@ -362,12 +398,14 @@ def _ledger_tac_cmd(repo_path: str, n: int = 500) -> str:
     """Shell expression that tac|heads the newest N ledger lines across the union
     (per-week subfolder shards + legacy flat 2026.jsonl). Mirrors
     activity_monitor._ledger_union_tac_cmd — kept local so keep_going stays
-    self-contained. repo_path is config-derived (no untrusted interpolation)."""
+    self-contained. Only <seg>/<seg>.jsonl is a shard (T-4517: a */*.jsonl glob
+    let ledger/appetite/ crowd out the newest lines). repo_path is config-derived
+    (no untrusted interpolation)."""
     ledger_dir = f"{repo_path}/ledger"
     legacy = f"{ledger_dir}/2026.jsonl"
     return (
-        f"{{ for f in $(ls -d {ledger_dir}/*/*.jsonl 2>/dev/null | sort); "
-        f"do cat \"$f\"; done; "
+        f"{{ for d in $(ls -d {ledger_dir}/*/ 2>/dev/null | sort); "
+        f"do s=\"${{d%/}}\"; f=\"$s/${{s##*/}}.jsonl\"; [ -f \"$f\" ] && cat \"$f\"; done; "
         f"[ -f {legacy} ] && cat {legacy}; }} 2>/dev/null | tac | head -n {n}"
     )
 
@@ -380,7 +418,7 @@ def latest_work_ts(cfg: dict) -> int | None:
     agent (same-account → no sudo) reading its own clone; mirrors capture_pane's
     cross-account fallback.
 
-    T-1950 (Atlas D-22, HO-ratified): this is a NO-AGENT-TAGGED-LEDGER-ENTRY
+    T-1950 (Artisan D-22, HO-ratified): this is a NO-AGENT-TAGGED-LEDGER-ENTRY
     signal, NOT an idleness/activity metric — do not read it as one, and do not
     widen it to count commits/pane activity (deliberate P6 strictness: a nudge
     system that counts any activity as success congratulates itself for
@@ -418,7 +456,9 @@ def latest_work_ts(cfg: dict) -> int | None:
             obj = json.loads(line)
         except (json.JSONDecodeError, ValueError):
             continue
-        if not isinstance(obj, dict) or obj.get("agent") != agent_id:
+        # T-4737: history carries the legacy id; new entries the ORG-100 role id
+        # (+ seat slot when the role is shared). agent_role_map matches both.
+        if not isinstance(obj, dict) or not agent_role_map.ledger_entry_by(obj, agent_id):
             continue
         ts_str = obj.get("ts")
         if not isinstance(ts_str, str):
@@ -780,18 +820,70 @@ def is_usage_capped(cfg: dict, agent: str, now_ts: int,
         return False
 
 
+def cap_or_usage_gate(cfg: dict, agent: str, now_ts: int,
+                      do_read_records=None, do_find_jsonl=None, do_fleet_gate=None):
+    """The default `do_cap_check` seam (T-4510 extends T-2024's): False to nudge, truthy to skip.
+
+    1. FLEET PRE-CAP GATE first (a cheap file read, no sudo): at/above the configured
+       fraction (default 95%) of the fleet's SHARED weekly Max the periodic nudge is a
+       make-work burn of the last slice, so skip until the reset. Returns the gate's
+       GateDecision (truthy; carries .reason and .window_key) so run() can log it once per
+       window rather than once per tick. Fails OPEN on every unknown (missing, unparseable,
+       expired or unreadable reading, or any gate error) — i.e. falls through.
+    2. Then T-2024's HIT-cap check, `is_usage_capped`, unchanged: returns True/False.
+
+    do_fleet_gate is an injection seam for testing (called with now_ts)."""
+    gate = do_fleet_gate or _fug.evaluate
+    try:
+        decision = gate(now_ts)
+    except Exception as exc:  # any surprise → fail open (fall through to the hit-cap check)
+        print(f"[keep_going] {agent}: fleet-usage-gate error {exc!r} — proceeding (fail open)",
+              file=sys.stderr)
+        decision = None
+    if decision is not None and decision.suppress:
+        return decision
+    return is_usage_capped(cfg, agent, now_ts, do_read_records, do_find_jsonl)
+
+
+def _seat_hold(agent: str):
+    """The EffectiveSeatState when `agent`'s intake is blocked, else None. keep_going runs
+    under the seat's own manager (pantheon-keep-going@.service, %h) but effective_for is
+    correct either way. Fail-open: any fault reads as 'not held' (logged)."""
+    try:
+        e = _seat_state.effective_for(agent)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[keep_going] {agent}: seat-state reader fault (fail-open): "
+              f"{type(exc).__name__}: {exc}", file=sys.stderr)
+        return None
+    if e.fault:
+        print(f"[keep_going] {agent}: seat-state reader fault (fail-open): {e.fault}",
+              file=sys.stderr)
+    return e if e.intake_blocked else None
+
+
 def run(agent: str, *, prompt: str = DEFAULT_PROMPT,
         do_capture=capture_pane, do_inject=inject,
         do_work_ts=latest_work_ts, do_session_id=current_session_id,
         do_queued_work=has_queued_work,
         do_mailbox_send=send_mailbox, mailbox_inbox: Path | None = None,
-        do_cap_check=is_usage_capped,
+        do_cap_check=cap_or_usage_gate,
+        do_sleep=time.sleep,
         now_ts: int | None = None,
-        adaptive: bool | None = None) -> int:
+        adaptive: bool | None = None,
+        do_seat_hold=None) -> int:
     cfg = AGENT_PANE.get(agent)
     if cfg is None:
         print(f"[keep_going] unknown agent {agent!r} (known: {list(AGENT_PANE)})", file=sys.stderr)
         return 64
+
+    # ORG-106 L2 (T-5525): a seat whose intake is blocked (seat-state paused/sleep record,
+    # maintenance, OOM hold) gets no nudge. First gate, before any pane capture, so a held
+    # seat costs nothing. Fail-open inside _seat_hold.
+    held = (do_seat_hold or _seat_hold)(agent)
+    if held:
+        print(f"[keep_going] {agent}: seat held ({', '.join(held.sources)}) — nudge skipped "
+              f"(ORG-106 L2)")
+        return 0
 
     def deliver() -> bool:
         """Delivery-mode dispatch (T-1827 R1): the decision logic above is identical
@@ -800,6 +892,28 @@ def run(agent: str, *, prompt: str = DEFAULT_PROMPT,
         if DELIVERY_MODE.get(agent, "send-keys") == "mailbox":
             return do_mailbox_send(agent, prompt, inbox=mailbox_inbox)
         return do_inject(cfg["pane_target"], prompt)
+
+    def landed_after_all() -> bool:
+        """T-4432: a failed send-keys nudge on a pane that is now GENERATING is the
+        idle->busy race (T-3554), not a failure. send_keys_submit reports 'submit
+        unconfirmed (still pending)' because the composer holds the text while the
+        turn starts. Measured on recovery 2026-09-30: the turn landed at 11:55:18.138,
+        and the verifier gave up at 11:55:22. Generating on ANY sample means it
+        landed. Idle, unknown or MODAL on every sample is still a failure: a modal
+        right after a nudge is a real wedge, so this keys on generating, not on
+        is_idle_at_prompt()==False. Mailbox delivery has no pane race."""
+        if DELIVERY_MODE.get(agent, "send-keys") == "mailbox":
+            return False
+        for sample in range(RECHECK_SAMPLES):
+            if sample:
+                do_sleep(RECHECK_INTERVAL_SECS)
+            now_pane = do_capture(cfg["pane_target"], cfg["unix_user"])
+            if now_pane is not None and is_generating(now_pane):
+                print(f"[keep_going] {agent}: submit unconfirmed but the pane is now GENERATING "
+                      f"(idle->busy race, T-4432; re-check {sample + 1}/{RECHECK_SAMPLES}) — "
+                      f"treating the nudge as landed", file=sys.stderr)
+                return True
+        return False
 
     pane = do_capture(cfg["pane_target"], cfg["unix_user"])
     if pane is None:
@@ -820,8 +934,22 @@ def run(agent: str, *, prompt: str = DEFAULT_PROMPT,
     # before). Placed before the backoff block so a capped skip does not consume
     # the adaptive-backoff budget.
     now_for_cap = now_ts if now_ts is not None else int(time.time())
-    if do_cap_check(cfg, agent, now_for_cap):
-        print(f"[keep_going] {agent}: usage/capability cap detected — skip (no nudge into a hit cap)")
+    capped = do_cap_check(cfg, agent, now_for_cap)
+    if capped:
+        reason = getattr(capped, "reason", None)
+        if isinstance(reason, str):
+            # T-4510: the fleet pre-cap gate (a GateDecision), not a HIT cap. Logged ONCE per
+            # window, not once per 15-min tick; nothing consumed, so nudging resumes at once
+            # when the window rolls or usage falls.
+            try:
+                first = _fug.should_log_once(f"keep_going:{agent}", getattr(capped, "window_key", None))
+            except Exception:  # noqa: BLE001 — best-effort marker (e.g. Path.home() RuntimeError):
+                first = True   # log anyway; it must never fail the unit and fire its alert
+            if first:
+                print(f"[keep_going] {agent}: nudge suppressed by the fleet usage gate — {reason}; "
+                      f"resumes automatically below the threshold or at the reset (T-4510)")
+        else:
+            print(f"[keep_going] {agent}: usage/capability cap detected — skip (no nudge into a hit cap)")
         return 0
 
     # Parked at the idle prompt → nudge CANDIDATE. Adaptive backoff gates whether
@@ -860,13 +988,18 @@ def run(agent: str, *, prompt: str = DEFAULT_PROMPT,
                 print(f"[keep_going] {agent}: parked at idle prompt — nudged ({reason})")
                 return 0
             # Delivery failed: do NOT persist new_state so the backoff isn't consumed by
-            # a failed send — retry next cycle.
+            # a failed send — retry next cycle. That holds on the landed-after-all path
+            # too (T-4432): a stale backoff only costs one extra nudge later.
+            if landed_after_all():
+                return 0
             print(f"[keep_going] {agent}: nudge delivery failed", file=sys.stderr)
             return 8
 
     # Legacy (KEEP_GOING_ADAPTIVE=0): nudge every idle cycle.
     if deliver():
         print(f"[keep_going] {agent}: parked at idle prompt — nudged to keep going (legacy)")
+        return 0
+    if landed_after_all():
         return 0
     print(f"[keep_going] {agent}: nudge delivery failed", file=sys.stderr)
     return 8

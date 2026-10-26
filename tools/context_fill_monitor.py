@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import getpass
 import json
 import os
@@ -83,9 +84,11 @@ from typing import Literal
 try:  # run-as-script (python3 tools/context_fill_monitor.py): tools/ on sys.path[0]
     from agent_role_map import instance_binding as _instance_binding
     from agent_role_map import control_plane_consume_service as _control_plane_consume_service
+    from agent_role_map import control_plane_controller_service as _control_plane_controller_service
 except ImportError:  # run-as-package (import tools.context_fill_monitor)
     from tools.agent_role_map import instance_binding as _instance_binding
     from tools.agent_role_map import control_plane_consume_service as _control_plane_consume_service
+    from tools.agent_role_map import control_plane_controller_service as _control_plane_controller_service
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -237,6 +240,9 @@ CONTEXT_FILL_IDLE_GRACE_TOKENS = int(
 # Cooldown: 30 min post-restart. Per T-0184 HO-locked decision (4) — prevents
 # re-fire loop after a successful restart while the new session warms.
 CONTEXT_FILL_COOLDOWN_SECONDS = 30 * 60
+# T-4278: exit 4 means the handoff ack timed out and the session was never
+# touched.  Retry promptly instead of burning the full post-dispatch cooldown.
+ACK_TIMEOUT_RETRY_SECONDS = 5 * 60
 
 # Default advertised context window: 1M tokens (Opus-class). Per-agent windows
 # override this via AGENT_CONFIG[<agent>]["context_window"] — see
@@ -291,6 +297,21 @@ STALENESS_ENABLED = os.environ.get("PANTHEON_STALENESS_ENABLED", "").strip().low
 # of zero progress — a large improvement over the ~2h specialist outage while staying
 # conservative against false positives.
 STALENESS_POLLS = int(os.environ.get("CONTEXT_FILL_STALENESS_POLLS", "4"))
+# T-3839: the wedge fires on a SUSTAINED signal (N polls of frozen fill) AND a
+# pane-wedged check — but the pane check was a single SNAPSHOT, so a TRANSIENT
+# non-idle render coinciding with the frozen-fill window false-fired (2026-09-20
+# specialist: a keep-going-injector prompt landed in the pane's bottom region at the
+# poll's pane-check instant, pushing the liveness footer out of the bottom lines,
+# so verify_startup read rc-7 "wedged" for ~a second while the agent was in fact
+# fine). A genuinely-wedged pane is PERSISTENTLY wedged; a transient render clears
+# in a second or two. So RE-SAMPLE the pane-wedged confirmation: require it on
+# every sample, first not-wedged read short-circuits (fast path for the healthy
+# common case). Embodies the resample/success-after-error discipline — mixing a
+# sustained condition with a snapshot condition is the defect.
+WEDGE_RESAMPLE_COUNT = int(os.environ.get("CONTEXT_FILL_WEDGE_RESAMPLE_COUNT", "2"))
+WEDGE_RESAMPLE_INTERVAL_SECONDS = float(
+    os.environ.get("CONTEXT_FILL_WEDGE_RESAMPLE_INTERVAL", "5")
+)
 # Distinct tombstone/restart reason so wedge restarts read clearly in logs and
 # drain with the right semantics (restart_drain handles wedge_staleness).
 STALENESS_REASON = "wedge_staleness"
@@ -448,7 +469,7 @@ SPEND_LIMIT_DEFAULT_ENABLED = True
 # clean prompt) but every input silently returns this error. T-2290 CORRECTION
 # (2026-07-29): this does NOT "never self-resolve" — the message says "monthly
 # spend limit" but the binding constraint is the CURRENT TIME WINDOW (the operator),
-# and it clears on its own when the window rolls. Measured: orchestrator/metis/atlas
+# and it clears on its own when the window rolls. Measured: orchestrator/mason/artisan
 # each lost ~2h and all resumed unaided. The detection is still right — a capped
 # seat is invisible without it, the wrong-layer-GREEN class applied to liveness
 # (process-up proxied working while the capability was gone; orchestrator sat
@@ -495,8 +516,12 @@ CAPABILITY_CAP_DEFAULT_ENABLED = True
 # on-model-pin.md). The alert is therefore an ACTION-NUDGE ("verify the pin"), NOT a
 # wedge alarm — routed to RECOVERY (the pin rewrite is Recovery's remediation).
 _CONSENT_FALLBACK_SUBTYPE = "model_consent_fallback"
-# The capped-tier model pins whose consent-fallback is worth nudging on.
-_CONSENT_FALLBACK_CAPPED_MODELS = frozenset({"claude-fable-5"})
+# The capped-tier model-pin PREFIXES whose consent-fallback is worth nudging on.
+# T-4012: PREFIX match, not exact membership — a seat re-pinned to a point-release
+# id like `claude-fable-5-1` (or `claude-fable-5[1m]`) is the same capped family and
+# must still nudge; an exact-set check silently defaulted the point-release to the
+# no-alert branch (bugs/model-family-prefix-predicate-defaults-unknown-id-to-unsafe-branch.md).
+_CONSENT_FALLBACK_CAPPED_MODEL_PREFIXES = frozenset({"claude-fable-5"})
 CONSENT_FALLBACK_COOLDOWN_SECONDS = 6 * 60 * 60
 CONSENT_FALLBACK_ALERT_LABEL = "consent-fallback"
 # Ships ON, same reasoning as the capability-cap alert: alert-only, low blast radius,
@@ -505,10 +530,17 @@ CONSENT_FALLBACK_ALERT_LABEL = "consent-fallback"
 CONSENT_FALLBACK_DEFAULT_ENABLED = True
 
 # T-0761 component 5: repo-audit tripwire ships dark by default.
-# Armed per-agent via PANTHEON_REPO_AUDIT_ENABLED=1 (systemd drop-in) once the
-# T-0761 enforcement regime is active and tickets carry repos: fields.  Until
-# then, merging dark prevents premature noise on every poll cycle.
+# T-3314: the source of truth for "declared" is the repos.yaml registry. A repo
+# whose `grants:` map holds the agent's instance role counts as declared, and so
+# do always_available / ignored entries and any active ticket's `repos:` field.
+# Arming is PER-AGENT via the `repo-audit.conf` leg of
+# tools/provision_context_fill_monitor_dropins.py (Environment=
+# PANTHEON_REPO_AUDIT_ENABLED=1), HO-first. The default stays OFF, so a seat is
+# armed only after `--repo-audit-dry-run --agent <seat>` reads clean (rc 0).
 REPO_AUDIT_DEFAULT_ENABLED = False
+# `--repo-audit-dry-run` exit code for "can't determine" (T-3314). Not 2: that is
+# argparse's usage-error code.
+REPO_AUDIT_RC_UNDETERMINED = 3
 
 # Path to the canonical restart wrapper. Lives in the `claude` account's
 # pantheon-config clone (per CLAUDE.md graceful-restart pin); read+exec via
@@ -547,6 +579,8 @@ HOOK_ALLOWLIST = {
         "ensure-hooks-active.sh",  # SessionStart auto-repair of core.hooksPath (T-1216 option B, the operator 2026-07-01 TG4512; self-heals the 6/09 silent-drift)
         "background-pipe-gate.py",  # PreToolUse(Bash) guard vs background cmds piped through head/tail/grep — eats exit code + evidence (T-1907; T-0649 pipeline landing, recovery-first soak)
         "urgent-mail-inject.py",  # PreToolUse(*) urgent-mail preempt — inject URGENT additionalContext when inbox/.urgent_pending present (T-1641 Phase-2, supervised-first-fire on recovery 2026-08-05, operator-directed TG6982/6993)
+        "worker-guard.py",  # T-4194 allowlist-first fleet rollout; settings.json wiring follows only after this entry is on main, so the T-1102 pairing guard never sees an unrecognized hook.
+        "presence-stop-hook.sh",  # Stop hook — SSEED cross-persona presence emitter (Car-thing, T-3657+); touches /home/pantheon-shared/presence/<persona>.mtime. Fleet-wired 2026-09-14 04:16Z by the sseed-presence Stage-2 rollout (github.com/example-org/sseed-presence @0caf5ae); allowlist BACKFILLED by Recovery 2026-09-14 closing the wire->allowlist gap (cleared the 6 T-0536 alerts). Verified benign: no net/creds/exec, fail-safe exit 0, content tracks canonical source github.com/example-org/sseed-presence emitter/hooks/ (verified byte-identical at triage 2026-09-14; hook is under active iteration — re-verify the live sha via the hook-integrity pass, don't treat any pinned hash here as current), clean wiring (abs path, no metachars).
     },
     "orchestrator": {
         "telegram-reply-gate.py",  # Stop hook — block a telegram-inbound turn ending without the reply tool (T-2188, operator-directed; recovery-first soak 2026-07-28)
@@ -561,10 +595,12 @@ HOOK_ALLOWLIST = {
         "verify-hook-integrity.sh",  # SessionStart hook content-integrity check vs canonical (T-1284; Miasma persistence-vector defense, automates the T-1244 manual diff)
         "worker-guard.py",        # PreToolUse(Bash) agent_type-gated guard vs off-brief SUBAGENT drift — token-read/raw Bot API/ledger+adr+notes writes, push/PR for implementer+reviewer; HO main-thread untouched (T-1345; live-wired orchestrator-first 2026-06-27 post echo-4c3-impl runaway)
         "ensure-hooks-active.sh",  # SessionStart auto-repair of core.hooksPath (T-1216 option B, the operator 2026-07-01 TG4512; self-heals the 6/09 silent-drift)
-        "telegram-reply-gate.py",  # Stop hook: block a turn that answered a Telegram inbound only in the TRANSCRIPT (T-2188, operator-directed via mnemosyne TG 206/211/212). CURATED, not auto-derived: read the file before adding — fail-open on every error path, bounded to ONE block per inbound (sha1 marker, 10-min prune) so an agent that genuinely cannot reply still ends its turn, and tail-reads the transcript (38MB measured) rather than parsing it whole. This is the STRUCTURAL form of the rule pinned at the top of CLAUDE.md, which is the highest-failure-rate rule I carry and has been the dominant lapse across HO sessions — its own docstring says it: "A pin is a reminder; this is a mechanism."
+        "telegram-reply-gate.py",  # Stop hook: block a turn that answered a Telegram inbound only in the TRANSCRIPT (T-2188, operator-directed via archivist TG 206/211/212). CURATED, not auto-derived: read the file before adding — fail-open on every error path, bounded to ONE block per inbound (sha1 marker, 10-min prune) so an agent that genuinely cannot reply still ends its turn, and tail-reads the transcript (38MB measured) rather than parsing it whole. This is the STRUCTURAL form of the rule pinned at the top of CLAUDE.md, which is the highest-failure-rate rule I carry and has been the dominant lapse across HO sessions — its own docstring says it: "A pin is a reminder; this is a mechanism."
         "background-pipe-gate.py",  # T-2313, allowlist-FIRST. ORCHESTRATOR WAS THE GAP, and the ticket as filed said otherwise: the Ask asserted "orchestrator + recovery carry this guard already (T-1907)" and recovery MEASURED orchestrator at ZERO refs across settings.json, settings.local.json and the project-level surface, re-verified independently here. What made it easy to read past: this seat has five other PreToolUse hooks registered and working, so the failure is not "hooks are broken here". The wrong belief came from recovery's own allowlist entry above reading "recovery-first soak" — an allowlist records that a hook is PERMITTED, not that any seat RUNS it, and reading it as coverage is the presence-vs-activation conflation T-2261 and T-2312 both landed on this same week. Widened to every seat but recovery on recovery's argument, accepted: long-suite-backgrounded-through-a-pipe is the orchestrator's normal working mode, and a false green here propagates further than a false green on a worker, because the rest of the fleet acts on this seat's readings.
         "urgent-mail-inject.py",  # PreToolUse(*) urgent-mail preempt (T-1641 Phase-2; proven live on recovery 2026-08-05). T-2692 fleet rollout 2026-08-12, operator-directed live window (TG 7830): wired into orchestrator settings.json + flag in claude-telegram.service Environment= same-day as this entry — effective at the seat's next session restart.
+        "root-env-guard.py",  # PreToolUse(Bash + file tools) T-5331, operator-approved TG 12178-12181: refuses agent commands naming the sudo password file or passing `sudo -S`, so tools/pantheon-sudo is the one sudo path; main loop + subagents; fail-closed via _failclosed. Allowlist-first, wired in the same arc. Claude seat only (the one account holding the file).
         "prune-stale-teams.py",  # SessionStart prune of dead sessions' ~/.claude/teams/session-<id>/ dirs (T-3074, PR #343; orchestrator-first live fire 2026-08-25). CURATED: fail-open, 6h staleness bar, three ANDed conjuncts, keep-on-doubt incl. unresolvable session id, symlinks skipped, --dry-run; session id from stdin JSON then CLAUDE_CODE_SESSION_ID. Wired via ~/.claude/hooks/ symlink like ensure-hooks-active.sh.
+        "presence-stop-hook.sh",  # Stop hook — SSEED cross-persona presence emitter (Car-thing, T-3657+); touches /home/pantheon-shared/presence/<persona>.mtime (emitter runs as orchestrator). Fleet-wired 2026-09-14 04:16Z by the sseed-presence Stage-2 rollout (github.com/example-org/sseed-presence @0caf5ae); allowlist BACKFILLED by Recovery 2026-09-14 closing the wire->allowlist gap. Verified benign: no net/creds/exec, fail-safe exit 0, content tracks canonical source github.com/example-org/sseed-presence emitter/hooks/ (verified byte-identical at triage 2026-09-14; hook is under active iteration — re-verify the live sha via the hook-integrity pass, don't treat any pinned hash here as current), clean wiring (abs path, no metachars).
         # ups-capture.py (T-3241 ORG-073 §4 contract-capture probe) pruned 2026-09-01 (Recovery): T-3241 resolved 2026-08-26, wire unwound 2026-08-25T21:16Z with leave-no-trace (P5), no seat wires it, T-3006 needs no future capture window. Removing the stale allowlist-first entry completes the leave-no-trace + closes the T-1965 stale-basename pre-bless surface. Re-add allowlist-first if a future ORG-073 capture window is opened.
     },
     "specialist": {
@@ -575,66 +611,330 @@ HOOK_ALLOWLIST = {
         "ensure-hooks-active.sh",  # SessionStart auto-repair of core.hooksPath (T-1216 option B, the operator 2026-07-01 TG4512; self-heals the 6/09 silent-drift)
         "background-pipe-gate.py",  # T-2313, allowlist-FIRST. Fleet-wide pass; specialist runs long research/watch suites backgrounded.
         "urgent-mail-inject.py",  # PreToolUse(*) urgent-mail preempt (T-1641 Phase-2; T-2692 fleet rollout 2026-08-12). ALLOWLIST-FIRST per the T-1947 bounded-exception ordering: self-install instruction dispatched via mailbox 2026-08-12; the seat wires its own settings.json at its next session cycle. If specialist's settings.json has no urgent-mail-inject entry yet, that is the expected transient, not drift.
+        "worker-guard.py",  # T-4194 allowlist-first fleet rollout; full Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep wiring follows after this entry lands on main.
+        "presence-stop-hook.sh",  # Stop hook — SSEED cross-persona presence emitter (Car-thing, T-3657+); touches /home/pantheon-shared/presence/<persona>.mtime. Fleet-wired 2026-09-14 04:16Z by the sseed-presence Stage-2 rollout (github.com/example-org/sseed-presence @0caf5ae); allowlist BACKFILLED by Recovery 2026-09-14 closing the wire->allowlist gap. Verified benign: no net/creds/exec, fail-safe exit 0, content tracks canonical source github.com/example-org/sseed-presence emitter/hooks/ (verified byte-identical at triage 2026-09-14; hook is under active iteration — re-verify the live sha via the hook-integrity pass, don't treat any pinned hash here as current), clean wiring (abs path, no metachars).
     },
     # T-1945: EMPTY allowlists are the strictest posture, not a no-op — these
     # personas were inventoried 2026-07-21 with ZERO hooks configured in
     # ~/.claude/settings.json, so ANY hook that ever appears is a deviation
     # alert. Do not "seed" these with entries preemptively; add a basename only
     # when a hook is deliberately installed on that account.
-    "mnemosyne": {
+    "archivist": {
         # ORG-042 second head; had NO hooks at bringup (verified 2026-07-21) until T-2188.
         "telegram-reply-gate.py",  # Stop hook — block a telegram-inbound turn ending without the reply tool (T-2188, operator-directed; recovery-first soak 2026-07-28)
-        # ALLOWLIST-FIRST, per the T-1947 bounded-exception ordering documented in the atlas
+        # ALLOWLIST-FIRST, per the T-1947 bounded-exception ordering documented in the artisan
         # block below: the install is PENDING (the fleet handoff-auto-read rollout is standing
-        # instruction; mnemosyne's seat acts on it at its next natural session cycle), and a
+        # instruction; archivist's seat acts on it at its next natural session cycle), and a
         # fresh install must not race Recovery's drift check in the gap. Landing the basename first
         # makes that window zero AND avoids the third failure this ordering exists to prevent,
-        # measured on metis 2026-07-28: settings.json-registered but not-allowlisted BLOCKS
+        # measured on mason 2026-07-28: settings.json-registered but not-allowlisted BLOCKS
         # EVERY COMMIT from the seat via the T-1102 pre-commit pairing guard, and the seat
         # cannot self-unblock because the fix lives in this file on PR-only main. If you are
-        # reading this and mnemosyne's settings.json still has no handoff-auto-read entry, the
+        # reading this and archivist's settings.json still has no handoff-auto-read entry, the
         # install half has not happened yet — that is the expected transient, not drift.
         "handoff-auto-read.sh",   # SessionStart org-content injection (fleet rollout; allowlist-first 2026-07-28, install pending)
-        "background-pipe-gate.py",  # T-2313, allowlist-FIRST. mnemosyne is a pure-ACP seat but runs the same backgrounded-suite workload; included in the fleet-wide pass rather than deferred, since the hazard is workload-shaped, not architecture-shaped.
-        "urgent-mail-inject.py",  # PreToolUse(*) urgent-mail preempt (T-1641 Phase-2; T-2692 fleet rollout 2026-08-12). ALLOWLIST-FIRST per the T-1947 bounded-exception ordering: self-install instruction dispatched via mailbox 2026-08-12; the seat wires its own settings.json at its next session cycle. If mnemosyne's settings.json has no urgent-mail-inject entry yet, that is the expected transient, not drift.
+        "background-pipe-gate.py",  # T-2313, allowlist-FIRST. archivist is a pure-ACP seat but runs the same backgrounded-suite workload; included in the fleet-wide pass rather than deferred, since the hazard is workload-shaped, not architecture-shaped.
+        "urgent-mail-inject.py",  # PreToolUse(*) urgent-mail preempt (T-1641 Phase-2; T-2692 fleet rollout 2026-08-12). ALLOWLIST-FIRST per the T-1947 bounded-exception ordering: self-install instruction dispatched via mailbox 2026-08-12; the seat wires its own settings.json at its next session cycle. If archivist's settings.json has no urgent-mail-inject entry yet, that is the expected transient, not drift.
+        "worker-guard.py",  # T-4194 allowlist-first fleet rollout; full Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep wiring follows after this entry lands on main.
+        "presence-stop-hook.sh",  # Stop hook — SSEED cross-persona presence emitter (Car-thing, T-3657+); touches /home/pantheon-shared/presence/<persona>.mtime. Fleet-wired 2026-09-14 04:16Z by the sseed-presence Stage-2 rollout (github.com/example-org/sseed-presence @0caf5ae); DELIBERATELY installed on this seat (not a preemptive seed — the T-1945 rule is satisfied). Allowlist BACKFILLED by Recovery 2026-09-14 closing the wire->allowlist gap. Verified benign: no net/creds/exec, fail-safe exit 0, content tracks canonical source github.com/example-org/sseed-presence emitter/hooks/ (verified byte-identical at triage 2026-09-14; hook is under active iteration — re-verify the live sha via the hook-integrity pass, don't treat any pinned hash here as current), clean wiring (abs path, no metachars).
+        "verify-hook-integrity.sh",  # SessionStart hook content-integrity check vs canonical (T-1284). T-4493, allowlist-FIRST per the T-1947 bounded exception: Recovery wires it (a symlink to the clone, as on orchestrator/specialist/recovery) right after this lands, so there is no UNRECOGNIZED window. Why: this seat never had it, and its ACTIVE handoff-auto-read.sh sat 2 months behind canonical with no alarm (found 2026-09-30 during T-4473).
     },
-    "metis": {
+    "mason": {
         # T-1937(a): FIRST hook deliberately installed on a seat. suborch1's
         # settings.json had zero hooks, which is exactly why core.hooksPath was
-        # found UNSET on this clone 2026-07-21 while atlas's was armed — the
+        # found UNSET on this clone 2026-07-21 while artisan's was armed — the
         # SessionStart self-heal had never been wired here. Added per the
         # rule above (a basename lands only when the hook is actually
         # installed), not seeded preemptively.
         "ensure-hooks-active.sh",  # SessionStart auto-repair of core.hooksPath (T-1216 option B)
-        "handoff-auto-read.sh",   # SessionStart org-content injection. Deployed 2026-07-28 23:12Z by the metis seat ITSELF, acting on orchestrator's fleet-rollout mailbox instruction (message verified consumed from metis/cur). Verified byte-identical to repo canonical (sha256 c5927258) and wired in the canonical shape before allowlisting — the T-0536 alert on it was the pairing gap, not an injection.
-        "background-pipe-gate.py",  # T-2313, allowlist-FIRST. metis runs the same workload class as atlas — long suites, backgrounded, piped — and hit the hazard the same night.
+        "handoff-auto-read.sh",   # SessionStart org-content injection. Deployed 2026-07-28 23:12Z by the mason seat ITSELF, acting on orchestrator's fleet-rollout mailbox instruction (message verified consumed from mason/cur). Verified byte-identical to repo canonical (sha256 c5927258) and wired in the canonical shape before allowlisting — the T-0536 alert on it was the pairing gap, not an injection.
+        "background-pipe-gate.py",  # T-2313, allowlist-FIRST. mason runs the same workload class as artisan — long suites, backgrounded, piped — and hit the hazard the same night.
+        "presence-stop-hook.sh",  # Stop hook — SSEED cross-persona presence emitter (Car-thing, T-3657+); touches /home/pantheon-shared/presence/<persona>.mtime. Fleet-wired 2026-09-14 04:16Z by the sseed-presence Stage-2 rollout (github.com/example-org/sseed-presence @0caf5ae); DELIBERATELY installed on this seat (not a preemptive seed — the T-1945 rule is satisfied). Allowlist BACKFILLED by Recovery 2026-09-14 closing the wire->allowlist gap. Verified benign: no net/creds/exec, fail-safe exit 0, content tracks canonical source github.com/example-org/sseed-presence emitter/hooks/ (verified byte-identical at triage 2026-09-14; hook is under active iteration — re-verify the live sha via the hook-integrity pass, don't treat any pinned hash here as current), clean wiring (abs path, no metachars).
+        "worker-guard.py",  # T-4318 (for T-4315), allowlist-FIRST per the T-1947/T-2313 bounded exception: orchestrator decided 2026-09-29 ~17:30Z to wire the guard on the seats (mason first as the soak); the seat wires its own settings.json PreToolUse(Bash) entry AFTER this lands, so there is no UNRECOGNIZED window. Verified benign by Recovery 2026-09-29 against main: the 47-line shim + tools/hooks/worker_guard_impl.py (sha256 685bd920…/b93cdcfb…, matching mason's request), stdlib-only imports, one read-only open(), no subprocess/network/writes, fail-open. It is the same file orchestrator has run live since 2026-06-27. Re-verify the live sha via the hook-integrity pass (T-4145 will change the impl).
+        "verify-hook-integrity.sh",  # SessionStart hook content-integrity check vs canonical (T-1284). T-4493, allowlist-FIRST per the T-1947 bounded exception: Recovery wires it (a symlink to the clone, as on orchestrator/specialist/recovery) right after this lands, so there is no UNRECOGNIZED window. Why: this seat never had it, and its ACTIVE handoff-auto-read.sh sat 2 months behind canonical with no alarm (found 2026-09-30 during T-4473).
     },
-    "atlas": {
+    "artisan": {
         # T-1947. NOTE THE ORDERING, and that it is a deliberate, bounded exception to the
         # "never seed preemptively" rule above — do not copy this pattern without reading why.
         #
         # As of THIS commit the hook is NOT yet installed on suborch2: settings.json has no
         # `hooks` key at all (245 bytes, first-hand verified 2026-07-22 — the T-1947 Ask
         # asserted the opposite and was wrong). The allowlist entry lands FIRST, deliberately,
-        # because atlas's install is a FRESH one: if the hook appeared before its basename was
+        # because artisan's install is a FRESH one: if the hook appeared before its basename was
         # allowlisted, Recovery's 5-min drift check would flag it as a deviation in the gap. Landing
-        # the entry first makes that window zero. Metis's T-1937 "allowlist WITH the install in
+        # the entry first makes that window zero. Mason's T-1937 "allowlist WITH the install in
         # one push" ordering applied to a hook that was ALREADY installed; the inverse case
         # needs the inverse sequence (HO ruling, T-1947).
         #
         # The exception is bounded and closes immediately: the settings.json install follows
         # right after this merges. RESOLVED 2026-07-28: the second half of T-1947 happened —
-        # ensure-hooks-active.sh was installed on suborch2 (deploy verified by metis's T-2261
+        # ensure-hooks-active.sh was installed on suborch2 (deploy verified by mason's T-2261
         # investigation the same night).
         #
-        # Why atlas needs it at all, corrected from the Ask: atlas's core.hooksPath IS armed and
+        # Why artisan needs it at all, corrected from the Ask: artisan's core.hooksPath IS armed and
         # works, but with no SessionStart self-heal nothing re-arms it if it drifts. Mirror image
-        # of metis (hers were unset-then-protected; atlas's are working-but-unprotected).
+        # of mason (hers were unset-then-protected; artisan's are working-but-unprotected).
         "ensure-hooks-active.sh",  # SessionStart auto-repair of core.hooksPath (T-1216 option B)
-        "handoff-auto-read.sh",   # SessionStart org-content injection. Installed 2026-07-28 ~23:37Z by the atlas seat itself (fleet rollout; settings.json edit approved by orchestrator via tmux, this-edit-only). Entry lands same-night so the T-1102 pairing guard does not block the seat's commits — the metis-measured failure mode this ordering prevents.
-        "background-pipe-gate.py",  # T-2313, allowlist-FIRST. atlas is the MOTIVATING seat: 2026-07-29 ~05:4xZ during T-2281 a full-sweep pytest backgrounded through `| tail -4` reported EXIT CODE 0 to the harness while pytest had reported `1 failed` — tail's status, not pytest's. Caught only because the output file looked empty and atlas went and read it.
+        "handoff-auto-read.sh",   # SessionStart org-content injection. Installed 2026-07-28 ~23:37Z by the artisan seat itself (fleet rollout; settings.json edit approved by orchestrator via tmux, this-edit-only). Entry lands same-night so the T-1102 pairing guard does not block the seat's commits — the mason-measured failure mode this ordering prevents.
+        "background-pipe-gate.py",  # T-2313, allowlist-FIRST. artisan is the MOTIVATING seat: 2026-07-29 ~05:4xZ during T-2281 a full-sweep pytest backgrounded through `| tail -4` reported EXIT CODE 0 to the harness while pytest had reported `1 failed` — tail's status, not pytest's. Caught only because the output file looked empty and artisan went and read it.
+        "presence-stop-hook.sh",  # Stop hook — SSEED cross-persona presence emitter (Car-thing, T-3657+); touches /home/pantheon-shared/presence/<persona>.mtime. Fleet-wired 2026-09-14 04:16Z by the sseed-presence Stage-2 rollout (github.com/example-org/sseed-presence @0caf5ae); DELIBERATELY installed on this seat (not a preemptive seed — the T-1945 rule is satisfied). Allowlist BACKFILLED by Recovery 2026-09-14 closing the wire->allowlist gap. Verified benign: no net/creds/exec, fail-safe exit 0, content tracks canonical source github.com/example-org/sseed-presence emitter/hooks/ (verified byte-identical at triage 2026-09-14; hook is under active iteration — re-verify the live sha via the hook-integrity pass, don't treat any pinned hash here as current), clean wiring (abs path, no metachars).
+        "worker-guard.py",  # T-4318 (for T-4315), allowlist-FIRST per the T-1947/T-2313 bounded exception: orchestrator decided 2026-09-29 ~17:30Z to wire the guard on the seats (artisan after a clean mason soak; entry landed now so its wire never trips the check); the seat wires its own settings.json PreToolUse(Bash) entry AFTER this lands, so there is no UNRECOGNIZED window. Verified benign by Recovery 2026-09-29 against main: the 47-line shim + tools/hooks/worker_guard_impl.py (sha256 685bd920…/b93cdcfb…, matching mason's request), stdlib-only imports, one read-only open(), no subprocess/network/writes, fail-open. It is the same file orchestrator has run live since 2026-06-27. Re-verify the live sha via the hook-integrity pass (T-4145 will change the impl).
+        "verify-hook-integrity.sh",  # SessionStart hook content-integrity check vs canonical (T-1284). T-4493, allowlist-FIRST per the T-1947 bounded exception: Recovery wires it (a symlink to the clone, as on orchestrator/specialist/recovery) right after this lands, so there is no UNRECOGNIZED window. Why: this seat never had it, and its ACTIVE handoff-auto-read.sh sat 2 months behind canonical with no alarm (found 2026-09-30 during T-4473).
     },
 }
+# T-4577: Claude Code mods loaded via `env.CLAUDE_CODE_PLUGIN_DIRS` in settings.json run
+# code at every session start, outside the hooks block, so HOOK_ALLOWLIST never saw them.
+# Per agent: the mod NAMES allowed, each only as the seat's OWN in-repo copy at
+# /home/<sudo_user>/pantheon-config/tools/mods/<name>, where the code is PR-reviewed.
+# Curated like HOOK_ALLOWLIST: add a name deliberately, never auto-derive. A seat absent
+# here may load no mod at all.
+PLUGIN_DIR_ALLOWLIST: dict[str, set[str]] = {
+    "orchestrator": {"fleet-usage"},  # T-4510 fleet usage producer; observe-only session.measure hook (reviewed by Recovery 2026-10-04)
+    "recovery": {"fleet-usage"},   # T-4510, wired 2026-10-04 20:34Z
+    "specialist": {"fleet-usage"},  # T-4510, wired 2026-10-04 20:34Z
+}
+PLUGIN_DIRS_ENV = "CLAUDE_CODE_PLUGIN_DIRS"
+PLUGIN_DEVIATION_PREFIX = f"{PLUGIN_DIRS_ENV} entry "
+# T-4600: a MARKETPLACE-installed plugin can carry a mod too (hooks.json "modules"), and
+# since Claude Code 2.1.287 mods are on by default and, per the mods admin docs, "can
+# approve a call that ... a PreToolUse hook outside managed settings blocked" (every
+# Pantheon guard hook is user-level). Per agent: the plugin keys (name@marketplace) allowed
+# to load a mod. Empty by default: an enabled installed plugin that ships a mod is a
+# deviation until someone reviews it and adds it here deliberately.
+MARKETPLACE_MOD_ALLOWLIST: dict[str, set[str]] = {}
+MARKETPLACE_MOD_DEVIATION_PREFIX = "marketplace plugin mod "
+_MARKETPLACE_PROBE_SCHEMA = "pantheon-marketplace-mods/1"
+# Runs AS the seat's user (via _sudo_prefix): lists enabled installed plugins whose
+# hooks file declares function modules. Reads only JSON manifests; never imports or runs
+# plugin code. argv[1] = the seat's launch project dir.
+# T-4600 REBOUND-1: enabledPlugins is merged across every settings scope Claude Code
+# reads, lowest precedence first: user, project (.claude/settings.json), local
+# (.claude/settings.local.json), flag (--settings on any live claude process of this
+# user, which every control-plane seat passes), managed (managed-settings.json plus the
+# managed-settings.d drop-ins). A higher scope's value for a key replaces a lower one's;
+# across several live processes a plugin any of them enables counts (errs toward
+# alerting). PANTHEON_PROBE_PROC_ROOT / PANTHEON_PROBE_MANAGED_DIR exist for tests.
+_MARKETPLACE_PROBE = r"""
+import glob, json, os, sys
+home = os.path.expanduser("~")
+project = sys.argv[1] if len(sys.argv) > 1 else home
+proc_root = os.environ.get("PANTHEON_PROBE_PROC_ROOT", "/proc")
+managed_dir = os.environ.get("PANTHEON_PROBE_MANAGED_DIR", "/etc/claude-code")
+def load(p):
+    try:
+        with open(p) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+def plugins_of(settings):
+    v = settings.get("enabledPlugins") if isinstance(settings, dict) else None
+    return v if isinstance(v, dict) else {}
+def flag_settings():
+    found = []
+    uid = os.getuid()
+    for pid in os.listdir(proc_root) if os.path.isdir(proc_root) else []:
+        if not pid.isdigit():
+            continue
+        base = os.path.join(proc_root, pid)
+        try:
+            if os.stat(base).st_uid != uid:
+                continue
+            with open(os.path.join(base, "cmdline"), "rb") as fh:
+                argv = [a.decode("utf-8", "replace") for a in fh.read().split(b"\0") if a]
+        except Exception:
+            continue
+        if not (any(os.path.basename(a) == "claude" for a in argv[:2])
+                or any(a.endswith("@anthropic-ai/claude-code/cli.js") for a in argv[:3])):
+            continue
+        for i, a in enumerate(argv):
+            val = argv[i + 1] if a == "--settings" and i + 1 < len(argv) else (
+                a.split("=", 1)[1] if a.startswith("--settings=") else None)
+            if val is None:
+                continue
+            if val.lstrip().startswith("{"):
+                try:
+                    found.append(json.loads(val))
+                except Exception:
+                    pass
+            else:
+                cwd = os.path.join(base, "cwd")
+                try:
+                    cwd = os.readlink(cwd)
+                except Exception:
+                    pass
+                found.append(load(os.path.join(cwd, os.path.expanduser(val))))
+    return found
+enabled_map = {}
+scopes = []
+for name, path in (("user", os.path.join(home, ".claude/settings.json")),
+                   ("project", os.path.join(project, ".claude/settings.json")),
+                   ("local", os.path.join(project, ".claude/settings.local.json"))):
+    s = load(path)
+    if s is not None:
+        scopes.append(name)
+        enabled_map.update(plugins_of(s))
+flag_union = {}
+flags = [s for s in flag_settings() if s is not None]
+for s in flags:
+    for k, v in plugins_of(s).items():
+        flag_union[k] = bool(flag_union.get(k)) or bool(v)
+if flags:
+    scopes.append("flag")
+enabled_map.update(flag_union)
+managed = [os.path.join(managed_dir, "managed-settings.json")] + sorted(
+    glob.glob(os.path.join(managed_dir, "managed-settings.d", "*.json")))
+for path in managed:
+    s = load(path)
+    if s is not None:
+        scopes.append("managed")
+        enabled_map.update(plugins_of(s))
+enabled = {k for k, v in enabled_map.items() if v}
+installed = (load(os.path.join(home, ".claude/plugins/installed_plugins.json")) or {}).get("plugins") or {}
+mods = []
+for key, entries in installed.items():
+    if key not in enabled:
+        continue
+    for entry in entries if isinstance(entries, list) else [entries]:
+        root = (entry or {}).get("installPath")
+        if not root:
+            continue
+        manifest = load(os.path.join(root, ".claude-plugin/plugin.json")) or {}
+        hooks_rel = manifest.get("hooks") if isinstance(manifest.get("hooks"), str) else "hooks/hooks.json"
+        hooks = load(os.path.normpath(os.path.join(root, hooks_rel))) or {}
+        modules = hooks.get("modules") if isinstance(hooks, dict) else None
+        if modules:
+            mods.append({"key": key, "path": root, "modules": len(modules)})
+# T-4651: content hashes for pinned plugins, requested via argv[2] (JSON):
+# {"pins": {key: {"files": [...], "dirs": [...], "normalize": {rel: [[new, old], ...]}}}}
+# Each listed file (plus every file under each dir, sorted) contributes rel\0sha256\n to
+# one digest; "normalize" undoes a known local patch before hashing so a patched and a
+# pristine copy hash the same.
+import hashlib, re
+def mcp_canonical(data, rule):
+    # Undo only the known local launch-command edits (T-2625/T-2639 absolute bun path,
+    # recovery's direct-spawn args), then canonicalize. Anything else in the file, including
+    # a different command or script, still changes the hash. Unparseable -> raw bytes.
+    try:
+        obj = json.loads(data)
+        for srv in (obj.get("mcpServers") or {}).values():
+            if re.fullmatch(rule["command_re"], str(srv.get("command", ""))):
+                srv["command"] = rule["command_to"]
+            for frm, to in rule.get("args_map") or []:
+                if srv.get("args") == frm:
+                    srv["args"] = to
+        return json.dumps(obj, sort_keys=True, separators=(",", ":")).encode()
+    except Exception:
+        return data
+def content_hash(root, spec):
+    rels = list(spec.get("files") or [])
+    for d in spec.get("dirs") or []:
+        for dp, dns, fns in os.walk(os.path.join(root, d)):
+            dns.sort()
+            rels += [os.path.relpath(os.path.join(dp, fn), root) for fn in sorted(fns)]
+    h = hashlib.sha256()
+    for rel in rels:
+        try:
+            with open(os.path.join(root, rel), "rb") as fh:
+                data = fh.read()
+        except Exception:
+            data = None
+        if data is not None and rel in (spec.get("normalize") or {}):
+            t = data.decode("utf-8", "surrogateescape")
+            for new, old in spec["normalize"][rel]:
+                t = t.replace(new, old, 1)
+            data = t.encode("utf-8", "surrogateescape")
+        if data is not None and rel in (spec.get("mcp_normalize") or {}):
+            data = mcp_canonical(data, spec["mcp_normalize"][rel])
+        digest = hashlib.sha256(data).hexdigest().encode() if data is not None else b"MISSING"
+        h.update(rel.encode() + b"\0" + digest + b"\n")
+    return h.hexdigest()
+try:
+    pin_req = json.loads(sys.argv[2]) if len(sys.argv) > 2 else {}
+except Exception:
+    pin_req = {}
+content = []
+for key, spec in (pin_req.get("pins") or {}).items():
+    entries = installed.get(key) or []
+    for entry in entries if isinstance(entries, list) else [entries]:
+        root = (entry or {}).get("installPath")
+        if root and os.path.isdir(root):
+            content.append({"key": key, "path": root, "version": (entry or {}).get("version"),
+                            "sha256": content_hash(root, spec)})
+print(json.dumps({"schema": "pantheon-marketplace-mods/1", "scopes": scopes, "mods": mods,
+                  "content": content}))
+"""
+# T-4651: content pins for marketplace plugins with an external, auto-updating source.
+# mcp-adoption §6 requires re-reviewing an allowlisted server's tool descriptions on any
+# version bump, and a rugpull can change content under an unchanged version, so the pin
+# is a content hash, not a version. On drift: run the §6 re-review of the new tool
+# definitions + skills, then add the new hash here. Never start the telegram server to
+# read its contract (a second getUpdates poller kills the live bridge); read server.ts.
+# server.ts is hashed with the T-2629 409 patch undone (telegram_poller_409_patch.sh
+# re-asserts it on every boot), so patched and pristine copies hash alike.
+PLUGIN_CONTENT_DRIFT_PREFIX = "plugin content drift "
+PLUGIN_CONTENT_PINS: dict[str, dict] = {
+    "telegram@claude-plugins-official": {
+        "files": ["server.ts", "package.json", "bun.lock", ".mcp.json"],
+        "dirs": ["skills"],
+        # .mcp.json holds the MCP launch command, so it is hashed (REBOUND-1) after
+        # undoing only the seats' known launch edits: the absolute bun path (T-2625
+        # recovery, T-2639 specialist) and recovery's direct-spawn args.
+        "mcp_normalize": {".mcp.json": {
+            "command_re": r"/home/[^/]+/\.bun/bin/bun",
+            "command_to": "bun",
+            "args_map": [[["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--silent", "server.ts"],
+                          ["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--shell=bun", "--silent", "start"]]],
+        }},
+        # node_modules is not hashed: changing it needs a same-user local attacker (out of
+        # this check's scope), and upstream dependency changes surface through bun.lock.
+        # 0.0.7 (lastUpdated 2026-08-13), reviewed 2026-10-05 by specialist (T-4651): 4 tools
+        # (reply, react, download_attachment, edit_message), server instructions, and
+        # skills access + configure all benign; network only api.telegram.org; one
+        # execFileSync('ps') stale-pid check. Normalized server.ts, package.json, bun.lock, .mcp.json
+        # and both SKILL.md files are byte-identical to upstream main (checked same day).
+        "sha256": {"b718a094304272453e6fd89f289db5874d2c01d97352addca035376a24950f69"},
+        "normalize_t2629": True,
+    },
+}
+_T2629_SCRIPT = Path(__file__).resolve().parent / "telegram_poller_409_patch.sh"
+
+
+def _t2629_blocks() -> tuple[str, str] | None:
+    """(OLD, NEW) exactly as the patch script's `read -r -d ''` heredocs yield them.
+
+    `read` with the default IFS trims leading/trailing space, tab and newline, and -r
+    keeps backslashes literal, so the value is the heredoc body stripped of those.
+    """
+    try:
+        text = _T2629_SCRIPT.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    out = []
+    for name in ("OLD_BLOCK", "NEW_BLOCK"):
+        m = re.search(rf"read -r -d '' {name} <<'EOF'\n(.*?)\nEOF\n", text, re.S)
+        if not m:
+            return None
+        out.append(m.group(1).strip(" \t\n"))
+    return out[0], out[1]
+
+
+def _content_pin_request() -> dict | None:
+    """The probe's argv[2] request, or None when the T-2629 blocks cannot be read
+    (hashing an un-normalized patched server.ts would page a false drift)."""
+    pins = {}
+    for key, spec in PLUGIN_CONTENT_PINS.items():
+        req = {"files": spec["files"], "dirs": spec["dirs"],
+               "mcp_normalize": spec.get("mcp_normalize") or {}}
+        if spec.get("normalize_t2629"):
+            blocks = _t2629_blocks()
+            if blocks is None:
+                return None
+            old, new = blocks
+            req["normalize"] = {"server.ts": [[new, old]]}
+        pins[key] = req
+    return {"pins": pins}
+
+
 # Re-alert at most once per this window per agent (deviation persists until a
 # human acts; don't spam every 5-min cycle).
 HOOK_ALERT_THROTTLE_SECONDS = 6 * 60 * 60
@@ -656,7 +956,7 @@ _HOOK_SHELL_METACHARS = (";", "|", "&", "`", "$", ">", "<", "(", ")", "{", "}", 
 # DEFENSIVE fallback path; the primary alert routes to Recovery's pane via
 # inbox_consumer._send_alert_via_recovery (see maybe_alert_hook_deviation).
 TELEGRAM_ENV = Path.home() / ".claude" / "channels" / "telegram" / ".env"
-OPERATOR_CHAT_ID = "456474197"
+OPERATOR_CHAT_ID = "424242424"
 
 
 # ---------------------------------------------------------------------------
@@ -724,12 +1024,12 @@ _MONITOR_TUNING: dict[str, dict] = {
     "orchestrator": {
         "context_window": DEFAULT_CONTEXT_WINDOW_TOKENS,
         "supervise_script_name": "claude-bot-supervise.sh",
-        "model_pin": "claude-opus-4-7",
+        "model_pin": "claude-opus-5-5",  # T-4067 fleet bump (the operator TG 10424, 2026-09-28)
     },
     "specialist": {
         "context_window": DEFAULT_CONTEXT_WINDOW_TOKENS,
         "supervise_script_name": "specialist-bot-supervise.sh",
-        "model_pin": "claude-opus-4-8",
+        "model_pin": "claude-opus-5-5",  # T-4526 (the operator TG 7988, 2026-10-04)
     },
     "recovery": {
         # Recovery uses tombstone-write (use_tombstone) not direct restart, and gets the
@@ -737,22 +1037,80 @@ _MONITOR_TUNING: dict[str, dict] = {
         # no auto-restart — Recovery is the backstop). No explicit context_window (falls to
         # the resolve() default — the one fire-path agent without the key, preserved).
         "supervise_script_name": "recovery-bot-supervise.sh",
-        "model_pin": "claude-opus-4-8",
+        "model_pin": "claude-opus-5-5",  # T-4067 fleet bump (the operator TG 10424, 2026-09-28)
         "use_tombstone": True,
     },
-    # OBSERVATION-ONLY (mnemosyne ORG-042; metis/atlas ORG-043 seats). Read-only
+    # OBSERVATION-ONLY (archivist ORG-042; mason/artisan ORG-043 seats). Read-only
     # consumers (channel-liveness, credential-expiry, hook-drift via recovery's cycle)
     # key on these; there is deliberately NO context-fill auto-restart (no @agent
     # timer, remediate=False), so no restart_bin is derived (observation_only
-    # suppresses it) even where a restart_service/pane is recorded (mnemosyne).
-    "mnemosyne": {
+    # suppresses it) even where a restart_service/pane is recorded (archivist).
+    "archivist": {
         "context_window": DEFAULT_CONTEXT_WINDOW_TOKENS,
-        "observation_only": True,
-        "remediate": False,
+        # ARMED for context-fill auto-restart (T-3819; the operator "restart on for everyone"
+        # 2026-09-20). observation_only removed AFTER a supervised handoff_and_restart verify
+        # passed live on her ACP seat (send-keys canned prompt -> HANDOFF ack -> restart ->
+        # acp-bridge reconnected clean, 2026-09-20T01:28Z). has_restart=True from her
+        # instance.yaml binding (claude-telegram-exocortex.service + pane), so dropping
+        # observation_only derives restart_bin (handoff_and_restart.sh). remediate:False was
+        # dropped too — the operator "restart on for everyone" 2026-09-20 makes the policy
+        # uniform across claude-harness personas post-T-3832 consolidation
+        # (channel_liveness_monitor.py:485 does read the flag; the prior "no code gate reads
+        # it" claim in this comment was wrong — T-3840 correction). hook_check_via_recovery KEPT —
+        # recovery's cycle still covers her hook-drift check (harmless once armed, no coverage loss).
+        # mason/artisan stay observation_only: Phase-1 service-backed them but their context-fill
+        # arm is their own Phase-2 (see T-3819).
         "hook_check_via_recovery": True,
     },
-    "metis": {"observation_only": True, "remediate": False, "hook_check_via_recovery": True},
-    "atlas": {"observation_only": True, "remediate": False, "hook_check_via_recovery": True},
+    # mason ARMED for context-fill auto-restart (T-3838, 2026-09-20; the operator "restart on
+    # for everyone"). observation_only + remediate removed AFTER a supervised LIVE-VERIFY
+    # passed on her substrate: a graceful bespoke relaunch LANDED clean (fresh session in
+    # pantheon-mason-seat.scope under user-1007.slice, runtime.json UNTOUCHED, consume timer
+    # unfenced + post-relaunch consume validated clean). bespoke_relaunch derives
+    # restart_bin=pantheon-seat-relaunch.sh + the relaunch identity by convention (NO
+    # restart_service — dodging the persona-consume@ Type=oneshot trap). remediate was
+    # vestigial (no code gate reads it). hook_check_via_recovery kept. orchestrator signed off the
+    # mechanism + adjacency (D15). artisan followed on 2026-09-21 (T-3846); see its entry.
+    "mason": {
+        "context_window": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        # T-4818 (2026-10-09) put mason OBSERVE-ONLY: the bespoke relaunch replayed a stale
+        # saved argv outside her runtime controller. Re-armed by T-5055 (2026-10-16): T-4789
+        # (resolve_restart_cfg) now routes a bespoke_relaunch seat with an ACTIVE controller
+        # through handoff_and_restart.sh --supervisor control-plane, so seat-relaunch only
+        # runs if the controller is inactive. Rollback: re-add "observation_only": True.
+        "bespoke_relaunch": True,
+        "hook_check_via_recovery": True,
+        # 2026-09-28 (Recovery): fresh lock path. mason's live tmux server (spawned
+        # 2026-09-20 18:35 by the PRE-5fd9ffb22 script, before T-3846's `9>&-`
+        # respawn fix) inherited fd 9 and holds the old
+        # /tmp/pantheon-seat-relaunch_mason.lock flock for its whole life, so every
+        # ctxfill relaunch since exited 1 "held by another instance" (verified via
+        # /proc/<tmux pid>/fd/9) and mason never cycled. A new path is never held by
+        # that leaked fd; the relaunch then kills the old server, releasing it too.
+        # The fixed script closes fd 9 on respawn, so this cannot recur.
+        "restart_lockfile": "/tmp/pantheon-seat-relaunch_mason.v2.lock",
+    },
+    # artisan ARMED for context-fill auto-restart (T-3846, the T-3838 artisan leg; 2026-09-21;
+    # the operator "restart on for everyone"). observation_only + remediate removed AFTER a
+    # supervised LIVE-VERIFY on its substrate: a graceful bespoke relaunch LANDED CLEAN
+    # (fresh session in pantheon-artisan-seat.scope under user-1008.slice, runtime.json
+    # UNTOUCHED, consume unfenced + rehydrate-clean matching mason's exit5/viability_blocked
+    # signature). Two relaunch seams were found + fixed en route (surfaced because artisan was
+    # blessed under an ephemeral scope, unlike mason): the fence now DRAINS an in-flight
+    # oneshot consume before respawn (dfaeee72f), and the respawn no longer leaks the flock
+    # fd into the new session (5fd9ffb22). Same mechanism/adjacency orchestrator signed off for
+    # mason (D15).
+    # T-5299 (2026-10-20): artisan completed its control-plane cutover (instance.yaml now
+    # carries supervisor: control-plane + a restart binding), so it drops bespoke_relaunch
+    # and takes the archivist/specialist shape: restart_bin=handoff_and_restart.sh
+    # --supervisor control-plane (kill-session, the controller relaunches). A leftover
+    # bespoke_relaunch would be wrong: with a restart_service present the relaunch identity
+    # is no longer derived, so build_restart_argv would KeyError and --validate would fail.
+    # Rollback: restore bespoke_relaunch AND remove the instance.yaml restart binding together.
+    "artisan": {
+        "context_window": DEFAULT_CONTEXT_WINDOW_TOKENS,
+        "hook_check_via_recovery": True,
+    },
 }
 
 
@@ -782,9 +1140,16 @@ def _build_agent_config() -> dict[str, dict]:
         # marathon, zero auto-restarts). Mirrors the restart_service
         # control-plane branch below (T-2658).
         supervisor = binding.get("supervisor")
+        # T-3838: bespoke-relaunch seats (mason/artisan) are respawned with cwd=
+        # <account>/pantheon-config (the captured launch cwd, same as T-3829), so
+        # their live session slugifies to -home-<account>-pantheon-config exactly
+        # like a control-plane seat — NOT the plain -home-<account>. The T-2682
+        # pane-cwd preference finds the right dir at runtime, but a pane-probe
+        # failure during a restart would fall back to jsonl_dir, so it must be the
+        # correct slug or the fallback reads a stale/empty dir (the recovery blind-spot).
         project_slug = (
             f"-home-{account}-pantheon-config"
-            if supervisor == "control-plane"
+            if supervisor == "control-plane" or tuning.get("bespoke_relaunch")
             else f"-home-{account}"
         )
         entry: dict = {
@@ -815,6 +1180,36 @@ def _build_agent_config() -> dict[str, dict]:
             if supervisor == "control-plane":
                 entry["restart_service"] = _control_plane_consume_service(persona)
                 entry["supervisor"] = "control-plane"
+        # T-3838: BESPOKE-relaunch seats (mason/artisan) — NOT cut over, so their
+        # instance.yaml binding has NO restart_service (has_restart False) and
+        # we must NOT derive one (the control-plane branch above would resolve
+        # persona-consume@<persona> = the Type=oneshot mailbox-drain trap). When
+        # ARMED (observation_only removed) and marked bespoke_relaunch, derive a
+        # restart_bin pointing at pantheon-seat-relaunch.sh plus the identity it
+        # needs, all by convention (a not-cut-over seat has nothing in
+        # instance.yaml): session <account>-main, pane <session>:0.0, scope
+        # pantheon-<persona>-seat.scope, and the consume timer to fence for the
+        # relaunch gap. INERT while observation_only stays True — the block is
+        # gated on `not observation_only`, so today (both seats observation_only)
+        # it adds nothing and the live config is byte-identical. The uid/account
+        # the script needs come from its own identity (it runs via sudo -u
+        # <account>), so they are not passed explicitly.
+        if tuning.get("bespoke_relaunch") and not has_restart and not observation_only:
+            session = tuning.get("relaunch_session", f"{account}-main")
+            entry["handoff_file"] = f"/home/{account}/HANDOFF.md"
+            entry["restart_bin"] = (
+                f"/home/{account}/pantheon-config/tools/pantheon-seat-relaunch.sh"
+            )
+            entry["restart_mode"] = "user"
+            entry["restart_target_pane"] = tuning.get("relaunch_pane", f"{session}:0.0")
+            entry["relaunch_session"] = session
+            entry["relaunch_window"] = tuning.get("relaunch_window", "harness")
+            entry["relaunch_scope_unit"] = f"pantheon-{persona}-seat.scope"
+            # The consume-timer fence is the T-3838 runtime-controller-adjacency
+            # seam (orchestrator-reviewed): the script stops/masks this for the relaunch
+            # gap so a dead-pane consume fire can't race the respawn (the
+            # create-path collision proven in the T-3838 design log).
+            entry["consume_timer"] = f"pantheon-persona-consume@{persona}.timer"
         name = tuning.pop("supervise_script_name", None)
         if name:
             entry["supervise_script"] = f"/home/{account}/.local/bin/{name}"
@@ -833,34 +1228,102 @@ class ActiveHarnessMonitorGate:
     agent: str
     status: Literal["enabled", "disabled"]
     active_harness: str
-    source: Literal["manifest-runtime", "runtime-json", "pre-controller"]
+    source: Literal["manifest-runtime", "runtime-json", "pre-controller", "live-pane"]
     reason: str
 
 
-def _runtime_state_path_for_agent(agent: str) -> Path:
-    state_root_env = os.environ.get("PANTHEON_PERSONA_STATE_DIR")
-    if state_root_env:
-        state_root = Path(state_root_env)
+def _is_own_account(account: str | None) -> bool:
+    return not account or account == _current_user()
+
+
+def _reads_cross_account(account: str | None) -> bool:
+    """True when the runtime.json must be read as another account (via sudo).
+    PANTHEON_STATE_DIR is an explicit relocation of the whole state tree (tests,
+    sandboxes; production units leave it unset), so it keeps every read local."""
+    return not os.environ.get("PANTHEON_STATE_DIR") and not _is_own_account(account)
+
+
+def _runtime_state_path_for_agent(agent: str, account: str | None = None) -> Path:
+    """The agent's runtime.json, under the agent's OWN account state dir (T-5024).
+
+    PANTHEON_PERSONA_STATE_DIR describes the MONITORING process's own persona (a
+    controller-launched shell exports recovery's), so it applies only when the agent
+    runs on this same account. Another account's file is
+    /home/<account>/.local/state/pantheon/personas/<agent>/... ."""
+    context_state_root = os.environ.get("PANTHEON_STATE_DIR")
+    if not _is_own_account(account):
+        if context_state_root:
+            state_root = Path(context_state_root) / "personas"
+        else:
+            state_root = Path("/home") / str(account) / ".local" / "state" / "pantheon" / "personas"
     else:
-        context_state_root = os.environ.get("PANTHEON_STATE_DIR")
-        state_root = Path(context_state_root) / "personas" if context_state_root else _DEFAULT_STATE_DIR / "personas"
+        # Own account: unchanged precedence (persona dir, then state dir, then default).
+        state_root_env = os.environ.get("PANTHEON_PERSONA_STATE_DIR")
+        if state_root_env:
+            state_root = Path(state_root_env)
+        elif context_state_root:
+            state_root = Path(context_state_root) / "personas"
+        else:
+            state_root = _DEFAULT_STATE_DIR / "personas"
     return state_root / agent / "runtime-controller" / "runtime.json"
+
+
+_RUNTIME_STATE_MISSING_RC = 3
+
+
+def _read_runtime_state(state_path: Path, account: str | None) -> tuple[str, str]:
+    """(kind, payload): ("missing", ""), ("ok", text) or ("error", why).
+
+    Another account's home is not readable by the monitoring process (T-5024: on
+    EACCES the old lookup in recovery's own home read as "missing", i.e.
+    pre-controller, and the gate failed OPEN), so a cross-account file is read as
+    that account via sudo. Only a positive "does not exist" is "missing";
+    anything else is "error", which the gate treats as disabled (fail closed)."""
+    if _reads_cross_account(account):
+        argv = _sudo_prefix(str(account)) + [
+            "bash", "-c", f'test -e "$1" || exit {_RUNTIME_STATE_MISSING_RC}; exec cat -- "$1"',
+            "_", str(state_path),
+        ]
+        try:
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+        except (OSError, subprocess.SubprocessError) as exc:
+            return "error", f"runtime state read as {account} failed: {exc.__class__.__name__}"
+        if proc.returncode == _RUNTIME_STATE_MISSING_RC:
+            return "missing", ""
+        if proc.returncode != 0:
+            return "error", f"runtime state read as {account} failed: rc={proc.returncode}"
+        return "ok", proc.stdout
+    try:
+        if not state_path.exists():
+            return "missing", ""
+        return "ok", state_path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return "error", f"runtime state unreadable: {exc.__class__.__name__}"
 
 
 def _manifest_runtime_references_codex(agent: str, manifest_path: Path | None = None) -> bool:
     try:
-        import yaml
+        import yaml  # noqa: F401  (kept: a missing PyYAML still means "no Codex binding")
         from agent_role_map import resolve_instance_role as _resolve_instance_role
+        from agent_role_map import _parse_manifest
     except ImportError:
         try:
-            import yaml
+            import yaml  # noqa: F401
             from tools.agent_role_map import resolve_instance_role as _resolve_instance_role  # type: ignore
+            from tools.agent_role_map import _parse_manifest  # type: ignore
         except ImportError:
             return False
 
     path = manifest_path or _REPO_ROOT / "instance.yaml"
+    # T-4298: agent_role_map's content-keyed parse cache (CSafeLoader) instead of a
+    # per-fire pure-Python safe_load. Freshness is unchanged: _parse_manifest reads
+    # the file on EVERY call and re-parses only when the text changed, so an edit
+    # between two fires (or two calls) is observed exactly as before. It raises what
+    # read_text+safe_load raised (OSError / yaml.YAMLError / UnicodeDecodeError), all
+    # swallowed below to False as before. The document is SHARED with that cache;
+    # this function only reads it (.get chains + isinstance), never mutates it.
     try:
-        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+        data = _parse_manifest(path)
     except Exception:
         return False
     if not isinstance(data, dict):
@@ -875,16 +1338,93 @@ def _manifest_runtime_references_codex(agent: str, manifest_path: Path | None = 
     role_runtime = roles.get(role_key)
     if not isinstance(role_runtime, dict):
         return False
+    # T-5011 PR-B: any non-Claude runtime counts (codex, and hermes, which also
+    # runs none of the Claude-only monitors' surfaces). Before, a role whose only
+    # non-Claude runtime was hermes read as "no Codex runtime binding" and kept the
+    # Claude-only monitors ENABLED while hermes was live.
     fallbacks = role_runtime.get("fallbacks")
     if isinstance(fallbacks, list):
         for fallback in fallbacks:
-            if isinstance(fallback, str) and fallback.split("/", 1)[0] == "codex":
+            if isinstance(fallback, str) and fallback.split("/", 1)[0] in _NON_CLAUDE_RUNTIMES:
                 return True
-    codex_config = role_runtime.get("codex")
-    return isinstance(codex_config, dict)
+    return any(isinstance(role_runtime.get(name), dict) for name in _NON_CLAUDE_RUNTIMES)
 
 
-def active_harness_monitor_gate(agent: str, cfg: dict, manifest_path: Path | None = None) -> ActiveHarnessMonitorGate:
+_NON_CLAUDE_RUNTIMES = ("codex", "hermes")
+
+
+_INTERPRETERS = frozenset({"node", "nodejs", "env", "python3", "python", "bash", "sh"})
+
+
+def classify_harness_argv(args: str) -> str | None:
+    """'claude' | 'codex' | 'hermes' from a process's argv string, or None.
+
+    Skips interpreter and wrapper words (`node /usr/bin/codex ...`, `env -- X=1 claude`), then
+    names the harness by the program's basename. Anything unrecognised is None."""
+    for word in (args or "").split():
+        if "=" in word or word.startswith("-"):
+            continue
+        base = os.path.basename(word)
+        if base in _INTERPRETERS:
+            continue
+        for harness in ("claude", "codex", "hermes"):
+            if base == harness or base.startswith(harness + "."):
+                return harness
+        return None
+    return None
+
+
+def _pane_root_harness(pane: str, sudo_user: str, agent: str) -> str | None:
+    """T-5146: which harness the pane's root process actually is, or None if unknown."""
+    inner = (
+        f"pid=$(XDG_RUNTIME_DIR=/run/user/$(id -u) tmux display-message "
+        f"-t {shlex.quote(pane)} -p '#{{pane_pid}}') && [ -n \"$pid\" ] && "
+        f"ps -o args= -p \"$pid\""
+    )
+    cmd = _sudo_prefix(sudo_user) + ["bash", "-c", inner]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, check=False,
+                                timeout=JSONL_PROBE_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        _log(agent, f"_pane_root_harness: subprocess error {exc!r}")
+        return None
+    if result.returncode != 0:
+        return None
+    return classify_harness_argv(result.stdout.strip())
+
+
+def active_harness_monitor_gate(agent: str, cfg: dict, manifest_path: Path | None = None,
+                                *, pane_harness_fn=None) -> ActiveHarnessMonitorGate:
+    """The recorded-state gate below, cross-checked against the LIVE pane (T-5146).
+
+    runtime.json can be stale: mason's still read `harness: claude` from 2026-10-17 05:56Z
+    while its pane ran codex from 10:19Z, so the Claude-only monitor stayed on and repeated
+    'no transcript, kick it' advice into an active codex turn for ~33h. When the record says
+    the monitor may run, a pane whose root process is a non-Claude harness overrides it.
+    An unreadable pane keeps the record's verdict (fail-open, as before)."""
+    gate = _recorded_harness_monitor_gate(agent, cfg, manifest_path)
+    if gate.status != "enabled" or gate.source == "manifest-runtime" or not isinstance(cfg, dict):
+        return gate
+    pane = cfg.get("restart_target_pane")
+    if not pane:
+        return gate
+    probe = pane_harness_fn or _pane_root_harness
+    try:
+        live = probe(pane, cfg.get("sudo_user"), agent)
+    except Exception:  # noqa: BLE001 — a probe failure keeps the recorded verdict
+        live = None
+    if live and live != "claude":
+        return ActiveHarnessMonitorGate(
+            agent=agent,
+            status="disabled",
+            active_harness=live,
+            source="live-pane",
+            reason=f"live pane runs {live} (recorded state: {gate.active_harness or gate.source})",
+        )
+    return gate
+
+
+def _recorded_harness_monitor_gate(agent: str, cfg: dict, manifest_path: Path | None = None) -> ActiveHarnessMonitorGate:
     """Return whether Claude-only continuity monitors may run for this agent.
 
     A missing controller state is pre-controller while the role still runs on
@@ -900,9 +1440,18 @@ def active_harness_monitor_gate(agent: str, cfg: dict, manifest_path: Path | Non
             source="manifest-runtime",
             reason="manifest has no Codex runtime binding",
         )
-    state_path = _runtime_state_path_for_agent(agent)
-    del cfg
-    if not state_path.exists():
+    account = cfg.get("sudo_user") if isinstance(cfg, dict) else None
+    state_path = _runtime_state_path_for_agent(agent, account)
+    kind, payload = _read_runtime_state(state_path, account)
+    if kind == "error":
+        return ActiveHarnessMonitorGate(
+            agent=agent,
+            status="disabled",
+            active_harness="",
+            source="runtime-json",
+            reason=payload,
+        )
+    if kind == "missing":
         return ActiveHarnessMonitorGate(
             agent=agent,
             status="enabled",
@@ -911,7 +1460,7 @@ def active_harness_monitor_gate(agent: str, cfg: dict, manifest_path: Path | Non
             reason="Codex fallback configured but controller runtime state not present",
         )
     try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
+        state = json.loads(payload)
     except Exception as exc:
         return ActiveHarnessMonitorGate(
             agent=agent,
@@ -983,7 +1532,7 @@ def _state_path_for_agent(agent: str) -> Path:
 def _last_fire_path_for_agent(agent: str) -> Path:
     """Return the per-agent last-FIRE state file (T-1330 dead-transcript guard source).
 
-    SEPARATE from last_restart (which is success-only and drives cooldown). This file
+    SEPARATE from last_restart (which is stamped at dispatch and drives cooldown). This file
     is written UNCONDITIONALLY at fire time — before fire_restart's success/failure is
     known — because the act of firing handoff_and_restart issues the service restart
     that freezes the transcript, regardless of whether the post-restart steady-state
@@ -1098,8 +1647,7 @@ def _sudo_prefix(sudo_user: str) -> list[str]:
     No sudo when the target is our OWN account: sudo-to-self is unnecessary and
     is not granted (you don't sudo to yourself). NOTE (corrected 2026-07-27,
     T-2029): Recovery's sudoers is now NOPASSWD:ALL to EVERY pantheon account
-    (claude, claude-research, exocortex, suborch1, suborch2, codex,
-    the-ancestor) — not the old narrow claude/claude-research-only grant a
+    (claude, claude-research, exocortex, suborch1, suborch2, codex) — not the old narrow claude/claude-research-only grant a
     prior version of this comment claimed. Verify with `sudo -n -l` rather than
     trusting a comment. Recovery monitoring itself reads its own jsonl directly —
     per the AGENT_CONFIG note
@@ -1468,7 +2016,7 @@ def _classify_api_record(rec: dict, force_statuses) -> str:
     if not isinstance(rec, dict) or rec.get("type") != "assistant":
         return "skip"
     # ⚠️ T-2298: MAIN-LOOP HEALTH AND SUBAGENT HEALTH ARE INDEPENDENT, and
-    # conflating them is a state I had no way to see at all. atlas measured a
+    # conflating them is a state I had no way to see at all. artisan measured a
     # healthy main loop whose DISPATCHED SUBAGENTS were being capped: the seat
     # keeps producing turns while the work it dispatched dies. A subagent record
     # carries isSidechain=true, and it must neither EXTEND a main-loop error run
@@ -1493,7 +2041,7 @@ def subagent_error_summary(records: list[dict], now_epoch: float, *,
     This is the fourth of the states a single snapshot conflates, and the one
     with no outside signal at all before now: the seat keeps producing turns —
     so every main-loop metric reads healthy — while the work it dispatched is
-    being capped and dying. atlas found it from inside; nothing outside could see it.
+    being capped and dying. artisan found it from inside; nothing outside could see it.
 
     Deliberately NOT folded into detect_sustained_api_errors. That function
     decides whether to force-RESTART a session, and a restart does not fix a
@@ -1650,7 +2198,9 @@ def detect_consent_fallback(records: list[dict]) -> tuple[str, str] | None:
         if rec.get("subtype") != _CONSENT_FALLBACK_SUBTYPE:
             continue
         original = rec.get("originalModel")
-        if original in _CONSENT_FALLBACK_CAPPED_MODELS:
+        if isinstance(original, str) and any(
+            original.startswith(p) for p in _CONSENT_FALLBACK_CAPPED_MODEL_PREFIXES
+        ):
             return (original, rec.get("fallbackModel") or "")
     return None
 
@@ -1778,6 +2328,168 @@ def selected_jsonl_is_dead_restarted(
         )
     except (TypeError, ValueError):
         return False
+
+
+# ---------------------------------------------------------------------------
+# Stale-jsonl guard (T-4088)
+# ---------------------------------------------------------------------------
+#
+# The T-1328 guard above keys on the fire-time mtime + a 5-min drain tolerance. It
+# misses a predecessor that was IDLE before the fire: mason 2026-09-28 was quiet
+# for 11 min, so its handoff flush landed ~13 min past the recorded mtime — outside
+# the tolerance — and the old 77% transcript read as live. An idle fresh session
+# writes NO jsonl, so find_latest_jsonl kept returning the predecessor's, and the
+# threshold fire would have killed the fresh session once the cooldown lifted.
+#
+# Structural signal instead of a tolerance: a jsonl last written BEFORE the pane's
+# current claude process started cannot be that process's live transcript (it
+# belongs to a predecessor, or to a --resume session that has not written yet).
+# Its fill says nothing about the running session, so the jsonl-derived detectors
+# and the absolute-threshold fire skip it. The pane-confirmed wedge/staleness path
+# and the pane-scrape spend-limit check still run (neither trusts the jsonl's
+# CONTENT — a boot-wedged fresh session also writes nothing). Fail-open: any probe
+# failure means "not stale".
+
+
+def _pane_process_start_epoch(pane: str, sudo_user: str, agent: str) -> float | None:
+    """Epoch start of *pane*'s root process (tmux ``#{pane_pid}`` — the
+    interactive claude itself on every seat, verified live 2026-09-28), or None on
+    any failure. One sudo'd call prints ``<now> <etimes>`` so both come from the
+    same host moment; start = now - etimes (1s granularity)."""
+    inner = (
+        f"pid=$(XDG_RUNTIME_DIR=/run/user/$(id -u) tmux display-message "
+        f"-t {shlex.quote(pane)} -p '#{{pane_pid}}') && [ -n \"$pid\" ] && "
+        f"echo \"$(date +%s) $(ps -o etimes= -p \"$pid\")\""
+    )
+    cmd = _sudo_prefix(sudo_user) + ["bash", "-c", inner]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=JSONL_PROBE_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        _log(agent, f"_pane_process_start_epoch: subprocess error {exc!r}")
+        return None
+    if result.returncode != 0:
+        return None
+    parts = result.stdout.split()
+    if len(parts) != 2:
+        return None
+    try:
+        now, etimes = int(parts[0]), int(parts[1])
+    except ValueError:
+        return None
+    if etimes < 0:
+        return None
+    return float(now - etimes)
+
+
+def stale_jsonl_session_start(jsonl: Path, cfg: dict, agent: str) -> float | None:
+    """The pane's claude start epoch iff *jsonl* was last written BEFORE it (a
+    predecessor's transcript — see guard comment above), else None. Fail-open: no
+    pane configured, an unresolvable process start, or an unreadable mtime all
+    return None (= not stale)."""
+    pane = cfg.get("restart_target_pane")
+    if not pane:
+        return None
+    start = _pane_process_start_epoch(pane, cfg["sudo_user"], agent)
+    if start is None:
+        return None
+    mtime = _jsonl_mtime(jsonl, cfg["sudo_user"], agent)
+    if mtime is None:
+        return None
+    try:
+        if not float(mtime) < start:
+            return None
+    except (TypeError, ValueError):
+        return None
+    _log(agent, f"selected jsonl {jsonl.name} last written {int(start - float(mtime))}s "
+                f"BEFORE the pane's claude started — predecessor's transcript (T-4088)")
+    return start
+
+
+# A successor that has written NO transcript this long after its claude started came
+# up IDLE: its resume kick was missing or dropped (a failed seat-relaunch kick exits
+# 10, which reconcile only counts as an ordinary restart failure), or the jsonl pick
+# is wrong. Either way the stale-jsonl guard now keeps the monitor from acting on it,
+# so surface it once per session instead of letting the seat sit silent.
+IDLE_SUCCESSOR_ALERT_SECONDS = int(
+    os.environ.get("CONTEXT_FILL_IDLE_SUCCESSOR_ALERT_SECONDS", str(20 * 60))
+)
+
+
+def _idle_successor_state_path_for_agent(agent: str) -> Path:
+    state_dir_env = os.environ.get("PANTHEON_STATE_DIR")
+    state_dir = Path(state_dir_env) if state_dir_env else _DEFAULT_STATE_DIR
+    return state_dir / f"context_fill_{agent}_idle_successor.json"
+
+
+def _pane_reads_busy(agent: str, cfg: dict) -> bool:
+    """True only on positive evidence of an active turn (inbox_consumer.pane_idle_state is
+    False). An uncapturable or ambiguous pane is not busy, so the alert still fires."""
+    text = _capture_pane_text(agent, cfg)
+    if not text:
+        return False
+    try:
+        try:
+            from tools.inbox_consumer import pane_idle_state  # run-as-package / tests
+        except ImportError:
+            from inbox_consumer import pane_idle_state  # run-as-script (prod)
+        return pane_idle_state(text) is False
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def maybe_alert_idle_successor(agent: str, cfg: dict, session_start: float) -> bool:
+    """Alert ONCE per session (keyed by its start epoch) when a stale-jsonl session
+    has run IDLE_SUCCESSOR_ALERT_SECONDS without writing a transcript. Routed like
+    the restart-failure alert (other agents -> Recovery triage; Recovery's own -> the operator).
+    Returns True when an alert was sent. Fail-soft throughout."""
+    idle_for = time.time() - session_start
+    if idle_for < IDLE_SUCCESSOR_ALERT_SECONDS:
+        return False
+    path = _idle_successor_state_path_for_agent(agent)
+    state = _read_state_file(path) or {}
+    if state.get("session_start") == int(session_start):
+        return False  # already alerted for this session
+    if _seat_muted(agent):
+        _log(agent, "idle-successor: seat muted (ORG-076 §7) — alert suppressed")
+        return False
+    if _pane_reads_busy(agent, cfg):
+        # T-5146: the pane is mid-turn, so the seat is not idle and a kick would inject into an
+        # active turn. Not marked alerted: if it later sits idle with no transcript, it alerts.
+        _log(agent, "idle-successor: pane reads BUSY (active turn) — no kick advice")
+        return False
+    pane = cfg.get("restart_target_pane", "<pane>")
+    handoff = cfg.get("handoff_file", "<handoff>")
+    started = time.strftime("%H:%MZ", time.gmtime(session_start))
+    text = (
+        f"[context_fill_monitor] {agent}: session started {started} has written NO "
+        f"transcript in {int(idle_for // 60)}m — likely came up IDLE (resume kick "
+        f"missing/dropped), or the jsonl pick is wrong. Context-fill is NOT evaluated "
+        f"until it writes (T-4088). Kick it: send_keys_submit.sh {pane} "
+        f"'Read {handoff}, drain your mailbox, and resume the queued work.'"
+    )
+    try:
+        try:
+            from tools.inbox_consumer import route_failure_alert  # run-as-package / tests
+        except ImportError:
+            from inbox_consumer import route_failure_alert  # run-as-script (prod)
+        route_failure_alert(agent, text, vocab=f"idle-successor ({agent})")
+    except Exception as exc:
+        _log(agent, f"idle-successor alert: routing unavailable ({exc!r}); not sent")
+        return False
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"session_start": int(session_start),
+                                    "alerted_ts": int(time.time())}) + "\n", encoding="utf-8")
+    except OSError as exc:
+        _log(agent, f"idle-successor: state write failed {exc!r} (non-fatal)")
+    _log(agent, f"idle-successor alert sent (session idle {int(idle_for)}s)")
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -2237,7 +2949,66 @@ def write_tombstone(state_dir: Path, agent: str, reason: str = "context_fill_thr
     return path
 
 
-def build_restart_argv(cfg: dict, agent: str, skip_ack: bool = False) -> list[str]:
+def _controller_unit_state(cfg: dict, agent: str) -> str:
+    """T-4789: "active" | "inactive" | "unknown" for pantheon-runtime-controller@<agent>.
+
+    Live state, read as the seat's account (same probe shape as
+    channel_liveness_monitor._session_unit_is_active). The verdict comes from
+    stdout, never rc (is-active exits non-zero for inactive). A timeout, an
+    OSError or an unrecognised word is "unknown", never "inactive"."""
+    probe = (
+        "XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user is-active "
+        f"{_control_plane_controller_service(agent)}"
+    )
+    try:
+        r = subprocess.run(
+            _sudo_prefix(cfg["sudo_user"]) + ["bash", "-c", probe],
+            capture_output=True, text=True, check=False, timeout=JSONL_PROBE_TIMEOUT_SECONDS,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return "unknown"
+    lines = (r.stdout or "").strip().splitlines()
+    word = lines[-1].strip() if lines else ""
+    if word in ("active", "activating", "reloading"):
+        return "active"
+    if word in ("inactive", "deactivating", "dead"):
+        return "inactive"
+    # "failed" is a managed seat whose controller broke (e.g. start-limit), not an
+    # unmanaged seat: seat-relaunch there could start a held runtime, so refuse.
+    return "unknown"
+
+
+def resolve_restart_cfg(cfg: dict, agent: str) -> dict | None:
+    """T-4789: pick the restart mechanism from live controller state.
+
+    A bespoke-relaunch seat (pantheon-seat-relaunch.sh kills the tmux server and
+    replays a captured argv, outside the controller and its overrides/holds.json)
+    whose runtime controller is ACTIVE restarts through the controller instead:
+    handoff_and_restart.sh --supervisor control-plane ends the pane and the
+    controller re-runs selection (the specialist shape). No active controller keeps
+    seat-relaunch unchanged. Returns None when the controller state cannot be
+    determined: fail closed, because guessing seat-relaunch could start a held
+    runtime; the caller reports a failed restart and the monitor retries."""
+    if not cfg.get("bespoke_relaunch"):
+        return cfg
+    state = _controller_unit_state(cfg, agent)
+    if state == "inactive":
+        return cfg
+    if state == "unknown":
+        return None
+    routed = dict(cfg)
+    routed.pop("bespoke_relaunch", None)
+    routed.pop("restart_lockfile", None)
+    routed["supervisor"] = "control-plane"
+    routed["restart_bin"] = str(Path(cfg["restart_bin"]).with_name("handoff_and_restart.sh"))
+    routed["restart_service"] = _control_plane_consume_service(agent)
+    routed["restart_mode"] = "user"
+    return routed
+
+
+def build_restart_argv(cfg: dict, agent: str, skip_ack: bool = False,
+                       dismiss_modal: bool = False,
+                       episode_start: int | None = None) -> list[str]:
     """Full argv for handoff_and_restart.sh against an agent's tmux (T-1795).
 
     Single source of truth for both the blocking path (`fire_restart`) and the
@@ -2246,6 +3017,30 @@ def build_restart_argv(cfg: dict, agent: str, skip_ack: bool = False) -> list[st
     `bash -c` string element and the argv stays a Python list end-to-end.
     """
     restart_bin = cfg.get("restart_bin", HANDOFF_RESTART_BIN)
+    if cfg.get("bespoke_relaunch"):
+        # T-3838: bespoke seat relaunch (mason/artisan). pantheon-seat-relaunch.sh
+        # takes a DIFFERENT flag surface than handoff_and_restart.sh — there is
+        # no --service (not cut over), so it is --persona/--session/--target-pane/
+        # --scope-unit plus the opt-in --consume-timer fence (the runtime-
+        # controller-adjacency seam). Same sudo'd-bash wrapper + unexpanded
+        # XDG_RUNTIME_DIR discipline as the standard path.
+        lockfile = cfg.get(
+            "restart_lockfile", f"/tmp/pantheon-seat-relaunch_{agent}.lock"
+        )
+        inner = (
+            f"XDG_RUNTIME_DIR=/run/user/$(id -u) {restart_bin} "
+            f"--persona {agent} "
+            f"--session {cfg['relaunch_session']} "
+            f"--target-pane {cfg['restart_target_pane']} "
+            f"--scope-unit {cfg['relaunch_scope_unit']} "
+            f"--window {cfg.get('relaunch_window', 'harness')} "
+            f"--handoff-file {cfg['handoff_file']} "
+            f"--lockfile {lockfile}"
+            + (f" --consume-timer {cfg['consume_timer']}" if cfg.get("consume_timer") else "")
+            + (f" --episode-start {int(episode_start)}" if episode_start is not None else "")
+            + (" --skip-ack" if skip_ack else "")
+        )
+        return _sudo_prefix(cfg["sudo_user"]) + ["bash", "-c", inner]
     # Per-agent lockfile so cross-account fires don't contend on /tmp file
     # ownership (default lock is owned by whichever account first invoked
     # handoff_and_restart.sh; subsequent cross-account runs hit Permission
@@ -2258,7 +3053,13 @@ def build_restart_argv(cfg: dict, agent: str, skip_ack: bool = False) -> list[st
         f"--target-pane {cfg['restart_target_pane']} "
         f"--handoff-file {cfg['handoff_file']} "
         f"--lockfile {lockfile}"
+        + (f" --episode-start {int(episode_start)}" if episode_start is not None else "")
         + (" --skip-ack" if skip_ack else "")
+        # T-4828: the WEDGE path only. A stalled pane may be parked on a permission
+        # dialog; Escape denies it before the handoff prompt (fail-closed), where a
+        # bare inject's Enter would APPROVE it. Not on fill restarts: there the pane
+        # may be mid-turn, and Escape would interrupt it.
+        + (" --dismiss-modal" if dismiss_modal else "")
         # T-2658: control-plane seats need the kill-session + scope-liveness
         # branch inside handoff_and_restart.sh instead of plain systemctl
         # restart / is-active against a bespoke unit.
@@ -2293,7 +3094,8 @@ CTXFILL_REMEDIATE_UNIT_PREFIX = "pantheon-ctxfill-remediate"
 
 def fire_restart_detached(
     cfg: dict, agent: str, *, unit_prefix: str = "pantheon-channel-remediate",
-    skip_ack: bool = False, collect: bool = True,
+    skip_ack: bool = False, collect: bool = True, dismiss_modal: bool = False,
+    episode_start: int | None = None,
 ) -> tuple[bool, str, str]:
     """Dispatch handoff_and_restart.sh as a DETACHED transient user unit (T-1795).
 
@@ -2321,13 +3123,20 @@ def fire_restart_detached(
     keeps --collect (it judges effectiveness by re-probing the bridge, not the unit).
     """
     unit = f"{unit_prefix}-{agent}-{int(time.time())}"
+    resolved = resolve_restart_cfg(cfg, agent)
+    if resolved is None:
+        return False, f"refusing restart: runtime-controller state for '{agent}' unknown", unit
+    cfg = resolved
     cmd = (
         ["systemd-run", "--user"]
         + (["--collect"] if collect else [])
         + ["--unit", unit,
            "-p", f"RuntimeMaxSec={DETACHED_RESTART_RUNTIME_MAX_SECONDS}",
            "--"]
-        + build_restart_argv(cfg, agent, skip_ack)
+        + build_restart_argv(
+            cfg, agent, skip_ack, dismiss_modal=dismiss_modal,
+            episode_start=episode_start,
+        )
     )
     try:
         r = subprocess.run(
@@ -2360,14 +3169,19 @@ def fire_restart(cfg: dict, agent: str, skip_ack: bool = False) -> tuple[bool, s
     (`restart failed: {output[:500]}`) still surfaces the tail.
     """
     if cfg.get("observation_only"):
-        # Structural refusal: observation-only agents (mnemosyne) have no
+        # Structural refusal: observation-only agents (archivist) have no
         # valid restart_bin and their auto-restart posture is deliberately
         # not-Recovery's-call. Any path reaching here is a wiring bug, not a
         # reason to restart the agent.
         msg = f"refusing fire_restart: agent '{agent}' is observation_only"
         _log(agent, msg)
         return False, msg
-    cmd = build_restart_argv(cfg, agent, skip_ack)
+    resolved = resolve_restart_cfg(cfg, agent)
+    if resolved is None:
+        msg = f"refusing fire_restart: runtime-controller state for '{agent}' unknown"
+        _log(agent, msg)
+        return False, msg
+    cmd = build_restart_argv(resolved, agent, skip_ack)
 
     collected: list[str] = []
     try:
@@ -2453,18 +3267,35 @@ def _validate_config() -> int:
             problems.append(
                 f"agent '{agent}' not a canonical persona {sorted(valid_personas)}"
             )
-        # Observation-only entries (e.g. mnemosyne) exist for the read-only
+        # Observation-only entries (e.g. archivist) exist for the read-only
         # consumers of AGENT_CONFIG (channel-liveness, credential-expiry) and
         # have NO fire path: no @agent timer instance, remediate=False. The
         # restart-field requirements apply only to agents something can fire.
         observation_only = bool(cfg.get("observation_only"))
-        required = ("jsonl_dir", "sudo_user") if observation_only else (
-            "jsonl_dir",
-            "sudo_user",
-            "restart_service",
-            "restart_target_pane",
-            "restart_bin",
-        )
+        if observation_only:
+            required = ("jsonl_dir", "sudo_user")
+        elif cfg.get("bespoke_relaunch"):
+            # T-3838: bespoke-relaunch seats (mason/artisan) have NO restart_service
+            # (deriving one would resolve the persona-consume@ Type=oneshot trap).
+            # Their fire path needs the relaunch identity instead — restart_service
+            # is deliberately ABSENT and must NOT be "fixed" by inventing one.
+            required = (
+                "jsonl_dir",
+                "sudo_user",
+                "restart_bin",
+                "restart_target_pane",
+                "relaunch_session",
+                "relaunch_scope_unit",
+                "handoff_file",
+            )
+        else:
+            required = (
+                "jsonl_dir",
+                "sudo_user",
+                "restart_service",
+                "restart_target_pane",
+                "restart_bin",
+            )
         for field in required:
             if not cfg.get(field):
                 problems.append(f"agent '{agent}': no {field} configured")
@@ -2566,6 +3397,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--clear-suppress",
         action="store_true",
         help="T-2965: clear --agent's wedge-restart suppress flag and exit.",
+    )
+    parser.add_argument(
+        "--repo-audit-dry-run",
+        action="store_true",
+        help="T-3314: read-only undeclared-repo audit preview for --agent. Ignores "
+             "PANTHEON_REPO_AUDIT_ENABLED; sends no alert and touches no marker. "
+             "Prints JSON on stdout (logs on stderr); exit 0 clean, 1 undeclared "
+             "repo(s), 3 can't determine.",
     )
     parser.add_argument(
         "--suppress-minutes",
@@ -2868,7 +3707,7 @@ def _maybe_fire_capability_cap(agent: str, cfg: dict, jsonl: Path) -> bool:
         f"looks idle (pane at a clean prompt) but every input silently returns this. "
         f"IT SELF-RESOLVES WHEN THE USAGE WINDOW ROLLS — despite the text saying "
         f"'monthly spend limit', the binding constraint is the CURRENT TIME WINDOW "
-        f"(the operator, 2026-07-29). Measured 2026-07-29: orchestrator/metis/atlas each lost "
+        f"(the operator, 2026-07-29). Measured 2026-07-29: orchestrator/mason/artisan each lost "
         f"~2h and all three resumed unaided, no intervention. DEFAULT ACTION: WAIT "
         f"and log it. Do NOT restart (re-hits the same window), do NOT switch the "
         f"--model pin, and do NOT escalate a raise-the-limit — the operator has ruled "
@@ -2982,9 +3821,9 @@ def _maybe_fire_consent_fallback(agent: str, cfg: dict, jsonl: Path) -> bool:
 def _sweep_cap_detectors_for(agent: str, cfg: dict) -> None:
     """Run the ALERT-ONLY cap detectors for an observation_only agent on recovery's cycle.
 
-    T-1980 coverage-void fix: mnemosyne + the ORG-043 seats have NO @agent monitor
+    T-1980 coverage-void fix: archivist + the ORG-043 seats have NO @agent monitor
     timer, so no cycle ever runs the cap detectors for them — a cap on those accounts
-    was structurally undetectable (mnemosyne's ~4h wedge, caught by a human, not a
+    was structurally undetectable (archivist's ~4h wedge, caught by a human, not a
     monitor). Detection is SEPARABLE from remediation: this runs ONLY the detect+alert
     paths (never fire_restart), so it is safe for an agent that gets no
     remediation action on this cycle. Locates the agent's latest jsonl;
@@ -2996,7 +3835,9 @@ def _sweep_cap_detectors_for(agent: str, cfg: dict) -> None:
         jsonl = find_latest_jsonl(
             projects_dir, cfg["sudo_user"], agent, pane=cfg.get("restart_target_pane")
         )
-        if jsonl is not None:
+        # T-4088: a predecessor's transcript describes a dead session — skip the
+        # jsonl-content detectors on it (same guard as the per-agent cycle).
+        if jsonl is not None and stale_jsonl_session_start(jsonl, cfg, agent) is None:
             _maybe_fire_capability_cap(agent, cfg, jsonl)
             _maybe_fire_consent_fallback(agent, cfg, jsonl)
         _maybe_fire_spend_limit(agent, cfg)
@@ -3035,10 +3876,16 @@ def _maybe_fire_spend_limit(agent: str, cfg: dict) -> bool:
     Hitting the monthly spend limit pops a BLOCKING /rate-limit-options TUI modal
     that an unattended agent cannot self-dismiss — it just sits idle. Because it is
     NOT an API error in the JSONL (unlike auth-outage's 401s), every JSONL detector
-    is blind to it; only a pane scrape sees it. Raising the limit is the operator's
-    account action (claude.ai/settings/usage), so — like auth-outage — this routes a
-    DIRECT-to-operator alert (no agent can self-remediate). Own cooldown; ships ON;
-    alert-only (never gates the loop). Returns True iff an alert fired.
+    is blind to it; only a pane scrape sees it. The cap SELF-CLEARS at the printed
+    reset (T-2290/T-4039: the "monthly" text is really the current usage window) — a
+    raise (claude.ai/settings/usage) only shortens a long wait, it is NOT the fix, and
+    Recovery can Esc-dismiss the modal post-reset (cap_modal_reaper.py, observe-only until
+    its armed first-fire, T-4064). Routing (T-4590, D1): inbox_consumer.route_failure_alert,
+    like every other per-agent failure. Another seat's modal goes to Recovery, and Recovery's own
+    goes to orchestrator's mailbox, never Recovery's pane (an injected Enter there picks a modal
+    option). The operator is reached only if delivery fails. It used to be a direct the operator
+    FYI, from before T-2290; his one lever, a raise, is ruled out (T-2290).
+    Own cooldown; ships ON; alert-only (never gates the loop). Returns True iff an alert fired.
     """
     enabled_default = "1" if SPEND_LIMIT_DEFAULT_ENABLED else "0"
     if os.environ.get("PANTHEON_SPEND_LIMIT_ENABLED", enabled_default) != "1":
@@ -3055,12 +3902,17 @@ def _maybe_fire_spend_limit(agent: str, cfg: dict) -> bool:
         return False
 
     msg = (
-        f"💸 [spend-limit] {agent} is WEDGED on the monthly-spend-limit modal "
+        f"💸 [spend-limit] {agent} is on the monthly-spend-limit modal "
         f"(\"You've hit your monthly spend limit\") — a blocking /rate-limit-options "
-        f"dialog it cannot self-dismiss, so it sits idle. A restart will NOT fix it "
-        f"(re-hits the same limit). FIX: raise the limit at claude.ai/settings/usage "
-        f"(your account action — no agent can self-remediate), then the agent needs a "
-        f"modal-dismiss + poke to resume. (2026-06-26 fleet spend-limit wedge.)"
+        f"dialog it cannot self-dismiss, so it sits idle. It SELF-CLEARS at the printed "
+        f"reset (T-2290: the 'monthly' text is really the current usage window — usually "
+        f"hours, occasionally up to ~2 days if the window is far, T-2387). DEFAULT: WAIT "
+        f"for the printed reset + log; do NOT restart (re-hits the window; the monitor no "
+        f"longer wedge-restart-loops a capped modal as of 9d0eaf23f). The modal does NOT "
+        f"auto-dismiss even after the reset — it needs an Esc (never Enter) once the window "
+        f"has rolled: sop/remediation/agent-spend-limit-wedge.md step 3 (cap_modal_reaper.py "
+        f"is observe-only until T-4064 arms it). Raising the limit at claude.ai/settings/usage "
+        f"only SHORTENS a long wait — optional, not required (the operator ruled no-raise, T-2290)."
     )
     if _seat_muted(agent):
         # ORG-076 §7 mute (T-3165): the modal was scraped + logged (trace kept); cooldown
@@ -3072,10 +3924,10 @@ def _maybe_fire_spend_limit(agent: str, cfg: dict) -> bool:
     delivered = False
     try:
         try:
-            from tools.inbox_consumer import _send_telegram_alert  # run-as-package / tests
+            from tools.inbox_consumer import route_failure_alert  # run-as-package / tests
         except ImportError:
-            from inbox_consumer import _send_telegram_alert  # run-as-script (prod)
-        _send_telegram_alert(msg)
+            from inbox_consumer import route_failure_alert  # run-as-script (prod)
+        route_failure_alert(agent, msg, SPEND_LIMIT_ALERT_LABEL)
         delivered = True
     except Exception as exc:  # alert routing must never wedge the monitor
         _log(agent, f"spend-limit: alert routing failed {exc!r}")
@@ -3297,10 +4149,18 @@ def _active_ticket_repos(repo_root: Path) -> set[str]:
         return set()
     # Import parse_front_matter lazily so tests that don't need ticket-parsing
     # don't drag in the module.  Fail-open if unavailable.
+    # T-3314: dual import, PACKAGE first. The systemd unit runs this file as a
+    # bare script (tools/ on sys.path[0], no `tools` package), where the
+    # package-only import silently returned set(); the bare fallback covers that.
+    # Package-first keeps test patches on `tools.ticket` effective even when
+    # another test has put tools/ on sys.path (the bare name would win there).
     try:
-        from tools.ticket import TicketError, parse_front_matter  # noqa: PLC0415
+        from tools.ticket import parse_front_matter  # noqa: PLC0415
     except ImportError:
-        return set()
+        try:
+            from ticket import parse_front_matter  # noqa: PLC0415
+        except ImportError:
+            return set()
     repos: set[str] = set()
     for md in active_dir.glob("*.md"):
         try:
@@ -3327,42 +4187,180 @@ def _undeclared_repos(
     return sorted(r for r in present if r not in ok)
 
 
+def _load_repo_registry_for_audit(repo_root: Path) -> dict | None:
+    """Load repos.yaml via the shared loader (T-1136), whatever the import shape.
+
+    The systemd unit runs this module as a bare script (tools/ on sys.path[0]),
+    where ``tools.repo_registry`` is not importable (ModuleNotFoundError would
+    escape main() every cycle once armed); tests import it as a package. Try
+    the PACKAGE first, then the bare name (T-3314): a bare script has no repo
+    root on sys.path, so it falls through to the bare import, while a process
+    with both shapes importable resolves the package module tests patch.
+    """
+    try:
+        from tools.repo_registry import load_repo_registry  # noqa: PLC0415
+    except ImportError:
+        from repo_registry import load_repo_registry  # noqa: PLC0415
+    return load_repo_registry(repo_root)
+
+
+def _import_agent_role_map():
+    """Return the agent_role_map module, package path first, bare name second (T-3314)."""
+    try:
+        import tools.agent_role_map as arm  # noqa: PLC0415
+    except ImportError:
+        import agent_role_map as arm  # noqa: PLC0415
+    return arm
+
+
+def _registry_grant_keys(registry: dict | None) -> set[str]:
+    """Every role-key that appears in any repos.yaml ``repos[].grants`` map (T-3314)."""
+    keys: set[str] = set()
+    for entry in (registry or {}).get("repos") or []:
+        if not isinstance(entry, dict):
+            continue
+        grants = entry.get("grants") or {}
+        if isinstance(grants, dict):
+            keys.update(str(k) for k in grants)
+    return keys
+
+
+def _resolve_audit_role(agent: str, registry: dict | None = None) -> str | None:
+    """Return *agent*'s instance role-key (the repos.yaml grants axis), or None.
+
+    Same lookup ticket_lint uses for grants (agent_role_map.resolve_instance_role).
+    The result counts as resolved ONLY when it is a known role-key: it appears
+    among the registry's grant keys (any repo's ``grants``) or among the instance
+    manifest's role-keys. Anything else (the identity fallback for an unregistered
+    name, an empty value, a raised error) is "unresolved", and the caller fails
+    OPEN rather than alerting on every repo the seat holds (T-3314).
+    """
+    try:
+        arm = _import_agent_role_map()
+        role = arm.resolve_instance_role(agent)
+        known = set(getattr(arm, "_PERSONA_TO_INSTANCE_ROLE", {}).values())
+    except Exception:  # manifest unreadable / import failure -> unresolved
+        return None
+    if not role or not isinstance(role, str):
+        return None
+    if role not in known and role not in _registry_grant_keys(registry):
+        return None
+    return role
+
+
+def _role_granted_repo_names(registry: dict, role: str) -> set[str]:
+    """Return repos in the registry ``repos:`` list whose ``grants`` map holds *role*.
+
+    T-3314: after T-2090 the registry grants ARE the declaration of which repos
+    a seat legitimately holds. Any access level (ro/rw) counts as declared.
+    """
+    granted: set[str] = set()
+    for entry in registry.get("repos") or []:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            continue
+        grants = entry.get("grants") or {}
+        if isinstance(grants, dict) and role in grants:
+            granted.add(entry["name"])
+    return granted
+
+
+@dataclass(frozen=True)
+class RepoAuditResult:
+    """Outcome of one undeclared-repo audit computation (T-3314).
+
+    ``error`` is set when the audit can't reach a verdict (registry absent, role
+    unresolved, scan failed); callers fail open on it.
+    """
+
+    role: str | None = None
+    present: tuple[str, ...] = ()
+    ok: tuple[str, ...] = ()
+    undeclared: tuple[str, ...] = ()
+    error: str | None = None
+
+
+def compute_repo_audit(agent: str, cfg: dict, repo_root: Path) -> RepoAuditResult:
+    """The computation shared by the tripwire and the dry run (T-3314).
+
+    Reads the registry, resolves the role's grants, collects active-ticket
+    ``repos:`` declarations and runs the (sudo'd) scan. No enable-flag check, no
+    alert and no marker I/O: those belong to ``maybe_alert_undeclared_repos``.
+    """
+    registry = _load_repo_registry_for_audit(repo_root)
+    if registry is None:
+        return RepoAuditResult(error="repos.yaml registry absent or unparseable")
+    role = _resolve_audit_role(agent, registry)
+    if role is None:
+        return RepoAuditResult(error=f"instance role for {agent!r} unresolved")
+    ok_set = (
+        _always_ok_repo_names(registry)
+        | _role_granted_repo_names(registry, role)
+        | _active_ticket_repos(repo_root)
+    )
+    present = _scan_agent_repos(agent, cfg)
+    if present is None:
+        return RepoAuditResult(role=role, error="repo scan failed")
+    return RepoAuditResult(
+        role=role,
+        present=tuple(present),
+        ok=tuple(sorted(ok_set)),
+        undeclared=tuple(_undeclared_repos(present, ok_set, set())),
+    )
+
+
+def run_repo_audit_dry_run(agent: str, cfg: dict, repo_root: Path) -> int:
+    """``--repo-audit-dry-run``: READ-ONLY audit preview before arming a seat (T-3314).
+
+    Runs the same computation as the tripwire WITHOUT the enable-flag check,
+    WITHOUT alerting and WITHOUT reading or writing the marker. Prints JSON
+    (agent, role, present, ok, undeclared, error) on stdout; any ``_log`` output
+    from the computation goes to stderr, so stdout is only the JSON. Returns 0
+    when nothing is undeclared, 1 when something is, and REPO_AUDIT_RC_UNDETERMINED
+    (3) when the audit can't determine (2 is argparse's usage-error code).
+    """
+    with contextlib.redirect_stdout(sys.stderr):
+        res = compute_repo_audit(agent, cfg, repo_root)
+    print(json.dumps({
+        "agent": agent,
+        "role": res.role,
+        "present": list(res.present),
+        "ok": list(res.ok),
+        "undeclared": list(res.undeclared),
+        "error": res.error,
+    }, indent=2))
+    if res.error is not None:
+        return REPO_AUDIT_RC_UNDETERMINED
+    return 1 if res.undeclared else 0
+
+
 def maybe_alert_undeclared_repos(agent: str, cfg: dict, repo_root: Path) -> None:
     """T-0761 component 5: alert-once tripwire for repos present on agent's disk
-    that are NOT declared in any active ticket's ``repos:`` field AND NOT in
-    always_available or ignored entries of repos.yaml.
+    that are NOT declared. A repo is declared when the agent's instance role holds
+    a repos.yaml grant for it (T-3314), when it is in always_available or
+    ignored, or when an active ticket's ``repos:`` field names it.
 
     Alert fires when the undeclared set changes; stays quiet when unchanged;
     marker is cleared when the set is empty (clean state).  Routed via the
     existing ``send_telegram`` helper (same alert channel as hook-deviation and
     missing-dir alerts).  Fail-open: any load failure (registry unavailable,
-    scan fails) skips the alert silently.
+    role unresolved, scan fails) skips the alert and logs.
 
     Gated on PANTHEON_REPO_AUDIT_ENABLED (default OFF, REPO_AUDIT_DEFAULT_ENABLED).
-    Per the T-0867 ship-dark playbook: armed per-agent via a systemd drop-in once
-    the T-0761 enforcement regime is active (tickets carry repos: fields).
+    Per the T-0867 ship-dark playbook it is armed per-agent through the
+    provisioner's repo-audit.conf drop-in leg (T-3314), after a clean
+    ``--repo-audit-dry-run``.
     """
-    # Ship-dark gate (T-0761 component 5): disarmed until enforcement regime live.
+    # Ship-dark gate (T-0761 component 5): armed per-agent by drop-in only.
     _enabled_default = "1" if REPO_AUDIT_DEFAULT_ENABLED else "0"
     if os.environ.get("PANTHEON_REPO_AUDIT_ENABLED", _enabled_default) != "1":
         return
 
-    # Load registry — fail-open if unavailable (T-1136: delegates to shared loader).
-    from tools.repo_registry import load_repo_registry  # noqa: PLC0415
+    res = compute_repo_audit(agent, cfg, repo_root)
+    if res.error is not None:
+        _log(agent, f"repo-audit: {res.error}; skipping audit")
+        return  # fail-open
 
-    registry = load_repo_registry(repo_root)
-    if registry is None:
-        _log(agent, "repo-audit: repos.yaml registry absent or unparseable; skipping audit")
-        return
-
-    always_ok = _always_ok_repo_names(registry)
-    ticket_repos = _active_ticket_repos(repo_root)
-
-    present = _scan_agent_repos(agent, cfg)
-    if present is None:
-        return  # scan failed — fail-open
-
-    undeclared = _undeclared_repos(present, always_ok, ticket_repos)
+    undeclared = list(res.undeclared)
     marker = _repo_audit_marker_path(agent)
 
     if not undeclared:
@@ -3378,9 +4376,9 @@ def maybe_alert_undeclared_repos(agent: str, cfg: dict, repo_root: Path) -> None
     # New or changed violation set — alert + write marker.
     msg = (
         f"⚠️ [repo-audit] {agent}: {len(undeclared)} repo(s) present on disk but "
-        f"NOT declared in any active ticket's repos: field — "
-        f"{', '.join(undeclared)}. "
-        f"Declare via a ticket repos: field or add to repos.yaml ignored: list."
+        f"NOT declared — {', '.join(undeclared)}. "
+        f"Declare via a repos.yaml grant for {res.role}, a ticket repos: field, "
+        f"or the ignored: list."
     )
     # DELIBERATELY NOT mute-gated (ORG-076 §7 / T-3165): this is a P1 present-but-undeclared
     # GOVERNANCE tripwire (T-0761), same class as the 🚨 hook-deviation security page — a noise
@@ -3414,7 +4412,8 @@ def _restart_failure_state_path_for_agent(agent: str) -> Path:
     return state_dir / f"restart_failure_count_{agent}.json"
 
 
-def bump_restart_failure_count(agent: str, last_error_tail: str) -> int:
+def bump_restart_failure_count(agent: str, last_error_tail: str,
+                               *, episode_start: int | None = None) -> int:
     """Increment the consecutive-failure counter for agent. Returns new count.
 
     Per T-0584 Layer 3: each fire_restart non-success bumps the counter; a
@@ -3437,6 +4436,9 @@ def bump_restart_failure_count(agent: str, last_error_tail: str) -> int:
         "ts": int(time.time()),
         "last_error_tail": last_error_tail,
     }
+    inherited_episode = prior.get("episode_start")
+    if inherited_episode is not None or episode_start is not None:
+        payload["episode_start"] = inherited_episode if inherited_episode is not None else episode_start
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
     return count
 
@@ -3468,11 +4470,25 @@ def _pending_dispatch_path_for_agent(agent: str) -> Path:
     return state_dir / f"restart_pending_dispatch_{agent}.json"
 
 
-def record_pending_dispatch(agent: str, unit: str, reason: str) -> None:
+def _restart_episode_start(agent: str, now: int | None = None) -> int:
+    """First dispatch timestamp for the current consecutive-failure episode."""
+    prior = _read_state_file(_restart_failure_state_path_for_agent(agent)) or {}
+    try:
+        return int(prior["episode_start"])
+    except (KeyError, TypeError, ValueError):
+        return int(time.time()) if now is None else int(now)
+
+
+def record_pending_dispatch(agent: str, unit: str, reason: str,
+                            *, episode_start: int | None = None) -> None:
     """Mark a dispatched detached restart for cross-cycle reconciliation (T-2459)."""
     path = _pending_dispatch_path_for_agent(agent)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"agent": agent, "unit": unit, "reason": reason, "ts": int(time.time())}
+    now = int(time.time())
+    payload = {
+        "agent": agent, "unit": unit, "reason": reason, "ts": now,
+        "episode_start": _restart_episode_start(agent, now) if episode_start is None else int(episode_start),
+    }
     path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
 
 
@@ -3483,6 +4499,31 @@ def _clear_pending_dispatch(agent: str) -> None:
             path.unlink()
         except OSError:
             pass
+
+
+def _shorten_ack_timeout_cooldown(agent: str) -> None:
+    """Leave only the bounded retry interval after an exit-4 no-op failure."""
+    path = _state_path_for_agent(agent)
+    state = _read_state_file(path)
+    if not state:
+        return
+    cooldown = int(os.environ.get(
+        "CONTEXT_FILL_COOLDOWN_SECONDS", CONTEXT_FILL_COOLDOWN_SECONDS
+    ))
+    retry = int(os.environ.get(
+        "CONTEXT_FILL_ACK_TIMEOUT_RETRY_SECONDS", ACK_TIMEOUT_RETRY_SECONDS
+    ))
+    retry = max(0, min(retry, cooldown))
+    # Never extend a cooldown that is already closer to expiry (for example,
+    # when reconciliation itself was delayed).
+    state["ts"] = min(
+        int(state.get("ts", 0)),
+        int(time.time()) - (cooldown - retry),
+    )
+    try:
+        path.write_text(json.dumps(state) + "\n", encoding="utf-8")
+    except OSError as exc:
+        _log(agent, f"ack-timeout cooldown shorten failed (keeping full cooldown): {exc!r}")
 
 
 def _show_transient_unit(unit: str) -> dict:
@@ -3503,6 +4544,20 @@ def _show_transient_unit(unit: str) -> dict:
         if sep:
             out[key] = val
     return out
+
+
+DIALOG_REFUSAL_MARKER = "refusing to inject"  # handoff_and_restart.sh step-3 guard (T-4828)
+
+
+def _unit_journal_contains(unit: str, needle: str) -> bool:
+    """True iff the transient unit's recent journal contains `needle`. Fail-open:
+    any read error is False, so the caller keeps the ordinary threshold path."""
+    try:
+        r = subprocess.run(["journalctl", "--user", "-u", unit, "--no-pager", "-o", "cat", "-n", "200"],
+                           capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return needle in (r.stdout or "")
 
 
 def reconcile_prior_dispatch(agent: str) -> None:
@@ -3552,10 +4607,21 @@ def reconcile_prior_dispatch(agent: str) -> None:
     if failed:
         tail = (f"detached restart unit {unit} FAILED "
                 f"(ActiveState={active} Result={result} ExecMainStatus={exec_status})")
+        # T-4833: a T-4828 dialog refusal (exit 3 + its journal line; exit 3 alone is
+        # also the older prompt-send failure) means the seat sits on a dialog Escape did
+        # not clear. That is the costly case to wait 3 cycles on, so alert at once.
+        dialog = exec_status == 3 and _unit_journal_contains(unit, DIALOG_REFUSAL_MARKER)
+        if dialog:
+            tail += (" — DIALOG REFUSAL: a confirm/permission dialog is focused on the pane "
+                     "and Escape did not clear it; answer or clear it by hand (T-4828)")
         _log(agent, tail)
-        count = bump_restart_failure_count(agent, tail)
-        if count >= RESTART_FAILURE_ALERT_THRESHOLD:
-            maybe_alert_restart_failure_threshold(agent, count, tail)
+        count = bump_restart_failure_count(
+            agent, tail, episode_start=pending.get("episode_start") or pending.get("ts")
+        )
+        if exec_status == 4:
+            _shorten_ack_timeout_cooldown(agent)
+        if dialog or count >= RESTART_FAILURE_ALERT_THRESHOLD:
+            maybe_alert_restart_failure_threshold(agent, count, tail, immediate=dialog)
         # Clean the lingering failed unit so it neither re-counts nor noises --failed.
         try:
             subprocess.run(["systemctl", "--user", "reset-failed", unit],
@@ -3570,28 +4636,33 @@ def reconcile_prior_dispatch(agent: str) -> None:
 
 
 def dispatch_detached_restart(
-    cfg: dict, agent: str, *, reason: str, skip_ack: bool = False
+    cfg: dict, agent: str, *, reason: str, skip_ack: bool = False,
+    dismiss_modal: bool = False,
 ) -> tuple[bool, str, str | None]:
     """T-2459: replace the blocking fire_restart in the three non-tombstone
     monitor branches. Dispatches handoff_and_restart.sh as a DETACHED transient
     unit (no --collect, so a failure lingers for reconcile_prior_dispatch) and
     records the pending marker. A 15-min oneshot can no longer SIGKILL — and
     orphan, cross-UID — an in-flight restart. Returns (dispatched_ok, output, unit)."""
+    episode_start = _restart_episode_start(agent)
     ok, output, unit = fire_restart_detached(
-        cfg, agent, unit_prefix=CTXFILL_REMEDIATE_UNIT_PREFIX, skip_ack=skip_ack, collect=False
+        cfg, agent, unit_prefix=CTXFILL_REMEDIATE_UNIT_PREFIX, skip_ack=skip_ack, collect=False,
+        dismiss_modal=dismiss_modal, episode_start=episode_start,
     )
     if ok and unit:
-        record_pending_dispatch(agent, unit, reason)
+        record_pending_dispatch(agent, unit, reason, episode_start=episode_start)
     return ok, output, unit
 
 
-def maybe_alert_restart_failure_threshold(agent: str, count: int, last_error_tail: str) -> bool:
+def maybe_alert_restart_failure_threshold(agent: str, count: int, last_error_tail: str,
+                                          *, immediate: bool = False) -> bool:
     """Surface a Telegram alert when consecutive failures hit the threshold.
 
     Re-alerts on every additional failure past the threshold (the failure is
-    actively wedged; we WANT periodic reminders). Returns True on send success.
+    actively wedged; we WANT periodic reminders). `immediate` skips the threshold
+    for a failure that must not wait (T-4833 dialog refusal). Returns True on send success.
     """
-    if count < RESTART_FAILURE_ALERT_THRESHOLD:
+    if count < RESTART_FAILURE_ALERT_THRESHOLD and not immediate:
         return False
     if _seat_muted(agent):
         # ORG-076 §7 mute: the wedge is already tracked in the failure-count state
@@ -3805,13 +4876,102 @@ def check_hook_allowlist(agent: str, cfg: dict) -> list[str]:
     for command in _extract_hook_commands(settings):
         if not _command_is_allowlisted(command, allow):
             deviations.append(command)
+    deviations.extend(_plugin_dir_deviations(agent, cfg, settings))
+    deviations.extend(_marketplace_mod_deviations(agent, cfg))
     return deviations
+
+
+def _marketplace_mod_deviations(agent: str, cfg: dict) -> list[str]:
+    """T-4600: each ENABLED marketplace-installed plugin that ships a mod, unless allowlisted.
+
+    One probe run as the seat's user reads enabledPlugins merged across the user,
+    project, local, flag and managed settings scopes (REBOUND-1), the plugin registry
+    and each enabled install's hooks manifest; it also hashes each installed
+    PLUGIN_CONTENT_PINS plugin (T-4651). Fail-OPEN on any read, run or
+    format error (the hook check's convention): a probe glitch must not page as a
+    deviation, and it is logged.
+    """
+    pin_request = _content_pin_request()
+    if pin_request is None:
+        _log(agent, "content-pin check: T-2629 blocks unreadable; content pins skipped")
+    cmd = _sudo_prefix(cfg["sudo_user"]) + [
+        "python3", "-c", _MARKETPLACE_PROBE, str(_launch_project_dir(cfg)),
+        json.dumps(pin_request or {})]
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, check=False, timeout=JSONL_PROBE_TIMEOUT_SECONDS
+        )
+        report = json.loads(result.stdout) if result.returncode == 0 else None
+    except (subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        _log(agent, f"marketplace-mod check: probe error {exc!r}; fail-open")
+        return []
+    if not isinstance(report, dict) or report.get("schema") != _MARKETPLACE_PROBE_SCHEMA:
+        _log(agent, "marketplace-mod check: no probe report; fail-open")
+        return []
+    allowed = MARKETPLACE_MOD_ALLOWLIST.get(agent, set())
+    deviations = [
+        f"{MARKETPLACE_MOD_DEVIATION_PREFIX}{m.get('key')!r} ({m.get('modules')} module(s) "
+        f"at {m.get('path')}; not in MARKETPLACE_MOD_ALLOWLIST)"
+        for m in report.get("mods") or []
+        if isinstance(m, dict) and m.get("key") not in allowed
+    ]
+    if pin_request is not None:
+        for c in report.get("content") or []:
+            if not isinstance(c, dict):
+                continue
+            pinned = (PLUGIN_CONTENT_PINS.get(c.get("key")) or {}).get("sha256") or set()
+            if c.get("sha256") not in pinned:
+                deviations.append(
+                    f"{PLUGIN_CONTENT_DRIFT_PREFIX}{c.get('key')!r} v{c.get('version')} at "
+                    f"{c.get('path')}: sha256 {c.get('sha256')} not pinned; run the "
+                    "mcp-adoption §6 re-review, then pin (T-4651)"
+                )
+    return deviations
+
+
+def _launch_project_dir(cfg: dict) -> Path:
+    """The seat's launch cwd, recovered from its live-session project slug (T-2682/T-3838):
+    -home-<account>-pantheon-config -> /home/<account>/pantheon-config, else the home dir."""
+    account = cfg["sudo_user"]
+    slug = Path(cfg.get("jsonl_dir", "")).name
+    if slug == f"-home-{account}-pantheon-config":
+        return Path(f"/home/{account}/pantheon-config")
+    return Path(f"/home/{account}")
+
+
+def _plugin_dir_deviations(agent: str, cfg: dict, settings: dict) -> list[str]:
+    """T-4577: each `env.CLAUDE_CODE_PLUGIN_DIRS` entry not in PLUGIN_DIR_ALLOWLIST.
+
+    Parsed the way Claude Code parses it: split on ':', trim, drop empties, expand a
+    leading '~' to the seat's home. An entry is OK iff its normpath is exactly
+    /home/<sudo_user>/pantheon-config/tools/mods/<name> with <name> allowlisted for the
+    agent; normpath folds any '..', so an escape cannot match. Only the settings.json
+    env is read, the same surface the hook check reads. Mod CONTENT is the hook-
+    integrity pass's job, as it is for hook scripts.
+    """
+    value = (settings.get("env") or {}).get(PLUGIN_DIRS_ENV)
+    if value is None:
+        return []
+    if not isinstance(value, str):
+        return [f"{PLUGIN_DEVIATION_PREFIX}{value!r} (not a string)"]
+    home = f"/home/{cfg['sudo_user']}"
+    allowed = {f"{home}/pantheon-config/tools/mods/{name}"
+               for name in PLUGIN_DIR_ALLOWLIST.get(agent, set())}
+    out = []
+    for raw in value.split(":"):
+        entry = raw.strip()
+        if not entry:
+            continue
+        path = home + entry[1:] if entry == "~" or entry.startswith("~/") else entry
+        if os.path.normpath(path) not in allowed:
+            out.append(f"{PLUGIN_DEVIATION_PREFIX}{entry!r} (not an allowlisted in-repo mod dir)")
+    return out
 
 
 def check_allowlist_staleness(agent: str, cfg: dict) -> list[str]:
     """Return allowlisted basenames NOT wired in the agent's settings.json.
 
-    T-1965 (Metis): basename-only matching makes a STALE allowlist entry
+    T-1965 (Mason): basename-only matching makes a STALE allowlist entry
     strictly worse than in a path-matched design — a retired-but-not-pruned
     name pre-blesses that basename wired later from ANY path, silently, on
     the exact surface whose job is catching injected hooks. This guard turns
@@ -4039,7 +5199,12 @@ def _reclassify_deviations_against_origin(
     still_deviant: list[str] = []
     stale_on_origin: list[str] = []
     for command in deviations:
-        if _command_is_allowlisted(command, origin_allow):
+        if command.startswith((PLUGIN_DEVIATION_PREFIX, MARKETPLACE_MOD_DEVIATION_PREFIX,
+                                PLUGIN_CONTENT_DRIFT_PREFIX)):
+            # T-4577/T-4600: a plugin-dir or marketplace-mod deviation is not a hook
+            # command, so the hook allowlist can never clear it, however permissive.
+            still_deviant.append(command)
+        elif _command_is_allowlisted(command, origin_allow):
             stale_on_origin.append(command)
         else:
             still_deviant.append(command)
@@ -4105,6 +5270,21 @@ def maybe_alert_hook_clone_stale(
         path.write_text(json.dumps({"last_alert_at": now, "stale": stale_commands, "origin_ref": origin_ref}))
     except Exception as exc:
         _log(agent, f"hook-check: clone-stale alert routing failed ({exc!r}); WARN log only this cycle")
+
+
+def maybe_alert_breakglass(agent: str) -> None:
+    """T-4392 phase 2a: run one fleet break-glass watch cycle (tools/breakglass_watch.py).
+
+    Best-effort + side-effect-only — never raises into the main control loop."""
+    try:
+        try:
+            from tools import breakglass_watch  # run-as-package / tests
+        except ImportError:
+            import breakglass_watch  # run-as-script (prod)
+        for msg in breakglass_watch.check_and_alert():
+            _log(agent, f"breakglass: alerted Recovery: {msg[:160]}")
+    except Exception as exc:
+        _log(agent, f"breakglass: watch cycle failed ({exc!r}); skipping this cycle")
 
 
 def maybe_alert_hook_deviation(agent: str, cfg: dict) -> None:
@@ -4214,6 +5394,37 @@ def _pane_confirmed_wedged(agent: str) -> bool:
         return False
 
 
+def _pane_confirmed_wedged_sustained(
+    agent: str,
+    samples: int | None = None,
+    interval: float | None = None,
+) -> bool:
+    """T-3839: True only when the pane reads wedged on EVERY sample (re-sampled a
+    few seconds apart). A genuinely-wedged pane is PERSISTENTLY wedged; a TRANSIENT
+    non-idle render — a keep-going-injector prompt landing in the bottom region and
+    pushing the liveness footer out of it, a mid-scroll frame — clears within a
+    second or two, so the single-snapshot _pane_confirmed_wedged false-fired on it
+    (the 2026-09-20 specialist wedge). The FIRST not-wedged read short-circuits to False
+    (no added latency for the healthy common case, which is the vast majority);
+    only an already-wedged-looking pane pays the re-sample cost.
+
+    STRICTLY SAFER than the single read: a real wedge stays wedged across samples
+    and still fires; the only thing filtered is a self-clearing transient — exactly
+    the false-fire class. Never causes a MISSED genuine wedge.
+
+    samples/interval are read from the module globals at CALL time when not passed
+    (NOT bound as import-time default args), so env/test patches take effect."""
+    n = WEDGE_RESAMPLE_COUNT if samples is None else samples
+    iv = WEDGE_RESAMPLE_INTERVAL_SECONDS if interval is None else interval
+    n = max(1, n)
+    for i in range(n):
+        if i > 0:
+            time.sleep(max(0.0, iv))
+        if not _pane_confirmed_wedged(agent):
+            return False
+    return True
+
+
 # Subagent-block guard (T-1776; redesigned per adversarial review): a session
 # BLOCKED on a long-running subagent has a frozen MAIN jsonl (the subagent's
 # transcript is outside the monitored projects dir) and a non-idle pane --
@@ -4235,8 +5446,17 @@ def _pane_confirmed_wedged(agent: str) -> bool:
 #
 # Anchored per-line (MULTILINE, glyph at line start) so the glyph and the metrics
 # are proven to be one physical line (not a stray prose bullet on the line above).
+# Spinner glyphs that prefix a running-subagent (or generating-main) status line.
+# The circle family (U+25EF..U+2022) plus the ASTERISK/STAR family (U+273B \u273B,
+# U+2736 \u2736, U+273D \u273D) that Claude Code renders for the "Working/Kneading\u2026" spinner.
+# T-3617: the star glyphs were missing here, so a session running subagents that
+# rendered a star spinner ("\u273B \u2026 \u2193 17.6k tokens") parsed as NO subagent line ->
+# _subagent_tokens None -> subagent_block_disposition "fire" -> a live agent
+# (specialist, mid operator-collaboration, 2026-09-11) was flagged wedged. Matching the
+# star (also the main-generation spinner) is correct for the wedge purpose: a
+# GROWING token count means alive; a wedged pane has no growing count -> still fires.
 _SUBAGENT_LINE_RE = re.compile(
-    "^\\s*[\u25EF\u25CB\u25CF\u25D0\u25D1\u25D2\u25D3\u2299\u2022]\\s+\\S+.*?\u2193\\s*([\\d.]+)\\s*k",
+    "^\\s*[\u25EF\u25CB\u25CF\u25D0\u25D1\u25D2\u25D3\u2299\u2022\u273B\u2736\u273D]\\s+\\S+.*?\u2193\\s*([\\d.]+)\\s*k",
     re.MULTILINE | re.UNICODE,
 )
 
@@ -4255,6 +5475,30 @@ def _subagent_tokens(pane_text):
         return None
 
 
+# T-3726: background-agent manage-view markers. Either indicates the session is
+# subagent-BLOCKED (managing a background agent), not a plain wedge -- even with
+# NO inline streamable ↓ token line and a FROZEN main transcript (the main is
+# frozen precisely BECAUSE the background agent holds the turn, so both T-3617
+# guards are structurally inert: _subagent_tokens None + main mtime unchanged).
+#   - '⧉' (U+29C9) is the inline background-agent glyph.
+#   - "↓ to manage" is inbox_consumer's vetted manage-view-ONLY sentinel. NOTE
+#     "← for agents" is NOT usable alone -- it also renders on the idle view
+#     (inbox_consumer._MANAGE_VIEW_SENTINEL comment), so matching it would
+#     over-suppress a genuinely-idle wedge.
+# Two markers = a glyph-drift belt, the same robustness lesson T-3617 taught
+# after a star spinner defeated the single circle-only regex.
+_BG_AGENT_GLYPH = "⧉"                 # ⧉
+_BG_AGENT_MANAGE_SENTINEL = "↓ to manage"   # "↓ to manage"
+
+
+def _pane_has_background_agent(pane_text):
+    """True iff the pane shows a background-agent manage state (⧉ marker or the
+    '↓ to manage' footer) -> the session is subagent-blocked, not plain-wedged."""
+    if not pane_text:
+        return False
+    return _BG_AGENT_GLYPH in pane_text or _BG_AGENT_MANAGE_SENTINEL in pane_text
+
+
 def _subagent_token_state_path_for_agent(agent):
     """Per-agent last-seen subagent-token state (separate control-loop file)."""
     state_dir_env = os.environ.get("PANTHEON_STATE_DIR")
@@ -4262,42 +5506,88 @@ def _subagent_token_state_path_for_agent(agent):
     return state_dir / f"subagent_tokens_{agent}.json"
 
 
-def subagent_block_disposition(agent, cfg, jsonl_name):
+def subagent_block_disposition(agent, cfg, jsonl_name, jsonl_mtime=None):
     """Decide, across POLLS, whether a wedge-candidate session is subagent-blocked
-    (healthy) or genuinely wedged. Returns:
-      'fire'     -- no subagent line (plain wedge), OR the subagent's token count
-                    is FROZEN vs the last poll (the subagent itself is wedged).
-      'suppress' -- the subagent's token count GREW since the last poll (alive).
-      'hold'     -- a subagent line is present but there is no prior reading to
-                    compare yet (first frozen poll) -- wait one more poll rather
-                    than fire, since we cannot yet tell alive-from-wedged.
-    State (last tokens + main jsonl) persists between polls; a main-jsonl change
-    resets it (fresh session). No subagent line -> 'fire' (conservative)."""
+    (healthy) or genuinely wedged. Two INDEPENDENT liveness signals, either of
+    which suppresses the wedge restart:
+
+      Signal 1 (T-3617, format-INDEPENDENT): the MAIN-session transcript (`jsonl_mtime`)
+        was written since the last poll -> the session is alive (sub-agents are
+        doing the work; the main token count plateaus but the session is not stuck).
+        This is robust to pane/spinner GLYPH DRIFT -- exactly the failure that
+        defeated signal 2 for specialist (star spinners the line regex did not match).
+      Signal 2 (T-1776, pane): the first running-subagent line's streamed ↓ token
+        count GREW since the last poll.
+
+    Returns:
+      'suppress' -- signal 1 OR signal 2 shows liveness (not wedged).
+      'hold'     -- cannot yet tell: a subagent line is present but no prior token
+                    reading to compare, OR no pane signal but a first mtime reading
+                    (wait one poll to see whether the transcript advances) rather
+                    than fire blind.
+      'fire'     -- no liveness signal AND no basis to wait: no subagent line and no
+                    transcript advancement (plain wedge), OR the subagent's token
+                    count is FROZEN vs the last poll (the subagent itself is wedged).
+
+    State (last tokens + mtime + main jsonl) persists between polls, keyed by the
+    main jsonl name; a main-jsonl change resets it (fresh session). `jsonl_mtime`
+    None means 'unknown' (probe failed) -> signal 1 is simply inert, never a fire."""
     import json as _json
-    tokens = _subagent_tokens(_capture_pane_text(agent, cfg))
+    pane_text = _capture_pane_text(agent, cfg)
+    tokens = _subagent_tokens(pane_text)
     path = _subagent_token_state_path_for_agent(agent)
-    if tokens is None:
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        return "fire"
-    prior = None
+
+    prior_tokens = None
+    prior_mtime = None
     try:
         data = _json.loads(path.read_text())
         if data.get("jsonl") == jsonl_name:
-            prior = float(data.get("tokens"))
+            pt = data.get("tokens")
+            prior_tokens = float(pt) if pt is not None else None
+            pm = data.get("mtime")
+            prior_mtime = float(pm) if pm is not None else None
     except (OSError, ValueError, TypeError):
-        prior = None
+        prior_tokens = None
+        prior_mtime = None
+
+    # Persist current readings (keyed by jsonl; a new jsonl resets the comparison).
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(_json.dumps({"jsonl": jsonl_name, "tokens": tokens}))
+        path.write_text(_json.dumps(
+            {"jsonl": jsonl_name, "tokens": tokens, "mtime": jsonl_mtime}))
     except OSError:
         pass
-    if prior is None:
-        return "hold"
-    if tokens > prior:
+
+    # Signal 1 -- main transcript advanced since last poll -> alive.
+    if prior_mtime is not None and jsonl_mtime is not None and jsonl_mtime > prior_mtime:
         return "suppress"
+
+    # Signal 2 -- pane subagent-token growth.
+    if tokens is not None:
+        if prior_tokens is None:
+            return "hold"
+        if tokens > prior_tokens:
+            return "suppress"
+        return "fire"
+
+    # Signal 3 (T-3726) -- a background-agent manage state (⧉ / "↓ to manage")
+    # means the session is subagent-BLOCKED, not plain-wedged, even with no
+    # streamable ↓ token line and a frozen main transcript (both prior guards are
+    # structurally inert in this state). Placed AFTER signal 2 so it only governs
+    # the tokens-None path: a frozen INLINE-subagent (tokens frozen) still fires
+    # above, never masked by a co-present footer. A genuinely-frozen plain pane
+    # carries no such marker -> falls through and fires.
+    if _pane_has_background_agent(pane_text):
+        return "suppress"
+
+    # No parseable subagent/spinner line and no background-agent marker. If we
+    # have a first transcript-mtime reading (real probe, no prior to compare),
+    # HOLD one poll so signal 1 gets a chance to prove liveness before we fire
+    # blind on an unparseable pane. Only when the mtime probe is unavailable
+    # (None) do we fall straight through to the conservative plain-wedge fire
+    # (preserving the pre-T-3617 behaviour).
+    if jsonl_mtime is not None and prior_mtime is None:
+        return "hold"
     return "fire"
 
 
@@ -4353,6 +5643,17 @@ INTERACTIVE_MODAL_SENTINELS = (
     "paste code here",                   # the OAuth code prompt (SOP §2)
     "oauth/authorize",                   # the OAuth URL chrome (claude.com/cai/oauth/authorize)
     "log in to claude",
+    # T-4024: the /rate-limit-options spend-limit modal ("You've hit your monthly spend
+    # limit … Adjust monthly spend limit / Wait for limit to reset"). A wedge-restart here
+    # is ALWAYS wrong on two counts: (1) the restart's send-keys lands IN the blocking
+    # modal (never dismisses it), so handoff_and_restart's ack times out (600s → exit 4)
+    # and re-fires hourly — the whole fleet (specialist/orchestrator/mason/artisan) wedged this way in the
+    # 2026-09-27 cap window; (2) a capped seat must WAIT for the usage window to roll, not
+    # restart — a restart re-hits the same window (T-2290). Suppress; the cap self-clears on
+    # window reset. Only reached on a CONFIRMED non-idle pane, so it cannot mask the
+    # idle-capped 429 variant (that stays at a clean prompt and never enters the wedge path).
+    SPEND_LIMIT_SENTINEL,          # "monthly spend limit" — modal header + "Adjust …" option
+    "wait for limit to reset",     # the /rate-limit-options choice; distinct from the 429 JSONL scrollback
 )
 WEDGE_SUPPRESS_FLAG_PATTERN = "wedge_suppress_{agent}.json"
 WEDGE_SUPPRESS_DEFAULT_MINUTES = 45
@@ -4417,8 +5718,9 @@ def _wedge_suppressed_by_flag(agent: str) -> bool:
 
 def _pane_in_interactive_modal(agent: str, cfg: dict) -> str | None:
     """Best-effort: the matched sentinel if the captured pane shows a /login|OAuth modal
-    (an auto-restart there is always wrong), else None. A capture failure returns None —
-    never suppress on an unread pane (that would mask real wedges)."""
+    or the /rate-limit-options spend-limit modal (T-4024) — an auto-restart on either is
+    always wrong — else None. A capture failure returns None — never suppress on an unread
+    pane (that would mask real wedges)."""
     pane = _capture_pane_text(agent, cfg)
     if not pane:
         return None
@@ -4434,15 +5736,18 @@ def _seat_in_maintenance(agent: str) -> bool:
     ACTIONS must be suppressed while a runtime-controller cutover install has the pane
     in a non-standard state (T-2953). Fail-open (False) on any import/registry fault so
     a broken registry can never silently mask a real wedge (auto-expiry in notify_policy
-    is the other half: a forgotten toggle self-clears)."""
+    is the other half: a forgotten toggle self-clears). ORG-106 L4b: a shim over the
+    shared seat_state.maintenance_active (same registry, same fail-open)."""
+    return _seat_state_mod().maintenance_active(agent)
+
+
+def _seat_state_mod():
+    """ORG-106 L4b: the seat_state module, importable from a package or a bare run."""
     try:
-        try:
-            from tools.notify_policy import in_maintenance
-        except ImportError:  # bare run with cwd=tools/
-            from notify_policy import in_maintenance  # type: ignore
-        return bool(in_maintenance(agent))
-    except Exception:
-        return False
+        from tools import seat_state
+    except ImportError:  # bare run with cwd=tools/
+        import seat_state  # type: ignore
+    return seat_state
 
 
 def _seat_muted(agent: str) -> bool:
@@ -4476,9 +5781,13 @@ def _seat_muted(agent: str) -> bool:
 def _wedge_restart_suppressed(agent: str, cfg: dict) -> str | None:
     """Reason a confirmed-wedged pane must NOT be auto-restarted, or None:
     (a) the seat is in a T-2984 maintenance window (cutover), (b) an explicit non-expired
-    suppress flag (T-2965), or (c) a recognised interactive modal."""
+    suppress flag (T-2965), (c) a recognised interactive modal, or (d) ORG-106 L4b: the
+    seat-state reader vetoes remediation (deep-sleep: a sleeping seat is not resumed)."""
     if _seat_in_maintenance(agent):
         return "seat in T-2984 maintenance mode (runtime-controller cutover window)"
+    seat = _seat_state_mod().safe_effective_for(agent)
+    if seat is not None and seat.remediation_vetoed:
+        return f"seat-state vetoes remediation ({seat.state}: {seat.reason or '-'})"
     if _wedge_suppressed_by_flag(agent):
         return "explicit suppress flag set (interactive maintenance)"
     modal = _pane_in_interactive_modal(agent, cfg)
@@ -4509,11 +5818,12 @@ def _maybe_fire_staleness(
         return None
     if not is_fill_frozen(history):
         return None
-    if not _pane_confirmed_wedged(agent):
+    if not _pane_confirmed_wedged_sustained(agent):
         _log(
             agent,
             f"fill frozen at {fill_tokens} tok for {STALENESS_POLLS} polls but pane "
-            f"is idle/healthy/uncheckable — treating as healthy-idle, NOT firing",
+            f"is idle/healthy/uncheckable (or only TRANSIENTLY non-idle — cleared on "
+            f"re-sample, T-3839) — treating as healthy-idle, NOT firing",
         )
         return None
 
@@ -4535,11 +5845,17 @@ def _maybe_fire_staleness(
     #   suppress → subagent streamed more output since last poll (alive);
     #   hold     → subagent present but no prior reading yet (wait one poll);
     #   fire     → no subagent line (plain wedge) OR subagent tokens frozen too.
-    disp = subagent_block_disposition(agent, cfg, jsonl.name)
+    # T-3617: pass the current main-transcript mtime so the guard can use
+    # transcript-advancement (format-independent) as a liveness signal alongside
+    # the pane token-count parse — robust to the spinner glyph drift that made the
+    # parse miss specialist's star spinner and false-fire a live, collaborating session.
+    cur_jsonl_mtime = _jsonl_mtime(jsonl, cfg["sudo_user"], agent)
+    disp = subagent_block_disposition(agent, cfg, jsonl.name, jsonl_mtime=cur_jsonl_mtime)
     if disp == "suppress":
-        _log(agent, f"fill frozen at {fill_tokens} tok + pane non-idle, BUT the "
-                    f"subagent's streamed-token count grew since last poll — "
-                    f"subagent-blocked, not wedged; NOT firing (T-1776)")
+        _log(agent, f"fill frozen at {fill_tokens} tok + pane non-idle, BUT the main "
+                    f"transcript advanced since last poll and/or the subagent's "
+                    f"streamed-token count grew — alive (subagent-blocked), not "
+                    f"wedged; NOT firing (T-1776/T-3617)")
         return None
     if disp == "hold":
         _log(agent, f"fill frozen at {fill_tokens} tok + pane non-idle + a subagent "
@@ -4574,7 +5890,9 @@ def _maybe_fire_staleness(
 
     # T-2459: DISPATCH detached (see _maybe_fire_api_health). ok == dispatched,
     # not restarted; the true outcome is reconciled cross-cycle from the unit.
-    ok, output, unit = dispatch_detached_restart(cfg, agent, reason=STALENESS_REASON)
+    # T-4828: a wedged pane may be parked on a permission dialog; deny it, never approve it.
+    ok, output, unit = dispatch_detached_restart(cfg, agent, reason=STALENESS_REASON,
+                                                 dismiss_modal=True)
     if ok:
         _log(agent, f"wedge restart DISPATCHED as transient unit {unit} (async; "
                     f"forensics: journalctl --user -u {unit}); recording state")
@@ -4676,6 +5994,11 @@ def main(argv: list[str] | None = None) -> int:
     if getattr(args, "report", False):
         return _print_context_report(agent, cfg)
 
+    # T-3314: --repo-audit-dry-run is READ-ONLY like --report. It exits here,
+    # before any alert/remediation call, so it can never fall through to a poll.
+    if getattr(args, "repo_audit_dry_run", False):
+        return run_repo_audit_dry_run(agent, cfg, Path(__file__).resolve().parent.parent)
+
     # T-2965: wedge-restart suppress-flag management — a side channel that exits
     # before the remediation loop (like --report), so it never falls through to a poll.
     if getattr(args, "clear_suppress", False):
@@ -4696,20 +6019,24 @@ def main(argv: list[str] | None = None) -> int:
     # command references is a pre-blessed basename, surfaced weekly until pruned.
     maybe_alert_allowlist_staleness(agent, cfg)
 
-    # T-1945: personas with NO @agent timer instance (mnemosyne, the ORG-043
+    # T-1945: personas with NO @agent timer instance (archivist, the ORG-043
     # seats) would never get their hook-drift SECURITY check run — armed-but-
     # unprobed. Recovery's cycle is their execution home: fan the (read-only,
     # per-agent-throttled) check out to every entry flagged hook_check_via_recovery.
     # Piggybacks on recovery like inbox_consumer's health loop; adds ~1 sudo cat
     # per persona per cycle.
     if agent == "recovery":
+        # T-4392 phase 2a: fleet break-glass watch — one sender (recovery's cycle), mails Recovery
+        # once when a live flag appears and once 1h before it expires. Not mute-gated: a
+        # live flag means security hooks fail open on that seat.
+        maybe_alert_breakglass(agent)
         for other, other_cfg in AGENT_CONFIG.items():
             if other != agent and other_cfg.get("hook_check_via_recovery"):
                 maybe_alert_hook_deviation(other, other_cfg)
                 maybe_alert_allowlist_staleness(other, other_cfg)
-                # T-1980 coverage-void fix: observation_only agents (mnemosyne + the
+                # T-1980 coverage-void fix: observation_only agents (archivist + the
                 # ORG-043 seats) have NO @agent monitor timer, so their CAP signals
-                # would never be detected — the void that let mnemosyne wedge ~4h until
+                # would never be detected — the void that let archivist wedge ~4h until
                 # a human caught it. Detection+alert is separable from auto-STEP (which
                 # stays off for them): run the alert-only cap detectors here, same
                 # piggyback as the hook check. Alert-only — never restarts/auto-switches.
@@ -4735,6 +6062,18 @@ def main(argv: list[str] | None = None) -> int:
             f"(active_harness={harness_gate.active_harness or 'unknown'}, "
             f"source={harness_gate.source})",
         )
+        return 0
+
+    # ORG-106 L4b (T-5527): a seat in deep-sleep (draining or asleep) is not polled for
+    # fill, API health or wedge: there is no session to restart, and a restart would
+    # resume work on a seat that was put to sleep on purpose. The alert-only security
+    # checks above still ran. Paused-intake is NOT skipped: the seat is up and its
+    # context still fills. Reader fault / unknown reads as not-asleep.
+    seat = _seat_state_mod().safe_effective_for(agent)
+    if seat is not None and seat.state == "deep-sleep":
+        _log(agent, f"seat is in deep-sleep ({seat.owner or '?'}: {seat.reason or '-'}; "
+                    f"until {seat.expires or 'no expiry'}) — skipping threshold, "
+                    f"api-health and wedge checks this poll")
         return 0
 
     cooldown = int(
@@ -4805,33 +6144,44 @@ def main(argv: list[str] | None = None) -> int:
                     f"transcript; fresh session not yet ranked by mtime — bail (T-1328/T-1330)")
         return 0
 
-    # --- API-health check (T-0510): force-restart an alive-but-400ing session.
-    # Tombstone-mode agents only (Recovery); own cooldown. ---
-    api_health_rc = _maybe_fire_api_health(agent, cfg, jsonl)
-    if api_health_rc is not None:
-        return api_health_rc
+    # --- Stale-jsonl guard (T-4088): the selected jsonl predates the pane's current
+    # claude process = a predecessor's transcript. Its CONTENT (400s/404s/401s/429s,
+    # fill) describes a dead session, so every jsonl-content detector below and the
+    # absolute-threshold fire skip it. Pane-based checks (spend-limit scrape,
+    # pane-confirmed wedge/staleness) still run. ---
+    stale_session_start = stale_jsonl_session_start(jsonl, cfg, agent)
+    jsonl_stale = stale_session_start is not None
+    if jsonl_stale:
+        maybe_alert_idle_successor(agent, cfg, stale_session_start)
 
-    # --- Model-outage check (T-1126): ALERT (not restart) on a session pinned to
-    # a removed/inaccessible --model (sustained 404s). Alert-only, own cooldown,
-    # ships dark (PANTHEON_MODEL_OUTAGE_ENABLED). Does not gate the loop. ---
-    _maybe_fire_model_outage(agent, cfg, jsonl)
+    if not jsonl_stale:
+        # --- API-health check (T-0510): force-restart an alive-but-400ing session.
+        # Tombstone-mode agents only (Recovery); own cooldown. ---
+        api_health_rc = _maybe_fire_api_health(agent, cfg, jsonl)
+        if api_health_rc is not None:
+            return api_health_rc
 
-    # --- Auth-outage check (T-1223): ALERT (not restart) on a session that cannot
-    # authenticate (sustained 401s). Re-login is the operator's; a restart re-inherits
-    # the dead credential. Direct-to-operator, own cooldown, ships ON; no loop gate. ---
-    _maybe_fire_auth_outage(agent, cfg, jsonl)
+        # --- Model-outage check (T-1126): ALERT (not restart) on a session pinned to
+        # a removed/inaccessible --model (sustained 404s). Alert-only, own cooldown,
+        # ships dark (PANTHEON_MODEL_OUTAGE_ENABLED). Does not gate the loop. ---
+        _maybe_fire_model_outage(agent, cfg, jsonl)
 
-    # Capability-cap wedge, JSONL variant (T-1980): sustained per-turn 429 + cap
-    # content = agent stuck on a spend/usage cap that looks idle. Alert-only to
-    # Recovery; reliable complement to the pane-scrape below. Ships ON.
-    _maybe_fire_capability_cap(agent, cfg, jsonl)
+        # --- Auth-outage check (T-1223): ALERT (not restart) on a session that cannot
+        # authenticate (sustained 401s). Re-login is the operator's; a restart re-inherits
+        # the dead credential. Direct-to-operator, own cooldown, ships ON; no loop gate. ---
+        _maybe_fire_auth_outage(agent, cfg, jsonl)
 
-    # Consent-fallback nudge (T-1980 signal-void fix): the Fable weekly-CREDITS cap
-    # surfaces as a model_consent_fallback SYSTEM record the harness auto-recovers
-    # from (switches the live session to opus) — detect_capability_cap is structurally
-    # blind to it. NOT a wedge; an action-nudge to verify the supervisor --model pin so
-    # a restart doesn't re-stall. Alert-only to Recovery; own cooldown; ships ON.
-    _maybe_fire_consent_fallback(agent, cfg, jsonl)
+        # Capability-cap wedge, JSONL variant (T-1980): sustained per-turn 429 + cap
+        # content = agent stuck on a spend/usage cap that looks idle. Alert-only to
+        # Recovery; reliable complement to the pane-scrape below. Ships ON.
+        _maybe_fire_capability_cap(agent, cfg, jsonl)
+
+        # Consent-fallback nudge (T-1980 signal-void fix): the Fable weekly-CREDITS cap
+        # surfaces as a model_consent_fallback SYSTEM record the harness auto-recovers
+        # from (switches the live session to opus) — detect_capability_cap is structurally
+        # blind to it. NOT a wedge; an action-nudge to verify the supervisor --model pin so
+        # a restart doesn't re-stall. Alert-only to Recovery; own cooldown; ships ON.
+        _maybe_fire_consent_fallback(agent, cfg, jsonl)
 
     # --- Spend-limit-wedge check (2026-06-26): ALERT (not restart) on a session
     # wedged on the monthly-spend-limit modal. Pane-scrape (not JSONL — the modal is
@@ -4889,6 +6239,14 @@ def main(argv: list[str] | None = None) -> int:
     )
     if staleness_rc is not None:
         return staleness_rc
+
+    # T-4088: never fire the absolute-threshold restart off a predecessor's fill —
+    # the running session has written nothing yet (idle fresh successor). Placed
+    # AFTER the staleness block so pane-confirmed wedge recovery stays live.
+    if jsonl_stale:
+        _log(agent, f"fill {fill_pct:.2%} is the PREDECESSOR's (stale jsonl) — NOT "
+                    f"evaluating the threshold until the running session writes (T-4088)")
+        return 0
 
     # T-2615: full-suppress the ABSOLUTE-THRESHOLD restart only, on an active
     # hold. Placed HERE -- after the staleness fallthrough above, deliberately

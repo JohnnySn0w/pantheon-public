@@ -15,11 +15,19 @@ import fleet_host_health as m  # noqa: E402
 class FakeOps:
     """Inject probe results and capture alerts, so no ssh/curl/ping runs in tests."""
 
-    def __init__(self, reachable=None, alarms=None, now=1000):
+    def __init__(self, reachable=None, alarms=None, now=1000, off_tailnet=None):
         self._reachable = reachable or {}     # host name/ip -> True/False/None
         self._alarms = alarms or {}           # netdata base url -> list[str]/None
         self._now = now
+        self._off = off_tailnet               # T-5385: this host's own tailnet state
         self.alerts = []                      # captured (msg, vocab, agent)
+        self.off_reports = []
+
+    def off_tailnet(self):
+        return self._off
+
+    def report_off_tailnet(self, state, detail):
+        self.off_reports.append((state, detail))
 
     def icmp_reachable(self, host):
         return self._reachable.get(host)
@@ -217,6 +225,27 @@ class CheckAllTests(unittest.TestCase):
             results = m.check_all(ops=ops, state_dir=Path(tmp))
             self.assertEqual([r["name"] for r in results], [h["name"] for h in m.HOSTS])
             self.assertTrue(all(r["verdict"] == m.OK for r in results))
+
+
+class OffTailnetT5385Test(unittest.TestCase):
+    def _check(self, off):
+        cfg = {"name": "boxon", "ping": "boxon", "netdata": None}
+        ops = FakeOps(reachable={"boxon": False}, off_tailnet=off)
+        with tempfile.TemporaryDirectory() as d:
+            r = m.check_host_once(cfg, ops=ops, state_dir=Path(d), now=1000,
+                                    cooldown_secs=3600, dry_run=False)
+        return r, ops
+
+    def test_unreachable_while_this_host_is_off_the_tailnet_does_not_alert(self):
+        r, ops = self._check("NeedsLogin")
+        self.assertEqual(r["verdict"], m.OFF_TAILNET)
+        self.assertEqual(ops.alerts, [])
+        self.assertEqual(ops.off_reports[0][0], "NeedsLogin")
+
+    def test_unreachable_on_the_tailnet_still_alerts(self):
+        r, ops = self._check(None)
+        self.assertEqual(r["verdict"], m.UNREACHABLE)
+        self.assertEqual(len(ops.alerts), 1)
 
 
 if __name__ == "__main__":

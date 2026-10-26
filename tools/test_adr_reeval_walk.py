@@ -492,5 +492,190 @@ class RealRepoSmoke(unittest.TestCase):
             + "\n  ".join(broken))
 
 
+# ---------------------------------------------------------------------------
+# Policy / SOP roots (T-4556)
+# ---------------------------------------------------------------------------
+
+def _gov_tree(td: str, files: dict[str, str]) -> Path:
+    root = Path(td)
+    for rel, text in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(textwrap.dedent(text), encoding="utf-8")
+    return root
+
+
+class GovernanceDocs(unittest.TestCase):
+    def test_header_line_split_on_semicolon(self):
+        with TemporaryDirectory() as td:
+            root = _gov_tree(td, {"rulebook/policies/alpha.md": """\
+                # Alpha
+
+                **Status:** Ratified
+                **Re-evaluate when:** a new class appears; a credential is exposed; a seat is added.
+
+                ## Body
+                text
+                """})
+            ts = W.scan_governance_docs(root)
+        self.assertEqual([t.trigger_id for t in ts],
+                         ["policy:alpha:H1", "policy:alpha:H2", "policy:alpha:H3"])
+        self.assertEqual(ts[0].when, "a new class appears")
+        self.assertEqual(ts[2].when, "a seat is added")
+        self.assertTrue(all(t.fires == "surface" and t.ttype == "prose" for t in ts))
+        self.assertEqual(ts[0].adr_id, "policy:alpha")
+
+    def test_section_form_bullets_sop(self):
+        with TemporaryDirectory() as td:
+            root = _gov_tree(td, {"sop/standard/beta.md": """\
+                # Beta
+                ## Re-evaluate when
+
+                - first thing changes
+                - second thing changes
+
+                ## Related
+                - not a trigger
+                """})
+            ts = W.scan_governance_docs(root)
+        self.assertEqual([t.trigger_id for t in ts],
+                         ["sop:standard/beta:S1", "sop:standard/beta:S2"])
+        self.assertEqual(ts[1].when, "second thing changes")
+        self.assertEqual(ts[0].adr_id, "sop:standard/beta")
+
+    def test_bulletless_section_yields_plain_lines(self):
+        with TemporaryDirectory() as td:
+            root = _gov_tree(td, {"rulebook/policies/gamma.md": """\
+                # Gamma
+                ## Re-evaluate when
+
+                A new project is added.
+                Escalation rate deviates.
+
+                ## Next
+                """})
+            ts = W.scan_governance_docs(root)
+        self.assertEqual([t.when for t in ts],
+                         ["A new project is added.", "Escalation rate deviates."])
+
+    def test_metadata_header_dropped_when_section_exists(self):
+        with TemporaryDirectory() as td:
+            root = _gov_tree(td, {"rulebook/policies/delta.md": """\
+                # Delta
+                **Re-evaluate when:** x changes; y changes.
+
+                ## Re-evaluate when
+                - x changes
+                - y changes
+                """})
+            ts = W.scan_governance_docs(root)
+        self.assertEqual([t.trigger_id for t in ts], ["policy:delta:S1", "policy:delta:S2"])
+
+    def test_pointer_header_plus_midbody_plus_section(self):
+        with TemporaryDirectory() as td:
+            root = _gov_tree(td, {"rulebook/policies/eps.md": """\
+                # Eps
+                **Re-evaluate when:** see "Re-evaluate when" section below - many things.
+
+                ## Calibration
+                **Re-evaluate when:** reversals recur 3x; the opposite error appears.
+
+                ## Re-evaluate when
+                - sec one
+                - sec two
+                """})
+            ts = W.scan_governance_docs(root)
+        ids = {t.trigger_id: t.when for t in ts}
+        self.assertEqual(ids, {
+            "policy:eps:S1": "sec one", "policy:eps:S2": "sec two",
+            "policy:eps:H1": "reversals recur 3x",
+            "policy:eps:H2": "the opposite error appears",
+        })
+
+    def test_pointer_header_alone_yields_nothing(self):
+        with TemporaryDirectory() as td:
+            root = _gov_tree(td, {"sop/standard/zeta.md": """\
+                # Zeta
+                **Re-evaluate when:** see "Re-evaluate when" section below.
+                """})
+            self.assertEqual(W.scan_governance_docs(root), [])
+
+    def test_non_matches_ignored_and_readme_skipped(self):
+        with TemporaryDirectory() as td:
+            root = _gov_tree(td, {
+                "sop/standard/eta.md": """\
+                    # Eta
+                    **Re-evaluated 2026-09-27 (T-1):** the old trigger fired.
+                    Per close: Re-evaluate trigger: 30 days post-B8.
+                    Re-evaluate at <trigger>: if <observation>.
+                    """,
+                "sop/standard/README.md": "# Idx\n**Re-evaluate when:** a; b.\n",
+                "rulebook/policies/README.md": "# Idx\n**Re-evaluate when:** a; b.\n",
+            })
+            self.assertEqual(W.scan_governance_docs(root), [])
+
+    def test_ids_unique_across_same_stem_and_remediation_recursion(self):
+        with TemporaryDirectory() as td:
+            root = _gov_tree(td, {
+                "rulebook/policies/same.md": "# P\n**Re-evaluate when:** one.\n",
+                "sop/standard/same.md": "# S\n**Re-evaluate when:** one.\n",
+                "sop/remediation/same.md": "# R\n**Re-evaluate when:** one.\n",
+            })
+            ts = W.scan_governance_docs(root)
+        ids = [t.trigger_id for t in ts]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(set(ids), {"policy:same:H1", "sop:standard/same:H1",
+                                    "sop:remediation/same:H1"})
+
+    def test_adr_scan_unchanged_by_new_roots(self):
+        """ADR invariance: scan_adrs ignores policy/SOP roots and its output on
+        a fixture ADR dir is identical whether or not governance docs exist."""
+        with TemporaryDirectory() as td:
+            root = _gov_tree(td, {
+                "architecture/adr/ORG-900-x.md": """\
+                    ---
+                    id: ORG-900
+                    ---
+                    # x
+                    **Re-evaluate when:** header line must stay unparsed for ADRs; b.
+                    ## Re-evaluate when
+                    - **ORG-900:R1** - one
+                    - plain
+                    """,
+            })
+            before = W.scan_adrs(root / "architecture" / "adr")
+            _gov_tree(td, {"rulebook/policies/p.md": "# P\n**Re-evaluate when:** q.\n"})
+            after = W.scan_adrs(root / "architecture" / "adr")
+        self.assertEqual(before, after)
+        self.assertEqual([t.trigger_id for t in before], ["ORG-900:R1", "ORG-900:S1"])
+
+    def test_run_walk_surfaces_governance_triggers_without_filing(self):
+        with TemporaryDirectory() as td:
+            root = _gov_tree(td, {
+                "architecture/adr/ORG-901-x.md": "---\nid: ORG-901\n---\n# x\n",
+                "rulebook/policies/p.md": "# P\n**Re-evaluate when:** the bridge changes.\n",
+            })
+            (root / "tickets").mkdir()
+            res = W.run_walk(now=dt.date(2026, 8, 3), adr_dir=root / "architecture" / "adr",
+                             tickets_root=root / "tickets", governance_root=root,
+                             dry_run=True, push=False)
+        self.assertEqual(res.surface_count, 1)
+        self.assertEqual(res.filed, [])
+        self.assertIn("policy:p:H1", res.watch_section)
+        self.assertIn("the bridge changes", res.watch_section)
+
+    def test_watch_section_heading_covers_policies(self):
+        t = W.Trigger("policy:p", "policy:p:H1", "prose", "x", "surface", "prose", "x")
+        self.assertIn("## ADR / policy / SOP re-eval watch", W.build_watch_section([t]))
+        self.assertIn("## ADR / policy / SOP re-eval watch", W.build_watch_section([]))
+
+    def test_live_tree_surfaces_known_policy_triggers(self):
+        ts = W.scan_governance_docs()
+        blob = "\n".join(f"{t.adr_id} {t.when}" for t in ts)
+        self.assertIn("last_inbound_at", blob)  # autonomy.md bridge trigger
+        self.assertTrue(any(t.adr_id == "policy:access-by-operation-risk" for t in ts))
+        self.assertTrue(all(t.fires == "surface" for t in ts))
+
+
 if __name__ == "__main__":
     unittest.main()

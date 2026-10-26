@@ -1,0 +1,406 @@
+---
+# ORG-099 seat-parity axis manifest
+# Authoritative source for what a Pantheon seat MUST have to count as at-parity.
+# Rendered by tools/parity_render.py (T-3747 BT2, to be built) into per-seat
+# check scripts + a fleet audit table. Amendments file as orchestrator-owned tickets
+# under ORG-099; new-axis additions matching existing tier taxonomy are
+# orchestrator-autonomous per feedback_infra_design_autonomous_with_corpus_check_msg10007.
+#
+# Schema:
+#   axes[]:
+#     axis_id       — kebab-case, stable identifier
+#     tier          — HARD | SOFT | BILLING | DOMAIN
+#     description   — one-line human summary
+#     applies_to    — "all-seats" | list of role-ids
+#     source_of_truth — file path (relative to pantheon-config repo root) OR external URI
+#     check_method  — one of: gh_api | systemd_query | file_grep | ticket_lookup | canary
+#     check_ref     — string identifying the specific check (BT2 renders this into a script)
+#     gap_history   — list of ticket-refs where this axis's failure was surfaced
+#
+# Version bump on any axis addition/retirement/tier-shift.
+
+schema_version: 1
+manifest_version: 6  # T-4160: codex-worker-guard-hook-trusted widened to the five Claude seats with a codex fallback. v5 = T-4155: HARD axis codex-worker-guard-hook-trusted (codex seat only). v4 = T-3766 tranche 5: domain-scope-declared applies_to narrowed to domain-scoped seats only (orch tier excluded per the operator's 2026-09-07 no-domain-scoping ratification)
+
+axes:
+
+  # ==================== HARD (§3.1) ====================
+
+  - axis_id: unix-account-linger-enabled
+    tier: HARD
+    description: "Persona's unix account exists + linger enabled (systemd-user manager keeps running across logouts). Boolean-normalized via python."
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: systemd_query
+    # Post-T-3751 boolean-normalization (2026-09-16): the bare loginctl output
+    # ('Linger=yes' or 'Linger=no' both rc=0) is UNMEASURABLE under
+    # classify_outcome's systemd_query branch by design. Wrap in python that
+    # emits true/false so it PASSes/FAILs cleanly.
+    check_ref: 'python3 -c "import subprocess; r=subprocess.run([\"loginctl\",\"show-user\",\"<account>\",\"--property=Linger\"],capture_output=True,text=True); print(\"true\" if r.stdout.strip()==\"Linger=yes\" else \"false\")"'
+    gap_history: []
+
+  - axis_id: harness-cli-installed-authed
+    tier: HARD
+    description: "Harness CLI (claude | codex) installed at its expected path per harness_runtime, AND auth token file present. Resolves the persona's declared harness from instance.yaml roles.<role>.harness, then checks the appropriate binary + credential file."
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: file_grep
+    # Post-T-3751 prose migration (2026-09-16): resolves harness from
+    # instance.yaml, then checks the right binary + credential file for that
+    # harness. Claude-code seats: /home/<account>/.npm-global/bin/claude +
+    # ~/.claude/.credentials.json. Codex seats: /usr/bin/codex +
+    # ~/.codex/auth.json. Sudo-wrapped by parity_render.py because <account>
+    # is present.
+    check_ref: 'python3 -c "import yaml,os; d=yaml.safe_load(open(\"instance.yaml\")); persona=\"<persona>\"; account=\"<account>\"; role=next((r for r,c in d.get(\"roles\",{}).items() if c.get(\"persona\")==persona),None); harness=d.get(\"roles\",{}).get(role,{}).get(\"harness\",\"\"); home=f\"/home/{account}\"; ok=(harness==\"claude-code\" and os.path.exists(f\"{home}/.npm-global/bin/claude\") and os.path.exists(f\"{home}/.claude/.credentials.json\")) or (harness==\"codex\" and os.path.exists(\"/usr/bin/codex\") and os.path.exists(f\"{home}/.codex/auth.json\")); print(\"true\" if ok else \"false\")"'
+    gap_history: []
+
+  - axis_id: permissions-allow-populated
+    tier: HARD
+    description: "harness config's permissions.allow array is non-empty (Claude Code) OR approval_policy set (Codex) — MOST-MISSED CHECK per bringup.md"
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: file_grep
+    # Claude Code variant; codex analog (approval_policy in ~/.codex/config.toml) is a separate axis-variant follow-up.
+    check_ref: 'python3 -c "import json;print(bool(json.load(open(\"/home/<account>/.claude/settings.json\")).get(\"permissions\",{}).get(\"allow\",[])))"'
+    gap_history: [T-1832]
+
+  - axis_id: permissions-allow-covers-mcp-tools
+    tier: HARD
+    description: "permissions.allow includes at least one entry with the mcp__<server>__ prefix for every MCP server declared for this persona in instance.yaml's persona_installer.claude_mcp_servers.personas.<persona>.servers. Personas with no MCP declared vacuously PASS."
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: file_grep
+    # G-f (T-3751 tranche 3): boolean-normalized real check. Reads instance.yaml
+    # for the persona's declared MCP servers, then reads the persona's own
+    # settings.json permissions.allow (sudo-wrapped by parity_render.py because
+    # <account> is present). Prints 'true' iff every declared server has at
+    # least one matching allow entry. Personas not in claude_mcp_servers.personas
+    # (recovery/codex) return true vacuously — no MCP declared, nothing
+    # to cover.
+    check_ref: 'python3 -c "import yaml,json; d=yaml.safe_load(open(\"instance.yaml\")); srvs=list(d.get(\"persona_installer\",{}).get(\"claude_mcp_servers\",{}).get(\"personas\",{}).get(\"<persona>\",{}).get(\"servers\",{}).keys()); allow=json.load(open(\"/home/<account>/.claude/settings.json\"))[\"permissions\"][\"allow\"] if srvs else []; missing=[s for s in srvs if not any(a.startswith(f\"mcp__{s}__\") for a in allow)]; print(\"true\" if not missing else \"false\")"'
+    gap_history: [T-1832]  # archivist 2026-07-20 caught by the operator TG 3833
+
+  - axis_id: mailbox-inbox-exists
+    tier: HARD
+    description: "Own inbox dir exists at hub under /home/post-office/mailbox/<persona>/ with correct ACLs (persona's account has an ACL entry granting access)"
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: file_grep
+    # G-f (T-3751 tranche 2): boolean-normalized real check. Verifies (a) inbox dir
+    # exists at the hub, AND (b) the persona's own unix account has an ACL grant on
+    # it (silent seat-isolation shape from T-1824 was one-direction ACL). Prints
+    # 'true' or 'false' → boolish-branch of classify_outcome → PASS/FAIL.
+    check_ref: 'python3 -c "import pathlib,subprocess; p=''/home/post-office/mailbox/<persona>/''; e=pathlib.Path(p).is_dir(); a=subprocess.run([''getfacl'',''-p'',p],capture_output=True,text=True).stdout if e else ''''; print(''true'' if e and ''user:<account>:'' in a else ''false'')"'
+    gap_history: []
+
+  - axis_id: mailbox-can-send-to-peers
+    tier: HARD
+    description: "Persona can send to ALL peer inboxes at the hub — verifies write ACL grant on /home/post-office/mailbox/<peer>/ for every peer persona (excluding self). A one-direction grant is silent seat-isolation (T-1824)."
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: file_grep
+    # G-f (T-3751 tranche 3b): boolean-normalized ACL scan. Enumerates peer
+    # personas from instance.yaml's roles: block, then getfacl each peer's
+    # inbox and verifies user:<account>: has 'w' in the perms. Silent
+    # seat-isolation (T-1824: archivist could receive not send) shows up as
+    # a peer missing the write ACL. Faster + more deterministic than a live-
+    # send canary: no I/O to real inboxes, no cleanup, safe to run in bulk.
+    check_ref: 'python3 -c "import yaml,subprocess as sp; d=yaml.safe_load(open(\"instance.yaml\")); ps=[r[\"persona\"] for r in d.get(\"roles\",{}).values() if r.get(\"persona\")]; ok=all(any(\"user:<account>:\" in l and \"w\" in l.split(\":\",2)[-1] for l in sp.run([\"getfacl\",\"-p\",f\"/home/post-office/mailbox/{p}\"],capture_output=True,text=True).stdout.splitlines()) for p in ps if p != \"<persona>\"); print(\"true\" if ok else \"false\")"'
+    gap_history: [T-1824]  # archivist could receive not send
+
+  - axis_id: mcp-python-package-pinned
+    tier: HARD
+    description: "mcp<2 pinned per-account (unpinned pulls 2.x which breaks lowlevel-Server decorators, MCP server FAILS at session start)"
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: file_grep
+    # T-3766 (2026-09-16): retired the embedded `sudo -u <account> pip show mcp`
+    # which was doubly-broken — (a) sudo-to-self denial when recovery audited recovery,
+    # (b) claude-fallback's sudo policy doesn't permit /usr/bin/pip. Boolean-
+    # normalized python via importlib.metadata is the account's own python
+    # resolution (site-packages honored under sudo-wrap-as-<account> after the
+    # T-3766 resolve_sudo_account change made file_grep wrap unconditional).
+    # The <account>= comment tag documents which account's install this measures
+    # and is preserved intentionally (no functional effect).
+    check_ref: 'python3 -c "import importlib.metadata as m; d=[x for x in m.distributions() if x.metadata[''Name'']==''mcp'']; v=d[0].version if d else ''''; print(''true'' if v and int(v.split(''.'')[0])<2 else ''false'')  # account=<account>"'
+    gap_history: [T-2521, T-1903, T-3766]
+
+  - axis_id: ticket-persona-registered
+    tier: HARD
+    description: "Persona registered in AGENT_ROLE_MAP / instance.yaml — ticket.py hard-rejects unregistered targets"
+    applies_to: all-seats
+    source_of_truth: pantheon-config/instance.yaml
+    check_method: ticket_lookup
+    check_ref: "python3 -c 'from tools.agent_role_map import AGENT_ROLE_MAP; assert \"<persona>\" in AGENT_ROLE_MAP'"
+    gap_history: [T-0762]
+
+  - axis_id: chat-surface-first-live-turn-verified
+    tier: HARD
+    description: "Persona has successfully called the reply tool at least once in their live sessions — verified by grep for mcp__plugin_telegram_telegram__reply in their transcript directory. Personas without a declared telegram channel (mailbox-first sub-orchs, codex) vacuously PASS."
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: file_grep
+    # G-f (T-3751 tranche 3c): boolean-normalized transcript grep. (a) resolves
+    # persona → role; (b) checks harness_runtime.roles.<role>.claude.native.channels
+    # OR persona_installer.codex_telegram_bridge.personas to determine if the
+    # persona has a telegram channel; (c) if yes, greps
+    # /home/<account>/.claude/projects/*/*.jsonl (any project dir: a seat whose
+    # live cwd is ~/pantheon-config writes elsewhere, T-4773) for the reply-
+    # tool invocation. Once observed, the persona has proven live-turn at
+    # least once — matches the axis intent (bringup-audit signal, not a fresh
+    # canary). Trade-off recorded: if transcripts get garbage-collected, a
+    # previously-verified persona would false-FAIL; ORG-099 §8 alarm-bias
+    # accepts that over false-PASS.
+    check_ref: 'python3 -c "import yaml,glob,subprocess as sp; d=yaml.safe_load(open(\"instance.yaml\")); persona=\"<persona>\"; account=\"<account>\"; role=next((r for r,c in d.get(\"roles\",{}).items() if c.get(\"persona\")==persona),None); tg=(\"channels\" in d.get(\"harness_runtime\",{}).get(\"roles\",{}).get(role,{}).get(\"claude\",{}).get(\"native\",{})) or (persona in d.get(\"persona_installer\",{}).get(\"codex_telegram_bridge\",{}).get(\"personas\",{})); files=glob.glob(f\"/home/{account}/.claude/projects/*/*.jsonl\") if tg else []; print(\"true\" if not tg or (files and sp.run([\"grep\",\"-l\",\"mcp__plugin_telegram_telegram__reply\"]+files,capture_output=True,text=True).stdout.strip()) else \"false\")"'
+    gap_history: []
+
+  - axis_id: inbox-consumer-timer-present
+    tier: HARD
+    description: "pantheon-inbox-consumer@<persona>.service + .timer exists on the account's own user-systemd manager (query the RIGHT manager, not the auditor's). Boolean-normalized via is-enabled."
+    applies_to: all-seats
+    source_of_truth: pantheon-config/tools/delivery_reachability.py
+    check_method: systemd_query
+    # Post-T-3751 boolean-normalization (2026-09-16): list-unit-files output
+    # is UNMEASURABLE under systemd_query without boolish. is-enabled prints
+    # 'enabled' rc=0 for enabled, 'disabled' rc=1 for disabled, 'not-found'
+    # rc=1 for absent. Absent → false (FAIL, HARD-tier alarm) is a more
+    # informative signal than UNMEASURABLE for a genuinely-missing timer.
+    check_ref: 'python3 -c "import os,subprocess; os.environ[\"XDG_RUNTIME_DIR\"]=f\"/run/user/{os.getuid()}\"; r=subprocess.run([\"systemctl\",\"--user\",\"is-enabled\",\"pantheon-inbox-consumer@<persona>.timer\"],capture_output=True,text=True); print(\"true\" if r.stdout.strip()==\"enabled\" else \"false\")"'
+    gap_history: [T-2232]  # artisan NO TIMER
+
+  - axis_id: delivery-mode-substrate-match
+    tier: HARD
+    description: "Declared DELIVERY_MODE matches substrate reality: send-keys ⇒ live tmux pane exists; mailbox ⇒ hub grants exist. Boolean-normalized via python-piped parse of delivery_reachability.py --json --dry-run."
+    applies_to: all-seats
+    source_of_truth: pantheon-config/tools/delivery_reachability.py
+    check_method: canary
+    # Post-T-3751 bugfix (2026-09-16): the previous check_ref used field
+    # names 'persona' and 'ok' that the tool never emitted (actual output
+    # uses 'agent' and 'state'). Result: r was always empty and sys.exit(1)
+    # → UNMEASURABLE for every seat. Also handled the list-vs-dict output
+    # shape (tool emits a bare JSON list, .get('results',d) was crashing on
+    # a list). Fixed to match live schema; state=='READY' is the PASS signal.
+    #
+    # T-3766 (2026-09-16): switched relative `tools/delivery_reachability.py`
+    # to absolute `/home/<account>/pantheon-config/tools/delivery_reachability.py`.
+    # Under sudo-wrap-as-<account>, cwd is bash's default for that account
+    # (typically ~), so the relative path resolved to the wrong place and
+    # returned rc=2 → UNMEASURABLE for 7/8 seats (recovery=P was the self-case
+    # where cwd happened to be right). Absolute path is deterministic across
+    # sudo-wrap boundaries.
+    check_ref: "python3 /home/<account>/pantheon-config/tools/delivery_reachability.py --json --dry-run | python3 -c 'import json,sys; d=json.load(sys.stdin); items=d if isinstance(d,list) else d.get(\"results\",[]); r=[x for x in items if x.get(\"agent\")==\"<persona>\"]; print(\"true\" if r and r[0].get(\"state\")==\"READY\" else \"false\")'"
+    gap_history: [T-2232, T-3766]
+
+  - axis_id: codex-worker-guard-hook-trusted
+    tier: HARD
+    description: "Codex's worker-guard PreToolUse hook (T-4144) is wired AND trusted, its matcher covers Bash + apply_patch, and no other trusted hook is undeclared by the codex-config snippet. Codex silently SKIPS an untrusted hook (T-3244), so losing the entry or its trusted_hash leaves codex subagents unguarded with no error."
+    # T-4160: widened from [peer-daemon-codex] to every seat with a codex runtime.
+    # The five Claude seats below carry codex as a FALLBACK (harness_runtime.roles.
+    # <role>.fallbacks), and codex 0.147 ships multi_agent default-on, so a failover
+    # could spawn unguarded codex subagents. Those seats have no codex-config clone:
+    # the check then declares no other hook (the guard must be the only one).
+    applies_to: [peer-daemon-codex, head-engineering-orchestrator, specialist, head-system-orchestrator, engineering-orchestrator-1, engineering-orchestrator-2]
+    source_of_truth: pantheon-config/tools/codex_hook_trust_check.py
+    check_method: file_grep
+    # T-4155 (2026-09-28): asks codex itself (app-server hooks/list) as the seat
+    # account, read-only; prints true/false, or exits 3 with no stdout when it
+    # cannot evaluate (UNMEASURABLE). Runs the tool from the SEAT'S clone (absolute
+    # path, same as delivery-mode-substrate-match) because codex cannot read the
+    # auditor's 700 home. The test -r guard keeps a seat clone that predates the
+    # tool at UNMEASURABLE: bare python3 on a missing script would print "No such
+    # file or directory" and file_grep would call that a HARD FAIL, paging orchestrator
+    # over a stale clone (fleet_clone_currency_check owns that signal) instead of a
+    # missing hook. --timeout 20 sits under PROBE_TIMEOUT (30) so a hung app-server
+    # reports its own UNMEASURABLE reason instead of a bare runner timeout.
+    # T-4160: the second gate refuses a seat-clone copy older than CHECK_CONTRACT 2.
+    # The contract-1 tool (T-4155) reads a Claude seat's missing codex-config snippet
+    # as unreadable, and its errno text trips file_grep's FAIL branch, which would
+    # page orchestrator over a stale clone instead of a missing guard.
+    check_ref: 'f=/home/<account>/pantheon-config/tools/codex_hook_trust_check.py; test -r "$f" || { echo "codex_hook_trust_check.py missing from the seat clone; see fleet_clone_currency_check" >&2; exit 3; }; grep -Eq "^CHECK_CONTRACT = [2-9]$" "$f" || { echo "seat-clone codex_hook_trust_check.py predates CHECK_CONTRACT 2; see fleet_clone_currency_check" >&2; exit 3; }; python3 "$f" --timeout 20'
+    gap_history: [T-4144, T-4155, T-4160]
+
+  # ==================== SOFT (§3.2) ====================
+
+  - axis_id: monitor-context-fill
+    tier: SOFT
+    description: "pantheon-context-fill-monitor@<persona>.timer active on recovery's audit substrate. Recovery-central templated per-seat; probed on auditor account, not seat account."
+    # T-3766 tranche 3 (2026-09-16): applies_to narrowed per recovery's re-seed
+    # audit — context-fill runs centrally on recovery's account for exactly
+    # {orchestrator, specialist, recovery} (the always-context-consuming seats). Consume-plane
+    # sub-orchs + codex + archivist don't take this axis at all.
+    applies_to: [head-engineering-orchestrator, specialist, head-system-orchestrator]
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: systemd_query
+    # T-3766 tranche 3 (2026-09-16): probe_on: auditor because the timers
+    # live on recovery's account (claude-fallback), templated per monitored seat.
+    # The prior seat-account probe (via default sudo-wrap) got 'not-found' on
+    # non-recovery accounts → false FAIL. is-active (not is-enabled) also avoids
+    # the "installed template preset returns 'enabled' for uninstantiated
+    # instances" false-PASS trap recovery identified. is-active returns 'active'
+    # rc=0 for a running instance, 'inactive' rc=3 for a stopped/absent
+    # instance.
+    probe_on: auditor
+    check_ref: 'python3 -c "import os,subprocess; os.environ[\"XDG_RUNTIME_DIR\"]=f\"/run/user/{os.getuid()}\"; r=subprocess.run([\"systemctl\",\"--user\",\"is-active\",\"pantheon-context-fill-monitor@<persona>.timer\"],capture_output=True,text=True); print(\"true\" if r.stdout.strip()==\"active\" else \"false\")"'
+    gap_history: [T-3766]
+
+  - axis_id: monitor-activity
+    tier: SOFT
+    description: "pantheon-activity-monitor@<persona>.timer active on recovery's audit substrate. Recovery-central templated per-seat; probed on auditor account. Per-tier threshold verification (orch 30m / impl 15m / rev 5m) is a separate concern."
+    # T-3766 tranche 3 (2026-09-16): applies_to narrowed per recovery's re-seed
+    # audit — activity-monitor runs centrally on recovery's account for exactly
+    # {orchestrator, artisan, mason} (the orchestrator tier). Non-orch seats don't
+    # take this axis.
+    applies_to: [head-engineering-orchestrator, engineering-orchestrator-1, engineering-orchestrator-2]
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: systemd_query
+    # T-3766 tranche 3 (2026-09-16): probe_on: auditor + is-active pattern —
+    # see monitor-context-fill note.
+    probe_on: auditor
+    check_ref: 'python3 -c "import os,subprocess; os.environ[\"XDG_RUNTIME_DIR\"]=f\"/run/user/{os.getuid()}\"; r=subprocess.run([\"systemctl\",\"--user\",\"is-active\",\"pantheon-activity-monitor@<persona>.timer\"],capture_output=True,text=True); print(\"true\" if r.stdout.strip()==\"active\" else \"false\")"'
+    gap_history: [T-3766]
+
+  - axis_id: monitor-keep-going
+    tier: SOFT
+    description: "pantheon-keep-going@<persona>.timer enabled. Boolean-normalized via is-enabled."
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: systemd_query
+    # Post-T-3751 boolean-normalization (2026-09-16): is-enabled prints
+    # 'enabled' rc=0 for an enabled timer. list-timers output is UNMEASURABLE
+    # under systemd_query without boolish.
+    check_ref: 'python3 -c "import os,subprocess; os.environ[\"XDG_RUNTIME_DIR\"]=f\"/run/user/{os.getuid()}\"; r=subprocess.run([\"systemctl\",\"--user\",\"is-enabled\",\"pantheon-keep-going@<persona>.timer\"],capture_output=True,text=True); print(\"true\" if r.stdout.strip()==\"enabled\" else \"false\")"'
+    gap_history: []
+
+  - axis_id: monitor-mailbox-wake
+    tier: SOFT
+    description: "pantheon-mailbox-wake@<persona>.timer enabled. Boolean-normalized via is-enabled."
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: systemd_query
+    # Post-T-3751 boolean-normalization (2026-09-16): same pattern as
+    # monitor-keep-going.
+    check_ref: 'python3 -c "import os,subprocess; os.environ[\"XDG_RUNTIME_DIR\"]=f\"/run/user/{os.getuid()}\"; r=subprocess.run([\"systemctl\",\"--user\",\"is-enabled\",\"pantheon-mailbox-wake@<persona>.timer\"],capture_output=True,text=True); print(\"true\" if r.stdout.strip()==\"enabled\" else \"false\")"'
+    gap_history: []
+
+  - axis_id: persona-orientation-rendered-fresh
+    tier: SOFT
+    description: "~/.claude/skills/pantheon-* rendered artifacts present + source-bindings.yaml fresh"
+    applies_to: all-seats
+    source_of_truth: pantheon-config/rulebook/persona-orientation/manifest.yaml
+    check_method: stale_check
+    # T-3813 (Recovery): was `file_grep`, which mapped check_stale.py's rc=2 STALE to
+    # UNMEASURABLE (its "unrecognized failure shape" fallback), burying real drift.
+    # `stale_check` classifies check_stale.py's explicit rc contract directly:
+    # rc=0 → PASS (all sources fresh); rc=2 → FAIL (drift or missing
+    # source-bindings.yaml). check_stale.py takes no --seat; it checks whatever
+    # clone it's invoked from (per-account, when parity_render.py sudo-wraps as
+    # <account>). Bound to the classify_outcome `stale_check` branch in parity_render.py.
+    check_ref: "python3 /home/<account>/pantheon-config/tools/persona_orientation/check_stale.py"
+    gap_history: []
+
+  - axis_id: role-claude-md-present
+    tier: SOFT
+    description: "Persona's role/CLAUDE.md present at expected account path"
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: file_grep
+    check_ref: "test -f /home/<account>/CLAUDE.md"
+    gap_history: []
+
+  - axis_id: standard-hook-set
+    tier: SOFT
+    description: "SessionStart + PreToolUse + PostToolUse + Stop + SessionEnd hooks installed with sane timeouts"
+    applies_to: all-seats
+    source_of_truth: sop/standard/pantheon-bringup.md
+    check_method: file_grep
+    check_ref: 'python3 -c "import json;print(json.load(open(\"/home/<account>/.claude/settings.json\"))[\"hooks\"])"'
+    gap_history: [T-3172]  # 6/14 explicit timeouts, 8/14 default 60s
+
+  - axis_id: sticker-mcp-registered
+    tier: SOFT
+    description: "State-sticker MCP (tools/sticker_mcp.py) registered in EVERY harness config the account has (~/.claude.json and ~/.codex/config.toml), so the seat can send its persona stickers whichever runtime it is on. The operator TG 11768: stickers on all Telegram-enabled seats."
+    applies_to: [head-engineering-orchestrator, specialist, head-system-orchestrator, head-memory-orchestrator]
+    source_of_truth: pantheon-config/tools/sticker_mcp.py
+    check_method: file_grep
+    # T-4991 (2026-10-14, Recovery). Boolean-normalized. Out of scope: peer-daemon-codex (consultant),
+    # which sends stickers through its own codex-telegram MCP tool allowlist (the operator TG 11770),
+    # not this server; system-orchestrator-1 (watchman), whose bot is a send-only alert bot
+    # with no persona sticker set; and mason/artisan, which have no Telegram bot.
+    check_ref: 'python3 -c "import json,os; h=os.path.expanduser(\"~\"); c=h+\"/.claude.json\"; x=h+\"/.codex/config.toml\"; ok=(not os.path.exists(c) or \"sticker_mcp.py\" in json.dumps(json.load(open(c)))) and (not os.path.exists(x) or \"[mcp_servers.sticker]\" in open(x).read()); print(\"true\" if ok else \"false\")"'
+    gap_history: [T-4991]
+
+  - axis_id: hc-controller-service
+    tier: SOFT  # MIGRATION-in-progress
+    description: "pantheon-runtime-controller@<persona>.service (T-2953 HC — in-flight cutover; seats may be pre-HC or HC)"
+    applies_to: all-seats
+    source_of_truth: pantheon-config/architecture/adr/ORG-053-persona-runtime-controller.md
+    check_method: systemd_query
+    # T-4884 (2026-10-13): was prose ("systemctl status ... (or documented pre-HC
+    # equivalent)"), which parity_render's prose guard maps to UNMEASURABLE for every
+    # seat. That was hidden by the T-2953 migration carve-outs on the pre-HC seats,
+    # but it left watchman (born on the controller, deliberately not carved) reading
+    # U. Boolean-normalized like monitor-mailbox-wake: is-active == active → true.
+    # Pre-HC seats stay covered by their migration-in-progress carve-outs.
+    check_ref: 'python3 -c "import os,subprocess; os.environ[\"XDG_RUNTIME_DIR\"]=f\"/run/user/{os.getuid()}\"; r=subprocess.run([\"systemctl\",\"--user\",\"is-active\",\"pantheon-runtime-controller@<persona>.service\"],capture_output=True,text=True); print(\"true\" if r.stdout.strip()==\"active\" else \"false\")"'
+    gap_history: [T-2953]
+
+  - axis_id: xdg-portal-masked
+    tier: SOFT
+    description: "XDG desktop-portal masked (headless hygiene; three silent-failure recurrences before fleet-wide mask via T-3722). Boolean-normalized via python."
+    applies_to: all-seats
+    source_of_truth: pantheon-config/notes/  # T-3722 landing note
+    check_method: systemd_query
+    # Post-T-3751 boolean-normalization (2026-09-16): is-enabled prints
+    # 'masked' rc=1 for a masked unit, 'enabled'/'disabled' rc=0/rc=1 for
+    # others. UNMEASURABLE under systemd_query without boolish. Wrap.
+    check_ref: 'python3 -c "import os,subprocess; os.environ[\"XDG_RUNTIME_DIR\"]=f\"/run/user/{os.getuid()}\"; r=subprocess.run([\"systemctl\",\"--user\",\"is-enabled\",\"xdg-desktop-portal.service\"],capture_output=True,text=True); print(\"true\" if r.stdout.strip()==\"masked\" else \"false\")"'
+    gap_history: [T-3722]
+
+  - axis_id: chronicle-archive-after-last-restart
+    tier: SOFT
+    description: "Seat's last session end is archived to its Chronicle (T-5016; the operator TG 11829/11830: every seat must have session history). Boolean via session_chronicle coverage --bool."
+    # T-5016 (2026-10-15): lands SOFT, not HARD. coverage prints false while a
+    # seat's last restart is not yet knowable (no archive since the controller
+    # hooks shipped), so HARD would page orchestrator for every seat until each one
+    # restarts on the new code. Promote to HARD once the fleet has cycled.
+    # Absolute seat-clone path + test -r guard: same reasons as
+    # delivery-mode-substrate-match and codex-worker-guard-hook-trusted (a stale
+    # clone reports UNMEASURABLE, not FAIL).
+    applies_to: all-seats
+    source_of_truth: pantheon-config/tools/session_chronicle.py
+    check_method: canary
+    check_ref: 'f=/home/<account>/pantheon-config/tools/session_chronicle.py; test -r "$f" || { echo "session_chronicle.py missing from the seat clone; see fleet_clone_currency_check" >&2; exit 3; }; python3 "$f" coverage --persona <persona> --bool'
+    gap_history: [T-3561, T-5016]
+
+  # ==================== BILLING (§3.3) ====================
+
+  - axis_id: billing-model-declared
+    tier: BILLING
+    description: "Seat's billing model declared: subscription-OAuth (claude-seat, kino) vs headless API key (archivist per project_kino_chat_sunset)"
+    applies_to: all-seats
+    source_of_truth: pantheon-config/instance.yaml
+    check_method: file_grep
+    check_ref: 'python3 -c "import yaml,sys; d=yaml.safe_load(open(\"instance.yaml\")); r=d.get(\"roles\",{}).get(\"<role>\",{}); sys.exit(0 if r.get(\"billing_model\") else 1)"'
+    gap_history: []
+
+  # ==================== DOMAIN (§3.4) ====================
+
+  - axis_id: domain-scope-declared
+    tier: DOMAIN
+    description: "Seat's work-scope partition declared. ONLY applies to domain-scoped seats (specialist, recovery, second-head, peer-daemon-*). HO + sub-orchs work project-wide by design (the operator ratification 2026-09-07, CLAUDE.md sub-orchestrators pin) and don't take a domain field at all."
+    # T-3766 tranche 5 (2026-09-16): narrowed applies_to to exclude the
+    # orchestrators (orchestrator, sub-orchestrator-1, sub-orchestrator-2).
+    # Prior 'all-seats' framing treated no-domain-scoping as a defensible
+    # exception via intentional-variant carve-outs (artisan + mason) — that
+    # inverted the semantic: your standing rule is that domain-scoping IS the
+    # exception (specialists + daemons + hemisphere-splits), not the default.
+    # Anyone reading the audit with the old shape would infer artisan/mason were
+    # missing something they SHOULD have; the reality is the axis asks a
+    # question that doesn't fit them. Executing under the operator's 2026-09-07
+    # ratification which is already the standing rule; the axis reshape is
+    # build-tier work conforming to ratified policy, not new policy.
+    applies_to: [specialist, head-system-orchestrator, head-memory-orchestrator, peer-daemon-codex]
+    source_of_truth: pantheon-config/instance.yaml
+    check_method: file_grep
+    check_ref: 'python3 -c "import yaml,sys; d=yaml.safe_load(open(\"instance.yaml\")); r=d.get(\"roles\",{}).get(\"<role>\",{}); sys.exit(0 if r.get(\"domain\") else 1)"'
+    gap_history: [T-3766]

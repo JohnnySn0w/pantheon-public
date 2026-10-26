@@ -98,9 +98,13 @@ class TestCaseFromJsonDict(unittest.TestCase):
 class TestLoadAllCasesAgainstCommittedSet(unittest.TestCase):
     """These exercise the REAL, frozen, committed eval set."""
 
-    def test_loads_all_35_committed_cases(self):
+    def test_load_all_cases_count_matches_manifest_total(self):
+        # v1 pinned 35; v2 widens (62 in the initial candidate tranche). The
+        # manifest is the authority — this test asserts loader/manifest agree
+        # rather than a hardcoded count that has to be bumped with every widen.
+        manifest = case_loader.load_manifest()
         cases = case_loader.load_all_cases()
-        self.assertEqual(len(cases), 35)
+        self.assertEqual(len(cases), manifest["counts"]["total"])
 
     def test_every_loaded_case_id_matches_its_key(self):
         cases = case_loader.load_all_cases()
@@ -126,11 +130,16 @@ class TestLoadCasesSplitScoping(unittest.TestCase):
         for case in holdout_cases.values():
             self.assertEqual(case.split, "holdout")
 
-    def test_train_and_holdout_partition_the_full_set(self):
+    def test_train_and_holdout_partition_the_scoreable_set(self):
+        # v2 introduced a third split value `deferred` (escalate-class cases,
+        # excluded from the optimization loop). load_cases("train") + load_cases(
+        # "holdout") partition the SCOREABLE subset, not the full set. The
+        # anti-leakage scoping seam intentionally does not expose `deferred`.
         train_cases = case_loader.load_cases("train")
         holdout_cases = case_loader.load_cases("holdout")
         all_cases = case_loader.load_all_cases()
-        self.assertEqual(set(train_cases) | set(holdout_cases), set(all_cases))
+        scoreable_ids = {cid for cid, c in all_cases.items() if c.split in ("train", "holdout")}
+        self.assertEqual(set(train_cases) | set(holdout_cases), scoreable_ids)
         self.assertTrue(set(train_cases).isdisjoint(set(holdout_cases)))
 
     def test_invalid_split_raises_value_error(self):

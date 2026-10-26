@@ -80,7 +80,7 @@ Ratified 2026-05-11 by the operator (msg_989 via T-0069). Followed the same perc
 ## Re-evaluate
 
 - **Per row:** 30 days post-ratification (first fleet-wide re-eval ratified 2026-07-06; next trigger ≈2026-08-05). Each agent re-runs `--propose-threshold` on accumulated data; HO compares to current value; amends this catalog if the recomputed value differs materially.
-- **Catalog-wide:** when a new long-lived agent joins the org (Echo resumed; new project starts). **Fired 3× 2026-07-19/20 (T-1917 note):** mnemosyne (ORG-042), metis + atlas (ORG-043) have no rows yet — deliberate, not drift: each row needs accumulated non-zero 5h-window `usage.jsonl` data first, and catalog additions route via the `--propose-threshold` proposal flow per T-1875's resolution. Add the three rows when their first 30-day accumulation supports a proposal.
+- **Catalog-wide:** when a new long-lived agent joins the org (Echo resumed; new project starts). **Fired 3× 2026-07-19/20 (T-1917 note):** archivist (ORG-042), mason + artisan (ORG-043) have no rows yet — deliberate, not drift: each row needs accumulated non-zero 5h-window `usage.jsonl` data first, and catalog additions route via the `--propose-threshold` proposal flow per T-1875's resolution. Add the three rows when their first 30-day accumulation supports a proposal.
 - **Distribution-shape change:** if a row's non-zero distribution turns multi-modal-beyond-bimodal or the saturation cluster shifts >2× from the baseline, surface as a separate ticket.
 
 ## Cross-link

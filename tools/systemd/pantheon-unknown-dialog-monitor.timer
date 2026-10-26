@@ -1,0 +1,17 @@
+[Unit]
+Description=Pantheon unknown-dialog monitor — every 5 min: alert Recovery on a seat parked on an unrecognised confirm dialog (T-2553)
+Documentation=file:///home/%u/pantheon-config/tools/unknown_dialog_monitor.py
+
+[Timer]
+# 5min matches cap_modal_reaper + codex_modal_monitor. With the 2-sample debounce, a dialog
+# must persist >= ~5 min before Recovery is alerted — long enough to skip transient dialogs,
+# short enough that an unattended seat is not parked for hours.
+OnUnitActiveSec=5min
+OnBootSec=3min
+OnActiveSec=1min
+
+# Deliberately NOT Persistent=true: level-triggered — the next fire re-reads current panes.
+Unit=pantheon-unknown-dialog-monitor.service
+
+[Install]
+WantedBy=timers.target

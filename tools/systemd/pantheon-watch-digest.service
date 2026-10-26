@@ -19,7 +19,9 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # deliberately" would have pointed specialist's digest at a path inside orchestrator's 700-mode home, which
 # specialist cannot read and which is a different bot anyway. Worth remembering before any sweep
 # auto-syncs anything — the repo is canonical for CONTENT, not automatically correct.
-Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
+# No PANTHEON_TELEGRAM_ENV here (T-4131): watch_digest resolves the token itself —
+# %h/.claude/channels/telegram/pantheon.env if present (specialist's per-bot file), else .env.
+# An explicit pointer defeats that fallback and silently skips sends when the file is absent.
 ExecStart=/usr/bin/python3 %h/pantheon-config/tools/watch_digest.py
 StandardOutput=journal
 StandardError=journal

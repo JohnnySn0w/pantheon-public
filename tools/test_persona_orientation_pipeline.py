@@ -109,44 +109,226 @@ class CheckStaleDetectsDrift(unittest.TestCase):
             )
 
 
+def source_binding_problems(root: Path) -> list[str]:
+    """The CI gate on rulebook/persona-orientation/source-bindings.yaml; [] means it
+    holds. T-4726: a stamp holds iff its source exists, its blob exists in this repo AND
+    is the source's blob at HEAD. git_sha is provenance only and is deliberately NOT
+    asserted reachable: a squash merge drops the PR branch's commits, so a source edit
+    and its re-stamp in one PR used to go red on main (#770, #785). Same contract as the
+    SOP-skill stamps (T-4669, test_persona_orientation_sop_skills.sop_stamp_problems)."""
+    path = root / "rulebook" / "persona-orientation" / "source-bindings.yaml"
+    if not path.exists():
+        return ["source-bindings.yaml missing -- run render.py first"]
+    bindings = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if not bindings:
+        return ["source-bindings.yaml is empty"]
+    problems = []
+    for rel_path, stamp in bindings.items():
+        if not (root / rel_path).exists():
+            problems.append(f"{rel_path}: does not exist on disk")
+            continue
+        blob_there = subprocess.run(
+            ["git", "cat-file", "-e", f"{stamp['git_blob']}^{{blob}}"], cwd=root, capture_output=True,
+        )
+        if blob_there.returncode != 0:
+            problems.append(f"{rel_path}: stamped blob does not exist in this repo")
+        head_blob = subprocess.run(
+            ["git", "rev-parse", f"HEAD:{rel_path}"], cwd=root, capture_output=True, text=True,
+        ).stdout.strip()
+        if head_blob != stamp["git_blob"]:
+            problems.append(f"{rel_path}: stamp is not the source at HEAD")
+    for item in check_stale.check_orientation_stamps(root):
+        problems.append(f"{item['path']}: {item['reason']}")
+    return problems
+
+
 class ManifestSourceBindingsReachable(unittest.TestCase):
     """Runs against the REAL repo + the actually-committed manifest and
     source-bindings.yaml -- this is the CI freshness gate itself, not a
     fixture test. cwd is this worktree's own root, never the shared
     checkout, per the standing pinned-revision reachability pattern
-    (bugs/pinned-git-revision-unreachable-fails-closed-at-activation.md)."""
-
-    def _git(self, *args: str) -> str:
-        result = subprocess.run(
-            ["git", *args], cwd=REPO_ROOT, check=True, capture_output=True, text=True,
-        )
-        return result.stdout.strip()
+    (bugs/pinned-git-revision-unreachable-fails-closed-at-activation.md).
+    T-4726: the gate checks content (the stamped blob is the source at HEAD),
+    not git_sha reachability, so a squash merge cannot red main."""
 
     def test_manifest_source_bindings_reachable(self):
-        bindings_path = REPO_ROOT / "rulebook" / "persona-orientation" / "source-bindings.yaml"
-        self.assertTrue(bindings_path.exists(), "source-bindings.yaml missing -- run render.py first")
+        self.assertEqual(source_binding_problems(REPO_ROOT), [])
 
-        with open(bindings_path, encoding="utf-8") as f:
-            bindings = yaml.safe_load(f)
-        self.assertTrue(bindings, "source-bindings.yaml is empty")
 
-        for rel_path, stamp in bindings.items():
-            with self.subTest(source=rel_path):
-                self.assertTrue(
-                    (REPO_ROOT / rel_path).exists(),
-                    f"{rel_path} does not exist on disk",
-                )
-                git_sha = stamp["git_sha"]
+def render_stamp(root: Path, rel_path: str) -> dict:
+    cache = render.SourceCache(root)
+    cache.text(rel_path)
+    return cache.bindings[rel_path]
 
-                # Fails if git_sha doesn't exist / isn't reachable from HEAD.
-                subprocess.run(
-                    ["git", "merge-base", "--is-ancestor", git_sha, "HEAD"],
-                    cwd=REPO_ROOT, check=True,
-                )
 
-                # Fails if git_sha:path doesn't resolve to the stamped blob.
-                resolved = self._git("rev-parse", f"{git_sha}:{rel_path}")
-                self.assertEqual(resolved, stamp["git_blob"])
+class ManifestEntriesAllStamped(unittest.TestCase):
+    """T-4743: every source the manifest + role-deltas pull in must have a stamp in
+    source-bindings.yaml (mirror of the SOP-skill 'no stamp recorded' check), and a
+    stamp for a source the manifest no longer pulls in is stale. Temp-dir repo only."""
+
+    SOURCE = "rulebook/fixture.md"
+    BINDINGS = "rulebook/persona-orientation/source-bindings.yaml"
+    IDENT = ["-c", "user.email=t@example.invalid", "-c", "user.name=t"]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        self.git("init", "-q", "-b", "main")
+        po = self.root / "rulebook" / "persona-orientation"
+        po.mkdir(parents=True)
+        (self.root / self.SOURCE).write_text("fixture body\n", encoding="utf-8")
+        (po / "manifest.yaml").write_text(yaml.safe_dump({
+            "version": 1,
+            "base_layer": {"sections": [{"id": "inline_one", "extract": "inline", "body": "hi"}]},
+            "roles": [{"id": "implementer", "delta_sections": ["d"]}],
+        }), encoding="utf-8")
+        (po / "role-deltas.yaml").write_text(yaml.safe_dump({
+            "version": 1,
+            "roles": {"implementer": {"d": {"extract": "full-file", "source": self.SOURCE}}},
+        }), encoding="utf-8")
+        self.commit("sources")
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", *self.IDENT, *args], cwd=self.root, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def commit(self, msg: str) -> None:
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", msg)
+
+    def stamp(self) -> None:
+        render.write_source_bindings(self.root, render.render_all(self.root)[1])
+        self.commit("stamps")
+
+    def test_manifest_entry_with_no_stamp_is_stale(self):
+        (self.root / self.BINDINGS).write_text("{}\n", encoding="utf-8")
+        self.commit("empty bindings")
+        report = check_stale.check(self.root)
+        self.assertEqual(report["status"], "stale")
+        self.assertEqual([d["path"] for d in report["drifted"]], [self.SOURCE])
+        self.assertIn("no stamp", report["drifted"][0]["reason"])
+        self.assertTrue(source_binding_problems(self.root))  # empty-bindings guard fires too
+
+    def test_fully_stamped_manifest_is_fresh(self):
+        self.stamp()
+        self.assertEqual(check_stale.check(self.root)["status"], "fresh")
+        self.assertEqual(source_binding_problems(self.root), [])
+
+    def test_stamp_for_a_source_the_manifest_no_longer_names_is_stale(self):
+        self.stamp()
+        (self.root / "rulebook" / "other.md").write_text("other\n", encoding="utf-8")
+        self.commit("other")
+        bindings = yaml.safe_load((self.root / self.BINDINGS).read_text(encoding="utf-8"))
+        bindings["rulebook/other.md"] = render_stamp(self.root, "rulebook/other.md")
+        render.write_source_bindings(self.root, bindings)
+        self.commit("stray stamp")
+        report = check_stale.check(self.root)
+        self.assertEqual(report["status"], "stale")
+        self.assertIn("no longer", report["drifted"][0]["reason"])
+
+    def test_real_repo_manifest_is_fully_stamped(self):
+        self.assertEqual(check_stale.check_orientation_stamps(REPO_ROOT), [])
+
+
+class SquashMergedSourceBindings(unittest.TestCase):
+    """T-4726: a source edit and its re-stamp in ONE PR, squash-merged. The squash drops
+    the branch's commits, so the stamp's git_sha is no longer an ancestor of main; the
+    gate must hold anyway, and a post-merge re-render must not touch the stamp."""
+
+    SOURCE = "sop/standard/demo.md"
+    BINDINGS = "rulebook/persona-orientation/source-bindings.yaml"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.tmp = Path(self._tmp.name)
+        self.root = self.tmp / "repo"
+        self.root.mkdir()
+        self.git("init", "-q", "-b", "main")
+        self.git("config", "user.email", "t@example.invalid")
+        self.git("config", "user.name", "t")
+        (self.root / "sop" / "standard").mkdir(parents=True)
+        (self.root / "rulebook" / "persona-orientation").mkdir(parents=True)
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=self.root, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def write_source(self, text: str, msg: str) -> None:
+        (self.root / self.SOURCE).write_text(text, encoding="utf-8")
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", msg)
+
+    def stamp(self) -> None:
+        """What render.py does for one source: stamp it at its last commit."""
+        data = (self.root / self.SOURCE).read_bytes()
+        bindings = {
+            self.SOURCE: {
+                "git_sha": self.git("log", "-1", "--format=%H", "--", self.SOURCE),
+                "git_blob": self.git("rev-parse", f"HEAD:{self.SOURCE}"),
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "byte_length": len(data),
+            }
+        }
+        render.write_source_bindings(self.root, bindings)
+
+    def commit_stamp(self, msg: str) -> None:
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", msg)
+
+    def test_edit_plus_restamp_in_one_pr_holds_after_a_squash_merge(self):
+        self.write_source("# Demo\n\nv1\n", "source v1")
+        self.stamp()
+        self.commit_stamp("stamps on main")
+        self.git("checkout", "-q", "-b", "feature")
+        self.write_source("# Demo\n\nv2\n", "source v2")
+        edit_sha = self.git("rev-parse", "HEAD")
+        self.stamp()
+        self.commit_stamp("restamp")
+        self.assertEqual(source_binding_problems(self.root), [])
+        stamp_sha = yaml.safe_load((self.root / self.BINDINGS).read_text())[self.SOURCE]["git_sha"]
+        self.assertEqual(stamp_sha, edit_sha)
+
+        self.git("checkout", "-q", "main")
+        self.git("merge", "--squash", "feature")
+        self.git("commit", "-q", "-m", "squash merge of feature")
+        ancestry = subprocess.run(
+            ["git", "merge-base", "--is-ancestor", stamp_sha, "HEAD"], cwd=self.root, capture_output=True,
+        )
+        self.assertEqual(ancestry.returncode, 1, "precondition: the stamped sha is gone from main")
+        self.assertEqual(source_binding_problems(self.root), [])
+
+        # CI's view: a clone of main that never fetched the feature branch.
+        clone = self.tmp / "clone"
+        subprocess.run(
+            ["git", "clone", "-q", "--single-branch", "--branch", "main", f"file://{self.root}", str(clone)],
+            check=True,
+        )
+        gone = subprocess.run(["git", "cat-file", "-e", f"{stamp_sha}^{{commit}}"], cwd=clone, capture_output=True)
+        self.assertNotEqual(gone.returncode, 0, "the clone must not contain the squashed-away commit")
+        self.assertEqual(source_binding_problems(clone), [])
+
+        # A post-merge re-render keeps the stamp byte-identical (no seat-clone churn).
+        before = (self.root / self.BINDINGS).read_text(encoding="utf-8")
+        self.stamp()
+        self.assertEqual((self.root / self.BINDINGS).read_text(encoding="utf-8"), before)
+        self.assertEqual(self.git("status", "--porcelain"), "")
+
+    def test_a_real_source_edit_is_restamped_and_a_stale_stamp_fails(self):
+        self.write_source("# Demo\n\nv1\n", "source v1")
+        self.stamp()
+        self.commit_stamp("stamps")
+        old_blob = yaml.safe_load((self.root / self.BINDINGS).read_text())[self.SOURCE]["git_blob"]
+        self.write_source("# Demo\n\nv2\n", "source v2")
+        self.assertIn(f"{self.SOURCE}: stamp is not the source at HEAD", source_binding_problems(self.root))
+        self.stamp()
+        new_blob = yaml.safe_load((self.root / self.BINDINGS).read_text())[self.SOURCE]["git_blob"]
+        self.assertNotEqual(new_blob, old_blob)
+        self.commit_stamp("restamp")
+        self.assertEqual(source_binding_problems(self.root), [])
 
 
 class BlockExtractionCompleteness(unittest.TestCase):
@@ -190,6 +372,52 @@ class BlockExtractionCompleteness(unittest.TestCase):
                             f"{spec['label']} extraction ends in a dangling colon "
                             "-- a list continuation was likely truncated",
                         )
+
+
+class ThreatModelWiring(unittest.TestCase):
+    """T-5288: ORG-105 is present in the cheat sheet and the reviewer checklists."""
+
+    def test_policy_triggers_carry_a_threat_model_pointer_to_org_105_section_4(self):
+        manifest = render.load_manifest(REPO_ROOT)
+        cache = render.SourceCache(REPO_ROOT)
+        section = next(s for s in manifest["base_layer"]["sections"] if s["id"] == "policy_triggers")
+        spec = next((x for x in section["sources"] if x["label"] == "threat-model"), None)
+        self.assertIsNotNone(spec, "policy_triggers has no threat-model entry")
+        paragraph = render.extract_heading_region_paragraph(
+            cache.text(spec["path"]), spec["heading"], spec.get("select_prefix"),
+        )
+        self.assertIn("ORG-105", paragraph)
+        self.assertIn("4", paragraph)
+
+    def test_reviewer_surfaces_carry_the_org_105_chain_line(self):
+        skill = (REPO_ROOT / "harness/claude/skills/reviewer-methodology/SKILL.md").read_text()
+        self.assertIn("Axis H", skill)
+        self.assertIn("ORG-105", skill)
+        sop = (REPO_ROOT / "sop/standard/reviewer-methodologies.md").read_text()
+        self.assertIn("ORG-105", sop)
+
+
+class RoleDeltaContent(unittest.TestCase):
+    """T-3997 / T-4005 regressions, against the real manifest + sources."""
+
+    COUNT_WORDS = {"one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten"}
+
+    def test_sourced_delta_keys_carry_no_count_words(self):
+        # A delta key renders verbatim as its section heading; a count baked
+        # into it ("three_methodologies") goes stale when the sourced body
+        # grows. Inline-only deltas are exempt: key and body are edited together.
+        role_deltas = render.load_role_deltas(REPO_ROOT)
+        for role_id, deltas in role_deltas["roles"].items():
+            for key, spec in deltas.items():
+                parts = spec if isinstance(spec, list) else [spec]
+                if all(p.get("extract") == "inline" for p in parts):
+                    continue
+                with self.subTest(role=role_id, key=key):
+                    self.assertFalse(self.COUNT_WORDS & set(key.split("_")), key)
+
+    def test_implementer_skill_carries_no_bare_stash_rule(self):
+        artifacts, _ = render.render_all(REPO_ROOT)
+        self.assertIn("never bare `git stash`", artifacts["role:implementer"])
 
 
 if __name__ == "__main__":

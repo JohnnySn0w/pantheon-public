@@ -51,7 +51,7 @@ from tools import mailbox as _mailbox  # noqa: E402  (needs sys.path above)
 # plan (precondition (a)).
 DEFAULT_INBOXES = (
     "orchestrator", "specialist", "specialist-a2a", "recovery", "codex",
-    "mnemosyne", "metis", "atlas", "the-ancestor",
+    "archivist", "mason", "artisan", "the-ancestor",
 )
 
 

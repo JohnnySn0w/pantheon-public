@@ -1,0 +1,14 @@
+[Unit]
+Description=Pantheon git reconciler — every 5 minutes (ORG-101 §3, T-4690)
+Documentation=file:///home/%u/pantheon-config/architecture/adr/ORG-101-git-redundancy-write-path-and-sync.md
+
+[Timer]
+# Short cadence on purpose: the lag between a GitHub PR merge and Forgejo catching up is the
+# read-failover staleness window, and after an outage it is the replay delay. The tool
+# holds a non-blocking flock, so an overrun fire skips instead of stacking.
+OnBootSec=2min
+OnUnitActiveSec=5min
+Unit=pantheon-git-reconciler.service
+
+[Install]
+WantedBy=timers.target

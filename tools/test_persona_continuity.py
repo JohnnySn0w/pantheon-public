@@ -68,7 +68,7 @@ class ContinuityFixture:
             }
         self.manifest_data: dict[str, object] = {
             "schema": pc.BUNDLE_SCHEMA_ID,
-            "persona_id": "cairn",
+            "persona_id": "consultant",
             "organism_id": "pantheon",
             "role_contract_ref": self.refs["role_contract_ref"],
             "identity_canon_ref": self.refs["identity_canon_ref"],
@@ -76,10 +76,10 @@ class ContinuityFixture:
             "capability_profile_ref": self.refs["capability_profile_ref"],
             "authority_profile_ref": self.refs["authority_profile_ref"],
             "memory_root_refs": [self.refs["memory"]],
-            "commitment_query": {"kind": "commitment", "persona_id": "cairn", "states": ["active", "waiting"]},
+            "commitment_query": {"kind": "commitment", "persona_id": "consultant", "states": ["active", "waiting"]},
             "runtime_binding_ref": self.refs["runtime_binding_ref"],
             "provenance": {
-                "authored_by": "cairn",
+                "authored_by": "consultant",
                 "adopted_by": "operator",
                 "source_revision": "rev-a",
                 "migrations": [],
@@ -103,7 +103,7 @@ class ContinuityFixture:
             "source_locator": "test-policy",
             "catalog_revision": "p1",
             "actors": [{
-                "actor_id": "cairn",
+                "actor_id": "consultant",
                 "authority_refs": ["authority:canonical"],
                 "allowed_purposes": ["hydrate-runtime", "checkpoint-boundary", "verify-candidate"],
             }],
@@ -135,7 +135,7 @@ class ContinuityFixture:
     def resolve(self, *, actor_authority: tuple[str, ...] = ("authority:canonical",)) -> pc.ResolvedContinuityView:
         manifest, policy = self.load()
         store = pc.ContinuitySourceStore(repo_root=self.repo, state_root=self.state, source_policy=policy)
-        actor = pc.ActorContext("cairn", actor_authority, (pc.ContinuityPurpose.HYDRATE_RUNTIME,))
+        actor = pc.ActorContext("consultant", actor_authority, (pc.ContinuityPurpose.HYDRATE_RUNTIME,))
         return pc.ContinuityResolver(store, checkpoint_root=self.checkpoints).resolve(
             manifest,
             purpose="hydrate-runtime",
@@ -147,9 +147,9 @@ class ContinuityFixture:
         data: dict[str, object] = {
             "runtime_id": "runtime-1",
             "harness_id": "codex",
-            "account_ref": "account:cairn",
+            "account_ref": "account:consultant",
             "responsive": True,
-            "self_identification": "Cairn",
+            "self_identification": "Consultant",
             "role_identification": "orchestrator",
             "authority_limits": ("authority:canonical",),
             "current_work_refs": ("ticket:T-3176",),
@@ -166,7 +166,7 @@ class ContinuityFixture:
     def boundary(self, **changes: object) -> pc.CheckpointBoundary:
         data: dict[str, object] = {
             "boundary_id": "boundary-1",
-            "author": "cairn",
+            "author": "consultant",
             "correlation_id": "corr-1",
             "created_at": "2026-09-06T00:00:00Z",
             "supersedes_receipt_path": None,
@@ -178,7 +178,7 @@ class ContinuityFixture:
     def checkpoint(self) -> tuple[pc.ResolvedContinuityView, pc.CheckpointReceipt]:
         view = self.resolve()
         _, policy = self.load()
-        actor = policy.actor_context("cairn", pc.ContinuityPurpose.HYDRATE_RUNTIME)
+        actor = policy.actor_context("consultant", pc.ContinuityPurpose.HYDRATE_RUNTIME)
         resolver = pc.ContinuityResolver(None, checkpoint_root=self.checkpoints, source_policy=policy)
         receipt = resolver.checkpoint(
             view,
@@ -337,7 +337,7 @@ class PersonaContinuityTests(unittest.TestCase):
         )
         store = pc.ContinuitySourceStore(repo_root=self.fx.repo, state_root=self.fx.state, source_policy=policy)
         resolver = pc.ContinuityResolver(store, checkpoint_root=self.fx.checkpoints)
-        actor = policy.actor_context("cairn", pc.ContinuityPurpose.HYDRATE_RUNTIME)
+        actor = policy.actor_context("consultant", pc.ContinuityPurpose.HYDRATE_RUNTIME)
         self.assert_code(
             "required-ref-unpinned",
             lambda: resolver.resolve(unpinned, purpose="hydrate-runtime", actor=actor, as_of=datetime.now(timezone.utc)),
@@ -378,7 +378,7 @@ class PersonaContinuityTests(unittest.TestCase):
         self.assert_code("actor-context-conflict", lambda: self.fx.resolve(actor_authority=("authority:other",)))
         manifest, policy = self.fx.load()
         store = pc.ContinuitySourceStore(repo_root=self.fx.repo, state_root=self.fx.state, source_policy=policy)
-        actor = pc.ActorContext("cairn", ("authority:canonical",), (pc.ContinuityPurpose.OPERATOR_AUDIT,))
+        actor = pc.ActorContext("consultant", ("authority:canonical",), (pc.ContinuityPurpose.OPERATOR_AUDIT,))
         self.assert_code("actor-purpose-refused", lambda: pc.ContinuityResolver(store, checkpoint_root=self.fx.checkpoints).resolve(manifest, purpose="operator-audit", actor=actor, as_of=datetime.now(timezone.utc)))
 
     def test_resolver_preserves_source_authority_and_redaction(self) -> None:
@@ -417,7 +417,7 @@ class PersonaContinuityTests(unittest.TestCase):
     def test_checkpoint_requires_verified_runtime_observation(self) -> None:
         view = self.fx.resolve()
         _, policy = self.fx.load()
-        actor = policy.actor_context("cairn", pc.ContinuityPurpose.HYDRATE_RUNTIME)
+        actor = policy.actor_context("consultant", pc.ContinuityPurpose.HYDRATE_RUNTIME)
         resolver = pc.ContinuityResolver(None, checkpoint_root=self.fx.checkpoints, source_policy=policy)
         self.assert_code("runtime-not-ready", lambda: resolver.checkpoint(view, boundary_id="boundary-1", runtime_observation=self.fx.observation(self_identification=""), content=self.fx.content(), boundary=self.fx.boundary(), producer_revision="r", actor=actor, purpose="hydrate-runtime"))
 
@@ -447,7 +447,7 @@ class PersonaContinuityTests(unittest.TestCase):
         candidate_path = self.fx.root / "candidate.json"
         candidate_path.write_bytes(json_bytes(pc._plain(self.fx.candidate(envelope))))
         os.chmod(candidate_path, 0o600)
-        proc = subprocess.run([sys.executable, str(CLI), "verify", "--receipt", str(receipt_path), "--manifest", str(self.fx.manifest), "--descriptor-root", str(self.fx.descriptors), "--checkpoint-root", str(self.fx.checkpoints), "--repo-root", str(self.fx.repo), "--state-root", str(self.fx.state), "--source-policy", str(self.fx.policy), "--candidate-evidence", str(candidate_path), "--actor-id", "cairn", "--purpose", "hydrate-runtime", "--json"], text=True, capture_output=True, check=False)
+        proc = subprocess.run([sys.executable, str(CLI), "verify", "--receipt", str(receipt_path), "--manifest", str(self.fx.manifest), "--descriptor-root", str(self.fx.descriptors), "--checkpoint-root", str(self.fx.checkpoints), "--repo-root", str(self.fx.repo), "--state-root", str(self.fx.state), "--source-policy", str(self.fx.policy), "--candidate-evidence", str(candidate_path), "--actor-id", "consultant", "--purpose", "hydrate-runtime", "--json"], text=True, capture_output=True, check=False)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(json.loads(proc.stdout)["status"], "ready")
 
@@ -523,7 +523,7 @@ class PersonaContinuityTests(unittest.TestCase):
         candidate = self.fx.candidate(envelope)
         manifest, policy = self.fx.load()
         store = pc.ContinuitySourceStore(repo_root=self.fx.repo, state_root=self.fx.state, source_policy=policy)
-        actor = policy.actor_context("cairn", pc.ContinuityPurpose.HYDRATE_RUNTIME)
+        actor = policy.actor_context("consultant", pc.ContinuityPurpose.HYDRATE_RUNTIME)
         resolver = pc.ContinuityResolver(store, checkpoint_root=self.fx.checkpoints)
 
         for field, value in (
@@ -558,7 +558,7 @@ class PersonaContinuityTests(unittest.TestCase):
     def test_verification_role_is_bound_to_governed_role_ref_not_runtime_claim(self) -> None:
         view = self.fx.resolve()
         _, policy = self.fx.load()
-        actor = policy.actor_context("cairn", pc.ContinuityPurpose.HYDRATE_RUNTIME)
+        actor = policy.actor_context("consultant", pc.ContinuityPurpose.HYDRATE_RUNTIME)
         resolver = pc.ContinuityResolver(None, checkpoint_root=self.fx.checkpoints, source_policy=policy)
         receipt = resolver.checkpoint(
             view,
@@ -583,9 +583,9 @@ class PersonaContinuityTests(unittest.TestCase):
     def test_checkpoint_refuses_cross_actor_view_replay_and_boundary_author(self) -> None:
         view = self.fx.resolve()
         _, policy = self.fx.load()
-        actor = policy.actor_context("cairn", pc.ContinuityPurpose.HYDRATE_RUNTIME)
+        actor = policy.actor_context("consultant", pc.ContinuityPurpose.HYDRATE_RUNTIME)
         resolver = pc.ContinuityResolver(None, checkpoint_root=self.fx.checkpoints, source_policy=policy)
-        verify_actor = policy.actor_context("cairn", pc.ContinuityPurpose.VERIFY_CANDIDATE)
+        verify_actor = policy.actor_context("consultant", pc.ContinuityPurpose.VERIFY_CANDIDATE)
         self.assert_code(
             "view-replay-refused",
             lambda: resolver.checkpoint(view, boundary_id="boundary-1", runtime_observation=self.fx.observation(), content=self.fx.content(), boundary=self.fx.boundary(), producer_revision="r", actor=verify_actor, purpose="verify-candidate"),
@@ -603,9 +603,9 @@ class PersonaContinuityTests(unittest.TestCase):
 
     def test_legacy_session_id_is_runtime_evidence_not_continuity(self) -> None:
         path = self.fx.state / "legacy.json"
-        path.write_bytes(json_bytes({"persona_id": "cairn", "session_id": "s-1", "harness": "old"}))
+        path.write_bytes(json_bytes({"persona_id": "consultant", "session_id": "s-1", "harness": "old"}))
         os.chmod(path, 0o600)
-        evidence = pc.classify_legacy_session_state(path, persona_id="cairn", state_root=self.fx.state)
+        evidence = pc.classify_legacy_session_state(path, persona_id="consultant", state_root=self.fx.state)
         self.assertEqual(evidence.classification, pc.SourceClassification.RUNTIME_EVIDENCE)
         self.assertTrue(evidence.cache_only)
         self.assertFalse(evidence.can_satisfy_required_ref)
@@ -614,11 +614,11 @@ class PersonaContinuityTests(unittest.TestCase):
 
     def test_legacy_migration_is_additive_idempotent_and_cache_only(self) -> None:
         path = self.fx.state / "legacy.json"
-        path.write_bytes(json_bytes({"persona_id": "cairn", "session_id": "s-1"}))
+        path.write_bytes(json_bytes({"persona_id": "consultant", "session_id": "s-1"}))
         os.chmod(path, 0o600)
         output = self.fx.root / "migration"
-        first = pc.migrate_legacy_session_state(path, persona_id="cairn", state_root=self.fx.state, output_root=output)
-        second = pc.migrate_legacy_session_state(path, persona_id="cairn", state_root=self.fx.state, output_root=output)
+        first = pc.migrate_legacy_session_state(path, persona_id="consultant", state_root=self.fx.state, output_root=output)
+        second = pc.migrate_legacy_session_state(path, persona_id="consultant", state_root=self.fx.state, output_root=output)
         self.assertEqual((first.status, second.status), ("created", "idempotent"))
         migrated = json.loads(Path(first.output_path).read_text())
         self.assertFalse(migrated["can_satisfy_required_ref"])
@@ -627,12 +627,12 @@ class PersonaContinuityTests(unittest.TestCase):
 
     def test_legacy_migration_concurrent_publish_is_atomic_and_idempotent(self) -> None:
         path = self.fx.state / "legacy.json"
-        path.write_bytes(json_bytes({"persona_id": "cairn", "session_id": "private-session"}))
+        path.write_bytes(json_bytes({"persona_id": "consultant", "session_id": "private-session"}))
         os.chmod(path, 0o600)
         output = self.fx.root / "migration-race"
 
         def migrate() -> pc.LegacyMigrationReceipt:
-            return pc.migrate_legacy_session_state(path, persona_id="cairn", state_root=self.fx.state, output_root=output)
+            return pc.migrate_legacy_session_state(path, persona_id="consultant", state_root=self.fx.state, output_root=output)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
             receipts = list(executor.map(lambda _: migrate(), range(2)))
@@ -667,7 +667,7 @@ class PersonaContinuityTests(unittest.TestCase):
 
     def test_cli_resolve_checkpoint_verify_are_real_subprocess_bounded_json(self) -> None:
         view_path = self.fx.root / "view.json"
-        resolve = subprocess.run([sys.executable, str(CLI), "resolve", "--manifest", str(self.fx.manifest), "--descriptor-root", str(self.fx.descriptors), "--repo-root", str(self.fx.repo), "--state-root", str(self.fx.state), "--source-policy", str(self.fx.policy), "--checkpoint-root", str(self.fx.checkpoints), "--actor-id", "cairn", "--purpose", "hydrate-runtime", "--output", str(view_path), "--json"], text=True, capture_output=True, check=False)
+        resolve = subprocess.run([sys.executable, str(CLI), "resolve", "--manifest", str(self.fx.manifest), "--descriptor-root", str(self.fx.descriptors), "--repo-root", str(self.fx.repo), "--state-root", str(self.fx.state), "--source-policy", str(self.fx.policy), "--checkpoint-root", str(self.fx.checkpoints), "--actor-id", "consultant", "--purpose", "hydrate-runtime", "--output", str(view_path), "--json"], text=True, capture_output=True, check=False)
         self.assertEqual(resolve.returncode, 0, resolve.stderr)
         self.assertLessEqual(len(resolve.stdout.encode()), pc.MAX_CLI_OUTPUT_BYTES)
         self.assertEqual(json.loads(resolve.stdout)["schema"], pc.VIEW_SCHEMA_ID)
@@ -679,7 +679,7 @@ class PersonaContinuityTests(unittest.TestCase):
         observation.write_bytes(json_bytes(pc._plain(self.fx.observation())))
         for path in (content, boundary, observation):
             os.chmod(path, 0o600)
-        checkpoint = subprocess.run([sys.executable, str(CLI), "checkpoint", "--view", str(view_path), "--content", str(content), "--boundary", str(boundary), "--runtime-observation", str(observation), "--checkpoint-root", str(self.fx.checkpoints), "--source-policy", str(self.fx.policy), "--actor-id", "cairn", "--purpose", "hydrate-runtime", "--producer-revision", "test", "--json"], text=True, capture_output=True, check=False)
+        checkpoint = subprocess.run([sys.executable, str(CLI), "checkpoint", "--view", str(view_path), "--content", str(content), "--boundary", str(boundary), "--runtime-observation", str(observation), "--checkpoint-root", str(self.fx.checkpoints), "--source-policy", str(self.fx.policy), "--actor-id", "consultant", "--purpose", "hydrate-runtime", "--producer-revision", "test", "--json"], text=True, capture_output=True, check=False)
         self.assertEqual(checkpoint.returncode, 0, checkpoint.stderr)
         receipt = json.loads(checkpoint.stdout)
         receipt_path = self.fx.root / "receipt.json"
@@ -689,7 +689,7 @@ class PersonaContinuityTests(unittest.TestCase):
         candidate_path = self.fx.root / "candidate.json"
         candidate_path.write_bytes(json_bytes(pc._plain(self.fx.candidate(envelope))))
         os.chmod(candidate_path, 0o600)
-        verify = subprocess.run([sys.executable, str(CLI), "verify", "--receipt", str(receipt_path), "--manifest", str(self.fx.manifest), "--descriptor-root", str(self.fx.descriptors), "--checkpoint-root", str(self.fx.checkpoints), "--repo-root", str(self.fx.repo), "--state-root", str(self.fx.state), "--source-policy", str(self.fx.policy), "--candidate-evidence", str(candidate_path), "--actor-id", "cairn", "--purpose", "hydrate-runtime", "--json"], text=True, capture_output=True, check=False)
+        verify = subprocess.run([sys.executable, str(CLI), "verify", "--receipt", str(receipt_path), "--manifest", str(self.fx.manifest), "--descriptor-root", str(self.fx.descriptors), "--checkpoint-root", str(self.fx.checkpoints), "--repo-root", str(self.fx.repo), "--state-root", str(self.fx.state), "--source-policy", str(self.fx.policy), "--candidate-evidence", str(candidate_path), "--actor-id", "consultant", "--purpose", "hydrate-runtime", "--json"], text=True, capture_output=True, check=False)
         self.assertEqual(verify.returncode, 0, verify.stderr)
         self.assertEqual(json.loads(verify.stdout)["status"], "ready")
 
@@ -709,7 +709,7 @@ class PersonaContinuityTests(unittest.TestCase):
         self.fx.manifest.write_bytes(b"x" * (pc.MAX_BUNDLE_BYTES + 1))
         os.chmod(self.fx.manifest, 0o600)
         proc = subprocess.run(
-            [sys.executable, str(CLI), "resolve", "--manifest", str(self.fx.manifest), "--descriptor-root", str(self.fx.descriptors), "--repo-root", str(self.fx.repo), "--state-root", str(self.fx.state), "--source-policy", str(self.fx.policy), "--checkpoint-root", str(self.fx.checkpoints), "--actor-id", "cairn", "--purpose", "hydrate-runtime", "--output", str(output), "--json"],
+            [sys.executable, str(CLI), "resolve", "--manifest", str(self.fx.manifest), "--descriptor-root", str(self.fx.descriptors), "--repo-root", str(self.fx.repo), "--state-root", str(self.fx.state), "--source-policy", str(self.fx.policy), "--checkpoint-root", str(self.fx.checkpoints), "--actor-id", "consultant", "--purpose", "hydrate-runtime", "--output", str(output), "--json"],
             text=True,
             capture_output=True,
             check=False,
@@ -763,7 +763,7 @@ class PersonaContinuityTests(unittest.TestCase):
 
         view = self.fx.resolve()
         _, policy = self.fx.load()
-        actor = policy.actor_context("cairn", pc.ContinuityPurpose.HYDRATE_RUNTIME)
+        actor = policy.actor_context("consultant", pc.ContinuityPurpose.HYDRATE_RUNTIME)
         real = self.fx.root / "real-checkpoint-parent"
         real.mkdir(mode=0o700)
         link = self.fx.root / "checkpoint-parent-link"
@@ -797,9 +797,9 @@ class PersonaContinuityTests(unittest.TestCase):
         base: dict[str, object] = {
             "schema": pc.SWITCH_SCHEMA_ID,
             "receipt_id": "receipt-1",
-            "persona_id": "cairn",
+            "persona_id": "consultant",
             "approved_plan_sha256": "1" * 64,
-            "actor_id": "cairn",
+            "actor_id": "consultant",
             "reviewed_source_revision": "r1",
             "old_runtime_observation": pc._plain(self.fx.observation()),
             "candidate_runtime_observation": pc._plain(self.fx.observation(runtime_id="candidate-1")),

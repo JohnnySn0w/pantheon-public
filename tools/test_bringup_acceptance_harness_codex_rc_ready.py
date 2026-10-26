@@ -35,6 +35,22 @@ from tools.bringup_acceptance.types import HardStop
 from tools.harness_adapter.types import TmuxTarget
 
 
+# T-5317: the drivers converge the worker-guard hook (real codex binary) before
+# the config snapshot. These tests use fake bindings and mock the startup
+# writers, so stub it module-wide; TestT5317Converge covers the call itself.
+_converge_patches = [mock.patch.object(m, "converge_worker_guard_hook")]
+
+
+def setUpModule() -> None:
+    for p in _converge_patches:
+        p.start()
+
+
+def tearDownModule() -> None:
+    for p in reversed(_converge_patches):
+        p.stop()
+
+
 def _skip_unless_disposable_tmux_available(test: unittest.TestCase) -> None:
     if shutil.which("tmux") is None or shutil.which("systemd-run") is None:
         test.skipTest("tmux/systemd-run not available in this environment")
@@ -207,7 +223,7 @@ class DisposableContextGuardTest(unittest.TestCase):
 class ManifestFixtureTest(unittest.TestCase):
     def test_manifest_carries_production_faithful_native_config(self) -> None:
         text = m._fixture_manifest_text(persona="p", account="claude")
-        self.assertIn("sandbox: workspace-write", text)
+        self.assertIn("sandbox: danger-full-access", text)
         self.assertIn("approval_policy: never", text)
 
 

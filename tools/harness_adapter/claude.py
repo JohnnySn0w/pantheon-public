@@ -21,9 +21,12 @@ import json
 import math
 import os
 import re
+import shlex
 import stat
+import sys
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -32,6 +35,7 @@ from tools.harness_adapter._common import (
     finalize_events,
     parse_json_object,
 )
+from tools.bypass_consent import ensure_bypass_consent
 from tools.harness_adapter.base import PantheonHarnessAdapter
 from tools.harness_adapter.types import (
     AuthDescriptor,
@@ -73,10 +77,18 @@ from tools.harness_adapter.provider_quota import (
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _COMPLETION_SCHEMA = "pantheon-harness-provider-completion/v1"
 _MAX_TRANSCRIPT_BYTES = 2 * 1024 * 1024
-_MAX_TRANSCRIPT_DELTA_BYTES = 256 * 1024
+# T-4452: a fresh session's transcript is read from offset 0, boot attachments
+# included. Recovery's was 166 KB with a 70.6 KB instructions line (CLAUDE.md plus
+# memory) at T-3026 attempt 3, over the old 256 KiB / 64 KiB caps' headroom.
+# The file cap above is the real bound on what is read.
+_MAX_TRANSCRIPT_DELTA_BYTES = _MAX_TRANSCRIPT_BYTES
 _MAX_TRANSCRIPT_LINES = 400
-_MAX_JSONL_LINE_BYTES = 64 * 1024
+_MAX_JSONL_LINE_BYTES = 1024 * 1024
 _MAX_STATUSLINE_BYTES = 1024 * 1024
+# T-4321: the probe's history entry is among the newest lines, so reading the
+# tail is enough (fleet history.jsonl files run up to ~2 MB).
+_MAX_PROMPT_HISTORY_TAIL_BYTES = 256 * 1024
+_EMPTY_PASTED_CONTENTS_RE = re.compile(rb'"pastedContents":\s*\{\}')
 
 
 def _normalize_provider_pane(text: str) -> str:
@@ -120,6 +132,495 @@ def classify_claude_post_start_subscription_cap(
     if not _has_claude_rate_limit_modal_framing(sample_text):
         return None, None
     return "claude-rate-limit-options-modal", "post-start-subscription-cap"
+
+
+# ------------------------------------------------------------ T-4037: mid-session
+# cap detection. classify_claude_post_start_subscription_cap (above) requires a
+# BASELINE diff (pre-launch vs post-launch pane sample) and only runs at
+# _controller_start_runtime time -- it structurally cannot see a cap that pops
+# WHILE an already-healthy runtime is mid-session (the T-4037 gap: a pane that
+# never died just reads as healthy forever). classify_claude_mid_session_cap
+# below is a single-sample classifier (no baseline needed) for that case.
+
+# T-4024 (real capture, specialist 2026-09-27 cap window) — independently defined here
+# rather than imported from tools/context_fill_monitor.py's SPEND_LIMIT_SENTINEL:
+# that module's own INTERACTIVE_MODAL_SENTINELS is loose substring matching mixed
+# with /login sentinels (explicitly not to be reused for detection, T-4037 brief);
+# this is a plain string literal, safe to duplicate without coupling the two.
+_SPEND_LIMIT_SENTINEL = "monthly spend limit"
+
+# Three reset-time text shapes observed in real captures (T-4037 REBOUND Finding 2
+# added the day-name shape; the docstrings below used to overclaim "two"):
+#   dated:    "Resets Sep 27, 5pm (UTC)"       -- the monthly-spend-limit modal
+#   bare:     "resets 2:50pm (UTC)"            -- the session/weekly/opus modal
+#   day-name: "resets Sunday" / "resets Mon 12:00am" -- real in-repo captures at
+#             tools/test_claude_quota_probe.py:230 and tools/test_ho_stop_failure.py:256;
+#             time-of-day is OPTIONAL on this shape (see _resolve_dow_reset).
+# The bare form mirrors tools/acp_bridge.py's _CAP_RESET_RE (cited, not imported --
+# a different subsystem/call-site parsing a different text source; duplicating a
+# 3-line regex is cheaper than an inter-module coupling for it, per P7). The
+# day-name form mirrors tools/hooks/ho_stop_failure.py's _RESETS_RE / _DOW_MAP /
+# _parse_resets_at weekday-advance algorithm (cited, not imported -- same
+# no-cross-module-coupling reasoning; that parser resolves in the OS LOCAL
+# timezone, which this module deliberately does NOT follow -- see _resolve_dow_reset).
+_MID_SESSION_CAP_DATED_RESET_RE = re.compile(
+    r"resets\s+(?!(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*\s)"
+    r"([A-Za-z]{3,9})\s+(\d{1,2}),?\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+    re.IGNORECASE,
+)
+_MID_SESSION_CAP_BARE_RESET_RE = re.compile(
+    r"reset[s]?\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b",
+    re.IGNORECASE,
+)
+# Day-name form: "resets Sunday" (bare) or "resets Mon 12:00am" (day + time). The
+# negative lookahead on the DATED regex above keeps it from ever treating one of
+# these seven tokens as a month name (T-4037 Finding 2) -- the two token sets are
+# disjoint by construction (no day-of-week abbreviation collides with a real month
+# abbreviation), so the exclusion never shadows a genuine dated match.
+_MID_SESSION_CAP_DOW_RESET_RE = re.compile(
+    r"resets?\s+(mon|tue|wed|thu|fri|sat|sun)[a-z]*"
+    r"(?:\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm))?\b",
+    re.IGNORECASE,
+)
+_DOW_ABBR_TO_NUM = {
+    "mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+}  # Monday=0..Sunday=6 -- mirrors tools/hooks/ho_stop_failure.py's _DOW_MAP exactly.
+# A reset time this-far-or-less BEHIND `now` reads as boundary clock skew (the
+# pane was captured right at/just after the reset), not a genuine stale/next-cycle
+# occurrence -- mirrors acp_bridge._CAP_RESET_SKEW_GRACE_SECS exactly (same
+# reasoning, independently named per the no-cross-module-coupling call above).
+_MID_SESSION_CAP_RESET_SKEW_GRACE_SECONDS = 15 * 60.0
+
+_MONTH_ABBR_TO_NUM = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
+# Bottom-region window for mid-session CHROME checks (T-4037 REBOUND round 1
+# Finding 1; TIGHTENED + FOOTER-ANCHORED in round 2 Finding 1 below). A live
+# modal is always the LAST thing rendered in a `capture-pane -p` sample --
+# nothing draws below it while it's open. Round 1 relied on a loose 20-line
+# "somewhere near the end" window; the round-2 reviewer showed ordinary prose
+# QUOTING the modal (sentinel + chrome + footer, byte-for-byte) still landed
+# inside that window whenever followed by 0-11 trailing lines of commentary.
+# Round 2 closes that gap two ways: (a) `_footer_is_final_line` below requires
+# the confirm/cancel footer to be the pane's absolute LAST non-blank line --
+# structurally impossible for a quote followed by ANY further prose, and
+# always true for the Claude Code UI's own always-rendered input-box/status
+# tail once the modal actually closes; (b) this window shrinks from 20 to 16
+# lines -- the longer real fixture's sentinel-to-footer span is exactly 13
+# lines (orchestrator_cap_modal_pane.txt), so 16 keeps a tight 3-line margin for
+# incidental variation (e.g. the "Skipped for Nm Ns" status line wrapping
+# onto two rows) without loosening back toward the 20-line gap the reviewer
+# exploited. The shorter real fixture's span is 6 lines
+# (orchestrator_spend_limit_modal_pane.txt), well inside either window.
+_MID_SESSION_CAP_BOTTOM_REGION_LINES = 16
+
+# T-4037 REBOUND round 2 Finding 1: the modal's confirm/cancel footer, matched
+# tolerant of leading/trailing whitespace and case (ANSI codes are already
+# stripped by `_normalize_provider_pane` before this ever runs -- both real
+# captures render each word of this line in its own escape-wrapped span, but
+# the LITERAL text between them, including the single spaces and the "·"
+# separator, is byte-identical across both fixtures once ANSI-stripped).
+_FOOTER_LINE_RE = re.compile(
+    r"(?i)^[ \t ]*enter[ \t ]+to[ \t ]+confirm[ \t ]*"
+    r"·[ \t ]*esc[ \t ]+to[ \t ]+cancel[ \t ]*$"
+)
+
+# T-4037 REBOUND round 2 Finding 2: the live modal marks its highlighted
+# option with "❯" immediately before the option text -- "❯ 1. Stop and wait
+# for limit to reset" (session/weekly/opus, real capture) / "❯ Adjust monthly
+# spend limit:" (spend-limit, real capture). `❯` ALONE proves nothing -- it is
+# also the ordinary idle-prompt cursor glyph (see `READY_PROMPT_LINE` in
+# tools/claude_quota_probe.py, which matches ANY line starting with "❯"
+# followed by arbitrary text) -- so this requires the glyph immediately
+# adjacent to the SPECIFIC option phrase, not bare presence anywhere in the
+# region. Matched against the already-lowercased region text in the chrome
+# checkers below.
+_SESSION_OPTION_GLYPH_RE = re.compile(
+    r"❯[ \t ]*1\.[ \t ]*stop[ \t ]+and[ \t ]+wait[ \t ]+"
+    r"for[ \t ]+limit[ \t ]+to[ \t ]+reset"
+)
+_SPEND_OPTION_GLYPH_RE = re.compile(
+    r"❯[ \t ]*adjust[ \t ]+monthly[ \t ]+spend[ \t ]+limit:"
+)
+
+
+def _footer_is_final_line(text: str) -> bool:
+    """True iff `text`'s absolute LAST non-empty line (after ANSI-strip and
+    trailing-blank-trim) is the modal's confirm/cancel footer (T-4037 REBOUND
+    round 2 Finding 1).
+
+    This is the structural anchor the round-2 reviewer's false positives all
+    share: a pane sample that merely QUOTES the modal in conversation is, in
+    the realistic case, followed by further conversational text, or --
+    whenever the modal has genuinely closed -- by the Claude Code UI's own
+    always-rendered input-box/prompt/status-line tail. Neither ever leaves
+    the footer as the pane's final rendered content. A live, still-open modal
+    is the one case where nothing renders below it.
+    """
+    normalized = _normalize_provider_pane(text).rstrip()
+    lines = normalized.splitlines()
+    if not lines:
+        return False
+    return _FOOTER_LINE_RE.fullmatch(lines[-1]) is not None
+
+
+def _bottom_region(text: str) -> str:
+    """Join the trailing `_MID_SESSION_CAP_BOTTOM_REGION_LINES` lines of
+    `text` (after trailing blank lines are stripped, since a fixed-height pane
+    routinely has empty rows below a modal that doesn't fill it). Callers
+    must gate on `_footer_is_final_line` first (T-4037 REBOUND round 2) --
+    this function only tightens the SPAN of the window; it does not itself
+    require the window to end at the footer."""
+    normalized = _normalize_provider_pane(text).rstrip()
+    lines = normalized.splitlines()
+    return "\n".join(lines[-_MID_SESSION_CAP_BOTTOM_REGION_LINES:])
+
+
+def _has_claude_session_cap_modal_chrome(text: str) -> bool:
+    """True iff `text`'s BOTTOM REGION (see `_bottom_region`) carries the
+    session/weekly/opus rate-limit modal's actual render CHROME -- the
+    "What do you want to do?" heading, the "❯"-adjacent first option and the
+    "Upgrade your plan" second option, from the real capture
+    (tools/testdata/orchestrator_cap_modal_pane.txt) -- not merely the framing
+    phrases `_has_claude_rate_limit_modal_framing` above checks.
+
+    T-4037 REBOUND round 1 Finding 1: that framing check (four loose
+    substrings, no positional constraint) is reused unmodified by
+    `classify_claude_post_start_subscription_cap`, which has its own
+    baseline-diff defence and is out of scope for this fix. This is a
+    DIFFERENT, stricter, mid-session-only check.
+
+    T-4037 REBOUND round 2 Finding 2: the confirm/cancel footer requirement
+    moved to the caller-level `_footer_is_final_line` gate (position-anchored,
+    strictly stronger than a substring check); the bare "1." / "stop and wait
+    for limit to reset" substrings moved into `_SESSION_OPTION_GLYPH_RE`,
+    which additionally requires the "❯" selector glyph immediately adjacent
+    to that phrase -- prose that quotes the option text without the glyph
+    prefix (the round-2 reviewer's ASCII-only repro) no longer matches.
+    """
+    region = _bottom_region(text).lower()
+    required = (
+        "what do you want to do?",
+        "2.",
+        "upgrade your plan",
+    )
+    if not all(item in region for item in required):
+        return False
+    return _SESSION_OPTION_GLYPH_RE.search(region) is not None
+
+
+def _has_claude_spend_limit_modal_chrome(text: str) -> bool:
+    """True iff `text`'s BOTTOM REGION (see `_bottom_region`) carries the
+    spend-limit modal's actual render CHROME (real capture,
+    tools/testdata/orchestrator_spend_limit_modal_pane.txt) -- the credit-balance
+    readout, the "❯"-adjacent adjust-limit option, and the wait-to-reset line.
+
+    T-4037 REBOUND round 1 Finding 1: replaces the pre-fix
+    `_has_claude_spend_limit_modal_framing`, which required only three loose
+    substrings ("monthly spend limit" / "what do you want to do?" / "wait for
+    limit to reset") anywhere in the pane -- the reviewer showed ordinary
+    prose discussing this very bug satisfies all three.
+
+    T-4037 REBOUND round 2 Finding 2: the confirm/cancel footer requirement
+    moved to the caller-level `_footer_is_final_line` gate; the bare "adjust
+    monthly spend limit:" substring moved into `_SPEND_OPTION_GLYPH_RE`,
+    which additionally requires the "❯" selector glyph immediately adjacent.
+
+    Does NOT require "/rate-limit-options" as a literal substring: the real
+    committed capture doesn't include the command-invocation line (it scrolled
+    out of the visible pane by capture time -- a visible-pane-only capture, per
+    _capture_visible_runtime_pane's own docstring, can legitimately miss it).
+    """
+    region = _bottom_region(text).lower()
+    required = (
+        _SPEND_LIMIT_SENTINEL,
+        "what do you want to do?",
+        "usage credit balance: $",
+        "wait for limit to reset",
+    )
+    if not all(item in region for item in required):
+        return False
+    return _SPEND_OPTION_GLYPH_RE.search(region) is not None
+
+
+def _cap_sentinel_kind(sentinel: str) -> str:
+    """Map a CAP_SENTINELS-captured phrase to the session/weekly/opus
+    modal_kind vocabulary (factored out of `classify_claude_mid_session_cap`'s
+    original inline `kind_match` regex, T-4047, so the post-start classifier
+    below can reuse the SAME regex rather than duplicating it). Returns
+    "unknown-limit" if the sentinel doesn't contain one of the three known
+    words -- defensive only; every real `CAP_SENTINELS` match always does."""
+    kind_match = re.search(r"(session|weekly|opus)", sentinel, re.IGNORECASE)
+    return f"{kind_match.group(1).lower()}-limit" if kind_match else "unknown-limit"
+
+
+def _parse_claude_mid_session_cap_reset_at(text: str, *, now: datetime) -> datetime | None:
+    """Absolute UTC reset instant parsed from a mid-session cap pane, or None.
+
+    Tries the dated form first ("Resets Sep 27, 5pm (UTC)" -- the spend-limit
+    modal), then the day-name form ("resets Sunday" / "resets Mon 12:00am" --
+    T-4037 Finding 2, real in-repo captures at
+    tools/test_claude_quota_probe.py:230 and tools/test_ho_stop_failure.py:256),
+    then the bare time-only form ("resets 2:50pm (UTC)" -- session/weekly/opus).
+    UTC is assumed for all three, matching every real capture on file (the
+    modal always states "(UTC)") -- this deliberately does NOT follow
+    tools/hooks/ho_stop_failure.py's OS-local-timezone resolution for its own
+    day-name form; see `_resolve_dow_reset`. A result within
+    `_MID_SESSION_CAP_RESET_SKEW_GRACE_SECONDS` behind `now` reads as boundary
+    skew and returns None (no confident parse) -- genuinely further behind
+    rolls to the next occurrence (next day for the bare form; next week for
+    the day-name form; next year for the dated form, since month+day are
+    already pinned). Never raises: any malformed group returns None, same as
+    "no reset text present" -- the caller (runtime_controller.py) falls back
+    to a conservative default either way.
+    """
+    normalized = _normalize_provider_pane(text)
+    dated = _MID_SESSION_CAP_DATED_RESET_RE.search(normalized)
+    if dated is not None:
+        return _resolve_dated_reset(dated, now=now)
+    dow = _MID_SESSION_CAP_DOW_RESET_RE.search(normalized)
+    if dow is not None:
+        return _resolve_dow_reset(dow, now=now)
+    bare = _MID_SESSION_CAP_BARE_RESET_RE.search(normalized)
+    if bare is not None:
+        return _resolve_bare_reset(bare, now=now)
+    return None
+
+
+def _resolve_dated_reset(match: re.Match[str], *, now: datetime) -> datetime | None:
+    month_name, day, hour, minute, meridiem = match.groups()
+    month = _MONTH_ABBR_TO_NUM.get(month_name[:3].lower())
+    if month is None:
+        return None
+    try:
+        day_i = int(day)
+        hour_i = int(hour) % 12
+        minute_i = int(minute or 0)
+    except ValueError:
+        return None
+    if not (1 <= day_i <= 31) or not (0 <= minute_i <= 59):
+        return None
+    if meridiem.lower() == "pm":
+        hour_i += 12
+    try:
+        candidate = now.replace(
+            year=now.year, month=month, day=day_i,
+            hour=hour_i, minute=minute_i, second=0, microsecond=0,
+        )
+    except ValueError:
+        return None  # e.g. Feb 30 -- not a real date
+    if candidate <= now:
+        if (now - candidate).total_seconds() <= _MID_SESSION_CAP_RESET_SKEW_GRACE_SECONDS:
+            return None
+        try:
+            candidate = candidate.replace(year=candidate.year + 1)
+        except ValueError:
+            return None  # T-4173: Feb 29 has no next-year date -> unparsed
+    return candidate
+
+
+def _resolve_dow_reset(match: re.Match[str], *, now: datetime) -> datetime | None:
+    """Resolve a day-name reset match ("resets Sunday" / "resets Mon 12:00am")
+    to the next UTC occurrence of that weekday (T-4037 Finding 2).
+
+    Mirrors tools/hooks/ho_stop_failure.py's `_DOW_MAP` + `_parse_resets_at`
+    weekday-advance algorithm (same-weekday-and-already-passed -> +7 days,
+    otherwise `(target - current) % 7` days ahead) -- duplicated, not
+    imported, per this module's existing no-cross-module-coupling call (see
+    the module-level comment above `_MID_SESSION_CAP_DATED_RESET_RE`). That
+    parser resolves in the OS LOCAL timezone (`datetime.now().astimezone()`);
+    this one stays in UTC throughout, consistent with every OTHER form this
+    module parses (`_resolve_dated_reset`, `_resolve_bare_reset`) and with the
+    real captures, which always state "(UTC)" explicitly.
+
+    When no time-of-day is present ("resets Sunday" bare), this resolves to
+    23:59:59 UTC on the next occurrence of that day -- the LAST instant the
+    real reset could plausibly land, given no more specific information. This
+    is a deliberately conservative (longer) choice: the caller
+    (runtime_controller.py's block_until_tmux_death) uses this value directly
+    as `cooldown_until` for the next retry attempt, and this feature's
+    existing posture everywhere else it faces comparable uncertainty (the
+    4-hour MID_SESSION_CAP_CONSERVATIVE_DEFAULT_SECONDS fallback, the
+    never-SIGKILL confirm-death wait) is to wait longer rather than risk
+    retrying before the cap has actually lifted. No formal P/D id names this
+    specific tradeoff; it is chosen for internal consistency with the rest of
+    the feature -- see this module's DECISIONS entry.
+    """
+    dow_str, hour, minute, meridiem = match.groups()
+    target_dow = _DOW_ABBR_TO_NUM.get(dow_str[:3].lower())
+    if target_dow is None:
+        return None
+    current_dow = now.weekday()
+    days_ahead = (target_dow - current_dow) % 7
+    if hour is None:
+        candidate = now.replace(hour=23, minute=59, second=59, microsecond=0) + timedelta(days=days_ahead)
+        if candidate <= now:
+            candidate += timedelta(days=7)
+        return candidate
+    try:
+        hour_i = int(hour) % 12
+        minute_i = int(minute or 0)
+    except ValueError:
+        return None
+    if not (0 <= minute_i <= 59):
+        return None
+    if meridiem.lower() == "pm":
+        hour_i += 12
+    candidate = now.replace(hour=hour_i, minute=minute_i, second=0, microsecond=0) + timedelta(days=days_ahead)
+    if candidate <= now:
+        if (now - candidate).total_seconds() <= _MID_SESSION_CAP_RESET_SKEW_GRACE_SECONDS:
+            return None
+        candidate += timedelta(days=7)
+    return candidate
+
+
+def _resolve_bare_reset(match: re.Match[str], *, now: datetime) -> datetime | None:
+    hour, minute, meridiem = match.groups()
+    try:
+        hour_i = int(hour) % 12
+        minute_i = int(minute or 0)
+    except ValueError:
+        return None
+    if not (0 <= minute_i <= 59):
+        return None
+    if meridiem.lower() == "pm":
+        hour_i += 12
+    candidate = now.replace(hour=hour_i, minute=minute_i, second=0, microsecond=0)
+    if candidate <= now:
+        if (now - candidate).total_seconds() <= _MID_SESSION_CAP_RESET_SKEW_GRACE_SECONDS:
+            return None
+        candidate += timedelta(days=1)
+    return candidate
+
+
+@dataclass(frozen=True)
+class ClaudeMidSessionCapModal:
+    """A single-sample mid-session cap classification (T-4037).
+
+    modal_kind: "session-limit" | "weekly-limit" | "opus-limit" | "monthly-spend-limit"
+    sentinel_text: the matched sentinel substring (for logging/debugging; never
+        the full pane text -- callers should not persist raw pane prose)
+    reset_at: absolute UTC reset instant parsed from the pane, or None if no
+        reset text was present/parseable
+    reset_source: "parsed" if reset_at is set, else None
+    render_span_sha256: sha256 hex digest of the exact tight bottom-region
+        text (`_bottom_region`, post ANSI-strip normalization) that satisfied
+        the footer/chrome/glyph checks (T-4037 REBOUND round 2 Finding 3).
+        Deterministic for a given `text`; a caller comparing two samples'
+        `render_span_sha256` is comparing ONLY the modal's own rendered span
+        -- never the full pane, which routinely carries unrelated churn above
+        the modal (e.g. a ticking "Skipped for Nm Ns" status line) that would
+        otherwise defeat a same-render debounce check on every real capture.
+        Never the sentinel/framing text alone -- two structurally different
+        renders that happen to share a sentinel line would still hash
+        differently, which is the intended (stricter) behavior.
+    """
+
+    modal_kind: str
+    sentinel_text: str
+    reset_at: datetime | None
+    reset_source: str | None
+    render_span_sha256: str
+
+
+def classify_claude_mid_session_cap(text: str, *, now: datetime) -> ClaudeMidSessionCapModal | None:
+    """Classify a SINGLE pane sample as a mid-session cap modal, or None.
+
+    Unlike `classify_claude_post_start_subscription_cap`, this needs no
+    baseline-diff -- it runs on one pane capture, taken any time after a
+    runtime is already up and healthy (T-4037: the gap that classifier can't
+    cover).
+
+    T-4037 REBOUND round 1 Finding 1: neither variant is classified on
+    framing phrases alone anymore. That was the false-positive gap the
+    reviewer found: prose *discussing* this bug, quoting the same
+    sentinel/framing phrases, would trip the pre-fix check on a flag-on /
+    non-comms / fallback-viable binding that drives a real terminate call.
+
+    T-4037 REBOUND round 2 Finding 1: round 1's fix (modal render CHROME,
+    scoped to a loose trailing 20-line window) was still defeated by ordinary
+    ASCII prose that quoted the modal byte-for-byte and was followed by a
+    SHORT amount of further text (0-11 trailing lines still fit inside that
+    window). This function now additionally requires
+    `_footer_is_final_line`: the pane's absolute LAST non-blank line must be
+    the modal's own confirm/cancel footer. A live, still-open modal is always
+    the last thing rendered in a `capture-pane -p` sample; prose quoting it,
+    or the Claude Code UI's own always-rendered input-box/status tail once
+    the modal has closed, is not. This is a single-sample, POSITION-anchored
+    structural check -- strictly stronger than the round-1 substring window,
+    which is also tightened (20 -> 16 lines, see `_bottom_region`).
+
+    T-4037 REBOUND round 2 Finding 2: `_has_claude_session_cap_modal_chrome`
+    and `_has_claude_spend_limit_modal_chrome` additionally require the "❯"
+    selector glyph immediately adjacent to the modal's highlighted option
+    text, not merely present anywhere in the window -- "❯" alone is also the
+    ordinary idle-prompt cursor (see `READY_PROMPT_LINE` in
+    tools/claude_quota_probe.py).
+
+    `_claude_cap_sentinel` and `_has_claude_rate_limit_modal_framing`
+    themselves stay byte-unchanged -- both are also used by the post-start
+    classifier above, which has its own baseline-diff defence and is out of
+    scope for this fix.
+
+    Residual risk (acknowledged, not eliminated; corrected from round 1's
+    overclaim that this was merely "unlikely"): a pane sample whose FINAL
+    static content -- with nothing rendered below it -- is a "❯"-glyph-exact
+    reproduction of the full modal, chrome, footer and all, still classifies
+    on THIS function alone. Closing that residual gap requires more than one
+    sample: the caller (`tools/runtime_controller.py`'s
+    `_observe_and_publish_mid_session_cap`) additionally requires TWO
+    consecutive samples, ~60s apart, whose `render_span_sha256` match exactly,
+    before it will ever publish `modal_present: true` or permit the swap
+    action -- see that function's docstring. So the true remaining bar, after
+    both layers, is: a pane whose final static content is, ACROSS TWO
+    SEPARATE POLLS, a glyph-exact reproduction of the modal with nothing
+    rendered below it either time. This function alone does not enforce that
+    second layer; it is documented here so a reader of this function in
+    isolation does not understate the risk.
+
+    T-4047 DECISION: this residual is formally ACCEPTED AND BOUNDED, not
+    closed with a further structural anchor. Re-verified against the current
+    code, the bar an adversarial pane sample must clear is FOUR independent
+    gates: (1) `_claude_cap_sentinel`'s exact "you've hit your
+    (session|weekly|opus) limit · resets ..." phrase (CAP_SENTINELS); (2)
+    `_footer_is_final_line` -- the modal's confirm/cancel footer must be the
+    pane's absolute LAST rendered line; (3) the "❯" selector glyph
+    immediately adjacent to the modal's own highlighted option text, not
+    merely present in the window (`_SESSION_OPTION_GLYPH_RE`/
+    `_SPEND_OPTION_GLYPH_RE`); (4) TWO consecutive samples ~60s apart whose
+    `render_span_sha256` matches byte-for-byte
+    (`_observe_and_publish_mid_session_cap`'s debounce). Recovery's cap-modal
+    reaper (T-4024, a different persona's tool reading the same published
+    state cross-account -- see `read_mid_session_cap_state`'s docstring) is a
+    fifth, independent re-verification layer before anything ever acts on
+    this. A further structural anchor (e.g. an ANSI/style byte a transcript
+    quote structurally can't reproduce) was considered and deferred: absent
+    an observed false positive, engineering past a four-gate-plus-cross-
+    account-reverify bar isn't justified by P7, and would be exactly the
+    novelty-driven engineering D12 warns against.
+    """
+    if not _footer_is_final_line(text):
+        return None
+    bottom = _bottom_region(text)
+    sentinel = _claude_cap_sentinel(bottom)
+    if sentinel is not None and _has_claude_session_cap_modal_chrome(text):
+        kind = _cap_sentinel_kind(sentinel)
+        reset_at = _parse_claude_mid_session_cap_reset_at(text, now=now)
+        return ClaudeMidSessionCapModal(
+            modal_kind=kind, sentinel_text=sentinel, reset_at=reset_at,
+            reset_source="parsed" if reset_at is not None else None,
+            render_span_sha256=_sha256_text(bottom),
+        )
+    if _has_claude_spend_limit_modal_chrome(text):
+        reset_at = _parse_claude_mid_session_cap_reset_at(text, now=now)
+        return ClaudeMidSessionCapModal(
+            modal_kind="monthly-spend-limit", sentinel_text=_SPEND_LIMIT_SENTINEL,
+            reset_at=reset_at, reset_source="parsed" if reset_at is not None else None,
+            render_span_sha256=_sha256_text(bottom),
+        )
+    return None
 
 
 def _sha256_text(value: str) -> str:
@@ -179,6 +680,83 @@ def _read_regular_file_no_follow(path: Path, *, max_bytes: int) -> tuple[bytes, 
         os.close(fd)
 
 
+# T-4459: the probe-taken fallback reads at most this many transcripts written since the
+# submit (newest first), each from its tail only.
+_PROBE_TRANSCRIPT_MAX_CANDIDATES = 4
+_PROBE_TRANSCRIPT_MTIME_SLACK_SECONDS = 5.0
+
+
+def _read_tail_no_follow(path: Path, *, max_bytes: int) -> bytes:
+    """The last ``max_bytes`` of a regular file, opened without following a symlink."""
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise OSError("not a regular file")
+        os.lseek(fd, max(0, st.st_size - max_bytes), os.SEEK_SET)
+        chunks: list[bytes] = []
+        remaining = min(st.st_size, max_bytes)
+        while remaining > 0:
+            chunk = os.read(fd, min(remaining, 65536))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def _probe_prompt_in_recent_transcript(account_home: Path, marker: bytes, since: datetime) -> bool:
+    """Did a transcript written since ``since`` record the probe as a USER event? (T-4459)
+
+    history.jsonl is not proof of a swallow. Claude Code 2.1.285 buffers history writes
+    (a pendingEntries queue flushed under a lock that can fail with LockContended), and
+    an entry's timestamp is its add time, not its write time. So in T-3026 attempt 4 the
+    history lacked a probe the harness had already taken, and the controller re-typed it
+    into a second turn. The transcript's user event is written at submit, so it settles
+    the question. Only .jsonl files under ~/.claude/projects touched since the submit are
+    read, newest first, bounded, never following a symlink. The nonce is fresh per probe,
+    so an older transcript can't carry it.
+    """
+    projects = account_home / ".claude" / "projects"
+    cutoff = since.timestamp() - _PROBE_TRANSCRIPT_MTIME_SLACK_SECONDS
+    candidates: list[tuple[float, str]] = []
+    try:
+        with os.scandir(projects) as project_dirs:
+            for project in project_dirs:
+                if not project.is_dir(follow_symlinks=False):
+                    continue
+                try:
+                    with os.scandir(project.path) as entries:
+                        for entry in entries:
+                            if not entry.name.endswith(".jsonl") or not entry.is_file(follow_symlinks=False):
+                                continue
+                            mtime = entry.stat(follow_symlinks=False).st_mtime
+                            if mtime >= cutoff:
+                                candidates.append((mtime, entry.path))
+                except OSError:
+                    continue
+    except OSError:
+        return False
+    candidates.sort(reverse=True)
+    for _mtime, path in candidates[:_PROBE_TRANSCRIPT_MAX_CANDIDATES]:
+        try:
+            tail = _read_tail_no_follow(Path(path), max_bytes=_MAX_PROMPT_HISTORY_TAIL_BYTES)
+        except OSError:
+            continue
+        for raw in tail.splitlines():
+            if marker not in raw or len(raw) > _MAX_JSONL_LINE_BYTES:
+                continue
+            try:
+                obj = json.loads(raw)
+            except ValueError:
+                continue  # the tail's first line may be cut mid-record
+            if isinstance(obj, Mapping) and obj.get("type") == "user":
+                return True
+    return False
+
+
 def _confined_transcript(account_home: Path, value: Any) -> Path | None:
     if not isinstance(value, str) or not value:
         return None
@@ -197,6 +775,53 @@ def _confined_transcript(account_home: Path, value: Any) -> Path | None:
     except OSError:
         return None
     return resolved
+
+
+def _completion_transcript(account_home: Path, value: Any) -> tuple[Path | None, str]:
+    """Classify the statusline's transcript_path for the provider-completion probe.
+
+    ("ok") the confined, bounded regular file. ("pending") a well-formed path
+    confined to ~/.claude/projects that is not usable YET: absent, because a fresh
+    session hasn't flushed its jsonl, or over _MAX_TRANSCRIPT_BYTES, because the
+    statusline still names a prior long session. The probe keeps polling, and a
+    condition that never clears still ends as provider-completion-not-proven at
+    the deadline. ("invalid") anything that can never become valid: non-string or
+    relative path, escape from ~/.claude/projects, symlink, non-regular file, or
+    any other OS error.
+
+    T-4151: all of these used to be terminal. On specialist 2026-09-28T13:34Z, the first
+    sample after a ctxfill restart named a transcript that did not exist yet, and
+    the candidate was torn down 10s after launch. Never reads the file."""
+    if not isinstance(value, str) or not value:
+        return None, "invalid"
+    raw = Path(value)
+    if not raw.is_absolute():
+        return None, "invalid"
+    try:
+        projects = (account_home / ".claude" / "projects").resolve()
+        resolved = raw.resolve()
+    except OSError:
+        return None, "invalid"
+    if not resolved.is_relative_to(projects):
+        return None, "invalid"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(resolved, flags)
+    except FileNotFoundError:
+        return None, "pending"
+    except OSError:
+        return None, "invalid"
+    try:
+        st = os.fstat(fd)
+    except OSError:
+        return None, "invalid"
+    finally:
+        os.close(fd)
+    if not stat.S_ISREG(st.st_mode):
+        return None, "invalid"
+    if st.st_size > _MAX_TRANSCRIPT_BYTES:
+        return None, "pending"
+    return resolved, "ok"
 
 
 def _transcript_boundary(account_home: Path, observation: Mapping[str, Any] | None) -> Mapping[str, Any] | None:
@@ -239,7 +864,10 @@ def _assistant_delta_has_nonce(path: Path, *, start: int, marker: str) -> tuple[
     malformed = 0
     for line in lines:
         if len(line) > _MAX_JSONL_LINE_BYTES:
-            malformed += 1
+            # T-4452: too big to parse is not malformed; skip it. A skip can
+            # only miss the reply (the probe keeps waiting), never pass one.
+            # No prefix peek: Claude Code writes the top-level "type" after
+            # "attachment"/"message", so a prefix shows a nested "type" first.
             continue
         try:
             obj = json.loads(line.decode("utf-8"))
@@ -601,7 +1229,7 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
             else None
         )
         if permission_mode is None:
-            permission_mode = "default"
+            permission_mode = "bypassPermissions"
         if isinstance(permission_mode, str):
             argv.extend(["--permission-mode", permission_mode])
         return CommandSpec(
@@ -614,6 +1242,24 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
                 "PANTHEON_TMUX_PANE": target.pane,
             },
         )
+
+    def interactive_statusline_settings(self, *, output: Path) -> dict[str, Any]:
+        """T-4024: Claude settings that make the MAIN session write the status-line
+        observation that prepare/assess_interactive_provider_completion (and
+        quota_observer) read from ``output``.
+
+        Only claude_quota_probe's isolated session ever had a statusLine
+        (T-2382). The main session had none, so provider completion could never
+        be proven and every claude start through ensure_runtime was torn down at
+        90s. The capture helper prints nothing, so the TUI's status line stays
+        empty. The controller writes this to a file and passes it as --settings.
+        """
+        helper = Path(__file__).resolve().parents[1] / "claude_statusline_capture.py"
+        command = " ".join(
+            shlex.quote(part)
+            for part in ("/usr/bin/python3", str(helper), "--output", str(output))
+        )
+        return {"statusLine": {"type": "command", "command": command}}
 
     def quota_observer(self, state_dir: Path) -> QuotaObserver:
         profile = self.launch.profile if self.launch else "legacy"
@@ -654,6 +1300,7 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
         profile: str,
         baseline: PostStartPaneSample,
         samples: Iterable[PostStartPaneSample],
+        now: datetime | None = None,
     ) -> PostStartAssessment:
         sample_tuple = tuple(samples)
         changed = tuple(
@@ -661,6 +1308,7 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
             for sample in sample_tuple
             if sample.sha256 != baseline.sha256
         )
+        resolved_now = now if now is not None else datetime.now(timezone.utc)
         for sample in sample_tuple:
             if sample.sha256 == baseline.sha256:
                 continue
@@ -669,6 +1317,17 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
                 sample_text=sample.text,
             )
             if pattern_id is not None:
+                # T-4047: derive the reset instant + modal kind from the SAME
+                # sample text the classifier above already matched against --
+                # `_claude_cap_sentinel` re-runs its cheap regex a second
+                # time rather than threading it out of
+                # classify_claude_post_start_subscription_cap's return shape
+                # (keeps that well-tested function's signature untouched;
+                # see this ticket's DECISIONS). Never None here: a non-None
+                # pattern_id structurally implies sample.text matched
+                # CAP_SENTINELS (classify_claude_post_start_subscription_cap
+                # requires it), so `or ""` is defensive only.
+                sentinel = _claude_cap_sentinel(sample.text) or ""
                 return PostStartAssessment(
                     schema="pantheon-harness-post-start-assessment/v1",
                     harness=harness,
@@ -679,6 +1338,8 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
                     baseline_sha256=baseline.sha256,
                     capture_count=len(sample_tuple),
                     changed_capture_indices=changed,
+                    cap_kind=_cap_sentinel_kind(sentinel),
+                    reset_at=_parse_claude_mid_session_cap_reset_at(sample.text, now=resolved_now),
                 )
         ready = any(
             sample.sha256 != baseline.sha256
@@ -819,7 +1480,23 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
                 changed_capture_indices=changed,
             )
         account_home = probe.provider_state["account_home"]
-        transcript = _confined_transcript(account_home, statusline.get("transcript_path"))
+        transcript, transcript_state = _completion_transcript(
+            account_home, statusline.get("transcript_path"))
+        if transcript_state == "pending":
+            return ProviderCompletionAssessment(
+                schema=_COMPLETION_SCHEMA,
+                harness=harness,
+                profile=profile,
+                status="unknown",
+                cause="provider-completion-waiting",
+                pattern_id=None,
+                nonce_sha256=probe.nonce_sha256,
+                prompt_sha256=probe.prompt_sha256,
+                statusline_baseline_sha256=baseline_sha,
+                statusline_observed_sha256=current_sha,
+                capture_count=len(sample_tuple),
+                changed_capture_indices=changed,
+            )
         if transcript is None:
             cause = "provider-completion-transcript-invalid"
             start = None
@@ -894,6 +1571,67 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
             transcript_end_offset=end,
             assistant_event_count=assistant_count,
         )
+
+    def interactive_provider_completion_submitted(
+        self,
+        *,
+        probe: ProviderCompletionProbe,
+    ) -> bool | None:
+        """Did Claude Code take the probe as a prompt at all? (T-4321)
+
+        Claude Code appends each submitted prompt to ~/.claude/history.jsonl at
+        submit time, before the turn runs (measured 2026-09-29: the entry is
+        stamped ~130 ms before the transcript's user event). A probe pasted
+        while the TUI is still booting can be swallowed: no history entry, no
+        transcript, and the completion wait can only time out (recovery's T-3026
+        handmove, 2026-09-29 19:59Z).
+
+        True: an entry carries the nonce, or a pasted-text entry is stamped at
+        or after the submit (a collapsed paste keeps its text in paste-cache,
+        so its nonce isn't visible here; it still proves a submit), or (T-4459)
+        a transcript written since the submit holds the nonce in a user event.
+        History writes are buffered, so a taken probe can be missing there.
+        False: the history is readable and holds no such entry, and no recent
+        transcript has the user event either.
+        None: can't tell (no history file yet, or unreadable). Callers must
+        not read that as swallowed.
+        """
+        account_home = probe.provider_state.get("account_home")
+        submitted_at = probe.provider_state.get("submitted_at")
+        if not isinstance(account_home, Path) or not isinstance(submitted_at, datetime):
+            return None
+        history = account_home / ".claude" / "history.jsonl"
+        try:
+            with history.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                handle.seek(max(0, handle.tell() - _MAX_PROMPT_HISTORY_TAIL_BYTES))
+                tail = handle.read()
+        except OSError:
+            return None
+        marker = probe.nonce_marker.encode("utf-8")
+        submitted_ms = submitted_at.timestamp() * 1000
+        for raw in tail.splitlines():
+            if marker in raw:
+                return True
+            # Every entry carries the key; only a NON-empty one can be a paste.
+            if b'"pastedContents"' not in raw or _EMPTY_PASTED_CONTENTS_RE.search(raw):
+                continue
+            try:
+                entry = json.loads(raw)
+            except ValueError:
+                continue  # the tail's first line may be cut mid-record
+            if not isinstance(entry, Mapping):
+                continue
+            stamp = entry.get("timestamp")
+            if (
+                entry.get("pastedContents")
+                and isinstance(stamp, (int, float))
+                and not isinstance(stamp, bool)
+                and stamp >= submitted_ms
+            ):
+                return True
+        # T-4459: an absent history entry is not a swallow while the write is buffered.
+        return _probe_prompt_in_recent_transcript(account_home, marker, submitted_at)
 
     # -------------------------------------------------------------------------
     # Partition 1 — Generalized surfaces
@@ -999,20 +1737,23 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
     def approval_defaults(self) -> dict[str, Any]:
         """Return claude-code unattended-mode defaults.
 
-        Pantheon keeps Claude Code in its explicit ``default`` permission mode
-        and grants unattended actions through the account's scoped
-        ``permissions.allow`` entries.  Bypass/dontAsk modes are security-posture
-        changes and are not adapter defaults.
+        Per the HC principle (HarnessAdapter.approval_defaults, T-4929; ORG-063 s1;
+        the operator TG 11742/11753 via T-4939) every harness gets the maximal unlock,
+        which for claude is ``bypassPermissions``, with the unix account as the
+        boundary (T-4935). Blocking PreToolUse hooks (worker-guard) and any
+        ``permissions.deny``/``ask`` rules still hold under this mode. The
+        one-time bypass warning dialog is pre-accepted by tools.bypass_consent
+        (user-scope settings; ``--settings`` does not count).
 
         Shape:
-            {"permission_mode": "default",
-             "flag": "--permission-mode default",
-             "tool_approval": "scoped-permissions.allow"}
+            {"permission_mode": "bypassPermissions",
+             "flag": "--permission-mode bypassPermissions",
+             "tool_approval": "bypass-permissions"}
         """
         return {
-            "permission_mode": "default",
-            "flag": "--permission-mode default",
-            "tool_approval": "scoped-permissions.allow",
+            "permission_mode": "bypassPermissions",
+            "flag": "--permission-mode bypassPermissions",
+            "tool_approval": "bypass-permissions",
         }
 
     # -------------------------------------------------------------------------
@@ -1188,3 +1929,23 @@ def _find_upward(cwd: Path, filename: str) -> Path | None:
         if current.parent == current:
             return None
         current = current.parent
+
+
+def prepare_claude_launch(binding: Any, *, cwd: Path) -> None:
+    """Seed a claude runtime before its interactive launch (T-5011 PR-A).
+
+    Moved verbatim out of ``runtime_controller._start_runtime`` (T-4924 plan
+    §2.4). T-4935: seats launch --permission-mode bypassPermissions; its
+    one-time warning dialog ("No, exit" preselected) is skipped only by
+    USER-scope settings (not the controller's --settings file), so seed it.
+    Fail-open, but say so: a False return means the seat may stall on the
+    dialog (T-4953).
+    """
+    del cwd
+    consent_dir = binding.account_home / ".claude"
+    if not ensure_bypass_consent(consent_dir):
+        print(
+            f"[runtime_controller] bypass consent NOT ensured in {consent_dir}/settings.json; "
+            "the seat may stall on the bypass-permissions warning dialog",
+            file=sys.stderr,
+        )

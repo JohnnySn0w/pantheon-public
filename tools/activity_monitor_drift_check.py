@@ -25,7 +25,7 @@ pair present at install, its own first-seen ts for one added later, T-3570 —
 not at some inferred pre-history); NOT complex per-persona thresholds (flat
 per-predicate env vars only).
 
-T-3570 (two false-alarm fixes for the T-3555 atlas/metis sub-orch coverage):
+T-3570 (two false-alarm fixes for the T-3555 artisan/mason sub-orch coverage):
   RC1 — PER-PAIR first-seen floor (above): a pair added after install no
   longer inherits the whole since-global-bootstrap gap on day one.
   RC2 — a "can this predicate CURRENTLY fire for this agent?" precondition
@@ -55,7 +55,7 @@ Environment overrides:
     ACTIVITY_MONITOR_DRIFT_THRESHOLD_STUCK_POKE_DAYS       — unset by default (unarmed).
     ACTIVITY_MONITOR_DRIFT_THRESHOLD_TUI_WEDGE_DAYS        — unset by default (unarmed).
     ACTIVITY_MONITOR_DRIFT_ALERT_COOLDOWN_SECONDS          — default 24h; per-(agent,predicate) re-alert cooldown.
-    PANTHEON_ORCHESTRATOR_INBOX                                   — default /home/the-ancestor/mailbox/orchestrator.
+    PANTHEON_ORCHESTRATOR_INBOX                                   — default <live hub>/orchestrator (/home/post-office/mailbox/orchestrator).
 
 Default-safe (T-0261): refuses a flagless run (exit 64).
 """
@@ -64,6 +64,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -76,18 +77,20 @@ from tools.activity_monitor import (  # noqa: E402
     AGENT_CONFIG,               # agents to sweep
     _scan_actionable_tickets,   # T-3570 RC2: can-it-currently-fire probe (int | None)
 )
+from tools.agent_role_map import mailbox_hub  # noqa: E402  (T-4096: hub from instance.yaml)
+from tools import seat_state  # noqa: E402  (ORG-106 L4c)
 
 STATE_DIR = Path(os.environ.get("PANTHEON_STATE_DIR") or (Path.home() / ".local" / "state" / "pantheon"))
 FIRES_PATH = STATE_DIR / "activity_monitor" / "fires.jsonl"
 BOOTSTRAP_PATH = STATE_DIR / "activity_monitor" / "drift_check_bootstrap.json"
 # T-3570 RC1: per-(agent,predicate) first-observation floor. A pair ADDED to
-# AGENT_CONFIG after the drift-check's original install (atlas/metis, T-3555)
+# AGENT_CONFIG after the drift-check's original install (artisan/mason, T-3555)
 # is first seen here and graced from THAT ts — not the stale global bootstrap
 # floor, which day-one false-alarmed a newly-added never-fired pair.
 FIRST_SEEN_PATH = STATE_DIR / "activity_monitor" / "drift_check_first_seen.json"
 ALERT_STATE_PATH = STATE_DIR / "activity_monitor" / "drift_alert_state.json"
 
-ORCHESTRATOR_INBOX = os.environ.get("PANTHEON_ORCHESTRATOR_INBOX", "/home/the-ancestor/mailbox/orchestrator")
+ORCHESTRATOR_INBOX = os.environ.get("PANTHEON_ORCHESTRATOR_INBOX") or f"{mailbox_hub()}/orchestrator"
 
 # Every fire-log key `_record_fire` can produce today (tools/activity_monitor.py):
 # the poke predicates that route through `_dispatch_poke` + the direct P1.d
@@ -232,12 +235,12 @@ def _seed_first_seen(store: dict[str, int], now: float, agents: list[str]) -> bo
     returns True if anything was added (so the caller persists).
 
     A pair is seeded the first run at which it is BOTH known (in AGENT_CONFIG)
-    AND armed — so a pair added later (atlas/metis, T-3555) gets a fresh grace
+    AND armed — so a pair added later (artisan/mason, T-3555) gets a fresh grace
     window from its own first observation, not the stale global bootstrap.
     One-time upgrade note: on the first run of this code, every current pair is
     seeded to `now`; this only affects NEVER-fired pairs' floors (a pair that
     has fired uses its real last-fire ts), and the only such armed pair today
-    (metis p1b) is benign — already RC2-suppressed while its queue is empty."""
+    (mason p1b) is benign — already RC2-suppressed while its queue is empty."""
     changed = False
     for agent in agents:
         for predicate in KNOWN_PREDICATES:
@@ -263,7 +266,7 @@ def _predicate_can_currently_fire(agent: str, predicate: str) -> bool | None:
     count_actionable_tickets >= 1 (activity_monitor.check_p1b), so an agent
     whose actionable queue is CONFIRMED-empty structurally cannot fire p1b —
     its silence is a health signal, not staleness (the same reasoning that
-    unarms p1a globally). A sub-orch (atlas/metis) idles at 0 active tickets
+    unarms p1a globally). A sub-orch (artisan/mason) idles at 0 active tickets
     between HO dispatches, so this is where its never-fired p1b reads as
     benign-quiet — with NO per-persona hardcode (a busy orchestrator keeps queue>=1
     and still alarms on a genuine p1b stale). Every other predicate returns
@@ -282,6 +285,90 @@ def _predicate_can_currently_fire(agent: str, predicate: str) -> bool | None:
     if n is None:
         return None  # probe failed -> unknown; do NOT suppress
     return n >= 1
+
+
+# T-5439: a persona in seat-maintenance, or with EVERY configured runtime held
+# in its holds.json, has no live pane by design, so p1b (and any pane-reading
+# predicate) cannot match. Its silence is an authorised no, not a stale
+# detector; mason (held since 10-19, T-5222) paged p1b daily until this. Same
+# shape as the parity_remediate #1064 and T-5282 consume guards. Both probes
+# fail toward ALERTING: a fault or an unreadable holds file never quiets a seat.
+REPO_ROOT = Path(__file__).resolve().parent.parent
+HOLDS_READ_TIMEOUT_SECONDS = 10
+
+
+def _seat_in_maintenance(agent: str) -> bool:
+    """notify_policy.in_maintenance, fail-open (any raise reads False). ORG-106 L4c: a
+    shim over the shared seat_state.maintenance_active, keeping this site's log line."""
+    return seat_state.maintenance_active(
+        agent, on_fault=lambda exc: _log(f"seat-maintenance check failed open for {agent}: {exc!r}"))
+
+
+def _configured_runtimes(agent: str) -> tuple[str, ...]:
+    """The persona's primary + fallback runtime refs from instance.yaml, or ()
+    if they cannot be resolved (which never counts as all-held)."""
+    try:
+        from tools.persona_bringup import configured_runtime_targets
+        return tuple(configured_runtime_targets(REPO_ROOT / "instance.yaml", agent))
+    except Exception as exc:  # noqa: BLE001 -- unknown runtimes: keep alerting
+        _log(f"could not resolve configured runtimes for {agent}: {exc!r}")
+        return ()
+
+
+def _read_persona_holds(agent: str) -> dict | None:
+    """The `holds` mapping from the persona's controller holds.json, read as
+    its own account (Recovery cannot traverse the 750 home). {} when the file is
+    absent (no holds); None when unknown (sudo/timeout fault, malformed file,
+    unknown agent). The controller fails a malformed file CLOSED for launches;
+    here it must not quiet a possibly-dead seat, so it reads as unknown."""
+    cfg = AGENT_CONFIG.get(agent)
+    if not cfg:
+        return None
+    home = Path(cfg["pantheon_config_path"]).parent
+    path = home / ".local" / "state" / "pantheon" / "personas" / agent / "overrides" / "holds.json"
+    from tools.seat_exec import seat_argv
+    # rc 3 marks "absent" so it is distinguishable from a sudo/cat failure.
+    inner = f'if [ -e "{path}" ]; then cat "{path}"; else exit 3; fi'
+    try:
+        r = subprocess.run(
+            seat_argv(cfg["sudo_user"], ["bash", "-c", inner]),
+            capture_output=True, text=True, timeout=HOLDS_READ_TIMEOUT_SECONDS,
+            stdin=subprocess.DEVNULL,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        _log(f"holds read failed for {agent}: {exc!r}")
+        return None
+    if r.returncode == 3:
+        return {}
+    if r.returncode != 0:
+        return None
+    try:
+        holds = json.loads(r.stdout).get("holds")
+    except (json.JSONDecodeError, AttributeError):
+        return None
+    return dict(holds) if isinstance(holds, dict) else None
+
+
+def _persona_quiesced(agent: str) -> str | None:
+    """Why `agent` is deliberately quiet ("seat-maintenance" / "all runtimes
+    held"), or None if it is not (or that cannot be confirmed)."""
+    if _seat_in_maintenance(agent):
+        return "seat-maintenance"
+    # ORG-106 L4c: a declared deep-sleep or pause is authorised quiet too. L2 stops the
+    # activity monitor's pokes for such a seat, so "no fires" is the expected state. Keyed
+    # on the seat-state record only (an OOM hold alone is not a declaration; in the live
+    # shape it re-arms maintenance, which the line above already covers).
+    seat = seat_state.safe_effective_for(agent)
+    if seat is not None and seat.state == seat_state.STATE_DEEP_SLEEP:
+        return "seat-sleep"
+    if seat is not None and seat.state == seat_state.STATE_PAUSED_INTAKE:
+        return "seat-paused"
+    runtimes = _configured_runtimes(agent)
+    if runtimes:
+        holds = _read_persona_holds(agent)
+        if holds is not None and all(r in holds for r in runtimes):
+            return "all runtimes held"
+    return None
 
 
 def compute_drift(
@@ -380,7 +467,8 @@ def _alert(
 
     - `route_failure_alert(agent=<drifted persona>, ...)` — NOT agent="recovery".
       Passing "recovery" would trip the SELF_TRIAGE_AGENT carve-out and bypass
-      Recovery's pane entirely for a full unthrottled direct-operator alert; the
+      Recovery's pane entirely (then a direct-operator alert; since T-4399, orchestrator's
+      mailbox with the operator as fallback); the
       ticket's routing ruling #1 ("Recovery-triage only, no additional direct-
       Telegram") wants the `agent != "recovery"` path (`_send_alert_via_recovery` —
       Recovery's pane + a throttled `[recovery routed]` audit-Telegram), which is
@@ -445,6 +533,22 @@ def check(*, dry_run: bool, now: float | None = None) -> int:
                 _predicate_can_currently_fire(d["agent"], d["predicate"]) is False:
             _log(f"suppressed (healthy-quiet: {d['predicate']} cannot currently fire "
                  f"for {d['agent']}, gap={d['gap_days']:.1f}d)")
+            continue
+        kept.append(d)
+    drifted = kept
+
+    # T-5439: drop every pair for a persona that is deliberately quiet (seat
+    # maintenance or fully held) -- fired-then-silent included, since a held
+    # seat's pane is gone. Logged, never alerted.
+    quiesced: dict[str, str | None] = {}
+    kept = []
+    for d in drifted:
+        agent = d["agent"]
+        if agent not in quiesced:
+            quiesced[agent] = _persona_quiesced(agent)
+        if quiesced[agent]:
+            _log(f"suppressed (authorised quiet: {agent} {quiesced[agent]}; "
+                 f"{d['predicate']} gap={d['gap_days']:.1f}d)")
             continue
         kept.append(d)
     drifted = kept

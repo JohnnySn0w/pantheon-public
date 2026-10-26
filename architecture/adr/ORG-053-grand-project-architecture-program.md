@@ -25,10 +25,7 @@ elements:
 **Umbrella name — SSEED (Synthetic Self-Evolving Ecosystem Distribution).** Coined + ratified by the operator 2026-08-18 (Telegram 7964 → 7966 "pen it down yeah"). Registered in `rulebook/goals.md` under the Grand Project root entry. Case IS load-bearing: `SSEED` = this ORG-053 grand-project umbrella; lowercase `seed` stays the pre-existing installer/checkout vocabulary (ORG-039 seed pattern, `pantheon-public seed`, T-2667 germination engine).
 
 **Status:** **Ratified 2026-08-02 by the operator (Telegram message 665; T-2399).**
-**Amended 2026-08-07** under the operator's direction (Telegram 7266/7267): added §6, the universal system-lifecycle contract + seed-provisioning posture (install / modify-update / configure / health-monitor / remove, on every organ). operator-directed; carries his authority as ratifier. **§6 formally confirmed by the operator 2026-08-12 (Telegram 7742, "confirmed", at the ORG-068 ratify) — flag cleared.**
-**HITL:** Autonomous draft under the operator's explicit direction (Telegram
-492/506/511); ratified by the operator because this establishes the root goal and
-reorients existing projects. **Tracking:** T-2388/T-2399.
+Amendment and HITL/tracking trail (§6 added 2026-08-07, confirmed 2026-08-12): `notes/2026-10-08-org-053-review-history.md`.
 
 **Source record:**
 [`notes/2026-08-01-grand-project-architecture-capture.md`](../notes/2026-08-01-grand-project-architecture-capture.md).

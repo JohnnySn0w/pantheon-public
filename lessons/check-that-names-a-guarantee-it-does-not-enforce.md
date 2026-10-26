@@ -71,7 +71,7 @@ CAN fail but whose implementation does not measure the thing it names.
    to police. (Surfaced by specialist 2026-08-03 during T-2425 agent-memory
    synthesis.)
 
-6. **Metis paper Forget benchmark scoring a null-memory model 47.50.** A
+6. **Mason paper Forget benchmark scoring a null-memory model 47.50.** A
    model that stores nothing scores 47.50 on the Forget column while
    scoring 1-10 on Remember/Update/Reflect — because forgetting-by-never-
    having-known passes the check by construction. The metric reports the
@@ -117,4 +117,4 @@ per specialist's YES on the "land it" open call.
 
 ## Keywords
 
-pantheon, methodology, guards, checks, unwired-catcher, false-safety, provenance, verification, swallowed-failure, discharge, enforcing-code, catcher-wired-to-its-own-input, farma, metis-forget, deploy-hook-refuse, channel-liveness, mutation-harness
+pantheon, methodology, guards, checks, unwired-catcher, false-safety, provenance, verification, swallowed-failure, discharge, enforcing-code, catcher-wired-to-its-own-input, farma, mason-forget, deploy-hook-refuse, channel-liveness, mutation-harness

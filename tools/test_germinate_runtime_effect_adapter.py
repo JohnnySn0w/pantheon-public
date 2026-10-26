@@ -494,6 +494,13 @@ def test_runtime_effect_sabotage_receipt_digest_and_probe_red_green(tmp_path: Pa
 
 
 def test_runtime_effect_forbidden_scope_static_guard() -> None:
+    # T-3841: this guard's ongoing value is the BYTE-CONTENT invariant — the
+    # germinate PoC files must never gain a forbidden byte-sequence (see the
+    # tuple below for the concrete list). A separate `git diff --name-only`
+    # scope-cordon that fired on any other file changing lived here through
+    # T-3340's PoC build phase (the operator 2026-09-01); it was dev-scaffolding
+    # that stopped serving once T-3340 landed and started failing on every
+    # unrelated PR. Removed here; byte-content assertions retained.
     paths = [
         Path("tools/germinate/runtime_effect_adapter.py"),
         Path("tools/test_germinate_runtime_effect_adapter.py"),
@@ -512,8 +519,6 @@ def test_runtime_effect_forbidden_scope_static_guard() -> None:
         assert needle not in data
         for item in forbidden:
             assert item not in data
-    changed = subprocess.run(["git", "diff", "--name-only"], check=True, capture_output=True, text=True).stdout.splitlines()
-    assert set(changed) <= set(str(path) for path in paths)
 
 
 def _run_child(boundary: str, root: Path) -> subprocess.CompletedProcess[str]:

@@ -30,16 +30,16 @@ from tools.a2a.passport_handshake import (
     select_strongest_common,
 )
 
-ENDPOINT = "did:web:snowis.me"
-CARD_URL = "https://snowis.me/.well-known/agent-card.json"
+ENDPOINT = "did:web:your-domain.example"
+CARD_URL = "https://your-domain.example/.well-known/agent-card.json"
 
 
 def _card_bytes(scheme_types: list[dict]) -> bytes:
     """Serialise a minimal Agent Card advertising the given securityScheme
     entries. Bytes are what get hashed + pinned (TG-869)."""
     card = {
-        "name": "snowis-seed",
-        "url": "https://snowis.me/a2a",
+        "name": "your-domain-seed",
+        "url": "https://your-domain.example/a2a",
         "securitySchemes": {f"s{i}": e for i, e in enumerate(scheme_types)},
     }
     return json.dumps(card).encode("utf-8")

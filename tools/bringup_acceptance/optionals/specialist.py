@@ -18,7 +18,7 @@ absent. The persona branch lives HERE, in the plug-in, by design -- core
 
 Off-prod isolation, by module:
 
-* :class:`ArgusWatchRunnerModule` -- proves ``tools/watch_runner.py``'s
+* :class:`SpecialistWatchRunnerModule` -- proves ``tools/watch_runner.py``'s
   cadence-computation + dispatch-brief-construction contract
   (``compute_due_briefs()`` / ``build_brief()``) against a DISPOSABLE fixture
   ``topics.md`` (the module-level ``watch_runner.TOPICS_FILE`` global is
@@ -30,7 +30,7 @@ Off-prod isolation, by module:
   has no off-prod-provable code path short of actually invoking a subagent,
   which this module must never do -- ``report()`` names this explicitly so it
   reads as accounted-for, not silently dropped.
-* :class:`ArgusWatchAutocommitModule` -- proves ``watch_runner.git_commit_and_
+* :class:`SpecialistWatchAutocommitModule` -- proves ``watch_runner.git_commit_and_
   push()`` end-to-end against a fully disposable git topology: a scratch
   working repo + a scratch ``git init --bare`` "origin", so the real
   pantheon-config repo/remote is never touched. ``PANTHEON_GIT_MUTATION_
@@ -215,7 +215,7 @@ def _bare_main_log(bare_dir: Path) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-class ArgusWatchRunnerModule:
+class SpecialistWatchRunnerModule:
     """Proves the watch-runner cadence/dispatch-brief contract + its systemd
     wiring. See module docstring for the researcher-dispatch fold-in and the
     disposable-fixture-topics.md rationale."""
@@ -353,7 +353,7 @@ class ArgusWatchRunnerModule:
 # ---------------------------------------------------------------------------
 
 
-class ArgusWatchAutocommitModule:
+class SpecialistWatchAutocommitModule:
     """Proves watch_runner.git_commit_and_push() end-to-end against a fully
     disposable git topology. See module docstring for the lockfile-override
     rationale and the HERMES-guard both-directions proof."""
@@ -468,7 +468,7 @@ class ArgusWatchAutocommitModule:
         )
 
 
-def build_optional_modules() -> tuple[ArgusWatchRunnerModule, ArgusWatchAutocommitModule]:
+def build_optional_modules() -> tuple[SpecialistWatchRunnerModule, SpecialistWatchAutocommitModule]:
     """The T-2561 optionals entry point: Specialist's optional-tier acceptance modules."""
 
-    return (ArgusWatchRunnerModule(), ArgusWatchAutocommitModule())
+    return (SpecialistWatchRunnerModule(), SpecialistWatchAutocommitModule())

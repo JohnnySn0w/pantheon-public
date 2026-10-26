@@ -12,7 +12,7 @@ An implementer on an `agent/<task>` branch suddenly cannot commit at all — the
 
 ## Cause
 
-The pairing guard compares the seat's **live** `~/.claude/settings.json` (rollout already applied) against `HOOK_ALLOWLIST` in the **worktree's checkout** of `tools/context_fill_monitor.py` — which predates the rollout's allowlist commit. Any agent branch cut before the rollout is structurally unable to commit, no matter what it changes. Same mechanics as the metis 2026-07-28 incident (seat-side), but hitting every in-flight agent worktree on the seat that rolled out. First observed on `agent/T-2912` during the T-2692 urgent-mail rollout, 2026-08-12.
+The pairing guard compares the seat's **live** `~/.claude/settings.json` (rollout already applied) against `HOOK_ALLOWLIST` in the **worktree's checkout** of `tools/context_fill_monitor.py` — which predates the rollout's allowlist commit. Any agent branch cut before the rollout is structurally unable to commit, no matter what it changes. Same mechanics as the mason 2026-07-28 incident (seat-side), but hitting every in-flight agent worktree on the seat that rolled out. First observed on `agent/T-2912` during the T-2692 urgent-mail rollout, 2026-08-12.
 
 ## Fix (surgical)
 

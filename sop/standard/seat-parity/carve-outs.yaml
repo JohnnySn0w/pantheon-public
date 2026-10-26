@@ -1,0 +1,481 @@
+---
+# ORG-099 seat-parity carve-outs manifest
+# Authoritative source for legitimate non-parity — a seat's exemption from an
+# axis MUST be declared here or it counts as drift (per ORG-099 §4).
+#
+# Schema per carve-out:
+#   seat            — persona name
+#   axis            — axis_id from axes.yaml
+#   verdict         — intentional-absence | intentional-variant | migration-in-progress | deferred
+#   rationale       — one-paragraph WHY
+#   ratifier        — operator-msg-ref | ADR-ref | ticket-ref that authorized this
+#   ratified_date   — ISO date
+#   verifier        — grepable/scriptable check that the carve-out is IN EFFECT
+#                     (so a carve-out that has silently degraded also gets caught)
+#   review_trigger  — event that would invalidate this carve-out
+#
+# Adding a HARD-axis carve-out requires operator-ratify (encodes what the fleet
+# cares about). SOFT/BILLING/DOMAIN carve-outs matching existing verdicts are
+# orchestrator-autonomous per feedback_infra_design_autonomous_with_corpus_check_msg10007.
+
+schema_version: 1
+manifest_version: 11  # 2026-10-26 (T-3421): RETIRED all 13 the-ancestor carve-outs (seat removed from instance.yaml; ORG-087 sec. 4). Prior: 10 — 2026-10-13 (recovery): ADDED 7 watchman codex-harness carve-outs mirroring codex (T-4884 B6). Prior: 9 — 2026-10-12 (recovery): RETIRED the 8 T-4539 seat-pause carve-outs (artisan restored 10-07 the operator TG 11438; mason live since 10-09, the operator TG 8195/8203; ledger f7664a1b1). Prior: 8 — 2026-10-04 (recovery): ADDED 8 T-4539 seat-pause carve-outs (artisan + mason x inbox-consumer-timer-present, delivery-mode-substrate-match, monitor-keep-going, monitor-mailbox-wake; the operator TG 10728). Prior: 7 — 2026-09-28 (orchestrator): RETIRED archivist billing-model-declared (premise false per T-4016/#475; parity-audit CARVE_OUT_BROKEN). Prior: 6 — 2026-09-17 (orchestrator): T-3742 resolved → RETIRED two archivist carve-outs (inbox-consumer-timer-present + monitor-keep-going). Design intent per ORG-042 is second-HO has consume-plane timers; archivist bringup step-(b) unit reinstall (per mailbox 01789608120527802387 orchestrator-green-light + archivist 01789607160628502759 own plan) enables them; transient parity-audit drift is the honest reminder mechanism during that window.
+
+carve_outs:
+
+  # RETIRED 2026-10-26 (T-3421): the-ancestor monitor-context-fill carve-out
+  # (operator-msg-2936). The seat was removed from instance.yaml under ORG-087
+  # sec. 4, so there is no seat left to carve out. Account removal is T-3422.
+
+  # ==================== archivist ====================
+
+  # RETIRED 2026-09-28 (orchestrator): archivist billing-model-declared carve-out.
+  # Its premise (headless Anthropic API key; verifier billing_model == 'api-key')
+  # was FALSE: T-4016 confirmed with archivist that exocortex bills via claude
+  # subscription OAuth, and PR #475 corrected instance.yaml to subscription-oauth.
+  # The parity-audit correctly reported CARVE_OUT_BROKEN (2026-09-28). The seat is
+  # now AT PARITY on this axis, so no carve-out is needed.
+
+  # ==================== recovery ====================
+
+  - seat: recovery
+    axis: domain-scope-declared
+    verdict: intentional-variant
+    rationale: >
+      Recovery-fallback holds asymmetric authority: broader sudo scope (kino /
+      journalctl / restart discipline), cross-account status-check role most
+      peers don't have, cross-account git-repo hygiene. Parity does NOT mean
+      identical-to-peers; recovery's authority must be AUTHORIZED-DIFFERENT, not
+      equalized-with-peers.
+    ratifier: sop/standard/cross-account-ops-discipline.md
+    ratified_date: 2026-06-01  # approximate; discipline SOP predates this manifest
+    verifier: "instance.yaml roles.head-system-orchestrator.domain includes 'recovery runbook'"
+    review_trigger: "any change to recovery's sudoers scope OR cross-account discipline SOP"
+
+  # ==================== artisan + mason (peer-orch tier) ====================
+  # T-3766 tranche 5 (2026-09-16): the prior artisan + mason intentional-variant
+  # carve-outs for domain-scope-declared were RETIRED. Rationale: the operator's
+  # 2026-09-07 ratification is that sub-orchs (and HO) don't take a domain
+  # field AT ALL — carve-outs treated no-domain as a defensible deviation,
+  # inverting the semantic. Fix landed on the axis side: applies_to on
+  # domain-scope-declared now excludes orchestrator + sub-orchestrator-*
+  # entirely, so no carve-out is needed for artisan/mason/orchestrator on this axis.
+  # If any future axis surfaces the same shape (parity axis conflating
+  # "should have X" with "if X, must be Y"), narrow applies_to rather than
+  # add carve-outs.
+
+  # ==================== watchman: codex-harness variants (T-4884 B6) ====================
+  # Watchman (codex-fallback, roles.system-orchestrator-1) is a codex-primary seat,
+  # so the codex peer daemon's Claude-Code-shaped axis carve-outs apply to it
+  # unchanged. Same verdicts and rationale shape as the codex entries above; the
+  # verifier is pointed at watchman's own role key. Deliberately NOT carved:
+  # hc-controller-service (watchman is born on pantheon-runtime-controller@, so it
+  # should PASS that axis, unlike codex). monitor-context-fill is not in its
+  # applies_to, so it needs no carve-out.
+
+  - seat: watchman
+    axis: harness-cli-installed-authed
+    verdict: intentional-variant
+    rationale: >
+      Codex harness variant (per pantheon-bringup.md §12), as for codex: config
+      shape (~/.codex/config.toml), permission model (approval_policy, not
+      permissions.allow) and plugin surface differ from Claude Code. Parity
+      SEMANTICS (harness authed + config present + tools allowed) still apply;
+      the check is per-harness.
+    ratifier: sop/standard/pantheon-bringup.md-section-12 (codex precedent) + T-4884
+    ratified_date: 2026-10-13
+    verifier: "instance.yaml roles.system-orchestrator-1.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction amendment OR watchman's primary harness changes"
+
+  - seat: watchman
+    axis: permissions-allow-populated
+    verdict: intentional-variant
+    rationale: >
+      Codex-side parity is approval_policy in ~/.codex/config.toml (instance.yaml
+      harness_runtime.roles.system-orchestrator-1: approval_policy never,
+      sandbox danger-full-access), not permissions.allow in
+      ~/.claude/settings.json. The axis check_ref verifies only the Claude
+      branch. Same shape as the codex carve-out.
+    ratifier: sop/standard/pantheon-bringup.md-section-12 (codex precedent) + T-4884
+    ratified_date: 2026-10-13
+    verifier: "instance.yaml roles.system-orchestrator-1.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing OR axes.yaml check_ref adds codex branch"
+
+  - seat: watchman
+    axis: role-claude-md-present
+    verdict: intentional-variant
+    rationale: >
+      A codex seat has no CLAUDE.md. Watchman's role-orientation surface is its
+      persona brief pinned-rules/watchman.md (installer brief-check) plus the
+      codex AGENTS.md surface. Absence of /home/codex-fallback/CLAUDE.md is not a
+      parity gap.
+    ratifier: sop/standard/pantheon-bringup.md-section-12 (codex precedent) + T-4884
+    ratified_date: 2026-10-13
+    verifier: "instance.yaml roles.system-orchestrator-1.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing"
+
+  - seat: watchman
+    axis: standard-hook-set
+    verdict: intentional-variant
+    rationale: >
+      Codex hook model is codex-native (config.toml hooks table), not Claude-Code
+      settings.json hooks. The axis is Claude-Code-shaped by construction;
+      KeyError('hooks') from the audit is the expected shape on a codex seat.
+    ratifier: sop/standard/pantheon-bringup.md-section-12 (codex precedent) + T-4884
+    ratified_date: 2026-10-13
+    verifier: "instance.yaml roles.system-orchestrator-1.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing OR axes.yaml check_ref adds codex branch"
+
+  - seat: watchman
+    axis: persona-orientation-rendered-fresh
+    verdict: intentional-variant
+    rationale: >
+      persona_orientation/check_stale.py is Claude-Code-clone-aware; a codex seat
+      uses the codex-side persona-orientation render path (T-3338 spawn
+      preload). Cross-harness parity is that both surfaces stay fresh, verified
+      per harness.
+    ratifier: T-3338 (codex precedent) + T-4884
+    ratified_date: 2026-10-13
+    verifier: "instance.yaml roles.system-orchestrator-1.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing OR codex-persona-orientation-check_stale equivalent surfaces"
+
+  - seat: watchman
+    axis: mcp-python-package-pinned
+    verdict: intentional-variant
+    rationale: >
+      Codex harness has its own MCP tool-wrap layer (codex-cli's built-in MCP
+      surface), not python-mcp, so there is no python 'mcp' dist to pin. Same
+      reasoning as codex, specialist and recovery.
+    ratifier: sop/standard/pantheon-bringup.md-section-12 (codex precedent) + T-4884
+    ratified_date: 2026-10-13
+    verifier: "instance.yaml roles.system-orchestrator-1.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing OR axes.yaml adds harness-aware MCP-check branch"
+
+  - seat: watchman
+    axis: monitor-keep-going
+    verdict: intentional-variant
+    rationale: >
+      pantheon-keep-going is a Claude-Code continuation injector; its delivery
+      path would false-pass on a codex pane. Watchman is exempt in
+      keep_going._NO_KEEP_GOING (T-4884 B6) and is woken by its deterministic
+      recovery_watcher and its mailbox, not an anti-idle timer (design note
+      §3/§4).
+    ratifier: sop/standard/pantheon-bringup.md-section-12 (codex precedent) + T-4884
+    ratified_date: 2026-10-13
+    verifier: "instance.yaml roles.system-orchestrator-1.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing OR watchman adopts a keep-going-equivalent continuation timer"
+
+  # ==================== codex ====================
+
+  - seat: codex
+    axis: harness-cli-installed-authed
+    verdict: intentional-variant
+    rationale: >
+      Codex harness variant (per pantheon-bringup.md §12): config shape (~/.codex/
+      config.toml), sudo scope (narrower), permission model (approval_policy vs
+      permissions.allow), plugin surface differ from Claude Code. Parity CHECK
+      is per-harness (§12.6 verification disposition table); parity SEMANTICS
+      (harness authed + config present + tools allowed) still apply.
+    ratifier: sop/standard/pantheon-bringup.md-section-12
+    ratified_date: 2026-06-09  # approximate; §12 predates
+    verifier: "instance.yaml roles.peer-daemon-codex.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction amendment OR new harness added to fleet"
+
+  # ==================== fleet-wide: HC controller migration ====================
+
+  # HC controller is MIGRATION-in-progress per T-2953. Every seat has a
+  # migration-in-progress carve-out for hc-controller-service until the cutover
+  # completes. When T-2953 resolves, these carve-outs auto-retire via the
+  # review_trigger.
+
+  - seat: orchestrator
+    axis: hc-controller-service
+    verdict: migration-in-progress
+    rationale: >
+      HC (harness-controller) cutover is in-flight per T-2953. Seats may be
+      pre-HC (own bespoke supervisor) OR HC (pantheon-runtime-controller@).
+      Not broken during migration.
+    ratifier: T-2953
+    ratified_date: 2026-08-14
+    verifier: "T-2953 state == inbox or active (still open)"
+    review_trigger: "T-2953 resolves — every seat should be on HC or explicitly-non-HC-with-rationale"
+
+  - seat: recovery
+    axis: hc-controller-service
+    verdict: migration-in-progress
+    rationale: "See orchestrator entry — fleet-wide HC migration per T-2953."
+    ratifier: T-2953
+    ratified_date: 2026-08-14
+    verifier: "T-2953 state == inbox or active"
+    review_trigger: "T-2953 resolves"
+
+  - seat: specialist
+    axis: hc-controller-service
+    verdict: migration-in-progress
+    rationale: "See orchestrator entry — fleet-wide HC migration per T-2953."
+    ratifier: T-2953
+    ratified_date: 2026-08-14
+    verifier: "T-2953 state == inbox or active"
+    review_trigger: "T-2953 resolves"
+
+  - seat: artisan
+    axis: hc-controller-service
+    verdict: migration-in-progress
+    rationale: "See orchestrator entry — fleet-wide HC migration per T-2953."
+    ratifier: T-2953
+    ratified_date: 2026-08-14
+    verifier: "T-2953 state == inbox or active"
+    review_trigger: "T-2953 resolves"
+
+  - seat: mason
+    axis: hc-controller-service
+    verdict: migration-in-progress
+    rationale: "See orchestrator entry — fleet-wide HC migration per T-2953."
+    ratifier: T-2953
+    ratified_date: 2026-08-14
+    verifier: "T-2953 state == inbox or active"
+    review_trigger: "T-2953 resolves"
+
+  - seat: archivist
+    axis: hc-controller-service
+    verdict: migration-in-progress
+    rationale: "See orchestrator entry — fleet-wide HC migration per T-2953. Also compounded by archivist currently offline (T-3742 bringup arc)."
+    ratifier: T-2953
+    ratified_date: 2026-08-14
+    verifier: "T-2953 state == inbox or active"
+    review_trigger: "T-2953 resolves OR T-3742 completes (whichever exposes the HC gap first)"
+
+  - seat: codex
+    axis: hc-controller-service
+    verdict: intentional-variant
+    rationale: >
+      Consultant runs on the Codex harness — HC controller (pantheon-runtime-
+      controller@) is Claude-Code-specific. Codex has its own supervisor per
+      pantheon-bringup.md §12 codex variant (codex-supervisor unit present
+      per §12 codex-variant table).
+    ratifier: sop/standard/pantheon-bringup.md-section-12
+    ratified_date: 2026-06-09
+    # T-3766 tranche 4 (2026-09-16): missed this codex compound in tranche 3
+    # (the 4-carve-out reduction only hit permissions-allow-populated /
+    # role-claude-md-present / standard-hook-set / persona-orientation-
+    # rendered-fresh). Same fix: single-shape verifier, "+ codex-supervisor
+    # unit present per §12" moved to rationale above.
+    verifier: "instance.yaml roles.peer-daemon-codex.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction amendment adds HC-equivalent for Codex"
+
+  # ==================== orchestrator ====================
+
+  - seat: orchestrator
+    axis: monitor-context-fill
+    verdict: intentional-variant
+    rationale: >
+      Orchestrator's context-fill monitoring is Recovery-side (cross-account), NOT a
+      orchestrator-user-scoped timer. Per CLAUDE.md §Recovery: "Recovery's cross-account
+      role applies to them at the orch tier the same way it applies to orchestrator."
+      Recovery runs the fleet's context-fill monitors on orchestrator's behalf from
+      Recovery's own user-systemd manager. The pantheon-context-fill-monitor@orchestrator
+      user-timer is intentionally absent from orchestrator's own manager. Autonomous
+      SOFT-tier carve-out matching the existing intentional-variant pattern.
+    ratifier: CLAUDE.md-recovery-cross-account-role
+    ratified_date: 2026-09-16
+    verifier: "systemctl --user list-unit-files 'pantheon-context-fill-monitor@orchestrator.timer' returns nothing (queried from orchestrator's own manager)"
+    review_trigger: "T-2953 HC cutover moves orchestrator to consume-plane AND orchestrator-user-scoped context-fill-monitor becomes the fleet-standard"
+
+  - seat: orchestrator
+    axis: monitor-activity
+    verdict: intentional-variant
+    rationale: >
+      Same shape as monitor-context-fill above: orchestrator's activity monitoring
+      is Recovery-side (cross-account) per CLAUDE.md §Recovery, not an orchestrator-user-
+      scoped timer. Autonomous SOFT-tier carve-out.
+    ratifier: CLAUDE.md-recovery-cross-account-role
+    ratified_date: 2026-09-16
+    verifier: "systemctl --user list-unit-files 'pantheon-activity-monitor@orchestrator.timer' returns nothing (queried from orchestrator's own manager)"
+    review_trigger: "T-2953 HC cutover moves orchestrator to consume-plane AND orchestrator-user-scoped activity-monitor becomes the fleet-standard"
+
+  - seat: archivist
+    axis: monitor-mailbox-wake
+    verdict: intentional-absence
+    rationale: >
+      archivist must NEVER have the standalone mailbox-wake timer: her
+      mailbox_wake.AGENT_PANE points at claude-telegram-bot-exocortex:0
+      (the operator's own chat tmux target), so a wake fire would send-keys into
+      the operator's conversation AND exit 64 ("unknown agent") on every fire,
+      guaranteeing unit failure. T-2702 scoped wake-timer enablement to an
+      explicit allowlist [orchestrator, codex, the-ancestor] that deliberately
+      excludes archivist (see instance.yaml wake_timer_personas comment).
+      Permanent safety-driven absence, NOT a bringup gap — it holds even once
+      archivist is back online. (Surfaced by the T-3756 first-clean fleet audit.)
+    ratifier: T-2702
+    ratified_date: 2026-09-16
+    verifier: "systemctl --user list-unit-files 'pantheon-mailbox-wake@archivist.timer' returns nothing"
+    review_trigger: "any change to the mailbox_wake AGENT_PANE target for exocortex away from the operator's chat tmux, OR archivist being added to instance.yaml wake_timer_personas"
+
+  # RETIRED 2026-09-17 (orchestrator): the two archivist carve-outs for
+  # inbox-consumer-timer-present and monitor-keep-going. T-3742
+  # (the ratifier) resolved 2026-09-16, so `T-3742 state == inbox or active`
+  # verifier flipped false → CARVE_OUT_BROKEN. Rather than roll a new
+  # ratifier ticket, the carve-outs retire outright: ORG-042 second-head
+  # design intent is that archivist HAS consume-plane timers (peer-HO
+  # wakeable), so the axes' PASS state is the correct target. Archivist's
+  # own message (mailbox 01789607160628502759, "holding step (b) as a
+  # deliberate step") plus orchestrator's ORG-042 green-light (mailbox
+  # 01789608120527802387) already coordinate step (b) unit reinstall to
+  # enable both timers + the acp-bridge. Transient drift alert during
+  # that window is the honest reminder mechanism; the carve-outs do not
+  # need to be kept alive to suppress it. If step (b) stalls indefinitely,
+  # re-file a fresh carve-out with a new ratifier tied to whatever is
+  # holding it.
+
+  # RETIRED 2026-10-26 (T-3421): the 11 the-ancestor retirement-bulk carve-outs
+  # (T-3766 tranches 1-2, ratifier T-3422). They covered the wind-down window;
+  # the seat is now out of instance.yaml, so parity no longer enumerates it.
+
+  # ==================== codex Claude-specific axis variants (T-3766 tranche 2) ====================
+  # Codex harness uses ~/.codex/config.toml + approval_policy semantics, not
+  # Claude-Code's ~/.claude/settings.json + permissions.allow. The following
+  # axes are structurally Claude-Code-shaped in their current check_refs;
+  # codex parity via the equivalent codex-side controls is verified per
+  # pantheon-bringup.md §12 disposition table, not via these axes.
+  # Follow-up: fold codex-branches into the check_refs themselves (or split into
+  # per-harness axis variants) — filed as a T-3766 follow-on if ORG-031
+  # harness-abstraction lands. Meanwhile: carve-outs.
+
+  - seat: codex
+    axis: permissions-allow-populated
+    verdict: intentional-variant
+    rationale: >
+      Codex-side parity is approval_policy in ~/.codex/config.toml, not
+      permissions.allow in ~/.claude/settings.json. The axis description
+      already acknowledges the OR-shape ("permissions.allow (Claude Code) OR
+      approval_policy set (Codex)"), but the current check_ref only verifies
+      the Claude branch. Verified per pantheon-bringup.md §12 codex variant —
+      approval_policy declaration in ~/.codex/config.toml is the codex-half of
+      the parity contract.
+    ratifier: sop/standard/pantheon-bringup.md-section-12
+    ratified_date: 2026-09-16
+    # T-3766 tranche 3 (2026-09-16): single-shape verifier per recovery's diagnosis
+    # — verify_carve_out fullmatches a "A + B" compound to NONE of its 3 shapes
+    # and reads UNMEASURABLE (not CARVE_OUT_VERIFIED). Dropped the compound
+    # "+ ~/.codex/config.toml approval_policy declared" clause; its content is
+    # captured in rationale above.
+    verifier: "instance.yaml roles.peer-daemon-codex.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing OR axes.yaml check_ref adds codex branch"
+
+  - seat: codex
+    axis: role-claude-md-present
+    verdict: intentional-variant
+    rationale: >
+      Codex uses codex-config-template (per codex bringup, pantheon-bringup.md
+      §12) not a CLAUDE.md file. The role-orientation surface for codex is
+      AGENTS.md + codex-config files, verified separately. Absence of
+      /home/codex/CLAUDE.md is not a parity gap.
+    ratifier: sop/standard/pantheon-bringup.md-section-12
+    ratified_date: 2026-09-16
+    verifier: "instance.yaml roles.peer-daemon-codex.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing"
+
+  - seat: codex
+    axis: standard-hook-set
+    verdict: intentional-variant
+    rationale: >
+      Codex hook model is codex-native (config.toml hooks table), not
+      Claude-Code settings.json hooks. The axis is Claude-Code-shaped by
+      construction. Codex's own hook coverage is verified per pantheon-bringup.md
+      §12 disposition table. KeyError('hooks') from the audit is the expected
+      shape when the check_ref hits codex's absent settings.json.
+    ratifier: sop/standard/pantheon-bringup.md-section-12
+    ratified_date: 2026-09-16
+    verifier: "instance.yaml roles.peer-daemon-codex.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing OR axes.yaml check_ref adds codex branch"
+
+  - seat: codex
+    axis: persona-orientation-rendered-fresh
+    verdict: intentional-variant
+    rationale: >
+      persona_orientation/check_stale.py is Claude-Code-clone-aware; codex uses
+      codex-config-template which has its own persona-orientation render path
+      (T-3338 codex-side spawn preload). Cross-harness parity is that BOTH
+      surfaces stay fresh, verified per-harness, not that both use the same
+      check_stale.py mechanism. T-3338 preload confirmed live in codex spawn
+      per its resolve note.
+    ratifier: T-3338
+    ratified_date: 2026-09-16
+    # T-3766 tranche 3 (2026-09-16): single-shape verifier per recovery's diagnosis
+    # — dropped compound "+ T-3338 preload confirmed live in codex spawn"
+    # clause; captured in rationale.
+    verifier: "instance.yaml roles.peer-daemon-codex.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing OR codex-persona-orientation-check_stale equivalent surfaces"
+
+  # ==================== mcp-python-package-pinned scope (T-3766 tranche 3) ====================
+  # Recovery's post-re-seed audit surfaced that specialist/recovery/codex don't have a python
+  # 'mcp' distribution installed at all — their MCP is the bun/TypeScript bridge
+  # (recovery's telegram server.ts, specialist's mailbox MCP, codex's MCP-tool wrap).
+  # The current mcp-python-package-pinned check assumes a python 'mcp' dist;
+  # importlib.metadata returns absent → false → FAIL → 3 seats read BROKEN.
+  # These are intentional-variants of the axis's INTENT (verify MCP setup so
+  # lowlevel-Server decorators don't break at session start) — the intent is
+  # python-mcp-specific; bun/TS MCPs don't have the lowlevel-Server decorator
+  # bug at all. Carve out the 3 bun/TS-MCP seats.
+
+  - seat: specialist
+    axis: mcp-python-package-pinned
+    verdict: intentional-variant
+    rationale: >
+      Specialist's MCP surface is bun/TS-based (mailbox MCP + telegram MCP), not
+      python-mcp. The lowlevel-Server-decorator break that this axis pins
+      against is a python-mcp-2.x-specific bug; the bun/TS MCPs don't share
+      the surface, so pinning python-mcp<2 is a no-op for this seat. Recovery
+      confirmed 2026-09-16-14 re-seed: importlib.metadata finds no 'mcp' dist.
+    ratifier: sop/standard/pantheon-bringup.md-section-12
+    ratified_date: 2026-09-16
+    # T-3766 tranche 4 (2026-09-16): fixed role-id typo (was 'orchestrator-1'
+    # which doesn't exist → CARVE_OUT_BROKEN per recovery's 2026-09-16-14 re-seed).
+    # Real role_id for specialist is 'specialist'; harness is 'claude-code'.
+    verifier: "instance.yaml roles.specialist.harness == 'claude-code'"
+    review_trigger: "specialist adopts a python-mcp-consuming subsystem (e.g. mcp-python-adapter for a new MCP server) OR axes.yaml adds a bun/TS-MCP-recognizing check branch"
+
+  - seat: recovery
+    axis: mcp-python-package-pinned
+    verdict: intentional-variant
+    rationale: >
+      Recovery's MCP surface is bun/TS-based (telegram server.ts + mailbox MCP),
+      not python-mcp. Same reasoning as the specialist entry: the python-mcp-2.x
+      lowlevel-Server bug this axis pins against doesn't apply to bun/TS MCPs.
+      Recovery confirmed 2026-09-16-14 re-seed: importlib.metadata finds no 'mcp'
+      dist.
+    ratifier: sop/standard/pantheon-bringup.md-section-12
+    ratified_date: 2026-09-16
+    verifier: "instance.yaml roles.head-system-orchestrator.persona == 'recovery'"
+    review_trigger: "recovery adopts a python-mcp-consuming subsystem OR axes.yaml adds a bun/TS-MCP-recognizing check branch"
+
+  - seat: codex
+    axis: mcp-python-package-pinned
+    verdict: intentional-variant
+    rationale: >
+      Codex harness has its own MCP tool-wrap layer (codex-cli's built-in MCP
+      surface), not python-mcp. Same reasoning as specialist + recovery: no python-mcp
+      to pin. Recovery confirmed 2026-09-16-14 re-seed: importlib.metadata finds
+      no 'mcp' dist on the codex account.
+    ratifier: sop/standard/pantheon-bringup.md-section-12
+    ratified_date: 2026-09-16
+    verifier: "instance.yaml roles.peer-daemon-codex.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing OR axes.yaml adds harness-aware MCP-check branch"
+
+  # ==================== codex monitor-keep-going (T-3766 tranche 4) ====================
+
+  - seat: codex
+    axis: monitor-keep-going
+    verdict: intentional-variant
+    rationale: >
+      pantheon-keep-going is a Claude-Code-harness continuation injector —
+      per recovery's 2026-09-16-14 re-seed, codex has NO pantheon-keep-going@codex.timer
+      (is-active → inactive; 0 keep-going timers in codex's list). Codex-CLI harness
+      uses a different continuation model, so this axis is Claude-Code-shaped and
+      doesn't apply to the codex variant. Sibling shape to the tranche-2 codex
+      harness-variant carve-outs (permissions-allow-populated, role-claude-md-present,
+      standard-hook-set, persona-orientation-rendered-fresh).
+    ratifier: sop/standard/pantheon-bringup.md-section-12
+    ratified_date: 2026-09-16
+    verifier: "instance.yaml roles.peer-daemon-codex.harness == 'codex'"
+    review_trigger: "ORG-031 harness-abstraction landing OR codex adopts a keep-going-equivalent continuation timer"

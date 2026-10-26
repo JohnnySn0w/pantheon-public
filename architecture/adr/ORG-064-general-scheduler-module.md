@@ -55,7 +55,7 @@ A single declarative spec is the source of truth for scheduling policy:
 - **per-persona schedules** — items scoped to one persona (e.g. specialist's research cadence, a persona's wake interval).
 - **per-persona exceptions** — a persona opts out of, or overrides the timing of, an all-persona item. Merge rule: **persona-level wins over all-persona** (defaults + overrides, the same shape as `instance.yaml`'s role config).
 
-**1a. Entry schema (firmed).** Each spec entry carries: `name`, `scope` (host / all-persona / per-persona), `calendar`, unit payload ref (what it runs), `OnFailure` wiring, `owner` (steward), a `serves:` line (why this timer exists — schedule provenance), and a `system:` field tying the entry to its **ORG-068 coverage-matrix row** — which makes the lifecycle contract's *monitor/cadence* column **derivable from the schedule spec** rather than separately maintained.
+**1a. Entry schema (firmed).** Each spec entry carries: `name`, `scope` (host / all-persona / per-persona), `calendar`, unit payload ref (what it runs), `OnFailure` wiring, `owner` (steward), a `serves:` line (why this timer exists — schedule provenance), and a `system:` field tying the entry to its **[[ORG-081]] registry `id`** (the ORG-068 coverage matrix retired into that registry on 2026-08-26; legacy titles alias through [[ORG-081]] D-13's one-time migration) — which makes the lifecycle contract's *monitor/cadence* column **derivable from the schedule spec** rather than separately maintained.
 
 **1b. Exception semantics (firmed — the operator's Q at TG 7757, ruled TG 7757/7760).** *Exceptions may touch WHEN or WHETHER, never WHAT.* Exactly two forms:
 - **Opt-out** — "this persona doesn't run the fleet job": an **explicit record with a reason** (waiver-with-rationale, the ORG-068 shape), never a silent absence — so the reconciler distinguishes *deliberately absent* from *missing = drift*.
@@ -76,6 +76,8 @@ The Scheduler module is a **stateless renderer**: it reads the spec and renders/
 **2b. Health surface (firmed).** The Scheduler reports on the ORG-068 D-Bus property surface: last-reconcile time + result, current drift count (owned-unit divergence + orphan count), and per-timer last-fire status. That is its own *monitor* leg.
 
 **2c. Build sequencing (the operator TG 7757 — "needs a ticket", filed).** Phase 1 = spec schema + render/dry-run reconciler, **broker-independent, zero privilege** — **T-2896**, fires on this ADR's ratify (T-2836). Phase 2 = apply + live-timer migration one class at a time — **T-2662**, gated on the Action Broker (T-2652) *and* T-2896. The critical path no longer waits on the broker to start.
+
+**2d. Germination seam ([[ORG-080]] §Amendment 2026-10-17, A-3).** The Scheduler is a registered ORG-080 day-one component: the engine calls its render + apply to install timers. In the other direction, Scheduler timers are the only unattended trigger for `germinate` (auto-update, periodic verify). A scheduled run carries only `privilege: none | seat` legs; for privileged components it may auto-stage but never cut over — cutover stays supervised.
 
 ### 3. Isolate properties (ORG-063 §4b, mandatory)
 Health-legible (§7 property surface), restart-fixable (reconcile-from-spec is idempotent), stateless (no session-continuity state). An isolate, monitorable by the future forward-looking control component (ORG-063 §Forward-looking).

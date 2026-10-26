@@ -261,7 +261,7 @@ def _build_response_for_request(handlers: dict, msg: dict) -> dict:
     T-1831: this is the class fix. The prior _recv_until had no concept of
     an incoming request at all — it discarded any message whose id happened
     not to match the response it was waiting on, silently dropping fs
-    requests and deadlocking the turn (the T-1830 mnemosyne incident). Every
+    requests and deadlocking the turn (the T-1830 archivist incident). Every
     incoming request now gets an explicit response, in-band, always.
 
     Shared by AcpTransport._recv_until's real dispatch and
@@ -504,7 +504,7 @@ class AcpBridge:
         # T-2259: when True AND main_pane reads affirmatively idle AND mail is
         # waiting, run_once() wakes the MAIN seat to drain instead of paying one
         # ACP turn per message. Opt-in per unit — the measured casualty
-        # (mnemosyne, 83-minute seat monopolisation over an idle main seat)
+        # (archivist, 83-minute seat monopolisation over an idle main seat)
         # enables it first; agents whose ACP turns are short keep the old path.
         self.prefer_main_seat = prefer_main_seat
         # T-1935: consume()'s per-inbox consumer lease defaults to a 900s TTL
@@ -658,7 +658,7 @@ class AcpBridge:
                 # _build_response_for_request) — the deadlock class behind
                 # the T-1830 hotfix (advertise a cap, _recv_until silently
                 # discards the wrapper's resulting request, turn hangs
-                # forever; live-hit by mnemosyne msg-1) cannot recur for fs,
+                # forever; live-hit by archivist msg-1) cannot recur for fs,
                 # because there is no longer any code path that advertises a
                 # cap without a handler backing it. tools/acp_bridge_wetrun.py's
                 # fs-caps rung is the wetrun-gate that keeps this honest for
@@ -698,7 +698,7 @@ class AcpBridge:
 
         ⚠️ WHY THE LOGGING IS THE POINT HERE. The bridge RESUMES by default and a new
         session id is the exception — measured across two seats, specialist kept the id on
-        19 of 22 restarts and mnemosyne on 3 of 4, so an id change is the ~14% case and
+        19 of 22 restarts and archivist on 3 of 4, so an id change is the ~14% case and
         it is the lossy one. Yet "the id changed" is the only signal that survived, and
         it carries TWO OPPOSITE meanings depending on why you restarted: after
         un-wedging a stuck turn a fresh session is the outcome you wanted, while after a
@@ -802,7 +802,7 @@ class AcpBridge:
         delivery makes staleness invisible to the RECEIVER — nothing in a
         delivered message says "three later messages from this sender are already
         queued behind me", so a message and its own RETRACTION are
-        indistinguishable on arrival. Mnemosyne measured the cost: she re-derived
+        indistinguishable on arrival. Archivist measured the cost: she re-derived
         work a peer had already withdrawn, and once corrected a figure the sender
         had retracted 16 minutes earlier.
 
@@ -1070,7 +1070,7 @@ class AcpBridge:
         None = could not find out.
 
         Deliberately a DIFFERENT question from `_main_pane_idle`, and that
-        difference is the whole point of this probe. mnemosyne's log has the one
+        difference is the whole point of this probe. archivist's log has the one
         real instance: a degrading tmux client walked the pane from
         writable-and-readable -> unwritable-but-readable (98 consecutive wake
         failures, ~8 min) -> unreadable, and the drain fired on the unreadable

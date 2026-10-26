@@ -1,0 +1,17 @@
+[Unit]
+Description=Pantheon fleet health collector, every minute (T-5395)
+Documentation=file:///home/%u/pantheon-config/architecture/rfc/RFC-004-fleet-health-and-repair-mechanism.md
+
+# NOT INSTALLED BY THIS STEP. Template only. Not installing this timer is the dark gate; enable
+# only after root has provisioned /run/pantheon-health (tmpfiles, incl. the kino ACL line named in
+# pantheon-health-collector.service). The aggregate's own collected_at / file mtime going stale is
+# the watcher signal for a broken collector.
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=pantheon-health-collector.service
+
+[Install]
+WantedBy=timers.target

@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
-"""session_reset_reconcile — daily cron that lands session-reset jsonl entries
-into structured ledger session_reset action entries.
+"""session_reset_reconcile — retired one-shot utility for turning session-reset
+JSONL records into structured ledger ``session_reset`` action entries.
 
 Per T-0257. The deferred half of T-0256: producers (ho_resumer,
 handoff_and_restart, activity_monitor P1.d) cannot commit at fire-time because
 they run pre-restart, mid-restart, or outside HO's git context. They write
-fire-time records to <state>/session_resets/<class>.jsonl. THIS reconciler
-runs daily, sweeps unconsumed entries, emits structured ledger session_reset
-entries, and commits.
+fire-time records to <state>/session_resets/<class>.jsonl. T-4288 retired the
+never-installed timer after 4.5 months demonstrated that no production consumer
+needed the derived ledger entries. The JSONL remains the forensic source, and
+this utility remains available for an explicitly supervised one-shot recovery.
 
 Also: journal-sweep for the 4th class (service_restart_unattributed) — scans
 claude-telegram.service Started events past N days; entries with no matching
 producer (cap_hit_auto_resume / handoff_restart) within ±10s get logged to
 service_restart_unattributed.jsonl with trigger=journal_sweep_unmatched.
 
-Cadence: daily at 00:30 UTC (after grooming at 00:00). systemd-user timer on
-Recovery's account.
+Cadence: none. The former systemd unit pair was removed by T-4288.
 
 Watermark: per-class last-consumed ts at <state>/session_resets/.reconcile_watermark.json.
 Survives crash/restart — re-running the same window is idempotent.
@@ -45,10 +45,12 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tools._git_utils import _git, _hermes_scan_file, _hermes_scan_message, pull_repo_or_warn
+from tools._git_utils import _git, _hermes_scan_file, _hermes_scan_message, pull_repo_or_warn, push_with_retry
+from tools import agent_role_map
 from tools._audit import append_ledger_entries
 from tools._audit import build_ledger_entry as _audit_build_entry
 from tools.ledger_shard import current_write_target
+from tools.seat_exec import seat_argv
 from tools.session_reset_log import (
     CLASSES,
     KNOWN_ACCOUNTS,
@@ -77,8 +79,25 @@ _PRODUCER_MATCH_TOLERANCE_SECONDS = 10
 _PRODUCER_CLASSES_FOR_ATTRIBUTION = ("cap_hit_auto_resume", "handoff_restart")
 
 # Journal target (the claude bot's user service — same target as health probes).
+# T-4159: this is the BESPOKE fallback only; _journal_user_unit() resolves the live
+# one from instance.yaml, which is pantheon-runtime-controller@orchestrator.service once
+# orchestrator's T-3650 hand-move lands (the retired bespoke unit logs no more Starts).
 _JOURNAL_USER_UNIT = "claude-telegram.service"
 _JOURNAL_SUDO_USER = "claude"
+
+
+def _journal_user_unit() -> str:
+    """The unit whose `Started` events mark an orchestrator session (re)start (T-4159).
+
+    agent_role_map.restart_target("orchestrator")["session_unit"]: the bespoke unit today,
+    the runtime controller after the hand-move (Restart=always, so each pane death
+    is one Started). Falls back to the bespoke constant if resolution fails, which
+    at worst reproduces the pre-T-4159 read."""
+    try:
+        from tools.agent_role_map import restart_target
+        return restart_target("orchestrator")["session_unit"]
+    except Exception:
+        return _JOURNAL_USER_UNIT
 
 # Subprocess timeouts.
 _JOURNAL_TIMEOUT_SECONDS = 60
@@ -101,7 +120,7 @@ def _log(msg: str) -> None:
 
 
 def _watermark_path() -> Path:
-    """Watermark lives in the caller's own state dir (Recovery, for the cron)."""
+    """Watermark lives in the explicitly invoking account's state directory."""
     return session_resets_dir() / _WATERMARK_NAME
 
 
@@ -140,19 +159,25 @@ def save_watermark(wm: dict[str, int], path: Path | None = None) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _entry_id_for(entry: dict) -> str:
+def _entry_id_for(entry: dict, write_ts: str | None = None) -> str:
     """Deterministic ledger entry id derived from the source entry.
 
-    Format: <ts_iso>-session-reset-<class>-<short-hash>. The short-hash is the
+    Format: <ts>-session-reset-<class>-<short-hash>. The short-hash is the
     first 6 chars of sha1(class + ts + trigger + agent_account) — gives us
     collision-resistant uniqueness across the per-day batch.
+
+    T-4737: `<ts>` is the entry's write time `write_ts` (ORG-001 id =
+    <ts>-<slug>); without it, the source's event time (the pre-T-4737 form).
+    The hash still covers the source event, so a batch written in one second
+    keeps unique ids.
     """
     cls = entry.get("class", "unknown")
     ts_iso = entry.get("ts_iso", "")
     trigger = entry.get("trigger", "")
     acct = entry.get("agent_account", "")
     h = hashlib.sha1(f"{cls}|{ts_iso}|{trigger}|{acct}".encode("utf-8")).hexdigest()[:6]
-    return f"{ts_iso}-session-reset-{cls.replace('_', '-')}-{h}"
+    prefix = write_ts if write_ts is not None else ts_iso
+    return f"{prefix}-session-reset-{cls.replace('_', '-')}-{h}"
 
 
 def _rationale_for(entry: dict) -> str:
@@ -169,16 +194,32 @@ def _rationale_for(entry: dict) -> str:
     return "; ".join(parts) + "."
 
 
-def build_ledger_entry(src: dict) -> dict:
+# T-4737: ORG-001 (amended 2026-10-08): the reconcile runs on recovery's seat; its
+# entries carry recovery's ORG-100 role id and seat slot, not the persona name.
+_LEDGER_AGENT, _LEDGER_EXECUTOR = agent_role_map.ledger_identity("recovery")
+
+
+def _utc_now_ts() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_ledger_entry(src: dict, write_ts: str | None = None) -> dict:
     """Build a structured ledger entry from a session_reset_log source entry.
 
     T-1088: the canonical 10-field ORG-001 assembly lives in `_audit`; this
     function stays as the session-reset-specific projection (id/links shape).
+
+    T-4737: `ts` is the write time (`write_ts`, default now), as ORG-001
+    requires; the reset's own time (`ts_iso`) goes in `decided_at`.
     """
+    ts = write_ts if write_ts is not None else _utc_now_ts()
+    event_ts = src.get("ts_iso") or None
     return _audit_build_entry(
-        entry_id=_entry_id_for(src),
-        ts=src.get("ts_iso", ""),
-        agent="recovery",
+        entry_id=_entry_id_for(src, ts),
+        ts=ts,
+        agent=_LEDGER_AGENT,
+        executor=_LEDGER_EXECUTOR,
+        decided_at=event_ts,
         action="session_reset",
         rationale=_rationale_for(src),
         justifies_via=["D1"],
@@ -240,19 +281,25 @@ def journal_started_events(
     *,
     since_days: int = _DEFAULT_JOURNAL_LOOKBACK_DAYS,
     sudo_user: str = _JOURNAL_SUDO_USER,
-    user_unit: str = _JOURNAL_USER_UNIT,
+    user_unit: str | None = None,
 ) -> list[int]:
     """Return epoch timestamps of `Started <unit>` events past N days.
+
+    `user_unit` defaults to _journal_user_unit(), resolved at CALL time (not as a
+    default-arg value, which would freeze at import).
 
     journalctl is run as the unit's owning user via sudo + XDG_RUNTIME_DIR.
     Best-effort: any failure returns [].
     """
-    cmd = [
-        "sudo", "-nu", sudo_user,
-        "bash", "-c",
+    # Own-account reads DIRECTLY — `sudo -nu <self>` is rejected and returns empty
+    # stdout, which the rc/stdout check below reads as [] = "no Started events", a false
+    # absence for the runner's own unit (bugs/sudo-u-to-runners-own-account-...md, T-4058).
+    user_unit = user_unit or _journal_user_unit()
+    inner = (
         f"XDG_RUNTIME_DIR=/run/user/$(id -u) journalctl --user-unit {user_unit} "
-        f"--since '{since_days} days ago' --no-pager -o short-iso 2>/dev/null | grep -F Started || true",
-    ]
+        f"--since '{since_days} days ago' --no-pager -o short-iso 2>/dev/null | grep -F Started || true"
+    )
+    cmd = seat_argv(sudo_user, ["bash", "-c", inner])
     try:
         result = subprocess.run(
             cmd, capture_output=True, text=True, check=False, timeout=_JOURNAL_TIMEOUT_SECONDS
@@ -344,10 +391,12 @@ def commit_and_push(modified_paths: list[Path], message: str) -> tuple[bool, str
                 if "nothing to commit" in r.stdout.lower() or "nothing to commit" in r.stderr.lower():
                     return True, "nothing to commit"
                 return False, f"git commit failed: {r.stderr.strip()}"
-            # Push.
-            r = _git("push", "origin", "main")
-            if r.returncode != 0:
-                return False, f"git push failed: {r.stderr.strip().splitlines()[-1] if r.stderr else 'unknown'}"
+            # Push. T-4388: through push_with_retry (one attempt, as before) so a
+            # rebase the pre-push freshness hook strands on a conflict is aborted,
+            # and a rebase already in progress is never pushed.
+            ok, detail = push_with_retry(_REPO_ROOT, refspec="main", attempts=1)
+            if not ok:
+                return False, f"git push failed: {detail}"
     except GitMutationLockTimeout as exc:
         return False, f"git mutation lock timeout: {exc}"
     return True, ""
@@ -360,12 +409,12 @@ def commit_and_push(modified_paths: list[Path], message: str) -> tuple[bool, str
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Daily session-reset reconciliation cron. "
+        description="Retired one-shot session-reset reconciliation utility. "
                     "Default-safe contract (T-0259): must pass --commit-prod, --dry-run, or --no-commit explicitly."
     )
     parser.add_argument(
         "--commit-prod", action="store_true",
-        help="commit + push to production ledger. systemd cron sets this; smoke runs MUST NOT.",
+        help="commit + push to production ledger; supervised runs only. Smokes MUST NOT.",
     )
     parser.add_argument(
         "--dry-run", action="store_true",
@@ -415,7 +464,7 @@ def _enforce_default_safe(args: argparse.Namespace) -> int | None:
     if not args.commit_prod and not safe_explicit:
         print(
             "ERROR: refusing to run without explicit mode. Pass one of:\n"
-            "  --commit-prod         commit + push to production (systemd cron path)\n"
+            "  --commit-prod         commit + push to production (supervised one-shot only)\n"
             "  --dry-run             scan + report only; no side effects\n"
             "  --no-commit           append to ledger but skip commit/push (smoke path)\n"
             "  --ledger-dir <path>   redirect to a tmp ledger dir (smoke path)\n"
@@ -450,7 +499,9 @@ def main(argv: list[str] | None = None) -> int:
             classes=list(_PRODUCER_CLASSES_FOR_ATTRIBUTION),
             since_epoch=int(time.time()) - args.journal_lookback_days * 86400,
         )
-        started = journal_started_events(since_days=args.journal_lookback_days)
+        journal_unit = _journal_user_unit()
+        started = journal_started_events(since_days=args.journal_lookback_days,
+                                         user_unit=journal_unit)
         unattributed = find_unattributed_restarts(started, producer_entries)
         if unattributed:
             _log(f"journal sweep: {len(unattributed)} unattributed Started events")
@@ -470,7 +521,7 @@ def main(argv: list[str] | None = None) -> int:
                         trigger="journal_sweep_unmatched",
                         ts=ts,
                         agent_account="recovery",
-                        source_unit=_JOURNAL_USER_UNIT,
+                        source_unit=journal_unit,
                     )
         else:
             _log("journal sweep: no unattributed Started events")
@@ -496,7 +547,8 @@ def main(argv: list[str] | None = None) -> int:
     _log(f"{len(unconsumed)} new entries to reconcile")
 
     # 4. Build ledger entries.
-    ledger_entries = [build_ledger_entry(e) for e in unconsumed]
+    write_ts = _utc_now_ts()
+    ledger_entries = [build_ledger_entry(e, write_ts) for e in unconsumed]
 
     # 5. HERMES belt on the rationale strings (cheap defensive check before
     #    appending). The guard runs again at file-tier post-append, but failing

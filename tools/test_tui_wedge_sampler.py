@@ -157,7 +157,7 @@ class SamplerIsReadOnlyTest(unittest.TestCase):
 
     def test_sample_agent_with_no_pane_records_None_without_capturing(self):
         with patch("tools.tui_wedge_sampler.capture_pane") as cap, \
-             patch("tools.tui_wedge_sampler.latest_jsonl_mtime", return_value=7):
+             patch("tools.tui_wedge_sampler.jsonl_turn_signal", return_value=7):
             rec = tws.sample_agent("specialist-a2a", {"sudo_user": "x"})
         cap.assert_not_called()
         self.assertIsNone(rec["pane"])
@@ -166,7 +166,7 @@ class SamplerIsReadOnlyTest(unittest.TestCase):
     def test_sample_agent_records_a_fingerprint_not_the_pane_text(self):
         secret = "sibling agent working content that must not be copied"
         with patch("tools.tui_wedge_sampler.capture_pane", return_value=secret), \
-             patch("tools.tui_wedge_sampler.latest_jsonl_mtime", return_value=1):
+             patch("tools.tui_wedge_sampler.jsonl_turn_signal", return_value=1):
             rec = tws.sample_agent("orchestrator", {"tmux_target_pane": "p", "sudo_user": "u"})
         self.assertNotIn(secret, json.dumps(rec))
         self.assertEqual(rec["pane"], tws.pane_fingerprint(secret))
@@ -199,6 +199,15 @@ class SamplerTargetsAreIndependentOfTheActuator(unittest.TestCase):
             with self.subTest(agent=agent):
                 self.assertTrue(cfg.get("tmux_target_pane"))
                 self.assertTrue(cfg.get("jsonl_dir"))
+
+    def test_jsonl_dirs_follow_the_seat_launch_shape(self):
+        # T-4159: derived from agent_role_map, not literals. The old recovery literal
+        # pointed at -pantheon-config while recovery was bespoke (no jsonl there).
+        from tools import agent_role_map
+        for agent, account in (("orchestrator", "claude"), ("recovery", "claude-fallback")):
+            with self.subTest(agent=agent):
+                self.assertEqual(tws.SAMPLE_TARGETS[agent]["jsonl_dir"],
+                                 agent_role_map.live_session_projects_dir(account))
 
 
 class SelfCaptureAvoidsSudo(unittest.TestCase):
@@ -256,7 +265,7 @@ class SelfCaptureAvoidsSudo(unittest.TestCase):
         with patch.object(tws.getpass, "getuser", return_value="recovery"), \
              patch.object(tws, "capture_pane", return_value="Y") as cp, \
              patch.object(tws, "_capture_self") as direct, \
-             patch.object(tws, "latest_jsonl_mtime", return_value=9):
+             patch.object(tws, "jsonl_turn_signal", return_value=9):
             rec = tws.sample_agent("orchestrator", cfg)
         cp.assert_called_once()
         direct.assert_not_called()

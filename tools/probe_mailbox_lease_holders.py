@@ -1,5 +1,10 @@
 import fcntl, os, re
 
+try:  # T-4096: the hub path comes from instance.yaml, never a literal.
+    from tools.agent_role_map import mailbox_hub
+except ImportError:  # script run: tools/ is on sys.path, the repo root is not
+    from agent_role_map import mailbox_hub
+
 # Parse by TOKEN SHAPE, never by column index: /proc/locks lines vary in field
 # count (blocked waiters render as "-> " continuations, POSIX vs FLOCK differ).
 # Specialist's own rule, T-2296: parse by the FLOCK token, and note the dev halves
@@ -36,8 +41,8 @@ for x in locks():
     print("   ", x)
 
 print("\nthe real question (dev,ino)-keyed, never ino alone:")
-for p in ("metis", "atlas", "orchestrator", "specialist", "codex", "mnemosyne"):
-    path = f"/home/the-ancestor/mailbox/{p}/.consumer.lock"
+for p in ("mason", "artisan", "orchestrator", "specialist", "codex", "archivist"):
+    path = f"{mailbox_hub()}/{p}/.consumer.lock"
     if not os.path.exists(path):
         print(f"  {p}: no lockfile")
         continue

@@ -111,7 +111,7 @@ def _make_file_args(**overrides) -> MagicMock:
     against; this fixture still sets them all explicitly for clarity)."""
     args = MagicMock()
     args.requester = "operator"
-    args.target = "recovery"
+    args.target = "role:system_orchestrator"
     args.title = "typed-edge test ticket"
     args.labels = None
     args.depends_on = None

@@ -1,0 +1,5 @@
+# Claude Code lays its own copy of the plugin API declarations here each time it loads a mod
+# from a folder (and regenerates them after an update): generated, never committed.
+.claude-plugin/types/
+# It also writes a tsconfig.json beside the mod that extends those declarations (T-4589).
+tsconfig.json

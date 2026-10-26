@@ -76,7 +76,18 @@ def require_privileged_uid_switch() -> None:
     scope and never returned.
     """
 
-    if not _ROOT_ENV_PATH.is_file():
+    # T-3940 fix-4: guard is_file() itself, not just the subsequent read_text().
+    # /home/claude/ on some CI runners is 0700 so the runner uid cannot stat()
+    # entries in it — is_file() raises PermissionError before it can return
+    # False. Same skip semantics for stat-refused, permission-refused-on-read,
+    # and genuinely-absent — all three are "this uid cannot use root.env".
+    try:
+        present = _ROOT_ENV_PATH.is_file()
+    except (PermissionError, OSError) as exc:
+        pytest.skip(
+            reason=f"privileged-uid-switch unavailable: cannot stat {_ROOT_ENV_PATH} ({exc})"
+        )
+    if not present:
         pytest.skip(
             reason=(
                 "privileged-uid-switch unavailable: "
@@ -84,7 +95,17 @@ def require_privileged_uid_switch() -> None:
             )
         )
 
-    sudo_pw = _read_sudo_pw()
+    try:
+        sudo_pw = _read_sudo_pw()
+    except (PermissionError, OSError) as exc:
+        # T-3940 fix-3: file exists but current uid can't read it (typical CI-runner
+        # posture — root.env is 0600 owned by a specific persona, other uids see it
+        # but can't open). Functionally identical to "absent" for this fixture's
+        # skip contract; the read-check inside the guard would otherwise raise
+        # through pytest as an ERROR rather than a clean SKIP.
+        pytest.skip(
+            reason=f"privileged-uid-switch unavailable: cannot read {_ROOT_ENV_PATH} ({exc})"
+        )
     try:
         proc = subprocess.run(
             ["sudo", "-S", "-k", "-v"],
@@ -105,6 +126,42 @@ def require_privileged_uid_switch() -> None:
             reason=(
                 "privileged-uid-switch unavailable: sudo -v exited "
                 f"{proc.returncode} (credential check failed)"
+            )
+        )
+
+    # T-3753: also verify the switched-uid can actually IMPORT the
+    # planner-sandbox module. On hosts where the operator's home is 0750
+    # (default on some distros), `nobody` cannot traverse into it, so
+    # PYTHONPATH=/home/<user>/pantheon-config yields ModuleNotFoundError
+    # in the switched-uid shell -- the switch itself works but the source
+    # tree is unreachable. Distinct primitive-state, distinct SKIP reason.
+    sudo_pw2 = _read_sudo_pw()
+    try:
+        import_probe = subprocess.run(
+            [
+                "sudo", "-S", "-k", "-u", PRIVILEGED_SWITCH_TARGET,
+                "env", f"PYTHONPATH={Path(__file__).resolve().parents[3].parent}",
+                "python3", "-c", "import tools.germinate.planner_sandbox.admission",
+            ],
+            input=sudo_pw2 + "\n",
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        pytest.skip(
+            reason=f"privileged-uid-switch source-tree-unreachable probe failed: {exc}"
+        )
+    finally:
+        sudo_pw2 = None  # noqa: F841
+
+    if import_probe.returncode != 0:
+        pytest.skip(
+            reason=(
+                "privileged-uid-switch source-tree-unreachable: "
+                f"{PRIVILEGED_SWITCH_TARGET} cannot import the planner-sandbox "
+                f"module (rc={import_probe.returncode}); likely operator-home "
+                f"mode blocks traversal. stderr={import_probe.stderr.strip()[:200]!r}"
             )
         )
 

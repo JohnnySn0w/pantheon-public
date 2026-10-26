@@ -3,7 +3,7 @@ aliases: [ORG-050]
 title: Security and identity contract for installer and persona bringup
 status: Ratified 2026-07-30 by the operator (Telegram 275)
 date: 2026-07-30
-author: Codex (Cairn)
+author: Codex (Consultant)
 relates: ORG-031, ORG-033, ORG-039, ORG-040, ORG-046, ORG-047
 build_disposition: built
 ---

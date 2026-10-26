@@ -17,6 +17,13 @@ Fail-closed: if the GitHub API cannot be reached after retries, that is ALSO a
 failure — a watchdog that shrugs at errors is blind exactly when the box's
 network/auth is broken, which is a state the operator should hear about.
 
+T-4575: it also FAILS when root's installed copy of the backup script
+(INSTALLED_SCRIPT, which the system unit executes) is missing, differs from the
+tracked tools/vps_state_backup.sh, or is not a root-owned, owner-only-writable
+regular file.
+Root never executes the claude-writable checkout; this is what keeps the root
+copy from drifting silently after a merge. Fix with REINSTALL_HINT.
+
 Usage: backup_staleness_check.py [--repo OWNER/NAME] [--max-age-hours N]
 Defaults: example-org/pantheon-vps-backup, 48h (tolerates one missed daily
 run + clock skew before alerting).
@@ -25,15 +32,63 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import errno
 import json
+import os
+import stat
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 DEFAULT_REPO = "example-org/pantheon-vps-backup"
 DEFAULT_MAX_AGE_HOURS = 48.0
 RETRIES = 3
 RETRY_SLEEP_S = 30
+
+INSTALLED_SCRIPT = Path("/usr/local/sbin/pantheon-vps-state-backup")
+SOURCE_SCRIPT = Path(__file__).resolve().parent / "vps_state_backup.sh"
+REINSTALL_HINT = (
+    "sudo install -o root -g root -m 0755 "
+    "/home/claude/pantheon-config/tools/vps_state_backup.sh " + str(INSTALLED_SCRIPT)
+)
+
+
+def installed_copy_drift(installed: Path = INSTALLED_SCRIPT, source: Path = SOURCE_SCRIPT,
+                         owner_uid: int = 0) -> str | None:
+    """Why root's installed backup script cannot be trusted, or None when it is a
+    regular file (not a symlink), byte-identical to the tracked source, owned by
+    `owner_uid`, and writable by its owner only."""
+    # One descriptor for the type check and the read: O_NOFOLLOW refuses a symlink,
+    # O_NONBLOCK keeps a FIFO from hanging the open, and nothing is read until fstat
+    # has proven a regular file.
+    try:
+        fd = os.open(installed, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as exc:
+        if exc.errno == errno.ELOOP:
+            return f"{installed} is a symlink, not a regular file"
+        return f"cannot read the installed copy {installed} ({exc.__class__.__name__})"
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return f"{installed} is not a regular file"
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            body = fh.read()
+    except OSError as exc:
+        return f"cannot read the installed copy {installed} ({exc.__class__.__name__})"
+    finally:
+        os.close(fd)
+    try:
+        tracked = Path(source).read_bytes()
+    except OSError as exc:
+        return f"cannot read the tracked source {source} ({exc.__class__.__name__})"
+    if st.st_uid != owner_uid:
+        return f"{installed} is owned by uid {st.st_uid}, not {owner_uid}"
+    if st.st_mode & 0o022:
+        return f"{installed} is group- or world-writable (mode {st.st_mode & 0o777:o})"
+    if body != tracked:
+        return f"{installed} differs from the tracked {source}"
+    return None
 
 
 def age_hours(iso_ts: str, now: dt.datetime) -> float:
@@ -64,6 +119,15 @@ def main(argv=None) -> int:
     ap.add_argument("--max-age-hours", type=float, default=DEFAULT_MAX_AGE_HOURS)
     args = ap.parse_args(argv)
 
+    drift = installed_copy_drift()
+    if drift:
+        print(f"DRIFT: {drift} — the root unit runs that copy, not the checkout. "
+              f"Reinstall: {REINSTALL_HINT}", file=sys.stderr)
+    fresh = _freshness(args)
+    return 1 if drift else fresh
+
+
+def _freshness(args) -> int:
     last_err: Exception | None = None
     for attempt in range(1, RETRIES + 1):
         try:

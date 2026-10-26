@@ -1,0 +1,24 @@
+
+  - Root cause: claude-fallback lingering is disabled. Its user manager—and ORG-
+    076 timer—dies when the last SSH session closes.
+
+  - Runner cycles themselves showed no refusals.
+  - Watchman lacks the required root privilege to restore linger; no repair
+    attempt was consumed.
+
+  - The operator received a Telegram action alert with the exact reversible command
+    and verification gate.
+
+  - T-5030 was retargeted to the operator in inbox/.
+  - The stale consultant@codex routing fix remains pending until the root repair is
+    completed and the ticket returns to Watchman.
+
+  The ticket-flow skill required the evidence-first diagnosis and retargeting
+  instead of leaving an operator-blocked ticket active.
+
+─ Worked for 4m 03s ────────────────────────────────────────────────────────────
+
+
+› Run /review on my current changes
+
+  gpt-5.6-sol high · ~/pantheon-config

@@ -22,9 +22,10 @@
 # the `grants` below are DESCRIPTIVE of current access reality, not a new policy
 # — widen them only via ticket + the operator's call, never silently.
 #
-# Grants are keyed on instance role-keys (ORG-030 Q4): orchestrator,
-# specialist, recovery, peer-daemon-codex, and — added 2026-07-21 by
-# T-1922 — sub-orchestrator-1, sub-orchestrator-2, second-head. The role→persona
+# Grants are keyed on instance role-keys (ORG-030 Q4): head-engineering-orchestrator,
+# specialist, head-system-orchestrator, peer-daemon-codex, and — added 2026-07-21 by
+# T-1922, role-keys carrying the operator's T-3807 ratified vocabulary —
+# engineering-orchestrator-1, engineering-orchestrator-2, head-memory-orchestrator. The role→persona
 # binding is in instance.yaml, which agent_role_map reads at import time (it is a
 # LIVE lookup, not documentation — see that file's status header).
 # Access levels: ro (clone/read for cross-reference), rw (clone + push).
@@ -36,73 +37,136 @@ schema_version: 1
 always_available:
   - repo: pantheon-config
     access: rw
-    # Seats + second head added 2026-07-21 (T-1922). NOTE: validate_repos_field does
+    # Seats + head-memory-orchestrator added 2026-07-21 (T-1922). NOTE: validate_repos_field does
     # NOT read this block — it reads each repo's own `grants:` map below. This list is
     # the documentation half; the grants entry is the functional half. Both are kept in
     # step deliberately (adding here alone would silently fail to clear lint).
-    agents: [orchestrator, specialist, recovery, sub-orchestrator-1, sub-orchestrator-2, second-head]
+    # system-orchestrator-1 (watchman, codex-fallback) added 2026-10-13: the operator TG 8313
+    # (deploy key added 2026-10-13; write verified). T-4945 / T-4884 B7 P5.
+    agents: [head-engineering-orchestrator, specialist, head-system-orchestrator, engineering-orchestrator-1, engineering-orchestrator-2, head-memory-orchestrator, system-orchestrator-1]
+  - repo: pantheon-inventory
+    access: rw
+    # T-4052 (the operator TG 10401: "fleet wide read and write"). Hardware inventory, one file
+    # per device. Every seat holds a clone at ~/pantheon-inventory (provisioned T-4051).
+    agents: [head-engineering-orchestrator, specialist, head-system-orchestrator, engineering-orchestrator-1, engineering-orchestrator-2, head-memory-orchestrator]
+
+# --- ORG-046 manifest: auth references (T-1998) -------------------------------
+# Named credentials bound to allowed hosts. The resolver (tools/remote_resolve.py)
+# enforces url-host ∈ allowed_hosts BEFORE any git subprocess (ORG-046 §4 finding 6);
+# the actual credential lives at the noted path and is applied by git's own
+# ssh-config / credential-store, not read from here. Repo-scoping rides on the
+# credential's own forge-side scope, not this host binding (ORG-046 §1). These are
+# ADDITIVE keys — repo_registry/ticket_lint/provisioning read `grants:` and ignore
+# these (yaml.safe_load + .get); load_manifest() reads them.
+auth_refs:
+  deploy-key:pantheon-config:
+    # GitHub reached via the account's default git ssh key (github.com). Per-repo
+    # ssh-alias hardening (the ORG-046 §1 example's github-<repo> alias) is a follow-up.
+    allowed_hosts: [github.com]
+  token:forgejo-pantheon-config:
+    # The same per-seat pantheon-fleet token as below (~/.git-credentials-forgejo, T-4051).
+    # pantheon-fleet is a READ collaborator on github-mirror/pantheon-config (T-1998,
+    # 2026-09-28). That grant is not a widening: every seat already holds rw on
+    # pantheon-config at GitHub (grants below). HTTPS auth-to-pull.
+    allowed_hosts: [git.your-self-hosted-git.example]
+  token:forgejo-pantheon-inventory:
+    # Per-seat 'seat-<account>' write token for the pantheon-fleet service user, in each
+    # account's ~/.git-credentials-forgejo (T-4051). HTTPS only: SSH doesn't reach
+    # git.your-self-hosted-git.example through Cloudflare. Revoke one seat by deleting its named token.
+    allowed_hosts: [git.your-self-hosted-git.example]
 
 repos:
   - name: pantheon-config
     description: orchestration hub (principles, directives, ADRs, ledger, tickets, tooling)
-    # sub-orchestrator-1/-2 + second-head added 2026-07-21 (T-1922), descriptive-of-current-
-    # reality per this file's own grants policy: all three personas already hold working
-    # pantheon-config push keys and have been committing here. Not a widening.
-    grants: { orchestrator: rw, specialist: rw, recovery: rw, sub-orchestrator-1: rw, sub-orchestrator-2: rw, second-head: rw }
+    # engineering-orchestrator-1/-2 + head-memory-orchestrator added 2026-07-21 (T-1922),
+    # descriptive-of-current-reality per this file's own grants policy: all three personas already
+    # hold working pantheon-config push keys and have been committing here. Not a widening.
+    # system-orchestrator-1 (watchman, codex-fallback) rw granted 2026-10-13: the operator TG 8313
+    # (deploy key added 2026-10-13; write verified). T-4945 / T-4884 B7 P5.
+    grants: { head-engineering-orchestrator: rw, specialist: rw, head-system-orchestrator: rw, engineering-orchestrator-1: rw, engineering-orchestrator-2: rw, head-memory-orchestrator: rw, system-orchestrator-1: rw }
+    # ORG-046 manifest-resolved remotes (T-1998). Preference = list order; exactly one
+    # primary. Q1 = GitHub-primary first (day-to-day git resolution UNCHANGED), with
+    # git.your-self-hosted-git.example the read-failover mirror (Forgejo pull-mirror of GitHub — the T-1871
+    # dead-man). READ-only failover per ORG-046 §2; write/push failover is the deferred
+    # half of T-1998, and primary↔mirror sync is currently handled by Forgejo's
+    # pull-mirror (24h interval, so the mirror can lag GitHub by up to a day). The
+    # verifier landed (T-3723, pinned-hash), but this stays INERT until the harness
+    # wiring lands and a seat holds a pin: with no pin, resolve_remote() refuses.
+    # The mirror url names its user on purpose. Since T-4051 each seat's credential
+    # store holds more than one git.your-self-hosted-git.example identity, and a bare url picks whichever
+    # one git-credential-store matches, not necessarily one that can read this repo.
+    # The explicit user makes the choice deterministic (same pattern as pantheon-inventory).
+    # Verified 2026-09-28: all six seats ls-remote the mirror with this url.
+    remotes:
+      - role: primary
+        url: git@github.com:example-org/pantheon-config.git
+        auth: deploy-key:pantheon-config
+      - role: mirror
+        url: https://pantheon-fleet@git.your-self-hosted-git.example/github-mirror/pantheon-config.git
+        auth: token:forgejo-pantheon-config
+        writable: true  # ORG-101 §2 / T-4690: converted 2026-10-07, fleet-writers team, protection parity proven
+
+  - name: pantheon-inventory
+    description: the operator's hardware inventory, one file per device (T-3994 / T-4052; fleet read+write per the operator TG 10401)
+    grants: { head-engineering-orchestrator: rw, specialist: rw, head-system-orchestrator: rw, engineering-orchestrator-1: rw, engineering-orchestrator-2: rw, head-memory-orchestrator: rw }
+    remotes:
+      - role: primary
+        url: https://pantheon-fleet@git.your-self-hosted-git.example/pantheon/pantheon-inventory.git
+        auth: token:forgejo-pantheon-inventory
 
   - name: pantheon-bridge
     description: "RETIRED (dead) — the ORG-004 shared getUpdates poller + SSE fanout is no longer running anywhere; every agent self-polls via the per-agent telegram plugin (T-0719/T-0759 failure class). Repo kept for history; do not revive without a design pass."
-    grants: { orchestrator: ro, recovery: ro }
+    grants: { head-engineering-orchestrator: ro, head-system-orchestrator: ro }
 
   - name: echo-prismatic
     description: Echo voice-agent stack (project-tier ADR-201+)
-    grants: { orchestrator: rw, sub-orchestrator-2: rw }   # atlas granted 2026-08-08 (the operator TG7351) for the T-2675 Echo retask; ssh alias github-echo-prismatic, deploy key echo_prismatic_deploy
+    grants: { head-engineering-orchestrator: rw, engineering-orchestrator-1: rw, engineering-orchestrator-2: rw }   # role-based: all engineering seats (the operator TG 11433, 2026-10-07); artisan first granted 2026-08-08 (TG7351); ssh alias github-echo-prismatic, deploy key echo_prismatic_deploy
 
   - name: echo-recorder
     description: echo audio-capture web app
-    grants: { orchestrator: rw, sub-orchestrator-2: rw }   # atlas granted 2026-08-08 (the operator TG7351); ssh alias github-echo-recorder
+    grants: { head-engineering-orchestrator: rw, engineering-orchestrator-1: rw, engineering-orchestrator-2: rw }   # role-based: all engineering seats (the operator TG 11433); ssh alias github-echo-recorder
 
   - name: echo_vault
     description: echo architecture vault
-    grants: { orchestrator: rw, sub-orchestrator-2: ro }   # atlas granted 2026-08-08 (the operator TG7351), read-only; ssh alias github-echo-vault, deploy key echo_vault_deploy
+    grants: { head-engineering-orchestrator: rw, engineering-orchestrator-1: ro, engineering-orchestrator-2: ro }   # role-based (the operator TG 11433): regulars read-only, as artisan had; ssh alias github-echo-vault, deploy key echo_vault_deploy
 
   - name: pantheon-pwa
     description: operator-facing PWA (kino)
-    grants: { orchestrator: rw }
+    grants: { head-engineering-orchestrator: rw }
 
   - name: revenue-project
     description: revenue-project project
-    grants: { orchestrator: rw }
+    grants: { head-engineering-orchestrator: rw }
 
   - name: personal-site-astro
     description: the operator's personal site (example.com rebuild)
-    grants: { orchestrator: rw }
+    grants: { head-engineering-orchestrator: rw }
 
   - name: vibecamp-scheduler
     description: the operator's vibecamp scheduler site (personal; push direct to main → GH Pages)
-    grants: { orchestrator: rw }
+    grants: { head-engineering-orchestrator: rw }
 
   - name: claude-config
     description: claude config (ORG-030 Phase 3 rename to claude-code-config pending — T-0915)
-    grants: { orchestrator: rw }
+    grants: { head-engineering-orchestrator: rw }
 
   # Added 2026-07-07 (T-1621, descriptive-of-current-reality per this file's own
   # grants policy — access below predates this entry and traces to tickets):
   - name: codex-config
     description: codex agent config + telegram bridge (poller/daemon, MAILBOX.md runbook); LIVE repo
-    grants: { peer-daemon-codex: rw, recovery: rw }   # recovery deploy key codex_config_deploy (T-1044/T-1046 arcs); canonical recovery clone ~/work/codex-config
+    grants: { peer-daemon-codex: rw, head-system-orchestrator: rw }   # recovery deploy key codex_config_deploy (T-1044/T-1046 arcs); canonical recovery clone ~/work/codex-config
   - name: codex-config-template
     description: genericized codex-config release template (T-1472); private mirror example-org/codex-config-template published by HO (T-1501); public flip operator-gated
-    grants: { orchestrator: rw }
+    grants: { head-engineering-orchestrator: rw }
 
   # Added 2026-08-28 (T-2090, descriptive-of-current-reality — both repos already
   # cloned on HO, surfaced during an operator ticket walk):
   - name: exocortex-skeleton
-    description: exocortex/mnemosyne memory-substrate skeleton
-    grants: { orchestrator: rw }   # ssh alias github-exocortex-skeleton (read-only deploy key not on the repo; HTTPS via PAT for writes)
+    description: exocortex/archivist memory-substrate skeleton
+    grants: { head-engineering-orchestrator: rw }   # ssh alias github-exocortex-skeleton (read-only deploy key not on the repo; HTTPS via PAT for writes)
   - name: pantheon-public
     description: neutralized public-facing mirror of pantheon-config, orphan-root private (initial publish gated on T-1963/T-1970/T-1989)
-    grants: { orchestrator: rw }
+    grants: { head-engineering-orchestrator: rw }
 
 # Repos PRESENT on an agent's box but intentionally NOT sanctioned project repos
 # (the operator ruling msg 3848, T-0761): the present-but-undeclared audit (T-0761
@@ -110,6 +174,8 @@ repos:
 # not cloned-on-demand — just present-and-tolerated. ticket_lint ignores this key
 # (loader reads only `repos:`).
 ignored:
+  - repo: pantheon-bridge.RETIRED-20260604
+    reason: "dead clone of the decommissioned Pantheon Bridge (retired 2026-06-04); kept on disk as history, no grant implied (T-3314 first dry run, 2026-10-26)"
   - repo: excalidraw-diagram-skill
     reason: "document-implementation tool, not a Pantheon/the operator project (the operator msg 3848)"
   - repo: sentient-internal
@@ -123,8 +189,8 @@ ignored:
   - repo: vibecamp-trials-tracker
     reason: "personal project (event-specific tooling); not Pantheon material (T-2090 ruling 2026-08-28)"
 
-# NOTE (grants policy, pending reclass): today orchestrator holds all
-# project repos; specialist/recovery hold only pantheon-config. Specialist
+# NOTE (grants policy, pending reclass): today head-engineering-orchestrator holds all
+# project repos; specialist/head-system-orchestrator hold only pantheon-config. Specialist
 # research that needs cross-reference (ro) or repo-specific output (rw) should
 # DECLARE it via a ticket `repos:` field + get the grant added here (the operator's
 # call, or per the domain definition once the orchestrator-tier-with-domains

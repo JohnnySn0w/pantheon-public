@@ -1,0 +1,48 @@
+
+  Queued for the next turn: queued while busy
+  (tip) Your message was queued for the next turn. Use /busy interrupt to make Enter stop the current run instead, or /busy steer to inject mid-run. This tip on
+ly shows once.
+
+╭─ ☤ Hermes ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+stub reply ok
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+────────────────────────────────────────
+● queued while busy
+────────────────────────────────────────
+
+
+╭─ ☤ Hermes ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╮
+stub reply ok
+╰──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────╯
+
+────────────────────────────────────────
+● trigger billing error
+────────────────────────────────────────
+
+⚠️   Attempt 1/3, not retryable failed: HTTP 402: Insufficient Balance
+❌ DeepSeek rejected the request and retrying won't help: HTTP 402: Insufficient Balance
+   💡 DeepSeek reported that billing, credits, or account entitlement is exhausted for deepseek-flash.
+   💡 Add credits or update billing with that provider, then retry.
+   💡 DeepSeek billing: https://platform.deepseek.com/top_up
+   💡 You can switch providers temporarily with /model <model> --provider <provider>.
+ ─  ☤ Hermes  ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+ Billing or credits exhausted: HTTP 402: Insufficient Balance
+
+ DeepSeek reported that billing, credits, or account entitlement is exhausted for deepseek-flash.
+ Add credits or update billing with that provider, then retry.
+ DeepSeek billing: https://platform.deepseek.com/top_up
+ You can switch providers temporarily with /model <model> --provider <provider>.
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ─ ⚡ Out of credits ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+     Add credits with DeepSeek: https://platform.deepseek.com/top_up
+     Or switch providers with /model <model> --provider <provider>.
+
+ ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☤ deepseek-flash │ ~68/1M │ [░░░░░░░░░░] ~0% │ ◷ 7.0s │ ↑ 0 t/s │ 1m │ ⏲ 0s │ ✓ 1s
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ Find and fix a failing test
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────

@@ -12,8 +12,7 @@ now that only happened when a human noticed the dashboard was down.
 This closes the gap the same way the sibling monitors do: pure HTTP probe (no
 LLM/API), timer-driven, ANTI-FLAP via a persisted consecutive-stall counter
 (each timer fire is a fresh oneshot process — the counter lives in the state
-file, not in-process, the same shape as the ancestor-liveness monitor's
-"N=3 consecutive not-alive"), a restart cooldown so a slow recovery can't
+file, not in-process; N=3 consecutive stalls), a restart cooldown so a slow recovery can't
 restart-storm, and windowed escalation (a SECOND restart inside 2x the cooldown
 means the restart isn't clearing the wedge — that's the operator-look signal,
 not the routine case).
@@ -29,7 +28,7 @@ working, not an incident; it's logged to the forensics jsonl, not pinged to
 The operator (D1 — don't spend his bandwidth on routine self-healing).
 
 POSTURE — DETECT (live) + REMEDIATE (ship-dark), matching the fleet's
-restart-automation stance (ancestor_liveness_monitor / channel_liveness_monitor):
+restart-automation stance (channel_liveness_monitor):
 detection, the consecutive-stall counter, and dry-run all run LIVE unconditionally;
 the actual `systemctl restart` is gated behind PANTHEON_AGENT_MONITOR_REMEDIATE_ENABLED
 (default OFF) pending a supervised first-fire (T-1134/T-1140 precedent — every
@@ -71,8 +70,8 @@ PROBE_TIMEOUT_SECONDS = int(os.environ.get("AGENT_MONITOR_PROBE_TIMEOUT_SECONDS"
 AGENT_MONITOR_URL = os.environ.get("AGENT_MONITOR_URL", "http://127.0.0.1:4820/")
 AGENT_MONITOR_UNIT_NAME = os.environ.get("AGENT_MONITOR_UNIT_NAME", "agent-monitor.service")
 
-# N=3: matches ancestor_liveness_monitor.DEFAULT_WEDGE_THRESHOLD (source-verified
-# 2026-07-27). At the 2-min timer interval this is a ~4-6min confirm window —
+# N=3 consecutive stalls, chosen for the timer cadence: at the 2-min timer
+# interval this is a ~4-6min confirm window —
 # appropriate for a failure mode that degrades over days, not a spike.
 STALL_CONSECUTIVE_THRESHOLD = int(os.environ.get("AGENT_MONITOR_STALL_THRESHOLD", "3"))
 
@@ -98,8 +97,7 @@ RESTART_ESCALATE_WINDOW_MULT = 2
 # ceiling plus node startup.
 RESTART_TIMEOUT_SECONDS = int(os.environ.get("AGENT_MONITOR_RESTART_TIMEOUT_SECONDS", "120"))
 
-# SHIP-DARK (T-1885 REBOUND round 1): matches ancestor_liveness_monitor's
-# PANTHEON_ANCESTOR_REMEDIATE_ENABLED / channel_liveness_monitor's
+# SHIP-DARK (T-1885 REBOUND round 1): matches channel_liveness_monitor's
 # PANTHEON_CHANNEL_REMEDIATE_ENABLED — identical read shape (source-verified),
 # default OFF pending a supervised first-fire (T-1134/T-1140 precedent: every
 # restart-automation arm gets one). Detection, the consecutive-stall counter,

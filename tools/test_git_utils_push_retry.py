@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 if __package__ in (None, ""):
@@ -580,6 +581,385 @@ class TestPushWithRetryResolverDeclinesRealConflict(unittest.TestCase):
         self.assertFalse((self.repo / ".git" / "rebase-merge").exists()
                          or (self.repo / ".git" / "rebase-apply").exists(),
                          "rebase must be aborted to clean state")
+
+
+# ---------------------------------------------------------------------------
+# 9. A rebase stranded by the pre-push freshness hook (T-4380)
+# ---------------------------------------------------------------------------
+#
+# On an ATTACHED branch (the shared checkout), `.githooks/pre-push` runs `git pull
+# --rebase --autostash` when the clone is behind. On a conflict the hook exits 1
+# WITHOUT aborting, leaving `.git/rebase-merge`. The failure carries none of the
+# non-ff markers, so push_with_retry used to call it "non-retryable" and return,
+# stranding the checkout mid-rebase and never consulting the conflict_resolver.
+
+_HOOKS_DIR = Path(__file__).resolve().parent.parent / ".githooks"
+
+
+def _init_attached_repo_with_hook(base: Path) -> tuple[Path, Path]:
+    """Bare origin + a clone ATTACHED to main with the real pre-push hook wired,
+    seeded with shared.txt. Returns (repo, bare)."""
+    bare = base / "origin.git"
+    bare.mkdir()
+    _run(["git", "init", "--bare", "-b", "main"], bare)
+    repo = base / "repo"
+    repo.mkdir()
+    _run(["git", "init", "-b", "main"], repo)
+    _run(["git", "config", "user.email", "hook-test@example"], repo)
+    _run(["git", "config", "user.name", "HookTest"], repo)
+    _run(["git", "remote", "add", "origin", str(bare)], repo)
+    (repo / "shared.txt").write_text("v0\n", encoding="utf-8")
+    _run(["git", "add", "shared.txt"], repo)
+    _run(["git", "commit", "-m", "seed"], repo)
+    _run(["git", "push", "origin", "main"], repo)
+    _run(["git", "config", "core.hooksPath", str(_HOOKS_DIR)], repo)
+    return repo, bare
+
+
+def _rebase_dirs_present(repo: Path) -> bool:
+    return (repo / ".git" / "rebase-merge").exists() or (repo / ".git" / "rebase-apply").exists()
+
+
+def _current_branch(repo: Path) -> str:
+    r = subprocess.run(["git", "symbolic-ref", "--short", "-q", "HEAD"], cwd=str(repo),
+                       capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def _head(repo: Path) -> str:
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo),
+                          capture_output=True, text=True).stdout.strip()
+
+
+class TestPushWithRetryHookStrandedRebase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name)
+        self.repo, self.bare = _init_attached_repo_with_hook(self.base)
+        # A local commit and a competing origin commit that conflict on shared.txt.
+        _make_commit_in_repo(self.repo, "shared.txt", "ours\n", "local edits shared")
+        self.local_sha = _head(self.repo)
+        _advance_bare_via_clone(self.base, self.bare, "shared.txt", "theirs\n")
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_resolver_drives_the_hooks_stranded_rebase_to_completion(self) -> None:
+        calls = {"n": 0}
+
+        def resolver(unmerged, cwd):
+            calls["n"] += 1
+            if set(unmerged) != {"shared.txt"}:
+                return False
+            (Path(cwd) / "shared.txt").write_text("resolved\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", "shared.txt"], cwd=str(cwd),
+                           capture_output=True, text=True, check=False)
+            return True
+
+        ok, msg = push_with_retry(self.repo, conflict_resolver=resolver)
+        self.assertTrue(ok, f"resolver must let the hook-stranded rebase land; got {msg!r}")
+        self.assertEqual(calls["n"], 1)
+        self.assertFalse(_rebase_dirs_present(self.repo))
+        self.assertEqual(_current_branch(self.repo), "main")
+        verify = self.base / "verify"
+        _run(["git", "clone", str(self.bare), str(verify)], self.base)
+        self.assertEqual((verify / "shared.txt").read_text(), "resolved\n")
+
+    def _assert_aborted_loudly(self, ok: bool, msg: str) -> None:
+        self.assertFalse(ok)
+        self.assertFalse(_rebase_dirs_present(self.repo), "must never be left mid-rebase")
+        self.assertEqual(_current_branch(self.repo), "main", "branch must be restored")
+        self.assertEqual(_head(self.repo), self.local_sha, "pre-rebase HEAD must be restored")
+        # The exact `git log --oneline` line, 4-space indented — not merely the sha or
+        # subject, which git's own "could not apply <sha>... <subject>" stderr
+        # tail would also satisfy.
+        short = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=str(self.repo),
+                               capture_output=True, text=True).stdout.strip()
+        self.assertIn(f"    {short} local edits shared", msg, "the unpushed commit must be listed")
+        self.assertIn("DID NOT LAND", msg)
+        self.assertIn("reset --hard", msg, "the manual recovery must be spelled out")
+        self.assertNotEqual(_bare_origin_head(self.bare), self.local_sha)
+        # git's own `hint: ... run "git rebase --continue"` (the hook re-prints it with
+        # a `pre-push: ` prefix) contradicts an ABORTED message; the useful lines stay.
+        self.assertNotIn("hint:", msg)
+        self.assertIn("Merge conflict in shared.txt", msg)
+
+    def test_resolver_declining_aborts_and_names_the_commit(self) -> None:
+        ok, msg = push_with_retry(self.repo, conflict_resolver=lambda unmerged, cwd: False)
+        self._assert_aborted_loudly(ok, msg)
+
+    def test_no_resolver_aborts_and_names_the_commit(self) -> None:
+        ok, msg = push_with_retry(self.repo)
+        self._assert_aborted_loudly(ok, msg)
+
+    def test_last_attempt_does_not_resolve_because_no_push_would_follow(self) -> None:
+        calls = {"n": 0}
+
+        def resolver(unmerged, cwd):
+            calls["n"] += 1
+            return True
+
+        ok, msg = push_with_retry(self.repo, attempts=1, conflict_resolver=resolver)
+        self._assert_aborted_loudly(ok, msg)
+        self.assertEqual(calls["n"], 0, "a resolved rebase with no push left would be a silent unpushed commit")
+
+    def test_failed_abort_is_reported_as_still_mid_rebase(self) -> None:
+        """If `git rebase --abort` itself fails, the checkout really IS stranded; the
+        message must say so and give the manual command, never claim it was restored."""
+        import tools._git_utils as gu
+
+        real_git = gu._git
+
+        def flaky_git(*args, cwd=gu.REPO_ROOT):
+            if args[:2] == ("rebase", "--abort"):
+                return subprocess.CompletedProcess(list(args), 1, "", "simulated abort failure")
+            return real_git(*args, cwd=cwd)
+
+        with unittest.mock.patch.object(gu, "_git", flaky_git):
+            ok, msg = push_with_retry(self.repo)
+        self.assertFalse(ok)
+        self.assertTrue(_rebase_dirs_present(self.repo), "fixture: the abort was suppressed")
+        self.assertIn("STILL MID-REBASE", msg)
+        self.assertIn("DID NOT LAND", msg)
+        self.assertIn("rebase --abort", msg, "the manual command must be spelled out")
+        self.assertNotIn("branch 'main' restored", msg)
+        _run(["git", "rebase", "--abort"], self.repo)  # test cleanup
+
+
+def _rebase_state_present_at(cwd: Path) -> bool:
+    """Independent of the code under test: ask git where THIS checkout keeps its
+    rebase state (per-worktree in a linked worktree) and look for the directories."""
+    for kind in ("rebase-merge", "rebase-apply"):
+        r = subprocess.run(["git", "rev-parse", "--git-path", kind], cwd=str(cwd),
+                           capture_output=True, text=True)
+        p = Path(r.stdout.strip())
+        if r.returncode == 0 and (p if p.is_absolute() else cwd / p).exists():
+            return True
+    return False
+
+
+class TestPushWithRetryHookStrandedRebaseInLinkedWorktree(unittest.TestCase):
+    """The harness worktrees and submodules carry a `.git` FILE, not a directory. The
+    fix must cover that shape: `_is_checkout_root` must accept it, and the rebase
+    state is then read from the worktree's private git dir (T-4380)."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.base = Path(self._tmp.name)
+        main, self.bare = _init_attached_repo_with_hook(self.base)
+        _run(["git", "branch", "feature"], main)
+        _run(["git", "push", "origin", "feature"], main)
+        self.wt = self.base / "linked-wt"
+        _run(["git", "worktree", "add", str(self.wt), "feature"], main)
+        self.assertTrue((self.wt / ".git").is_file(), "fixture: a linked worktree's .git is a file")
+        _make_commit_in_repo(self.wt, "shared.txt", "ours\n", "local edits shared")
+        self.local_sha = _head(self.wt)
+        rival = self.base / "rival"
+        _run(["git", "clone", str(self.bare), str(rival)], self.base)
+        _run(["git", "config", "user.email", "rival@example"], rival)
+        _run(["git", "config", "user.name", "Rival"], rival)
+        _run(["git", "checkout", "-B", "feature", "origin/feature"], rival)
+        _make_commit_in_repo(rival, "shared.txt", "theirs\n", "rival edits shared")
+        _run(["git", "push", "origin", "feature"], rival)
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def test_resolver_lands_the_hooks_stranded_rebase_in_a_linked_worktree(self) -> None:
+        def resolver(unmerged, cwd):
+            if set(unmerged) != {"shared.txt"}:
+                return False
+            (Path(cwd) / "shared.txt").write_text("resolved\n", encoding="utf-8")
+            subprocess.run(["git", "add", "--", "shared.txt"], cwd=str(cwd),
+                           capture_output=True, text=True, check=False)
+            return True
+
+        ok, msg = push_with_retry(self.wt, refspec="HEAD:feature", conflict_resolver=resolver)
+        self.assertTrue(ok, f"the fix must reach a `.git`-file checkout; got {msg!r}")
+        self.assertFalse(_rebase_state_present_at(self.wt))
+        self.assertEqual(_current_branch(self.wt), "feature")
+        verify = self.base / "verify"
+        _run(["git", "clone", "--branch", "feature", str(self.bare), str(verify)], self.base)
+        self.assertEqual((verify / "shared.txt").read_text(), "resolved\n")
+
+    def test_no_resolver_aborts_loudly_and_restores_the_branch_in_a_linked_worktree(self) -> None:
+        ok, msg = push_with_retry(self.wt, refspec="HEAD:feature")
+        self.assertFalse(ok)
+        self.assertFalse(_rebase_state_present_at(self.wt), "must never be left mid-rebase")
+        self.assertEqual(_current_branch(self.wt), "feature", "branch must be restored")
+        self.assertEqual(_head(self.wt), self.local_sha)
+        self.assertIn("DID NOT LAND", msg)
+        self.assertIn("local edits shared", msg)
+
+
+class TestPushWithRetryNoCheckoutNoProbe(unittest.TestCase):
+    """A cwd that is not a checkout root (no `.git` entry of its own) has no
+    established rebase state, so push_with_retry must neither probe for one (no extra
+    git spawns — the consumer tests that pin exact git-call sequences run against
+    exactly such cwds) nor claim ownership of one after a failed push (T-4380: act
+    only on a rebase PROVEN to have appeared during this call)."""
+
+    def test_no_rebase_probe_and_no_rebase_abort_outside_a_checkout(self) -> None:
+        import tools._git_utils as gu
+
+        real_git = gu._git
+        seen: list[tuple] = []
+
+        def recording_git(*args, cwd=gu.REPO_ROOT):
+            seen.append(args)
+            return real_git(*args, cwd=cwd)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with unittest.mock.patch.object(gu, "_git", recording_git):
+                ok, msg = push_with_retry(Path(tmp))
+        self.assertFalse(ok)
+        self.assertIn("non-retryable", msg)
+        # T-3600's read-only branch-safety probe (symbolic-ref/log) is not ours.
+        probes = [a for a in seen if a[0] not in ("symbolic-ref", "log")]
+        self.assertEqual([a[0] for a in probes], ["push"], f"unexpected git calls: {probes!r}")
+
+
+class TestPushWithRetryLeavesForeignRebaseAlone(unittest.TestCase):
+    """A rebase that was ALREADY in progress at entry is somebody else's work
+    (a human mid-resolution): push_with_retry must not abort it (T-4380)."""
+
+    def test_rebase_present_at_entry_is_not_aborted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, bare = _init_attached_repo_with_hook(base)
+            _make_commit_in_repo(repo, "shared.txt", "ours\n", "local edits shared")
+            _advance_bare_via_clone(base, bare, "shared.txt", "theirs\n")
+            _run(["git", "fetch", "origin", "main"], repo)
+            r = subprocess.run(["git", "rebase", "origin/main"], cwd=str(repo),
+                               capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertTrue(_rebase_dirs_present(repo), "fixture: a human's rebase is in progress")
+            # T-4422: with a rebase at entry the push is not attempted at all, so even a
+            # remote that would fail for an unrelated reason is never contacted.
+            _run(["git", "remote", "set-url", "origin", str(base / "does-not-exist.git")], repo)
+            ok, msg = push_with_retry(repo)
+            self.assertFalse(ok)
+            self.assertNotIn("non-retryable", msg)
+            self.assertIn("push refused", msg)
+            self.assertIn("no push, fetch, rebase, continue or abort was run", msg)
+            self.assertTrue(_rebase_dirs_present(repo), "a foreign in-progress rebase must be left untouched")
+
+    def test_non_ff_rejection_with_a_rebase_at_entry_runs_no_rebase_at_all(self) -> None:
+        """The pre-existing non-ff path (fetch, `git rebase FETCH_HEAD`, resolver /
+        abort) used to abort a person's in-progress rebase. With a rebase present at
+        entry, NO rebase / continue / abort may run on any path: the call returns a
+        loud (False, msg) naming the rebase and leaves it exactly as it found it."""
+        import tools._git_utils as gu
+
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            repo, bare = _init_attached_repo_with_hook(base)
+            _run(["git", "config", "--unset", "core.hooksPath"], repo)  # plain non-ff, no hook
+            _make_commit_in_repo(repo, "shared.txt", "ours\n", "local edits shared")
+            _advance_bare_via_clone(base, bare, "shared.txt", "theirs\n")
+            _run(["git", "fetch", "origin", "main"], repo)
+            r = subprocess.run(["git", "rebase", "origin/main"], cwd=str(repo),
+                               capture_output=True, text=True)
+            self.assertNotEqual(r.returncode, 0)
+            self.assertTrue(_rebase_dirs_present(repo), "fixture: a human's rebase is in progress")
+            # Origin moves on past what that rebase is based on, so the push is a real
+            # non-ff rejection (HEAD is the rebase's `onto`, now behind origin).
+            rival = base / "rival"
+            _run(["git", "clone", str(bare), str(rival)], base)
+            _run(["git", "config", "user.email", "rival@example"], rival)
+            _run(["git", "config", "user.name", "Rival"], rival)
+            _make_commit_in_repo(rival, "other.txt", "unrelated\n", "rival adds other")
+            _run(["git", "push", "origin", "main"], rival)
+            head_before = _head(repo)
+            unmerged_before = subprocess.run(["git", "status", "--porcelain"], cwd=str(repo),
+                                             capture_output=True, text=True).stdout
+
+            real_git = gu._git
+            seen: list[tuple] = []
+            resolver_calls = {"n": 0}
+
+            def recording_git(*args, cwd=gu.REPO_ROOT):
+                seen.append(args)
+                return real_git(*args, cwd=cwd)
+
+            def resolver(unmerged, cwd):
+                resolver_calls["n"] += 1
+                return True
+
+            with unittest.mock.patch.object(gu, "_git", recording_git):
+                ok, msg = push_with_retry(repo, conflict_resolver=resolver)
+
+            self.assertFalse(ok)
+            self.assertIn("ALREADY IN PROGRESS", msg)
+            self.assertIn("rebase-merge", msg, "the message must name the rebase")
+            self.assertIn("DID NOT LAND", msg)
+            self.assertEqual([a for a in seen if a[0] == "rebase"], [], "no rebase/continue/abort may run")
+            # T-4422 (and T-4380 r2 mutant N12): nothing touches the remote either.
+            self.assertEqual([a for a in seen if a[0] == "fetch"], [], "no fetch before/after the foreign guard")
+            self.assertEqual([a for a in seen if a[0] == "push"], [], "the half-rebased HEAD must not be pushed")
+            self.assertEqual(_head(bare), _head(rival), "origin must be exactly as the rival left it")
+            self.assertEqual(resolver_calls["n"], 0, "the resolver must not be handed a person's rebase")
+            self.assertTrue(_rebase_dirs_present(repo), "the person's rebase must survive untouched")
+            self.assertEqual(_head(repo), head_before)
+            self.assertEqual(
+                subprocess.run(["git", "status", "--porcelain"], cwd=str(repo),
+                               capture_output=True, text=True).stdout,
+                unmerged_before, "the working tree / index must be exactly as found",
+            )
+
+
+
+class TestStderrTailHintFilter(unittest.TestCase):
+    """T-4380 r2 surviving mutants N3/N7/N8 (pinned in T-4422): git's `hint:` advice is
+    dropped per LINE by prefix (bare or `pre-push:`-prefixed), on a base with no
+    trailing newline, from both the foreign-rebase and the STILL-MID-REBASE messages."""
+
+    DETAIL = (
+        "error: failed to push some refs\n"
+        "hint: Updates were rejected because the tip is behind\n"
+        "pre-push: hint: run git rebase --continue\n"
+        "error: see the note, hint: inline text stays"  # no trailing newline
+    )
+
+    def _check(self, msg: str) -> None:
+        self.assertIn("error: failed to push some refs", msg)
+        self.assertIn("error: see the note, hint: inline text stays", msg, "only a hint: PREFIX drops a line")
+        self.assertNotIn("Updates were rejected", msg)
+        self.assertNotIn("run git rebase --continue\n", msg + "\n")
+
+    def test_tail_filters_by_line_prefix_without_trailing_newline(self) -> None:
+        from tools._git_utils import _stderr_tail
+        out = _stderr_tail(self.DETAIL)
+        self.assertEqual(out.splitlines(), [
+            "error: failed to push some refs",
+            "error: see the note, hint: inline text stays",
+        ])
+
+    def test_foreign_rebase_message_drops_hints(self) -> None:
+        from tools._git_utils import _foreign_rebase_message
+        self._check(_foreign_rebase_message(Path("/x"), "rebase-merge", self.DETAIL))
+
+    def test_still_mid_rebase_message_drops_hints(self) -> None:
+        from tools._git_utils import _stranded_rebase_abort_message
+        msg = _stranded_rebase_abort_message(Path("/x"), "HEAD:main", "main", self.DETAIL, aborted=False)
+        self.assertIn("STILL MID-REBASE", msg)
+        self._check(msg)
+
+
+# T-4940: isolate the seat's state dir for plain-unittest runs (pytest's conftest
+# _isolate_state_dir already does this per test). See tools/_seat_state_isolation.py.
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover - run from tools/
+    import _seat_state_isolation  # type: ignore[no-redef]
+
+
+def setUpModule() -> None:
+    _seat_state_isolation.start()
+
+
+def tearDownModule() -> None:
+    _seat_state_isolation.stop()
 
 
 if __name__ == "__main__":

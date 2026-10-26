@@ -67,10 +67,7 @@ The decisive synthesis: Specialist **already has** the interactive session both 
 - Formal agent-registry persona change elevating Specialist to a named "orchestrator" class (vs operationally orchestrating) — decide if/when it matters.
 - Echo's per-MCP context cache (ADR-212) is orthogonal.
 
-**ratification steer (the operator msg_2646, 2026-05-29) — incorporated:**
-- Cost: can't afford headless `claude -p` past the ~June-13 API switchover — **confirms the migration off `claude -p` and makes the deadline hard** (not "not worried"; affirmatively unaffordable). Subagent token cost (≈1×) is acceptable.
-- Resilience (resolves former open-Q on a watchdog): **yes — give Specialist's session the same wedge/restart-recovery tooling HO runs** (auto-resume, wedge-detection; reuse of the ADR-211 E3/E4 + HO restart machinery). Added as an explicit decision element below.
-- Elevation (resolves former open-Q on persona/registry): Specialist is **already** a daemon tmux session like Orchestrator/HO — this is **operational** (finagle the launch flags so the session dispatches subagents + harden it), not a rebuild or a heavy registry change.
+The ratification steer (the operator msg_2646: cost, resilience, elevation) that produced the decision element below is in `notes/2026-10-08-org-025-review-history.md`.
 
 **Added decision element (per the steer):** Specialist's interactive session gets the HO-style **wedge/restart-recovery tooling** (auto-resume on cap-hit, wedge/liveness detection, restart machinery) so a scheduled watch is never silently missed when the session is down/wedged. This is a migration prerequisite, not a follow-up.
 

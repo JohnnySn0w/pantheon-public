@@ -36,7 +36,7 @@ class TestTicketReadmeRowEmitter(unittest.TestCase):
     def _ticket(self, tid: str, title: str, state: str = "done"):
         return tk.Ticket(
             path=Path("tickets") / state / f"{tid}.md",
-            fields={"id": tid, "state": state, "requester": "atlas",
+            fields={"id": tid, "state": state, "requester": "artisan",
                     "target": "orchestrator", "created": "2026-07-23T00:00:00Z"},
             body="",
             title=title,
@@ -51,7 +51,7 @@ class TestTicketReadmeRowEmitter(unittest.TestCase):
 
     def test_pipe_free_row_is_byte_identical_to_old_literal(self) -> None:
         full, _ = tk._partition_done_rows([self._ticket("T-0001", "a plain title")])
-        expected = "| T-0001 | done | a plain title | atlas → orchestrator | 2026-07-23 |"
+        expected = "| T-0001 | done | a plain title | artisan → orchestrator | 2026-07-23 |"
         self.assertEqual(full[0], expected)
 
 

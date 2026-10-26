@@ -1,9 +1,9 @@
 """tools/_lease.py — single-holder, stale-safe, daemon-safe file lease (T-0896).
 
 Factors the proven handoff_and_restart.sh T-0584 "Stale-flock takeover" pattern
-into a reusable Python primitive. Built for the Veneration harness (T-0766) — only
-one veneration may run against the shared the-ancestor substrate at a time — but it
-is path-agnostic for any single-holder coordination need.
+into a reusable Python primitive. Built for the Veneration harness (T-0766; removed
+T-4741 #835) — only one veneration could run against the shared (since-retired)
+the-ancestor substrate at a time — and it is path-agnostic for any single-holder coordination need.
 
 Properties (per T-0766 design B/C/D):
 
@@ -92,11 +92,11 @@ class Lease:
 
     def _write_record(self) -> None:
         # ttl_secs is RECORDED because staleness is a property of the HOLDER, not of
-        # whoever happens to ask (T-2236, mnemosyne). Without it, `_holder_is_stale`
+        # whoever happens to ask (T-2236, archivist). Without it, `_holder_is_stale`
         # judges a long-lived holder against the ACQUIRER's TTL: an MCP consume
         # (DEFAULT_TTL_SECS=900) declared a 7200s ACP bridge stale after 15 minutes
         # and SIGKILLed it — same uid, so the kill was permitted. Measured live with
-        # both bridges past threshold: specialist 1365s, mnemosyne 2708s.
+        # both bridges past threshold: specialist 1365s, archivist 2708s.
         rec = {
             "pid": os.getpid(),
             "start": int(time.time()),

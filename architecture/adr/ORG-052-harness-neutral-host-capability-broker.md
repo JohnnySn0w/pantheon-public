@@ -3,7 +3,7 @@ aliases: [ORG-052]
 title: Harness-neutral host capability broker with MCP adapters over system D-Bus
 status: "Ratified 2026-07-31 by the operator (Telegram message 450). Amended 2026-08-26 by [[ORG-082]] (operator-ratified via Telegram 8612 as the ORG-080 + ORG-081 + ORG-082 bundle): substrate op families (account/group/ACL/sudoers/root-unit + mailbox-dir + linger) move off the broker daemon's exposed surface (bootstrap in-process root only); gate 32a (same-registry-digest acceptance) added."
 date: 2026-07-30
-author: Codex (Cairn); canonicalized by Cairn as interim dispatcher under D2
+author: Codex (Consultant); canonicalized by Consultant as interim dispatcher under D2
 relates: ORG-031, ORG-033, ORG-040, ORG-049, ORG-050, ORG-051
 # elements: — ORG-065 machine index of the "Acceptance gates for implementation"
 # section (T-2934 migration walk, pass 1). E<n> == gate n, 1:1; text is a
@@ -1123,6 +1123,40 @@ This ratified decision accepts these architecture calls:
 13. cross-persona work links a broker-owned request plan to a matching new plan
     under the recipient's own identity and policy; mailbox delivery never
     transfers credentials, identity, or capability.
+
+### Provisional wire names (pending ratification)
+
+Ratification covers the closed, versioned namespace and the internal
+signatures above, but not the concrete strings implementation has minted
+inside them. These are PROVISIONAL until ratified together. The canonical
+table, with the minting ticket for each name, is "Provisional names pending
+ratification" in `tools/host_control/README.md`.
+
+- the `org.pantheon.HostBroker1.Error.*` broker error names (T-2912 OQ4),
+  plus `…Error.RateLimited` (T-2917 5a);
+- the host MCP adapter error codes (T-2915), including `broker_rate_limited`;
+- `org.pantheon.HostBroker1.ExecutionSource` and the
+  `pantheon-host-execution-spec/v1` schema;
+- the per-seat executor bus-name scheme `org.pantheon.HostExecutor1.U<uid>`,
+  the `org.pantheon.HostExecutor1.Executor` interface, the
+  `org.pantheon.HostExecutor1.Error.*` names, and the
+  `pantheon-host-execution-result/v1` and `pantheon-host-executor-config/v1`
+  schemas, including the `mailbox_hub` key and its `@MAILBOX_HUB@` unit
+  substitution (the config path and entrypoint are owned by T-2920);
+- the T-2917 5b-5d execution vocabulary:
+  - verify sentinels and seat-local residue ids;
+  - execution states (`refused`) and kinds (`reconcile`);
+  - journal events (`spec_rearmed`, `execute_retry`, `redispatch_intent`,
+    `execute_voided`, `reconcile_probe`);
+  - reconciler detail codes and the rollback restore intent;
+- the `operation_driver` leg of the `pantheon-health/v1` broker roster
+  (T-2917 5d.4).
+- the automatic apply-compensation vocabulary (T-4964): the
+  `broker:apply-compensation` approval sentinel, the reserved
+  `broker compensation <handle>` idempotency namespace, the
+  `compensation_authorized` / `compensation_refused` journal events,
+  `compensation_error`, and the OperationGet
+  `compensation_operation_handle` field.
 
 ## DECISIONS
 

@@ -321,7 +321,7 @@ class VerifyTests(ConsumeOnboardTestCase):
                     0, "NextElapseUSecRealtime=Mon 2026-08-10 00:00:00 UTC\nNextElapseUSecMonotonic=0\n", ""
                 ),
                 ("pgrep", "-u", ACCOUNT, "-a", "-f", r"\.npm-global/bin/clau[d]e"): CommandResult(
-                    0, "12345 claude --model claude-opus-4-8 --permission-mode default\n", ""
+                    0, "12345 claude --model claude-opus-4-8 --permission-mode bypassPermissions\n", ""
                 ),
             }
         )
@@ -347,7 +347,7 @@ class VerifyTests(ConsumeOnboardTestCase):
                 ): CommandResult(0, "NextElapseUSecRealtime=n/a\nNextElapseUSecMonotonic=0\n", ""),
                 ("pgrep", "-u", ACCOUNT, "-a", "-f", r"\.npm-global/bin/clau[d]e"): CommandResult(
                     0,
-                    "12345 claude --model claude-opus-4-8 --permission-mode default "
+                    "12345 claude --model claude-opus-4-8 --permission-mode bypassPermissions "
                     "--channels plugin:telegram@x\n",
                     "",
                 ),

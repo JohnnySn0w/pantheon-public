@@ -199,21 +199,21 @@ class Arc:
         self.manifest_path = tmp / "manifest.yaml"
         self.manifest_path.write_text("roles: {}\n")
         comms = {"kind": "telegram"} if telegram else None
-        self.old = _binding(tmp, role="orchestrator", persona="cairn", account="codex-old",
+        self.old = _binding(tmp, role="orchestrator", persona="consultant", account="codex-old",
                              harness="codex", communications=comms)
-        self.candidate = _binding(tmp, role="orchestrator", persona="cairn", account="claude-new",
+        self.candidate = _binding(tmp, role="orchestrator", persona="consultant", account="claude-new",
                                    harness="claude", communications=comms)
         self.world.live[self.world.ref(self.old)] = True
         if telegram:
             self.world.receiver = self.world.ref(self.old)
         switch_state_root = tmp / "switch-state"
         self.config = csc.CoordinatorConfig(
-            persona_id="cairn", organism_id="pantheon",
+            persona_id="consultant", organism_id="pantheon",
             runtime_manifest_path=self.manifest_path,
             bundle_path=self.cf.manifest, descriptor_root=self.cf.descriptors,
             repo_root=tmp, state_root=tmp / "state", checkpoint_root=self.cf.checkpoints,
             switch_state_root=switch_state_root,
-            actor=pc.ActorContext("cairn", ("authority:canonical",), (pc.ContinuityPurpose.HYDRATE_RUNTIME,)),
+            actor=pc.ActorContext("consultant", ("authority:canonical",), (pc.ContinuityPurpose.HYDRATE_RUNTIME,)),
             transaction_ceiling_minutes=15,
         )
         ports = _ports(self.world)
@@ -320,7 +320,7 @@ class PreflightTests(TmpCase):
         self.assertTrue(result.old_sole_receiver_proof)
         self.assertEqual(len(arc.world.maintenance_entries), 1)
         persona, minutes, reason = arc.world.maintenance_entries[0]
-        self.assertEqual(persona, "cairn")
+        self.assertEqual(persona, "consultant")
         self.assertLessEqual(minutes, arc.config.transaction_ceiling_minutes)
 
     def test_preflight_refuses_incompatible_authority(self) -> None:
@@ -360,7 +360,7 @@ class CheckpointTests(TmpCase):
         plan = arc.plan()
         preflight = arc.coordinator.preflight(plan)
         envelope = arc.coordinator.require_checkpoint(plan, preflight, checkpoint_envelope_path=arc.checkpoint_envelope_path)
-        self.assertEqual(envelope.persona_id, "cairn")
+        self.assertEqual(envelope.persona_id, "consultant")
 
     def test_require_checkpoint_refuses_descriptor_drift(self) -> None:
         arc = _arc(self.tmp)
@@ -581,7 +581,7 @@ class CommitTransferTests(TmpCase):
         self.assertFalse(arc.world.live[arc.world.ref(arc.old)])
         self.assertTrue(arc.world.live[arc.world.ref(arc.candidate)])
         self.assertEqual(arc.world.receiver, arc.world.ref(arc.candidate))
-        self.assertEqual(arc.world.maintenance_exits, ["cairn"])
+        self.assertEqual(arc.world.maintenance_exits, ["consultant"])
         self.assertFalse(arc.world.isolated[arc.world.ref(arc.candidate)])  # released post-commit
 
     def test_commit_transfer_refuses_when_not_all_assertions_passed(self) -> None:
@@ -641,7 +641,7 @@ class RollbackTests(TmpCase):
         receipt = arc.coordinator.rollback(plan, reason="test", stage_reached="preflighted")
         self.assertEqual(receipt.outcome, "rolled-back")
         self.assertTrue(arc.world.live[arc.world.ref(arc.old)])
-        self.assertIn("cairn", arc.world.maintenance_exits)
+        self.assertIn("consultant", arc.world.maintenance_exits)
 
     def test_rollback_refuses_on_postimage_drift(self) -> None:
         arc = _arc(self.tmp)
@@ -692,14 +692,14 @@ class EmitReceiptTests(TmpCase):
         # filename must not raise. We exercise _publish_receipt directly to
         # prove that half of the contract (emit_receipt's receipt_id makes
         # two calls always distinct artifacts, by design -- see DECISIONS).
-        directory = arc.config.switch_state_root / "cairn" / "receipts"
+        directory = arc.config.switch_state_root / "consultant" / "receipts"
         raw = csc._json_bytes({"a": 1})
         self.assertTrue(csc._publish_receipt(directory, "x.json", raw))
         self.assertFalse(csc._publish_receipt(directory, "x.json", raw))  # identical -> idempotent no-op
 
     def test_conflicting_second_publish_is_refused(self) -> None:
         arc = _arc(self.tmp)
-        directory = arc.config.switch_state_root / "cairn" / "receipts"
+        directory = arc.config.switch_state_root / "consultant" / "receipts"
         csc._publish_receipt(directory, "x.json", csc._json_bytes({"a": 1}))
         with self.assertRaises(pc.ContinuityError) as ctx:
             csc._publish_receipt(directory, "x.json", csc._json_bytes({"a": 2}))
@@ -717,7 +717,7 @@ class EmitReceiptTests(TmpCase):
             checkpoint=None, verification=None, isolation_proof=None,
         )
         reloaded = pc.validate_switch_receipt_file(
-            arc.config.switch_state_root / "cairn" / "receipts" / f"{receipt.receipt_id}.json"
+            arc.config.switch_state_root / "consultant" / "receipts" / f"{receipt.receipt_id}.json"
         )
         self.assertEqual(reloaded.receipt_sha256, receipt.receipt_sha256)
 
@@ -772,7 +772,7 @@ class ResumeAfterCrashTests(TmpCase):
 
         arc = _arc(self.tmp, telegram=True)
         plan, envelope, receipt = self._committed_transition(arc)
-        transition = csc._read_transition(arc.config.switch_state_root, "cairn", plan.plan_id)
+        transition = csc._read_transition(arc.config.switch_state_root, "consultant", plan.plan_id)
         corrupted = dataclasses.replace(transition, checkpoint_sha256="f" * 64)
         csc._write_transition(arc.config.switch_state_root, corrupted)
         result = arc.coordinator.resume_after_crash(plan.plan_id)
@@ -862,6 +862,24 @@ class DefaultPortsWiringTests(TmpCase):
         for field in dataclasses.fields(csc.CoordinatorPorts):
             self.assertTrue(callable(getattr(ports, field.name)), field.name)
 
+    def test_default_start_runtime_opts_out_of_prior_receiver_stop(self) -> None:
+        # T-4179 pin: the coordinator owns its receiver handoff
+        # (commit_transfer -> transition_runtime_with_receiver_handoff), so its
+        # candidate START must not stop the old seat's codex poller; rollback
+        # (start_runtime(old) -> ensure_runtime reuse) would never restart it.
+        from unittest import mock
+        from tools.harness_adapter import base as harness_base
+
+        arc = _arc(self.tmp)
+        ports = csc.default_ports(arc.config)
+        binding = object()
+        with mock.patch.object(harness_base, "adapter_for", create=True, return_value="adapter"), \
+                mock.patch.object(runtime_controller, "ensure_runtime", return_value="handle") as ensure:
+            self.assertEqual(ports.start_runtime(binding), "handle")
+        ensure.assert_called_once_with(
+            binding, "adapter", state_root=arc.config.state_root, stop_prior_receiver=False
+        )
+
     def test_default_git_revision_returns_valid_sha(self) -> None:
         import subprocess
         repo = self.tmp / "repo"
@@ -904,7 +922,7 @@ class CodexNetworkIsolationTests(TmpCase):
     stopped at dataclass-equality on writable_roots alone."""
 
     def _codex_binding(self, *, config_overrides: dict | None = None) -> PersonaBinding:
-        binding = _binding(self.tmp, role="orchestrator", persona="cairn", account="codex-candidate", harness="codex")
+        binding = _binding(self.tmp, role="orchestrator", persona="consultant", account="codex-candidate", harness="codex")
         if config_overrides is not None:
             native = {**binding.launch.native, "config_overrides": config_overrides}
             binding = dataclasses.replace(binding, launch=dataclasses.replace(binding.launch, native=native))
@@ -1081,6 +1099,23 @@ class RealClaudeIsolationMergeTests(TmpCase):
         settings = csc._load_settings(self._settings_path(binding))
         tagged = [item for item in settings["hooks"]["PreToolUse"] if item.get(csc._GUARD_TAG)]
         self.assertEqual(len(tagged), 1)
+
+
+class ExitMaintenanceToleranceTests(unittest.TestCase):
+    """T-5396: exit_maintenance now refuses an unreadable registry; the coordinator's
+    default adapter must warn and continue, not abort a committed transition."""
+
+    def test_unreadable_registry_warns_and_returns_false(self):
+        import contextlib
+        import io
+        from unittest import mock
+        from tools import continuity_switch_coordinator as csc
+        err = io.StringIO()
+        with mock.patch.object(csc.notify_policy, "exit_maintenance",
+                               side_effect=csc.notify_policy.RegistryUnreadable("torn")), \
+                contextlib.redirect_stderr(err):
+            self.assertFalse(csc._default_exit_maintenance("specialist"))
+        self.assertIn("expires on its own", err.getvalue())
 
 
 if __name__ == "__main__":

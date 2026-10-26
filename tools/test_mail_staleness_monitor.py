@@ -6,7 +6,10 @@ what the shell owns and what it must never do: enumeration (including the case w
 CANNOT see its own population), the two-tier policy, the unknown-pane coercion, and the
 read-only/never-kick contract.
 """
+import contextlib
+import dataclasses
 import fcntl
+import io
 import json
 import re
 import shutil
@@ -130,28 +133,28 @@ class TierPolicyTest(unittest.TestCase):
         self.assertNotIn("OBSERVED idle", text)
 
     def test_warn_realert_after_pane_goes_unknown_does_not_claim_observed_idle(self):
-        """T-2395, measured on mnemosyne 2026-08-02.
+        """T-2395, measured on archivist 2026-08-02.
 
         The ledger HOLDS accumulated idle evidence when the pane goes unknown
         (detect: "busy/unknown + unread -> HOLD") — correct, and not what this
         guards. The bug is that re-alerts then fire off that held count while the
-        text still says the pane "was OBSERVED idle". mnemosyne alerted that way
+        text still says the pane "was OBSERVED idle". archivist alerted that way
         at 313 held samples, from a seat with no claude process and no tmux
         server at all: true once, reported in the present tense.
         """
         state = {}
         # Accumulate real warn-tier evidence while the pane IS readable and idle.
         for _ in range(msm.WARN_SAMPLES):
-            alerts, state = msm.evaluate({"mnemosyne": _obs(unread=1, pane_idle=True)}, state)
-        self.assertTrue(any(a.inbox == "mnemosyne" for a in alerts),
+            alerts, state = msm.evaluate({"archivist": _obs(unread=1, pane_idle=True)}, state)
+        self.assertTrue(any(a.inbox == "archivist" for a in alerts),
                         "precondition: the warn tier must have alerted while readable")
         # Now the seat goes dark — pane unreadable. Drive it to a re-alert.
         alerts = []
         for _ in range(msm.REALERT_AFTER_SAMPLES + msm.COARSE_SAMPLES + 1):
-            alerts, state = msm.evaluate({"mnemosyne": _obs(unread=1, pane_idle=None)}, state)
-            if any(a.inbox == "mnemosyne" for a in alerts):
+            alerts, state = msm.evaluate({"archivist": _obs(unread=1, pane_idle=None)}, state)
+            if any(a.inbox == "archivist" for a in alerts):
                 break
-        texts = [a.text for a in alerts if a.inbox == "mnemosyne"]
+        texts = [a.text for a in alerts if a.inbox == "archivist"]
         self.assertTrue(texts, "expected a re-alert off the held counter")
         for t in texts:
             self.assertNotIn("OBSERVED idle", t)
@@ -265,12 +268,20 @@ class StateTest(unittest.TestCase):
 
     def test_absent_state_file_starts_clean(self):
         self.assertEqual(msm.load_state(self.d / "nope.json"),
-                         {"warn": {}, "coarse": {}, "urgent": {}})
+                         {"warn": {}, "coarse": {}, "urgent": {}, "busy_stale": {}})
 
     def test_corrupt_state_starts_clean_rather_than_crashing(self):
         self.path.write_text("{not json")
         self.assertEqual(msm.load_state(self.path),
-                         {"warn": {}, "coarse": {}, "urgent": {}})
+                         {"warn": {}, "coarse": {}, "urgent": {}, "busy_stale": {}})
+
+    def test_busy_stale_stamps_roundtrip_as_floats(self):
+        """T-4323: like "urgent", the busy-stale tier holds cooldown epochs."""
+        state = {"warn": {}, "coarse": {}, "urgent": {}, "busy_stale": {"artisan": 1790700000.0}}
+        msm.save_state(state, self.path)
+        self.assertEqual(msm.load_state(self.path)["busy_stale"], {"artisan": 1790700000.0})
+        self.path.write_text(json.dumps({"busy_stale": {"artisan": "soon"}}))
+        self.assertEqual(msm.load_state(self.path)["busy_stale"], {})
 
     def test_urgent_stamps_roundtrip_as_floats_not_InboxState(self):
         """T-2237 rev2: the urgent tier holds epochs, so it must NOT go through
@@ -296,6 +307,42 @@ class PaneCaptureTest(unittest.TestCase):
 
     def test_blank_pane_target_is_unknown(self):
         self.assertIsNone(msm.capture_pane_idle("x", panes={"x": ("someuser", "")}))
+
+    def test_turn_ended_pane_with_running_agents_is_idle(self):
+        """T-4284: a turn-ended pane with background agents accepts mail, so unread
+        mail there is idle+unread. Pins the delivery default at this caller."""
+        testdata = Path(__file__).resolve().parent / "testdata"
+        panes = {"x": (os.environ.get("USER", ""), "x:0")}
+        for name in ("recovery_turn_ended_bg_agent_pane.txt", "orchestrator_turn_ended_bg_agents_pane.txt"):
+            pane = (testdata / name).read_text(encoding="utf-8")
+            done = msm.subprocess.CompletedProcess([], 0, stdout=pane, stderr="")
+            with self.subTest(name), patch.object(msm.subprocess, "run", return_value=done):
+                self.assertIs(msm.capture_pane_idle("x", panes=panes), True)
+
+    def test_capture_keeps_escapes_so_a_dim_suggestion_reads_idle(self):
+        """T-4284: a DIM prompt suggestion in an idle composer is not unread-blocking
+        text. Both the same-account and the sudo capture pass -e."""
+        testdata = Path(__file__).resolve().parent / "testdata"
+        pane = (testdata / "artisan_idle_ghost_suggestion_pane_ansi.txt").read_text(encoding="utf-8")
+        done = msm.subprocess.CompletedProcess([], 0, stdout=pane, stderr="")
+        for account in (os.environ.get("USER", ""), "otheruser"):
+            with self.subTest(account=account), \
+                    patch.object(msm.subprocess, "run", return_value=done) as run:
+                self.assertIs(msm.capture_pane_idle("x", panes={"x": (account, "x:0")}), True)
+                self.assertRegex(" ".join(run.call_args.args[0]), r"capture-pane(?: -\w)* -e\b")
+
+    def test_generation_under_the_plain_footer_is_busy(self):
+        """T-4284: unread mail on a generating pane is not idle+unread, even when the
+        footer omits "esc to interrupt" (both live specialist captures)."""
+        import test_kick_verify
+        testdata = Path(__file__).resolve().parent / "testdata"
+        panes = {"x": (os.environ.get("USER", ""), "x:0")}
+        for name, pane in (
+                ("specialist 09-28", test_kick_verify.SPECIALIST_WORKING_2026_09_28),
+                ("specialist 07:40", (testdata / "specialist_generating_no_esc_pane.txt").read_text(encoding="utf-8"))):
+            done = msm.subprocess.CompletedProcess([], 0, stdout=pane, stderr="")
+            with self.subTest(name), patch.object(msm.subprocess, "run", return_value=done):
+                self.assertIs(msm.capture_pane_idle("x", panes=panes), False)
 
 
 class CountIsTristateT2310(unittest.TestCase):
@@ -518,13 +565,13 @@ class TestSuppressDraining(unittest.TestCase):
     def _obs(self, oldest_s):
         return types.SimpleNamespace(oldest_unread_age_s=oldest_s)
 
-    def test_MNEMOSYNE_CASE_draining_slowly_is_suppressed(self):
+    def test_ARCHIVIST_CASE_draining_slowly_is_suppressed(self):
         """Live 2026-07-28: 10 unread, head 26.6m old, but acks landing between
         samples and the ACP bridge provably mid-turn (transcript +5.4KB/20s).
         T-2257: "draining" is now membership in drain_progress()'s advanced set."""
-        alerts = [self._alert("mnemosyne")]
+        alerts = [self._alert("archivist")]
         kept, dropped = mon.suppress_draining(
-            alerts, {"mnemosyne": self._obs(26.6 * 60)}, {"mnemosyne"})
+            alerts, {"archivist": self._obs(26.6 * 60)}, {"archivist"})
         self.assertEqual(kept, [])
         self.assertEqual(len(dropped), 1)
 
@@ -540,17 +587,17 @@ class TestSuppressDraining(unittest.TestCase):
     def test_PERMANENCE_REGRESSION_one_old_ack_does_not_suppress_forever(self):
         """T-2257 THE defect: under the old static comparison (recency <
         oldest_unread_age), one partial drain made suppression PERMANENT — both
-        ages grow at the same rate, so the sign never flips. mnemosyne was
+        ages grow at the same rate, so the sign never flips. archivist was
         silently unalertable for 3+ hours (gap 110.3m, constant), specialist for 45m,
         on the exact night the operator was reporting them broken.
 
-        The live mnemosyne numbers from that night: oldest unread 186.7m,
+        The live archivist numbers from that night: oldest unread 186.7m,
         last delivery 76.4m ago — i.e. ONE ack long ago, frozen since. The old
         predicate suppressed this forever; the fixed one must alert, because
         nothing advanced SINCE THE LAST SAMPLE."""
-        alerts = [self._alert("mnemosyne")]
+        alerts = [self._alert("archivist")]
         kept, dropped = mon.suppress_draining(
-            alerts, {"mnemosyne": self._obs(186.7 * 60)}, set())
+            alerts, {"archivist": self._obs(186.7 * 60)}, set())
         self.assertEqual(len(kept), 1,
                          "an inbox with an old ack but no NEW acks is stalled, not draining")
         self.assertEqual(dropped, [])
@@ -634,6 +681,403 @@ class UrgentUndeliveredTest(unittest.TestCase):
         text = self._detect(now=self._past_grace())[0][0].text
         self.assertIn("credential-expiry", text)
         self.assertIn("SEVERITY", text)
+
+
+class BusyStaleT4323(unittest.TestCase):
+    """T-4323(b): a pane read BUSY was the one state no tier alerted on, so any
+    wrong-BUSY verdict (#386, T-4319 R1's quoted footer) could starve a seat in
+    silence. This tier bounds that silence on AGE."""
+
+    NOW = 1_800_000_000.0
+
+    def setUp(self):
+        self.AGE = msm.BUSY_STALE_AGE_SECONDS
+        self.hub = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.hub, True)
+        import mailbox as _mb
+        self.mb = _mb
+        _mb.provision(self.hub / "artisan")
+
+    def _detect(self, obs, prior=None, now=None, skip=frozenset()):
+        return msm.detect_busy_stale(obs, hub=self.hub, prior=prior,
+                                     now=self.NOW if now is None else now, skip=skip)
+
+    def _busy(self, age, unread=3):
+        return {"artisan": _obs(unread=unread, pane_idle=False, age=age)}
+
+    def test_busy_past_the_backstop_alerts(self):
+        alerts, state = self._detect(self._busy(self.AGE + 60))
+        self.assertEqual([(a.inbox, a.kind) for a in alerts], [("artisan", "busy_stale")])
+        self.assertIn("busy-stale", alerts[0].text)
+        self.assertIn("MISREAD as busy", alerts[0].text)
+        self.assertEqual(alerts[0].oldest_age_s, self.AGE + 60)
+        self.assertEqual(state, {"artisan": self.NOW})
+
+    def test_busy_under_the_backstop_is_silent(self):
+        self.assertEqual(self._detect(self._busy(self.AGE - 60)), ([], {}))
+
+    def test_idle_and_unknown_panes_belong_to_the_other_tiers(self):
+        for idle in (True, None):
+            with self.subTest(pane_idle=idle):
+                obs = {"artisan": _obs(unread=3, pane_idle=idle, age=self.AGE * 3)}
+                self.assertEqual(self._detect(obs)[0], [])
+
+    def test_a_held_consumer_lease_is_turn_length_not_starvation(self):
+        # T-2283's reasoning: under a live lease the agent cannot ack its own mail.
+        obs = {"artisan": dataclasses.replace(_obs(unread=3, pane_idle=False, age=self.AGE * 3),
+                                            consumer_lease_held=True)}
+        self.assertEqual(self._detect(obs)[0], [])
+
+    def test_a_draining_inbox_is_silent(self):
+        # main() hands this tier the draining-coerced view: unread 0, no age.
+        self.assertEqual(self._detect({"artisan": _obs(unread=0, pane_idle=False)})[0], [])
+
+    def test_urgent_mail_belongs_to_the_urgent_tier(self):
+        self.mb.send(self.hub / "artisan", "x", "unit-failure-alert", subject="s",
+                     severity="urgent")
+        self.assertEqual(self._detect(self._busy(self.AGE * 3, unread=1))[0], [])
+
+    def test_an_inbox_another_tier_alerted_this_sample_is_not_doubled(self):
+        self.assertEqual(self._detect(self._busy(self.AGE * 3), skip={"artisan"}), ([], {}))
+
+    def test_cooldown_then_realert_and_recovery_drops_the_stamp(self):
+        busy = self._busy(self.AGE * 3)
+        _, st = self._detect(busy)
+        held, st2 = self._detect(busy, prior=st, now=self.NOW + msm.BUSY_STALE_REALERT_SECONDS - 1)
+        self.assertEqual((held, st2), ([], st))
+        again, st3 = self._detect(busy, prior=st2, now=self.NOW + msm.BUSY_STALE_REALERT_SECONDS)
+        self.assertEqual(len(again), 1)
+        realert_at = self.NOW + msm.BUSY_STALE_REALERT_SECONDS
+        self.assertEqual(st3, {"artisan": realert_at})
+        recovered = {"artisan": _obs(unread=0, pane_idle=False)}
+        # Recovered inside the cooldown: the stamp is kept (a flap is not a recovery).
+        self.assertEqual(self._detect(recovered, prior=st3, now=realert_at + 1), ([], st3))
+        # Recovered AND the cooldown elapsed: dropped, so the next incident alerts fresh.
+        self.assertEqual(
+            self._detect(recovered, prior=st3, now=realert_at + msm.BUSY_STALE_REALERT_SECONDS),
+            ([], {}))
+
+    def test_a_flap_inside_the_cooldown_alerts_once(self):
+        # rev-t4284b r1 R1: qualify -> not qualifying -> qualify again must not re-alert
+        # the same backlog. Each non-qualifying read the reviewer reproduced.
+        busy = self._busy(self.AGE * 3)
+        flaps = {
+            "unknown pane": {"artisan": _obs(unread=3, pane_idle=None, age=self.AGE * 3)},
+            "idle pane": {"artisan": _obs(unread=3, pane_idle=True, age=self.AGE * 3)},
+            "drain-coerced": {"artisan": _obs(unread=0, pane_idle=False)},
+        }
+        for label, flap in flaps.items():
+            with self.subTest(flap=label):
+                first, st = self._detect(busy)
+                _, st = self._detect(flap, prior=st, now=self.NOW + 300)
+                again, st = self._detect(busy, prior=st, now=self.NOW + 600)
+                self.assertEqual((len(first), again), (1, []))
+                self.assertEqual(st, {"artisan": self.NOW})
+
+    def test_a_stamp_for_an_inbox_gone_from_obs_is_pruned(self):
+        self.assertEqual(self._detect({}, prior={"artisan": self.NOW - 60}), ([], {}))
+
+    def test_unread_with_no_stat_able_age_is_silent(self):
+        # rev-t4284b r1 NIT-2: observe() can count a file in new/ that is consumed
+        # before _oldest_age stats it, giving unread > 0 with age None.
+        self.assertEqual(self._detect({"artisan": _obs(unread=2, pane_idle=False, age=None)}), ([], {}))
+
+    def test_the_backstop_never_fires_before_the_tiers_that_own_the_state(self):
+        # rev-t4284b r1 NIT-1: relational pins, not copies of the constants.
+        self.assertGreaterEqual(msm.BUSY_STALE_AGE_SECONDS,
+                                msm.COARSE_SAMPLES * msm.SAMPLE_INTERVAL_SECONDS)
+        self.assertGreaterEqual(msm.BUSY_STALE_REALERT_SECONDS, msm.SAMPLE_INTERVAL_SECONDS)
+
+
+class BusyStaleWiringT4323(unittest.TestCase):
+    """main() runs the busy-stale tier on the draining-coerced view and persists it."""
+
+    def setUp(self):
+        self.hub = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.hub, True)
+        import mailbox as _mb
+        _mb.provision(self.hub / "artisan")
+
+    def _main(self, advanced, busy_stale=None):
+        obs = {"artisan": _obs(unread=2, pane_idle=False, age=msm.BUSY_STALE_AGE_SECONDS + 300)}
+        delivered, saved = [], {}
+        blank = {"warn": {}, "coarse": {}, "urgent": {}, "busy_stale": dict(busy_stale or {})}
+        with patch.object(msm, "observe", return_value=obs), \
+                patch.object(msm, "load_state", return_value=blank), \
+                patch.object(msm, "save_state", side_effect=lambda st, *a, **k: saved.update(st)), \
+                patch.object(msm, "delivery_recency", return_value={}), \
+                patch.object(msm, "load_drain_clock", return_value={}), \
+                patch.object(msm, "drain_progress", return_value=({}, set(advanced))), \
+                patch.object(msm, "save_drain_clock"), \
+                patch.object(msm, "deliver", side_effect=lambda alerts, **k: delivered.extend(alerts)):
+            self.assertEqual(msm.main(["--hub", str(self.hub)]), 0)
+        return delivered, saved
+
+    def test_main_delivers_and_persists_a_busy_stale_alert(self):
+        delivered, saved = self._main(advanced=())
+        self.assertEqual([(a.inbox, a.kind) for a in delivered], [("artisan", "busy_stale")])
+        self.assertIn("artisan", saved["busy_stale"])
+
+    def test_main_does_not_alert_on_a_draining_inbox(self):
+        delivered, saved = self._main(advanced=("artisan",))
+        self.assertEqual(delivered, [])
+        self.assertEqual(saved["busy_stale"], {})
+
+    def test_main_suppresses_a_held_seat_T5244(self):
+        # mason 2026-10-19: paged 'idle with 1 unread, 3.0h' while held in maintenance.
+        with patch.object(msm, "_inbox_in_maintenance", side_effect=lambda n: n == "artisan"):
+            delivered, saved = self._main(advanced=())
+        self.assertEqual(delivered, [])
+        self.assertEqual(saved["busy_stale"], {})
+
+    def test_main_drops_urgent_alert_and_cooldown_for_a_held_seat_T5244(self):
+        urgent = ms.Alert(inbox="artisan", kind="urgent_undelivered", unread=1,
+                           oldest_age_s=60.0, samples=0, text="urgent")
+        with patch.object(msm, "_inbox_in_maintenance", side_effect=lambda n: n == "artisan"), \
+                patch.object(msm, "detect_urgent_undelivered",
+                             return_value=([urgent], {"artisan": time.time()})):
+            delivered, saved = self._main(advanced=())
+        self.assertEqual(delivered, [])
+        self.assertEqual(saved["urgent"], {})
+
+    # --- ORG-106 L4b (T-5527): queued mail to a paused / sleeping seat is expected ---
+    def _seat(self, **kw):
+        from tools.seat_state_testkit import eff
+        return patch("tools.seat_state.safe_effective_for", return_value=eff(**kw))
+
+    def test_main_suppresses_a_paused_seat_T5527(self):
+        with self._seat(state="paused-intake"):
+            delivered, saved = self._main(advanced=())
+        self.assertEqual(delivered, [])
+        self.assertEqual(saved["busy_stale"], {})
+
+    def test_main_suppresses_a_deep_sleep_seat_T5527(self):
+        for asleep in (True, False):
+            with self._seat(state="deep-sleep", asleep=asleep):
+                delivered, saved = self._main(advanced=())
+            self.assertEqual(delivered, [])
+            self.assertEqual(saved["busy_stale"], {})
+
+    def _urgent(self):
+        return ms.Alert(inbox="artisan", kind="urgent_undelivered", unread=1,
+                        oldest_age_s=60.0, samples=0, text="urgent")
+
+    def test_paused_seat_keeps_the_urgent_tier_and_its_cooldown_T5527(self):
+        # ORG-106 decision 2 / L2: urgent mail WAKES a paused seat, so urgent mail still
+        # unread there means the wake failed. It must alert, and its cooldown must persist.
+        stamp = time.time()
+        with self._seat(state="paused-intake"), \
+                patch.object(msm, "detect_urgent_undelivered",
+                             return_value=([self._urgent()], {"artisan": stamp})):
+            delivered, saved = self._main(advanced=())
+        self.assertEqual([(a.inbox, a.kind) for a in delivered], [("artisan", "urgent_undelivered")])
+        self.assertEqual(saved["urgent"], {"artisan": stamp})
+
+    def test_paused_seat_ordinary_tiers_stay_excluded_with_urgent_present_T5527(self):
+        with self._seat(state="paused-intake"), \
+                patch.object(msm, "detect_urgent_undelivered",
+                             return_value=([self._urgent()], {"artisan": time.time()})):
+            delivered, saved = self._main(advanced=())
+        self.assertEqual([a.kind for a in delivered], ["urgent_undelivered"])   # no busy_stale
+        self.assertEqual(saved["busy_stale"], {})
+
+    def test_deep_sleep_seat_drops_both_tiers_and_the_urgent_cooldown_T5527(self):
+        # mail queues for the wake, so neither tier alerts while the seat sleeps.
+        for asleep in (True, False):
+            with self._seat(state="deep-sleep", asleep=asleep), \
+                    patch.object(msm, "detect_urgent_undelivered",
+                                 return_value=([self._urgent()], {"artisan": time.time()})):
+                delivered, saved = self._main(advanced=())
+            self.assertEqual(delivered, [])
+            self.assertEqual(saved["urgent"], {})
+            self.assertEqual(saved["busy_stale"], {})
+
+    def test_maintenance_drops_both_tiers_exactly_as_before_T5527(self):
+        with patch.object(msm, "_inbox_in_maintenance", side_effect=lambda n: n == "artisan"), \
+                patch.object(msm, "detect_urgent_undelivered",
+                             return_value=([self._urgent()], {"artisan": time.time()})):
+            delivered, saved = self._main(advanced=())
+        self.assertEqual(delivered, [])
+        self.assertEqual(saved["urgent"], {})
+
+    def test_main_still_alerts_for_active_unknown_and_oom_only_seats_T5527(self):
+        # an OOM hold alone is not a paused/asleep record; maintenance is the other leg
+        for seat in (self._seat(), self._seat(oom=True), patch("tools.seat_state.safe_effective_for",
+                                                               return_value=None)):
+            with seat:
+                delivered, _ = self._main(advanced=())
+            self.assertEqual([(a.inbox, a.kind) for a in delivered], [("artisan", "busy_stale")])
+
+    def test_paused_gate_fails_open_on_reader_fault_T5527(self):
+        with patch("tools.seat_state.safe_effective_for", side_effect=OSError("boom")):
+            self.assertFalse(msm._inbox_seat_paused("artisan"))
+        with patch("tools.seat_state.safe_effective_for", return_value=None):
+            self.assertFalse(msm._inbox_seat_paused("artisan"))
+
+    def test_maintenance_alone_still_suppresses_exactly_as_before_T5527(self):
+        with patch("tools.notify_policy.in_maintenance", return_value=True):
+            self.assertTrue(msm._inbox_in_maintenance("artisan"))
+            delivered, _ = self._main(advanced=())
+        self.assertEqual(delivered, [])
+
+    def test_suppress_maintenance_default_covers_maintenance_and_sleep_not_pause_T5527(self):
+        al = ms.Alert(inbox="artisan", kind="urgent_undelivered", unread=1, oldest_age_s=60.0,
+                      samples=0, text="t")
+        for maint, asleep, paused, dropped_expected in (
+                (True, False, False, True), (False, True, False, True),
+                (False, False, True, False), (False, False, False, False)):
+            with patch.object(msm, "_inbox_in_maintenance", return_value=maint), \
+                    patch.object(msm, "_inbox_seat_asleep", return_value=asleep), \
+                    patch.object(msm, "_inbox_seat_paused", return_value=paused):
+                kept, dropped = msm.suppress_maintenance([al])
+            self.assertEqual(bool(dropped), dropped_expected, (maint, asleep, paused))
+
+    def test_maintenance_gate_fails_open_T5244(self):
+        with patch("tools.notify_policy.in_maintenance", side_effect=OSError("boom")):
+            self.assertFalse(msm._inbox_in_maintenance("artisan"))
+
+    def test_main_honours_a_persisted_stamp_across_samples(self):
+        # rev-t4284b r1 R1 (ii): the cooldown must survive the load_state/save_state
+        # round trip, or the tier pages every sample (the reviewer's mutant R-c).
+        stamp = time.time() - 60
+        delivered, saved = self._main(advanced=(), busy_stale={"artisan": stamp})
+        self.assertEqual(delivered, [])
+        self.assertEqual(saved["busy_stale"], {"artisan": stamp})
+
+
+class BusyStaleDeliveryT4323(unittest.TestCase):
+    """deliver() for the busy-stale tier: recovery's own goes to orchestrator, not to a direct
+    the operator Telegram (NIT-4), and no tier-kind busy_stale triggers the dormant-seat
+    sender notice (NIT-3)."""
+
+    def setUp(self):
+        self.hub = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.hub, True)
+        import mailbox as _mb
+        self.mb = _mb
+        for name in ("recovery", "orchestrator", "artisan", "mason"):
+            _mb.provision(self.hub / name)
+
+    def _alert(self, inbox, kind=msm._KIND_BUSY_STALE, text=None):
+        return ms.Alert(inbox=inbox, kind=kind, unread=2, oldest_age_s=9000.0, samples=0,
+                        text=text or f"mailbox: {inbox} read BUSY")
+
+    def _deliver(self, alert, send=None, muted=False, dry_run=False):
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.object(msm, "_inbox_seat_is_paused", return_value=False))
+            stack.enter_context(patch.object(msm, "_inbox_seat_is_on_demand_parked",
+                                             return_value=False))
+            notify = stack.enter_context(patch.object(msm, "notify_senders"))
+            # BARE inbox_consumer: see PausedSeatSuppressionTest._deliver.
+            route = stack.enter_context(patch("inbox_consumer.route_failure_alert"))
+            # Hermetic: never read the live mute registry.
+            stack.enter_context(patch("inbox_consumer._persona_is_muted", return_value=muted))
+            if send is not None:
+                stack.enter_context(patch.object(msm.mailbox, "send", side_effect=send))
+            msm.deliver([alert], dry_run=dry_run, hub=self.hub)
+        return route, notify
+
+    def _orchestrator_mail(self):
+        return sorted((self.hub / "orchestrator" / "new").iterdir())
+
+    def test_recovery_self_busy_stale_mails_orchestrator_and_does_not_page_operator(self):
+        route, notify = self._deliver(self._alert("recovery"))
+        self.assertFalse(route.called)
+        self.assertFalse(notify.called)
+        mail = self._orchestrator_mail()
+        self.assertEqual(len(mail), 1)
+        self.assertIn("mailbox: recovery read BUSY", mail[0].read_text(encoding="utf-8"))
+
+    def test_other_seats_busy_stale_keeps_the_failure_route(self):
+        """r2 NIT-4: over more than one seat, orchestrator included, so neither the orchestrator
+        route nor the no-sender-notice gate can be keyed on one inbox name."""
+        for seat in ("artisan", "mason", "orchestrator"):
+            with self.subTest(seat):
+                route, notify = self._deliver(self._alert(seat))
+                self.assertEqual(route.call_args.args[0], seat)
+                self.assertFalse(notify.called)
+                self.assertEqual(self._orchestrator_mail(), [])
+
+    def test_muted_recovery_busy_stale_takes_the_mute_aware_route(self):
+        """r2 NIT-1: the direct mail to orchestrator bypassed the ORG-076 §7 mute. A muted
+        recovery's busy-stale goes to route_failure_alert, which honours the mute."""
+        route, _ = self._deliver(self._alert("recovery"), muted=True)
+        self.assertEqual(self._orchestrator_mail(), [])
+        self.assertEqual(route.call_args.args[0], "recovery")
+
+    def test_orchestrator_mail_carries_the_full_alert_text(self):
+        """r2 NIT-2: the subject keeps 120 chars, and the real alert runs ~380 with the
+        actionable part at the end. Only the payload carries that tail."""
+        tail = "Check the pane: TAIL-MARKER-4323"
+        text = "mailbox: recovery read BUSY with unread mail " + "x" * 120 + " " + tail
+        self._deliver(self._alert("recovery", text=text))
+        (mail,) = self._orchestrator_mail()
+        msg = json.loads(mail.read_text(encoding="utf-8"))
+        self.assertNotIn(tail, msg["subject"])
+        self.assertTrue(msg["payload"]["text"].endswith(tail))
+
+    def test_dry_run_delivers_nothing(self):
+        """r2 NIT-3: a dry run prints and returns. Nothing reaches orchestrator's mailbox,
+        the failure route or the sender notices, for recovery's own alert or another's."""
+        for alert in (self._alert("recovery"), self._alert("artisan", kind=ms.KIND_IDLE_WITH_UNREAD)):
+            with self.subTest(alert.inbox):
+                route, notify = self._deliver(alert, dry_run=True)
+                self.assertFalse(route.called)
+                self.assertFalse(notify.called)
+                self.assertEqual(self._orchestrator_mail(), [])
+
+    def test_a_failed_mail_to_orchestrator_falls_back_to_the_failure_route(self):
+        def boom(*a, **k):
+            raise OSError("hub unwritable")
+        route, _ = self._deliver(self._alert("recovery"), send=boom)
+        self.assertEqual(route.call_args.args[0], "recovery")
+
+    def test_inbox_consumer_import_failure_still_sends_recoveries_alert_to_orchestrator(self):
+        """rev-t4323a r1 N1c: route_failure_alert lives in inbox_consumer, so if that
+        import fails the failure route would lose recovery's alert too. Recovery's busy-stale
+        still goes to orchestrator (the mail needs only mailbox); nothing else does."""
+        with patch.dict(sys.modules, {"inbox_consumer": None}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertTrue(msm._busy_stale_goes_to_orchestrator(self._alert("recovery")))
+            self.assertFalse(msm._busy_stale_goes_to_orchestrator(self._alert("artisan")))
+            self.assertFalse(msm._busy_stale_goes_to_orchestrator(
+                self._alert("recovery", kind=ms.KIND_IDLE_WITH_UNREAD)))
+
+    def test_other_kinds_still_notify_senders(self):
+        route, notify = self._deliver(self._alert("recovery", kind=ms.KIND_IDLE_WITH_UNREAD))
+        self.assertEqual(route.call_args.args[0], "recovery")
+        self.assertTrue(notify.called)
+        self.assertEqual(self._orchestrator_mail(), [])
+
+
+class MutedRecipientSenderNoticeT4749(unittest.TestCase):
+    """T-4749: a recipient paused through the ORG-076 §7 mute registry must not
+    re-notify its SENDERS. route_failure_alert already honoured the mute for the
+    recipient's own alert, but notify_senders mails each sender directly, so artisan
+    got a notice every ~1h for the whole mason pause over one benign heads-up."""
+
+    setUp = BusyStaleDeliveryT4323.setUp
+    _alert = BusyStaleDeliveryT4323._alert
+    _deliver = BusyStaleDeliveryT4323._deliver
+
+    def _idle(self, inbox):
+        return self._alert(inbox, kind=ms.KIND_IDLE_WITH_UNREAD,
+                           text=f"mailbox: {inbox} idle with unread")
+
+    def test_muted_recipient_does_not_notify_senders(self):
+        _, notify = self._deliver(self._idle("mason"), muted=True)
+        self.assertFalse(notify.called)
+
+    def test_unmuted_recipient_still_notifies_senders(self):
+        # The guard must not swallow T-2267's dormant-seat notice for a live seat.
+        _, notify = self._deliver(self._idle("mason"), muted=False)
+        self.assertTrue(notify.called)
+
+    def test_mute_lookup_failure_still_notifies_senders(self):
+        # Fail-open, like notify_policy itself: a broken lookup is not a mute.
+        with patch.dict(sys.modules, {"inbox_consumer": None}), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertFalse(msm._recipient_is_muted("mason"))
 
 
 class UrgentGraceTest(unittest.TestCase):
@@ -761,11 +1205,11 @@ class PausedSeatSuppressionTest(unittest.TestCase):
         return route
 
     def test_paused_seat_is_not_alerted(self):
-        # MEASURED: mnemosyne re-alerted about hourly through the whole
+        # MEASURED: archivist re-alerted about hourly through the whole
         # operator-directed pause, over one DLQ message deliberately parked there
         # as T-2384's only live specimen. Real, known, ticketed, and unable to
         # change until the seat comes back.
-        self.assertFalse(self._deliver("mnemosyne", True).called)
+        self.assertFalse(self._deliver("archivist", True).called)
 
     def test_live_seat_still_alerts(self):
         # The guard must not swallow the condition this monitor exists for.
@@ -780,17 +1224,17 @@ class InboxSeatIsPausedTest(unittest.TestCase):
 
     def test_disabled_unit_reads_paused(self):
         with self._with(return_value=True):
-            self.assertTrue(msm._inbox_seat_is_paused("mnemosyne"))
+            self.assertTrue(msm._inbox_seat_is_paused("archivist"))
 
     def test_enabled_unit_reads_not_paused(self):
         with self._with(return_value=False):
-            self.assertFalse(msm._inbox_seat_is_paused("mnemosyne"))
+            self.assertFalse(msm._inbox_seat_is_paused("archivist"))
 
     def test_unknown_reads_not_paused(self):
         # None must NOT become "paused" — that would silence a real condition on
         # a seat we merely failed to probe.
         with self._with(return_value=None):
-            self.assertFalse(msm._inbox_seat_is_paused("mnemosyne"))
+            self.assertFalse(msm._inbox_seat_is_paused("archivist"))
 
     def test_non_persona_inbox_reads_not_paused(self):
         # specialist-a2a is a real inbox and NOT a persona seat — the exact enumeration
@@ -800,7 +1244,7 @@ class InboxSeatIsPausedTest(unittest.TestCase):
 
     def test_probe_exception_reads_not_paused(self):
         with self._with(side_effect=RuntimeError("sudo denied")):
-            self.assertFalse(msm._inbox_seat_is_paused("mnemosyne"))
+            self.assertFalse(msm._inbox_seat_is_paused("archivist"))
 
 
 class InboxSeatIsOnDemandParkedTest(unittest.TestCase):
@@ -814,12 +1258,12 @@ class InboxSeatIsOnDemandParkedTest(unittest.TestCase):
     def test_allowlisted_and_generating_not_parked(self):
         # pane_idle=False means the seat is mid-turn, not parked — the condition
         # this monitor exists to catch could be exactly that.
-        self.assertFalse(msm._inbox_seat_is_on_demand_parked("atlas", False))
+        self.assertFalse(msm._inbox_seat_is_on_demand_parked("artisan", False))
 
     def test_allowlisted_and_unknown_pane_not_parked(self):
-        # T-2665 option (a), deliberate: an absent-pane on-demand seat (mnemosyne
+        # T-2665 option (a), deliberate: an absent-pane on-demand seat (archivist
         # has no tmux server at all) is NOT attributed here — None never suppresses.
-        self.assertFalse(msm._inbox_seat_is_on_demand_parked("mnemosyne", None))
+        self.assertFalse(msm._inbox_seat_is_on_demand_parked("archivist", None))
 
     def test_non_allowlisted_seat_not_parked(self):
         # Always-on seats must still alert even if their pane happens to read idle.
@@ -841,22 +1285,22 @@ class InboxSeatIsOnDemandParkedTest(unittest.TestCase):
     def test_parked_within_ceiling_still_parked(self):
         # T-3454: idle on-demand seat, mail younger than the ceiling = legit park.
         young = msm.ON_DEMAND_PARK_CEILING_SEC - 1
-        self.assertTrue(msm._inbox_seat_is_on_demand_parked("metis", True, young))
+        self.assertTrue(msm._inbox_seat_is_on_demand_parked("mason", True, young))
 
     def test_parked_past_ceiling_is_not_suppressed(self):
         # T-3454 REGRESSION: an idle on-demand seat whose mail aged PAST the ceiling
-        # is NOT attributed as parked — the broken-wake signature (T-3427 metis/atlas
+        # is NOT attributed as parked — the broken-wake signature (T-3427 mason/artisan
         # rot: up, idle, never woken) that park-suppression must stop hiding. Pre-T-3454
         # this returned True (suppressed) regardless of age.
         old = msm.ON_DEMAND_PARK_CEILING_SEC + 1
-        self.assertFalse(msm._inbox_seat_is_on_demand_parked("metis", True, old))
-        self.assertFalse(msm._inbox_seat_is_on_demand_parked("atlas", True, old))
+        self.assertFalse(msm._inbox_seat_is_on_demand_parked("mason", True, old))
+        self.assertFalse(msm._inbox_seat_is_on_demand_parked("artisan", True, old))
 
     def test_ceiling_none_age_preserves_pre_t3454_behavior(self):
         # An unsupplied age (None) must not trip the ceiling — pre-T-3454 two-arg
         # callers keep the pure (allowlist AND idle) behavior.
-        self.assertTrue(msm._inbox_seat_is_on_demand_parked("metis", True, None))
-        self.assertTrue(msm._inbox_seat_is_on_demand_parked("metis", True))
+        self.assertTrue(msm._inbox_seat_is_on_demand_parked("mason", True, None))
+        self.assertTrue(msm._inbox_seat_is_on_demand_parked("mason", True))
 
 
 class OnDemandParkedWiringTest(unittest.TestCase):
@@ -883,20 +1327,20 @@ class OnDemandParkedWiringTest(unittest.TestCase):
         return route
 
     def test_allowlisted_and_idle_is_suppressed(self):
-        # atlas/metis parked idle-at-prompt: the exact false-fire this ticket fixes.
-        self.assertFalse(self._deliver("atlas", True).called)
-        self.assertFalse(self._deliver("metis", True).called)
+        # artisan/mason parked idle-at-prompt: the exact false-fire this ticket fixes.
+        self.assertFalse(self._deliver("artisan", True).called)
+        self.assertFalse(self._deliver("mason", True).called)
 
     def test_allowlisted_but_generating_still_alerts(self):
         # pane_idle=False means mid-turn — never suppress; the real condition could
         # be exactly a wedged mid-turn seat.
-        self.assertTrue(self._deliver("atlas", False).called)
+        self.assertTrue(self._deliver("artisan", False).called)
 
     def test_allowlisted_but_absent_pane_still_alerts(self):
-        # option (a): raw None (mnemosyne, no tmux server) is never-suppress-on-
+        # option (a): raw None (archivist, no tmux server) is never-suppress-on-
         # unknown. Also the wiring-level guard against feeding a coarse_view-coerced
         # (None->True) value: if that regressed, this would wrongly suppress.
-        self.assertTrue(self._deliver("mnemosyne", None).called)
+        self.assertTrue(self._deliver("archivist", None).called)
 
     def test_non_allowlisted_idle_still_alerts(self):
         # An always-on seat that happens to read idle must still alert.
@@ -905,7 +1349,7 @@ class OnDemandParkedWiringTest(unittest.TestCase):
     def test_missing_obs_falls_back_to_alerting(self):
         # Backward-compat: a caller that does not thread obs (obs=None) must neither
         # crash nor suppress — the predicate simply cannot fire without pane_idle.
-        self.assertTrue(self._deliver("atlas", True, thread_obs=False).called)
+        self.assertTrue(self._deliver("artisan", True, thread_obs=False).called)
 
 
 class TestDeliveryRecency(unittest.TestCase):
@@ -971,7 +1415,7 @@ class TestCoerceDrainingIsCalledAndWorks(unittest.TestCase):
 class TestSuppressionMustNotPoisonTheRealertThrottle(unittest.TestCase):
     """T-2240, the bug this cost. Suppressing AFTER evaluate() let detect() emit the
     alert, set samples_since_alert=0, and start the ~1h REALERT throttle — while the
-    operator saw '0 alert(s)'. mnemosyne's bridge died silently 19:20-20:50Z on
+    operator saw '0 alert(s)'. archivist's bridge died silently 19:20-20:50Z on
     2026-07-28; the monitor ran 23 times, alerted zero times, and its state showed
     idle_unread_samples=22 with samples_since_alert=8. Alerts raised, swallowed,
     then throttled."""
@@ -1143,7 +1587,7 @@ class TestDrainProgress(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# T-2267 (metis): a sender cannot tell that a dispatch went into a seat with
+# T-2267 (mason): a sender cannot tell that a dispatch went into a seat with
 # nobody home. The receiver is absent BY DEFINITION, so the sender is the only
 # party who could notice — and it had no surface that reported it.
 # --------------------------------------------------------------------------
@@ -1152,7 +1596,7 @@ class StalledSenderAttributionTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.hub = pathlib.Path(self._tmp.name) / "hub"
         self.hub.mkdir()
-        self.box = self.hub / "metis"
+        self.box = self.hub / "mason"
         mon.mailbox.provision(self.box)
         for who in ("orchestrator", "specialist"):
             mon.mailbox.provision(self.hub / who)
@@ -1160,7 +1604,7 @@ class StalledSenderAttributionTest(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _alert(self, inbox="metis"):
+    def _alert(self, inbox="mason"):
         return types.SimpleNamespace(inbox=inbox, kind="idle_with_unread", text="x")
 
     def test_attributes_stalled_mail_to_each_distinct_sender(self):
@@ -1211,15 +1655,15 @@ class StalledSenderAttributionTest(unittest.TestCase):
         mon.mailbox.send(self.box, {"n": 1}, sender="orchestrator")
         mon.mailbox.send(self.box, {"n": 2}, sender="specialist")
         # the box's own mail to itself must not generate a self-notice
-        mon.mailbox.send(self.box, {"n": 3}, sender="metis")
+        mon.mailbox.send(self.box, {"n": 3}, sender="mason")
         notified = mon.notify_senders(self._alert(), self.hub, now=time.time())
         self.assertEqual(sorted(notified), ["specialist", "orchestrator"])
-        self.assertNotIn("metis", notified)
+        self.assertNotIn("mason", notified)
         for who in ("orchestrator", "specialist"):
             landed = list((self.hub / who / "new").iterdir())
             self.assertEqual(len(landed), 1, f"{who} must receive exactly one notice")
             msg = json.loads(landed[0].read_text())
-            self.assertEqual(msg["payload"]["inbox"], "metis")
+            self.assertEqual(msg["payload"]["inbox"], "mason")
             self.assertEqual(msg["payload"]["kind"], "undrained_queue")
 
     def test_a_sender_with_no_provisioned_inbox_does_not_break_the_sampler(self):
@@ -1243,7 +1687,10 @@ class StalledSenderAttributionTest(unittest.TestCase):
         a correct notify_senders that deliver() never calls is the same
         presence-without-activation defect as T-2312."""
         mon.mailbox.send(self.box, {"n": 1}, sender="orchestrator")
-        mon.deliver([self._alert()], dry_run=False, hub=self.hub, now=time.time())
+        # T-4749: hermetic mute. With no PANTHEON_MUTE_REGISTRY, notify_policy reads
+        # the LIVE health-plane registry, where mason may really be muted.
+        with patch("inbox_consumer._persona_is_muted", return_value=False):
+            mon.deliver([self._alert()], dry_run=False, hub=self.hub, now=time.time())
         landed = list((self.hub / "orchestrator" / "new").iterdir())
         self.assertEqual(len(landed), 1,
                          "deliver() must emit the sender notice, not just the "

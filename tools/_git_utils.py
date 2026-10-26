@@ -88,6 +88,7 @@ import errno
 import fcntl
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -149,6 +150,74 @@ def _hermes_scan_message(message: str) -> bool:
     return _HERMES_PATTERN.search(message.encode("utf-8")) is None
 
 
+_READ_FAILOVER_ENV = "PANTHEON_READ_FAILOVER"
+
+
+def _read_failover_module():
+    try:
+        from tools import read_failover
+    except ImportError:
+        import read_failover  # type: ignore[no-redef]
+    return read_failover
+
+
+def _fetch_fallback_note() -> str:
+    return "trying read-failover" if os.environ.get(_READ_FAILOVER_ENV) == "1" else "using stale clone"
+
+
+# T-4167: a test must never fast-forward the REAL checkout. Layer-3 integration tests
+# spawn the real scripts as subprocesses (tools/_test_fixtures.setup_integration_env),
+# where no in-process mock reaches, and a script's sync helper resolves REPO_ROOT from
+# its own file -- the real checkout. In CI's shared checkout that fast-forward moved
+# tickets origin had just resolved (T-4165's T-4137 FileNotFoundError); locally it
+# pulls the running agent's own clone. Scoped to the real REPO_ROOT only, so a helper
+# syncing a TMP repo (cwd=...) is untouched.
+_NO_REAL_REPO_SYNC_ENV = "PANTHEON_TEST_NO_REAL_REPO_SYNC"
+# Captured from __file__, never from REPO_ROOT: tests patch REPO_ROOT to a tmp repo, and
+# the guard must still recognise only the real checkout.
+_REAL_REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _real_repo_sync_blocked(cwd: Path | str | None = None) -> bool:
+    if os.environ.get(_NO_REAL_REPO_SYNC_ENV) != "1":
+        return False
+    try:
+        return Path(cwd if cwd is not None else REPO_ROOT).resolve() == _REAL_REPO_ROOT
+    except OSError:
+        return False
+
+
+def _real_repo_sync_skip_note() -> str:
+    return f"repo sync skipped: {_NO_REAL_REPO_SYNC_ENV}=1 (test run; never sync the real checkout)"
+
+
+def _try_read_failover(component: str) -> bool:
+    """T-1998: ORG-046 read failover after a failed origin fetch. True iff
+    origin/main is now at least as fresh as the mirror, so the caller should go
+    on to the ff-merge. Never raises (the pull path is fail-open)."""
+    if os.environ.get(_READ_FAILOVER_ENV) != "1":
+        return False
+    try:
+        res = _read_failover_module().fetch_main_via_mirror(REPO_ROOT)
+    except Exception as exc:  # noqa: BLE001 — fail-open
+        print(f"[{component}] read-failover error ({exc!r}); using stale clone", file=sys.stderr)
+        return False
+    suffix = "" if res.ok else "; using stale clone"
+    print(f"[{component}] read-failover: {res.detail}{suffix}", file=sys.stderr)
+    return res.ok
+
+
+def _refresh_manifest_pin(component: str) -> None:
+    """T-1998: re-pin repos.yaml from the just-fetched origin/main when armed.
+    Never raises; a failed refresh only means a later failover fail-closes."""
+    if os.environ.get(_READ_FAILOVER_ENV) != "1":
+        return
+    try:
+        _read_failover_module().refresh_pin_if_armed(REPO_ROOT)
+    except Exception as exc:  # noqa: BLE001 — fail-open
+        print(f"[{component}] manifest pin refresh failed ({exc!r})", file=sys.stderr)
+
+
 def pull_repo_or_warn(component: str) -> None:
     """Best-effort sync of the pantheon-config clone against origin/main.
 
@@ -163,7 +232,15 @@ def pull_repo_or_warn(component: str) -> None:
     Fail-open: any failure (network blip, real divergence, missing remote,
     fetch error) logs to stderr and proceeds with the existing local state.
     Stale-but-running beats halted-on-network.
+
+    T-1998: when armed (PANTHEON_READ_FAILOVER=1 + a manifest pin), a failed
+    origin fetch falls back to the ORG-046 manifest mirror (read only, see
+    tools/read_failover.py), and a successful one refreshes the manifest pin.
+    Unarmed, behaviour is exactly as before.
     """
+    if _real_repo_sync_blocked():
+        print(f"[{component}] {_real_repo_sync_skip_note()}", file=sys.stderr)
+        return
     # 1. Fetch origin/main into refs/remotes/origin/main (does NOT touch
     #    FETCH_HEAD's "for-merge" flag in a way the next step cares about).
     try:
@@ -175,12 +252,17 @@ def pull_repo_or_warn(component: str) -> None:
             timeout=30,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
-        print(f"[{component}] fetch skipped ({exc!r}); using stale clone", file=sys.stderr)
-        return
-    if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or [""]
-        print(f"[{component}] fetch failed (rc={result.returncode}): {detail[0]}; using stale clone", file=sys.stderr)
-        return
+        print(f"[{component}] fetch skipped ({exc!r}); {_fetch_fallback_note()}", file=sys.stderr)
+        if not _try_read_failover(component):
+            return
+    else:
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip().splitlines()[-1:] or [""]
+            print(f"[{component}] fetch failed (rc={result.returncode}): {detail[0]}; {_fetch_fallback_note()}", file=sys.stderr)
+            if not _try_read_failover(component):
+                return
+        else:
+            _refresh_manifest_pin(component)
 
     # 2. ff-only merge against the named remote-tracking ref. Explicit ref
     #    bypasses FETCH_HEAD entirely — no multi-branch pollution surface.
@@ -221,6 +303,8 @@ def pull_repo_strict() -> tuple[bool, str]:
     (`tools/watch_runner.py:git_commit_and_push`), or log-and-return
     (`tools/watch_runner.py:git_commit_ledger_entry`).
     """
+    if _real_repo_sync_blocked():
+        return True, ""
     try:
         result = subprocess.run(
             ["git", "fetch", "origin", "main"],
@@ -313,6 +397,140 @@ def _resolve_and_continue_rebase(cwd: Path, resolver, max_iters: int = 50) -> bo
         return False
 
 
+def _rebase_in_progress_kind(cwd: Path) -> str | None:
+    """"rebase-merge" / "rebase-apply" when a rebase is in progress in `cwd`'s
+    repo, else None. The state dir is resolved via `git rev-parse --git-path`, which
+    is correct in linked worktrees too."""
+    for kind in ("rebase-merge", "rebase-apply"):
+        res = _git("rev-parse", "--git-path", kind, cwd=cwd)
+        if res.returncode != 0:
+            continue
+        rel = res.stdout.strip()
+        if not rel:
+            continue
+        path = Path(rel) if os.path.isabs(rel) else (cwd / rel)
+        if path.exists():
+            return kind
+    return None
+
+
+# T-4422: the in-progress git operations a ticket write must never commit into.
+# All of these live in the PER-WORKTREE git dir, so `--absolute-git-dir` (one spawn)
+# finds them in a linked worktree as well as the main checkout.
+_MID_OPERATION_MARKERS = (
+    ("rebase-merge", "rebase"),
+    ("rebase-apply", "rebase (am)"),
+    ("MERGE_HEAD", "merge"),
+    ("CHERRY_PICK_HEAD", "cherry-pick"),
+    ("REVERT_HEAD", "revert"),
+)
+
+
+def _mid_operation_kind(cwd: Path) -> str | None:
+    """The in-progress rebase / merge / cherry-pick / revert in `cwd`'s worktree, as a
+    short name, else None. Not a repo (or git failed) reads as None: the caller's own
+    git commands will then fail loudly on their own."""
+    res = _git("rev-parse", "--absolute-git-dir", cwd=cwd)
+    if res.returncode != 0 or not res.stdout.strip():
+        return None
+    git_dir = Path(res.stdout.strip())
+    for marker, name in _MID_OPERATION_MARKERS:
+        if (git_dir / marker).exists():
+            return name
+    return None
+
+
+def _is_checkout_root(cwd: Path) -> bool:
+    """Spawn-free: is `cwd` itself a checkout root — does it carry a `.git` entry (a
+    directory, or the `gitdir:` FILE of a linked worktree or submodule; `.exists()`,
+    never `.is_dir()`)? push_with_retry runs its destructive rebase clean-up only on
+    rebase state it has positively observed in a checkout root (T-4380). A cwd that
+    is not one keeps the pre-T-4380 behaviour: no probe, no claim. So a SUBDIRECTORY
+    cwd silently does not get the stranded-rebase clean-up; no caller passes one
+    (all pass REPO_ROOT or a worktree root). No ancestor walk: it would spend probe
+    spawns on scratch dirs, and a stray `.git` above one (e.g. `/tmp/.git`) would make
+    every temp cwd probe — harmless to correctness (git exits 128 there, the probe
+    reads "no rebase"), pure spawn cost."""
+    return (Path(cwd) / ".git").exists()
+
+
+def _unpushed_commits_summary(cwd: Path, refspec: str) -> str:
+    """One line per local commit not yet on the remote branch `refspec` targets
+    (`origin/<dst>..HEAD`, up to 10). Falls back to HEAD's own line when the range
+    cannot be computed, so the message can always name at least one commit."""
+    dst = refspec.rsplit(":", 1)[-1].strip()
+    short = dst[len("refs/heads/"):] if dst.startswith("refs/heads/") else dst
+    res = _git("log", "--oneline", "--max-count=10", f"refs/remotes/origin/{short}..HEAD", cwd=cwd)
+    lines = [ln for ln in res.stdout.splitlines() if ln.strip()] if res.returncode == 0 else []
+    if not lines:
+        head = _git("log", "--oneline", "-1", "HEAD", cwd=cwd)
+        lines = [ln for ln in head.stdout.splitlines() if ln.strip()]
+    return "\n".join(f"    {ln}" for ln in lines) or "    (could not list commits — see `git reflog`)"
+
+
+# git's `hint: ...` advice lines, bare or re-printed by the pre-push hook with its
+# `pre-push: ` prefix.
+_HINT_LINE_RE = re.compile(r"^\s*(?:pre-push:\s*)?hint:", re.IGNORECASE)
+
+
+def _stderr_tail(git_detail: str, max_lines: int = 12) -> str:
+    """The last `max_lines` lines of git's output, minus its `hint:` advice. The hint
+    tells the reader to `git rebase --continue` — which contradicts a message that has
+    just said the rebase was ABORTED (or that names its own recovery)."""
+    kept = [ln for ln in git_detail.strip().splitlines() if not _HINT_LINE_RE.match(ln)]
+    return "\n".join(kept[-max_lines:])
+
+
+def _foreign_rebase_message(cwd: Path, kind: str, git_detail: str, *, pushed: bool = True) -> str:
+    """LOUD failure text for a rebase that was ALREADY in progress in `cwd` when
+    push_with_retry was entered (T-4380). That rebase is somebody's own work: nothing
+    was fetched, rebased, continued or aborted. Since T-4422 the push itself is not
+    attempted either (`pushed=False`)."""
+    what = (
+        "no push, fetch, rebase, continue or abort was run"
+        if not pushed
+        else "no fetch, rebase, continue or abort was run"
+    )
+    lead = "push refused" if not pushed else "push rejected"
+    tail = _stderr_tail(git_detail)
+    return (
+        f"{lead}: a rebase ({kind}) was ALREADY IN PROGRESS in {cwd} when this push "
+        f"started, so it was left exactly as found ({what}). THE OP DID NOT LAND. Finish "
+        f"it (`git -C {cwd} rebase --continue`) or abandon it (`git -C {cwd} rebase "
+        f"--abort`) by hand, then retry." + (f"\n{tail}" if tail else "")
+    )
+
+
+def _stranded_rebase_abort_message(
+    cwd: Path, refspec: str, branch: str, git_detail: str, aborted: bool
+) -> str:
+    """LOUD failure text for a rebase the pre-push freshness hook left stranded
+    (T-4380). Names the unpushed commit(s) and the manual recovery, because the
+    push's own stderr says only `failed to push some refs` — the op did not land
+    and nothing else tells the caller so."""
+    dst = refspec.rsplit(":", 1)[-1].strip()
+    short = dst[len("refs/heads/"):] if dst.startswith("refs/heads/") else dst
+    tail = _stderr_tail(git_detail)
+    if not aborted:
+        return (
+            f"rebase conflict left mid-rebase by the pre-push freshness hook, and "
+            f"`git rebase --abort` FAILED — {cwd} is STILL MID-REBASE. THE OP DID NOT "
+            f"LAND. Run `git -C {cwd} rebase --abort` (or resolve and `git -C {cwd} "
+            f"rebase --continue`) by hand.\n{tail}"
+        )
+    where = f"branch '{branch}'" if branch else "its pre-rebase HEAD (detached)"
+    return (
+        f"rebase conflict in the pre-push freshness rebase (ABORTED; {where} restored to "
+        f"its pre-rebase state). THE OP DID NOT LAND: these local commit(s) are NOT on "
+        f"origin/{short}:\n{_unpushed_commits_summary(cwd, refspec)}\n"
+        f"Recover by hand: `git -C {cwd} fetch origin {short} && git -C {cwd} rebase "
+        f"origin/{short}`, resolve, `git rebase --continue`, then push; or, if the change "
+        f"should be redone from scratch, `git -C {cwd} reset --hard origin/{short}` "
+        f"(DISCARDS the commit(s) above). Do NOT re-run the originating op before "
+        f"deciding — its commit already exists locally.\n{tail}"
+    )
+
+
 # ---------------------------------------------------------------------------
 # HEAD:main push guard (T-3600).
 #
@@ -386,14 +604,178 @@ def _warn_if_branch_carries_nonticket_commits(cwd: Path, refspec: str) -> None:
         return  # fail-open — the guard must NEVER break a push
 
 
+# ---------------------------------------------------------------------------
+# ORG-101 §2 (T-4690): gated push order — write authority first, Forgejo second.
+# ---------------------------------------------------------------------------
+
+_UNSET = object()
+MIRROR_PUSH_TIMEOUT_S = 20
+_PROBE_TIMEOUT_S = 10
+
+# Answers the server actually GAVE (auth/permission/protection/decline, non-ff).
+# Checked FIRST and always win: a real answer is never a reason to write elsewhere.
+_REAL_ANSWER_MARKERS = (
+    "permission denied", "authentication failed", "could not read username",
+    "access denied", "forbidden", "publickey", "permission to", "protected branch",
+    "declined", "pre-receive hook", "gh006", "gh013", "repository rule", "not allowed",
+    "rejected", "non-fast-forward", "fetch first",
+)
+_REAL_ANSWER_RE = re.compile(r"\b40[13]\b")
+# The server answered "I failed" (GitHub reachable, push errored server-side).
+_SERVER_ERROR_MARKERS = (
+    "remote: fatal error", "remote: fatal:", "rpc failed", "internal server error",
+    "bad gateway", "service unavailable", "gateway time-out", "remote: error: internal",
+)
+_SERVER_ERROR_RE = re.compile(r"(returned error: 5\d\d|http 5\d\d)")
+_REMOTE_ERROR_FAULT_RE = re.compile(r"remote: error:[^\n]*(internal|fatal|rpc|\b5\d\d\b)")
+_NETWORK_MARKERS = (
+    "could not resolve host", "could not resolve hostname", "connection refused",
+    "connection timed out", "timed out", "network is unreachable", "no route to host",
+    "failed to connect", "couldn't connect to server", "connection reset",
+    "temporary failure in name resolution", "name or service not known",
+    "ssh: connect to host",
+)
+
+
+def _classify_push_failure(stderr: str) -> str:
+    """Classify a failed push's stderr: "real_answer" | "server_error" | "network" | "other".
+
+    Order is the contract (ORG-101 §2): real answers (auth, permission, protection,
+    hook-declined, non-ff) win over everything; then server-side faults; then
+    network-class failures. Anything matching none is "other" and fails closed.
+    """
+    low = (stderr or "").lower()
+    if any(m in low for m in _REAL_ANSWER_MARKERS) or _REAL_ANSWER_RE.search(low):
+        return "real_answer"
+    if any(m in low for m in _SERVER_ERROR_MARKERS) or _SERVER_ERROR_RE.search(low):
+        return "server_error"
+    # A generic "remote: error" line only counts when it itself names a server fault;
+    # policy refusals ("refusing to update checked out branch", "denied by ...") are not.
+    if "failed to push some refs" in low and _REMOTE_ERROR_FAULT_RE.search(low):
+        return "server_error"
+    if any(m in low for m in _NETWORK_MARKERS):
+        return "network"
+    return "other"
+
+
+def _origin_reachable(cwd: Path) -> bool:
+    """ORG-046 §2 fetch-reachability: `git ls-remote origin` answers."""
+    try:
+        res = subprocess.run(
+            ["git", "ls-remote", "origin"], cwd=cwd, capture_output=True, text=True,
+            timeout=_PROBE_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    return res.returncode == 0
+
+
+def _origin_failover_warranted(cwd: Path, stderr: str) -> bool:
+    """True iff the write authority is down (not merely saying no): a server-side
+    fault (no probe needed — the server itself said it failed) or a network-class
+    failure CONFIRMED by a failing ls-remote. Real answers and ambiguous errors: False."""
+    kind = _classify_push_failure(stderr)
+    if kind == "server_error":
+        return True
+    if kind == "network":
+        return not _origin_reachable(cwd)
+    return False
+
+
+def _resolve_write_mirror(cwd: Path, *, manifest_loader=None) -> str | None:
+    """The writable Forgejo mirror url for this clone's origin, or None (no write
+    redundancy = today's behavior). Fail-closed on trust (pin-verified manifest),
+    on an unmatched origin, on host binding, and on git url rewriting; fail-open
+    on any error (never breaks a push)."""
+    try:
+        try:
+            from tools import remote_resolve as rr
+        except ImportError:
+            import remote_resolve as rr  # type: ignore[no-redef]
+        loader = manifest_loader or rr.load_production_manifest
+        manifest = loader()
+        # Default-off costs no git spawn: with no writable remote anywhere in the
+        # (pin-verified) manifest the push path is byte-for-byte today's behavior.
+        if not manifest.signature_verified or not any(
+            r.writable for repo in manifest.repos.values() for r in repo.remotes
+        ):
+            return None
+        got = _git("remote", "get-url", "origin", cwd=cwd)
+        if got.returncode != 0:
+            return None
+        remote = rr.writable_mirror_for(manifest, got.stdout.strip())
+        if remote is None:
+            return None
+        rewritten = _git("ls-remote", "--get-url", remote.url, cwd=cwd)
+        if rewritten.returncode != 0 or rewritten.stdout.strip() != remote.url:
+            return None  # insteadOf would redirect the credential past host binding
+        # --get-url ignores url.<base>.pushInsteadOf, but a push honors it: refuse any
+        # such rewrite (rc 0 = at least one entry; rc 1 = none; anything else = unknown).
+        push_rw = _git("config", "--get-regexp", r"^url\..*\.pushinsteadof$", cwd=cwd)
+        if push_rw.returncode != 1:
+            return None
+        return remote.url
+    except Exception:  # noqa: BLE001 — fail-open: never break a push
+        return None
+
+
+def _push_to_mirror(cwd: Path, mirror_url: str, refspec: str) -> tuple[bool, str]:
+    """Best-effort single push to the Forgejo mirror (no retries, bounded)."""
+    try:
+        res = subprocess.run(
+            ["git", "push", mirror_url, refspec], cwd=cwd, capture_output=True, text=True,
+            timeout=MIRROR_PUSH_TIMEOUT_S,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {MIRROR_PUSH_TIMEOUT_S}s"
+    except OSError as exc:
+        return False, repr(exc)
+    if res.returncode == 0:
+        return True, ""
+    lines = (res.stderr or res.stdout).strip().splitlines()
+    return False, lines[-1] if lines else "unknown error"
+
+
+def mirror_push_after_origin(cwd: Path, refspec: str, *, mirror_url=_UNSET) -> str | None:
+    """ORG-101 §2 dual-write leg ALONE, for a caller that pushed origin itself because
+    it owns its retry/rebase semantics (T-4691: pantheon_config_sync, the delivery
+    rebase controller). Call it only after origin ACCEPTED `refspec`. One bounded,
+    best-effort push to the writable Forgejo mirror; never fails over, never raises.
+    Returns None when no mirror is writable for this clone (inert), else a note for
+    the caller's log."""
+    try:
+        mirror = _resolve_write_mirror(cwd) if mirror_url is _UNSET else mirror_url
+        if not mirror:
+            return None
+        ok, detail = _push_to_mirror(cwd, mirror, refspec)
+    except Exception as exc:  # noqa: BLE001 — origin already landed; never undo that
+        ok, detail = False, repr(exc)
+    return "mirror pushed" if ok else f"mirror push failed ({detail}); reconciler will heal"
+
+
+_FORGEJO_ONLY_NOTE = "pushed to Forgejo only; replay to GitHub pending (reconciler)"
+
+
 def push_with_retry(
     cwd: Path,
     *,
     refspec: str = "HEAD:main",
     attempts: int = 3,
     conflict_resolver=None,
+    mirror_url=_UNSET,
 ) -> tuple[bool, str]:
     """Push `origin <refspec>` with retry on non-fast-forward rejection.
+
+    ORG-101 §2 write redundancy (T-4690), inert unless the manifest marks a Forgejo
+    mirror `writable: true` for this clone's origin (`mirror_url` overrides the
+    manifest lookup; None = off):
+      - after origin ACCEPTS, the same refspec is pushed once to the mirror,
+        best-effort (bounded, no retry); a mirror failure is noted, result stays True.
+      - when origin is DOWN (server-side fault, or unreachable per ls-remote) the
+        push goes to the mirror instead, returning success with a "replay pending"
+        note; non-ff retries then fetch+rebase against the mirror.
+      - a non-ff / auth / permission / protected-branch / hook-declined answer, or an
+        ambiguous error, NEVER falls over to the mirror (split-brain guard).
 
     Retry semantics:
       1. Attempt `git push origin <refspec>`.
@@ -413,6 +795,20 @@ def push_with_retry(
          self-heals" does NOT hold — survive a mechanical generated-file
          conflict instead of stranding the commit (T-0846).
       6. After exhausting `attempts` → return (False, msg) fail-loud.
+      7. A push can also fail because the pre-push freshness hook
+         (`.githooks/pre-push`) ran `git pull --rebase` on an ATTACHED branch and
+         stopped on a conflict: the hook exits 1 leaving `.git/rebase-merge`, and its
+         stderr carries none of the non-ff markers. A rebase that was NOT in
+         progress at entry but is after a failed push is exactly that (T-4380): a
+         `conflict_resolver` gets the same chance as in (5) and the push is retried;
+         otherwise the rebase is aborted (branch restored) and (False, msg) is
+         returned, naming the unpushed commit(s) and the manual recovery.
+      8. A rebase already in progress at entry (checkout root) is somebody else's
+         and is NEVER touched: the call returns (False, msg) at once, naming it,
+         WITHOUT pushing (T-4422 — HEAD is then a detached, half-rebased state, and
+         a push could report an up-to-date no-op as landed or publish a partial
+         rebase). A cwd that is not a checkout root is neither probed nor claimed —
+         no extra git spawns, the old behaviour.
 
     Args:
         cwd: Working directory for git commands (the worktree path).
@@ -434,15 +830,58 @@ def push_with_retry(
         _warn_if_branch_carries_nonticket_commits(cwd, refspec)
     except Exception:
         pass
-    for attempt_num in range(1, attempts + 1):
-        res = _git("push", "origin", refspec, cwd=cwd)
+    # T-4380: only a rebase that appeared during this call (inferred from state: the
+    # checkout was observed rebase-free at entry) is the hook's to clear. A rebase already in progress
+    # at entry (`rebase_at_entry`: somebody's own) is never touched on ANY path below:
+    # no rebase / continue / abort runs, the call returns a loud (False, msg) instead.
+    # A cwd that is not a checkout root is neither probed nor claimed.
+    is_root = _is_checkout_root(cwd)
+    rebase_at_entry = _rebase_in_progress_kind(cwd) if is_root else None
+    # T-4422: a rebase already in progress at entry means HEAD is somebody's detached,
+    # half-rebased state. Pushing it can "succeed" as an up-to-date no-op (reporting a
+    # landing that did not happen) or publish a partial rebase, so do not push at all.
+    if rebase_at_entry is not None:
+        return False, _foreign_rebase_message(cwd, rebase_at_entry, "", pushed=False)
+    hook_rebase_ours_to_handle = is_root and rebase_at_entry is None
+    mirror = _resolve_write_mirror(cwd) if mirror_url is _UNSET else mirror_url
+    dest = "origin"  # becomes the mirror url once origin is confirmed down
+    attempt_num = 0
+    while attempt_num < attempts:
+        attempt_num += 1
+        res = _git("push", dest, refspec, cwd=cwd)
         if res.returncode == 0:
-            return True, f"pushed {refspec} (attempt {attempt_num})"
+            msg = f"pushed {refspec} (attempt {attempt_num})"
+            if dest != "origin":
+                return True, f"{msg}; {_FORGEJO_ONLY_NOTE}"
+            note = mirror_push_after_origin(cwd, refspec, mirror_url=mirror)
+            if note:
+                msg += f"; {note}"
+            return True, msg
+
+        # T-4380: the pre-push freshness hook's `git pull --rebase` may have stopped
+        # on a conflict and exited 1 without aborting. Never leave that behind.
+        if hook_rebase_ours_to_handle and _rebase_in_progress_kind(cwd) is not None:
+            if (
+                conflict_resolver is not None
+                and attempt_num < attempts  # a resolved rebase needs a push left to land on
+                and _resolve_and_continue_rebase(cwd, conflict_resolver)
+            ):
+                continue  # hook's rebase resolved + completed → retry the push
+            abort_res = _git("rebase", "--abort", cwd=cwd)
+            aborted = abort_res.returncode == 0 and _rebase_in_progress_kind(cwd) is None
+            branch = _git("symbolic-ref", "--short", "-q", "HEAD", cwd=cwd).stdout.strip()
+            return False, _stranded_rebase_abort_message(
+                cwd, refspec, branch, (res.stderr or res.stdout), aborted
+            )
 
         stderr_lower = res.stderr.lower()
         is_non_ff = any(marker in stderr_lower for marker in _NON_FF_MARKERS)
 
         if not is_non_ff:
+            if dest == "origin" and mirror and _origin_failover_warranted(cwd, res.stderr):
+                dest = mirror  # the write authority is down, not refusing: ORG-101 §2
+                attempt_num -= 1  # the redirected push is not a retry of the same target
+                continue
             # Auth, network, or other hard failure — do not retry.
             detail = (res.stderr or res.stdout).strip()
             return False, f"git push failed (non-retryable): {detail}"
@@ -455,7 +894,7 @@ def push_with_retry(
             )
 
         # Non-ff rejection with retries remaining: fetch + rebase onto fresh origin/main.
-        fetch_res = _git("fetch", "origin", "main", cwd=cwd)
+        fetch_res = _git("fetch", dest, "main", cwd=cwd)
         if fetch_res.returncode != 0:
             detail = (fetch_res.stderr or fetch_res.stdout).strip()
             return False, f"git fetch failed during retry (attempt {attempt_num}): {detail}"
@@ -493,23 +932,16 @@ def _abort_stale_rebase(cwd: Path = REPO_ROOT) -> bool:
     `git rebase --abort` to restore a clean base. Returns True if a stale rebase
     was cleared, False (no-op) when none was in progress.
     """
-    for kind in ("rebase-merge", "rebase-apply"):
-        res = _git("rev-parse", "--git-path", kind, cwd=cwd)
-        if res.returncode != 0:
-            continue
-        rel = res.stdout.strip()
-        if not rel:
-            continue
-        path = Path(rel) if os.path.isabs(rel) else (cwd / rel)
-        if path.exists():
-            _git("rebase", "--abort", cwd=cwd)
-            print(
-                f"[git_utils] cleared stale in-progress rebase ({kind}) before sync "
-                f"({cwd}) — likely an interrupted prior run (T-1191)",
-                file=sys.stderr,
-            )
-            return True
-    return False
+    kind = _rebase_in_progress_kind(cwd)
+    if kind is None:
+        return False
+    _git("rebase", "--abort", cwd=cwd)
+    print(
+        f"[git_utils] cleared stale in-progress rebase ({kind}) before sync "
+        f"({cwd}) — likely an interrupted prior run (T-1191)",
+        file=sys.stderr,
+    )
+    return True
 
 
 # T-2333: named prefixes for the two DISTINCT failure texts below. Exported so
@@ -553,6 +985,8 @@ def pull_or_rebase_strict(cwd: Path = REPO_ROOT, conflict_resolver=None) -> tupl
 
     Returns (True, "") on success, (False, "<reason>") on any unrecoverable failure.
     """
+    if _real_repo_sync_blocked(cwd):
+        return True, ""
     # Self-heal before syncing: clear any stale in-progress rebase a prior
     # interrupted run may have left behind (T-1191), which would otherwise make
     # the ff-only merge below fail "a rebase is in progress" and wedge the clone.
@@ -1085,6 +1519,41 @@ class WorktreeError(Exception):
     """
 
 
+def _worktree_add_timeout_s() -> int:
+    try:
+        v = int(os.environ.get("PANTHEON_WORKTREE_ADD_TIMEOUT_S", "180"))
+    except ValueError:
+        return 180
+    return min(max(v, 30), 900)
+
+
+_WORKTREE_ADD_TIMEOUT_S = _worktree_add_timeout_s()
+
+
+def _discard_failed_worktree(wt_path: Path) -> None:
+    """T-5076: best-effort teardown after a failed `git worktree add`.
+
+    `remove -f -f` is the double force a LOCKED worktree needs, then `prune` drops a
+    registration whose directory is already gone, then the directory itself goes. The path
+    is this process's own (/tmp/<script>-<pid>, absent at step 1), so nothing else is
+    touched. Every step is bounded and swallows its own failure, so the caller's
+    WorktreeError (the real fault) is what surfaces."""
+    for argv in (["git", "worktree", "remove", "-f", "-f", str(wt_path)],
+                 ["git", "worktree", "prune"]):
+        try:
+            subprocess.run(argv, cwd=REPO_ROOT, capture_output=True, text=True,
+                           timeout=60, check=False)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            print(f"[with_worktree] warning: {' '.join(argv[:3])} after a failed add: {exc!r}",
+                  file=sys.stderr)
+    try:
+        shutil.rmtree(wt_path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        print(f"[with_worktree] warning: could not remove {wt_path}: {exc!r}", file=sys.stderr)
+
+
 def with_worktree(fn: Callable[[Path], T]) -> T:
     """Run `fn(worktree_path)` in a fresh detached git worktree off origin/main.
 
@@ -1100,8 +1569,9 @@ def with_worktree(fn: Callable[[Path], T]) -> T:
          P4, D5): stale leftover means a prior fire crashed without cleanup;
          operator should triage before the next fire runs.
       2. Fetch `origin main` (30s timeout). Failure → WorktreeError.
-      3. `git worktree add --detach <path> origin/main`. Failure → WorktreeError
-         with the git error detail (P4 traceability).
+      3. `git worktree add --detach <path> origin/main` (180s, PANTHEON_WORKTREE_ADD_TIMEOUT_S).
+         Failure or timeout → the half-made worktree is removed (remove -f -f, prune, rmtree;
+         T-5076), then WorktreeError with the git error detail (P4 traceability).
       4. Call fn(path). Return value or exception propagates.
       5. `git worktree remove --force <path>` in try/finally. If removal fails,
          log to stderr but do NOT mask fn's return value or re-raise over fn's
@@ -1150,20 +1620,25 @@ def with_worktree(fn: Callable[[Path], T]) -> T:
             f"git fetch origin main failed (rc={fetch_result.returncode}): {detail}"
         )
 
-    # Step 3: create the worktree.
+    # Step 3: create the worktree. T-5076: a full-tree checkout is I/O-heavy, and on 2026-10-17
+    # the 30s add timed out at load ~40 on 4 cores, so the ceiling is wider (env-tunable).
+    # A failed or killed add leaves git's half-made worktree registered and LOCKED
+    # ('initializing'), so it is torn down before the error is raised.
     try:
         add_result = subprocess.run(
             ["git", "worktree", "add", "--detach", str(wt_path), "origin/main"],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=_WORKTREE_ADD_TIMEOUT_S,
             check=False,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
+        _discard_failed_worktree(wt_path)
         raise WorktreeError(f"git worktree add failed: {exc!r}") from exc
     if add_result.returncode != 0:
         detail = (add_result.stderr or add_result.stdout).strip()
+        _discard_failed_worktree(wt_path)
         raise WorktreeError(
             f"git worktree add --detach {wt_path} origin/main failed "
             f"(rc={add_result.returncode}): {detail}"

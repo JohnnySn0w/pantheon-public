@@ -14,7 +14,7 @@ It is NOT a replacement for the workflow. It runs on one seat's clone against
 trigger sequence entered history between the last verified point and
 origin/main?*
 
-## Four design decisions, each bought with a failure
+## Five design decisions, each bought with a failure
 
 1. **`git log -p`, never `git diff BASE...HEAD`.** A cumulative three-dot diff
    shows NET EFFECT: a line added in one commit and removed in a later one leaves
@@ -42,6 +42,24 @@ origin/main?*
    untouched, so the next run re-scans the same window and keeps failing until a
    human resolves it. Advancing on violation would audit the problem away.
 
+5. **Every committed byte, merges included (T-4229).** The producer is
+   `git log -p --text --no-textconv --no-ext-diff --diff-merges=remerge`, plus a
+   second `--min-parents=3 --diff-merges=separate` pass for octopus merges (git
+   skips remerge for 3+ parents: one warning line, no patch). The flag tuples
+   are imported from `hermes_history_audit` (T-4211), not restated. Plain
+   `git log -p` printed only `Binary files ... differ` for a NUL-bearing or
+   .gitattributes `binary`/`-diff` file, and NO patch at all for a merge, so an
+   evil-merge line was invisible. remerge rather than `separate`: this tool
+   counts every match on the whole surface and a nonzero count pins the
+   watermark, so a merge must be charged only with what its resolution
+   introduced. `separate` re-shows a merged branch against the other parent,
+   re-counting content already on the surface or already behind the watermark
+   (e.g. a pre-bootstrap historical hit), which would turn a clean merge into
+   a permanent violation. remerge stays complete because each parent's own
+   commits are either in the same window or behind the watermark. (remerge's
+   conflict markers, shown as removed lines, can still repeat a side's bytes;
+   that is the same all-lines over-count a context line already has here.)
+
 ## Source cleanliness
 
 This file must never contain the unescaped trigger as contiguous bytes. The
@@ -63,6 +81,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "tools"))
 
 from _git_utils import _HERMES_PATTERN  # noqa: E402  single source of truth for the trigger
+# T-4229: the producer flags are the history audit's (T-4211): shared, not restated.
+from hermes_history_audit import _OCTOPUS_SHOW_ARGS, _SHOW_ARGS  # noqa: E402
 
 DEFAULT_STATE = Path.home() / ".local" / "state" / "pantheon" / "hermes_local_audit.json"
 
@@ -135,10 +155,30 @@ def resolve_base(state: dict, override: str | None) -> str:
     return base
 
 
-def scan_window(base: str, head_sha: str) -> tuple[int, bytes]:
-    """Return (violation_count, matched_sample) over the per-commit surface."""
-    # Design decision 1: log -p, not diff A...B.
-    surface = _git("log", "-p", "--no-color", f"{base}..{head_sha}", binary=True)
+def scan_window(base: str, head_sha: str, cwd: Path | None = None) -> tuple[int, bytes]:
+    """Return (violation_count, surface) over the per-commit surface.
+
+    The surface is every commit's message and patch in the window (design
+    decisions 1 and 5): the remerge log, then per-parent patches of any octopus
+    merge. A git failure raises AuditError (exit 2), never a partial surface.
+    """
+    rng = f"{base}..{head_sha}"
+    # Design decision 1: log -p, not diff A...B. Design decision 5: --text, raw
+    # blob bytes, and each merge as the remerge diff of its resolution.
+    surface = _git("log", *_SHOW_ARGS, "--no-color", rng, binary=True, cwd=cwd)
+    # Octopus merges got no patch above; show them against each parent.
+    # `--format=` because their messages are already on the surface. Caveat:
+    # per-parent (`separate`) output over-counts, so a clean octopus merge of
+    # a dirty, pre-watermark side can pin the watermark (the thing remerge
+    # avoids for 2-parent merges). Accepted: git skips remerge for octopus
+    # merges, and origin/main has none (0 of ~29.7k commits; PR merges never
+    # produce one). Only appended when non-empty, to avoid copying the surface.
+    octopus = _git(
+        "log", "--min-parents=3", "--format=", *_OCTOPUS_SHOW_ARGS, "--no-color", rng,
+        binary=True, cwd=cwd,
+    )
+    if octopus:
+        surface += octopus
     hits = _HERMES_PATTERN.findall(surface)
     return len(hits), surface
 

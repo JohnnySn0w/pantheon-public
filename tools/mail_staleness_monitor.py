@@ -35,7 +35,7 @@ for one and structurally unreachable for the other.
     kicked IS the fault this detector exists for. Warning at 15 min there is the point,
     not a false positive.
 
-  COARSE tier — pane_idle None (codex's TUI, mnemosyne's absent pane). Condition 5 is
+  COARSE tier — pane_idle None (codex's TUI, archivist's absent pane). Condition 5 is
   UNREACHABLE here by my own contract ("None must never wake"), so these agents are
   bounded by the TTL backstop exactly as they were before T-2158:
         <= 300s   first wake (condition 1, "newer message")   -> marker ts
@@ -57,7 +57,9 @@ False: a generating agent SHOULD have mail waiting, and a busy agent is exactly 
 age-only threshold fires on hardest — so an age-only detector fires most on the
 healthiest agents and gets itself ignored. Hence:
     True  (idle)       -> evidence accumulates; alert at the WARN tier.
-    False (generating) -> suppress. Legitimately busy.
+    False (generating) -> suppress. Legitimately busy. The one bound is T-4323's
+                          busy-stale backstop: unread older than 2h alerts anyway,
+                          since a pane MISREAD as busy is otherwise never reported.
     None  (unknown)    -> do NOT suppress and do NOT escalate: fall through to the
                           COARSE tier only.
 
@@ -65,7 +67,7 @@ That last line is orchestrator's deviation from my own "None must never drive an
 and I am adopting it deliberately rather than by omission. My rule was written for the
 WAKER, where acting on unknown means injecting into a pane that might be mid-turn. Here
 the action is a read-only alert, and the cost asymmetry inverts: suppressing on unknown
-would silently drop codex and mnemosyne — the two unreadable-pane substrates — out of
+would silently drop codex and archivist — the two unreadable-pane substrates — out of
 coverage entirely, and they are two of the three agents the originating incident was
 about. Unknown + 45 minutes of unmoved mail is a real signal whatever the pane would
 have said. The alert text says the pane was UNREADABLE rather than idle, so the claim
@@ -118,7 +120,12 @@ from mailbox import _INFLIGHT_DIR, _CLAIM_OWNER_LOCK  # noqa: E402
 # it would land in the one predicate we consolidated to stop exactly this.
 from mailbox import Lease, UNKNOWN  # noqa: E402
 
-MAILBOX_HUB = Path(os.environ.get("PANTHEON_MAILBOX_HUB", "/home/the-ancestor/mailbox"))
+try:  # T-4096: the hub default comes from instance.yaml, never a literal.
+    from tools.agent_role_map import mailbox_hub  # noqa: E402
+except ImportError:  # script run: tools/ is on sys.path, the repo root is not
+    from agent_role_map import mailbox_hub  # type: ignore  # noqa: E402
+
+MAILBOX_HUB = Path(os.environ.get("PANTHEON_MAILBOX_HUB") or mailbox_hub())
 STATE_PATH = Path.home() / ".local" / "state" / "pantheon" / "mail_staleness_monitor.json"
 
 # The installed timer's OnUnitActiveSec is the SURFACE THAT DECIDES the real sample
@@ -157,8 +164,8 @@ _KIND_URGENT_UNDELIVERED = "urgent_undelivered"
 # Fallback names ONLY (strategy 3 above) — never the primary source of truth, because
 # a list of names cannot contain the box nobody named. specialist-a2a is here precisely
 # because it is not a persona and my T-2159 probe missed it for that reason.
-CANDIDATE_INBOXES = ["recovery", "orchestrator", "specialist", "mnemosyne", "codex", "metis", "atlas",
-                     "the-ancestor", "specialist-a2a"]
+CANDIDATE_INBOXES = ["recovery", "orchestrator", "specialist", "archivist", "codex", "mason", "artisan",
+                     "specialist-a2a"]
 
 
 # ---------------------------------------------------------------- enumeration
@@ -166,8 +173,8 @@ def _hub_subdir_count(hub: Path) -> int | None:
     """True number of subdirectories of `hub`, WITHOUT listing it.
 
     A directory's st_nlink is 2 + its subdirectory count ("." + ".." + one ".." per
-    child). Recovery can stat the hub but cannot list it (mode 0710, owner the-ancestor:
-    the veneration group gets --x, i.e. traverse only), so this is the one completeness
+    child). Recovery can stat the hub but cannot list it (mode 0710, owner post-office:
+    the mailbox group gets --x, i.e. traverse only), so this is the one completeness
     oracle available without borrowing another account's eyes. None if even stat fails.
     """
     try:
@@ -182,7 +189,7 @@ def discover_inboxes(hub: Path = MAILBOX_HUB) -> tuple[list[str], str | None]:
     THREE STRATEGIES, and the third is the one that makes this trustworthy:
 
     1. Direct listing. Fails for Recovery — the hub is 0710 and only its owner can read it.
-    2. Borrow the owner's eyes: `sudo -u the-ancestor ls`. This works and is the normal
+    2. Borrow the owner's eyes: `sudo -u <hub owner> ls`. This works and is the normal
        path. (My first attempt at this used bare `sudo`, i.e. sudo-to-ROOT, which Recovery
        does not have — and I nearly recorded "the hub cannot be enumerated" off that
        one failed command. Sudo-to-a-different-user and sudo-to-root are separate
@@ -354,11 +361,13 @@ def capture_pane_idle(inbox: str, panes: dict[str, tuple[str, str]] | None = Non
     if not target or not target.strip():
         return None
     try:
+        # -e: pane_idle_state needs the DIM attribute to tell a prompt suggestion
+        # from typed text (T-4284).
         if account == os.environ.get("USER", ""):
-            cmd = ["tmux", "capture-pane", "-p", "-t", target]
+            cmd = ["tmux", "capture-pane", "-p", "-e", "-t", target]
         else:
             cmd = ["sudo", "-n", "-u", account, "bash", "-c",
-                   f'XDG_RUNTIME_DIR=/run/user/$(id -u) tmux capture-pane -p -t {target}']
+                   f'XDG_RUNTIME_DIR=/run/user/$(id -u) tmux capture-pane -p -e -t {target}']
         out = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
         if out.returncode != 0:
             return None
@@ -543,7 +552,7 @@ def _coerce_draining(obs, advanced):
     the previous sample. T-2257: this REPLACES the old static comparison
     (recency < oldest_unread_age). Both of those grow at the same rate, so their
     difference was CONSTANT and one partial drain suppressed an inbox FOREVER —
-    mnemosyne and specialist were silently unalertable for hours on 2026-07-28 while
+    archivist and specialist were silently unalertable for hours on 2026-07-28 while
     the operator was reporting them broken. "Is it draining?" is a question about
     change over time; only a cross-sample delta can answer it.
 
@@ -643,9 +652,9 @@ def suppress_draining(alerts, obs, advanced):
     """Drop alerts for inboxes that are demonstrably DRAINING, just slowly.
 
     WHY THIS EXISTS. The WARN tier gates on the agent's MAIN PANE being idle.
-    For ACP-backed agents (mnemosyne, specialist) the main pane is NOT the consumer —
+    For ACP-backed agents (archivist, specialist) the main pane is NOT the consumer —
     the ACP bridge is — so the pane reads idle while the bridge works, and every
-    healthy backlog would page. Measured before deploying: mnemosyne sat at 10
+    healthy backlog would page. Measured before deploying: archivist sat at 10
     unread with a 26.6-minute-old head while its bridge was provably mid-turn
     (transcript +5.4KB in 20s). That alert would have been true and useless, and
     a monitor that fires on healthy gets switched off — after which the real
@@ -659,13 +668,13 @@ def suppress_draining(alerts, obs, advanced):
     The ORIGINAL discriminator ("a delivery more recent than the oldest pending
     message") was wrong in principle: both ages grow at the same rate, so the
     comparison's sign could never flip and ONE partial drain suppressed the inbox
-    FOREVER. Live consequence 2026-07-28: mnemosyne (gap 110m, constant) and
+    FOREVER. Live consequence 2026-07-28: archivist (gap 110m, constant) and
     specialist (gap 31m, constant) were permanently unalertable — precisely the two
     inboxes the operator was reporting as broken. Third defect in this suppression
     path; see the mutation tests before touching it again.
 
     Still validated against 2026-07-28's real cases, now via the delta:
-      mnemosyne, healthy-but-slow  : acks landing between samples -> advances -> SUPPRESS
+      archivist, healthy-but-slow  : acks landing between samples -> advances -> SUPPRESS
       specialist, bridge dead 14:35-16:20: cur/ frozen at 14:35, mail piling
                                      -> never advances            -> ALERT
     Fails LOUD: an inbox not in `advanced` (unknown clock, first run, frozen)
@@ -680,9 +689,77 @@ def suppress_draining(alerts, obs, advanced):
     return kept, dropped
 
 
+def _inbox_in_maintenance(inbox: str) -> bool:
+    """T-5244: True iff the seat behind `inbox` is in an ACTIVE seat-maintenance
+    window (notify_policy, T-2984). Inbox names are persona names. Fail-open.
+    ORG-106 L4b: a shim over the shared seat_state.maintenance_active."""
+    return _seat_state_mod().maintenance_active(inbox)
+
+
+def _seat_state_mod():
+    """ORG-106 L4b: the seat_state module, importable from a package or a bare run."""
+    try:
+        from tools import seat_state
+    except ImportError:  # bare run with cwd=tools/
+        import seat_state  # type: ignore
+    return seat_state
+
+
+def _inbox_seat_paused(inbox: str) -> bool:
+    """ORG-106 L4b (T-5527): True iff the seat behind `inbox` has a seat-state RECORD of
+    paused-intake or deep-sleep, so mail queued to it is expected, not a staleness fault.
+    Keyed on the record's state (not intake_blocked): an OOM hold or the legacy flag also
+    block intake but are not a declared pause, and keep alerting exactly as before.
+    Fail-open: an unreadable / unknown seat reads False, so an alert is never silenced."""
+    try:
+        seat = _seat_state_mod().safe_effective_for(inbox)
+        return bool(seat is not None and seat.state != "active")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _inbox_seat_asleep(inbox: str) -> bool:
+    """ORG-106 L4b: True iff the seat-state record is deep-sleep (draining or asleep).
+    Fail-open like _inbox_seat_paused."""
+    try:
+        seat = _seat_state_mod().safe_effective_for(inbox)
+        return bool(seat is not None and seat.state == "deep-sleep")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _inbox_held(inbox: str) -> bool:
+    """ORDINARY tiers (warn / coarse / busy_stale): maintenance (T-5244) or a declared
+    pause / sleep (ORG-106). Both names resolved per call so each leg stays patchable."""
+    return _inbox_in_maintenance(inbox) or _inbox_seat_paused(inbox)
+
+
+def _inbox_urgent_held(inbox: str) -> bool:
+    """URGENT tier: maintenance (unchanged) or deep-sleep only. A PAUSED seat is woken by
+    urgent mail (ORG-106 decision 2, L2), so urgent mail still unread there means the wake
+    failed and must alert; a sleeping seat queues mail for its wake, so it does not."""
+    return _inbox_in_maintenance(inbox) or _inbox_seat_asleep(inbox)
+
+
+def suppress_maintenance(alerts, in_maintenance=None):
+    """T-5244: drop alerts for seats held in seat-maintenance. A held seat cannot
+    drain by design, so its unread mail is expected, not an outage (mason paged
+    '1 unread, 3.0h' 2026-10-19 while held). Applies to every tier, urgent included:
+    the hold is deliberate and expires on its own."""
+    check = in_maintenance or _inbox_urgent_held  # resolved per call: patchable
+    kept, dropped = [], []
+    for a in alerts:
+        (dropped if check(a.inbox) else kept).append(a)
+    return kept, dropped
+
+
 # -------------------------------------------------------------------- state
+# Tiers whose state is {inbox: last_alert_epoch} rather than ms.InboxState.
+_STAMP_TIERS = ("urgent", "busy_stale")
+
+
 def load_state(path: Path = STATE_PATH) -> dict[str, dict]:
-    blank: dict[str, dict] = {"warn": {}, "coarse": {}, "urgent": {}}
+    blank: dict[str, dict] = {"warn": {}, "coarse": {}, "urgent": {}, "busy_stale": {}}
     try:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError, ValueError):
@@ -695,8 +772,10 @@ def load_state(path: Path = STATE_PATH) -> dict[str, dict]:
             except TypeError:
                 continue  # a shape change must degrade to "start fresh", never crash
     # T-2237 rev2: "urgent" holds {inbox: last_alert_epoch} floats, NOT
-    # InboxState — the cooldown stamps for the severity-first path.
-    out["urgent"] = {k: v for k, v in (raw.get("urgent") or {}).items()
+    # InboxState — the cooldown stamps for the severity-first path. T-4323's
+    # "busy_stale" tier is the same shape.
+    for tier in _STAMP_TIERS:
+        out[tier] = {k: v for k, v in (raw.get(tier) or {}).items()
                      if isinstance(v, (int, float))}
     return out
 
@@ -704,7 +783,7 @@ def load_state(path: Path = STATE_PATH) -> dict[str, dict]:
 def save_state(state: dict[str, dict], path: Path = STATE_PATH) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(
-        {tier: (dict(boxes) if tier == "urgent"
+        {tier: (dict(boxes) if tier in _STAMP_TIERS
                 else {k: asdict(v) for k, v in boxes.items()})
          for tier, boxes in state.items()},
         indent=2) + "\n", encoding="utf-8")
@@ -824,6 +903,73 @@ def detect_urgent_undelivered(hub: Path = MAILBOX_HUB, prior: dict | None = None
     return alerts, next_urgent
 
 
+# T-4323(b): the BUSY backstop. pane_idle False suppresses every tier above, and
+# the waker defers to it too, so a pane MISREAD as busy got no alert at all: #386,
+# and T-4319 R1's quoted "Enter to view" footer, starved seats in silence. This
+# tier bounds that silence on AGE, not samples. A busy seat with steady mail churn
+# never reaches unread 0, so a sample count would fire on healthy agents. 2h is
+# far past any wake cycle; T-4287's exit-8 counts are the data to tune it with.
+BUSY_STALE_AGE_SECONDS = int(os.environ.get("MAIL_STALENESS_BUSY_STALE_AGE_SECONDS", "7200"))
+BUSY_STALE_REALERT_SECONDS = int(os.environ.get("MAIL_STALENESS_BUSY_STALE_REALERT_SECONDS", "3600"))
+_KIND_BUSY_STALE = "busy_stale"
+
+
+def detect_busy_stale(obs: dict, hub: Path = MAILBOX_HUB, prior: dict | None = None,
+                      now: float | None = None, skip=frozenset()) -> tuple[list, dict]:
+    """Alerts for inboxes read BUSY with unread mail older than the backstop.
+
+    `obs` must be the draining-coerced view (main() passes it): an inbox that
+    acked since the last sample has unread 0 there, and a consumer that is
+    draining is not starved. Left to the tiers that own them: idle panes (WARN),
+    unreadable panes (COARSE), a held consumer lease (T-2283: turn length, not
+    starvation) and urgent mail (the severity path). `skip` names inboxes some
+    other tier already alerted this sample, so none is reported twice.
+
+    `prior` is {inbox: last_alert_epoch}, like the urgent path. A stamp still
+    inside the cooldown is kept for any inbox present in `obs`, even one that
+    doesn't qualify this sample. Without that, one unknown or IDLE read (a
+    flapping pane, a failed capture) dropped it, and the next BUSY read re-alerted
+    the same backlog (rev-t4284b r1 R1). Once the cooldown has run out the stamp
+    drops, so the next incident alerts fresh.
+    """
+    now = time.time() if now is None else now
+    prior = prior or {}
+    next_state: dict[str, float] = {}
+    alerts = []
+    for name, o in sorted(obs.items()):
+        age = o.oldest_unread_age_s
+        if (o.pane_idle is not False or o.consumer_lease_held or not o.unread
+                or not isinstance(age, (int, float)) or age < BUSY_STALE_AGE_SECONDS
+                or name in skip or urgent_unread(hub / name)):
+            continue
+        last = prior.get(name)
+        if isinstance(last, (int, float)) and (now - last) < BUSY_STALE_REALERT_SECONDS:
+            next_state[name] = last  # still in cooldown; keep the stamp
+            continue
+        next_state[name] = now
+        alerts.append(ms.Alert(
+            inbox=name,
+            kind=_KIND_BUSY_STALE,
+            unread=o.unread,
+            oldest_age_s=age,
+            samples=0,
+            text=(f"mailbox: {name} read BUSY with {o.unread} unread, oldest "
+                  f"{ms._format_age(age)}: past the "
+                  f"{ms._format_age(BUSY_STALE_AGE_SECONDS)} busy-stale backstop "
+                  f"(T-4323). Every other tier and the waker defer to a busy pane, "
+                  f"so this is the only alert it can get. Either one turn has run "
+                  f"that long without draining, or the pane is being MISREAD as busy "
+                  f"(the T-4319 class). Check the pane: a turn-ended prompt with "
+                  f"this backlog is a stuck seat."),
+        ))
+    for name in obs:
+        last = prior.get(name)
+        if (name not in next_state and isinstance(last, (int, float))
+                and (now - last) < BUSY_STALE_REALERT_SECONDS):
+            next_state[name] = last
+    return alerts, next_state
+
+
 def _inbox_seat_is_paused(inbox: str) -> bool:
     """Is this inbox's agent a seat that was deliberately taken out of service?
 
@@ -872,13 +1018,13 @@ def _inbox_seat_is_paused(inbox: str) -> bool:
 # `AGENT_CONFIG` and `_persona_panes()` at write time; `InboxSeatIsOnDemandParkedTest
 # .test_allowlist_members_are_real_persona_seats` catches drift so a future
 # typo/rename fails a test instead of silently disabling attribution.
-ON_DEMAND_PERSONAS: frozenset[str] = frozenset({"atlas", "metis", "mnemosyne"})
+ON_DEMAND_PERSONAS: frozenset[str] = frozenset({"artisan", "mason", "archivist"})
 
 # T-3454: park-suppression CEILING. An on-demand seat legitimately sits idle-with-
 # unread between dispatches, so we suppress — but NOT indefinitely. An up-but-idle
 # seat whose WAKE is broken (mail arrives, nothing wakes it to consume) is
 # INDISTINGUISHABLE from a legit park by the pane alone — that is exactly how the
-# metis/atlas 6-week rot (T-3427) slipped past this monitor: their wake timers were
+# mason/artisan 6-week rot (T-3427) slipped past this monitor: their wake timers were
 # never enabled, they sat idle-at-prompt, and park-suppression hid the aging queue.
 # So past this ceiling the "parked by design" attribution no longer holds and the
 # alert proceeds regardless of pane. Deliberately GENEROUS (48h): far beyond any
@@ -916,18 +1062,18 @@ def _inbox_seat_is_on_demand_parked(inbox: str, pane_idle: bool | None,
     detection tier (see its docstring) — that coercion is correct for THAT tier's
     purpose and wrong for this one. Feeding a coarse_view-coerced observation here
     would silently convert an absent-pane on-demand seat into a suppressed alert:
-    mnemosyne has no tmux server at all, so its raw pane_idle is None, but its
+    archivist has no tmux server at all, so its raw pane_idle is None, but its
     coarse_view-coerced pane_idle is True — passing the coerced value would make
-    this predicate wrongly attribute mnemosyne as "parked" from silence alone,
+    this predicate wrongly attribute archivist as "parked" from silence alone,
     which is exactly the never-suppress-on-unknown invariant this file's fail-safe
     doctrine (`_consumer_lease_held`, `_inbox_seat_is_paused`) exists to prevent.
 
     DELIBERATE non-coverage (option (a), T-2665 design discussion): an on-demand
     seat with an ABSENT pane (`pane_idle is None`) is therefore NOT attributed
-    here — it keeps alerting. mnemosyne fits this today. This is intentional, not
+    here — it keeps alerting. archivist fits this today. This is intentional, not
     an oversight: coercing None to "parked" would require guessing that silence
-    means benign-park rather than wedged/dead, and mnemosyne is not noisy the way
-    atlas/metis are, so the cost of leaving it uncovered is small. Do not "fix"
+    means benign-park rather than wedged/dead, and archivist is not noisy the way
+    artisan/mason are, so the cost of leaving it uncovered is small. Do not "fix"
     this by treating None as parked.
 
     Any non-allowlisted persona, or pane_idle in {False, None}, returns False —
@@ -986,7 +1132,7 @@ def evaluate(obs, prior, *, warn_samples=WARN_SAMPLES, coarse_samples=COARSE_SAM
     # emitted long after the pane stopped being readable, still asserting
     # "pane was OBSERVED idle".
     #
-    # MEASURED 2026-08-02: mnemosyne, whose seat was deliberately paused (no claude
+    # MEASURED 2026-08-02: archivist, whose seat was deliberately paused (no claude
     # process, no tmux server at all), alerted from the warn tier at
     # idle_unread_samples=313 with exactly that text. The 313 were real, and every
     # one of them predates the pause. Coarse held only 2. The claim was true once
@@ -1064,16 +1210,16 @@ def stalled_senders(box: Path, now: float) -> dict | None:
 def notify_senders(alert, hub: Path, now: float, dry_run: bool = False) -> list:
     """Tell each SENDER that its dispatch is sitting in a queue nobody is draining.
 
-    THE GAP THIS CLOSES (T-2267, metis): when a seat is dormant the receiver is
+    THE GAP THIS CLOSES (T-2267, mason): when a seat is dormant the receiver is
     absent BY DEFINITION, so the only party who could notice is the sender — and
     the sender had no surface that reported it. In the worked case orchestrator
-    dispatched T-2245 into a dormant metis seat at 21:38:53Z and reported the
+    dispatched T-2245 into a dormant mason seat at 21:38:53Z and reported the
     dispatch upstream as fact; what eventually surfaced it was an OnFailure line
     on an unrelated unit, firing nine minutes later, reaching a third party.
 
     WHY THIS IS AFTER-THE-FACT RATHER THAN AT SEND TIME, which was one of the
     placements offered and is the one I rejected: a send-time probe is another
-    POINT SAMPLE, and metis's own critique of this failure is that two point
+    POINT SAMPLE, and mason's own critique of this failure is that two point
     proxies (`pgrep -c` counting a dormant account's systemd/gpg-agent baseline,
     and new==0 read as "drains promptly") both agreed with health while neither
     measured it. A liveness answer that is true at 21:38:53Z says nothing about
@@ -1127,6 +1273,62 @@ def notify_senders(alert, hub: Path, now: float, dry_run: bool = False) -> list:
 
 
 # ---------------------------------------------------------------- delivery
+# rev-t4284b r1 NIT-4 (orchestrator's call): route_failure_alert("recovery") was a direct
+# the operator Telegram. That's the wrong tier for a trigger built on a BUSY heuristic
+# (D1), so recovery's own busy-stale goes to orchestrator, which escalates if it's real.
+# (Since T-4399 route_failure_alert("recovery") also goes to orchestrator first, but this mail
+# keeps the structured busy-stale payload and skips the recovery-self backoff.)
+_BUSY_STALE_RECOVERY_SELF_ROUTE = "orchestrator"
+
+
+def _send_busy_stale_to_orchestrator(alert, line: str, hub: Path) -> bool:
+    """Mail recovery's own busy-stale alert to orchestrator. False on failure, so the caller
+    falls back to the normal route: this monitor fails toward alerting."""
+    try:
+        mailbox.send(hub / _BUSY_STALE_RECOVERY_SELF_ROUTE,
+                     {"kind": _KIND_BUSY_STALE, "inbox": alert.inbox, "unread": alert.unread,
+                      "oldest_age_s": alert.oldest_age_s, "text": line},
+                     sender=_ALERT_VOCAB, subject=line[:120])
+        return True
+    except Exception as exc:
+        print(f"[mail_staleness_monitor] busy-stale mail to {_BUSY_STALE_RECOVERY_SELF_ROUTE} "
+              f"failed ({exc!r}); falling back to the failure route", file=sys.stderr)
+        return False
+
+
+def _busy_stale_goes_to_orchestrator(alert) -> bool:
+    """Recovery's own busy-stale alert, while recovery is not muted. rev-t4323 r2 NIT-1: a
+    muted recovery takes the failure route, which honours the ORG-076 §7 mute registry;
+    the direct mail to orchestrator does not."""
+    if alert.kind != _KIND_BUSY_STALE:
+        return False
+    try:
+        from inbox_consumer import SELF_TRIAGE_AGENT, _persona_is_muted
+    except Exception as exc:  # fail toward alerting: the orchestrator mail needs only mailbox
+        print(f"[mail_staleness_monitor] inbox_consumer import failed ({exc!r}); "
+              f"routing recovery's busy-stale to {_BUSY_STALE_RECOVERY_SELF_ROUTE} unmuted",
+              file=sys.stderr)
+        return alert.inbox == "recovery"
+    return alert.inbox == SELF_TRIAGE_AGENT and not _persona_is_muted(SELF_TRIAGE_AGENT)
+
+
+def _recipient_is_muted(inbox: str) -> bool:
+    """Is this inbox's persona muted in the ORG-076 §7 registry (a declared pause)?
+
+    T-4749. The pause signal for controller-managed seats (mason, artisan): their
+    session has no restart_service, so _inbox_seat_is_paused cannot see it, but the
+    pause runbook mutes them. Fail-open like notify_policy: any lookup failure is
+    "not muted", so the sender notice still goes out.
+    """
+    try:
+        from inbox_consumer import _persona_is_muted
+        return _persona_is_muted(inbox) is True
+    except Exception as exc:
+        print(f"[mail_staleness_monitor] mute lookup for {inbox} failed ({exc!r}); "
+              f"treating as not muted", file=sys.stderr)
+        return False
+
+
 def deliver(alerts, obs: dict | None = None, dry_run: bool = False,
             coverage_warning: str | None = None,
             hub: Path = MAILBOX_HUB, now: float | None = None) -> None:
@@ -1150,7 +1352,7 @@ def deliver(alerts, obs: dict | None = None, dry_run: bool = False,
     for a in alerts:
         if _inbox_seat_is_paused(a.inbox):
             # T-2397: the seat was taken out of service on purpose, so nobody
-            # draining it is the intended state, not a fault. MEASURED: mnemosyne
+            # draining it is the intended state, not a fault. MEASURED: archivist
             # was re-alerted about hourly for the whole operator-directed pause
             # (the operator TG6694) over one held DLQ message that is DELIBERATELY
             # parked there as T-2384's only live specimen. The condition is real,
@@ -1168,7 +1370,7 @@ def deliver(alerts, obs: dict | None = None, dry_run: bool = False,
         # BY DESIGN — they drain when next spawned, not continuously — so an
         # undrained queue on one is a parked state, not a fault. Their session unit
         # stays ENABLED, so _inbox_seat_is_paused above does not see them, which is
-        # why they previously false-fired (atlas/metis, ~hourly, 2026-08-08).
+        # why they previously false-fired (artisan/mason, ~hourly, 2026-08-08).
         # Suppress ONLY on affirmative (allowlisted) AND (RAW pane_idle is True);
         # absent/generating pane still alerts (never-suppress-on-unknown). pane_idle
         # is threaded from main()'s obs, which preserves the raw tristate
@@ -1183,8 +1385,12 @@ def deliver(alerts, obs: dict | None = None, dry_run: bool = False,
                   f"{a.text[:70]}")
             continue
         line = f"[{_ALERT_VOCAB}] {a.text}"
+        busy_stale_self = _busy_stale_goes_to_orchestrator(a)
         if dry_run:
-            print(f"  WOULD SEND: {line}")
+            where = f" (to {_BUSY_STALE_RECOVERY_SELF_ROUTE}'s mailbox)" if busy_stale_self else ""
+            print(f"  WOULD SEND{where}: {line}")
+            continue
+        if busy_stale_self and _send_busy_stale_to_orchestrator(a, line, hub):
             continue
         try:
             from inbox_consumer import route_failure_alert
@@ -1192,9 +1398,21 @@ def deliver(alerts, obs: dict | None = None, dry_run: bool = False,
                                 line, _ALERT_VOCAB)
         except Exception as exc:  # delivery must never break the sampler
             print(f"[mail_staleness_monitor] delivery failed: {exc!r}", file=sys.stderr)
+        if a.kind == _KIND_BUSY_STALE:
+            # rev-t4284b r1 NIT-3: the sender notice below was written for a dormant
+            # seat ("QUEUE NOBODY IS DRAINING"). A BUSY pane may be mid-turn, so it
+            # claims more than this tier knows, and it would cost each sender a turn.
+            continue
         # T-2267: the alert above tells the RECIPIENT's triage path. When nobody is
         # draining that inbox, the one party guaranteed not to hear about it is the
         # SENDER — so tell it too, separately and by name.
+        # T-4749: unless the recipient is muted (a declared pause). route_failure_alert
+        # above already withheld the recipient's own alert for that mute, and a sender
+        # notice would otherwise repeat every realert (~1h) for the whole pause.
+        if _recipient_is_muted(a.inbox):
+            print(f"[mail_staleness_monitor] {a.inbox}: recipient muted (declared "
+                  f"pause) — not notifying senders: {a.text[:70]}")
+            continue
         try:
             notify_senders(a, hub, time.time() if now is None else now, dry_run)
         except Exception as exc:
@@ -1227,12 +1445,12 @@ def main(argv=None) -> int:
     # throttle (12 samples, ~1h) blocked the next one. The operator saw
     # "0 alert(s)" while the monitor quietly refused to speak.
     #
-    # That is not hypothetical: mnemosyne's bridge died silently 19:20-20:50Z on
+    # That is not hypothetical: archivist's bridge died silently 19:20-20:50Z on
     # 2026-07-28. The monitor ran 23 times across that window and alerted ZERO
     # times, with state showing idle_unread_samples=22 and samples_since_alert=8 —
     # alerts raised, swallowed, and then throttled. A 90-minute delivery outage
     # went unreported by the tool built that afternoon to report exactly it, and
-    # mnemosyne found it by hand.
+    # archivist found it by hand.
     #
     # Coercing the OBSERVATION means a draining inbox never counts as an
     # idle-with-unread sample at all: nothing is emitted, so nothing is throttled.
@@ -1246,6 +1464,14 @@ def main(argv=None) -> int:
     recency = delivery_recency(hub)
     clock, advanced = drain_progress(hub, load_drain_clock())
     obs, draining = _coerce_draining(obs, advanced)
+
+    # T-5244: a seat held in seat-maintenance is excluded BEFORE evaluate(), not just
+    # muted after it: muting an emitted alert would leave the state machine believing it
+    # had alerted and throttle the first real alert after the hold (the 2026-07-28
+    # swallow-then-throttle defect described above).
+    # ORG-106 L4b: a declared pause / deep-sleep queues mail on purpose, same exclusion.
+    held_inboxes = {name for name in obs if _inbox_held(name)}
+    obs = {k: v for k, v in obs.items() if k not in held_inboxes}
 
     alerts, next_state = evaluate(obs, prior)
 
@@ -1267,10 +1493,36 @@ def main(argv=None) -> int:
         seen = {(a.inbox, a.kind) for a in alerts}
         alerts = alerts + [a for a in urgent_alerts if (a.inbox, a.kind) not in seen]
 
+    # T-4323(b): the BUSY backstop runs last, on the draining-coerced `obs`, and
+    # skips any inbox another tier already alerted this sample.
+    busy_alerts, busy_state = detect_busy_stale(
+        obs, hub=hub, prior=prior.get("busy_stale") if isinstance(prior, dict) else None,
+        skip={a.inbox for a in alerts})
+    next_state["busy_stale"] = busy_state
+    alerts = alerts + busy_alerts
+
+    # The urgent tier reads the hub directly, so it still sees held inboxes: drop those
+    # alerts AND their cooldown entries, so the urgent tier starts fresh after the hold.
+    alerts, held = suppress_maintenance(alerts)
+    # ORG-106: the urgent cooldown is dropped only for inboxes whose URGENT tier is held
+    # (maintenance / deep-sleep). A paused seat's urgent stamps persist, so a failed wake
+    # re-alerts on the normal cooldown, not every sample.
+    urgent_held = {name for name in held_inboxes if _inbox_urgent_held(name)}
+    for a in held:
+        urgent_held.add(a.inbox)
+        held_inboxes.add(a.inbox)
+    next_state["urgent"] = {k: v for k, v in (next_state.get("urgent") or {}).items()
+                            if k not in urgent_held}
+
     for name, o in sorted(obs.items()):
         state = {True: "idle", False: "busy", None: "unknown"}[o.pane_idle]
         print(f"  {name:<14} unread={o.unread:<3} in_flight={o.in_flight:<3} pane={state}")
     print(f"  {len(alerts)} alert(s)")
+    for name in sorted(held_inboxes):
+        if _inbox_in_maintenance(name):
+            print(f"  · {name}: seat-maintenance active — alerts suppressed (T-5244)")
+        else:
+            print(f"  · {name}: seat paused / asleep (ORG-106) — mail queues by design, ordinary alerts suppressed (urgent kept unless asleep)")
     for a in suppressed:
         r = recency.get(a.inbox)
         age = f"{r/60:.1f}m ago" if r is not None else "unknown"

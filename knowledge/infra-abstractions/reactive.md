@@ -24,7 +24,7 @@ the chains table in the README is the composition view; this file is the per-com
 (a timer re-fire never double-delivers); cross-account/group-gated consumers respect the
 [user-systemd group constraint](cross-cutting-patterns.md#user-systemd-carries-only-the-primary-group)
 (the hub's inotify `.path` units are structurally DEAD — clock-timer transport is the
-mechanism, `sg veneration`-wrapped ExecStart) and the
+mechanism, `sg pantheon-mailbox`-wrapped ExecStart; group formerly `veneration`) and the
 [timer-anchor discipline](cross-cutting-patterns.md#timer-anchor-discipline-survive-a-manager-restart)
 (`OnBootSec` + `OnUnitActiveSec`, survives a manager restart). Repairs are **verified
 structurally** (PID change, file written, ref updated) — never trust exit-zero/is-active
@@ -42,11 +42,10 @@ structurally** (PID change, file written, ref updated) — never trust exit-zero
 ### mailbox_wake — hub-mail delivery
 - `tools/mailbox_wake.py` (drives `mailbox.py`) · `pantheon-mailbox-wake@.{service,timer}` · `OnBootSec=2min` + 5 min, per-agent.
 - **Chain:** agents (`mailbox.send`) → `/home/the-ancestor/mailbox/<agent>/new/` → wake the agent to consume. Marker-debounced. The load-bearing autonomous-intercomms path (T-1015); restart-durable.
-- **codex caveat (T-1041):** codex participates but is not a Claude agent — `bwrap` sandbox blocks `sg` (needs **native** `veneration` membership via user-manager restart, not daemon restart); the hub must be in `writable_roots` with group-writable entries (the `0710` hub parent breaks bwrap's git-prep → every codex shell command fails); codex cwd is its home so kicks need **absolute** paths. Runbook: `codex-config:MAILBOX.md`.
+- **codex caveat (T-1041):** codex participates but is not a Claude agent — `bwrap` sandbox blocks `sg` (needs **native** `pantheon-mailbox` membership via user-manager restart, not daemon restart); the hub must be in `writable_roots` with group-writable entries (the `0710` hub parent breaks bwrap's git-prep → every codex shell command fails); codex cwd is its home so kicks need **absolute** paths. Runbook: `codex-config:MAILBOX.md`.
 
-### ancestor_consume — the-ancestor dispatch loop
-- `tools/ancestor_consume.py` · runs *inside* the `pantheon-ancestor-daemon.service` session (the unit hosts the daemon; no ExecStart references the script — the old map conflated the two).
-- **Chain:** mail/work addressed to the shared-state host → the-ancestor's own dispatch loop (T-0765 glue; ORG-026 Phase 2 / T-1017 wires the remaining consume sides).
+### ancestor_consume — REMOVED
+- Was the-ancestor's dispatch loop (T-0765). Daemon decommissioned T-2214 (2026-07-28); `tools/ancestor_consume.py` removed T-4741 (#835, 2026-10-09). The hub account + mailbox tree remain as substrate; nothing consumes the-ancestor's box.
 
 ## Subtype: Repairer — execute the repair the artifact requests
 
@@ -72,5 +71,5 @@ nudging of *healthy-but-idle* agents is [Scheduled/Monitor](scheduled.md) (`keep
 ## Placement notes
 
 - New consumer: add the chain row in the README first (producer → artifact → consumer), then the component entry here. Deliverer vs Repairer by what the artifact asks for (work vs repair).
-- After ANY tooling against another agent's live session (even read-only), verify health and STATE it (memory `feedback_confirm_health_after_touching_live_sessions`). Account for auto-remediation when diagnosing — a healthy snapshot ≠ false alarm (memory `feedback_account_for_auto_remediation_in_incident_diagnosis`).
-- The old families map here as: Pollers → Deliverer; Wakers → split (`keep_going` → Scheduled/Monitor; `mailbox_wake` stays here as Deliverer — it delivers work); Remediators' *standing* members → Repairer (`handoff_and_restart.sh` + `restart_request` + `veneration` → [Invoked](invoked.md), they have no standing trigger).
+- After ANY tooling against another agent's live session (even read-only), verify health and STATE it (`sop/standard/confirm-health-after-touching-a-live-session.md`). Account for auto-remediation when diagnosing — a healthy snapshot ≠ false alarm (memory `feedback_account_for_auto_remediation_in_incident_diagnosis`).
+- The old families map here as: Pollers → Deliverer; Wakers → split (`keep_going` → Scheduled/Monitor; `mailbox_wake` stays here as Deliverer — it delivers work); Remediators' *standing* members → Repairer (`handoff_and_restart.sh` + `restart_request` (+ the since-removed `veneration`) → [Invoked](invoked.md), they have no standing trigger).

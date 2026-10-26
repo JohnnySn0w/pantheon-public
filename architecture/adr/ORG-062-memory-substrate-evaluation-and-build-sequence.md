@@ -2,7 +2,7 @@
 aliases: [ORG-062]
 id: ORG-062
 title: "Memory substrate evaluation methodology and build sequence"
-status: Draft (Autonomous — Specialist-authored under the operator's direction, Telegram 1186; canonical-written by orchestrator; awaiting the operator ratification — extends operator-ratified ORG-058)
+status: Ratified 2026-10-07
 date: 2026-08-03
 # re_evaluate: machine-checkable mirror of the "## Re-evaluate when" section,
 # consumed by tools/adr_reeval_walk.py (T-2527) during the weekly-review walk.
@@ -46,7 +46,7 @@ elements:
 
 # ORG-062 — Memory substrate evaluation methodology and build sequence (extends ORG-058)
 
-**Status:** **Draft / Autonomous — awaiting the operator ratification.** Authored by Specialist
+**Status:** Ratified 2026-10-07 by the operator (Telegram 11286, on the T-2517 walk: "ratify"; he prefers ADRs abstract with detail in referenced files, so the PMB-1 criteria correctly stay in the T-2425 report). The §6 companion amendment to ORG-058:R7 was ratified separately (Telegram 11289) and applied to ORG-058. Previously: Draft / Autonomous. Authored by Specialist
 (claude-research) at the operator's explicit direction (Telegram 1186, 2026-08-03); canonical
 `adr/` write by orchestrator per ORG-012 (Specialist's seat cannot write `adr/`) and the T-2399
 draft-in-episodic → canonical-adr precedent. **HITL:** agent-authored; ratification
@@ -71,7 +71,7 @@ the memory organ is built, or *what the current evidence supports*.
 Two commissioned syntheses (T-2425, T-2512) now supply that. Their load-bearing
 conclusions:
 
-- **Native/latent memory is not a replacement for external memory** — the Metis authors
+- **Native/latent memory is not a replacement for external memory** — the Mason authors
   say so; measured, on the external benchmark native memory scored *below* plain RAG, and
   storing irrelevant memory cost −22pt strict instruction-following (T-2425 §1.3, §1.6).
 - **No architecture dominates; match to workload** — so the right unit of decision is a
@@ -123,7 +123,7 @@ re-implements those more weakly. Sequence:
 
 ### 3. Native memory and self-evolving world models are watch-only
 
-Native/latent memory (Metis class) and self-evolving world-model substrates (MemOS class)
+Native/latent memory (Mason class) and self-evolving world-model substrates (MemOS class)
 are **not built** under this ADR. They trip ORG-058 §6's "identity cannot be silently
 learned" gate and R7's serializable-with-governance precondition, and carry the measured
 −22pt instruction-following cost. They are re-evaluated only on **ORG-058:R7**, and only

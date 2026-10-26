@@ -302,7 +302,7 @@ def test_pending_park_refuses_on_unenumerated_prior_state(case_id: str, extra: d
 
 
 # ---------------------------------------------------------------------------
-# Test 2: Reboot-recovery trace (Cairn v9 BLOCK-2 witness).
+# Test 2: Reboot-recovery trace (Consultant v9 BLOCK-2 witness).
 # ---------------------------------------------------------------------------
 
 

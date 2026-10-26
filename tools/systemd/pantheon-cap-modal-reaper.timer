@@ -1,0 +1,18 @@
+[Unit]
+Description=Pantheon cap-modal reaper — every 5 min: dismiss a rolled spend-limit modal once its window has rolled (T-4024)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# 5min matches cap_mute_driver + the flood monitors. Latency is not correctness-critical: the
+# modal persists indefinitely until Esc'd, and the reaper only acts AFTER the window has
+# rolled, so a few minutes past reset is fine. Level-triggered + idempotent.
+OnUnitActiveSec=5min
+OnBootSec=3min
+OnActiveSec=1min
+
+# Deliberately NOT Persistent=true: a missed window is not a missed job — the next fire reads
+# the current pane + current state and fully reconciles.
+Unit=pantheon-cap-modal-reaper.service
+
+[Install]
+WantedBy=timers.target

@@ -198,7 +198,7 @@ def _cmd_verify(args: argparse.Namespace) -> int:
 
 def _cmd_plan(args: argparse.Namespace) -> int:
     try:
-        manifest = Manifest.load(args.manifest)
+        manifest = Manifest.load(args.manifest, strict_flip_keys=False)
         binding = manifest.binding(args.persona)
     except ManifestError as exc:
         raise CliError(str(exc)) from exc

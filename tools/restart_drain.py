@@ -147,7 +147,7 @@ DETACHED_LAUNCH_TIMEOUT_SECONDS = 15
 # `"restart_service" not in b` gate below is already the correct predicate and was
 # already doing the real work; the outer tuple only ever subtracted from it. The
 # measured casualty: instance.yaml grants restart_service to FOUR roles (adding
-# second-head/mnemosyne), so a restart tombstone written for mnemosyne hit the
+# second-head/archivist), so a restart tombstone written for archivist hit the
 # `agent not in DRAIN_AGENT_CONFIG` branch and was quarantined as an unknown
 # agent — the drain silently did not cover a seat the manifest says is
 # restartable. Deriving deletes the list rather than extending it, so the next
@@ -157,7 +157,7 @@ DETACHED_LAUNCH_TIMEOUT_SECONDS = 15
 # same-account by construction: a drain only ever sees tombstones in its OWN
 # account's PANTHEON_STATE_DIR (~/.local/state/pantheon, home-rooted), so
 # widening this map cannot let one account fire another's restart — it only lets
-# mnemosyne's own drain act on mnemosyne's own tombstone.
+# archivist's own drain act on archivist's own tombstone.
 
 
 def _build_drain_config() -> dict:
@@ -537,6 +537,11 @@ def _fire_restart(cfg: dict, agent: str, *, skip_ack: bool = False) -> tuple[boo
     run_cmd += ["--collect", f"--unit={unit_name}"]
     if mode == "user":
         run_cmd.append(f"--setenv=XDG_RUNTIME_DIR=/run/user/{os.getuid()}")
+        # T-4834: --collect GCs a failed unit and the tombstone is already removed, so
+        # a failed restart (e.g. the T-4828 exit-3 dialog refusal) was silent. Page
+        # Recovery through the user-unit alert template; its journal read outlives GC.
+        # systemd-run -p does not expand %n, so the instance is the literal unit name.
+        run_cmd += ["-p", f"OnFailure=pantheon-unit-failure-alert@{unit_name}.service.service"]
     run_cmd += ["--", "bash", "-c", inner]
 
     try:

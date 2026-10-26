@@ -48,6 +48,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+from tools import agent_role_map
 from tools import mailbox
 from tools.bringup_acceptance import restore as restore_mod
 from tools.bringup_acceptance.evidence import RunPaths, write_module_evidence
@@ -72,8 +73,10 @@ _CONSUME_LABEL = "mailbox-roundtrip-prove"
 # default. A module-level constant (not imported from either) so a change to
 # either of those defaults does not silently widen or narrow this guard --
 # see the DECISIONS on why this module does not share private state with its
-# siblings.
-_REAL_HUB_DEFAULT = Path("/home/the-ancestor/mailbox")
+# siblings. The value itself is the canonical manifest hub (instance.yaml
+# mailbox.hub via agent_role_map, T-4096) — a public source, not sibling
+# private state — so the guard follows the real hub across an ORG-087 move.
+_REAL_HUB_DEFAULT = Path(agent_role_map.mailbox_hub())
 
 
 @contextmanager

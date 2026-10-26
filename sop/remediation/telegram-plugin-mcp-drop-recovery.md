@@ -8,7 +8,7 @@ How to recover an agent (Orchestrator/Specialist/Recovery) whose **Telegram chan
 
 The agent is **comms-dark but not wedged**: the `claude --channels plugin:telegram@claude-plugins-official` session keeps processing turns, the pane is healthy/idle, `systemctl is-active` is `active` — but the Telegram MCP server (a child of the claude process, providing `mcp__plugin_telegram_telegram__reply` + inbound) has lost its connection. The operator can neither reach nor be reached by the agent.
 
-**Why the standard detectors miss it:** wedge/staleness (T-0857) needs a *frozen pane*; verify_startup checks *pane* health. Both read session-liveness, which is green. This is a *channel-layer* failure — `is-active`/pane-healthy is **not** a comms-health signal (sibling to the 2026-05-21 alive-but-erroring mode). The agent's only intact comms path is the **ticket queue** — expect it to self-report by filing a target=recovery ticket.
+**Why the standard detectors miss it:** wedge/staleness (T-0857) needs a *frozen pane*; verify_startup checks *pane* health. Both read session-liveness, which is green. This is a *channel-layer* failure — `is-active`/pane-healthy is **not** a comms-health signal (sibling to the 2026-05-21 alive-but-erroring mode). The agent's only intact comms path is the **ticket queue** — expect it to self-report by filing a target=role:head_system_orchestrator ticket.
 
 **Key architecture fact:** Telegram is a Claude Code *plugin baked into the session*, not a separate service. There is **no separate bridge to bounce** — the MCP server lives inside the claude process. So the only fixes are in-session reconnect (not agent-drivable) or a client restart.
 
@@ -29,7 +29,7 @@ The agent is **comms-dark but not wedged**: the `claude --channels plugin:telegr
 
 - **Never** spawn a second `claude` / `claude --bare` / anything that grabs the Telegram token — it steals the token and kills the *live* bridge ([[feedback_no_second_claude_with_telegram_plugin]]).
 - **Never** `systemctl restart` and trust exit-zero / `is-active` as proof — verify by PID change.
-- After any send-keys to the agent's pane, **confirm its health** (`is-active` + capture-pane) and state it ([[feedback_confirm_health_after_touching_live_sessions]]).
+- After any send-keys to the agent's pane, **confirm its health** (`is-active` + capture-pane) and state it (`sop/standard/confirm-health-after-touching-a-live-session.md`).
 
 ## Autonomous-vs-bubble-up D3 placement
 
@@ -40,5 +40,5 @@ The agent is **comms-dark but not wedged**: the `claude --channels plugin:telegr
 
 - Incident: [`incidents/2026-06-06-orchestrator-telegram-plugin-drop`](../../incidents/2026-06-06-orchestrator-telegram-plugin-drop/README.md).
 - Sibling SOPs: [`recovery-service-recovery.md`](recovery-service-recovery.md), [`persona-daemon-liveness-recovery.md`](persona-daemon-liveness-recovery.md) (process-exit / inert-daemon modes — distinct from this channel-drop mode).
-- Memory: [[reference_handoff_restart_systemctl_no_op]], [[reference_telegram_agent_setup]], [[feedback_no_second_claude_with_telegram_plugin]], [[feedback_confirm_health_after_touching_live_sessions]].
+- Memory: [[reference_handoff_restart_systemctl_no_op]], [[reference_telegram_agent_setup]], [[feedback_no_second_claude_with_telegram_plugin]]. SOP: `sop/standard/confirm-health-after-touching-a-live-session.md`.
 - Detection gap (no auto-detect for channel-down-while-session-healthy): follow-up ticket off T-0893.

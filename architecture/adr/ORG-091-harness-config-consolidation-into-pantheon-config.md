@@ -27,10 +27,10 @@ Today Pantheon has three source-of-truth repos on the VPS: `pantheon-config` (or
 Beyond the permission issue, the topology has three secondary drift shapes measured at T-3102's audit:
 
 1. **Repo drift.** claude-config + codex-config are edited independently and drift both from each other and from what `persona_installer` would install today. T-3102's audit found live-state divergence at material.
-2. **INSTANCE-content leak into FRAMEWORK repos.** claude-config carries `pinned-rules/orchestrator.md` (persona brief content), asymmetric with specialist.md + recovery.md which live in `pantheon-config/pinned-rules/`. codex-config hardcodes `/home/codex` paths + the operator's chat_id `456474197` — INSTANCE-class values baked into FRAMEWORK templates in violation of [[ORG-039]] §1.
-3. **De-facto pinned-rules-home drift.** The pantheon-config `pinned-rules/README.md` still names `claude-config/pinned-rules/` as canonical home per [[T-0493]], but five of seven pinned-rules files (Recovery / Specialist / Metis / Atlas / Mnemosyne + orchestrator-codex) already live in `pantheon-config/pinned-rules/`. Only `orchestrator.md` sits in claude-config. The canonical-home claim is de-facto obsolete.
+2. **INSTANCE-content leak into FRAMEWORK repos.** claude-config carries `pinned-rules/orchestrator.md` (persona brief content), asymmetric with specialist.md + recovery.md which live in `pantheon-config/pinned-rules/`. codex-config hardcodes `/home/codex` paths + the operator's chat_id `424242424` — INSTANCE-class values baked into FRAMEWORK templates in violation of [[ORG-039]] §1.
+3. **De-facto pinned-rules-home drift.** The pantheon-config `pinned-rules/README.md` still names `claude-config/pinned-rules/` as canonical home per [[T-0493]], but five of seven pinned-rules files (Recovery / Specialist / Mason / Artisan / Archivist + orchestrator-codex) already live in `pantheon-config/pinned-rules/`. Only `orchestrator.md` sits in claude-config. The canonical-home claim is de-facto obsolete.
 
-T-3104 surfaced three candidate shapes for the fix: A (partition-in-place, keep separate repos + distribute FRAMEWORK slice per [[ORG-028]] par 4), B (consolidate FRAMEWORK slices into `pantheon-config/harness/{claude,codex}/` subdirs, retire the separate repos, public mirror becomes a generated artifact), C (rename + partition, keep separate repos, cheapest incremental improvement). Cairn's audit recommendation was B. The operator ratified the direction (Telegram 9105).
+T-3104 surfaced three candidate shapes for the fix: A (partition-in-place, keep separate repos + distribute FRAMEWORK slice per [[ORG-028]] par 4), B (consolidate FRAMEWORK slices into `pantheon-config/harness/{claude,codex}/` subdirs, retire the separate repos, public mirror becomes a generated artifact), C (rename + partition, keep separate repos, cheapest incremental improvement). Consultant's audit recommendation was B. The operator ratified the direction (Telegram 9105).
 
 ## Riskiest assumption
 
@@ -46,7 +46,7 @@ Adopt **shape B** — consolidate the FRAMEWORK slices of both harness-config re
 
 - `pantheon-config/harness/claude/` — the FRAMEWORK slice of what was `claude-config`. Includes `agents/`, generic `pinned-rules/` templates, `settings.json.template`, hook wiring, MCP scaffolding — everything harness-generic per [[ORG-039]] §1.
 - `pantheon-config/harness/codex/` — the FRAMEWORK slice of what was `codex-config`. Same partition principle. Absolute paths and instance-specific values (chat_id, `/home/codex`) route through `instance.yaml` per ORG-039 §2.
-- `pantheon-config/pinned-rules/orchestrator.md` — INSTANCE-slice persona brief. Joins the existing `specialist.md` / `recovery.md` / `metis.md` / `atlas.md` / `mnemosyne.md` / `orchestrator-codex.md` per the pattern the majority already follows. Retires the [[T-0493]] canonical-home-in-claude-config claim as superseded by this ADR.
+- `pantheon-config/pinned-rules/orchestrator.md` — INSTANCE-slice persona brief. Joins the existing `specialist.md` / `recovery.md` / `mason.md` / `artisan.md` / `archivist.md` / `orchestrator-codex.md` per the pattern the majority already follows. Retires the [[T-0493]] canonical-home-in-claude-config claim as superseded by this ADR.
 - Separate top-level `claude-config` + `codex-config` repos: **archived read-only** post-migration + before deploy-key retirement. Old repos remain fetchable for provenance/audit; nothing writes to them.
 
 ### 2. Mirror as generated artifact
@@ -82,19 +82,19 @@ Everything operator-specific (chat_id, absolute paths, persona name bindings, se
 - **"canonical pinned-rules home is `claude-config/pinned-rules/`"** — RETIRED. The canonical home is `pantheon-config/pinned-rules/` for every persona, uniform. Orchestrator's `orchestrator.md` migrates as part of the phase-2 partition.
 - **Edit protocol ("no PRs needed, self-commit, git history is audit trail")** — PRESERVED. Applies uniformly to `pantheon-config/pinned-rules/*.md` post-migration.
 
-## Migration plan (Cairn's 7-phase path, adopted)
+## Migration plan (Consultant's 7-phase path, adopted)
 
 Each phase is reversible per phase and standalone-landable.
 
 1. **Ratify this ADR.** The operator ratifies against this body. T-3104 resolves as executed-via-ORG-091. This phase is the ratification event, not a code landing.
-2. **Genericize + partition both live repos in place.** In claude-config: strip persona-brief content from `pinned-rules/orchestrator.md` (INSTANCE) into a target that will move to `pantheon-config/pinned-rules/orchestrator.md`; keep the role-keyed skeleton. In codex-config: parameterize hardcoded `/home/codex` paths and the allowlist template's hardcoded chat_id (`456474197`) via `instance.yaml`-style references. Add leakage-scan tests + clean-home smoke. Reversible (revert commit). Both repos remain their own source of truth this phase.
+2. **Genericize + partition both live repos in place.** In claude-config: strip persona-brief content from `pinned-rules/orchestrator.md` (INSTANCE) into a target that will move to `pantheon-config/pinned-rules/orchestrator.md`; keep the role-keyed skeleton. In codex-config: parameterize hardcoded `/home/codex` paths and the allowlist template's hardcoded chat_id (`424242424`) via `instance.yaml`-style references. Add leakage-scan tests + clean-home smoke. Reversible (revert commit). Both repos remain their own source of truth this phase.
 3. **Import FRAMEWORK history into `pantheon-config/harness/{claude,codex}/`** via `git subtree add` (preserves the imported repo's commit history under the subdirectory prefix). At this phase both source-of-truth locations exist simultaneously — old repos still writable, new subdirs additive. Reversible by removing the subdirs.
 4. **Path-scoped owners + CI.** `pantheon-config/harness/claude/` changes trigger the claude harness's unit / clean-home / leakage / packaging / installer tests; `harness/codex/` similarly. Unrelated ticket / ledger changes to pantheon-config don't publish a harness release. Reversible by removing the CI gates.
 5. **Reproducible versioned bundles / release mirrors.** Land the mirror-generation pipeline that produces `claude-code-config` releases from `pantheon-config/harness/claude/` + allowlisted shared assets. A deployed seat binds to a pantheon-config commit + subtree/bundle digest. Reversible by unpublishing the release; the source stays.
 6. **Update `persona_installer` / bridge / all executable old-path consumers.** Every code path that reads `claude-config` or `codex-config` retargets to `pantheon-config/harness/{claude,codex}/`. Canary on one seat + prove rollback before fleet rollout. Reversible by reverting the persona_installer changes; old repos still exist as fallback until phase 7.
 7. **Archive old repos read-only + retire deploy keys.** Only after all seats + the self-hoster release consume the new source. This phase is the point-of-no-return; before this phase, everything is reversible on the same-day.
 
-Between phase 5 and phase 7, both source locations exist and are consumed. This is the transient overlap Cairn's audit called out — needs ordering discipline so nothing reads from both simultaneously (a per-executable one-of-two-locations config binding, not both).
+Between phase 5 and phase 7, both source locations exist and are consumed. This is the transient overlap Consultant's audit called out — needs ordering discipline so nothing reads from both simultaneously (a per-executable one-of-two-locations config binding, not both).
 
 ## Consequences
 
@@ -131,7 +131,7 @@ Between phase 5 and phase 7, both source locations exist and are consumed. This 
 
 ### Cost break-even
 
-Cairn's audit put A's ongoing cost as "6+ clones added to seats + T-1475 pipeline update + ongoing per-repo maintenance." B has a one-time migration cost + retires ongoing cost. Break-even is fast as the fleet grows — SSEED will spawn seats programmatically, and each new seat under A adds two clones + two deploy-key provisioning steps that B eliminates.
+Consultant's audit put A's ongoing cost as "6+ clones added to seats + T-1475 pipeline update + ongoing per-repo maintenance." B has a one-time migration cost + retires ongoing cost. Break-even is fast as the fleet grows — SSEED will spawn seats programmatically, and each new seat under A adds two clones + two deploy-key provisioning steps that B eliminates.
 
 ## Boundary — what this ADR does NOT decide
 
@@ -151,7 +151,7 @@ Cairn's audit put A's ongoing cost as "6+ clones added to seats + T-1475 pipelin
 - [[ORG-079]] — L1 install-completeness contract; V<n> invariants continue to check the same content, just resolved through pantheon-config/harness/*/ path.
 - [[ORG-080]] — germination engine (SSEED); new-seat provisioning under B simplifies from 3-clone to 1-clone shape.
 - [[T-3104]] — the scoping ticket + the operator's B ratify direction (TG 9105).
-- [[T-3102]] — the audit that identified the topology drift + Cairn's cost-compared A/B/C.
+- [[T-3102]] — the audit that identified the topology drift + Consultant's cost-compared A/B/C.
 - [[T-1475]] — the public mirror history that becomes a generated-artifact pipeline under phase 5.
 - [[T-0493]] — pinned-rules edit-protocol + canonical-home claim being retired.
 - [[T-0495]] / [[T-0496]] — Recovery + Specialist pinned-rules-in-pantheon-config accommodation; retires as "the accommodation IS the canonical home now."

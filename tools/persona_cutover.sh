@@ -135,6 +135,11 @@ DBUS="$PCX_DBUS_SESSION_BUS_ADDRESS"
 export XDG_RUNTIME_DIR="$XRD"
 export DBUS_SESSION_BUS_ADDRESS="$DBUS"
 
+# ORG-106 L3a (T-5526): a cutover starts the seat's session; never wake a deep-sleeping seat.
+_lc_rc=0
+python3 "$SCRIPT_DIR/seat_state.py" launch-check "$PERSONA" || _lc_rc=$?
+[[ $_lc_rc -ne 3 ]] || die "${PERSONA} is in deep-sleep; wake it first (harness ${PERSONA} wake)"
+
 # --- precondition: persona is install-done / harness-findable (T-2611) -----
 # Read-only (runs installer.plan() + a read-only preflight pass; never
 # apply()). Runs in both dry-run and --execute modes: it's cheap and it's the
@@ -392,7 +397,7 @@ if echo "$CUTOVER_ARGV" | grep -q -- "--model ${PCX_MODEL}"; then
 else
   echo "verify: --model flag MISSING FAIL"; fail=1
 fi
-if echo "$CUTOVER_ARGV" | grep -q -- "--permission-mode default"; then
+if echo "$CUTOVER_ARGV" | grep -q -- "--permission-mode bypassPermissions"; then
   echo "verify: --permission-mode flag OK"
 else
   echo "verify: --permission-mode flag MISSING FAIL"; fail=1

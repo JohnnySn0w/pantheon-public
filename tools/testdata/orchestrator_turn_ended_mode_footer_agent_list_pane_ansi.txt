@@ -1,0 +1,24 @@
+
+[92m●[39m Teammate [1m[92m@installer-arc[0m finished
+  [2m[37mGot it,[0m [2m[37mnothing changes[0m [2m[37mfor the[0m [2m[37mfix round: both new kinds stay in [0m
+  [2m[37mOUT_OF_ENVELOPE_KINDS, sitting before the fires in the activation phase. In [0m
+  [2m[37mthe round-2 review brief I'll ask the reviewer to confirm …[0m
+
+[97m●[39m The installer-arc orchestrator took the ruling, and its round-2 review brief
+  will check that both new ops stay out of the broker and run before every
+  launch. It's still waiting on the T-5473/4 implementer's fix report.
+
+[37m────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[37m────────────────────────────────────────────────────────────────────────────────
+[39m  [91m⏵⏵ bypass permissions on[2m[37m · [0m[96m9 shells[39m
+
+[1m  ● main[0m
+[2m[37m  ◯ implementer[0m    [2m[37mChecking smoke1.log for crash[0m  [2m[37m1h 41m 18s · ↓ 361.2k tokens[0m
+[2m[37m  ◯ installer-arc[0m  [2m[37mInstaller hardening arc orche…[0m                         [2m[37midle[0m
+[2m[37m  ◯ implementer[0m    [2m[37mCommitting persona_installer …[0m  [2m[37m1h 1m 32s · ↓ 130.0k tokens[0m
+[2m[37m [0m [2m[37m◯[0m [2m[37mimplementer[0m    [2m[37mLaunching importer test suite[0m      [2m[37m32m 0s[0m [2m[37m·[0m [2m[37m↓[0m [2m[37m273.2k[0m [2m[37mtokens[0m
+
+
+
+

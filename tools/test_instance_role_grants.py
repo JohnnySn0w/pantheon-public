@@ -8,7 +8,7 @@ fixture can catch. Precedent: the live-tree regression guard in the T-1309 tempf
 lint. There is no CI here — `python3 -m unittest` is the gate.
 
 What went wrong (the class these guard):
-  metis / atlas / mnemosyne were registered in agent_role_map.AGENT_ROLE_MAP but had no
+  mason / artisan / archivist were registered in agent_role_map.AGENT_ROLE_MAP but had no
   `roles:` entry in instance.yaml. resolve_instance_role() falls back to IDENTITY on a miss,
   so it returned the persona name unchanged, the repos.yaml grants lookup missed, and every
   retask ticket declaring a `repos:` field failed ticket_lint. The failure was silent at the
@@ -51,11 +51,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 from tools._snapshot_site_scan import SnapshotSiteScanner  # noqa: E402
 
-# The three bindings ruled by the T-1922 HO ruling (ORG-043 seats + ORG-042 second head).
+# The three bindings ruled by the T-1922 HO ruling (ORG-043 seats + ORG-042 second head);
+# role-keys carry the operator's T-3807 ratified roles vocabulary.
 T1922_BINDINGS = {
-    "metis": "sub-orchestrator-1",
-    "atlas": "sub-orchestrator-2",
-    "mnemosyne": "second-head",
+    "mason": "engineering-orchestrator-1",
+    "artisan": "engineering-orchestrator-2",
+    "archivist": "head-memory-orchestrator",
 }
 
 
@@ -237,7 +238,7 @@ class TestBindingFallbackStaysInSync(unittest.TestCase):
         )
 
     def test_every_instance_yaml_persona_exists_in_the_binding_fallback(self) -> None:
-        """THE OTHER DIRECTION (T-2256, metis's reviewer finding).
+        """THE OTHER DIRECTION (T-2256, mason's reviewer finding).
 
         The two guards above assert fallback ⊆ manifest — no stale entries, no
         contradictions. Neither asserted manifest ⊆ fallback, so a persona bound
@@ -280,27 +281,23 @@ class TestSupervisorField(unittest.TestCase):
 
         self.assertEqual(instance_binding("specialist").get("supervisor"), "control-plane")
 
-    def test_recovery_is_not_control_plane_pre_t3026(self) -> None:
-        """T-3082: recovery's binding must NOT claim control-plane until T-3026's
-        interactive-session cutover actually lands -- pre-cutover the live
-        session is the bespoke claude-telegram-fallback.service, so a
-        control-plane marking makes cfm derive the oneshot consume unit as
-        the restart target, which cannot cycle that session (the T-3082
-        bug). Absence here is the truthful, pre-cutover binding."""
+    def test_recovery_is_control_plane_post_t3026(self) -> None:
+        """T-3026 (2026-09-29): recovery's interactive session moved onto the
+        control plane (runtime controller + consume timer), so its binding now
+        claims control-plane, as specialist's does. Pre-cutover this asserted absence
+        (T-3082); the marker landed only after Gate B and verification passed."""
         from tools.agent_role_map import instance_binding
 
-        self.assertIsNone(instance_binding("recovery").get("supervisor"))
+        self.assertEqual(instance_binding("recovery").get("supervisor"), "control-plane")
 
-    def test_orchestrator_is_not_control_plane_pre_t2953(self) -> None:
-        """T-3098: orchestrator's binding must NOT claim control-plane until T-2953's
-        full cutover actually lands -- pre-cutover the live session is the
-        bespoke claude-telegram.service, so a control-plane marking makes cfm
-        derive the oneshot consume unit as the restart target, which cannot
-        cycle that session (the T-3098 bug, mirrors T-3082's recovery shape).
-        Absence here is the truthful, pre-cutover binding."""
+    def test_orchestrator_is_control_plane_post_t2953(self) -> None:
+        """T-2953 (2026-10-24): orchestrator's interactive session moved onto the
+        control plane (runtime controller + consume timer), so its binding now
+        claims control-plane, as recovery's and specialist's do. Pre-cutover this asserted
+        absence (T-3098); the marker landed only after Gate B and verification passed."""
         from tools.agent_role_map import instance_binding
 
-        self.assertIsNone(instance_binding("orchestrator").get("supervisor"))
+        self.assertEqual(instance_binding("orchestrator").get("supervisor"), "control-plane")
 
     def test_control_plane_consume_service_derives_from_persona(self) -> None:
         from tools.agent_role_map import control_plane_consume_service
@@ -678,7 +675,7 @@ class TestManifestWasActuallyLoaded(unittest.TestCase):
         fallback.
 
         NOT SATISFIABLE BY THE HOST (T-2324 class, folded in on the rebound). This suite runs
-        on exactly one seat — suborch2/atlas — and an assertion that happened to exercise the
+        on exactly one seat — suborch2/artisan — and an assertion that happened to exercise the
         axis through the RUNNING account would pass for a second, independent reason: where it
         ran. That is the measured shape of T-2324, where test_deploy_hook.py passed 73/73 on
         recovery and failed 5 on orchestrator from byte-identical files, because it hardcoded "claude" and
@@ -935,7 +932,7 @@ class TestManifestWasActuallyLoaded(unittest.TestCase):
 # this file; importing back the other way would be a circular import.)
 #
 # TWO SITES, DIFFERENT SHAPES, PER-CATEGORY ASSERTIONS — NOT one table twice.
-# WITHIN a single entry the fields split three ways (atlas's T-2365 analysis), and
+# WITHIN a single entry the fields split three ways (artisan's T-2365 analysis), and
 # only two of the three may follow a perturbed manifest:
 #   1. BINDING-DERIVED, ACCOUNT-CARRYING (sudo_user, jsonl_dir, handoff_file,
 #      restart_bin, supervise_script prefix) — the perturbed account MUST appear and
@@ -1067,7 +1064,7 @@ class TestFleetMonitorConsumersFollowThePerturbedManifest(unittest.TestCase):
         the manifest DOES own is every entry's account, which must arrive perturbed in the
         account-carrying paths (category 1) and be absent from them as the live string.
 
-        metis/atlas carry ONLY sudo_user + jsonl_dir + tuning (no restart config); mnemosyne
+        mason/artisan carry ONLY sudo_user + jsonl_dir + tuning (no restart config); archivist
         has handoff_file but no restart_bin (observation_only suppresses the fire path);
         orchestrator/specialist/recovery carry the full set. jsonl_dir's project slug is
         -home-<account>-pantheon-config for a control-plane seat (specialist) and -home-<account>
@@ -1103,6 +1100,20 @@ class TestFleetMonitorConsumersFollowThePerturbedManifest(unittest.TestCase):
                     pa = self._probe_account(persona)
                     live_home = self._live_home_segment(persona)
                     control_plane = self.witness[persona].get("supervisor") == "control-plane"
+                    # T-3838: bespoke_relaunch seats (mason, artisan post-T-3846
+                    # arm) also slugify their live-session dir to
+                    # -home-<account>-pantheon-config, not the plain
+                    # -home-<account>, because they respawn with
+                    # cwd=<account>/pantheon-config. The MONITOR_TUNING is
+                    # code-side state (context_fill_monitor._MONITOR_TUNING),
+                    # not manifest state, so the witness reads it directly
+                    # rather than inferring from the (empty) supervisor field.
+                    # This mirrors the code's own branch at
+                    # tools/context_fill_monitor.py:852-856.
+                    from tools.context_fill_monitor import _MONITOR_TUNING
+                    bespoke_relaunch = bool(
+                        _MONITOR_TUNING.get(persona, {}).get("bespoke_relaunch")
+                    )
 
                     # -- category 1: binding-derived, ACCOUNT-CARRYING (the liveness proof) --
                     self.assertEqual(
@@ -1110,7 +1121,11 @@ class TestFleetMonitorConsumersFollowThePerturbedManifest(unittest.TestCase):
                         pa,
                         f"{persona}: sudo_user did not follow the perturbed manifest account",
                     )
-                    slug = f"-home-{pa}-pantheon-config" if control_plane else f"-home-{pa}"
+                    slug = (
+                        f"-home-{pa}-pantheon-config"
+                        if (control_plane or bespoke_relaunch)
+                        else f"-home-{pa}"
+                    )
                     self.assertEqual(
                         entry["jsonl_dir"],
                         f"/home/{pa}/.claude/projects/{slug}",
@@ -1120,10 +1135,18 @@ class TestFleetMonitorConsumersFollowThePerturbedManifest(unittest.TestCase):
                     if "handoff_file" in entry:
                         self.assertEqual(entry["handoff_file"], f"/home/{pa}/HANDOFF.md")
                     if "restart_bin" in entry:
-                        self.assertEqual(
-                            entry["restart_bin"],
-                            f"/home/{pa}/pantheon-config/tools/handoff_and_restart.sh",
+                        # T-3838: armed-bespoke_relaunch seats (artisan post-T-3846
+                        # arm, and mason at its own arm) use pantheon-seat-relaunch.sh
+                        # rather than the standard handoff_and_restart.sh. The
+                        # bespoke path is gated in cfm at tools/context_fill_monitor.py:900
+                        # on `bespoke_relaunch AND not has_restart AND not observation_only`,
+                        # so mirror it here to preserve the same manifest→consumer parity.
+                        expected_restart_bin = (
+                            f"/home/{pa}/pantheon-config/tools/pantheon-seat-relaunch.sh"
+                            if bespoke_relaunch
+                            else f"/home/{pa}/pantheon-config/tools/handoff_and_restart.sh"
                         )
+                        self.assertEqual(entry["restart_bin"], expected_restart_bin)
                     if "supervise_script" in entry:
                         # The script NAME is monitor-owned; only the /home/<account>/ prefix is
                         # binding-derived, so prefix + not-live is the precise statement here.
@@ -1144,8 +1167,18 @@ class TestFleetMonitorConsumersFollowThePerturbedManifest(unittest.TestCase):
                             )
 
                     # -- category 2: binding-derived, NON-account — must NOT carry the probe --
-                    for field in ("restart_service", "restart_mode", "restart_target_pane",
-                                  "supervisor"):
+                    # T-3838: bespoke_relaunch seats compute restart_target_pane +
+                    # relaunch_session + relaunch_scope_unit from `{account}-main`
+                    # via _MONITOR_TUNING (session name IS account-driven for the
+                    # bespoke tmux shape), so those specific fields DO follow the
+                    # account under perturbation on those seats. The category-2
+                    # assumption ("pane is monitor-owned, not account-derived")
+                    # holds for control-plane + standard-restart-service seats
+                    # only. Narrow the checked field-set on bespoke_relaunch.
+                    non_account_fields = ("restart_service", "restart_mode", "supervisor")
+                    if not bespoke_relaunch:
+                        non_account_fields = non_account_fields + ("restart_target_pane",)
+                    for field in non_account_fields:
                         if field in entry:
                             self.assertNotIn(
                                 _PROBE_ACCOUNT_SUFFIX,
@@ -1176,7 +1209,7 @@ class TestFleetMonitorConsumersFollowThePerturbedManifest(unittest.TestCase):
         AGENT_CONFIG has no analogue of.
 
         The KEY SET is manifest-derived here (unlike AGENT_CONFIG's monitor-owned set): exactly
-        the personas instance.yaml grants restart_service, computed from the witness. mnemosyne
+        the personas instance.yaml grants restart_service, computed from the witness. archivist
         is named explicitly — it is T-2370's measured casualty, dropped by a hand-carried
         _DRAIN_PERSONAS tuple that contradicted the manifest and had its tombstones quarantined
         as an unknown agent. handoff_file/restart_bin carry the perturbed account (liveness);
@@ -1185,9 +1218,9 @@ class TestFleetMonitorConsumersFollowThePerturbedManifest(unittest.TestCase):
         """
         grantees = {p for p, b in self.witness.items() if "restart_service" in b}
         self.assertIn(
-            "mnemosyne",
+            "archivist",
             grantees,
-            "the live manifest no longer grants mnemosyne restart_service — the witness for "
+            "the live manifest no longer grants archivist restart_service — the witness for "
             "this test is stale (or T-2370's fix regressed in instance.yaml)",
         )
 
@@ -1203,9 +1236,9 @@ class TestFleetMonitorConsumersFollowThePerturbedManifest(unittest.TestCase):
                     "it does not is carried (T-2370's shape).",
                 )
                 self.assertIn(
-                    "mnemosyne",
+                    "archivist",
                     config,
-                    "the drain no longer covers mnemosyne — T-2370's exact defect, its restart "
+                    "the drain no longer covers archivist — T-2370's exact defect, its restart "
                     "tombstones quarantined as an unknown agent",
                 )
 
@@ -1439,7 +1472,7 @@ class TestFleetHealthFleetFollowsTheSupervisorMarker(unittest.TestCase):
                 p
                 for p, b in self.witness.items()
                 if p != flip and b.get("supervisor") != "control-plane" and p in {
-                    "recovery", "orchestrator", "specialist", "codex", "metis", "atlas", "mnemosyne"
+                    "recovery", "orchestrator", "specialist", "codex", "mason", "artisan", "archivist"
                 }
             ),
             None,

@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon mailbox traffic snapshot — every 6h (03:35/09:35/15:35/21:35 UTC)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 03/6:35:00 UTC
+Persistent=true
+Unit=pantheon-mailbox-traffic.service
+
+[Install]
+WantedBy=timers.target

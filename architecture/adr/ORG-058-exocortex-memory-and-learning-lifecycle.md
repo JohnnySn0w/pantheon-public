@@ -22,11 +22,9 @@ elements:
 
 # ORG-058 — Exocortex-centered memory and learning lifecycle
 
-**Status:** **Ratified 2026-08-02 by the operator with ORG-053 (Telegram message
-665; T-2399).** **HITL:** Autonomous draft under the operator's explicit direction.
-**Tracking:** T-2388/T-2399.
+**Status:** **Ratified 2026-08-02 by the operator with ORG-053 (Telegram message 665; T-2399).** HITL/tracking provenance and the 2026-08-30 trust-floor amendment trail (Consultant, D3): `notes/2026-10-08-org-058-review-history.md`.
 
-**Amendment trail:** Trust-floor inheritance amendment autonomously adopted by Cairn on 2026-08-30 under D3, written under D2 with independent preimplementation and postimplementation review. This amendment does not alter the original operator-ratified status recorded above.
+**Amendment (2026-10-05, T-4275):** The lifecycle transition map (plan report §5; `memory_envelope.LIFECYCLE_TRANSITIONS`) gains the edge `RETAINED_SOURCE_REF → FORGOTTEN_DERIVED`. It was proposed by archivist and written under D2, and ACCEPTED by the operator on review (Telegram 630, 2026-10-07; the ADR human-review gate per #738); ledger `2026-10-05T06:54:12Z-t4275-org058-source-ref-forget-decision`. Before this change, a subject-initiated forget of a source-ref memory could only exit to DECAYED, which means "expired by policy". FORGOTTEN_DERIVED means that the *memory artifact* was forgotten at the subject's request, while the canonical source is untouched. A source-ref memory is a derived reference, not the source. No new terminal state was added: the transition's FROM state in the append-only log already records source-ref vs derived. No migration is needed. Policy expiry still goes to DECAYED. This amendment does not alter the ratified status.
 
 **Extends:** ORG-035 and ORG-044. **Composes with:** Echo's corpus identity,
 ORG-042 privacy separation, ORG-047 presenter identity, and ORG-050/051
@@ -79,7 +77,7 @@ Native or latent model memory and dynamic memory state may be used as a runtime
 cache, compression layer, or learned-memory substrate. They do not become
 canonical durable memory unless surfaced through the governed memory envelope
 with provenance, authority, retention, correction, export, and forgetting
-behavior. This is an evidence-bounded posture: *Metis: Memory Foundation Model*
+behavior. This is an evidence-bounded posture: *Mason: Memory Foundation Model*
 (arXiv:2607.26760v1, §§2.1–2.5, PDF pp. 3–6) defines native memory state and
 procedures; its training data defines memory-operation and auxiliary stress
 surfaces (§§4.1–4.2, PDF pp. 13–16), and its controlled experiments report
@@ -232,7 +230,7 @@ Memory-substrate evaluation must exercise, at minimum:
 - general capability and instruction-following regression after memory
   activation.
 
-These criteria adapt the measured task and limitation surfaces in Metis
+These criteria adapt the measured task and limitation surfaces in Mason
 §§4.1–4.2 and §§6.5–6.6; they do not adopt its model as Pantheon's memory
 architecture.
 
@@ -257,7 +255,7 @@ architecture.
 - **ORG-058:R4** — a user requests global correction/erasure;
 - **ORG-058:R5** — memory retrieval becomes a material latency/context bottleneck;
 - **ORG-058:R6** — learned behavior changes identity or relationship expectations; or
-- **ORG-058:R7** — a production harness exposes serializable native memory with export, deletion, audit, and authority controls, making it eligible for evaluation as an Exocortex acceleration layer rather than a replacement.
+- **ORG-058:R7** — a production harness exposes serializable native memory with export, deletion, audit, and authority controls, and passes [[ORG-062]] PMB-1 Track C governance conformance, including verified deletion (C3+C4), making it eligible for evaluation as an Exocortex acceleration layer rather than a replacement. *(Amended 2026-10-07 by the operator, Telegram 11289, the ORG-062 §6 companion amendment ratified on the T-2517 walk.)*
 ## DECISIONS
 
 - **Native memory remains an optional governed substrate — serves experimentation

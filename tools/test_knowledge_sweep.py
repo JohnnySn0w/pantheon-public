@@ -131,7 +131,7 @@ class TestFileSweepTicket(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue(mock_file.called)
         argv = mock_file.call_args.args[0]
-        self.assertEqual(argv[argv.index("--target") + 1], "specialist")
+        self.assertEqual(argv[argv.index("--target") + 1], "role:research_orchestrator")
         self.assertEqual(argv[argv.index("--requester") + 1], "specialist")
         # ticket.py rejects --intent for non-operator targets, so a target=specialist
         # dispatch ticket must NOT carry it (regression lock for the 2026-06-06
@@ -413,7 +413,11 @@ class TestSweepArgvAcceptedByRealTicketPy(unittest.TestCase):
                         self._staged.add(p)
                 return MagicMock(returncode=0, stdout="", stderr="")
             if argv[:2] == ["git", "diff"]:
-                out = "\n".join(sorted(self._staged))
+                # T-4885: the file verb also asks `--name-status` (ADD assertion).
+                out = "\n".join(
+                    (f"A\t{x}" if "--name-status" in argv else x)
+                    for x in sorted(self._staged)
+                )
                 return MagicMock(
                     returncode=0, stdout=out + ("\n" if out else ""), stderr=""
                 )
@@ -473,7 +477,7 @@ class TestSweepArgvAcceptedByRealTicketPy(unittest.TestCase):
         bad = tail[:i] + ["--intent", "action"] + tail[i:]
         with patch("sys.stderr", new_callable=io.StringIO) as err:
             rc = ticket.main(bad + ["--no-push"])
-        self.assertEqual(rc, 1)
+        self.assertEqual(rc, ticket.EXIT_REFUSAL)  # T-4496: a caller refusal, not a fault
         self.assertIn("--intent is target=operator-specific", err.getvalue())
 
 

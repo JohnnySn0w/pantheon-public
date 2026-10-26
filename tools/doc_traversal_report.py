@@ -53,8 +53,10 @@ from pathlib import Path
 
 try:  # run-as-script (python3 tools/doc_traversal_report.py): tools/ on sys.path[0]
     import agent_role_map
+    from seat_exec import is_own_account, seat_argv
 except ImportError:  # run-as-package (import tools.doc_traversal_report)
     from tools import agent_role_map
+    from tools.seat_exec import is_own_account, seat_argv
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -77,6 +79,20 @@ AGENTS = {
     "specialist": {
         "user": "claude-research",
         "projects_dir": agent_role_map.live_session_projects_dir("claude-research"),
+    },
+    # T-4672 (the operator TG 11067): the other session-running seats. Recovery already holds
+    # NOPASSWD into each account (sudoers.d/60-fallback-exocortex, 61-fallback-suborch).
+    "mason": {
+        "user": "suborch1",
+        "projects_dir": agent_role_map.live_session_projects_dir("suborch1"),
+    },
+    "artisan": {
+        "user": "suborch2",
+        "projects_dir": agent_role_map.live_session_projects_dir("suborch2"),
+    },
+    "archivist": {
+        "user": "exocortex",
+        "projects_dir": agent_role_map.live_session_projects_dir("exocortex"),
     },
 }
 
@@ -101,12 +117,15 @@ _GOV_SEG_TO_REPO_PATH = {"sop": "sop", "adr": "architecture/adr", "rulebook": "r
 # Transcript parsing
 
 
-def parse_transcript_lines(lines):
+def parse_transcript_lines(lines, include_sidechain=False):
     """Yield tool_use events from raw jsonl lines, in chronological order.
 
     Event: {"idx": int, "ts": str|None, "tool": str, "input": dict}.
     Malformed lines and sidechain records are skipped silently. Ordering is
     by timestamp when every event has one, else by line position.
+
+    include_sidechain=True keeps sidechain records: every record in a subagent
+    transcript (<sid>/subagents/agent-*.jsonl) has isSidechain true (T-4509).
     """
     events = []
     for lineno, line in enumerate(lines):
@@ -119,7 +138,7 @@ def parse_transcript_lines(lines):
             continue
         if not isinstance(rec, dict):
             continue
-        if rec.get("isSidechain"):
+        if rec.get("isSidechain") and not include_sidechain:
             continue
         msg = rec.get("message")
         if not isinstance(msg, dict):
@@ -456,15 +475,12 @@ def list_local_sessions(projects_dir, last_n):
 
 
 def list_remote_sessions(user, projects_dir, last_n):
-    """Cross-account listing — glob MUST expand inside the sudo'd shell."""
-    cmd = [
-        "sudo",
-        "-nu",
-        user,
-        "bash",
-        "-c",
-        "ls -t %s/*.jsonl 2>/dev/null" % shlex.quote(projects_dir),
-    ]
+    """Cross-account listing — glob MUST expand inside the sudo'd shell. Own-account
+    reads DIRECTLY (no self-sudo: `sudo -nu <self>` is rejected and returns empty
+    stdout, which this function would read as an empty session list — a false absence
+    for the runner's own account; bugs/sudo-u-to-runners-own-account-...md, T-4058)."""
+    inner = "ls -t %s/*.jsonl 2>/dev/null" % shlex.quote(projects_dir)
+    cmd = seat_argv(user, ["bash", "-c", inner])
     try:
         out = subprocess.run(
             cmd, capture_output=True, text=True, timeout=30, check=False
@@ -480,11 +496,13 @@ def load_session_lines(path, user=None):
     """Return the file's lines, via sudo cat for cross-account paths.
     Returns None (with a stderr warning) on failure."""
     try:
-        if user is None:
+        # Own-account (or unspecified) reads directly — `sudo -nu <self>` is rejected
+        # (returns None here, a fail-safe but needless miss for the runner's own path).
+        if user is None or is_own_account(user):
             with open(path, "r", encoding="utf-8", errors="replace") as fh:
                 return fh.readlines()
         out = subprocess.run(
-            ["sudo", "-nu", user, "cat", path],
+            seat_argv(user, ["cat", path]),
             capture_output=True,
             text=True,
             timeout=120,

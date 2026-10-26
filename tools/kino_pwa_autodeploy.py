@@ -292,8 +292,13 @@ def rsync_to_deploy() -> tuple[bool, str]:
     Runs as claude (both dirs are claude-owned). Trailing slash on the source so
     contents (not the dir itself) are mirrored, matching the SOP command exactly.
     """
+    # T-4027: --chmod=g-w. The source checkout's files are claude:pantheon-shared
+    # rw-rw-r--, and `-a` copied that group-write into /opt, which let any
+    # pantheon-shared seat edit the code kino executes (src/daemon/main.ts) and
+    # the served bundles. Dirs too: nothing but this rsync (as the owner, claude)
+    # writes /opt, so no group needs write there.
     inner = (
-        "rsync -a "
+        "rsync -a --chmod=g-w "
         "--exclude node_modules --exclude .git --exclude web/node_modules "
         f"{SOURCE_DIR}/ {DEPLOY_DIR}/"
     )

@@ -1,0 +1,18 @@
+[Unit]
+Description=Pantheon seat-parity audit — 6-hourly fleet parity drift-net (T-3750)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# SIX-HOURLY, matching delivery_reachability's armed cadence — the reference model the ticket
+# names. What this watches (a seat's provisioned parity) changes only when someone provisions,
+# pauses, retires or reconfigures a seat: a human-timescale event, so noticing drift six hours
+# late costs nothing against the per-fire cross-account sudo sweep. The minute (:41) and hours
+# (01/07/13/19) are offset from the other Recovery timers — delivery-reachability (03,09,15,21:23),
+# grooming (12:00), welltrod (09:20), policy-outflow (12:45) — to avoid push/probe contention.
+OnCalendar=*-*-* 01,07,13,19:41:00
+Persistent=true
+RandomizedDelaySec=600
+Unit=pantheon-parity-audit.service
+
+[Install]
+WantedBy=timers.target

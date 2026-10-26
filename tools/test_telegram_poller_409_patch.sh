@@ -75,6 +75,31 @@ else
   bad "unrelated copy was modified"
 fi
 
+# 4. T-4092: with no T2629_TARGETS, the globs are rooted at the seat home —
+# $HOME by default, or the first argument — never a hardcoded account.
+seat="$TMP/seat-home"
+cache_ts="$seat/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7/server.ts"
+market_ts="$seat/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram/server.ts"
+mkdir -p "$(dirname "$cache_ts")" "$(dirname "$market_ts")"
+printf 'const before = 1\n%s\nconst after = 2\n' "$OLD" > "$cache_ts"
+printf 'const before = 1\n%s\nconst after = 2\n' "$OLD" > "$market_ts"
+env -u T2629_TARGETS HOME="$seat" bash "$HELPER" >/dev/null
+if grep -q 'T-2629: never give up' "$cache_ts" && grep -q 'T-2629: never give up' "$market_ts"; then
+  ok "default target root is \$HOME (cache + marketplace copies patched)"
+else
+  bad "\$HOME-rooted copies NOT patched"
+fi
+other="$TMP/other-home"
+other_ts="$other/.claude/plugins/cache/claude-plugins-official/telegram/0.0.9/server.ts"
+mkdir -p "$(dirname "$other_ts")"
+printf 'const before = 1\n%s\nconst after = 2\n' "$OLD" > "$other_ts"
+env -u T2629_TARGETS HOME="$seat" bash "$HELPER" "$other" >/dev/null
+if grep -q 'T-2629: never give up' "$other_ts"; then
+  ok "seat-home argument overrides \$HOME"
+else
+  bad "seat-home argument ignored"
+fi
+
 echo
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]

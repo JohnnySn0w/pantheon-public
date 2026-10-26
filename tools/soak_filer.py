@@ -79,7 +79,8 @@ UNRESOLVED_STATES = ("inbox", "active")
 def unresolved_soak_for(agent: str, repo_root: Path | None = None) -> str | None:
     """Return the filename of an unresolved auto-soak ticket targeting `agent`,
     else None. "Unresolved" = present in tickets/inbox/ or tickets/active/ (NOT
-    done/). Matches on frontmatter target == agent AND SOAK_LABEL in labels.
+    done/). Matches SOAK_LABEL in labels AND the subject seat: `subject:<agent>`
+    label (T-5239), or — legacy — frontmatter target == agent / the leg title.
 
     Mirrors inbox_consumer._list_auto_delivered_unresolved_for_agent's
     inbox+active scan model — deliberately NOT knowledge_sweep's inbox-only
@@ -98,7 +99,17 @@ def unresolved_soak_for(agent: str, repo_root: Path | None = None) -> str | None
                 t = parse_ticket(p)
             except Exception:
                 continue
-            if t.fields.get("target") == agent and SOAK_LABEL in (t.fields.get("labels") or []):
+            labels = t.fields.get("labels") or []
+            if SOAK_LABEL not in labels:
+                continue
+            # T-5239: the leg's SUBJECT seat is the `subject:<agent>` label (a target is
+            # now a role pool shared by several seats). Also match the legacy persona
+            # target and the title for legs filed/re-pooled before the label existed.
+            if (
+                f"subject:{agent}" in labels
+                or t.fields.get("target") == agent
+                or f"soak leg \u2014 {agent} (" in str(getattr(t, "title", "") or "")
+            ):
                 return p.name
     return None
 
@@ -108,8 +119,20 @@ def unresolved_soak_for(agent: str, repo_root: Path | None = None) -> str | None
 # ---------------------------------------------------------------------------
 
 
+def soak_target(agent: str) -> str:
+    """Pool-role `--target` for `agent`'s soak leg (T-5239; see file_soak_tickets)."""
+    from tools.agent_role_map import persona_pool_role
+    role = persona_pool_role(agent)
+    if not role:
+        raise ValueError(f"no pool role for soak agent {agent!r}")
+    return f"role:{role}"
+
+
 def _build_ask(agent: str) -> str:
     return (
+        f"SUBJECT SEAT: `{agent}` (label `subject:{agent}` - descriptive only; this "
+        f"ticket is routed to a role pool, so run the leg on the `{agent}` account/"
+        f"checkout it measures).\n\n"
         f"Suite-health soak leg for the `{agent}` account — standing all-accounts "
         f"soak (T-0991/T-0992 option b: each account runs its OWN leg, no "
         f"cross-account sudo).\n\n"
@@ -181,10 +204,14 @@ def file_soak_tickets(
             str(tb),
             "file",
             "--requester", "recovery",
-            "--target", agent,
+            # T-5239 / ORG-088 (the operator TG 12076/12077): role-only routing. The leg is
+            # routed to the seat's POOL role; whichever member pulls it runs it. The
+            # seat the leg MEASURES rides as the `subject:<agent>` label + a body line.
+            # A label DESCRIBES, it never routes: no delivery path reads `subject:`.
+            "--target", soak_target(agent),
             # NB: no --intent — ticket.py rejects it for non-operator targets.
             "--title", title,
-            "--labels", SOAK_LABELS_CSV,
+            "--labels", f"{SOAK_LABELS_CSV},subject:{agent}",
             "--project-id", "null",
             "--nearest-intent-ref", "maintenance:test-suite-soak",
             "--ask", _build_ask(agent),

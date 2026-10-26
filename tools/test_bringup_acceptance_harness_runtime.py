@@ -197,7 +197,7 @@ class DiagnoseVerdictTest(unittest.TestCase):
             _diagnose_verdict(report)
 
 
-class ThothCodexBootstrapTest(unittest.TestCase):
+class OrchestratorCodexBootstrapTest(unittest.TestCase):
     def test_orchestrator_controller_bootstrap_preserves_mailbox_wake_and_pane_logging(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -246,7 +246,13 @@ class ThothCodexBootstrapTest(unittest.TestCase):
                 rc, "_start_runtime", return_value=rc.RuntimeStart(rc.TMUX_RUNTIME_SCOPE_UNIT, False)
             ), mock.patch.object(rc, "_verify_started_runtime"), mock.patch.object(
                 rc, "_verify_runtime_input_ready"
-            ), mock.patch.object(rc, "_run_post_start_commands"), _provenance_patch():
+            ), mock.patch.object(rc, "_run_post_start_commands"), mock.patch.object(
+                # T-4179: ensure_runtime now probes the codex poller before a comms
+                # claude launch; keep this hermetic (no KEEP bridge subprocess).
+                rc,
+                "_probe_out_of_runtime_receiver_absent",
+                return_value=rc._ManagedReceiverProbe(True, "absent", "test-absent", {}),
+            ), _provenance_patch():
                 current_handle = rc.ensure_runtime(
                     primary,
                     adapter=mock.Mock(),
@@ -427,12 +433,12 @@ class ThothCodexBootstrapTest(unittest.TestCase):
                     events.append(f"{binding.launch.harness}:proof-{expected}")
                     return ReceiverStateProof(expected, {"expected": expected, "harness": binding.launch.harness})
 
-            def start_runtime(binding, adapter, *, replace=False, context=None):
+            def start_runtime(binding, adapter, *, replace=False, context=None, state_root=None):
                 del adapter, replace, context
                 events.append(f"{binding.launch.harness}:start")
                 return rc.RuntimeStart(rc.TMUX_RUNTIME_SCOPE_UNIT, True)
 
-            def verify_input(binding, started, *, state_root=None, adapter=None, context=None):
+            def verify_input(binding, started, *, state_root=None, adapter=None, context=None, launched_at=None):
                 del state_root, adapter, context
                 if binding.launch.harness == "claude":
                     raise rc.RuntimeOperationalFailure(

@@ -3,7 +3,7 @@
 Pure-unit: the systemd + git probe boundaries (_systemctl_show, _git_head_epoch)
 are mocked so no live systemd introspection, cross-account sudo, or Telegram sends
 occur. Proves the classifier keys on TIMER health (not commit age) — so a healthy
-timer on an idle seat with a stale HEAD is HEALTHY (the mnemosyne-2026-08-11 case,
+timer on an idle seat with a stale HEAD is HEALTHY (the archivist-2026-08-11 case,
 the whole reason for the design) — and flags a genuinely stopped timer as STALLED.
 """
 from __future__ import annotations
@@ -63,7 +63,7 @@ class ClassifyTimerHealth(unittest.TestCase):
         self.assertIn("active+enabled", detail)
 
     def test_idle_seat_stale_head_but_healthy_timer_is_HEALTHY(self):
-        # THE design case: mnemosyne 2026-08-11 — HEAD 13 days old, timer firing fine.
+        # THE design case: archivist 2026-08-11 — HEAD 13 days old, timer firing fine.
         nxt = time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(NOW + 30 * 60))
         cls, _ = _classify(show=_show_out(next_dt=nxt), head_epoch=int(NOW - 13 * DAY))
         self.assertEqual(cls, "HEALTHY")
@@ -125,10 +125,10 @@ class ClassifyFallback(unittest.TestCase):
 class AlertThrottle(unittest.TestCase):
     def test_should_alert_respects_cooldown(self):
         state = {}
-        self.assertTrue(m._should_alert("mnemosyne", "STALLED", NOW, state))
-        state["mnemosyne:STALLED"] = NOW
-        self.assertFalse(m._should_alert("mnemosyne", "STALLED", NOW + 60, state))
-        self.assertTrue(m._should_alert("mnemosyne", "STALLED", NOW + m.ALERT_COOLDOWN_SECONDS + 1, state))
+        self.assertTrue(m._should_alert("archivist", "STALLED", NOW, state))
+        state["archivist:STALLED"] = NOW
+        self.assertFalse(m._should_alert("archivist", "STALLED", NOW + 60, state))
+        self.assertTrue(m._should_alert("archivist", "STALLED", NOW + m.ALERT_COOLDOWN_SECONDS + 1, state))
 
     def test_alert_classes_are_the_actionable_ones(self):
         self.assertEqual(m.ALERT_CLASSES, {"STALLED", "MISFIRE_WINDOW", "UNVERIFIABLE_STALE"})
@@ -143,9 +143,9 @@ class CheckLoop(unittest.TestCase):
              mock.patch.object(m, "_alert", side_effect=lambda s, c, d: alerts.append((s, c))), \
              mock.patch.object(m, "_load_state", return_value={}), \
              mock.patch.object(m, "_save_state"):
-            problems = m.check(["recovery", "mnemosyne"], dry_run=False, now=NOW)
+            problems = m.check(["recovery", "archivist"], dry_run=False, now=NOW)
         self.assertEqual(problems, 1)
-        self.assertEqual(alerts, [("mnemosyne", "STALLED")])
+        self.assertEqual(alerts, [("archivist", "STALLED")])
 
     def test_dry_run_sends_no_alert(self):
         with mock.patch.object(m, "classify", return_value=("STALLED", "bad")), \

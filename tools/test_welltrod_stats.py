@@ -140,7 +140,7 @@ class RemoteListingTest(unittest.TestCase):
     (welltrod_stats uses subprocess.run only — no Popen — so patching run
     covers the whole surface.)"""
 
-    CFG = {"user": "claude", "projects_dir": "/home/claude/p"}
+    CFG = {"user": "welltrod-other-seat", "projects_dir": "/home/other/p"}  # never the running account
 
     def _completed(self, rc, stdout="", stderr=""):
         return subprocess.CompletedProcess([], rc, stdout=stdout, stderr=stderr)
@@ -185,6 +185,20 @@ class RemoteListingTest(unittest.TestCase):
             with contextlib.redirect_stderr(io.StringIO()):
                 got = ws.list_sessions_in_window("orchestrator", self.CFG, 0, 10)
         self.assertIsNone(got)
+
+
+class OwnAccountListingTest(unittest.TestCase):
+    """T-4671: when the collector runs AS the target account, no sudo (sudo-to-self
+    fails and would read as listing_failed)."""
+
+    def test_both_listings_run_without_sudo_for_own_account(self):
+        import getpass
+        cfg = {"user": getpass.getuser(), "projects_dir": "/x/p"}
+        done = subprocess.CompletedProcess([], 0, stdout="1721385600.5 /x/p/s.jsonl\n", stderr="")
+        for fn in (ws.list_session_entries, ws.list_subagent_entries):
+            with mock.patch.object(ws.subprocess, "run", return_value=done) as run:
+                self.assertIsNotNone(fn("self", cfg, 0))
+            self.assertEqual(run.call_args[0][0][:2], ["bash", "-c"], fn.__name__)
 
 
 class ListingFailurePropagationTest(unittest.TestCase):
@@ -460,6 +474,200 @@ class CommitProdTest(unittest.TestCase):
             ).stdout
             self.assertIn("welltrod", log)
             self.assertTrue((work / ws.SNAPSHOT_DIR / "latest.json").exists())
+
+
+
+
+def _sidechain_line(path):
+    return json.dumps(
+        {
+            "isSidechain": True,
+            "timestamp": "2026-10-01T00:00:00Z",
+            "message": {
+                "content": [
+                    {"type": "tool_use", "name": "Read", "input": {"file_path": path}}
+                ]
+            },
+        }
+    )
+
+
+class SubagentListingTest(unittest.TestCase):
+    """T-4509: subagent transcripts at <projects_dir>/<sid>/subagents/agent-*.jsonl."""
+
+    CFG = {"user": "welltrod-other-seat", "projects_dir": "/home/other/p"}  # never the running account
+
+    def test_local_finds_nested_agent_files_only_within_window(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            (d / "sess1" / "subagents").mkdir(parents=True)
+            (d / "sess2" / "subagents").mkdir(parents=True)
+            (d / "sess2" / "other").mkdir(parents=True)
+            new = d / "sess1" / "subagents" / "agent-aaa.jsonl"
+            old = d / "sess2" / "subagents" / "agent-old.jsonl"
+            wrong_dir = d / "sess2" / "other" / "agent-zzz.jsonl"
+            not_agent = d / "sess1" / "subagents" / "notes.jsonl"
+            main = d / "main.jsonl"
+            for f in (new, old, wrong_dir, not_agent, main):
+                f.write_text("{}\n")
+            os.utime(old, (1_000_000, 1_000_000))
+            got = ws.list_subagent_entries("recovery", {"user": None, "projects_dir": td}, 1_000_010)
+        self.assertEqual([p for _, p in got], [str(new)])
+
+    def test_local_missing_projects_dir_is_listing_failure_not_zero(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = os.path.join(td, "nope")
+            self.assertIsNone(ws.list_subagent_entries("recovery", {"user": None, "projects_dir": missing}, 0))
+
+    def test_remote_find_argv_and_parse(self):
+        stdout = "1721385600.5 /x/s/subagents/agent-a.jsonl\n1721385900.5 /x/s/subagents/agent-b b.jsonl\njunk\n"
+        with mock.patch.object(
+            ws.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=stdout, stderr=""),
+        ) as run:
+            got = ws.list_subagent_entries("orchestrator", self.CFG, 100)
+        cmd = run.call_args[0][0]
+        self.assertEqual(cmd[:4], ["sudo", "-n", "-u", "welltrod-other-seat"])
+        for frag in ("-maxdepth 3", "*/subagents/*", "agent-*.jsonl", "-newermt @100"):
+            self.assertIn(frag, cmd[-1])
+        self.assertEqual(
+            got,
+            [
+                (1721385900.5, "/x/s/subagents/agent-b b.jsonl"),
+                (1721385600.5, "/x/s/subagents/agent-a.jsonl"),
+            ],
+        )
+
+    def test_failures_are_the_none_sentinel(self):
+        with mock.patch.object(
+            ws.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 1, stdout="", stderr="no"),
+        ):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(ws.list_subagent_entries("orchestrator", self.CFG, 0))
+        with mock.patch.object(ws.subprocess, "run", side_effect=OSError("boom")):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertIsNone(ws.list_subagent_entries("orchestrator", self.CFG, 0))
+
+    def test_main_listing_still_excludes_subagent_files(self):
+        stdout = "1721385800.5 /x/s/subagents/agent-sub.jsonl\n1721385700.5 /x/mid.jsonl\n"
+        with mock.patch.object(
+            ws.subprocess,
+            "run",
+            return_value=subprocess.CompletedProcess([], 0, stdout=stdout, stderr=""),
+        ) as run:
+            got = ws.list_sessions_in_window("orchestrator", self.CFG, 0, 10)
+        self.assertEqual(got, ["/x/mid.jsonl"])
+        self.assertIn("-maxdepth 1", run.call_args[0][0][-1])
+
+
+class SubagentGatherTest(unittest.TestCase):
+    def test_all_sidechain_transcript_yields_events_and_stem_session_id(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td) / "repo"
+            root.mkdir()
+            make_gov_repo(root)
+            proj = Path(td) / "proj"
+            sub = proj / "sess1" / "subagents"
+            sub.mkdir(parents=True)
+            gov = str(root / "sop" / "standard" / "alpha.md")
+            (sub / "agent-abc123.jsonl").write_text(_sidechain_line(gov) + "\n")
+            cfg = {"user": None, "projects_dir": str(proj)}
+            reports = ws.gather_subagent_reports("recovery", cfg, 0, 10, str(root))
+        self.assertEqual([r["session_id"] for r in reports], ["agent-abc123"])
+        self.assertEqual(reports[0]["governance_touches"][0]["count"], 1)
+        self.assertIsNotNone(reports[0]["mtime"])
+
+    def test_listing_failure_propagates_none(self):
+        with mock.patch.object(ws, "list_subagent_entries", return_value=None):
+            self.assertIsNone(ws.gather_subagent_reports("recovery", {"user": None, "projects_dir": "/x"}, 0, 10, "/r"))
+
+
+class SubagentColumnTest(unittest.TestCase):
+    def _run(self, td, sub_fn):
+        make_gov_repo(Path(td))
+
+        def gather(agent, cfg, cutoff, mx, rr):
+            return [fake_report("m1", [("sop/standard/alpha.md", 2)])]
+
+        return ws.collect_all(
+            td, 14, 10, ["orchestrator"], gather_fn=gather, subagent_gather_fn=sub_fn
+        )
+
+    def test_separate_block_and_main_docs_unchanged(self):
+        def sub(agent, cfg, cutoff, mx, rr):
+            return [
+                fake_report("agent-1", [("sop/standard/alpha.md", 1)]),
+                fake_report("agent-2", [("sop/standard/beta.md", 3)]),
+            ]
+
+        with tempfile.TemporaryDirectory() as t1, tempfile.TemporaryDirectory() as t2:
+            snap, rows = self._run(t1, sub)
+            base, base_rows = self._run(t2, None)
+        for k in ("docs", "agents", "totals", "coverage", "schema_version"):
+            self.assertEqual(snap[k], base[k])
+        self.assertEqual(snap["schema_version"], 1)
+        sa = snap["subagents"]
+        self.assertEqual(sa["agents"]["orchestrator"]["sessions_analyzed"], 2)
+        self.assertEqual(sa["totals"]["sessions_analyzed"], 2)
+        by = {d["path"]: d for d in sa["docs"]}
+        self.assertEqual(by["sop/standard/beta.md"]["well_trod"], 1)
+        self.assertEqual(by["sop/standard/beta.md"]["touches"], 3)
+        self.assertEqual(by["sop/standard/beta.md"]["per_agent"], {"orchestrator": {"sessions": 1, "touches": 3}})
+        self.assertNotIn("subagents", base)
+        self.assertEqual(
+            sorted((r["session_id"], r.get("source")) for r in rows),
+            [("agent-1", "subagent"), ("agent-2", "subagent"), ("m1", None)],
+        )
+        self.assertEqual(base_rows, [r for r in rows if r["session_id"] == "m1"])
+
+    def test_subagent_listing_failure_is_flagged_in_subagent_block_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            snap, rows = self._run(td, lambda *a: None)
+        self.assertTrue(snap["subagents"]["agents"]["orchestrator"]["listing_failed"])
+        self.assertEqual(snap["subagents"]["agents"]["orchestrator"]["sessions_analyzed"], 0)
+        self.assertNotIn("listing_failed", snap["agents"]["orchestrator"])
+
+    def test_subagents_are_cut_by_window(self):
+        def sub(agent, cfg, cutoff, mx, rr):
+            old = fake_report("agent-old", [("sop/standard/alpha.md", 1)])
+            old["mtime"] = 1.0
+            return [old, fake_report("agent-new", [("sop/standard/alpha.md", 1)])]
+
+        with tempfile.TemporaryDirectory() as td:
+            snap, _ = self._run(td, sub)
+        self.assertEqual(snap["subagents"]["totals"]["sessions_analyzed"], 1)
+
+    def test_injected_main_gather_alone_skips_subagents(self):
+        # hermetic-skip rule: documented in collect_all
+        with mock.patch.object(ws, "gather_subagent_reports") as g:
+            with tempfile.TemporaryDirectory() as td:
+                snap, _ = self._run(td, None)
+        g.assert_not_called()
+        self.assertNotIn("subagents", snap)
+
+    def test_production_default_calls_real_subagent_gatherer(self):
+        # No injection at all: the skip must NOT be the production behaviour.
+        with tempfile.TemporaryDirectory() as td:
+            make_gov_repo(Path(td))
+            with mock.patch.object(
+                ws, "gather_session_reports", return_value=[]
+            ), mock.patch.object(
+                ws,
+                "gather_subagent_reports",
+                return_value=[fake_report("agent-p", [("sop/standard/alpha.md", 1)])],
+            ) as g:
+                snap, rows = ws.collect_all(td, 14, 10, ["orchestrator"])
+        self.assertEqual(g.call_count, 1)
+        self.assertEqual(g.call_args[0][0], "orchestrator")
+        self.assertEqual(snap["subagents"]["totals"]["sessions_analyzed"], 1)
+        self.assertEqual(rows[0]["source"], "subagent")
+
+    def test_cli_has_max_subagent_sessions_default_1000(self):
+        args = ws.build_arg_parser().parse_args([])
+        self.assertEqual(args.max_subagent_sessions, 1000)
 
 
 if __name__ == "__main__":

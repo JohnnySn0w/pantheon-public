@@ -52,6 +52,12 @@ for REPO in "$HOME"/*/; do
 # .git is a dir in the canonical clone, a file in linked worktrees; accept both.
 if [[ -d "$REPO/.git" || -f "$REPO/.git" ]]; then
   current="$(git -C "$REPO" config --local core.hooksPath 2>/dev/null || true)"
+  # A linked worktree reads its main clone's SHARED config, where the absolute form names
+  # the MAIN worktree's hooks. git runs those, so that value is active too (T-4427). Only an
+  # ordinary <main>/.git common dir counts; anything else leaves main_root empty.
+  common="$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+  main_root=""
+  [[ "$common" == /*/.git ]] && main_root="${common%/.git}"
   if [[ -z "$current" ]]; then
     if git -C "$REPO" config core.hooksPath "$SUBDIR" 2>/dev/null; then
       out+="🔧 ensure-hooks-active: core.hooksPath was UNSET in ${REPO} — auto-repaired to ${SUBDIR}."$'\n'
@@ -60,7 +66,11 @@ if [[ -d "$REPO/.git" || -f "$REPO/.git" ]]; then
       out+="⚠️ ensure-hooks-active: core.hooksPath is UNSET in ${REPO} and auto-repair FAILED — hooks are NOT running."$'\n'
       out+="Fix manually: git -C ${REPO} config core.hooksPath ${SUBDIR}"$'\n'
     fi
-  elif [[ "$current" != "$SUBDIR" ]]; then
+  elif [[ "$current" != "$SUBDIR" && "$current" != "$REPO/$SUBDIR" \
+          && ( -z "$main_root" || "$current" != "$main_root/$SUBDIR" ) ]]; then
+    # The absolute form resolves to the same hooks. Claude Code's
+    # isolation-worktree creation rewrites core.hooksPath to it on every
+    # dispatch, so warning on it is noise, and resetting it just churns.
     out+="⚠️ ensure-hooks-active: core.hooksPath in ${REPO} is '${current}', not '${SUBDIR}'. Not clobbering."$'\n'
     out+="If unintended, run: git -C ${REPO} config core.hooksPath ${SUBDIR}"$'\n'
   fi

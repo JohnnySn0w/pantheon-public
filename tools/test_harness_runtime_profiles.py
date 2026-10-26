@@ -652,6 +652,9 @@ class RuntimeProfileResolutionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeProfileError, "must be a bool"):
             resolve_controller_config(manifest, persona="recovery", role="recovery")
 
+    # T-4037/T-4046 per-role opt-in tests removed: T-5446 made both flips schema-defaulted ON and
+    # the keys unsettable; coverage lives in tools/test_t5451_flip_policy.py.
+
     def test_fallback_profile_must_exist_and_cannot_self_cycle(self) -> None:
         missing = _manifest()
         missing["harness_runtime"]["roles"]["recovery"]["fallbacks"] = [
@@ -948,11 +951,17 @@ class RuntimeManifestFileTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeProfileError, "must not vary"):
             resolve_controller_config(manifest, persona="recovery", role="recovery")
 
-    def test_permission_policy_orchestrator_codex_compiles_danger_full_never_without_widening_other_roles(self) -> None:
+    def test_permission_policy_orchestrator_and_hc_codex_fallbacks_compile_danger_full_never(self) -> None:
+        # T-4025 (the operator TG 7477, 2026-09-26): the codex full-perms policy widened —
+        # ALL HC-controlled codex fallbacks (orchestrator + specialist/recovery/mason/artisan) run
+        # danger-full-access, gated on the UID-cordon tightening (T-2654) landing
+        # first. Previously only orchestrator was danger-full and this test guarded that the
+        # others stayed workspace-write; that asymmetry is intentionally removed.
+        # peer-daemon-codex (consultant) moved to danger-full-access too (T-4929, TG 11741/11742).
         manifest = yaml.safe_load((REPO_ROOT / "instance.yaml").read_text(encoding="utf-8"))
         orchestrator = resolve_launch_config(
             manifest,
-            role="orchestrator",
+            role="head-engineering-orchestrator",
             account_home=Path("/home/claude"),
             selected_harness="codex",
             bound_persona="orchestrator",
@@ -961,7 +970,7 @@ class RuntimeManifestFileTests(unittest.TestCase):
         )
         self.assertEqual(orchestrator.native["permission_posture"], "full-auto")
         self.assertEqual(orchestrator.native["execution_boundary"], "unrestricted")
-        spec = CodexHarnessAdapter("orchestrator", launch=orchestrator).build_interactive_launch(
+        spec = CodexHarnessAdapter("head-engineering-orchestrator", launch=orchestrator).build_interactive_launch(
             TmuxTarget("claude-telegram-bot", "harness", "0"),
             cwd=REPO_ROOT,
         )
@@ -970,7 +979,9 @@ class RuntimeManifestFileTests(unittest.TestCase):
 
         for role, persona, account in (
             ("specialist", "specialist", Path("/home/claude-research")),
-            ("recovery", "recovery", Path("/home/claude-fallback")),
+            ("head-system-orchestrator", "recovery", Path("/home/claude-fallback")),
+            ("engineering-orchestrator-1", "mason", Path("/home/suborch1")),
+            ("engineering-orchestrator-2", "artisan", Path("/home/suborch2")),
         ):
             with self.subTest(role=role):
                 launch = resolve_launch_config(
@@ -983,7 +994,7 @@ class RuntimeManifestFileTests(unittest.TestCase):
                     mailbox_hub=Path("/home/the-ancestor/mailbox"),
                 )
                 self.assertNotIn("permission_posture", launch.native)
-                self.assertEqual(launch.native.get("sandbox"), "workspace-write")
+                self.assertEqual(launch.native.get("sandbox"), "danger-full-access")
                 self.assertEqual(launch.native.get("config_overrides", {}).get("approval_policy"), "never")
 
     def test_permission_policy_rejects_unknown_duplicate_missing_or_wrong_harness_values(self) -> None:
@@ -1045,11 +1056,11 @@ class RuntimeManifestFileTests(unittest.TestCase):
             )
 
         live_shaped = yaml.safe_load((REPO_ROOT / "instance.yaml").read_text(encoding="utf-8"))
-        del live_shaped["harness_runtime"]["roles"]["orchestrator"]["codex"]["execution_boundary"]
+        del live_shaped["harness_runtime"]["roles"]["head-engineering-orchestrator"]["codex"]["execution_boundary"]
         with self.assertRaisesRegex(RuntimeProfileError, "execution_boundary"):
             resolve_launch_config(
                 live_shaped,
-                role="orchestrator",
+                role="head-engineering-orchestrator",
                 account_home=Path("/home/claude"),
                 selected_harness="codex",
                 bound_persona="orchestrator",
@@ -1137,6 +1148,92 @@ class RuntimeManifestFileTests(unittest.TestCase):
                         target,
                         cwd=Path("/tmp"),
                     )
+
+
+
+class RoleExecutableOverrideTests(unittest.TestCase):
+    """T-5038: harness_runtime.roles.<role>.<harness>.executable picks a per-role
+    binary (recovery's root-owned /opt copy), with the profile's template rules."""
+
+    def _resolve(self, role_exe, *, account_home=Path("/home/acct"), cli=None, harness="claude-code"):
+        manifest = _manifest()
+        if role_exe is not _UNSET:  # always on the CLAUDE block
+            manifest["harness_runtime"]["roles"]["recovery"]["claude"]["executable"] = role_exe
+        return resolve_launch_config(
+            manifest, role="recovery", account_home=account_home,
+            selected_harness=harness, executable_override=cli,
+        )
+
+    def test_role_executable_replaces_the_profile_path(self) -> None:
+        launch = self._resolve("/opt/pantheon/claude/current/claude.exe")
+        self.assertEqual(launch.executable, Path("/opt/pantheon/claude/current/claude.exe"))
+        self.assertIn("harness_runtime.roles.recovery.claude.executable", launch.sources)
+
+    def test_absent_role_executable_keeps_the_profile_path(self) -> None:
+        launch = self._resolve(_UNSET)
+        self.assertEqual(launch.executable, Path("/home/acct/bin/claude"))
+        self.assertFalse(any(s.endswith(".executable") for s in launch.sources))
+
+    def test_role_executable_supports_the_account_home_template(self) -> None:
+        launch = self._resolve("{account_home}/opt/claude.exe")
+        self.assertEqual(launch.executable, Path("/home/acct/opt/claude.exe"))
+
+    def test_cli_override_still_wins(self) -> None:
+        launch = self._resolve("/opt/pantheon/claude/current/claude.exe", cli=Path("/usr/local/bin/claude"))
+        self.assertEqual(launch.executable, Path("/usr/local/bin/claude"))
+        self.assertIn("override.executable", launch.sources)
+
+    def test_bad_role_executables_are_refused(self) -> None:
+        for bad, pattern in (("relative/claude", "absolute"), ("", "non-empty"), (42, "non-empty"),
+                             ("{home}/claude", "account_home")):
+            with self.subTest(bad=bad), self.assertRaisesRegex(RuntimeProfileError, pattern):
+                self._resolve(bad)
+
+    def test_only_the_named_harness_is_affected(self) -> None:
+        launch = self._resolve("/opt/pantheon/claude/current/claude.exe", harness="codex")
+        self.assertEqual(launch.executable, Path("/tmp/fake-codex"))
+
+
+_UNSET = object()
+
+
+class DiagnosticsUnreadablePathTests(unittest.TestCase):
+    """T-5057/T-5093: a probe path under an unreadable dir (another account's 0700
+    home, as on the CT202 runner) reads as a failed observation; it must never raise
+    PermissionError out of collect(), which left diagnose with empty stdout."""
+
+    def test_executable_under_unreadable_dir_is_fail_not_crash(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses directory permissions")
+        with tempfile.TemporaryDirectory() as tmp:
+            account_home = Path(tmp)
+            exe = _make_executable(account_home, "bin/claude")
+            launch = resolve_launch_config(
+                _manifest(),
+                role="recovery",
+                account_home=account_home,
+                selected_harness="claude",
+            )
+            adapter = ClaudeHarnessAdapter(
+                "recovery",
+                claude_home=account_home,
+                launch=launch,
+            )
+            locked = exe.parent
+            locked.chmod(0)
+            try:
+                report = BasicHarnessDiagnosticProbe(
+                    adapter,
+                    cwd=REPO_ROOT,
+                    execution_context="unreadable-home",
+                ).collect()
+            finally:
+                locked.chmod(0o755)
+            executable_obs = next(
+                obs for obs in report.observations if obs.check_id == "claude.executable"
+            )
+            self.assertEqual(executable_obs.status, "fail")
+            self.assertEqual(executable_obs.evidence["configured_path"], str(exe))
 
 
 if __name__ == "__main__":

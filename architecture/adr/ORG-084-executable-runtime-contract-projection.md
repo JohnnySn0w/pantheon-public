@@ -1,7 +1,7 @@
 ---
 id: ORG-084
 title: Executable runtime contract projection
-status: "Adopted 2026-09-07 by Cairn under D3 during the T-3388 bounded autonomy experiment, after independent substantive review of contract candidate ff05165e256a0de17ac17c241a3b911d62f7fbad. Contract and migration inventory only; no schema validator, generator, CI gate, collector, deployment, or runtime adoption exists yet."
+status: "Adopted 2026-09-07 by Consultant under D3 during the T-3388 bounded autonomy experiment, after independent substantive review of contract candidate ff05165e256a0de17ac17c241a3b911d62f7fbad. Contract and migration inventory only; no schema validator, generator, CI gate, collector, deployment, or runtime adoption exists yet."
 date: 2026-08-31
 hitl: Autonomous
 build_disposition: needs-build

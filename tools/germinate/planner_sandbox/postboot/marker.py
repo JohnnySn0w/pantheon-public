@@ -75,25 +75,28 @@ class MarkerCompatWarning:
 MarkerState = MarkerPresent | MarkerAbsent | MarkerMalformed | MarkerCompatWarning
 
 
-def current_boot_id() -> str:
+def current_boot_id(path: Path | None = None) -> str:
     """Read the real host's current boot id from /proc.
 
     Fail-closed (C4): a read failure raises typed ``PrimitiveUnavailable``
-    rather than falling back to any default.
+    rather than falling back to any default. ``path`` (T-5074, additive)
+    lets the germination engine's simulated backend name its own boot-id
+    file; ``None`` reads the module-level ``BOOT_ID_PATH`` at call time.
     """
 
+    boot_id_path = BOOT_ID_PATH if path is None else path
     try:
-        raw = BOOT_ID_PATH.read_text(encoding="utf-8")
+        raw = boot_id_path.read_text(encoding="utf-8")
     except OSError as exc:
-        raise PrimitiveUnavailable("boot-id", f"read {BOOT_ID_PATH} failed: {exc}") from exc
+        raise PrimitiveUnavailable("boot-id", f"read {boot_id_path} failed: {exc}") from exc
 
     boot_id = raw.strip()
     if not boot_id:
-        raise PrimitiveUnavailable("boot-id", f"{BOOT_ID_PATH} read as empty")
+        raise PrimitiveUnavailable("boot-id", f"{boot_id_path} read as empty")
     return boot_id
 
 
-def write_marker(boot_id: str) -> None:
+def write_marker(boot_id: str, path: Path | None = None) -> None:
     """Atomically write the postboot marker with the given boot_id.
 
     Real temp-file + rename (matches ADR's own atomic-write pattern and
@@ -103,25 +106,31 @@ def write_marker(boot_id: str) -> None:
     roots aren't pre-created the way production's tmpfs mount is).
     """
 
-    MARKER_PATH.parent.mkdir(parents=True, exist_ok=True)
+    marker_path = MARKER_PATH if path is None else path
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
     body = json.dumps({"marker_version": CURRENT_MARKER_VERSION, "boot_id": boot_id})
 
-    tmp_path = MARKER_PATH.with_suffix(MARKER_PATH.suffix + ".tmp")
+    tmp_path = marker_path.with_suffix(marker_path.suffix + ".tmp")
     tmp_path.write_text(body, encoding="utf-8")
     tmp_path.chmod(0o644)
-    os.rename(tmp_path, MARKER_PATH)
+    os.rename(tmp_path, marker_path)
 
 
-def read_marker() -> MarkerState:
-    """Read MARKER_PATH and classify it into one of the four MarkerState variants."""
+def read_marker(path: Path | None = None) -> MarkerState:
+    """Read the marker and classify it into one of the four MarkerState variants.
 
-    if not MARKER_PATH.exists():
+    ``path`` (T-5074, additive): ``None`` reads the module-level
+    ``MARKER_PATH`` at call time, so existing monkeypatching still works.
+    """
+
+    marker_path = MARKER_PATH if path is None else path
+    if not marker_path.exists():
         return MarkerAbsent()
 
     try:
-        raw = MARKER_PATH.read_text(encoding="utf-8")
+        raw = marker_path.read_text(encoding="utf-8")
     except OSError as exc:
-        return MarkerMalformed(f"read {MARKER_PATH} failed: {exc}")
+        return MarkerMalformed(f"read {marker_path} failed: {exc}")
 
     try:
         payload = json.loads(raw)

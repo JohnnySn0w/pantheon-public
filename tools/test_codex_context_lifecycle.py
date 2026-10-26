@@ -147,7 +147,7 @@ def _active_step() -> ccl.ActiveStepSnapshot:
     return ccl.ActiveStepSnapshot(
         step_id="T-2957/step",
         summary="implement lifecycle",
-        chat_id="456474197",
+        chat_id="424242424",
         status="active",
         started_at=NOW,
         updated_at=NOW,

@@ -15,7 +15,7 @@ from tools.a2a.did_web import (
     select_authentication_key,
 )
 
-DID = "did:web:snowis.me"
+DID = "did:web:your-domain.example"
 
 
 def _jwk_vm(vid, alg="ES256", crv="P-256"):
@@ -27,19 +27,19 @@ def _jwk_vm(vid, alg="ES256", crv="P-256"):
 
 class TestResolveDidWebUrl(unittest.TestCase):
     def test_bare_domain(self):
-        self.assertEqual(resolve_did_web_url("did:web:snowis.me"),
-                         "https://snowis.me/.well-known/did.json")
+        self.assertEqual(resolve_did_web_url("did:web:your-domain.example"),
+                         "https://your-domain.example/.well-known/did.json")
 
     def test_with_path(self):
-        self.assertEqual(resolve_did_web_url("did:web:snowis.me:agents:recovery"),
-                         "https://snowis.me/agents/recovery/did.json")
+        self.assertEqual(resolve_did_web_url("did:web:your-domain.example:agents:recovery"),
+                         "https://your-domain.example/agents/recovery/did.json")
 
     def test_with_percent_encoded_port(self):
         self.assertEqual(resolve_did_web_url("did:web:localhost%3A3000"),
                          "https://localhost:3000/.well-known/did.json")
 
     def test_rejects_non_did_web(self):
-        for bad in ("did:key:z6Mk", "https://snowis.me", "", "did:web:"):
+        for bad in ("did:key:z6Mk", "https://your-domain.example", "", "did:web:"):
             with self.assertRaises(DidResolutionError):
                 resolve_did_web_url(bad)
 
@@ -49,17 +49,17 @@ class TestResolveDidWebUrl(unittest.TestCase):
 
     def test_rejects_empty_path_segment(self):
         with self.assertRaises(DidResolutionError):
-            resolve_did_web_url("did:web:snowis.me::recovery")
+            resolve_did_web_url("did:web:your-domain.example::recovery")
 
     def test_rejects_dot_dot_path_segment(self):
         # T-2867 DIDWEB-3: a ".." path segment is refused.
         with self.assertRaises(DidResolutionError):
-            resolve_did_web_url("did:web:snowis.me:..")
+            resolve_did_web_url("did:web:your-domain.example:..")
 
     def test_rejects_encoded_slash_path_segment(self):
         # T-2867 DIDWEB-3: a segment that percent-decodes to carry a slash is refused.
         with self.assertRaises(DidResolutionError):
-            resolve_did_web_url("did:web:snowis.me:a%2Fb")
+            resolve_did_web_url("did:web:your-domain.example:a%2Fb")
 
 
 class TestParseDidDocument(unittest.TestCase):

@@ -1,0 +1,632 @@
+schema: org083.normalized-input.v1
+contract:
+  schema_version: 1
+  contract_id: repo-evidence-pantheon-config-org083-pilot
+  repository: pantheon-config
+  registry_revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+  evidence_revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+  collected_at: '2026-09-07T00:00:00Z'
+  repo_class: live_code
+  arc_author: consultant
+  fleet_steward_role: orchestrator
+  repo_evidence_owner_role: orchestrator
+  owner_resolution:
+    eligible_rw_roles:
+    - orchestrator
+    - recovery
+    - second-head
+    - specialist
+    - sub-orchestrator-1
+    - sub-orchestrator-2
+    registry_revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    registry_blob_id: 370e16f2faa2d76db1e24546b1860f27d6feb842
+    instance_blob_id: 9f58a10f5c6161b53ff31d245907a01daacb4113
+    requested_role: orchestrator
+    resolved_role: orchestrator
+    basis: explicit-assignment
+    assignment_authority: orchestrator:T-3380
+    issues: []
+  maturity: inventory_only
+  target_maturity: baseline
+  next_review: schema validator independent review
+  inventory:
+    language_substrates:
+    - python
+    runner_manifests:
+    - pyproject absent; pytest by convention
+    test_commands:
+    - python3 -m pytest tools/test_repository_evidence.py
+    ci_workflows: []
+    applicability_evidence_ids:
+    - art-pending
+  dimension_dispositions:
+  - disposition_id: disp-line
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    dimension: line
+    status: deferred
+    authority: ORG-083
+    reason: pilot carries shape only
+    scope:
+      selectors:
+      - tools/
+    effective_revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    measurement_ids: []
+    changed_code_record_id: null
+    mutation_record_id: null
+    flake_observation_ids: []
+    deferral_id: def-inventory
+    exclusion_id: null
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+    re_evaluate_trigger: adapter verified
+  - disposition_id: disp-branch
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    dimension: branch
+    status: deferred
+    authority: ORG-083
+    reason: pilot carries shape only
+    scope:
+      selectors:
+      - tools/
+    effective_revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    measurement_ids: []
+    changed_code_record_id: null
+    mutation_record_id: null
+    flake_observation_ids: []
+    deferral_id: def-inventory
+    exclusion_id: null
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+    re_evaluate_trigger: adapter verified
+  - disposition_id: disp-function
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    dimension: function
+    status: deferred
+    authority: ORG-083
+    reason: pilot carries shape only
+    scope:
+      selectors:
+      - tools/
+    effective_revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    measurement_ids: []
+    changed_code_record_id: null
+    mutation_record_id: null
+    flake_observation_ids: []
+    deferral_id: def-inventory
+    exclusion_id: null
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+    re_evaluate_trigger: adapter verified
+  - disposition_id: disp-changed_code
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    dimension: changed_code
+    status: deferred
+    authority: ORG-083
+    reason: pilot carries shape only
+    scope:
+      selectors:
+      - tools/
+    effective_revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    measurement_ids: []
+    changed_code_record_id: null
+    mutation_record_id: null
+    flake_observation_ids: []
+    deferral_id: def-inventory
+    exclusion_id: null
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+    re_evaluate_trigger: adapter verified
+  - disposition_id: disp-mutation
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    dimension: mutation
+    status: deferred
+    authority: ORG-083
+    reason: pilot carries shape only
+    scope:
+      selectors:
+      - tools/
+    effective_revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    measurement_ids: []
+    changed_code_record_id: null
+    mutation_record_id: null
+    flake_observation_ids: []
+    deferral_id: def-inventory
+    exclusion_id: null
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+    re_evaluate_trigger: adapter verified
+  - disposition_id: disp-flake
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    dimension: flake
+    status: deferred
+    authority: ORG-083
+    reason: pilot carries shape only
+    scope:
+      selectors:
+      - tools/
+    effective_revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    measurement_ids: []
+    changed_code_record_id: null
+    mutation_record_id: null
+    flake_observation_ids: []
+    deferral_id: def-inventory
+    exclusion_id: null
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+    re_evaluate_trigger: adapter verified
+  quantitative_measurements: []
+  changed_code_records: []
+  mutation_records: []
+  flake_observations: []
+  boundary_records:
+  - boundary_record_id: boundary-production_subprocess
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    boundary_kind: production_subprocess
+    producer: pantheon-config
+    transport: none
+    consumer: local validator
+    status: not_exercised
+    tests: []
+    preconditions: []
+    asserted_effect: not exercised in inventory pilot
+    artifact_ids: []
+    owner: orchestrator
+    deferral_id: def-inventory
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+  - boundary_record_id: boundary-shell_suite
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    boundary_kind: shell_suite
+    producer: pantheon-config
+    transport: none
+    consumer: local validator
+    status: not_exercised
+    tests: []
+    preconditions: []
+    asserted_effect: not exercised in inventory pilot
+    artifact_ids: []
+    owner: orchestrator
+    deferral_id: def-inventory
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+  - boundary_record_id: boundary-producer_consumer
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    boundary_kind: producer_consumer
+    producer: pantheon-config
+    transport: none
+    consumer: local validator
+    status: not_exercised
+    tests: []
+    preconditions: []
+    asserted_effect: not exercised in inventory pilot
+    artifact_ids: []
+    owner: orchestrator
+    deferral_id: def-inventory
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+  - boundary_record_id: boundary-ipc
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    boundary_kind: ipc
+    producer: pantheon-config
+    transport: none
+    consumer: local validator
+    status: not_exercised
+    tests: []
+    preconditions: []
+    asserted_effect: not exercised in inventory pilot
+    artifact_ids: []
+    owner: orchestrator
+    deferral_id: def-inventory
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+  - boundary_record_id: boundary-network
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    boundary_kind: network
+    producer: pantheon-config
+    transport: none
+    consumer: local validator
+    status: not_exercised
+    tests: []
+    preconditions: []
+    asserted_effect: not exercised in inventory pilot
+    artifact_ids: []
+    owner: orchestrator
+    deferral_id: def-inventory
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+  - boundary_record_id: boundary-storage
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    boundary_kind: storage
+    producer: pantheon-config
+    transport: none
+    consumer: local validator
+    status: not_exercised
+    tests: []
+    preconditions: []
+    asserted_effect: not exercised in inventory pilot
+    artifact_ids: []
+    owner: orchestrator
+    deferral_id: def-inventory
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+  - boundary_record_id: boundary-external_api
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    boundary_kind: external_api
+    producer: pantheon-config
+    transport: none
+    consumer: local validator
+    status: not_exercised
+    tests: []
+    preconditions: []
+    asserted_effect: not exercised in inventory pilot
+    artifact_ids: []
+    owner: orchestrator
+    deferral_id: def-inventory
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+  - boundary_record_id: boundary-ui_e2e
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    boundary_kind: ui_e2e
+    producer: pantheon-config
+    transport: none
+    consumer: local validator
+    status: not_exercised
+    tests: []
+    preconditions: []
+    asserted_effect: not exercised in inventory pilot
+    artifact_ids: []
+    owner: orchestrator
+    deferral_id: def-inventory
+    applicability_evidence_ids: []
+    steward_approval: null
+    applicability_decision: null
+    approved_disposition_decision: null
+  retry_policy_records:
+  - retry_policy_id: retry-none
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    command_fingerprint: none
+    test_set_fingerprint: repository-evidence-tests
+    policy_source: none
+    max_attempts: 1
+    effect_on_evidence: no retry evidence claimed
+    linked_flake_ids: []
+  deploy_tolerance_records:
+  - deploy_tolerance_id: deploy-none
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    workflow: none
+    step: none
+    command_identity: none
+    approver: orchestrator
+    started_at: '2026-09-07T00:00:00Z'
+    expiry:
+      kind: timestamp
+      value: '2026-12-31T00:00:00Z'
+      action: fleet_drift
+    trigger:
+      kind: timestamp
+      value: '2026-12-31T00:00:00Z'
+    restoration_plan: not a deployment record
+    effect_on_evidence: none
+    evidence_artifact_id: art-pending
+  test_surface_gaps: []
+  effectiveness_receipts:
+  - effectiveness_receipt_id: eff-quarantine-shape
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    kind: quarantine_review
+    reviewed_at: '2026-09-07T00:00:00Z'
+    reviewer: orchestrator
+    scope:
+      selectors:
+      - tools/repository_evidence.py
+    limitations: shape only; quarantine_review is never positive
+    payload:
+      quarantine_id: quarantine-shape
+      reproduction_artifact_id: art-pending
+      restoration_attempt: not attempted
+      disposition: non-positive shape receipt
+    review_decision: null
+    independent_review_decision: null
+  efficiency_records:
+  - efficiency_id: efficiency-shape
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    environment_fingerprint: fixture
+    command_fingerprint: fixture
+    test_set_fingerprint: fixture
+    observation_window: fixture
+    sample_count: 1
+    costs:
+      local_setup:
+        state: unavailable
+        reason: pilot shape only
+        amount: null
+        unit: null
+        artifact_id: null
+        authority_decision: null
+      local_runtime:
+        state: unavailable
+        reason: pilot shape only
+        amount: null
+        unit: null
+        artifact_id: null
+        authority_decision: null
+      ci_queue:
+        state: unavailable
+        reason: pilot shape only
+        amount: null
+        unit: null
+        artifact_id: null
+        authority_decision: null
+      ci_runner:
+        state: unavailable
+        reason: pilot shape only
+        amount: null
+        unit: null
+        artifact_id: null
+        authority_decision: null
+      rerun:
+        state: unavailable
+        reason: pilot shape only
+        amount: null
+        unit: null
+        artifact_id: null
+        authority_decision: null
+      mutation:
+        state: unavailable
+        reason: pilot shape only
+        amount: null
+        unit: null
+        artifact_id: null
+        authority_decision: null
+      cpu:
+        state: unavailable
+        reason: pilot shape only
+        amount: null
+        unit: null
+        artifact_id: null
+        authority_decision: null
+      monetary:
+        state: unavailable
+        reason: pilot shape only
+        amount: null
+        unit: null
+        artifact_id: null
+        authority_decision: null
+    cadence: none
+    comparison_baseline_id: null
+    comparability:
+      verdict: refused
+      reason: shape only
+    artifact_id: art-pending
+    limitations: not measured
+  parity_records:
+  - parity_id: parity-local-only
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    verdict: local_only
+    local_command: python3 -m pytest tools/test_repository_evidence.py
+    ci_command: null
+    local_environment: fixture
+    ci_environment: null
+    test_set_fingerprint: repository-evidence-tests
+    workflow_revision: null
+    artifact_ids:
+    - art-pending
+    differences:
+    - no CI evidence in pilot
+    equivalence_evidence_id: null
+    owner: orchestrator
+    waiver_id: null
+    restoration_plan: future parity evidence before promotion
+  retention_records:
+  - retention_id: ret-art-pending
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    artifact_id: art-pending
+    artifact_class: proof
+    created_at: '2026-09-07T00:00:00Z'
+    storage_locator:
+      kind: inline
+      value: cGVuZGluZyBwcm9vZgo=
+    digest_algorithm: sha256
+    digest: 6edb07dcabfa513c5b69878a02a262c74535e906736229789cf5f436dfe2b9d9
+    availability:
+      state: verified_available
+      verified_at: '2026-09-07T00:00:00Z'
+      retrieval_receipt_id: receipt-art-pending
+    retrieval_receipts:
+    - receipt_id: receipt-art-pending
+      artifact_id: art-pending
+      retrieved_at: '2026-09-07T00:00:00Z'
+      observed_locator: inline
+      observed_digest_algorithm: sha256
+      observed_digest: 6edb07dcabfa513c5b69878a02a262c74535e906736229789cf5f436dfe2b9d9
+      observed_size: 14
+    retention_end:
+      kind: timestamp
+      value: '2026-12-31T00:00:00Z'
+    expiry_action: retain_tombstone
+    tombstone_artifact_id: null
+    owner: orchestrator
+    superseded_by: null
+  generated_source_records:
+  - generated_source_id: generated-none
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    path_selectors: []
+    source_of_truth: not applicable to pilot
+    generator: null
+    generated_revision: null
+    generated_digest: null
+    risk_acceptor: orchestrator
+    affected_dimensions: []
+    treatment: included
+    reason: no generated exclusion claimed
+    exclusion_id: null
+    re_evaluate_trigger: generated source appears
+  exclusion_records: []
+  waiver_records: []
+  maturity_deferrals:
+  - maturity_deferral_id: def-inventory
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    owner: orchestrator
+    reviewer: orchestrator
+    approver: orchestrator
+    reason: pilot inventory only
+    scope:
+      dimensions:
+      - line
+      - branch
+      - function
+      - changed_code
+      - mutation
+      - flake
+    started_at: '2026-09-07T00:00:00Z'
+    expiry:
+      kind: timestamp
+      value: '2026-12-31T00:00:00Z'
+      action: fleet_drift
+    restoration_condition: verified adapters and independent evidence
+    restoration_plan: T-3380 follow-up machinery before promotion
+    compensating_evidence_ids:
+    - art-pending
+    decision_ref: tickets/active/T-3380.md
+    active_state:
+      status: active
+      evaluated_at: '2026-09-07T00:00:00Z'
+      evidence_id: art-pending
+    expiry_action: revert_to_inventory
+    authority_decision:
+      decision_id: decision-def-inventory
+      role: orchestrator
+      decision_ref: tickets/active/T-3380.md
+      decided_at: '2026-09-07T00:00:00Z'
+      scope:
+        kind: obligation
+        repository: pantheon-config
+        revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+        obligation: maturity-deferral
+        record_id: def-inventory
+      artifact_id: art-pending
+    current_stage: inventory_only
+    target_stage: baseline
+    blocked_prerequisite: independent measurement/parity prerequisites
+    unsupported_dimensions:
+    - line
+    - branch
+    - function
+    - changed_code
+    - mutation
+    - flake
+    downstream_ticket: T-3380
+    next_action: keep pilot non-enforcing
+    review_trigger: schema validator independently reviewed
+  quarantine_records:
+  - quarantine_id: quarantine-shape
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    owner: orchestrator
+    reviewer: orchestrator
+    approver: orchestrator
+    reason: shape-only non-positive receipt
+    scope:
+      tests: []
+    started_at: '2026-09-07T00:00:00Z'
+    expiry:
+      kind: timestamp
+      value: '2026-12-31T00:00:00Z'
+      action: fleet_drift
+    restoration_condition: real quarantine evidence exists
+    restoration_plan: none
+    compensating_evidence_ids:
+    - art-pending
+    decision_ref: tickets/active/T-3380.md
+    active_state:
+      status: active
+      evaluated_at: '2026-09-07T00:00:00Z'
+      evidence_id: art-pending
+    expiry_action: revert_to_inventory
+    authority_decision:
+      decision_id: decision-quarantine-shape
+      role: orchestrator
+      decision_ref: tickets/active/T-3380.md
+      decided_at: '2026-09-07T00:00:00Z'
+      scope:
+        kind: obligation
+        repository: pantheon-config
+        revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+        obligation: maturity-deferral
+        record_id: quarantine-shape
+      artifact_id: art-pending
+    classification: suspected_flake
+    tests: []
+    evidence_ids:
+    - art-pending
+    flake_observation_id: null
+    retry_policy_id: retry-none
+    coverage_impact: none
+    boundary_impact: none
+  artifact_records:
+  - artifact_id: art-pending
+    repository: pantheon-config
+    revision: 4d58f73d7c6a1e880a4baaefdbc5a125abaaac7f
+    artifact_class: proof
+    created_at: '2026-09-07T00:00:00Z'
+    producer: fixture
+    tool: normalized-input
+    config_identity: none
+    storage_locator:
+      kind: inline
+      value: cGVuZGluZyBwcm9vZgo=
+    media_type: text/plain
+    digest_algorithm: sha256
+    digest: 6edb07dcabfa513c5b69878a02a262c74535e906736229789cf5f436dfe2b9d9
+    size: 14
+    sensitivity: internal
+    access: repo
+    tombstone: null
+    payload: null

@@ -1,0 +1,30 @@
+[Unit]
+Description=Pantheon hermes-audit dispatch — workflow_dispatch the audit on main when the tip is uncovered (T-5354)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928).
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# ⚠️ CLAUDE SEAT ONLY: it dispatches through `gh`, and recovery holds no GitHub auth (same reason as
+# pantheon-ci-audit-tip-coverage.service).
+#
+# An ACTUATOR, separate from the tip-coverage MONITOR on purpose. That unit stays detect + alert
+# only; if this one stops, the monitor still pages. Bounded: it dispatches only when the tip is
+# uncovered AND no main audit is queued or running, so at most one dispatch is ever outstanding.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/hermes_audit_dispatch.py
+
+StandardOutput=journal
+StandardError=journal
+
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=default.target

@@ -37,8 +37,12 @@ def _default_manifest() -> Path:
 
 
 def _default_state_root() -> Path:
+    """T-5028 (b): the same personas-dir resolution as runtime_controller._state_root."""
     value = os.environ.get("PANTHEON_PERSONA_STATE_DIR")
-    return Path(value) if value else Path.home() / ".local" / "state" / "pantheon" / "personas"
+    if value:
+        return Path(value)
+    state_dir = os.environ.get("PANTHEON_STATE_DIR")
+    return Path(state_dir) / "personas" if state_dir else Path.home() / ".local" / "state" / "pantheon" / "personas"
 
 
 def _bounded_error(value: str, *, limit: int = 240) -> str:
@@ -174,6 +178,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--correlation-id")
     parser.add_argument("--recovery-id")
     parser.add_argument("--reason")
+    parser.add_argument(
+        "--override-hold",
+        action="store_true",
+        help="T-5028: if the destination is operator-held, clear the hold (ledgered via the "
+        "harness CLI), alert Recovery, then swap. Requires --reason. Fresh initiations only.",
+    )
     parser.add_argument("--state-root", type=Path, default=_default_state_root())
     args = parser.parse_args(argv)
 
@@ -189,6 +199,8 @@ def main(argv: list[str] | None = None) -> int:
             "--recover-compensation-failed-target-live, and --recover-started-unverified "
             "are mutually exclusive"
         )
+    if args.override_hold and any(modes):
+        parser.error("--override-hold applies to a fresh operator swap only, not to a gate or recovery mode")
     if args.completion_gate:
         if not args.expect_correlation_id or not args.expect_destination:
             parser.error("--completion-gate requires --expect-correlation-id and --expect-destination")
@@ -320,6 +332,8 @@ def main(argv: list[str] | None = None) -> int:
             trigger=args.trigger,
             correlation_id=correlation_id,
             state_root=args.state_root,
+            override_hold=args.override_hold,
+            override_reason=args.reason,
         )
     except Exception as exc:
         print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, sort_keys=True))

@@ -1,0 +1,32 @@
+{
+  "conservative_state": "untrusted",
+  "digest": "sha256:policy-lattice-digest",
+  "labels": [
+    "reviewed",
+    "untrusted"
+  ],
+  "order_pairs": [
+    [
+      "untrusted",
+      "reviewed"
+    ]
+  ],
+  "policy_ref": "P-lattice",
+  "privacy_labels": [
+    "internal",
+    "personal"
+  ],
+  "privacy_order_pairs": [
+    [
+      "internal",
+      "personal"
+    ]
+  ],
+  "purpose_floors": {
+    "assertion": "reviewed",
+    "companionship": "untrusted"
+  },
+  "revision": "rev-2026-08-30",
+  "self_adjudication_allowed": false,
+  "total_order": false
+}

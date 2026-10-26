@@ -63,10 +63,13 @@ _CITED = re.compile(
 STATUS_OK, STATUS_MISSING = "OK", "MISSING"
 STATUS_UNREACHABLE, STATUS_UNLANDED = "UNREACHABLE", "UNLANDED"
 
+# T-4537: where main() fetches GitHub PR heads (refs/pull/<N>/head).
+PR_REFS = "refs/pr/*"
 
-def _git(*args, cwd=REPO):
+
+def _git(*args, cwd=REPO, input=None):
     return subprocess.run(["git", "-C", str(cwd), *args],
-                          capture_output=True, text=True)
+                          capture_output=True, text=True, input=input)
 
 
 def cited_tokens(text: str) -> list[str]:
@@ -91,17 +94,54 @@ def classify(token: str, *, ref: str = "origin/main", cwd=REPO) -> str:
     anywhere, which is the rebase-rewrote-it case the audit was built for.
     Collapsing the two would put recoverable citations in the same bucket as lost
     ones and make the gate cry wolf on every in-flight branch reference.
+
+    T-4537: a PR head (refs/pr/*, fetched by main) counts as a ref here too. The
+    fleet squash-merges and deletes agent/<ticket> branches, which orphaned every
+    review-time citation of a branch head (157 NEW on 2026-10-04). GitHub keeps
+    refs/pull/<N>/head forever, so the reader can still verify them via the PR.
     """
-    if _git("cat-file", "-e", f"{token}^{{commit}}", cwd=cwd).returncode != 0:
-        return STATUS_MISSING                      # not an object here — noise
-    if _git("merge-base", "--is-ancestor", token, ref, cwd=cwd).returncode == 0:
-        return STATUS_OK
-    # Exists but not on `ref`. Is it on ANY ref? If so the reader can still get to
-    # it; if not, it is orphaned and the citation is unverifiable.
-    r = _git("branch", "-a", "--contains", token, cwd=cwd)
-    if r.returncode == 0 and r.stdout.strip():
-        return STATUS_UNLANDED
-    return STATUS_UNREACHABLE
+    return classify_many([token], ref=ref, cwd=cwd)[token]
+
+
+def _rev_set(*revs, cwd=REPO) -> set[str]:
+    r = _git("rev-list", *revs, cwd=cwd)
+    return set(r.stdout.split()) if r.returncode == 0 else set()
+
+
+def classify_many(tokens, *, ref: str = "origin/main", cwd=REPO) -> dict[str, str]:
+    """`classify` for many tokens in at most three git calls (T-4529).
+
+    Per-token subprocesses (cat-file -e, merge-base --is-ancestor, branch -a
+    --contains) cost ~15k tokens x 2-3 spawns, and the weekly run hit its 15min
+    timeout. Same answers, batched:
+      MISSING      `<tok>^{commit}` does not resolve (absent, ambiguous, or not a
+                   commit), via one `cat-file --batch-check`;
+      OK           the resolved sha is in `rev-list <ref>`, i.e. an ancestor of ref;
+      UNLANDED     else it is in `rev-list --branches --remotes --glob=refs/pr/*`:
+                   the commits `branch -a --contains` would find a branch for, plus
+                   PR heads (T-4537);
+      UNREACHABLE  otherwise.
+    """
+    tokens = list(dict.fromkeys(tokens))
+    if not tokens:
+        return {}
+    r = _git("cat-file", "--batch-check", cwd=cwd,
+             input="".join(f"{t}^{{commit}}\n" for t in tokens))
+    lines = r.stdout.splitlines() if r.returncode == 0 else []
+    resolved: dict[str, str] = {}
+    for tok, line in zip(tokens, lines):
+        parts = line.split()
+        if len(parts) == 3 and parts[1] == "commit":
+            resolved[tok] = parts[0]
+    out = {t: STATUS_MISSING for t in tokens if t not in resolved}
+    on_ref = _rev_set(ref, cwd=cwd) if resolved else set()
+    off_ref = {t: sha for t, sha in resolved.items() if sha not in on_ref}
+    out.update({t: STATUS_OK for t in resolved if t not in off_ref})
+    if off_ref:
+        on_branch = _rev_set("--branches", "--remotes", f"--glob={PR_REFS}", cwd=cwd)
+        out.update({t: STATUS_UNLANDED if sha in on_branch else STATUS_UNREACHABLE
+                    for t, sha in off_ref.items()})
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -154,12 +194,24 @@ def partition_baseline(findings, baseline):
     loaded gun — it silently pre-authorises whatever later reoccupies that exact
     (token, path) pair. Reported, never fatal: pruning is housekeeping, and
     failing the weekly run over it would recreate the noise this ticket removes.
+
+    T-4537: pairs compare with the ticket STATE dir folded out
+    (tickets/{inbox,active,done}/T-N.md). A ticket changing state is the same
+    document, so a baselined citation in an open ticket must not re-page when it
+    resolves. A genuine move (any other path change) still loses its exemption.
     """
-    observed = {(tok, path) for path, tok in findings}
-    new = [(path, tok) for path, tok in findings if (tok, path) not in baseline]
-    standing = [(path, tok) for path, tok in findings if (tok, path) in baseline]
-    stale_rows = sorted(baseline - observed)
+    def key(tok, path):
+        return tok, _STATE_DIR.sub(r"\1*/", path)
+
+    exempt = {key(tok, path) for tok, path in baseline}
+    observed = {key(tok, path) for path, tok in findings}
+    new = [(path, tok) for path, tok in findings if key(tok, path) not in exempt]
+    standing = [(path, tok) for path, tok in findings if key(tok, path) in exempt]
+    stale_rows = sorted(row for row in baseline if key(*row) not in observed)
     return new, standing, stale_rows
+
+
+_STATE_DIR = re.compile(r"^(tickets/)(?:inbox|active|done)/")
 
 
 def _write_baseline(path, findings) -> None:
@@ -199,13 +251,17 @@ def sweep(paths, *, ref: str = "origin/main", cwd=REPO) -> dict:
         p = pathlib.Path(p)
         files.extend(sorted(p.rglob("*.md")) if p.is_dir() else [p])
     findings = {STATUS_MISSING: [], STATUS_UNREACHABLE: [], STATUS_UNLANDED: []}
+    cited: list[tuple[pathlib.Path, list[str]]] = []
     for f in files:
         try:
             text = f.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        for tok in cited_tokens(text):
-            st = classify(tok, ref=ref, cwd=cwd)
+        cited.append((f, cited_tokens(text)))
+    status = classify_many([t for _, toks in cited for t in toks], ref=ref, cwd=cwd)
+    for f, toks in cited:
+        for tok in toks:
+            st = status[tok]
             if st != STATUS_OK:
                 findings[st].append((str(f.relative_to(cwd) if cwd in f.parents
                                          else f), tok))
@@ -234,6 +290,10 @@ def main(argv=None) -> int:
     # Reachability is measured against the REMOTE's view. Without this the answer
     # describes a stale local ref and can call a landed commit unreachable.
     _git("fetch", "-q", "origin")
+    # T-4537: PR heads too, into a private namespace (not refs/remotes, so branch
+    # listings stay clean). A squash-merged agent/<ticket> branch is deleted, but
+    # its PR head is not, so review-time citations stay verifiable through it.
+    _git("fetch", "-q", "--prune", "origin", f"+refs/pull/*/head:{PR_REFS}")
     f = sweep(paths, ref=args.ref)
 
     unreachable, missing = f[STATUS_UNREACHABLE], f[STATUS_MISSING]
@@ -242,7 +302,7 @@ def main(argv=None) -> int:
           f"{len(unreachable)} UNREACHABLE, {len(unlanded)} UNLANDED, "
           f"{len(missing)} MISSING (info)")
     if unlanded:
-        print(f"  ⚠️ UNLANDED — a real commit on another ref, NOT on {args.ref}. "
+        print(f"  ⚠️ UNLANDED — a real commit on another ref (a branch or a PR head), NOT on {args.ref}. "
               f"Verifiable, but do not describe it as landed:")
         for path, tok in unlanded:
             print(f"    {tok}  {path}")

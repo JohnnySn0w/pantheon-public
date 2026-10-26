@@ -55,6 +55,7 @@ from tools.host_control.contracts import (
     HostControlError,
     IdempotencyConflict,
     InvalidTransition,
+    JournalBusy,
     PolicyDenied,
     RegistryError,
     SubjectMismatch,
@@ -299,6 +300,20 @@ class ApprovalErrorNamespaceTests(unittest.TestCase):
                     wire.FAILED_ERROR,
                 )
 
+    def test_journal_busy_resolves_to_failed_via_its_ancestor(self) -> None:
+        # T-4334: journal write-lock contention is a retryable refusal at
+        # the journal boundary, deliberately NOT a new wire name (the
+        # closed namespace is ratified): it resolves through HostControlError
+        # to Failed, and its server-authored message is the bounded body.
+        exc = JournalBusy(
+            "transition_grant[revoked]: journal write lock busy after "
+            "5000 ms (lock contention); nothing was written; retry later"
+        )
+        self.assertEqual(wire.error_name_for(exc), wire.FAILED_ERROR)
+        body = wire.error_body_for(exc)
+        self.assertEqual(body, str(exc))
+        self.assertLessEqual(len(body), 200)
+
     def test_error_mapping_is_total_over_the_live_exception_hierarchy(
         self,
     ) -> None:
@@ -416,10 +431,10 @@ class ApproverIdentityResolutionTests(unittest.TestCase):
     ) -> None:
         resolver = self._resolver(
             approver_policy_raw(
-                subjects={"specialist": 1001, "metis": 1001},
+                subjects={"specialist": 1001, "mason": 1001},
                 approvers={
                     "specialist": approver_entry(),
-                    "metis": approver_entry(),
+                    "mason": approver_entry(),
                 },
             )
         )
@@ -573,6 +588,9 @@ REVIEW_SUMMARY_KEYS = {
     "created_at",
     "expires_at",
     "decided_at",
+    # T-2919 Q3 (additive, provisional v1)
+    "approval_handle",
+    "human_request",
 }
 HANDOFF_SUMMARY_KEYS = {
     "request_plan_handle",
@@ -1123,6 +1141,15 @@ class RecordingApprovalService:
     def approval_status(self, *args: object) -> object:
         return self._respond("approval_status", args)
 
+    def request_human(self, *args: object) -> object:
+        return self._respond("request_human", args)
+
+    def human_decision(self, *args: object) -> object:
+        return self._respond("human_decision", args)
+
+    def review_extras(self, *args: object) -> object:
+        return self._respond("review_extras", args)
+
 
 def _bare_approval(**attrs: object) -> object:
     """Instance without dbus export machinery, for negative paths a
@@ -1135,9 +1162,22 @@ def _bare_approval(**attrs: object) -> object:
 
 
 def _invoke(instance: object, method: str, args: tuple, sender: object):
-    return getattr(approval_dbus.HostApproval1Object, method)(
-        instance, *args, sender=sender
-    )
+    func = getattr(approval_dbus.HostApproval1Object, method)
+    if getattr(func, "_dbus_async_callbacks", None):
+        # T-5518: RequestHuman replies through dbus-python async callbacks;
+        # collect what it settled with (synchronously, against these fakes)
+        out: dict = {}
+        func(
+            instance,
+            *args,
+            sender=sender,
+            reply_cb=lambda *values: out.setdefault("reply", values),
+            error_cb=lambda error: out.setdefault("error", error),
+        )
+        if "error" in out:
+            raise out["error"]
+        return out["reply"]
+    return func(instance, *args, sender=sender)
 
 
 @requires_dbus
@@ -1294,9 +1334,15 @@ class ApprovalIdentityGateInProcessTests(unittest.TestCase):
         self._assert_subject_denied(caught)
         self.assertEqual(service.calls, [])
 
-    def test_ingress_uid_gets_bounded_unsupported(self) -> None:
-        dbus_module = self._dbus()
-        service = RecordingApprovalService()
+    def test_ingress_uid_reaches_exactly_one_human_decision_call(self) -> None:
+        # T-2919: the transport passes the LIVE bus uid (never a caller
+        # field) and maps the two ratified slots
+        from tools.host_control.approval.human import HumanDecisionResult
+
+        self._dbus()
+        service = RecordingApprovalService(
+            human_decision=HumanDecisionResult("a" * 64, "granted", "e" * 64, False)
+        )
         instance = _bare_approval(
             _service=service,
             _approver_resolver=ResolverReturns(None),
@@ -1305,18 +1351,16 @@ class ApprovalIdentityGateInProcessTests(unittest.TestCase):
         )
         instance._get_unix_user = lambda sender: 9002
         method, args = ALL_METHOD_CALLS[6]
-        with self.assertRaises(dbus_module.DBusException) as caught:
-            _invoke(instance, method, args, ":1.9")
-        self.assertEqual(
-            caught.exception.get_dbus_name(),
-            wire.UNSUPPORTED_ERROR,
-        )
-        self.assertIn("T-2919", caught.exception.get_dbus_message())
-        self.assertEqual(service.calls, [])
+        self.assertEqual(_invoke(instance, method, args, ":1.9"), ("granted", "e" * 64))
+        self.assertEqual(service.calls, [("human_decision", 9002) + tuple(args)])
 
-    def test_approver_gets_bounded_unsupported_request_human(self) -> None:
-        dbus_module = self._dbus()
-        service = RecordingApprovalService()
+    def test_approver_reaches_exactly_one_request_human_call(self) -> None:
+        from tools.host_control.approval.human import HumanRequestResult
+
+        self._dbus()
+        service = RecordingApprovalService(
+            request_human=HumanRequestResult("d" * 64, "presented", False)
+        )
         instance = _bare_approval(
             _service=service,
             _approver_resolver=ResolverReturns("specialist"),
@@ -1324,19 +1368,13 @@ class ApprovalIdentityGateInProcessTests(unittest.TestCase):
             _ingress_uid=9002,
         )
         instance._get_unix_user = lambda sender: 1001
-        with self.assertRaises(dbus_module.DBusException) as caught:
-            _invoke(
-                instance,
-                "RequestHuman",
-                ("a" * 64, "b" * 64, "key-1"),
-                ":1.9",
-            )
         self.assertEqual(
-            caught.exception.get_dbus_name(),
-            wire.UNSUPPORTED_ERROR,
+            _invoke(instance, "RequestHuman", ("a" * 64, "b" * 64, "key-1"), ":1.9"),
+            ("d" * 64, "presented"),
         )
-        self.assertIn("T-2919", caught.exception.get_dbus_message())
-        self.assertEqual(service.calls, [])
+        self.assertEqual(
+            service.calls, [("request_human", "specialist", "a" * 64, "b" * 64, "key-1")]
+        )
 
     def test_approver_denied_surfaces_exact_name_and_reason_body(
         self,
@@ -1404,7 +1442,7 @@ class Gate12DisclosureThroughTransportTests(unittest.TestCase):
 
         from tools.host_control.approval.identity import ApproverResolver
 
-        temp = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         policy_raw = approver_policy_raw(
             subjects={"specialist": 1001, "alpha": 2002},
@@ -1948,7 +1986,7 @@ class ApprovalPrivateBusCase(unittest.TestCase):
         cls.daemon_log = cls._bus_handle.log
         cls.daemon = cls._bus_handle.process
         cls.bus_address = cls._bus_handle.bus_address
-        cls.work = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        cls.work = tempfile.TemporaryDirectory()
         cls._logs = []
         cls._processes = []
 
@@ -2223,19 +2261,22 @@ class ApprovalReviewerBusTests(ApprovalPrivateBusCase):
         self.assertEqual(raw["review_handle"], str(handle))
         self.assertEqual(str(state), raw["state"])
 
-    def test_request_human_is_exposed_but_unsupported(self) -> None:
+    def test_request_human_without_a_registered_ingress_refuses_bounded(self) -> None:
+        # T-2919: RequestHuman is live; this driver registers no human
+        # ingress, so the domain refuses with the closed code and creates
+        # nothing (the full path is tools/test_host_control_telegram_ingress*)
         handle, _state, _digest, _summary = self._call(
             "Review",
             "sss",
             (self.state["plan_handle"], self.state["plan_digest"], ""),
         )
         error = self.assert_wire_error(
-            wire.UNSUPPORTED_ERROR,
+            wire.FAILED_ERROR,
             "RequestHuman",
             "sss",
             (str(handle), self.state["plan_digest"], "bus-human-key-1"),
         )
-        self.assertIn("T-2919", error.get_dbus_message())
+        self.assertEqual(error.get_dbus_message(), "human_ingress_unconfigured")
 
     def test_error_names_round_trip_verbatim(self) -> None:
         error = self.assert_wire_error(
@@ -2350,7 +2391,7 @@ class SelfApprovalTrustDomainBusTests(ApprovalPrivateBusCase):
         )
 
     def test_same_uid_shadow_cannot_decide_an_open_review(self) -> None:
-        # the review was opened driver-side by 'metis', a legitimate
+        # the review was opened driver-side by 'mason', a legitimate
         # approver on a third uid; the bus caller holds the review
         # handle AND the digest and is still refused — decide is the
         # authoritative gate
@@ -2483,15 +2524,18 @@ class HumanIngressBusTests(ApprovalPrivateBusCase):
 
     SCENARIO = "ingress"
 
-    def test_human_decision_gates_then_refuses_unsupported(self) -> None:
+    def test_human_decision_passes_transport_but_domain_requires_registration(self) -> None:
+        # T-2919: the transport gate admits the configured ingress uid;
+        # the domain rechecks the same live uid against the root-owned
+        # HumanIngressRegistration, which this driver does not configure
         error = self.assert_wire_error(
-            wire.UNSUPPORTED_ERROR,
+            wire.POLICY_DENIED_ERROR,
             "HumanDecision",
             "ssssss",
             ("a" * 64, "b" * 64, "granted", "e" * 64, "f" * 64, "key-1"),
             wire.HUMAN_INGRESS_INTERFACE,
         )
-        self.assertIn("T-2919", error.get_dbus_message())
+        self.assertEqual(error.get_dbus_message(), "subject_denied")
 
     def test_reviewer_and_consumer_refuse_the_ingress_uid(self) -> None:
         for method, signature, args, interface in _all_bus_calls()[:6]:

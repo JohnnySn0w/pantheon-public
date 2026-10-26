@@ -854,5 +854,20 @@ class ApprovalCounts:
     bound_grants: int
 
 
+@dataclass(frozen=True)
+class ExpirySweepStatus:
+    """Bounded read-only contention signal for the expiry sweeper (T-4350).
+
+    In-memory, per service instance (the long-lived daemon object): a
+    durable write is impossible in exactly the contended case, and a
+    restart merely re-accumulates. Provide-the-read, defer-the-wiring, like
+    ``ApprovalCounts``: whoever wires a sweeper must expose
+    ``consecutive_busy_sweeps`` via Health1.
+    """
+
+    busy_sweeps_total: int
+    consecutive_busy_sweeps: int
+
+
 def _optional_str(value: object) -> str | None:
     return None if value is None else str(value)

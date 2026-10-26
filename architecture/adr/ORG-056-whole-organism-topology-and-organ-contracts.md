@@ -75,7 +75,7 @@ hemisphere heads:
 human / outside world
         <-> Bridge
              |-- technical/Pantheon head -> its team
-             `-- personal/creative head (Mnemosyne, ORG-042) -> its team
+             `-- personal/creative head (Archivist, ORG-042) -> its team
 ```
 
 It answers directly when its grounded model and authority are sufficient,

@@ -1,0 +1,2 @@
+{"type": "system", "subtype": "init", "model": "deepseek-flash", "session_id": "20261014_192837_14166f", "timestamp": 1792006117807}
+{"type": "result", "session_id": "20261014_192837_14166f", "exit_code": 130, "text": "", "tokens": {"input": 0, "output": 0, "total": 0, "cache_read": 0, "cache_write": 0}, "duration_ms": 116620, "error": "Interrupted", "timestamp": 1792006234428}

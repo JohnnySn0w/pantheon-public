@@ -1,0 +1,16 @@
+  The gate should finish around 05:20–05:40Z, inside the 05:00–05:45Z window
+  when the daily SuperNote ingest runs. So the deploy waits until after 05:45Z
+  either way. The gate only runs on the dev copy, so finishing inside the window
+  touches nothing live.
+  Still waiting on:
+  - T-2518 step 2b′: orchestrator's merge.
+  - T-2518 step 2d: the trial run of the tier on test-data version 3.
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · 1 shell · ← for agents · ↓ to manage
+                                         ✔ Update installed · Restart to apply
+  ● main
+  ◯ t2518-s2d-implementer  T-2518 s2d warm tier … 1h 49m 39s · ↓ 152.1k tokens
+  ◯ t2518-s2e-implementer  T-2518 s2e harness im…                         idle
+  ◯ t2518-s2e-reviewer     T-2518 s2e independen…                         idle

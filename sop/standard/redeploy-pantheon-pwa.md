@@ -32,7 +32,7 @@ merged 09:32 UTC and the poller had it built + restarted by **09:35 UTC**, unatt
   masked, or a `smoke:build` gate failure it logged and refused to ship past), or you need a
   *forced* redeploy with no `origin/main` advance (e.g. a `/opt` corruption repair). Otherwise the
   timer already has it; a manual run is redundant (and a redundant `kino` restart is a small live
-  disruption). Redeploys, when manually tracked, use a `target=recovery` carrier ticket (e.g. T-0515).
+  disruption). Redeploys, when manually tracked, use a `target=role:head_system_orchestrator` carrier ticket (e.g. T-0515).
 
 ## Production layout (verified 2026-05-21)
 
@@ -66,8 +66,10 @@ bun run build:web        # cd web && bun install && bun run build → outputs ./
 # 2. Smoke the build — all three artifacts must be present before shipping
 bun run smoke:build      # asserts build/web/{index.html, manifest.webmanifest, sw.js}
 
-# 3. Ship source + built bundle to the deployment copy (no --delete; exclude deps/vcs)
-rsync -a \
+# 3. Ship source + built bundle to the deployment copy (no --delete; exclude deps/vcs).
+#    --chmod=g-w (T-4027): don't copy the source's pantheon-shared group-write into
+#    /opt, since kino executes and serves those files.
+rsync -a --chmod=g-w \
   --exclude node_modules --exclude .git --exclude web/node_modules \
   /home/claude/pantheon-pwa/ /opt/pantheon-pwa/
 

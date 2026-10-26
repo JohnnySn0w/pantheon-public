@@ -23,14 +23,7 @@ Each step names the action, the verification that it took, and the escalation if
 
 ### 0. Altitude gate — an ADR ratifies the decision, not the build spec
 
-An ADR ratifies a **decision**: the durable architectural commitment and its rationale. It must not carry builder-grade detail (parameter tables, numeric values, state-machine mechanics, enumerated invariants that are implementation rather than decision). When drafting surfaces such detail, RELOCATE it rather than delete it:
-
-- **Detailed reasoning / mechanism analysis → a referenced NOTE doc**, linked from the ADR (`notes/` is the working-tier home per ORG-015). The thinking is preserved and navigable from the decision without bloating the ratifiable body.
-- **Build values tuned at first-fire** (timeouts, budgets, cooldowns, SLO/RTO numbers) **→ the build ticket** (steps 2 + 4 below), where they are consumed.
-
-The gate fires at DRAFTING, so builder detail never reaches the operator's ratification queue — his ratification is of decisions only. The failure this closes is over-specification ahead of felt pain (a builder-grade spec for a surface stages away from build); it is the same appetite/altitude judgment as [[ORG-089]] / `shaping-and-viability.md`, applied to the ADR document boundary. Companion: `sop/standard/ratifiable-adr-shape.md` covers the paired clutter rule (review-cycle content out of the ratifiable copy) as a single discovery surface.
-
-Motivating exhibit: the ORG-047 passport cluster (ORG-069–072), where ORG-071's build-time parameter table (the operator RATIFY-WITH-TRIM TG 1784) and ORG-072's A-item mechanics (the operator RATIFY-WITH-RELOCATION TG 1786-1791) were relocated at ratification. Directed by the operator TG 1789 (2026-09-06).
+Apply the altitude rule in [`ratifiable-adr-shape.md`](ratifiable-adr-shape.md) §The altitude rule while drafting: the ADR carries decisions and intent; mechanism reasoning goes to a referenced note, and build values tuned at first fire go to the build ticket (steps 2 and 4 below). That SOP holds the rule, its relocate-or-trim options and the ORG-071 exhibit; this step only places the gate at the start of the buildout procedure. *(Shrunk to a pointer 2026-10-16, Orchestrator, T-5060: the two SOPs had carried the same rule twice.)*
 
 Verification: the ratifiable ADR body reads as decisions + intent only; every mechanism-tier claim has a build-ticket link or a referenced-note link.
 Escalation: if a mechanism-tier claim IS load-bearing for the decision itself (rare), keep it inline and NAME it explicitly as decision-load-bearing so a future reviewer knows not to relocate it.
@@ -105,7 +98,7 @@ When the operator ratifies against the surface: flip the ADR status line to Rati
 
 - **Motivating case:** the ORG-064 miss (the operator TG 7629–7636; scoping ticket T-2837).
 - **Structural successor:** `architecture/adr/ORG-065` — the typed ADR-obligation → ticket → evidence lineage graph with closure-validation is the durable enforcement of this same lineage (this SOP is the near-term human process; ORG-065 is the machine-checked shape, T-2169-prose → ORG-065-structural). **Downstream vision (the operator TG 7636):** ORG-065's base lineage graph is BUILT (T-2673 + BT1-5 + T-3328); the remaining step — typed nodes + edges modeling task-tier readiness/blocked-at-which-tier — turns "plan out work" itself into safe autonomous idle work. This SOP is layer one of that progression; the built base graph provides the machine-checked lineage this SOP produces prose-first.
-- **Guard mechanics:** `tools/ticket_grooming.py` (ratified-unbuilt + zero-ticket backstop; `build_disposition`/`scoping_ticket` exemptions, T-2806); `tools/adr_scoping_lint.py` + `.github/workflows/adr-scoping-lint.yml` (prevent-at-creation); `adr/README.md` §build_disposition.
+- **Guard mechanics:** `tools/ticket_grooming.py` (ratified-unbuilt + zero-ticket backstop; `build_disposition`/`scoping_ticket` exemptions, T-2806); `tools/adr_scoping_lint.py` + `.github/workflows/adr-scoping-lint.yml` (prevent-at-creation); `architecture/adr/README.md` §build_disposition.
 - **Ticket conventions:** ORG-003 (ticket system); ORG-013 (cascade-unblock); ORG-019 (block state in frontmatter, `blocked/` dir retired); the `agent/<task>` branch + HO-push flow.
 - **Principles + directives:** P4 (traceability — the ADR↔build lineage is the audit chain); P5 (humans ratify — the step-5 surface); D6 (plan-first + deviation-flag); D7 (decision/dispatch flow); chain-of-justification (DECISIONS carry the lineage across dispatch boundaries).
 

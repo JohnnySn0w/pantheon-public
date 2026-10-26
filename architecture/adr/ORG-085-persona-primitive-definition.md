@@ -2,10 +2,10 @@
 aliases: [ORG-085]
 id: ORG-085
 title: "Persona primitive: harness, functional role, named continuity, and binding"
-status: "Adopted 2026-09-01 by Cairn under D3 after independent exact-candidate APPROVE of f981f8e4e1f81c5802248007dbdc069672fd7c03; no goal-level or reserved trigger fired. Conceptual contract only: no schema implementation, registry row, installer change, routing change, or runtime migration lands here."
+status: "Ratified 2026-10-07 by the operator (Telegram 11340, with the 2026-10-07 model/effort amendment; he co-authored it). Previously: Adopted 2026-09-01 by Consultant under D3 after independent exact-candidate APPROVE of f981f8e4e1f81c5802248007dbdc069672fd7c03; no goal-level or reserved trigger fired. Conceptual contract only: no schema implementation, registry row, installer change, routing change, or runtime migration lands here."
 date: 2026-09-01
-author: Cairn
-steward: cairn
+author: Consultant
+steward: consultant
 hitl: Autonomous
 relates: [ORG-027, ORG-031, ORG-057, ORG-058, ORG-059, ORG-075, ORG-079, ORG-080, ORG-081, ORG-084]
 build_disposition: no-build-needed
@@ -26,9 +26,9 @@ create a fourth layer, a new registry, or an implementation schema.
 
 ## Status and authority
 
-This decision is **Adopted 2026-09-01 by Cairn under D3**. Independent review of
+This decision is **Ratified 2026-10-07 by the operator** (Telegram 11340), with the 2026-10-07 amendment (§Amendment). The operator co-authored it. It was earlier **Adopted 2026-09-01 by Consultant under D3**, during the TG 1890 one-week autonomy experiment. Independent review of
 exact candidate `f981f8e4e1f81c5802248007dbdc069672fd7c03` returned APPROVE with
-no findings, after which Cairn authorized the status transition. No goal-level
+no findings, after which Consultant authorized the status transition. No goal-level
 or reserved trigger fired: the ADR creates no account or access grant, secret or
 spend, public/external act, operator-owned north-star change, or reserved
 [[ORG-042]] topology flip. None of those acts is authorized by this ADR.
@@ -82,7 +82,8 @@ L1 HarnessDefinition -> L2 RoleDefinition -> L3 PersonaDefinition
 - **L2 Role** is a shareable functional work and authority envelope. It owns
   authentication/permission policy references, capabilities and work shape,
   autonomy and decision authority, trust posture, ratifiable-document scope and
-  access, and model/effort defaults.
+  access, and model/effort **requirements**: a harness-neutral capability tier and effort
+  intent. The binding resolves them to a concrete model (amended 2026-10-07, see §Amendment).
 - **L3 Persona** is the stable named continuity: identity and memory-content
   references, accumulated history and relationships, role membership, a
   declared default embodiment binding, and pinned communication style,
@@ -125,8 +126,8 @@ RoleDefinition {
   capability_policy_refs: Set[AuthorityRef]
   mcp_capability_refs: Set[AuthorityRef]
   skill_policy_refs: Set[AuthorityRef]
-  model_default: ModelRef
-  effort_default: EffortRef
+  model_requirement: CapabilityTierRef   # harness-neutral, e.g. "strong-reasoning" (amended 2026-10-07)
+  effort_intent: EffortIntentRef         # harness-neutral (amended 2026-10-07)
   authentication_permission_refs: Set[AuthorityRef]
   autonomy_trust_policy_refs: NonEmptySet[AuthorityRef]
   decision_authority_refs: NonEmptySet[AuthorityRef]
@@ -179,6 +180,8 @@ PersonaBinding {
   install_manifest_ref: AuthorityRef
   harness_adapter_ref: AuthorityRef
   runtime_binding_ref: Optional[RuntimeObservationRef]
+  model_resolution: ModelRef             # concrete, harness-specific; resolves L2 model_requirement (amended 2026-10-07)
+  effort_resolution: EffortRef           # concrete, harness-specific; resolves L2 effort_intent (amended 2026-10-07)
   source_revision: RevisionRef
   source_digest: Digest
   lifecycle: planned | enabled | disabled | retired
@@ -252,7 +255,8 @@ ResolutionReceipt {
 | memory mechanism | L1 | definition | set of refs | no L3 mechanism replacement without typed adapter override | [[ORG-058]] mechanism authority; no memory payload in L1 |
 | functional Role membership and default | L3 | definition | non-empty set; exactly one default | explicit L3 source amendment only | PersonaDefinition; PersonaBinding and instance role-key MUST NOT duplicate membership |
 | work envelope, capabilities, MCP/skill allowance | L2 | definition | sets | L3 may narrow only; never widen privilege | RoleDefinition plus [[ORG-059]] native authority; discovery is not authorization |
-| model/effort defaults | L2 | definition | exactly one each | L3 persona-narrow override with OverrideRecord | RoleDefinition; harness config is a projection, not authority |
+| model/effort requirement (harness-neutral) | L2 | definition | exactly one each | L3 persona-narrow override with OverrideRecord | RoleDefinition (amended 2026-10-07) |
+| model/effort resolution (concrete, harness-specific) | binding | binding | exactly one each per binding | none (re-bind instead) | PersonaBinding; must satisfy the L2 requirement (amended 2026-10-07) |
 | autonomy, decision authority, trust posture, ratifiable scope/class access | L2 | definition | non-empty authority refs where required | L3 may narrow only when the named policy permits; never widen | rulebook/RoleDefinition; no style or target name grants authority |
 | identity canon, memory content, relationship history | L3 | definition | reference sets | governed source correction/supersession only | [[ORG-057]]/[[ORG-058]] sources; hidden/native/session state never becomes canon |
 | persona/style/dialect/tone source | L3 | definition | exactly one pinned persona and style source | explicit provenance-bearing persona amendment | pinned persona source; Role constraints may bound conduct but do not own style |
@@ -498,6 +502,12 @@ component/runtime contracts. Proposed ORG-084 is an informed projection seam,
 not an authority this ADR may promote. This ADR defines concepts and ownership
 only.
 
+## Amendment 2026-10-07: model and effort split between L2 and the binding
+
+**the operator, Telegram 11338** (on Orchestrator's walk review: "point 2 is very good actually, keep that"). Concrete model names are harness-specific (Opus on Claude Code, gpt-5.5 on Codex), so holding a `ModelRef` in the harness-neutral Role leaked L1 detail into L2, and a harness swap would have needed a role edit. Now L2 states a harness-neutral **requirement** (`model_requirement: CapabilityTierRef`, `effort_intent: EffortIntentRef`), and the **binding**, which already names the harness, resolves it to the concrete `ModelRef`/`EffortRef`. A binding whose model doesn't satisfy its role's requirement is a refusal, not a silent downgrade. `ResolvedPersona.effective_model` and `effective_effort` are unchanged: they read the binding's resolution.
+
+Also from that review, considered and kept as written: trust posture stays L2. The general model is role-seated trust; Pantheon's higher trust is an instance-level setting of its role definitions, because Pantheon is the R&D instance (the operator TG 11336).
+
 ## Consequences
 
 Positive:
@@ -589,7 +599,7 @@ Revisit this decision when any of the following occurs:
 | 3 | L3 Persona owns named continuity, content/history, style, and binding selection | built |
 | 4 | composition is L1 → L2 → L3 | built |
 | 5 | downward overrides are rare, typed, bounded, and provenance-bearing | built |
-| 6 | model/effort defaults are L2 with persona-narrow override | built |
+| 6 | model/effort defaults are L2 with persona-narrow override | built; amended 2026-10-07: L2 holds the harness-neutral requirement, and the binding holds the concrete model |
 | 7 | autonomy, authority, and trust posture are L2 | built |
 | 8 | memory mechanism is L1; memory/identity content is L3 | built |
 | 9 | communication style/dialect/tone is L3 | built |
@@ -597,7 +607,7 @@ Revisit this decision when any of the following occurs:
 | 11 | routing/install/mailbox/continuity interaction contract | built conceptually; implementation deferred-with-disclosure |
 | 12 | explicit conceptual serializable fields without parallel registry | built |
 | 13 | definition/binding/runtime planes preserve ORG-081 and adopted runtime-contract authority without promoting Proposed ORG-084 | built |
-| 14 | D2/D3 status and handoff legality | built; Adopted 2026-09-01 by Cairn after independent exact-candidate approval |
+| 14 | D2/D3 status and handoff legality | built; Adopted 2026-09-01 by Consultant after independent exact-candidate approval |
 | 15 | full report enumerates rulings | built in this and the reviewer-ruling tables |
 
 ## Independent-reviewer rulings 1–15
@@ -609,7 +619,7 @@ Revisit this decision when any of the following occurs:
 | 3 | L3 Persona | built |
 | 4 | L1 → L2 → L3 | built |
 | 5 | bounded provenance-bearing downward override | built |
-| 6 | L2 model/effort default and persona-narrow override | built |
+| 6 | L2 model/effort default and persona-narrow override | built; amended 2026-10-07 (see §Amendment) |
 | 7 | L2 autonomy/authority/trust | built |
 | 8 | L1 memory mechanism vs L3 content | built |
 | 9 | L3 communication style | built |
@@ -647,7 +657,16 @@ No ruling is infeasible-stopped. No implementation claim is made.
   consumers** — serves audit-chain truth over the stale ticket Ask —
   **justified-via P4, D4.**
 - **Adopt only after independent exact-byte approval, while retaining merge to
-  Cairn** — serves D2 pen ownership, reviewer independence, and the current D3
+  Consultant** — serves D2 pen ownership, reviewer independence, and the current D3
   below-goal closure path; candidate `f981f8e4e1f81c5802248007dbdc069672fd7c03`
   was APPROVED with no findings before the status transition, and no reserved
   trigger fired — **justified-via P5, D2, D3, D6, D7.**
+
+## Amendment 2026-09-27 — role naming convention (T-4003)
+
+Owed by [[ORG-100]] §Pending downstream ADR amendments (operator-ratified 2026-09-19). Appended; the ratified body above is unchanged. New L2 RoleDefinition entries (the §Decision table's L2 rows) follow ORG-100's ratified naming pattern:
+- `head_<domain>_orchestrator` for a domain's key seat;
+- `<domain>_orchestrator` for its regular seats;
+- `head_auditor` for the auditor class.
+
+A role class that doesn't parse under that pattern is an ORG-100 amendment, not a local exception.

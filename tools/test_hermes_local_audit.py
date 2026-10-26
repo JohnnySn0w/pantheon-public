@@ -8,7 +8,11 @@ this file. `grep -cF` for the unescaped form against this file must return 0.
 
 from __future__ import annotations
 
+import io
 import json
+import os
+import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -83,7 +87,8 @@ class Watermark(unittest.TestCase):
     def _audit_with(self, surface: bytes, head="newhead", base="oldbase"):
         def fake_git(*args, **kw):
             if args[0] == "log":
-                return surface
+                # The octopus pass (T-4229) finds no octopus merges here.
+                return b"" if "--min-parents=3" in args else surface
             if args[0] == "rev-parse":
                 return head + "\n"
             if args[0] == "rev-list":
@@ -151,6 +156,189 @@ class ExitCodes(unittest.TestCase):
             run.return_value = mock.Mock(returncode=128, stdout="", stderr="fatal: bad object")
             with self.assertRaises(hla.AuditError):
                 hla._git("rev-parse", "nope")
+
+
+# ---------------------------------------------------------------------------
+# T-4229: the producer must see every committed byte (real temp git repos).
+# The old command, `git log -p --no-color`, printed `Binary files ... differ`
+# for a NUL / .gitattributes-binary file and no patch at all for a merge.
+# Each fixture asserts that the old command is blind to it (the RED check)
+# before asserting the audit counts it.
+# ---------------------------------------------------------------------------
+
+OLD_CMD = ("log", "-p", "--no-color")
+
+
+class _Repo:
+    """Throwaway repo with hermetic config (no global/system config, no hooks)."""
+
+    ENV = {
+        **os.environ,
+        "GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.com",
+        "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.com",
+        "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull,
+    }
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self("init", "-q", "-b", "main")
+
+    def __call__(self, *args: str, check: bool = True) -> bytes:
+        return subprocess.run(
+            ["git", "-c", "core.hooksPath=" + os.devnull, "-c", "commit.gpgsign=false", *args],
+            cwd=self.root, env=self.ENV, capture_output=True, check=check,
+        ).stdout
+
+    def commit(self, files: dict, msg: str) -> str:
+        for name, data in files.items():
+            (self.root / name).write_bytes(data)
+        self("add", "-A")
+        self("commit", "-q", "-m", msg)
+        return self.head()
+
+    def head(self) -> str:
+        return self("rev-parse", "HEAD").decode().strip()
+
+
+class ProducerSeesEveryAddedLine(unittest.TestCase):
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.r = _Repo(Path(tmp.name))
+        # Hermetic config for the audit's own git calls too.
+        env = mock.patch.dict(os.environ, {"GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull})
+        env.start()
+        self.addCleanup(env.stop)
+        self.base = self.r.commit(
+            {".gitattributes": b"*.blob binary\n*.nd -diff\n", "f.txt": b"top\n- x\nbottom\n"}, "base",
+        )
+
+    def _scan(self) -> int:
+        return hla.scan_window(self.base, self.r.head(), cwd=self.r.root)[0]
+
+    def _old_blind(self) -> None:
+        """RED check: the pre-T-4229 command does not see the trigger."""
+        old = self.r(*OLD_CMD, f"{self.base}..HEAD")
+        self.assertNotIn(TRIGGER, old)
+
+    def _plant(self, files: dict) -> None:
+        self.r.commit(files, "plant")
+        self.assertIn(b"Binary files", self.r(*OLD_CMD, "-1"))
+        self._old_blind()
+
+    def _two_branches(self, side: dict, trunk: dict) -> str:
+        r = self.r
+        r("checkout", "-q", "-b", "side")
+        side_sha = r.commit(side, "side")
+        r("checkout", "-q", "main")
+        r.commit(trunk, "trunk")
+        return side_sha
+
+    def test_nul_file_is_counted(self):
+        self._plant({"bin.dat": b"\x00\x01" + TRIGGER + b"\x00"})
+        self.assertEqual(self._scan(), 1)
+
+    def test_gitattributes_binary_file_is_counted(self):
+        self._plant({"x.blob": b"text " + TRIGGER + b"\n"})
+        self.assertEqual(self._scan(), 1)
+
+    def test_gitattributes_minus_diff_file_is_counted(self):
+        self._plant({"y.nd": TRIGGER + b"\n"})
+        self.assertEqual(self._scan(), 1)
+
+    def test_clean_binary_is_not_counted(self):
+        self.r.commit({"bin.dat": b"\x00\x01clean\x00" * 1000}, "plant")
+        self.assertEqual(self._scan(), 0)
+
+    def test_header_lookalike_evil_merge_is_counted(self):
+        """Both branches clean; the merge resolution replaces `- x` with
+        `+ <trigger>`, which the combined diff renders as a `--- x` /
+        `+++ <trigger>` header-lookalike pair."""
+        self._two_branches({"s.txt": b"side\n"}, {"m.txt": b"trunk\n"})
+        self.r("merge", "-q", "--no-ff", "--no-commit", "side")
+        self.r.commit({"f.txt": b"top\n+ " + TRIGGER + b"\nbottom\n"}, "merge")
+        self.assertIn(b"\n--- x\n+++ " + TRIGGER, self.r("show", "HEAD", "-p"))  # fixture sanity
+        self._old_blind()
+        self.assertEqual(self._scan(), 1)
+
+    def test_clean_merge_of_dirty_side_is_not_recounted(self):
+        """Correct attribution: the side commit is counted once; the clean
+        merge adds nothing (under `separate` it would be counted again)."""
+        side_sha = self._two_branches({"s.txt": b"x " + TRIGGER + b"\n"}, {"m.txt": b"trunk\n"})
+        self.r("merge", "-q", "--no-ff", "side", "-m", "merge")
+        self.assertEqual(self._scan(), 1)
+        # A window with the dirty side commit already behind the watermark:
+        # the clean merge must not re-introduce it (it would pin the watermark).
+        after_side = hla.scan_window(side_sha, self.r.head(), cwd=self.r.root)[0]
+        self.assertEqual(after_side, 0)
+        # Under `separate` that same window is dirty (the rejected alternative).
+        sep = self.r("log", "-p", "--text", "--diff-merges=separate", f"{side_sha}..HEAD")
+        self.assertIn(TRIGGER, sep)
+
+    def test_clean_merge_is_not_a_false_positive(self):
+        self._two_branches({"s.txt": b"side\n"}, {"m.txt": b"trunk\n"})
+        self.r("merge", "-q", "--no-ff", "side", "-m", "merge")
+        self.assertEqual(self._scan(), 0)
+
+    def test_octopus_evil_merge_is_counted_via_separate_fallback(self):
+        r = self.r
+        for b in ("x", "y"):
+            r("checkout", "-q", "-b", b, "main")
+            r.commit({b + ".txt": b.encode() + b"\n"}, b)
+        r("checkout", "-q", "main")
+        r("merge", "-q", "--no-ff", "--no-commit", "x", "y")
+        r.commit({"evil.txt": b"e " + TRIGGER + b"\n"}, "octopus")
+        self._old_blind()
+        self.assertGreaterEqual(self._scan(), 1)
+
+    def test_git_failure_is_loud(self):
+        with self.assertRaises(hla.AuditError):
+            hla.scan_window(self.base, "0" * 40, cwd=self.r.root)
+
+    def test_git_lacking_remerge_is_loud_end_to_end(self):
+        """A git that rejects a producer flag must exit 2, never 0 (clean)."""
+        # A bare origin, so audit()'s fetch + origin/main resolve for real.
+        origin = self.r.root.parent / (self.r.root.name + "-origin.git")
+        subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True, env=_Repo.ENV)
+        self.addCleanup(shutil.rmtree, origin, True)
+        self.r.commit({"a.txt": b"clean\n"}, "work")
+        self.r("remote", "add", "origin", str(origin))
+        self.r("push", "-q", "origin", "main")
+        state = self.r.root / ".audit-state.json"
+        real_git = shutil.which("git")
+        shim_dir = self.r.root.parent / (self.r.root.name + "-shim")
+        shim_dir.mkdir()
+        self.addCleanup(shutil.rmtree, shim_dir, True)
+        shim = shim_dir / "git"
+        shim.write_text(
+            "#!/bin/sh\n"
+            'for a in "$@"; do [ "$a" = "--diff-merges=remerge" ] && '
+            "{ echo \"error: invalid value for '--diff-merges'\" >&2; exit 129; }; done\n"
+            f'exec {real_git} "$@"\n'
+        )
+        shim.chmod(0o755)
+        argv = ["--base", self.base, "--state", str(state), "--dry-run"]
+        with mock.patch.object(hla, "REPO_ROOT", self.r.root):
+            self.assertEqual(hla.main(argv), 0)  # control: the real git scans clean
+            with mock.patch.dict(os.environ, {"PATH": f"{shim_dir}:{os.environ['PATH']}"}), \
+                 mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+                self.assertEqual(hla.main(argv), 2)
+        self.assertIn("AUDIT COULD NOT RUN", err.getvalue())
+        self.assertIn("--diff-merges", err.getvalue())
+
+    def test_producer_flags_are_the_history_audits(self):
+        self.assertEqual(hla._SHOW_ARGS[:4], ("-p", "--text", "--no-textconv", "--no-ext-diff"))
+        self.assertIn("--diff-merges=remerge", hla._SHOW_ARGS)
+        self.assertIn("--diff-merges=separate", hla._OCTOPUS_SHOW_ARGS)
+
+
+class SourceCleanliness(unittest.TestCase):
+
+    def test_no_contiguous_trigger_in_touched_files(self):
+        here = Path(__file__).resolve().parent
+        for name in ("hermes_local_audit.py", "test_hermes_local_audit.py"):
+            self.assertNotIn(TRIGGER, (here / name).read_bytes(), name)
 
 
 if __name__ == "__main__":

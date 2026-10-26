@@ -17,7 +17,7 @@ from pathlib import Path
 from tools import harness_telegram as ht
 
 
-OPERATOR = 456474197
+OPERATOR = 424242424
 STRANGER = 999999999
 
 
@@ -126,8 +126,8 @@ class TestLoadAllowFrom(unittest.TestCase):
 
     def test_valid_file_returns_int_set(self):
         path = self.base / "access.json"
-        path.write_text(json.dumps({"dmPolicy": "allowlist", "allowFrom": ["456474197"]}), encoding="utf-8")
-        self.assertEqual(ht.load_allow_from(path), frozenset({456474197}))
+        path.write_text(json.dumps({"dmPolicy": "allowlist", "allowFrom": ["424242424"]}), encoding="utf-8")
+        self.assertEqual(ht.load_allow_from(path), frozenset({424242424}))
 
     def test_malformed_json_returns_empty_not_crash(self):
         path = self.base / "access.json"
@@ -163,6 +163,49 @@ class TestExecuteParsedInvocation(unittest.TestCase):
         self.assertEqual(code, 0)
         entries = list(self.ledger_dir.rglob("*.jsonl"))
         self.assertEqual(len(entries), 1)
+
+
+class TestSeatPauseWakeParse(unittest.TestCase):
+    """ORG-106 L1 (T-5524): pause/wake flow through the shared parser."""
+
+    def _parse(self, text):
+        return ht.parse_harness_message(text, OPERATOR, allow_from={OPERATOR})
+
+    def test_pause_parses_with_options(self):
+        r = self._parse('/harness specialist pause --for 2h --owner operator --ticket T-5524 --reason "quota crunch"')
+        self.assertIsInstance(r, ht.ParsedInvocation)
+        self.assertEqual(r.args.command, "pause")
+        self.assertEqual(r.args.reason, "quota crunch")
+
+    def test_wake_parses(self):
+        r = self._parse('/harness specialist wake --reason "done"')
+        self.assertIsInstance(r, ht.ParsedInvocation)
+        self.assertEqual(r.args.command, "wake")
+
+    def test_missing_reason_prompts(self):
+        for verb in ("pause", "wake"):
+            r = self._parse(f"/harness specialist {verb}")
+            self.assertIsInstance(r, ht.ReasonPrompt, verb)
+            self.assertEqual(r.command, verb)
+
+    def test_bad_for_is_parse_error(self):
+        r = self._parse('/harness specialist pause --for 99d --reason "x"')
+        self.assertIsInstance(r, ht.ParseError)
+
+    def test_huge_and_unicode_for_are_parse_errors_not_raises(self):
+        for bad in ("99999999999d", "\u0663h"):
+            r = self._parse(f'/harness specialist pause --for {bad} --reason "x"')
+            self.assertIsInstance(r, ht.ParseError, bad)
+
+    def test_stranger_refused(self):
+        r = ht.parse_harness_message("/harness specialist pause --reason x", STRANGER, allow_from={OPERATOR})
+        self.assertIsInstance(r, ht.AuthRefusal)
+
+    def test_usage_lists_new_verbs(self):
+        r = self._parse("/harness")
+        self.assertIsInstance(r, ht.ParseError)
+        self.assertIn("pause", r.message)
+        self.assertIn("wake", r.message)
 
 
 if __name__ == "__main__":

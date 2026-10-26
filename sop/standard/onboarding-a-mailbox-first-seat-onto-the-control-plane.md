@@ -1,6 +1,6 @@
 ---
 title: Onboarding a mailbox-first seat onto the consume control plane
-status: Drafted 2026-08-08 by Orchestrator (HO), written from the real execution that landed T-2677 (metis + atlas moved onto pantheon-persona-consume, operator-directed TG7340/7343). Adopted 2026-08-08 by Orchestrator (HO) — the same below-goal-level methodology-SOP pattern `onboarding-a-new-harness.md` (T-1031) and `migrating-an-existing-persona-onto-the-control-plane.md` (T-2633) were adopted under (autonomous per msg-3733 principles-as-ratification; sop/ is an HO-written surface per D2). The operator override-available. The ONBOARDING ACTION on any specific seat remains a goal-level call; this SOP is the how, not a decision to fire. Documents the CURRENT operator recipe (performed by hand); generalizing it into a one-command op is a tracked follow-up (T-2679).
+status: Drafted 2026-08-08 by Orchestrator (HO), written from the real execution that landed T-2677 (mason + artisan moved onto pantheon-persona-consume, operator-directed TG7340/7343). Adopted 2026-08-08 by Orchestrator (HO) — the same below-goal-level methodology-SOP pattern `onboarding-a-new-harness.md` (T-1031) and `migrating-an-existing-persona-onto-the-control-plane.md` (T-2633) were adopted under (autonomous per msg-3733 principles-as-ratification; sop/ is an HO-written surface per D2). The operator override-available. The ONBOARDING ACTION on any specific seat remains a goal-level call; this SOP is the how, not a decision to fire. Documents the CURRENT operator recipe (performed by hand); generalizing it into a one-command op is a tracked follow-up (T-2679).
 ---
 
 # Onboarding a mailbox-first seat onto the consume control plane
@@ -10,9 +10,9 @@ status: Drafted 2026-08-08 by Orchestrator (HO), written from the real execution
 - `migrating-an-existing-persona-onto-the-control-plane.md` moves an EXISTING claude persona that already runs a bespoke telegram-bot supervisor onto `pantheon-persona-consume@<persona>`, via `tools/persona_cutover.sh`. That tool HARD-REQUIRES a telegram channel (`persona_cutover_resolve.py` `CONTROL_PLANE_CHANNELS` check, ~line 327) and a bespoke supervisor to tear down.
 - `onboarding-a-new-harness.md` brings up a NEW non-claude harness (codex, etc.).
 
-Neither fits a **from-scratch, mailbox-first claude seat** — no bespoke supervisor to migrate from, and NO telegram channel (all comms via the mailbox). The sub-orchestrator seats **metis** (suborch1) and **atlas** (suborch2) were the first two, moved 2026-08-08 under T-2677 after ~10 days of dormancy caused by their old wake timers being `start`-ed but never `enable`-d (they did not survive a session restart). The consume control plane replaces that: an `enable`-d `pantheon-persona-consume@<persona>.timer` fires every ~2min, and each fire wakes (or first-launches) the seat to work its mailbox.
+Neither fits a **from-scratch, mailbox-first claude seat** — no bespoke supervisor to migrate from, and NO telegram channel (all comms via the mailbox). The sub-orchestrator seats **mason** (suborch1) and **artisan** (suborch2) were the first two, moved 2026-08-08 under T-2677 after ~10 days of dormancy caused by their old wake timers being `start`-ed but never `enable`-d (they did not survive a session restart). The consume control plane replaces that: an `enable`-d `pantheon-persona-consume@<persona>.timer` fires every ~2min, and each fire wakes (or first-launches) the seat to work its mailbox.
 
-**Key fact that makes this config-only (no code change):** a mailbox-first seat carries NO `native.channels` in its manifest launch stanza. `tools/harness_adapter/claude.py` `build_interactive_launch` (~line 371) appends `--channels` ONLY when channels is a non-empty string, and `tools/harness_adapter/diagnostics.py` (~line 455) validates channels ONLY when present. So the channel-less launch is simply `claude --model claude-opus-4-8 --permission-mode default` — the same shape as specialist/recovery minus the `--channels` flag.
+**Key fact that makes this config-only (no code change):** a mailbox-first seat carries NO `native.channels` in its manifest launch stanza. `tools/harness_adapter/claude.py` `build_interactive_launch` (~line 371) appends `--channels` ONLY when channels is a non-empty string, and `tools/harness_adapter/diagnostics.py` (~line 455) validates channels ONLY when present. So the channel-less launch is simply `claude --model claude-opus-4-8 --permission-mode bypassPermissions` (T-4935; was `default`) — the same shape as specialist/recovery minus the `--channels` flag.
 
 ---
 
@@ -57,7 +57,7 @@ In `instance.yaml` `harness_runtime.roles.<role>`, fill the stub to carry the co
         profile: interactive-subscription
         model: claude-opus-4-8            # fleet policy (T-2643)
         native:
-          permission_mode: default
+          permission_mode: bypassPermissions   # T-4935 (was default)
           # NO channels key — this is the mailbox-first difference
 ```
 
@@ -68,7 +68,7 @@ Commit + push to `main`, then `git pull` the seat's OWN clone to that commit (th
 The `persona.brief` precondition (`persona_installer.py` ~line 798, `persona_bringup.py` ~line 496) requires a tracked `pinned-rules/<persona>.md`. Adopt the seat's EXISTING live brief verbatim rather than inventing one:
 
 - Copy `/home/<account>/CLAUDE.md` content into `pinned-rules/<persona>.md`, commit + push, pull the seat clone.
-- As the seat account, back up and symlink the live path to the tracked file (the specialist/recovery/mnemosyne pattern):
+- As the seat account, back up and symlink the live path to the tracked file (the specialist/recovery/archivist pattern):
   `cp ~/CLAUDE.md ~/CLAUDE.md.pre-symlink-<date>; ln -sf ~/pantheon-config/pinned-rules/<persona>.md ~/CLAUDE.md`
 
 ### 3. Install the consume units as operator, then fire
@@ -94,9 +94,9 @@ Run after enabling the timer, before declaring the seat onboarded:
 
 - [ ] Service fires clean: `journalctl --user -u pantheon-persona-consume@<persona>.service` shows `Finished` (or SuccessExitStatus 3/4/5), not `Failed`, across at least 2-3 consecutive fires.
 - [ ] Timer armed with a finite next-elapse: `systemctl --user list-timers pantheon-persona-consume@<persona>.timer`.
-- [ ] The launched `claude` carries the correct channel-less argv: `pgrep -u <account> -a -f "claude --"` shows `claude --model claude-opus-4-8 --permission-mode default` (NO `--channels`).
+- [ ] The launched `claude` carries the correct channel-less argv: `pgrep -u <account> -a -f "claude --"` shows `claude --model claude-opus-4-8 --permission-mode bypassPermissions` (NO `--channels`).
 - [ ] `runtime.json` present under `~/.local/state/pantheon/...` (so the mismatch branch will not fire).
-- [ ] Mailbox round-trip: the seat wakes on a real inbound and (for a seat whose job is to report upward) mailboxes its lead. In T-2677, metis and atlas each self-woke, loaded their brief, and mailboxed orchestrator — the definitive end-to-end proof.
+- [ ] Mailbox round-trip: the seat wakes on a real inbound and (for a seat whose job is to report upward) mailboxes its lead. In T-2677, mason and artisan each self-woke, loaded their brief, and mailboxed orchestrator — the definitive end-to-end proof.
 - [ ] `systemctl --user reset-failed pantheon-persona-consume@<persona>.service` if any transient failure was logged during setup.
 
 If the first fires are not clean, roll back (below), diagnose, re-attempt only after the root cause is understood — same disarm discipline as the sibling SOPs.
@@ -132,4 +132,4 @@ Out of scope: personas with a bespoke telegram supervisor (`migrating-an-existin
 - `tools/persona_bringup.py` (`consume`) + `tools/runtime_controller.py` (`ensure_runtime`) — the consume runtime.
 - `tools/harness_adapter/claude.py` `build_interactive_launch` — where `--channels` is conditionally added (the channel-less fact).
 - `architecture/adr/ORG-031-harness-abstraction-and-daemon-onboarding.md` / `architecture/adr/ORG-050-security-and-identity-contract.md` — the control-plane ADRs.
-- T-2677 (the metis/atlas execution this SOP was written from), T-2678 (the kill-stale-pane failure), T-2679 (generalize step 3 + this SOP).
+- T-2677 (the mason/artisan execution this SOP was written from), T-2678 (the kill-stale-pane failure), T-2679 (generalize step 3 + this SOP).

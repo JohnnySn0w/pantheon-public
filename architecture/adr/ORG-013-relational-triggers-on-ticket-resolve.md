@@ -11,6 +11,14 @@ build_disposition: built
 
 **Amended 2026-05-19 by ORG-019:** `blocked/` directory retired. Cascade-unblock semantics shift from "blocked → inbox/active dir move" to "dependant in inbox/ with `depends_on` gate clears when last dep resolves (frontmatter rewrite; file stays in inbox/)." Blocked-revisit digest section retires entirely. See §1 (amended) and §2 (retired) below for the post-ORG-019 mechanism shape.
 
+**Amended 2026-09-22 by T-3933** (orchestrator-autonomous per infra-design msg10007 + goal-neutral maintenance; **Adopted 2026-09-27 under D3**: cascade mechanics sit below the goal-level bar and the operator's msg_1293 unblock gate is unchanged, so no ratify walk is owed (T-4000)): cascade splits into two legs — a **partial-strip** leg (always fires on every resolve, prunes `parent_tid` and any independently-shipped sibling from every dependant's `depends_on`; no unblock, no stamp changes) plus the historical **full-unblock** leg (fires only when `_all_other_deps_shipped`; strips `auto_delivered` stamps; makes the dependant deliverable). This is a strict refinement, NOT a reversal of the operator's msg_1293 ratification: the full-unblock leg's gate + stamp semantics are byte-unchanged. What T-3933 closes is the middle-state accumulation gap the original hard-contract exposed — a dependant with `depends_on: [A(done), B(open)]` used to keep A as a stale-done ref indefinitely (or until every sibling shipped, or until a hand/sweep cleanup ran). Now A gets pruned eagerly; B still gates. See §1 (updated hard-contract) below.
+
+**Amended 2026-09-29 by T-4186** (orchestrator-autonomous, on the same basis as T-3933: cascade mechanics sit below the goal-level bar; the operator's msg_1293 unblock gate and both legs' semantics are unchanged, so no ratify walk is owed). The edge-triggered **PR-merge path is retired**, and a **level-triggered backstop sweep** replaces it. Resolve-time cascade is unchanged and remains primary.
+- `.github/workflows/cascade-on-merge.yml` (T-3289) walked each push's renames into done/ and ran `ticket.py cascade --tid` for each. Its `GITHUB_TOKEN` could never push to protect-main (the bypass actors are DeployKey and User only, and there were 0 `cascade:` commits ever), and stale refs had already leaked (T-3382 on T-3381; T-3227 on T-3176 and T-3218).
+- `tools/cascade_sweep.py` on a 15-minute seat-side timer (`pantheon-cascade-sweep.{service,timer}`, on the claude seat) finds every inbox/active ticket whose `depends_on` names a shipped tid (`_dep_is_shipped`, ORG-089). It then runs the same `ticket.py cascade --tid`, under the existing lock/pull/push path.
+- It is **additive**, not a reversal of "Atomic commit over event+cron pickup". Resolve still cascades atomically in the resolve commit. The sweep only reconciles tickets that reached done/ by a non-resolve route (a PR/admin merge move, or a hand move) or were missed. It is idempotent and makes no commit when nothing is stale.
+- `cmd_cascade` now also **refuses a dropped tid** (a `_dep_is_shipped` guard, pre-lock and in-lock). Before this, a manual `cascade --tid <dropped>` would have stripped a dependant's gate on a bet that was abandoned, not shipped (ORG-089).
+
 **Date authored:** 2026-05-14
 
 **Author:** Orchestrator (Orchestrator) — restructured from Recovery's prior SOP draft.
@@ -66,19 +74,21 @@ Mechanism details:
 
 **Post-ORG-019 semantics:** the cascade rewrites `depends_on` on dependant tickets in-place rather than moving files between directories.
 
-`tools/ticket.py resolve T-X` — after moving T-X to `done/` and editing its frontmatter, `_cascade_unblock_dependants(T-X)` runs as a `cascade_callback` inside `_do_transition` (before the commit). The cascade:
+`tools/ticket.py resolve T-X` — after moving T-X to `done/` and editing its frontmatter, `_cascade_unblock_dependants(T-X)` runs as a `cascade_callback` inside `_do_transition` (before the commit). The cascade fires two legs, per T-3933:
 
 1. Scans `inbox/`, `active/` for tickets whose `depends_on` includes T-X.
-2. For each dependant: checks if every OTHER dep is also in `done/`.
-3. If all deps satisfied: removes T-X from the dependant's `depends_on` list (frontmatter edit), appends a transition log entry: `[auto-unblock] depends_on T-X resolved (cascade)`. File stays in its current directory (no `git mv`).
-4. All cascade file changes batch into the SAME atomic commit as the parent resolve. Commit message gains a trailing `Auto-unblock cascade: N dependant(s) had depends_on satisfied per T-0328.` line.
+2. For each dependant, computes `remaining_deps = [d for d in deps if d != T-X and not _dep_is_shipped(d)]` and rewrites the dependant's `depends_on` to `remaining_deps` — pruning T-X **plus any other independently-shipped sibling** (T-2177). This step is **always applied** (partial-strip leg).
+3. **If** every other dep was already shipped (`_all_other_deps_shipped`): also strips `auto_delivered` / `auto_delivered_at` stamps (T-0971 arm-A) and appends `[auto-unblock] dep resolved` to the dependant's transition log — the ticket is now deliverable (full-unblock leg).
+4. **Else** (dependant still gated on at least one open sibling): appends `[cascade] stale-done dep <T-X> stripped` to the transition log, no stamp changes. The dependant stays in inbox/+active/, `depends_on` faithfully reflects only the still-open gates.
+5. All cascade file changes batch into the SAME atomic commit as the parent resolve. Commit message (via `cmd_cascade`, the sweep/manual path since T-4186; the retired PR-merge Action before it) distinguishes the legs: `"ORG-013 cascade (T-3933 two-leg): N partial-strip (stale-done ref pruned; still gated) + M auto-unblock (fully deliverable now)"` (T-3941).
 
 Tickets with future `not_before` stay suppressed by `inbox_consumer.py` regardless of cascade activity — the calendar gate and the dependency gate are orthogonal mechanisms.
 
-**Hard contract (load-bearing):**
+**Hard contract (load-bearing; T-3933-refined):**
 - **Always-on.** No opt-in/opt-out label; the relational trigger is the default mechanism.
-- **Multi-dep partial-resolve does NOT fire** (frontmatter still shows other-deps in `depends_on`). Only fires on all-deps-done.
-- **Malformed dep IDs fail closed.** A dependant with a non-`T-NNNN`-shaped dep stays "dep not done." Surfaces during grooming or human review rather than silently auto-unblocking on uncertainty.
+- **Partial-strip always fires** (T-3933). Every resolve prunes the resolving tid — plus any independently-shipped sibling — from every dependant's `depends_on`. Closes the middle-state accumulation gap the original all-or-nothing wording produced.
+- **Full-unblock (deliverable-status change + stamp-strip) still fires only on all-deps-shipped** — the operator msg_1293's original ratification is preserved byte-for-byte on this axis. A dependant with a still-open sibling gets its stale-done refs pruned but stays gated.
+- **Malformed dep IDs fail closed on the UNBLOCK path only.** A dependant with a non-`T-NNNN`-shaped or dropped sibling stays "not-yet-deliverable" — the unblock gate refuses to reason about uncertainty. The partial-strip leg is NOT gated by that fail-closed posture (T-3933 decision i): a malformed sibling says nothing about whether the just-shipped parent should still be listed; the shared `remaining_deps` computation drops parent unconditionally while a malformed sibling stays on its own account.
 
 ### 2. ~~Blocked-revisit digest section~~ — RETIRED per ORG-019
 
@@ -115,19 +125,47 @@ Atomic with this ADR's ratification — the code shipped via T-0328:
 
 Ratification gates this ADR's documentary precedent; code behavior is live regardless.
 
+**T-3933 partial-strip leg (landed at pantheon-config@a559ff4d3, PR #471 merged 2026-09-22):**
+- `_cascade_unblock_dependants` split into a shared `remaining_deps` computation + a conditional `if full_unblock:` branch for the deliverable-status change (stamps + `[auto-unblock]` actor). The `else:` branch appends `[cascade] stale-done dep <tid> stripped` and touches no stamps.
+- `_all_other_deps_shipped` (renamed from `_all_other_deps_done` per T-3440 Scope B) — unchanged; the fail-closed unblock gate is verbatim from msg_1293.
+- Tests: `test_ticket.py:TestCascadeUnblockOnResolve` (399 cases across the module), `test_ticket_cascade.py:TestCmdCascadeMultiDepMixedState` + `TestCmdCascadeLegAwareCommitMessage` (T-3941 leg-aware commit-body coverage), `test_appetite_circuit_breaker.py:TestDroppedDepDoesNotUnblock` (FALSIFIER 2 dropped-sibling still gates).
+- 6 line-targeted mutations (M1-M6, T-3933 impl-side) confirm falsifiability. M4 substituted with M4′ (partial leg drops only parent_tid) after original M4 discovered to be a no-op given call-site invariants — disclosed at commit time per feedback_no_fabricated_tool_results.
+
+**T-3941 leg-aware commit-message body (landed at pantheon-config@4bfe013d1):**
+- `_cascade_unblock_dependants` grew an opt-in `stats: dict[str, int] | None = None` param.
+- `cmd_cascade` opts in + builds the commit-message body from per-leg counts so `git log` distinguishes partial-strip-only from full-unblock fires.
+
+**T-4186 level-triggered sweep (landed at pantheon-config@1986ecfde, PR #529, merged 2026-09-29):**
+- `tools/cascade_sweep.py` reconciles stale refs. It re-detects between tids, attempts each tid once, and caps at 25 per run.
+  - DEFERRED (exit 0): a busy `git_mutation_lock`, or the seat checkout on a non-main branch.
+  - FAILED (exit 1, `OnFailure` alert): non-convergence.
+  - `--check` is read-only.
+- `tools/systemd/pantheon-cascade-sweep.{service,timer}` runs at `*:04,19,34,49`, with `Persistent=true`, installed on the claude seat.
+- Retired: `.github/workflows/cascade-on-merge.yml` and `tools/cascade_diff_scan.py`, plus their tests.
+- `cmd_cascade` has the dropped-tid refusal, with each check pinned by its own test.
+- Tests: `tools/test_cascade_sweep.py`, including a hermetic real-git e2e with a racing push, and `tools/test_ticket_cascade.py`.
+- Live canary at install (2026-09-29 ~02:49Z): `--check` listed the 3 leaked refs (T-3176, T-3218 → T-3227; T-3381 → T-3382). The first sweep reported fixed=2, skipped=1 (T-3218 was cleared as a sibling side effect of T-3176), with 2 `cascade:` commits (14ea796a4, b1e788c9b); T-3227 is now `depends_on: [T-3226]` and T-3382 `[T-2667]`. The second sweep was a no-op.
+- Liveness and deferral monitoring: T-4220 (PR #538, merged @ae1be4ffa, 2026-09-29).
+  - The 8th CONSECUTIVE pure-deferral run exits 1, so `OnFailure` pages. That narrows "DEFERRED (exit 0)" above to a single or short run of deferrals. The counter is fail-open and never changes the exit code on its own faults.
+  - The consumer-liveness monitor (Recovery's seat) watches the sweep for fires-then-goes-quiet: 60 min max silence, via its `WATCHED_UNITS` registry.
+  - A deleted or disabled sweep timer is report-only there. Ownership of that gap is T-4232.
+
 ## Re-evaluate when
 
 - Manual-block usage emerges as a regular pattern → reconsider Option B (opt-out label).
 - Cross-repo `depends_on` becomes a thing → cascade currently only scans `pantheon-config/tickets/`; cross-repo would need a different lookup mechanism (and probably a sibling ADR).
 - Cascade firing rate becomes load-significant → already batched (one dep-scan per resolve); further optimization (cached dep-graph) only justified if `_find_dependants` shows up in profiles.
+- The sweep's fix rate stays well above 0 (T-4186) → something is routing tickets to done/ outside resolve. Find it, rather than leaning on the backstop.
 
 ## DECISIONS
 
 - **Always-on cascade over opt-in/opt-out label** — justifies via P1 + the operator msg_1293 (default-on; rare override case bears the friction).
 - **Atomic commit over event+cron pickup** — justifies via D2 (audit-chain integrity; no inbox/blocked-mismatch window between resolve and unblock).
-- **All-deps-done firing over partial-cascade** — justifies via D10 + clarity-of-state (`depends_on` showing un-done IDs is a clearer "still waiting" signal than a half-unblocked state).
+- **All-deps-done firing over partial-cascade** — justifies via D10 + clarity-of-state (`depends_on` showing un-done IDs is a clearer "still waiting" signal than a half-unblocked state). *(T-3933 refinement: the deliverable-status change (unblock + stamp-strip) still fires only on all-deps-done. The complementary partial-strip leg keeps `depends_on` faithful to actually-open gates without changing deliverability — the two axes are separable and had been conflated in the original wording. See below.)*
 - **Prior-claim-aware restore-target over always-inbox** — justifies via mid-work-preservation (a previously-claimed ticket carries work context that returning-to-inbox would lose).
-- **Malformed-dep fail-closed** — justifies via D2 + P1 (failure mode should be visible-blocked-for-review, not silent-auto-unblock on uncertainty).
+- **Malformed-dep fail-closed on unblock** — justifies via D2 + P1 (failure mode should be visible-blocked-for-review, not silent-auto-unblock on uncertainty). *(T-3933: the fail-closed posture gates deliverability only. Partial-strip prunes the just-shipped parent regardless — a malformed sibling says nothing about whether the parent should still be listed.)*
+- **T-3933 partial-strip refinement (added 2026-09-22)** — justifies via P1 (mechanism-over-convention: structural prune retires the periodic-sweep alternative) + P4 (traceability: `depends_on` reflects actually-open gates instead of accumulating stale-done refs until every sibling ships) + D6 (minimum-viable-change: extends the existing cascade, adds no new scheduled unit or CLI surface) + D10 (compatibility: msg_1293's all-deps-done unblock gate is byte-unchanged; partial-strip is strictly additive).
+- **T-4186 level-triggered sweep over the edge-triggered PR-merge Action (added 2026-09-29)** — justifies via P1 (a reconcile that re-reads state converges whatever route moved a ticket to done/; the edge trigger could never push and silently leaked 3 refs) + D2 (the resolve-time atomic cascade stays primary; the sweep's own `cascade:` commits are traceable) + P7 (cheap backstop: idempotent, no commit when clean). The dropped-tid refusal in `cmd_cascade` justifies via ORG-089 (dropped ≠ shipped).
 - **SOP→ADR conversion** — justifies via [[ORG-012]] §Promotion #5 (architectural decision-among-alternatives with named tradeoffs is ADR-shape, not SOP-shape) + the operator verdict msg_~1497-window ("this should be an adr not an sop").
 
 ## Cross-references
@@ -136,5 +174,11 @@ Ratification gates this ADR's documentary precedent; code behavior is live regar
 - [[ORG-012]] §Promotion #5 — SOP→ADR conversion path justifying this restructure.
 - T-0185 (transition log 2026-05-13T06:17Z) — external-substrate gap incident motivating the manual-block override preservation.
 - T-0244 — `git pull --ff-only` discipline that bounds cross-process race-safety for the cascade.
-- T-0328 — implementation ticket (closed); T-0329 — ratification ticket (was for the retired SOP; will be re-filed against this ADR).
+- T-0328 — implementation ticket (closed); T-0329 — ratification ticket (was for the retired SOP; superseded: ORG-013 ratified directly 2026-06-07). *(Erratum 2026-09-27, operator-approved TG 10399 / T-4036.)*
+- T-3182 — artisan's arc where the middle-state accumulation gap surfaced (2 of 4 dependants hand-cleared after resolve; post-cascade hygiene sweep @34332a9f had independently cleaned 20 more stale-done refs). Motivated T-3933.
+- T-3933 — partial-strip leg implementation (PR #471 merged @a559ff4d3, 2026-09-22).
+- T-3941 — leg-aware commit-message body (landed @4bfe013d1).
+- T-3942 — this amendment (Adopted 2026-09-27 under D3; T-4000).
+- T-4186 / T-4199 — level-triggered sweep replacing the cascade-on-merge Action (PR #529 merged @1986ecfde, 2026-09-29); T-4220 — its liveness + deferral escalation.
 - `lessons/structural-enforcement-retires-the-prose-rule.md` — same P1-flavor lesson this ADR operationalizes for `depends_on` tracking.
+- `lessons/2026-09-22-adversarial-review-plus-mutation-test-falsification.md` — falsifiability discipline the T-3933 mutation coverage carries forward.

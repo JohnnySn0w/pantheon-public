@@ -24,6 +24,7 @@ from collections import Counter
 from pathlib import Path
 
 import tools.spine_index_groom as sig
+from tools._tree_walk import walk_paths
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -139,7 +140,8 @@ class TestLiveTree(unittest.TestCase):
 
     def test_no_malformed_autogen_rows_repo_wide(self) -> None:
         malformed: list[str] = []
-        for md in sorted(REPO_ROOT.rglob("*.md")):
+        # walk_paths, not rglob: tolerate entries vanishing mid-walk (T-4450).
+        for md in walk_paths(REPO_ROOT, "*.md"):
             if ".git/" in str(md):
                 continue
             try:

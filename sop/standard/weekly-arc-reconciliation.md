@@ -36,7 +36,7 @@ The pass is NOT gated on the weekly cadence for the actual re-sequencing — HO 
 ## Cadence + wiring
 
 - **Weekly cadence** rides the existing `pantheon-weekly-ticket-summary.timer` (Monday 09:00 UTC per `sop/standard/weekly-ticket-summary-generation.md`).
-- **HO's session** picks up the weekly-ticket-summary generation request (target=orchestrator, labels weekly-summary). While generating the digest, HO executes this reconciliation pass and folds the "Reconciliation" section into the output.
+- **HO's session** picks up the weekly-ticket-summary generation request (target=role:head_engineering_orchestrator, labels weekly-summary). While generating the digest, HO executes this reconciliation pass and folds the "Reconciliation" section into the output.
 - **No new cron, no new timer, no new role.** The pass rides the existing weekly cron; the S3+S4 collaboration is HO reading Specialist's outputs at the same cadence Specialist already produces them.
 
 ## Discipline (what the pass MUST do + MUST NOT do)

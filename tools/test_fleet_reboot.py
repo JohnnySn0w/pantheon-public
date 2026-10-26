@@ -202,6 +202,44 @@ class TestRegistry(unittest.TestCase):
         self.assertTrue(clean)
 
 
+class TestHandoffPauseIdentity(unittest.TestCase):
+    """T-4159: the pause call names the seat by its instance.yaml restart identity,
+    so a control-plane seat never gets the retired bespoke unit."""
+
+    def _argv(self, agent, target=None, raises=False):
+        from unittest.mock import patch
+        seen = {}
+        def run(argv, timeout=900):
+            seen["argv"] = argv
+            return 0, ""
+        fake = type("ARM", (), {})()
+        if raises:
+            def rt(_p): raise KeyError(_p)
+        else:
+            def rt(_p): return target
+        fake.restart_target = rt
+        with patch.object(fr, "agent_role_map", fake):
+            fr.quiesce_handoff_pause(agent, fr.FLEET[agent], run=run, dry_run=False)
+        return seen["argv"][-1]
+
+    def test_control_plane_seat_gets_consume_unit_and_flag(self):
+        inner = self._argv("orchestrator", {"service": "pantheon-persona-consume@orchestrator.service",
+                                     "supervisor": "control-plane"})
+        self.assertIn("--service pantheon-persona-consume@orchestrator.service", inner)
+        self.assertIn("--supervisor control-plane", inner)
+        self.assertNotIn("claude-telegram.service", inner)
+
+    def test_bespoke_seat_unchanged(self):
+        inner = self._argv("orchestrator", {"service": "claude-telegram.service", "supervisor": "bespoke"})
+        self.assertIn("--service claude-telegram.service", inner)
+        self.assertIn("--supervisor bespoke", inner)
+
+    def test_resolution_failure_falls_back_to_static_entry(self):
+        inner = self._argv("orchestrator", raises=True)
+        self.assertIn(f"--service {fr.FLEET['orchestrator']['service']}", inner)
+        self.assertIn("--supervisor bespoke", inner)
+
+
 class TestCLI(unittest.TestCase):
     def test_cli_dry_run_default_exit_0(self):
         # Real side-effect funcs but dry_run=True everywhere -> no live ops.

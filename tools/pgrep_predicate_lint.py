@@ -81,6 +81,11 @@ import re
 import sys
 from pathlib import Path
 
+try:
+    from tools._tree_walk import walk_paths
+except ImportError:  # bare run with cwd=tools/ (tools/ on sys.path, repo root not)
+    from _tree_walk import walk_paths  # type: ignore[no-redef]
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 #: Files scanned: executable/script surfaces. Prose dirs are excluded wholesale —
@@ -100,6 +105,11 @@ SKIP_DIR_NAMES = frozenset({
     "adr", "reports", "archive", "sop", "rulebook", "pinned-rules", "skills",
     "promotion-candidates", "dispatches", "finances", "assets", "screenshots",
 })
+
+#: Path prefixes that are not this tree at all. `.claude/worktrees/` is where an
+#: isolation-worktree agent checks out ANOTHER commit (gitignored); scanning it
+#: lints stale code and turns any seat with such an agent red (T-4513).
+SKIP_PATH_PREFIXES: tuple[tuple[str, ...], ...] = ((".claude", "worktrees"),)
 
 #: (path relative to repo root, reason). Curated — see ALLOWLIST above.
 ALLOWLIST: tuple[tuple[str, str], ...] = (
@@ -122,6 +132,15 @@ ALLOWLIST: tuple[tuple[str, str], ...] = (
         "agent SESSION processes, which have no systemd unit and no discriminating "
         "process name (`pgrep -x` would match every node/codex on the box). "
         "uid-scoped + absolute binary path makes a false match negligible.",
+    ),
+    (
+        "harness/codex/codex_self_restart.sh",
+        "T-4756 / ORG-091: imported VERBATIM from codex-config at T-4755 (C1); "
+        "Consultant-owned runtime. `pgrep -u \"$(id -u)\" -f 'codex-linux-x64.*/bin/codex$'` "
+        "is uid-scoped and anchored on the codex binary path suffix, the same shape "
+        "as the pantheon_oom_shield.sh entry above, so a false match is negligible. "
+        "It is listed per-file, not as a harness/ skip, so the rest of harness/ stays "
+        "linted. Re-examined when T-4750 C4b reworks the codex runtime.",
     ),
     (
         "tools/ho_resumer.py",
@@ -248,10 +267,14 @@ def scan(root: Path, allowlist: tuple[tuple[str, str], ...] = ALLOWLIST) -> list
     """Return [(relpath, lineno, line)] for every non-allowlisted finding."""
     allowed = {p for p, _reason in allowlist}
     out: list[tuple[str, int, str]] = []
-    for path in sorted(root.rglob("*")):
+    # walk_paths, not rglob: tolerate entries vanishing mid-walk (T-4450).
+    for path in walk_paths(root):
         if not path.is_file() or path.suffix not in SCAN_SUFFIXES:
             continue
-        if any(part in SKIP_DIR_NAMES for part in path.relative_to(root).parts[:-1]):
+        parts = path.relative_to(root).parts
+        if any(part in SKIP_DIR_NAMES for part in parts[:-1]):
+            continue
+        if any(parts[: len(prefix)] == prefix for prefix in SKIP_PATH_PREFIXES):
             continue
         if path.name.startswith(TEST_PREFIXES):
             continue

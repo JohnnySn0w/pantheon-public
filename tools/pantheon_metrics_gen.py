@@ -3,15 +3,17 @@
 personal-site PANTHEON window (T-3625).
 
 STATIC-by-construction safety: emits ONLY the allowlisted coarse fields (persona
-label + cpu%/mem%/state per member; cluster load%/up/total). NEVER hostnames,
-account/service names, uids, paths, pids, host<->VM<->CT topology, model pins,
-session/token internals, or ticket content. A leak_scan() runs on every output
-and REFUSES to write if any forbidden content or non-allowlisted key appears --
-the "do not overexpose" guardrail enforced in code.
+label + cpu%/mem%/state per member; cluster load%/up/total; and coarse per-host
+up/down under ALLOWLISTED host labels for the SYSTEMS//UPLINK panel -- a raw
+infra hostname is never emitted; sensitive ones like pve2/boxon stay on the
+FORBIDDEN floor). NEVER account/service names, uids, paths, pids, host<->VM<->CT
+topology, model pins, session/token internals, or ticket content. A leak_scan()
+runs on every output and REFUSES to write if any forbidden content or
+non-allowlisted key appears -- the "do not overexpose" guardrail enforced in code.
 
 Writes a LOCAL file. Public exposure (caddy file_server + DNS) is separate.
 
-Roster (operator-confirmed surface, T-3625): 6 claude-harness agents + cairn
+Roster (operator-confirmed surface, T-3625): 6 claude-harness agents + consultant
 (codex harness) + echo (the echo.service audio daemon). Three measurement kinds:
   agent   -- per-account (claude harness): ps %mem, /proc cpu-delta, .claude
              jsonl freshness for active/idle/down.
@@ -23,6 +25,11 @@ Roster (operator-confirmed surface, T-3625): 6 claude-harness agents + cairn
 import argparse, json, os, subprocess, sys, time
 from datetime import datetime, timezone
 
+try:  # dual-identity-safe (run-as-package vs bare run with cwd=tools/)
+    from tools.seat_exec import seat_argv
+except ImportError:  # pragma: no cover
+    from seat_exec import seat_argv  # type: ignore
+
 SCHEMA = "pantheon-metrics/1"
 NCPU = os.cpu_count() or 1
 ACTIVE_JSONL_FRESH_SEC = 60
@@ -31,32 +38,73 @@ ROSTER = [
     {"label": "orchestrator",     "acct": "claude",         "kind": "agent"},
     {"label": "specialist",     "acct": "claude-research", "kind": "agent"},
     {"label": "recovery",      "acct": "claude-fallback", "kind": "agent"},
-    {"label": "metis",     "acct": "suborch1",        "kind": "agent"},
-    {"label": "atlas",     "acct": "suborch2",        "kind": "agent"},
-    {"label": "mnemosyne", "acct": "exocortex",       "kind": "agent"},
-    {"label": "cairn",     "acct": "codex",           "kind": "codex"},
+    {"label": "mason",     "acct": "suborch1",        "kind": "agent"},
+    {"label": "artisan",     "acct": "suborch2",        "kind": "agent"},
+    {"label": "archivist", "acct": "exocortex",       "kind": "agent"},
+    {"label": "consultant",     "acct": "codex",           "kind": "codex"},
     {"label": "echo",      "acct": "claude", "kind": "service", "service": "echo.service"},
 ]
 
+# Per-host coarse up/down for the personal-site SYSTEMS // UPLINK panel (T-3721).
+# The site consumer lowercases label and matches it against ["vps","pve2","boxon",
+# "laptop"], rendering up / down / "?" (absent). Probe internals (ssh hostnames)
+# stay private -- ONLY {label, up:bool} is emitted and leak_scan-checked.
+#   local -> the host this collector runs on (the swarm VPS): up by construction.
+#   ssh   -> reachability of sshhost from recovery's account. up = ssh exit != 255;
+#            255 is a transport/connect failure, while any other code means the
+#            transport connected and the remote ran -- so it distinguishes a
+#            down host from a remote-command quirk (e.g. Windows powershell
+#            rejecting the unix `true`).
+# The two home-cluster hosts emit under GENERIC tokens, NOT their real names:
+# pve2 -> "lab", boxon -> "home". This is the operator's A decision on T-3721 (chose A
+# over B on 2026-09-15): keep the leak_scan FORBIDDEN floor intact (pve2/boxon
+# stay forbidden substrings; only the coarse token + up/down reach the public
+# feed) rather than carve real infra names out of the floor. The site remaps its
+# visible PVE2/BOXON labels to lab/home to match (specialist owns that). vps + laptop
+# keep real labels (they were never on the floor).
+HOSTS_ROSTER = [
+    {"label": "vps",    "probe": "local"},
+    {"label": "laptop", "probe": "ssh", "sshhost": "operator-w11"},
+    {"label": "lab",    "probe": "ssh", "sshhost": "pve2"},
+    {"label": "home",   "probe": "ssh", "sshhost": "boxon"},
+]
+
 # --- output allowlist (leak_scan invariants) ---
-TOP_KEYS = {"schema", "generated_at", "cluster", "agents"}
+TOP_KEYS = {"schema", "generated_at", "cluster", "agents", "hosts"}
 CLUSTER_KEYS = {"load_pct", "agents_up", "agents_total"}
 AGENT_KEYS = {"label", "cpu_pct", "mem_pct", "state"}
-STATES = {"active", "idle", "down"}
+HOST_KEYS = {"label", "up"}
+STATES = {"active", "idle", "down", "unknown"}
+# T-4070: "unknown" = the cross-account probe itself FAILED (sudo/bus error), which is
+# not a real negative. The site consumer (T-3626) hard-guards the schema and falls back
+# to simulated data on an unexpected value, so "unknown" is only EMITTED once the site
+# accepts it. Until then it renders as the legacy "down", with a stderr line saying it
+# was a probe failure, not a real down.
+EMIT_UNKNOWN = os.environ.get("PANTHEON_METRICS_EMIT_UNKNOWN") == "1"
 ALLOWED_LABELS = {m["label"] for m in ROSTER}
+ALLOWED_HOST_LABELS = {h["label"] for h in HOSTS_ROSTER}
 # Forbidden substrings: account/service names + host/path/id chrome. Persona
-# labels (orchestrator/specialist/recovery/metis/atlas/mnemosyne/cairn/echo) are the ALLOWED
+# labels (orchestrator/specialist/recovery/mason/artisan/archivist/consultant/echo) are the ALLOWED
 # public identifiers; the underlying account names (claude/claude-research/
 # codex/...) and the ".service" suffix are forbidden -- disjoint from the labels.
 FORBIDDEN = [
     "claude", "research", "fallback", "suborch", "exocortex", "codex",
-    "the-ancestor", "/home", "snowis", "swarm", "boxon", "pve2", "gpu-ml",
+    "the-ancestor", "/home", "your-domain", "swarm", "boxon", "pve2", "gpu-ml",
     ".service", ".scope", "tmux", "/proc", "/sys", "uid", "pid", "jsonl",
 ]
 
 
 def _run(argv):
     return subprocess.run(argv, capture_output=True, text=True)
+
+
+def _seat_argv(account, cmd):
+    """argv to run `bash -c cmd` AS `account` — DIRECTLY (no sudo) when `account` is our
+    own, else `sudo -u <account> bash -c cmd`. Delegates to the shared seat_exec.seat_argv
+    (T-4066) so the own-account-direct discrimination lives in one place; preserves this
+    tool's original `sudo -u` (no -n) shape via the sudo= override. The class this guards:
+    bugs/sudo-u-to-runners-own-account-fails-per-seat-cross-account-tool-false-null.md."""
+    return seat_argv(account, ["bash", "-c", cmd], sudo=("sudo", "-u"))
 
 
 def _uid(account):
@@ -111,9 +159,12 @@ def _has_agent_proc(uid):
 
 
 def _jsonl_fresh(account):
+    """True/False = fresh or not; None = the probe FAILED (T-4070: not 'idle')."""
     cmd = ('find ~/.claude/projects -maxdepth 2 -name "*.jsonl" '
            '-printf "%T@\\n" 2>/dev/null | sort -rn | head -1')
-    out = _run(["sudo", "-u", account, "bash", "-c", cmd])
+    out = _run(_seat_argv(account, cmd))
+    if out.returncode != 0:
+        return None
     try:
         return (time.time() - float(out.stdout.strip())) <= ACTIVE_JSONL_FRESH_SEC
     except ValueError:
@@ -121,10 +172,33 @@ def _jsonl_fresh(account):
 
 
 def _svc_show(account, service, prop):
-    out = _run(["sudo", "-u", account, "bash", "-c",
+    """The property value, or None when the probe FAILED (rc != 0: sudo/bus error).
+    T-4070: a failed probe is NOT an empty/"inactive" answer. systemctl itself exits 0
+    with "inactive" for a stopped or unknown unit."""
+    out = _run(_seat_argv(account,
                 f'XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user show '
-                f'{service} -p {prop} --value'])
+                f'{service} -p {prop} --value'))
+    if out.returncode != 0:
+        return None
     return out.stdout.strip()
+
+
+def _host_up(entry):
+    """Coarse reachability for one UPLINK host. local -> True (the collector runs
+    on it). ssh -> up unless ssh reports a transport/connect failure (exit 255)
+    or the probe times out. BatchMode + ConnectTimeout so a down host fails fast
+    and never hangs the push timer; the remote command's own exit code is
+    irrelevant (we only care that the transport connected -- see HOSTS_ROSTER)."""
+    if entry["probe"] == "local":
+        return True
+    try:
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=4",
+             "-o", "StrictHostKeyChecking=accept-new", entry["sshhost"], "exit"],
+            capture_output=True, text=True, timeout=8)
+        return r.returncode != 255
+    except (subprocess.TimeoutExpired, OSError):
+        return False
 
 
 def collect(roster, sample_sec=1.0):
@@ -137,7 +211,7 @@ def collect(roster, sample_sec=1.0):
             pids = _account_pids(uid)
             ctx[m["label"]] = {"uid": uid, "pids": pids, "j0": _pids_jiffies(pids)}
         elif m["kind"] == "service":
-            ns = _svc_show(m["acct"], m["service"], "CPUUsageNSec")
+            ns = _svc_show(m["acct"], m["service"], "CPUUsageNSec") or ""
             ctx[m["label"]] = {"ns0": int(ns) if ns.isdigit() else 0}
     tot0 = _total_cpu_jiffies()
     time.sleep(sample_sec)
@@ -150,22 +224,33 @@ def collect(roster, sample_sec=1.0):
         lbl, kind = m["label"], m["kind"]
         c = ctx[lbl]
         if kind in ("agent", "codex"):
-            cpu = round(max(_pids_jiffies(c["pids"]) - c["j0"], 0) / dtot * 100.0, 1)
+            # Clamped like the service branch: over a short window, jiffy granularity can
+            # put an account's delta past the total, and leak_scan would then refuse the
+            # WHOLE write (the site falls back to simulated data).
+            cpu = round(min(max(_pids_jiffies(c["pids"]) - c["j0"], 0) / dtot * 100.0, 100.0), 1)
             mem = _mem_pct_account(c["uid"])
-            if not _has_agent_proc(c["uid"]):
+            if c["uid"] < 0:
+                state = "unknown"  # T-4070: `id -u` failed -- can't look, not "down"
+            elif not _has_agent_proc(c["uid"]):
                 state = "down"
             elif kind == "agent":
-                state = "active" if _jsonl_fresh(m["acct"]) else "idle"
+                fresh = _jsonl_fresh(m["acct"])
+                state = "unknown" if fresh is None else ("active" if fresh else "idle")
             else:  # codex: running but no claude-transcript -> idle (no active detect)
                 state = "idle"
         else:  # service
-            ns1 = _svc_show(m["acct"], m["service"], "CPUUsageNSec")
+            ns1 = _svc_show(m["acct"], m["service"], "CPUUsageNSec") or ""
             dns = max((int(ns1) if ns1.isdigit() else c["ns0"]) - c["ns0"], 0)
             cpu = round(min(dns / cap_ns * 100.0, 100.0), 1)
-            memc = _svc_show(m["acct"], m["service"], "MemoryCurrent")
+            memc = _svc_show(m["acct"], m["service"], "MemoryCurrent") or ""
             mem = round((int(memc) / memtotal * 100.0), 1) if memc.isdigit() and memtotal else 0.0
-            state = "idle" if _svc_show(m["acct"], m["service"], "ActiveState") == "active" else "down"
-        if state != "down":
+            active = _svc_show(m["acct"], m["service"], "ActiveState")
+            state = "unknown" if active is None else ("idle" if active == "active" else "down")
+        if state == "unknown" and not EMIT_UNKNOWN:
+            print(f"[pantheon_metrics_gen] {lbl}: probe FAILED; rendering the legacy 'down' "
+                  f"until the site accepts 'unknown' (T-4070)", file=sys.stderr)
+            state = "down"
+        if state not in ("down", "unknown"):
             up += 1
         members.append({"label": lbl, "cpu_pct": cpu, "mem_pct": mem, "state": state})
 
@@ -173,9 +258,10 @@ def collect(roster, sample_sec=1.0):
         load1 = float(f.read().split()[0])
     cluster = {"load_pct": round(min(load1 / NCPU * 100.0, 100.0), 1),
                "agents_up": up, "agents_total": len(roster)}
+    hosts = [{"label": h["label"], "up": _host_up(h)} for h in HOSTS_ROSTER]
     return {"schema": SCHEMA,
             "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "cluster": cluster, "agents": members}
+            "cluster": cluster, "agents": members, "hosts": hosts}
 
 
 def leak_scan(doc):
@@ -193,6 +279,10 @@ def leak_scan(doc):
         assert a["state"] in STATES, f"state: {a['state']}"
         assert 0 <= a["cpu_pct"] <= 100, "cpu_pct range"
         assert 0 <= a["mem_pct"] <= 100, "mem_pct range"
+    for h in doc.get("hosts", []):  # optional key; absent doc still validates
+        assert set(h) <= HOST_KEYS, f"host keys: {set(h) - HOST_KEYS}"
+        assert h["label"] in ALLOWED_HOST_LABELS, f"host label not allowlisted: {h['label']}"
+        assert isinstance(h["up"], bool), f"host up not bool: {h['label']}"
     blob = json.dumps(doc).lower()
     hits = [s for s in FORBIDDEN if s in blob]
     assert not hits, f"forbidden substrings in output: {hits}"
@@ -203,23 +293,38 @@ def _selftest():
     good = {"schema": SCHEMA, "generated_at": "2026-09-11T00:00:00Z",
             "cluster": {"load_pct": 40.0, "agents_up": 7, "agents_total": 8},
             "agents": [{"label": "orchestrator", "cpu_pct": 10.0, "mem_pct": 20.0, "state": "active"},
-                       {"label": "cairn", "cpu_pct": 1.0, "mem_pct": 2.0, "state": "idle"},
+                       {"label": "consultant", "cpu_pct": 1.0, "mem_pct": 2.0, "state": "idle"},
                        {"label": "echo", "cpu_pct": 0.5, "mem_pct": 0.1, "state": "idle"},
-                       {"label": "mnemosyne", "cpu_pct": 0.0, "mem_pct": 0.0, "state": "down"}]}
+                       {"label": "archivist", "cpu_pct": 0.0, "mem_pct": 0.0, "state": "down"}],
+            "hosts": [{"label": "vps", "up": True},
+                      {"label": "laptop", "up": False}]}
     assert leak_scan(good)
+    # hosts is optional: a doc predating the field still validates (backward-compat).
+    nohosts = json.loads(json.dumps(good)); del nohosts["hosts"]
+    assert leak_scan(nohosts)
     for mutate, why in [
         (lambda d: d.update(hostname="swarm"), "extra top key"),
         (lambda d: d["agents"][0].__setitem__("label", "claude"), "forbidden label"),
         (lambda d: d["agents"][0].__setitem__("state", "active/home"), "forbidden substring"),
         (lambda d: d["agents"][0].__setitem__("label", "codex"), "account-name label"),
+        (lambda d: d["hosts"][0].__setitem__("zone", "dc1"), "extra host key"),
+        # "node9" is neither a FORBIDDEN substring nor allowlisted -> isolates the
+        # ALLOWED_HOST_LABELS guard (a forbidden name like pve2 would be caught by
+        # the substring scan too, so it would not prove THIS guard fires).
+        (lambda d: d["hosts"][0].__setitem__("label", "node9"), "host label not allowlisted"),
+        # belt-and-suspenders: a forbidden infra name is doubly blocked (label
+        # allowlist AND the FORBIDDEN substring scan).
+        (lambda d: d["hosts"][0].__setitem__("label", "pve2"), "forbidden host label"),
+        (lambda d: d["hosts"][0].__setitem__("up", "yes"), "host up non-bool"),
     ]:
         bad = json.loads(json.dumps(good)); mutate(bad)
         try:
             leak_scan(bad); raise SystemExit(f"FAIL: {why} not caught")
         except AssertionError:
             pass
-    print("selftest: OK (clean passes; extra-key, forbidden-label, forbidden-substring, "
-          "account-name-label all caught)")
+    print("selftest: OK (clean + hosts pass; no-hosts back-compat; extra-key, forbidden-label, "
+          "forbidden-substring, account-name-label, extra-host-key, host-label-not-allowlisted, "
+          "forbidden-host-label, host-up-non-bool all caught)")
 
 
 def main():

@@ -67,10 +67,15 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tools import seat_state  # noqa: E402  (ORG-106 L4b)
+
 # Reuse context_fill_monitor's per-agent config + sudo helper (one source of
 # truth for sudo_user) and inbox_consumer's failure-alert router.
 from tools.context_fill_monitor import (  # noqa: E402
     AGENT_CONFIG,
+    _read_runtime_state,
+    _reads_cross_account,
+    _runtime_state_path_for_agent,
     _seat_in_maintenance,
     _seat_muted,
     _sudo_prefix,
@@ -110,16 +115,6 @@ VOCAB = "channel-liveness"
 REMEDIATE_ENABLED = os.environ.get("PANTHEON_CHANNEL_REMEDIATE_ENABLED", "").strip().lower() in (
     "1", "true", "yes", "on",
 )
-# Per-agent probe SKIP set (comma-separated agent names via env). A listed seat is
-# not probed/alerted/remediated at all — for a seat whose bridge this probe cannot
-# model (e.g. mid-harness-migration: orchestrator on the Codex harness writes no Claude
-# `bot.pid`, so the Claude-bridge probe reads a PERMANENT false comms-dark that only
-# noise-wakes Recovery). Default empty (skip nothing) — the path is inert when unset.
-# Set via the systemd drop-in; remove when the seat's real substrate is probeable
-# (T-2959). Reversible config, not code logic. Loses no real signal: the probe is
-# already blind to a non-Claude seat, whose health is covered by mail-staleness +
-# the seat's own harness monitoring.
-CHANNEL_LIVENESS_SKIP = {a.strip() for a in os.environ.get("CHANNEL_LIVENESS_SKIP", "").split(",") if a.strip()}
 # Restart reason recorded on the tombstone / in logs.
 REMEDIATE_REASON = "bridge_down"
 # Cooldown between bridge-down remediations per agent — spaces restarts so a
@@ -179,7 +174,7 @@ def _session_unit_is_disabled(agent: str, cfg: dict) -> bool | None:
     is fighting whoever paused it. MEASURED 2026-08-02: after the operator-directed
     fleet daemon pause (the operator TG6694 — "temp turn off daemons for everyone except
     you, codex, and recovery"; orchestrator stopped AND disabled 23 units across specialist,
-    mnemosyne, metis, atlas), this monitor alerted on specialist and mnemosyne every poll
+    archivist, mason, artisan), this monitor alerted on specialist and archivist every poll
     and fired FOUR graceful-restart remediations at specialist, each one escalating
     "Operator look needed" to Recovery — while the fleet sat under token minimization.
 
@@ -192,7 +187,7 @@ def _session_unit_is_disabled(agent: str, cfg: dict) -> bool | None:
     DISABLED is the discriminator, not INACTIVE. A crashed unit stays `enabled` and
     reads inactive/failed — that must still alert. Only an explicit disable means a
     human took it out of service. Verified both directions at the time of writing:
-    orchestrator (running) reads enabled+active; specialist and mnemosyne (paused) read
+    orchestrator (running) reads enabled+active; specialist and archivist (paused) read
     disabled+inactive.
 
     Returns True (disabled → paused), False (enabled/static/… → judge normally), or
@@ -222,7 +217,7 @@ def _session_unit_is_disabled(agent: str, cfg: dict) -> bool | None:
         # rather than by enabling the unit (recovery ran disabled+ACTIVE via
         # pantheon-runtime-tmux.scope). Treating disabled-alone as paused
         # FALSE-SUPPRESSES a live seat's alerts. Genuine pause is disabled AND
-        # not-running (specialist/mnemosyne read disabled+INACTIVE, T-2393). So
+        # not-running (specialist/archivist read disabled+INACTIVE, T-2393). So
         # confirm the unit is actually stopped before calling it paused; a
         # disabled-but-ACTIVE seat judges normally. Fail-open: if we cannot
         # confirm it is inactive, do NOT suppress (None), because silencing a
@@ -312,7 +307,82 @@ def _pidfile_is_provably_absent(cfg: dict, sudo: list[str]) -> bool | None:
     return None
 
 
+CODEX_POLLER_UNIT = "codex-telegram-poller.service"
+
+# Runs as the seat's account. Prints exactly one verdict word and never the token:
+# SAME (the codex poller's live process holds the bot token in the plugin .env),
+# DIFF, NOPOLLER (unit not active / no MainPID), or UNKNOWN (anything unreadable).
+_CODEX_POLLER_PROBE = r"""
+import hashlib, os, re, subprocess, sys
+def h(b): return hashlib.sha256(b).hexdigest()
+try:
+    out = subprocess.run(["systemctl", "--user", "show", "-p", "ActiveState", "-p", "MainPID",
+                          sys.argv[1]], capture_output=True, text=True, timeout=10,
+                         env=dict(os.environ, XDG_RUNTIME_DIR="/run/user/%d" % os.getuid())).stdout
+    f = dict(l.split("=", 1) for l in out.splitlines() if "=" in l)
+    pid = f.get("MainPID", "0")
+    if f.get("ActiveState") != "active" or pid in ("", "0"):
+        print("NOPOLLER"); sys.exit(0)
+    live = None
+    for e in open("/proc/%s/environ" % pid, "rb").read().split(b"\0"):
+        if e.startswith(b"TELEGRAM_BOT_TOKEN="):
+            live = e.split(b"=", 1)[1]
+    if live is None:
+        cfgdir = os.path.expanduser("~/.config/codex-telegram/.env")
+        for l in open(cfgdir, "rb"):
+            if l.strip().startswith(b"TELEGRAM_BOT_TOKEN="):
+                live = l.strip().split(b"=", 1)[1].strip(b"'\"")
+    plug = None
+    for l in open(sys.argv[2], "rb"):
+        m = re.match(rb"\s*(?:export\s+)?TELEGRAM_BOT_TOKEN\s*=\s*[\"']?([^\"'\s]+)", l)
+        if m:
+            plug = m.group(1)
+    if not live or not plug:
+        print("UNKNOWN")
+    else:
+        print("SAME" if h(live) == h(plug) else "DIFF")
+except Exception:
+    print("UNKNOWN")
+"""
+
+
+def _codex_poller_serves_bridge(cfg: dict) -> bool | None:
+    """T-2959: is this seat's inbound bot polled by its codex harness instead?
+
+    A seat on codex runs codex-telegram-poller.service against the SAME bot as the
+    Claude plugin bridge. Telegram allows one poller per bot, so the plugin bridge
+    is down by design while codex holds it, and probe_bridge's Claude-only checks
+    read comms-dark (specialist 2026-10-14: 7 false pages; orchestrator during T-2953).
+    True only on positive evidence: the poller unit is active AND its live process
+    holds the plugin .env's token (compared by hash in the seat's own account; the
+    token never leaves that process). A poller for a DIFFERENT bot is False, so it
+    can never mask a real outage. None = could not tell (callers keep 'down')."""
+    rc, out = _run(_sudo_prefix(cfg["sudo_user"]) + [
+        "python3", "-I", "-c", _CODEX_POLLER_PROBE, CODEX_POLLER_UNIT, _bridge_env_path_for(cfg)])
+    verdict = out.strip().splitlines()[-1].strip() if (rc == 0 and out.strip()) else ""
+    if verdict == "SAME":
+        return True
+    if verdict in ("DIFF", "NOPOLLER"):
+        return False
+    return None
+
+
 def probe_bridge(agent: str, cfg: dict) -> tuple[str, str]:
+    """Probe one agent's inbound telegram path: the Claude plugin bridge, or (when
+    that reads down) a codex-telegram poller holding the same bot (T-2959).
+
+    Returns the same statuses as _probe_claude_bridge; a 'down' becomes 'up' only
+    when _codex_poller_serves_bridge proves the codex harness polls the bot."""
+    status, detail = _probe_claude_bridge(agent, cfg)
+    if status != "down":
+        return status, detail
+    if _codex_poller_serves_bridge(cfg):
+        return "up", (f"{CODEX_POLLER_UNIT} active on the same bot token (codex harness); "
+                      f"Claude plugin bridge idle by design ({detail})")
+    return status, detail
+
+
+def _probe_claude_bridge(agent: str, cfg: dict) -> tuple[str, str]:
     """Probe one agent's inbound telegram poller.
 
     Returns (status, detail) where status is:
@@ -483,7 +553,7 @@ def _maybe_remediate(agent: str, cfg: dict, detail: str, *, now: int) -> bool:
         _log(agent, "bridge down: remediation DISABLED (ship-dark); alert-only")
         return False
     if not cfg.get("remediate", True):
-        # Per-agent observation-only opt-out (mnemosyne: auto-restart is her
+        # Per-agent observation-only opt-out (archivist: auto-restart is her
         # call per the 2026-07-20 orchestrator+recovery profile agreement, and her account
         # has no pantheon-config clone for restart_bin anyway).
         _log(agent, "bridge down: remediation opted out per-agent (remediate=False); alert-only")
@@ -579,6 +649,11 @@ def _in_restart_window(agent: str, now: int, grace: int | None = None) -> bool:
     min later would read consecutive=2 → a false "restart did NOT restore"
     escalation. Do NOT stamp context_fill_last_fire from the remediation path —
     that file feeds context-fill's dead-transcript guard (T-1330).
+
+    T-5156: a runtime-controller respawn counts too (see
+    _controller_respawn_ts). With remediation ON, a probe that lands mid-
+    respawn used to read the OLD bot.pid as dead and dispatch a restart that
+    killed the fresh session (specialist 21:04Z + 22:34Z 2026-10-18).
     """
     import json
     grace = RESTART_GRACE_SECONDS if grace is None else grace
@@ -595,7 +670,146 @@ def _in_restart_window(agent: str, now: int, grace: int | None = None) -> bool:
             latest = max(latest, int(ts))
         except (OSError, ValueError, TypeError):
             continue
+    if latest > 0 and (now - latest) < grace:
+        return True  # already in window: skip the (sudo) controller reads
+    latest = max(latest, _controller_respawn_ts(agent))
     return latest > 0 and (now - latest) < grace
+
+
+# Controller evidence events that mean "this seat's runtime is being (re)started":
+# the session died (the controller respawns it) or a start just completed.
+# Deliberately NOT controller_start_deferred_lock_contended: our own remediation
+# holding the operation lock emits it, so it must not extend suppression.
+_RESPAWN_EVIDENCE_EVENTS = ("chronicle_session_end", "post_start_command")
+_EVIDENCE_TAIL_BYTES = 262144
+
+
+def _iso_epoch(value) -> int:
+    from datetime import datetime
+    try:
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _controller_respawn_ts(agent: str) -> int:
+    """Epoch of the seat's latest controller (re)start signal, 0 if none (T-5156).
+
+    Sources, both under the seat's runtime-controller dir: runtime.json's
+    runtime_start_{boundary,observed}_at (written once a start is observed) and
+    the tail of controller-evidence.jsonl for _RESPAWN_EVIDENCE_EVENTS, which
+    covers the gap between the old session dying and runtime.json moving.
+    Another account's dir is mode 700, so both are read as that account via
+    sudo (same path as context_fill_monitor's T-5024 gate). Fail-open: any
+    unreadable/malformed source contributes nothing. Bounded by the caller's
+    grace, so a seat that dies and is NOT respawned still alerts."""
+    import json
+    account = (AGENT_CONFIG.get(agent) or {}).get("sudo_user")
+    runtime_path = _runtime_state_path_for_agent(agent, account)
+    latest = 0
+    kind, text = _read_runtime_state(runtime_path, account)
+    if kind == "ok":
+        try:
+            doc = json.loads(text)
+        except ValueError:
+            doc = None
+        if isinstance(doc, dict):
+            for key in ("runtime_start_boundary_at", "runtime_start_observed_at"):
+                latest = max(latest, _iso_epoch(doc.get(key)))
+    for rec in _respawn_evidence_records(agent, account, runtime_path):
+        latest = max(latest, _iso_epoch(rec.get("recorded_at")))
+    return latest
+
+
+def _respawn_evidence_records(agent: str, account, runtime_path: Path) -> list[dict]:
+    """The _RESPAWN_EVIDENCE_EVENTS records in the tail of the seat's
+    controller-evidence.jsonl (read as the seat account when cross-account).
+    Fail-open: an unreadable file or a malformed line contributes nothing."""
+    import json
+    evidence_path = runtime_path.parent / "controller-evidence.jsonl"
+    try:
+        if _reads_cross_account(account):
+            proc = subprocess.run(
+                _sudo_prefix(str(account)) + [
+                    "bash", "-c", f'exec tail -c {_EVIDENCE_TAIL_BYTES} -- "$1"', "_", str(evidence_path)],
+                capture_output=True, text=True, timeout=15)
+            tail = proc.stdout if proc.returncode == 0 else ""
+        else:
+            with open(evidence_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - _EVIDENCE_TAIL_BYTES))
+                tail = fh.read().decode("utf-8", "replace")
+    except (OSError, subprocess.SubprocessError):
+        tail = ""
+    out = []
+    for line in tail.splitlines():
+        if not any(ev in line for ev in _RESPAWN_EVIDENCE_EVENTS):
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(rec, dict) and rec.get("event") in _RESPAWN_EVIDENCE_EVENTS:
+            out.append(rec)
+    return out
+
+
+# T-5165: the grace above reopens on EVERY respawn, so a seat whose session dies
+# and is respawned every <=10 min would never page. The unit's StartLimitBurst only
+# bounds controller-process crashes, not session deaths, and no other monitor counts
+# them. So: this many controller-recorded session DEATHS (chronicle_session_end
+# cause=death; graceful replace/start/fallback-return ends do not count) inside the
+# window means a crash loop, and the grace stops suppressing the alert. Calibrated on
+# specialist's evidence 10-15..10-19: 14 deaths, at most 2 in any hour (the oomd pairs).
+RESPAWN_LOOP_DEATHS = int(os.environ.get("CHANNEL_LIVENESS_RESPAWN_LOOP_DEATHS", "3"))
+RESPAWN_LOOP_WINDOW_SECONDS = int(os.environ.get("CHANNEL_LIVENESS_RESPAWN_LOOP_WINDOW_SECONDS", "3600"))
+
+
+def _session_deaths_in_window(agent: str, now: int, window: int | None = None) -> int:
+    """Controller-recorded session deaths for *agent* in the last *window* seconds (T-5165)."""
+    window = RESPAWN_LOOP_WINDOW_SECONDS if window is None else window
+    account = (AGENT_CONFIG.get(agent) or {}).get("sudo_user")
+    runtime_path = _runtime_state_path_for_agent(agent, account)
+    deaths = set()
+    for rec in _respawn_evidence_records(agent, account, runtime_path):
+        if rec.get("event") != "chronicle_session_end" or rec.get("cause") != "death":
+            continue
+        ts = _iso_epoch(rec.get("recorded_at"))
+        if ts and 0 <= now - ts < window:
+            deaths.add(rec.get("transition_id") or ts)
+    return len(deaths)
+
+
+def _sleep_breach(agent: str, detail: str, seat, *, now: int, dry_run: bool) -> str:
+    """ORG-106 L4b: the seat is declared asleep (deep-sleep, phase asleep) yet its inbound
+    bridge is UP, i.e. a session is running. A real fault: page it. Alert-only (this
+    monitor never kills a session). Deliberately NOT gated by maintenance, a pause or the
+    restart grace, and it skips this monitor's LOCAL mute gate (_seat_muted). The global
+    ORG-076 section 7 chokepoint still applies: the page goes through route_failure_alert,
+    which is where the operator mute is enforced, so a muted seat's breach page is
+    suppressed there in production. Only the alert cooldown throttles repeats here."""
+    _log(agent, f"SLEEP BREACH: declared asleep but the bridge is up ({detail})")
+    if dry_run:
+        _log(agent, "DRY-RUN: would page sleep_breach")
+        return "sleep_breach"
+    if _in_alert_cooldown(agent, now, ALERT_COOLDOWN_SECONDS):
+        _log(agent, "sleep breach in alert cooldown; not re-alerting")
+        return "sleep_breach"
+    msg = (
+        f"🛌 [channel-liveness] {agent}: SLEEP BREACH — the seat is declared in deep-sleep "
+        f"(phase asleep; {seat.owner or '?'}: {seat.reason or '-'}; until "
+        f"{seat.expires or 'no expiry'}) but its inbound Telegram bridge is UP, so a session "
+        f"is running. Either the sleep drain did not finish or something relaunched the seat. "
+        f"Not auto-remediated. Check `seat_state status {agent}` and the controller evidence."
+    )
+    try:
+        from tools.inbox_consumer import route_failure_alert
+        route_failure_alert(agent, msg, "sleep_breach")
+        _record_alert(agent, now, "sleep_breach")
+        _log(agent, "sleep breach alerted via route_failure_alert")
+    except Exception as exc:  # fail-open: a notify failure must not crash the poll
+        _log(agent, f"alert routing failed ({exc!r})")
+    return "sleep_breach"
 
 
 def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) -> str:
@@ -606,15 +820,30 @@ def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) ->
     deliberately taken out of service. Not alertable, not remediable.
     """
     now = int(time.time()) if now is None else now
-    if agent in CHANNEL_LIVENESS_SKIP:
-        _log(agent, "migration-exempt (CHANNEL_LIVENESS_SKIP); not probing/alerting/remediating")
-        return "skipped"
     cfg = AGENT_CONFIG.get(agent)
     if cfg is None:
         _log(agent, "no AGENT_CONFIG entry; skipping")
         return "no_bridge"
     status, detail = probe_bridge(agent, cfg)
     _log(agent, f"bridge {status}: {detail}")
+    # ORG-106 L4b (T-5527): the declared seat state, read once and evaluated BEFORE every
+    # suppression below (maintenance, pause, restart grace, mute, cooldown), so none of
+    # them can hide a broken sleep.
+    seat = seat_state.safe_effective_for(agent)
+    if seat is not None and seat.expected_down:
+        if status == "up":
+            return _sleep_breach(agent, detail, seat, now=now, dry_run=dry_run)
+        _log(agent, f"seat is asleep (deep-sleep; {seat.owner or '?'}: {seat.reason or '-'}; "
+                    f"until {seat.expires or 'no expiry'}) — bridge {status} is expected; "
+                    f"not alerting/remediating")
+        return "asleep"
+    if seat is not None and seat.state == seat_state.STATE_DEEP_SLEEP:
+        # draining toward sleep: the session is being wound down on purpose.
+        _log(agent, "seat is draining toward deep-sleep — not alerting/remediating this poll")
+        return "asleep"
+    if seat is not None and seat.state == seat_state.STATE_PAUSED_INTAKE:
+        _log(agent, f"seat is paused-intake ({seat.owner or '?'}: {seat.reason or '-'}; "
+                    f"until {seat.expires or 'no expiry'}) — the seat is up, judged normally")
     if status != "down":
         return status
     # Seat-maintenance precondition (T-2984) — the strongest "leave this seat alone"
@@ -640,11 +869,19 @@ def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) ->
     # restart is the restart, not an incident — suppress BOTH the alert and the
     # (flag-gated) remediation; a genuinely dead bridge is still down next poll
     # past the grace and fires normally.
+    crash_loop_deaths = 0
     if _in_restart_window(agent, now):
-        _log(agent, f"down but within the post-restart grace window "
-                    f"({RESTART_GRACE_SECONDS}s); expected during a graceful "
-                    f"restart — not alerting/remediating this poll")
-        return status
+        # T-5165: a crash loop keeps the window permanently open. Past the bound,
+        # alert anyway; remediation stays off (cycling cannot fix a session that keeps
+        # dying, and a probe mid-respawn kills the fresh session, T-5156).
+        crash_loop_deaths = _session_deaths_in_window(agent, now)
+        if crash_loop_deaths < RESPAWN_LOOP_DEATHS:
+            _log(agent, f"down but within the post-restart grace window "
+                        f"({RESTART_GRACE_SECONDS}s); expected during a graceful "
+                        f"restart — not alerting/remediating this poll")
+            return status
+        _log(agent, f"down inside the restart grace, but {crash_loop_deaths} session deaths in "
+                    f"{RESPAWN_LOOP_WINDOW_SECONDS}s: crash loop — alerting, not remediating")
     if dry_run:
         _log(agent, "DRY-RUN: would alert + (if enabled) remediate (bridge down)")
         return status
@@ -657,6 +894,23 @@ def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) ->
         _log(agent, "down but seat muted (ORG-076 §7) — page suppressed (trace kept); remediation unaffected")
     elif _in_alert_cooldown(agent, now, ALERT_COOLDOWN_SECONDS):
         _log(agent, "down but in alert cooldown; not re-alerting")
+    elif crash_loop_deaths:
+        msg = (
+            f"🔁 [channel-liveness] {agent}: session CRASH-LOOPING — the runtime controller "
+            f"recorded {crash_loop_deaths} session deaths in the last "
+            f"{RESPAWN_LOOP_WINDOW_SECONDS // 60} min and the inbound Telegram poller reads "
+            f"DOWN ({detail}). Each respawn reopens the restart grace, so this is the bound "
+            f"(T-5165). Not auto-remediated: cycling cannot fix a session that keeps dying. "
+            f"Read controller-evidence.jsonl for the death cause; see "
+            f"sop/remediation/control-plane-seat-dead-or-wedged.md."
+        )
+        try:
+            from tools.inbox_consumer import route_failure_alert
+            route_failure_alert(agent, msg, VOCAB)
+            _record_alert(agent, now, detail)
+            _log(agent, "crash-loop alerted via route_failure_alert")
+        except Exception as exc:  # fail-open: a notify failure must not crash the poll
+            _log(agent, f"alert routing failed ({exc!r})")
     else:
         msg = (
             # NB (T-2393): this used to assert "while session appears healthy". It
@@ -678,6 +932,8 @@ def check_agent(agent: str, *, dry_run: bool = False, now: int | None = None) ->
             _log(agent, "alerted via route_failure_alert")
         except Exception as exc:  # fail-open: a notify failure must not crash the poll
             _log(agent, f"alert routing failed ({exc!r})")
+    if crash_loop_deaths:
+        return status  # T-5165: alert-only inside the restart window (see above)
     # Auto-remediation (flag-gated, ship-dark; own cooldown) — independent of the
     # alert throttle so a persistent-down bridge still gets remediated.
     try:

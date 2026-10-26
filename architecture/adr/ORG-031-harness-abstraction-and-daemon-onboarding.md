@@ -72,11 +72,13 @@ The adapter keys on the **role/domain axis** (ORG-027), not on persona identity 
 
 ### (ii) Policy layer for codex — Option (b), org-tier
 
-Run codex under `approval_policy="never"` + `sandbox_mode="workspace-write"` + `[sandbox_workspace_write] network_access=true`, relying on Pantheon's **existing org-tier policy** (Unix-asymmetric sudo + file-ownership write-scope + ratification gates + autonomy bar) — mirroring how Orchestrator/Specialist/Recovery already operate. This is **live-verified** on the running TUI daemon (zero approval prompts including MCP + `spawn_agent`; `trust_level` alone does NOT silence prompts, `approval_policy` does; prior config backed up at `~codex/.codex/config.toml.bak.preunattended`).
+Run codex under `approval_policy="never"` + `sandbox_mode="danger-full-access"` *(amended 2026-10-12, the operator TG 11733/11737; originally `sandbox_mode="workspace-write"` + `[sandbox_workspace_write] network_access=true`)*, relying on Pantheon's **existing org-tier policy** (Unix-asymmetric sudo + file-ownership write-scope + ratification gates + autonomy bar) — mirroring how Orchestrator/Specialist/Recovery already operate. This is **live-verified** on the running TUI daemon (zero approval prompts including MCP + `spawn_agent`; `trust_level` alone does NOT silence prompts, `approval_policy` does; prior config backed up at `~codex/.codex/config.toml.bak.preunattended`).
 
 Rationale: (1) one policy model across all agents is what makes the abstraction's policy layer org-tier — the whole point of the epic; (2) it is the **same risk profile already accepted** for the bypass-permissions claude agents on this single-tenant, HO-monitored VPS, which is exactly the "thoroughly isolated, trusted, monitored" environment OpenAI's docs scope this config to; (3) Option (a) (in-harness `on-request` approvals plumbed to operator via Telegram) is a *different* operating model from the claude instances and adds orchestration to plumb for no consistency gain.
 
 **Scope of this decision:** ratifies the policy *posture* for codex-as-peer-daemon. The test config is already live on the daemon (a reversible config write); no further org-tier policy mechanism changes.
+
+**Amendment (2026-10-12, the operator TG 11733/11737):** codex runs `danger-full-access` + `approval_policy="never"` by design. "Permissions operate at the user level not at the harness level": the security boundary is the unix account (ORG-063 §2, "the UID is still the wall"), never a harness sandbox. The live codex config already runs this way.
 
 ### (iii) Generalized daemon-onboarding procedure
 

@@ -36,7 +36,9 @@ flips at deploy time; the flip is driven solely by the on-disk presence of
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import re
+import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # The legacy single-file shard name. ORG-001 §Format chose `YYYY.jsonl`;
@@ -184,6 +186,131 @@ def existing_entry_ids(ledger_dir: Path) -> set[str]:
     return ids
 
 
+# ORG-001 per-entry rules (amended 2026-10-08, the operator TG 11474; T-4734).
+# WARN-only until T-4739 flips ENFORCE: a rule failure is reported on stderr
+# and the entry is still written. With ENFORCE, a failure raises ValueError
+# before the file is opened.
+ENFORCE = False
+
+REQUIRED_FIELDS: tuple[str, ...] = (
+    "id",
+    "ts",
+    "agent",
+    "action",
+    "rationale",
+    "justifies_via",
+)
+
+# `agent` values outside the ORG-100 role vocabulary that ORG-001 allows.
+EXTRA_AGENT_VALUES: frozenset[str] = frozenset({"human:operator"})
+
+# How far `ts` may sit from the writer's clock: it is measured in the same
+# command that appends the entry, so anything further is a reused or
+# extrapolated stamp.
+TS_MAX_SKEW_SECONDS = 300
+
+_ID_SLUG_RE = re.compile(r"[a-z0-9]+(?:-[a-z0-9]+)*")
+
+
+def _role_vocabulary() -> tuple[frozenset[str], frozenset[str]]:
+    """(allowed `agent` values, role ids shared by more than one seat)."""
+    try:
+        from tools import agent_role_map
+    except ImportError:  # run as a script from tools/
+        import agent_role_map  # type: ignore[no-redef]
+    roles = agent_role_map.known_role_ids()
+    return roles | EXTRA_AGENT_VALUES, agent_role_map.NON_INJECTIVE_ROLE_IDS
+
+
+def validate_entry(entry: dict, now: datetime | None = None) -> list[str]:
+    """Check `entry` against ORG-001's rules for NEW entries; return the
+    problems found (empty when it conforms).
+
+    - every required field is present and non-empty (`justifies_via` a
+      non-empty list);
+    - `ts` is `TS_FORMAT` UTC and within `TS_MAX_SKEW_SECONDS` of `now`
+      (write time);
+    - `id` is `<ts>-<slug>`: the entry's own `ts`, then a kebab-case slug;
+    - `agent` is an ORG-100 role id or `human:operator`;
+    - `executor` is set when `agent` is a role shared by several seats.
+
+    History is never checked: this runs only on the write path.
+    """
+    problems: list[str] = []
+    for name in REQUIRED_FIELDS:
+        value = entry.get(name)
+        if value in (None, "", []):
+            problems.append(f"missing required field {name!r}")
+    jv = entry.get("justifies_via")
+    if jv not in (None, "", []) and not (
+        isinstance(jv, list) and all(isinstance(p, str) and p for p in jv)
+    ):
+        problems.append("'justifies_via' must be a non-empty list of principle ids")
+
+    ts_raw = entry.get("ts")
+    ts: datetime | None = None
+    if isinstance(ts_raw, str) and ts_raw:
+        try:
+            ts = datetime.strptime(ts_raw, TS_FORMAT).replace(tzinfo=timezone.utc)
+        except ValueError:
+            problems.append(f"'ts' {ts_raw!r} is not {TS_FORMAT} UTC")
+    if ts is not None:
+        clock = now if now is not None else datetime.now(timezone.utc)
+        skew = abs((ts - clock).total_seconds())
+        if skew > TS_MAX_SKEW_SECONDS:
+            problems.append(
+                f"'ts' {ts_raw} is {skew:.0f}s from the writer's clock; ORG-001 "
+                "ts is the write time (date -u in the appending command); an "
+                "earlier decision time goes in 'decided_at'"
+            )
+
+    entry_id = entry.get("id")
+    if isinstance(entry_id, str) and entry_id and isinstance(ts_raw, str):
+        prefix = f"{ts_raw}-"
+        if not entry_id.startswith(prefix) or not _ID_SLUG_RE.fullmatch(
+            entry_id[len(prefix) :]
+        ):
+            problems.append(
+                f"'id' {entry_id!r} is not '<ts>-<slug>' (the entry's ts, then a "
+                "lowercase kebab-case slug)"
+            )
+
+    agent = entry.get("agent")
+    if isinstance(agent, str) and agent:
+        try:
+            allowed, shared = _role_vocabulary()
+        except Exception as exc:  # noqa: BLE001 - the vocabulary is advisory here
+            problems.append(f"cannot load the ORG-100 role vocabulary: {exc}")
+        else:
+            if agent not in allowed:
+                problems.append(
+                    f"'agent' {agent!r} is not an ORG-100 role id or human:operator "
+                    "(persona names and orchestrator are history-only)"
+                )
+            elif agent in shared and not entry.get("executor"):
+                problems.append(
+                    f"'agent' {agent!r} is shared by several seats; set 'executor' "
+                    "to your seat slot id (e.g. engineering-orchestrator-2)"
+                )
+    return problems
+
+
+def check_new_entry(entry: dict, now: datetime | None = None) -> None:
+    """Report (WARN) or refuse (ENFORCE) an entry that breaks ORG-001's rules.
+
+    The single write-path gate shared by `append_entry` and
+    `tools/_audit.append_ledger_entries`.
+    """
+    problems = validate_entry(entry, now)
+    if not problems:
+        return
+    label = entry.get("id") or "<no id>"
+    if ENFORCE:
+        raise ValueError(f"ledger entry {label} breaks ORG-001: " + "; ".join(problems))
+    for problem in problems:
+        print(f"ledger: WARN ORG-001 {label}: {problem}", file=sys.stderr)
+
+
 def append_entry(ledger_dir: Path, entry: dict) -> Path:
     """Append a ledger entry to the shard its OWN timestamp belongs in (T-2077).
 
@@ -216,7 +343,12 @@ def append_entry(ledger_dir: Path, entry: dict) -> Path:
 
     This refuses BEFORE opening the file, so a rejected append leaves the
     ledger byte-identical.
+
+    T-4734: every entry is first checked against ORG-001's rules for new
+    entries (`check_new_entry`): reported on stderr while `ENFORCE` is off,
+    refused before the file is opened once it is on.
     """
+    check_new_entry(entry)
     legacy = ledger_dir / LEGACY_LEDGER_FILENAME
     entry_id = entry.get("id")
     if isinstance(entry_id, str) and entry_id:

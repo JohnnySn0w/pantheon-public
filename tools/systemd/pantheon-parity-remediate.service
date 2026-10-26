@@ -1,0 +1,30 @@
+[Unit]
+Description=Pantheon seat-parity self-repair — Recovery's bounded auto-remediation of safe mechanical parity breaks (T-3798)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on a genuine crash (an unreadable
+# manifest, an import failure) wake Recovery via the ORG-026 mailbox. An unrepairable safe-axis FAIL
+# is NOT a crash — parity_remediate returns 0 and ESCALATES that to orchestrator itself (same choice as
+# the audit), so this fires only on the tool itself breaking.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# BOUNDED by construction (see the tool's header): it re-runs the READ-ONLY audit, then for the
+# SAFE_AXES allowlist ONLY (mechanical, idempotent, reversible timer-enables) and verdict==FAIL
+# ONLY (carve-outs are never FAIL, so intentional exemptions are never touched), it runs
+# `systemctl --user enable --now` on the seat's OWN account and re-verifies. It pokes no live
+# agent pane; a repair it cannot apply is escalated to orchestrator, not forced.
+#
+# `sg pantheon-mailbox` for the same reason the audit uses it: a `systemctl --user` unit does not
+# inherit recovery's pantheon-mailbox supplementary group, and the repair-failed escalation leg
+# writes into orchestrator's hub inbox (group pantheon-mailbox, mode 2770). The cross-account
+# `sudo -u <account>` repair itself needs no group; the wrap is harmless for clean runs.
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/parity_remediate.py"
+StandardOutput=journal
+StandardError=journal
+# One read-only audit sweep (~8 seats x ~20 axes, each probe bounded 30s in parity_render) plus a
+# handful of bounded enable+verify calls. The 15min ceiling covers a slow manager without wedging.
+TimeoutStartSec=15min

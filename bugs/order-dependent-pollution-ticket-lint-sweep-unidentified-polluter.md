@@ -1,6 +1,6 @@
 ---
 symptom: "test_ticket_lint.retarget and test_ticket_state_sweep.t0141 fail under full `unittest discover -s tools` but pass in isolation and in their own modules — order-dependent cross-module pollution with an UNIDENTIFIED mechanism. Currently latent, not fixed: masked-on-main since T-1936 (2026-07-23) has RESURFACED — the t0141 half unmasked twice on 2026-08-25 (T-3240 arc, T-3241 arc); the retarget half stayed green those runs. Surfacing is stochastic under concurrent host load — a clean serial re-run of the identical failing tree passed."
-fix: "None yet — and do NOT apply the T-1943 idiom (_git_common_dir cache reset in setUp): that mechanism is DISPROVEN for these two. Atlas's falsification (2026-07-23, T-1939 arc): both tests shell out to ticket.py as a SUBPROCESS, which builds its own fresh in-process cache, so the parent test-runner's poisoned/warmed cache is irrelevant — he set the cache to the bogus linked-worktree FILE shape and both tests still passed. If the pair resurfaces (any change that reorders discovery can unmask it), file a ticket WITH the failing reproduction — that is the only honest basis for a fix; a setUp cache-reset would be a no-op that reads as handled."
+fix: "None yet — and do NOT apply the T-1943 idiom (_git_common_dir cache reset in setUp): that mechanism is DISPROVEN for these two. Artisan's falsification (2026-07-23, T-1939 arc): both tests shell out to ticket.py as a SUBPROCESS, which builds its own fresh in-process cache, so the parent test-runner's poisoned/warmed cache is irrelevant — he set the cache to the bogus linked-worktree FILE shape and both tests still passed. If the pair resurfaces (any change that reorders discovery can unmask it), file a ticket WITH the failing reproduction — that is the only honest basis for a fix; a setUp cache-reset would be a no-op that reads as handled."
 domain: pantheon, tests, unittest, discover, order-dependence, pollution, subprocess
 ---
 
@@ -10,7 +10,7 @@ domain: pantheon, tests, unittest, discover, order-dependence, pollution, subpro
 
 - Pre-2026-07-23 (before the T-1936 merge), `test_ticket_lint.retarget` and
   `test_ticket_state_sweep.t0141` failed deterministically in full-discover and passed in
-  isolation — classic cross-module pollution (Atlas, T-1936 baseline differentials).
+  isolation — classic cross-module pollution (Artisan, T-1936 baseline differentials).
 - Post-T-1936, full-discover green (3595 OK) was **incidental discovery reordering** from two
   new test modules, not a fix. Pollution latent.
 - The obvious suspect is DISPROVEN: it is NOT the `_git_common_dir` module-global cache

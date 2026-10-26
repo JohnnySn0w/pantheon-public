@@ -54,9 +54,14 @@ ENV_FILE="${HOME}/.claude/channels/telegram/.env"
 STATE_FILE="${HOME}/.claude/recovery-telegram-watchdog.state"
 LOG_FILE="${HOME}/.claude/logs/recovery-telegram-watchdog.log"
 # Absolute repo path — this script is INSTALLED to ~/.local/bin (a different dir
-# than the repo), so a BASH_SOURCE-relative lookup would miss self_restart.sh.
-SELF_RESTART="/home/claude-fallback/pantheon-config/tools/self_restart.sh"
-CHAT_ID="456474197"                              # the operator
+# than the repo), so a BASH_SOURCE-relative lookup would miss the restart wrapper.
+# T-4159: fire recovery_self_restart.sh, which RESOLVES the restart target from
+# instance.yaml (agent_role_map.py restart-target recovery), instead of hardcoding
+# claude-telegram-fallback.service. After T-3026's move that bespoke unit is
+# retired, and restarting it would resurrect a second supervisor next to the
+# runtime controller; the wrapper cycles the control-plane session instead.
+SELF_RESTART="/home/claude-fallback/pantheon-config/tools/recovery_self_restart.sh"
+CHAT_ID="424242424"                              # the operator
 
 DEBOUNCE=2          # consecutive absent fires before acting (rides out boot window)
 COOLDOWN=600        # sec between restart fires (== effectiveness window)
@@ -108,6 +113,28 @@ alert_operator() {
 # --- 1. Session-alive gate --------------------------------------------------
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
   # Session itself is down -> recovery-bot-supervise's domain, not ours. Reset.
+  ST[consec]=0; save_state
+  exit 0
+fi
+
+# --- 1b. Harness gate (T-4184): not ours when the session runs CODEX ----------
+# After T-3026's move the runtime controller can launch CODEX in this session
+# (claude capped -> codex fallback). A codex runtime has no claude plugin child
+# to watch, so an ABSENT verdict there is meaningless, and self_restart would kill
+# the live codex runtime (up to CAP/h, then page the operator). Positive detection of
+# a codex process in the pane, NOT "no claude process found": the latter would
+# silently disable this watchdog for claude too if claude's argv ever drifts.
+pane_harness_is_codex() {
+  local pp pid
+  pp="$(tmux list-panes -t "$SESSION" -F '#{pane_pid}' 2>/dev/null | head -1)"
+  [[ "$pp" =~ ^[0-9]+$ ]] || return 1
+  for pid in "$pp" $(pgrep -P "$pp" 2>/dev/null); do
+    tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null | grep -qE '(^|/)codex(\.js)?( |$)' && return 0
+  done
+  return 1
+}
+if pane_harness_is_codex; then
+  [[ "${ST[consec]}" -ne 0 ]] && log "HARNESS=codex: controller codex runtime, not a claude session; clearing absent streak (consec was ${ST[consec]})"
   ST[consec]=0; save_state
   exit 0
 fi
@@ -193,7 +220,7 @@ fi
 
 # Fire the sanctioned self-restart (detached; survives the session restart).
 if [[ "$DRY_RUN" == "1" ]]; then
-  log "WOULD FIRE self_restart (dry-run): $SELF_RESTART --service claude-telegram-fallback.service --mode user --target-pane ${SESSION}:0"
+  log "WOULD FIRE self_restart (dry-run): $SELF_RESTART (target resolved from instance.yaml)"
   save_state
   exit 0
 fi
@@ -206,8 +233,7 @@ fi
 
 log "FIRING self_restart (count_in_window was ${count}, consec=${ST[consec]})"
 export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
-if "$SELF_RESTART" --service claude-telegram-fallback.service --mode user \
-     --target-pane "${SESSION}:0" >>"$LOG_FILE" 2>&1; then
+if "$SELF_RESTART" >>"$LOG_FILE" 2>&1; then
   ST[last_restart]="$NOW"
   ST[restarts]="${ST[restarts]:+${ST[restarts]} }$NOW"
   ST[consec]=0

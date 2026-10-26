@@ -1,0 +1,41 @@
+[Unit]
+Description=Pantheon nightly-CI watch — mail orchestrator once per red scheduled CI run, and when the schedule dies or cannot be measured (T-4402)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928). This is what turns an UNDELIVERABLE
+# alert into a visible one: tools/ci_nightly_watch.py exits non-zero only when the mailbox send
+# failed, so OnFailure speaks about a dead alert path and stays quiet about a monitor that
+# worked. (An alerting verdict that DELIVERED exits 0.)
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# ⚠️ THIS UNIT BELONGS ON THE `claude` SEAT AND ONLY THERE. It reads GitHub's API through `gh`,
+# and only the claude account is logged in (recovery holds no GitHub auth). Same seat rule as
+# pantheon-ci-audit-tip-coverage.service; do not route it through another account's credential.
+#
+# WHY IT EXISTS: the scheduled nightly (ci.yml, `cron: '0 9 * * *'`) was red every day from
+# 2026-09-08 to 09-27 and nobody was told. GitHub creates that run 4-6h late (~13-17Z) — noted,
+# not fixed here — so this fires hourly all day rather than in a window.
+#
+# DETECT + ALERT only: it mails orchestrator's ORG-026 mailbox (never Telegram, never the operator) and
+# re-runs nothing. State (once-per-run dedupe) lives in ~/.local/state/pantheon/ci-nightly-watch.json;
+# the expiring mute is ~/.local/state/pantheon/ci-nightly-watch.disabled ({reason, until}).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/ci_nightly_watch.py
+
+StandardOutput=journal
+StandardError=journal
+
+# Worst case is three empty-read retries (10s apart), the run list, one jobs read and up to four
+# job-log reads at 45s each. Well short of the hourly period, and generous enough that the unit is
+# never killed by its own timeout mid-alert (which would fire OnFailure about the monitor).
+TimeoutStartSec=10min
+
+[Install]
+WantedBy=default.target

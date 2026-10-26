@@ -1,0 +1,31 @@
+[Unit]
+Description=Pantheon recovery-seat watcher: deterministic incident classifier over the fleet health export, DRY-RUN (T-4884 B3)
+Documentation=file:///home/%u/pantheon-config/notes/2026-10-12-t4884-codex-recovery-seat-design.md
+
+# NOT auto-installed by any provision script. Template only (T-4884 B3). Runs on
+# the recovery seat's account (codex-fallback, created at B7) as a user unit.
+# Name-agnostic: the seat names itself in its first session, so neither this
+# unit nor its paths carry a persona name (renaming is a manifest edit only). It reads
+# ONLY the sanitized export in /run/pantheon-health (group pantheon-health,
+# read-only for codex-fallback) and writes only its state file and its heartbeat
+# /run/recovery-seat-health/watcher.json (root-provisioned via tmpfiles:
+#     d /run/recovery-seat-health 2750 codex-fallback pantheon-health -
+# ). Until that dir exists the service exits 2, the intended loud failure.
+#
+# --live-page (T-5034, the operator TG 11849/11854): the codex-free page to the operator is
+# sent for real; every other action stays would-act, and the watcher never builds
+# a pane injector, broker client or mailbox sender (design §8 inertness contract,
+# narrowed to the page). --live (T-4884 B13) sends every action (page, mail Recovery,
+# wake the seat); switch to it only for the Recovery-supervised first fire, after
+# mailing orchestrator. Rollback: --live-page, or --dry-run.
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/recovery_watcher.py --live-page
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=50s

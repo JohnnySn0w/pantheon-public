@@ -20,11 +20,14 @@ Scope is deliberately narrow for precision:
     LAST command's, and `| wc -l` destroys MORE evidence than `| tail`, which
     the original set blocked). Still a named set, deliberately — not a
     blanket all-pipes block: `tee`, process substitution and legitimate
-    streaming pass, and the fail-open/precision posture is unchanged.
+    streaming pass, and the precision posture is unchanged.
   - Quoted spans are stripped first (mcp-list-guard precedent): a quoted
     mention of `| tail` is prose, not a pipe.
-  - FAIL-OPEN: any error or ambiguity → allow. A guard must never brick a
-    session's tooling.
+  - FAIL-CLOSED since T-4392 phase 2c (was fail-open): main() runs through
+    tools/hooks/_failclosed.py, so an exception, an unparseable/ambiguous
+    payload, the 15s deadline from process start, or a Bash command over
+    MAX_COMMAND_CHARS DENIES (exit 2, one stderr line naming the cause).
+    The verdict logic itself is unchanged; break-glass is the helper's.
 
 Hard block, no retry-marker escape (mcp-list-guard model, not act-vs-ask): the
 fix is always available — drop the pipe, redirect raw, filter at READ time.
@@ -36,22 +39,87 @@ feedback_wire_hook_update_allowlist).
 
 from __future__ import annotations
 
-import json
+import bisect
+import os
 import re
 import sys
 
 # Quoted spans stripped before matching — a mention is not an invocation.
 _QUOTED_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
 
-# A real pipe (not ||), optionally |&, into a named filter (bare or
-# path-invoked) in command position of the next segment. Set widened by T-2328;
-# the trailing lookahead is what keeps tailscale/grepdiff/awkward/wcurl-style
-# lookalikes out.
-_PIPE_FILTER_RE = re.compile(
-    r"(?<!\|)\|&?(?!\|)"                    # | or |& but not ||
-    r"\s*(?:command\s+|exec\s+)?"           # common wrappers
-    r"(?:\S*/)?(?:head|tail|grep|wc|sed|awk|cut|sort|uniq|jq)(?=\s|$|[;&|`)\n])"
-)
+# What is blocked: a real pipe (not ||), optionally |&, into a named filter (bare
+# or path-invoked) in command position of the next segment. Set widened by
+# T-2328; the trailing lookahead is what keeps tailscale/grepdiff/awkward/wcurl-
+# style lookalikes out. Until T-4392 phase 2c this was ONE regex:
+#
+#   (?<!\|)\|&?(?!\|)\s*(?:command\s+|exec\s+)?(?:\S*/)?(?:NAMES)(?=\s|$|[;&|`)\n])
+#
+# which is QUADRATIC: at every pipe the greedy `\S*` runs to the end of the
+# whitespace-free stretch and backtracks through each `/`, and every further `|`
+# inside that stretch restarts the same scan (`'|/'*n`: 2.7s CPU at 16 KB).
+# _pipes_into_filter() below computes EXACTLY the same yes/no in linear time;
+# tools/test_background_pipe_gate.py keeps that regex verbatim as the oracle.
+_NAME_AT = r"(?:head|tail|grep|wc|sed|awk|cut|sort|uniq|jq)(?=\s|$|[;&|`)\n])"
+_NAME_AT_RE = re.compile(_NAME_AT)
+_SLASH_NAME_RE = re.compile("/" + _NAME_AT)      # a `/` the path form can end at
+_WS_RUN_RE = re.compile(r"\s*")
+_WS_CHAR_RE = re.compile(r"\s")
+_WRAPPER_RE = re.compile(r"command\s+|exec\s+")  # common wrappers
+
+
+def _pipes_into_filter(text: str) -> bool:
+    """The old regex's `.search(text)` truth value, in linear time.
+
+    For each `|` not preceded by `|`, the regex may continue after `|` (unless `||`
+    follows) or after `|&` (unless `|` follows). From there `\\s*` and the optional
+    wrapper's `\\s+` can only usefully consume their WHOLE whitespace run (stopping
+    short leaves a whitespace char, which neither a name nor `\\S*/` can start
+    with), giving at most two positions q. At q the regex matches iff a name (plus
+    boundary) starts at q, or some `/`+name starts at or after q with no
+    whitespace in between (that is `\\S*/`). The `/`+name positions are found once;
+    the next-whitespace lookup is cached, and the q values only move forward, so
+    every character is scanned a bounded number of times."""
+    if "|" not in text:
+        return False
+    n = len(text)
+    slash_names = None
+    ws_cache = [-1, -1]  # [queried from, first whitespace at or after it (or n)]
+
+    def next_ws(q):
+        if not ws_cache[0] <= q <= ws_cache[1]:
+            m = _WS_CHAR_RE.search(text, q)
+            ws_cache[0], ws_cache[1] = q, (m.start() if m else n)
+        return ws_cache[1]
+
+    def filter_at(q):
+        nonlocal slash_names
+        if q >= n:
+            return False
+        if _NAME_AT_RE.match(text, q):
+            return True
+        if slash_names is None:
+            slash_names = [m.start() for m in _SLASH_NAME_RE.finditer(text)]
+        j = bisect.bisect_left(slash_names, q)
+        return j < len(slash_names) and slash_names[j] < next_ws(q)
+
+    p = text.find("|")
+    while p != -1:
+        if p == 0 or text[p - 1] != "|":
+            after = text[p + 1] if p + 1 < n else ""
+            starts = []
+            if after != "|":
+                starts.append(p + 1)
+            if after == "&" and (text[p + 2] if p + 2 < n else "") != "|":
+                starts.append(p + 2)
+            for a in starts:
+                q = _WS_RUN_RE.match(text, a).end()
+                if filter_at(q):
+                    return True
+                w = _WRAPPER_RE.match(text, q)
+                if w and filter_at(w.end()):
+                    return True
+        p = text.find("|", p + 1)
+    return False
 
 
 def command_pipes_background_output(command: str) -> bool:
@@ -59,7 +127,7 @@ def command_pipes_background_output(command: str) -> bool:
     if not command:
         return False
     stripped = _QUOTED_RE.sub(" ", command)
-    return bool(_PIPE_FILTER_RE.search(stripped))
+    return _pipes_into_filter(stripped)
 
 
 def decide(data: dict) -> dict | None:
@@ -96,19 +164,42 @@ def decide(data: dict) -> dict | None:
     }
 
 
+# The fail-closed runner checks this cap on EVERY Bash call, before decide() sees
+# it, and this hook is not agent_type-gated: it runs on the main thread of every
+# seat, foreground calls included. So the cap is mcp-list-guard's main-thread
+# 262,144 (room for orchestrator heredocs), not the helper's 65,536 default. The
+# linear scan's worst shape costs ~0.5s CPU here, well inside the 15s budget;
+# tools/test_background_pipe_gate_failclosed.py pins it.
+MAX_COMMAND_CHARS = 262_144
+
+
 def main() -> None:
+    """Run the gate FAIL-CLOSED (T-4392 phase 2c) through tools/hooks/_failclosed.py.
+
+    decide() is unchanged. What changed is the HOOK-level failure mode: an exception, an
+    ambiguous payload, the 15s deadline from process start, or a command over
+    MAX_COMMAND_CHARS now DENIES (exit 2, stderr names the cause) instead of exiting 0. The
+    helper is imported from THIS file's real directory, first on sys.path (a decoy on
+    PYTHONPATH cannot win); if that import fails, the gate denies too, since an ImportError
+    would exit 1, which fails open."""
     try:
-        raw = sys.stdin.read()
-        data = json.loads(raw) if raw.strip() else {}
-    except Exception:
-        sys.exit(0)  # fail-open
-    try:
-        payload = decide(data)
-    except Exception:
-        sys.exit(0)  # fail-open
-    if payload is not None:
-        print(json.dumps(payload))
-    sys.exit(0)
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        import _failclosed
+    except BaseException as exc:  # noqa: BLE001 - an import failure must DENY
+        missing = isinstance(exc, FileNotFoundError) or (
+            isinstance(exc, ModuleNotFoundError) and exc.name == "_failclosed")
+        if missing:
+            hint = ("The hook's directory lacks _failclosed.py: run the hook from the "
+                    "pantheon-config clone, or unwire it via the Edit tool.")
+        else:
+            hint = (f"the hook's _failclosed.py failed to import ({type(exc).__name__}): "
+                    "fix it, or unwire the hook via the Edit tool.")
+        sys.stderr.write(
+            "BLOCKED (background-pipe-gate, fail-closed, T-4392): cannot import _failclosed "
+            f"({exc!r}). {hint}\n"
+        )
+        sys.exit(2)
+    _failclosed.run("background-pipe-gate", decide, max_command_chars=MAX_COMMAND_CHARS)
 
 
 if __name__ == "__main__":

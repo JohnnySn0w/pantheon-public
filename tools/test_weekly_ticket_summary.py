@@ -10,6 +10,8 @@ no headless dispatch).
 from __future__ import annotations
 
 import datetime as dt
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -567,13 +569,122 @@ class TestScaleMetrics(unittest.TestCase):
         self.assertTrue(block.strip().startswith("<!--"), block)
         self.assertIn("unavailable", block)
 
+    def test_compute_scale_metrics_timeout_degrades_to_documented_comment(self):
+        # The fallback the real-repo smoke tolerates under load is exactly this one:
+        # a git TimeoutExpired lands in the documented comment and names the timeout.
+        exc = subprocess.TimeoutExpired(["git", "rev-list", "--count", "HEAD"], 120)
+        with mock.patch("subprocess.run", side_effect=exc):
+            block = wts.compute_scale_metrics()
+        self.assertTrue(block.startswith("<!-- scale metrics unavailable: "), block)
+        self.assertIn("timed out after 120 seconds", block)
+
+    def test_compute_scale_metrics_exact_values_on_fixture_repo(self):
+        """T-4345: pins the exact, comma-formatted path with REAL git, on a small
+        fixture repo whose every number is known in advance (1,001 commits via
+        fast-import, 1,200 md + 1,100 py lines, ticket ids up to T-1500). This is
+        stronger than the real-repo smoke (which can only regex for a comma) and,
+        being sub-second, it carries the formatting intent even when the smoke
+        has to stand down under runner load."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            md = "alpha beta\n" * 1200   # 1,200 lines, 2,400 words, 13,200 bytes
+            py = "x = 1\n" * 1100        # 1,100 lines, 3,300 words,  6,600 bytes
+            stream = [
+                "commit refs/heads/main",
+                "committer T <t@example.invalid> 1700000000 +0000",
+                "data 4", "init",
+                f"M 644 inline big.md\ndata {len(md)}\n{md}",
+                f"M 644 inline code.py\ndata {len(py)}\n{py}",
+            ]
+            for i in range(1000):  # 1,000 empty commits on top: 1,001 in all
+                stream += ["commit refs/heads/main",
+                           f"committer T <t@example.invalid> {1700000001 + i} +0000",
+                           "data 1", "c"]
+            no_git_env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+            with mock.patch.dict(os.environ, no_git_env, clear=True):
+                for args, stdin in ((["git", "init", "-q", "-b", "main"], None),
+                                    (["git", "fast-import", "--quiet"], "\n".join(stream) + "\n"),
+                                    (["git", "reset", "-q", "--hard", "main"], None)):
+                    subprocess.run(args, cwd=repo, input=stdin, text=True, check=True,
+                                   capture_output=True, timeout=120)
+                # Tickets are counted from the filesystem, not git: left untracked
+                # so they don't perturb the line/word/byte totals.
+                for state, tid in (("done", "T-0007"), ("inbox", "T-1500"), ("active", "T-0042")):
+                    (repo / "tickets" / state).mkdir(parents=True)
+                    (repo / "tickets" / state / f"{tid}.md").write_text("t\n")
+                block = wts.compute_scale_metrics(repo)
+        self.assertTrue(block.startswith("### Pantheon at scale\n"), block)
+        self.assertIn("- **1,500** tickets filed (1 done, 1 queued, 1 active) · **1,001** commits\n", block)
+        self.assertIn("- **2,300** lines · **5,700** words · ~**0 MB** of text across **2** tracked files\n", block)
+        self.assertIn("- Prose vs code runs near-even: **1,200** markdown lines (2,400 words) "
+                      "to **1,100** Python lines\n", block)
+
     def test_compute_scale_metrics_real_repo_smoke(self):
-        # Read-only integration against the real repo: exact, comma-formatted numbers.
+        """Read-only integration against the real repo: exact, comma-formatted numbers.
+
+        T-4345: on the loaded CI runner `git rev-list --count HEAD` (sub-second
+        here: ~0.1s with a commit-graph, ~0.9s without) exceeded its 120s timeout
+        under cgroup memory thrash, and the function took its documented
+        degrade-to-a-comment path. That path is the contract, so a TIMEOUT is
+        reported as a skip here, not a failure; the formatted path is pinned
+        exactly by the fixture-repo test above. Any other fallback (an empty
+        read, an exception from the code) still fails."""
         block = wts.compute_scale_metrics()
+        if block.startswith("<!-- scale metrics unavailable: ") and "timed out after" in block:
+            self.skipTest(f"git timed out under host load (documented fallback): {block.strip()}")
         self.assertIn("Pantheon at scale", block)
         self.assertIn("commits", block)
         self.assertIn("tickets filed", block)
         self.assertRegex(block, r"\d{1,3},\d{3}")  # thousands-separated numbers present
+
+
+class TestScriptModeImports(unittest.TestCase):
+    def test_adr_reeval_walk_importable_in_script_mode(self):
+        """The systemd unit runs `python3 tools/weekly_ticket_summary.py`, so
+        sys.path[0] is tools/ and a bare `from tools...` failed: the ADR re-eval
+        walk never ran from the unit ("No module named 'tools'", 2026-08-03 to
+        09-28). Emulate script mode in a clean interpreter, then hit the real
+        call site.
+
+        T-4230: the IMPORT is what this proves, but the call site then also ran the
+        walk over the live repo (every ADR, plus the grand-program index lint over
+        the ~4300-ticket tree): 21.5s alone, and it blew its 120s timeout at host
+        load ~26. So the walk is now pointed at an empty tmp fixture. Nothing that
+        is under test changes: the subprocess still runs the REAL
+        `_import_run_walk()` under script-mode sys.path (the thing that broke) and
+        the REAL `_adr_reeval_watch` call site; only the directories the walk
+        scans are redirected, by wrapping the run_walk it returns. And the output
+        is now also required NOT to be the degrade-to-a-comment path, which
+        `_adr_reeval_watch` takes on any exception (that path is how the original
+        defect stayed silent, and how a broken fixture would too)."""
+        import os
+        import subprocess
+        import sys
+        script = Path(wts.__file__).resolve()
+        with tempfile.TemporaryDirectory(prefix="t4230-adr-") as tmp:
+            (Path(tmp) / "adr").mkdir()
+            (Path(tmp) / "tickets" / "done").mkdir(parents=True)
+            code = (
+                "import datetime as dt, pathlib, runpy, sys\n"
+                f"sys.path[0] = {str(script.parent)!r}\n"
+                f"m = runpy.run_path({str(script)!r})\n"
+                "g = m['_adr_reeval_watch'].__globals__\n"
+                "real_import = g['_import_run_walk']\n"
+                "def redirected():\n"
+                "    run_walk = real_import()  # the REAL script-mode import under test\n"
+                "    return lambda **kw: run_walk(**{**kw,\n"
+                f"        'adr_dir': pathlib.Path({tmp + '/adr'!r}),\n"
+                f"        'tickets_root': pathlib.Path({tmp + '/tickets'!r})}})\n"
+                "g['_import_run_walk'] = redirected\n"
+                "print(m['_adr_reeval_watch']('', dt.date(2026, 9, 27)))\n"
+            )
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+            r = subprocess.run([sys.executable, "-c", code], capture_output=True,
+                               text=True, cwd="/", env=env,
+                               timeout=120)  # a HANG bound only; the hermetic run is ~1s CPU
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertNotIn("No module named 'tools'", r.stdout)
+        self.assertNotIn("unavailable", r.stdout, "walk degraded to its failure comment")
 
 
 if __name__ == "__main__":

@@ -243,7 +243,9 @@ def main() -> int:
         )
     except Exception as exc:  # noqa: BLE001 — best-effort logging side-effect
         _log(f"session_reset_log append failed (non-fatal): {exc}")
-    cmd = [claude_bin, "--resume", session_id, "-p", RESUMER_PROMPT]
+    # T-4935: same unlock as the seats (adapter approval_defaults); -p has no dialog.
+    cmd = [claude_bin, "--resume", session_id, "--permission-mode", "bypassPermissions",
+           "-p", RESUMER_PROMPT]
 
     def _fire_resume():
         """Run `claude --resume` once. Returns the CompletedProcess, or None if

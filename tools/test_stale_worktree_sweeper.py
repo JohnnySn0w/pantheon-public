@@ -248,5 +248,118 @@ class HealStaleGcLog(unittest.TestCase):
         self.assertFalse(any(a[0] == "rm" for a in calls))
 
 
+class SquashMergedRealGit(unittest.TestCase):
+    """T-4674: guard 4 against REAL git (merge-tree semantics can't be shown with mocks).
+    pantheon-config squash-merges, so a merged agent/<ticket> HEAD is never an ancestor of
+    main; the old ancestry-only test kept every such worktree forever."""
+
+    def setUp(self):
+        import tempfile
+        self._tmp = tempfile.TemporaryDirectory(dir="/tmp")
+        root = Path(self._tmp.name)
+        self.origin, self.repo, self.wt = root / "origin.git", root / "repo", root / "wt"
+        g = lambda *a, cwd=None: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True, text=True)
+        self.g = g
+        g("init", "-q", "--bare", "-b", "main", str(self.origin))
+        g("clone", "-q", str(self.origin), str(self.repo))
+        for k, v in (("user.name", "t"), ("user.email", "t@t"), ("commit.gpgsign", "false")):
+            g("config", k, v, cwd=self.repo)
+        (self.repo / "a.txt").write_text("one\ntwo\nthree\n")
+        g("add", ".", cwd=self.repo); g("commit", "-q", "-m", "base", cwd=self.repo)
+        g("push", "-q", "origin", "main", cwd=self.repo)
+        g("worktree", "add", "-q", "-b", "agent/T-1", str(self.wt), cwd=self.repo)
+        for k, v in (("user.name", "t"), ("user.email", "t@t")):
+            g("config", k, v, cwd=self.wt)
+        (self.wt / "a.txt").write_text("one\nTWO\nthree\n")
+        g("commit", "-q", "-am", "edit 1", cwd=self.wt)
+        (self.wt / "b.txt").write_text("new\n")
+        g("add", ".", cwd=self.wt); g("commit", "-q", "-m", "edit 2", cwd=self.wt)
+        self.patches = [mock.patch.object(sw, "MIN_AGE_MIN", 0.0),
+                        mock.patch.object(sw, "THROWAWAY_PREFIXES", (str(root) + "/",))]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self._tmp.cleanup()
+
+    def _squash_merge(self):
+        self.g("merge", "--squash", "agent/T-1", cwd=self.repo)
+        self.g("commit", "-q", "-m", "squash T-1", cwd=self.repo)
+        self.g("push", "-q", "origin", "main", cwd=self.repo)
+        self.g("fetch", "-q", "origin", cwd=self.wt)
+
+    def _classify(self):
+        head = self.g("rev-parse", "HEAD", cwd=self.wt).stdout.strip()
+        wt = {"path": str(self.wt), "head": head, "branch": "refs/heads/agent/T-1", "main": False}
+        with redirect_stderr(io.StringIO()):
+            return sw.classify(getpass_user(), str(self.repo), wt)
+
+    def test_squash_merged_worktree_is_removable(self):
+        self._squash_merge()
+        ok, reason = self._classify()
+        self.assertTrue(ok, reason)
+        self.assertIn("squash", reason)
+
+    def test_unmerged_worktree_is_kept(self):
+        self.g("fetch", "-q", "origin", cwd=self.wt)
+        ok, reason = self._classify()
+        self.assertFalse(ok)
+        self.assertIn("UNMERGED", reason)
+
+    def test_extra_commit_after_the_squash_is_kept(self):
+        self._squash_merge()
+        (self.wt / "c.txt").write_text("more work\n")
+        self.g("add", ".", cwd=self.wt); self.g("commit", "-q", "-m", "post-squash work", cwd=self.wt)
+        ok, reason = self._classify()
+        self.assertFalse(ok, "work committed after the squash must never be swept")
+
+    def test_main_later_rewriting_the_same_lines_keeps_it(self):
+        self._squash_merge()
+        (self.repo / "a.txt").write_text("one\nTwo-again\nthree\n")
+        self.g("commit", "-q", "-am", "later edit on main", cwd=self.repo)
+        self.g("push", "-q", "origin", "main", cwd=self.repo)
+        self.g("fetch", "-q", "origin", cwd=self.wt)
+        ok, _ = self._classify()
+        self.assertFalse(ok, "a merge-tree conflict must fail toward keeping")
+
+
+class UntrackedScratchRealGit(unittest.TestCase):
+    """T-4675: guard 3 against REAL git. A merged worktree holding an untracked,
+    NON-ignored file (notes, a half-written new file) must be kept; one holding only
+    an ignored build dir must still go. `status.showUntrackedFiles=no` is set on the
+    repo so the guard can't lean on git's default: it must ask for untracked files
+    itself."""
+
+    # Reuse the squash fixture without inheriting (and re-running) its tests.
+    tearDown = SquashMergedRealGit.tearDown
+    _squash_merge = SquashMergedRealGit._squash_merge
+    _classify = SquashMergedRealGit._classify
+
+    def setUp(self):
+        SquashMergedRealGit.setUp(self)
+        (self.repo / ".git" / "info" / "exclude").write_text("target/\n")
+        self.g("config", "status.showUntrackedFiles", "no", cwd=self.repo)
+        self._squash_merge()
+
+    def test_untracked_non_ignored_scratch_is_kept(self):
+        (self.wt / "notes.md").write_text("half-written\n")
+        ok, reason = self._classify()
+        self.assertFalse(ok, "untracked scratch in a merged worktree must never be swept")
+        self.assertIn("dirty", reason)
+
+    def test_only_ignored_build_dir_is_still_removed(self):
+        (self.wt / "target").mkdir()
+        (self.wt / "target" / "big.rlib").write_text("x")
+        ok, reason = self._classify()
+        self.assertTrue(ok, reason)
+
+
+def getpass_user():
+    import getpass
+    return getpass.getuser()
+
+
 if __name__ == "__main__":
     unittest.main()

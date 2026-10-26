@@ -8,7 +8,7 @@ At the **start of any new project intended to persist or ship** — a tool, a se
 
 Applies to personal projects (auto-karaoke, vibecamp-*) and Pantheon projects alike. The discipline is the same; only the remote/merge conventions differ per project.
 
-**Project formation precedes bootstrap** (per ORG-054, ratified 2026-08-24). A project's identity — `project_id`, telos, parent, lifecycle — is established BEFORE any repo work. Bootstrap does not create a project; it realizes an already-formed project as a fresh code artifact.
+**Project formation precedes bootstrap** (per ORG-054, ratified 2026-08-24; operationalized in `sop/standard/project-lifecycle.md`). A project's identity — `project_id`, telos, parent, lifecycle — is established BEFORE any repo work, per that SOP's Formation section. Bootstrap does not create a project; it realizes an already-formed project as a fresh code artifact.
 
 Three cases + the routing this SOP owns:
 
@@ -19,6 +19,21 @@ Three cases + the routing this SOP owns:
 **Skip** for genuine one-shots: a throwaway diagnostic script, a one-render scratch job, anything that runs once and is discarded. If you find yourself running it a second time or handing it to someone, it has crossed into this SOP's scope — bootstrap it then.
 
 ## Procedure
+
+> Before repository initialization, run the project-formation section of the
+> project-lifecycle SOP. A persistent project must already have a canonical
+> project record, stable `project_id`, telos, classification, boundary,
+> stewardship, developmental mode, operational obligations, and an explicit
+> nullable `parent_goal_ref`. Creating a new telos is goal-level. Joining a
+> composed program requires the parent decision. A standalone project records
+> `parent_goal_ref: null`; no framework default supplies a root.
+>
+> A bounded exploratory probe may precede formation when it is labeled as a
+> probe, has no persistent deployment or independent obligations, and names
+> the ticket intent that bounds it. Reuse, handoff, persistence, or a new telos
+> triggers formation before repository bootstrap.
+
+The numbered steps below are the **repository** procedure — they realize an already-formed project as a fresh code artifact. `git init` (step 1) is the first *repository* action, not the first *project* action.
 
 1. **`git init`** in the project root.
 2. **`.gitignore` first** — exclude heavy/generated artifacts before the first `git add`, so they never enter history: virtualenvs, build/work/output dirs, caches, and large media (`*.mp3 *.mp4 *.wav *.npz` etc.). Source only is tracked.
@@ -42,7 +57,7 @@ Three cases + the routing this SOP owns:
 
 This SOP covers *bootstrapping the one-time repo + Tier-1 baseline for a newly-formed project*. It does NOT:
 
-- **Form the project itself** — that's ORG-054 project identity, upstream of any repo work.
+- **Form the project itself** — that's ORG-054 project identity, upstream of any repo work. Repository bootstrap does not create project identity, choose its parent, change developmental mode, or close the project — see `sop/standard/project-lifecycle.md` for all of those.
 - **Cover embedded projects** — projects that legitimately don't need their own repo (see When to use this §case 2).
 - **Cover extractions** — carving existing code into its own repo has its own SOP (`repository-extraction.md`).
 - **Prescribe the project's ongoing test strategy, CI, or branch protection** — those are per-project decisions made once the project has shape.
@@ -51,7 +66,8 @@ It is a floor (no persisting project that gets a dedicated repo starts without a
 
 ## Cross-references
 
-- `architecture/adr/ORG-054-project-lifecycle-and-purpose-chain.md` — project identity/formation authority upstream of this SOP.
+- `architecture/adr/ORG-054-project-ontology-and-upward-justification.md` — project identity/formation authority upstream of this SOP.
+- `sop/standard/project-lifecycle.md` — formation, developmental-mode transition, reorientation, replacement, split, merge, and retirement/closure procedure this SOP's precondition points at.
 - `sop/standard/repository-extraction.md` — the SOP for carving existing code into its own dedicated repo (case 3 above).
 - `feedback_github_per_repo_deploy_keys` — Pantheon code-repo remote convention.
 - `sop/standard/plan-first-dispatch.md` — when the bootstrap is large enough to dispatch an implementer.

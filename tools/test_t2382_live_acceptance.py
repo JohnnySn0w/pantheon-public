@@ -849,7 +849,7 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
             provider="claude",
             quota_source="statusline",
             executable_name="claude",
-            argv_tail=("--permission-mode", "default", "interactive"),
+            argv_tail=("--permission-mode", "bypassPermissions", "interactive"),
             run_id=run_id,
         )
 
@@ -1158,7 +1158,7 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
         exe = self._write("bin/claude", "exe")
         runtime_state = self._runtime_state("claude", provider="claude", executable=exe)
         proc_root = self._proc_root(
-            {123: (str(exe.resolve()), "--permission-mode", "default", "interactive")},
+            {123: (str(exe.resolve()), "--permission-mode", "bypassPermissions", "interactive")},
             executable=exe,
         )
         runner = self._runner(
@@ -1253,7 +1253,7 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
         self.assertEqual(event.payload["server_pid"], 456)
         self.assertIn("tmux-spawn-deadbeef.scope", event.payload["cgroup"][0])
 
-    def test_claude_runtime_requires_exact_explicit_default_permission_mode(self) -> None:
+    def test_claude_runtime_requires_exact_explicit_bypass_permission_mode(self) -> None:
         repo, self.reviewed = self._repo()
         exe = self._write("bin/permission-mode-claude", "exe")
         runtime_state = self._runtime_state(
@@ -1264,15 +1264,15 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
             "duplicate": (
                 (
                     "--permission-mode",
-                    "default",
+                    "bypassPermissions",
                     "--permission-mode",
-                    "default",
+                    "bypassPermissions",
                 ),
                 "exactly one explicit",
             ),
-            "widened": (
-                ("--permission-mode", "bypassPermissions"),
-                "not explicit default",
+            "narrowed": (
+                ("--permission-mode", "default"),
+                "not explicit bypassPermissions",
             ),
         }
         for index, (label, (tail, error)) in enumerate(cases.items(), start=30):
@@ -1305,7 +1305,7 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
                 123: (
                     str(exe.resolve()),
                     "--permission-mode",
-                    "default",
+                    "bypassPermissions",
                     "interactive",
                 )
             },
@@ -1313,7 +1313,7 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
         )
         runner = self._runner(
             repo,
-            self.root / "installed/unused-permission-default.service",
+            self.root / "installed/unused-permission-bypass.service",
             tmux_sequences={"pantheon-recovery:harness": ["%7\t123\t0\tclaude\n"]},
         )
         event = observe_runtime_state(
@@ -1551,21 +1551,21 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
                     str(claude.resolve()),
                     str(codex.resolve()),
                     "--permission-mode",
-                    "default",
+                    "bypassPermissions",
                     "interactive",
                 ),
                 302: (
                     str(claude.resolve()),
                     "--permission-mode",
-                    "default",
+                    "bypassPermissions",
                     "interactive",
                 ),
             }
         else:
             proc_entries = {
-                pids[0]: (str(claude.resolve()), "--permission-mode", "default", "interactive"),
+                pids[0]: (str(claude.resolve()), "--permission-mode", "bypassPermissions", "interactive"),
                 pids[1]: (str(codex.resolve()), "interactive"),
-                pids[2]: (str(claude.resolve()), "--permission-mode", "default", "interactive"),
+                pids[2]: (str(claude.resolve()), "--permission-mode", "bypassPermissions", "interactive"),
             }
         proc_entries = {**proc_entries, 999: ("tmux", "server")}
         proc_root = self._proc_root(proc_entries)
@@ -1987,7 +1987,7 @@ class T2382LiveAcceptanceFixtureTest(unittest.TestCase):
         proc_root = self._proc_root(
             {
                 401: (str(codex.resolve()), "interactive"),
-                402: (str(claude.resolve()), "--permission-mode", "default", "interactive"),
+                402: (str(claude.resolve()), "--permission-mode", "bypassPermissions", "interactive"),
                 999: ("tmux", "server"),
             }
         )

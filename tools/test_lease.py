@@ -254,7 +254,7 @@ class TestAcquirerTtlMustNotUndercutHolder(unittest.TestCase):
     "stale" at 901s and SIGTERM/SIGKILLs it — permitted, same uid.
 
     Measured live 2026-07-28 with both holders ALIVE and already past the window:
-    specialist pid 323758 held 5111s, mnemosyne pid 385082 held 3375s. One MCP consume
+    specialist pid 323758 held 5111s, archivist pid 385082 held 3375s. One MCP consume
     call would have killed either.
 
     These tests live here rather than in test_mailbox_mcp because all 15 tests in

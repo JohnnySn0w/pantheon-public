@@ -25,6 +25,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools import _git_utils, ticket
+from tools._test_fixtures import contained_path
 
 
 # ---------------------------------------------------------------------------
@@ -123,8 +124,8 @@ class RatifyLiftUnitBase(unittest.TestCase):
 
         def fake_run(argv, **kwargs):
             if argv[:2] == ["git", "mv"] and len(argv) >= 4:
-                src = self.root / argv[2]
-                dst = self.root / argv[3]
+                src = contained_path(self.root, argv[2])
+                dst = contained_path(self.root, argv[3])
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(src), str(dst))
                 return MagicMock(returncode=0, stdout="", stderr="")
@@ -176,7 +177,8 @@ class RatifyLiftUnitBase(unittest.TestCase):
         args.ticket = tid
         args.with_summary = summary
         args.no_push = True  # avoid push in unit tests
-        return args
+        from tools.test_ticket import with_ruling  # T-5015 register flags
+        return with_ruling(args, self.root)
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +475,282 @@ class TestRatifyLiftStatusLine(unittest.TestCase):
         self.assertEqual(warnings, [])
 
 
+    # -- T-5373: pending / until-ratified sentence strip + residual guard ----
+
+    T5370_LINE = (
+        "**Status:** Draft 2026-10-22 (T-5111; Author: Recovery). Pending the operator "
+        "ratification per the sop/remediation per-SOP ratification rule "
+        "(T-0157). Gap found while revising "
+        "`persona-daemon-liveness-recovery.md` (T-5061). Until ratified, "
+        "every path below is applied **with a report**, and Path D is "
+        "always bubble-up."
+    )
+
+    def _status_line(self, result: str) -> str:
+        return [l for l in result.splitlines() if l.startswith("**Status:**")][0]
+
+    def test_t5370_exact_line_fully_cleaned(self) -> None:
+        result, warnings = self._call(f"# Doc\n\n{self.T5370_LINE}\n\n## B\n", self.root)
+        self.assertIsNotNone(result)
+        line = self._status_line(result)
+        today = ticket.datetime.now(ticket.timezone.utc).strftime("%Y-%m-%d")
+        self.assertEqual(
+            line,
+            f"**Status:** **Ratified {today} by the operator.** Drafted 2026-10-22 "
+            "(T-5111; Author: Recovery). Gap found while revising "
+            "`persona-daemon-liveness-recovery.md` (T-5061).",
+        )
+        self.assertEqual(warnings, [])
+
+    def test_single_sentence_dated_draft_becomes_drafted(self) -> None:
+        result, warnings = self._call("**Status:** Draft 2026-10-22 (T-1).\n", self.root)
+        line = self._status_line(result)
+        self.assertTrue(line.endswith(" Drafted 2026-10-22 (T-1)."), line)
+        self.assertEqual(warnings, [])
+
+    def test_bare_draft_without_date_still_stripped(self) -> None:
+        result, _ = self._call("**Status:** DRAFT. Authored 2026-05-01 (T-2).\n", self.root)
+        line = self._status_line(result)
+        self.assertNotIn("DRAFT", line)
+        self.assertIn("Authored 2026-05-01 (T-2).", line)
+
+    def test_unratified_sentence_removed_whole_neighbours_kept(self) -> None:
+        result, _ = self._call(
+            "**Status:** Drafted 2026-05-01 (T-3). This doc is unratified until "
+            "review. Amended 2026-05-02 (T-4).\n",
+            self.root,
+        )
+        line = self._status_line(result)
+        self.assertNotIn("unratified", line)
+        self.assertIn("Drafted 2026-05-01 (T-3).", line)
+        self.assertIn("Amended 2026-05-02 (T-4).", line)
+
+    def test_all_sentences_stripped_leaves_bare_prefix(self) -> None:
+        result, warnings = self._call(
+            "**Status:** Pending the operator ratification.\n", self.root
+        )
+        line = self._status_line(result)
+        self.assertRegex(line, r"^\*\*Status:\*\* \*\*Ratified \d{4}-\d{2}-\d{2} by the operator\.\*\*$")
+        self.assertEqual(warnings, [])
+
+    def test_residual_guard_skips_write_and_warns(self) -> None:
+        content = (
+            "# Doc\n\n**Status:** Drafted 2026-05-01. Reviewers are pending "
+            "sign-off from Recovery.\n"
+        )
+        result, warnings = self._call(content, self.root)
+        self.assertIsNone(result)
+        self.assertEqual((self.root / "adr" / "test-doc.md").read_text(), content)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("test-doc.md", warnings[0])
+        self.assertIn("HAND FLIP", warnings[0])
+
+    def test_bare_pending_sentence_on_clean_draft_line_trips_guard(self) -> None:
+        """Pins the intended false-positive: bare 'pending' (no 'ratif')
+        on an otherwise-clean Draft line is refused, not silently lifted."""
+        content = "**Status:** Draft 2026-10-22 (T-1). Build ticket T-1 pending.\n"
+        result, warnings = self._call(content, self.root)
+        self.assertIsNone(result)
+        self.assertEqual((self.root / "adr" / "test-doc.md").read_text(), content)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("HAND FLIP", warnings[0])
+
+    def test_t5370_lift_is_idempotent(self) -> None:
+        result, _ = self._call(f"{self.T5370_LINE}\n", self.root)
+        p = self.root / "adr" / "test-doc.md"
+        warnings: list[str] = []
+        again = ticket._lift_ratifiable_doc_status(p, self.root, warnings)
+        self.assertIsNone(again)
+        self.assertEqual(p.read_text(), result)
+        self.assertEqual(warnings, [])
+
+    def test_gated_on_ratification_prose_not_stripped(self) -> None:
+        result, warnings = self._call(
+            "**Status:** Drafted 2026-05-01. Build is a ticket gated on "
+            "ratification (T-9).\n",
+            self.root,
+        )
+        self.assertIn("gated on ratification (T-9).", self._status_line(result))
+        self.assertEqual(warnings, [])
+
+
+    # -- T-5405: lineage kept, bold/paren balance, awaiting-regex mangle ----
+
+    ACP_LINE = (
+        "**Status:** Draft 2026-07-26 (Author: Recovery; filed from the "
+        "archivist context-wedge + specialist T-2038 cap-loop recurrences. "
+        "Pending the operator ratification per the sop/remediation per-SOP "
+        "ratification rule.)"
+    )
+    TELEGRAM_LINE = (
+        "**Status:** Draft 2026-06-06 (operator-requested in-incident, msg "
+        "2705 \u2014 he provided the canonical remediation; pending formal "
+        "ratification per the sop/remediation per-SOP ratification rule). "
+        "Author: Recovery. Filed from "
+        "[`incidents/2026-06-06-orchestrator-telegram-plugin-drop`]"
+        "(../../incidents/2026-06-06-orchestrator-telegram-plugin-drop/README.md)."
+    )
+    RECOVERY_LINE = (
+        "**Status:** Draft 2026-05-21 (filed from the 2026-05-21 ~14h Recovery "
+        "outage; pending the operator ratification per the sop/remediation "
+        "per-SOP ratification rule). Author: Recovery."
+    )
+    DIAGNOSING_LINE = (
+        "**Status:** Drafted 2026-05-27 by Orchestrator (Orchestrator). "
+        "**Drafted, NOT yet awaiting ratification** \u2014 Phase 1 isn't "
+        "fully closed; finalize the SOP after the T-0607 ceremony lands so "
+        "any final-tier surprise gets folded in. Authoring per D2 (HO "
+        "drafts; the operator ratifies via in-file Status update)."
+    )
+    ORG095_LINE = (
+        "**Status:** Draft (Authored 2026-09-06 by Orchestrator (HO); V3 direction "
+        "endorsed by the operator via recovery-relayed TG 6767/6768 \u2014 "
+        "automated-custody DEFAULT, offline-root demoted to OPTIONAL "
+        "hardened tier for technical operators; \u00a71 revised 2026-09-06 "
+        "to reflect the two-tier model). **Date:** 2026-09-06 **Author:** "
+        "Orchestrator (HO) **HITL:** Ratify-required. **Related:** [[ORG-047]] D5 "
+        "(this ADR extracts + fully specifies), [[ORG-069]] (Split D "
+        "\u2014 content/tool authorization), [[ORG-070]] (Split E \u2014 "
+        "evidence & governance), [[ORG-071]] (Split B \u2014 network "
+        "capabilities), [[ORG-072]] (Split C \u2014 lifecycle health & "
+        "recovery), [[T-2803]] (security-considerations triage), [[T-2810]] "
+        "(V1+V2 envelope \u2014 DECIDED 2026-09-06 prefer-adr TG "
+        "6755/6757/6759), [[T-2811]] (this ADR's scoping ticket), [[T-3488]] "
+        "(V3 redesign \u2014 direction endorsed TG 6767/6768; concrete "
+        "model in \u00a71 below)."
+    )
+    WEEKLY_LINE = (
+        "**Status:** Adopted 2026-09-06 by Orchestrator (HO) pending the operator ratify "
+        "\u2014 under D3/msg-3733 this pattern would normally be "
+        "HO-autonomous adoption + ledger, BUT the mechanism affects "
+        "operator-visible outputs (leans in the weekly digest) + establishes "
+        "ongoing HO discipline that shapes priority-list re-ordering, so "
+        "surfacing to the operator for the formal ratify is the honest posture. "
+        "Direction ratified by the operator 2026-09-05 via Telegram 1754 "
+        "(org-planning Decision 3). Owned by HO (orchestrator) as author + "
+        "operator; Specialist's S4 read feeds the input signal; no new "
+        "portfolio-manager role is created."
+    )
+
+    def _lifted(self, line: str) -> str:
+        result, warnings = self._call(f"# D\n\n{line}\n\n## B\n", self.root)
+        self.assertIsNotNone(result, warnings)
+        self.assertEqual(warnings, [])
+        return self._status_line(result)
+
+    def _prefix(self) -> str:
+        today = ticket.datetime.now(ticket.timezone.utc).strftime("%Y-%m-%d")
+        return f"**Status:** **Ratified {today} by the operator.** "
+
+    def test_acp_pending_clause_in_paren_keeps_lineage(self) -> None:
+        self.assertEqual(
+            self._lifted(self.ACP_LINE),
+            self._prefix() + "Drafted 2026-07-26 (Author: Recovery; filed from "
+            "the archivist context-wedge + specialist T-2038 cap-loop "
+            "recurrences)",
+        )
+
+    def test_telegram_pending_clause_in_paren_keeps_lineage(self) -> None:
+        self.assertEqual(
+            self._lifted(self.TELEGRAM_LINE),
+            self._prefix() + "Drafted 2026-06-06 (operator-requested "
+            "in-incident, msg 2705 \u2014 he provided the canonical "
+            "remediation). Author: Recovery. Filed from "
+            "[`incidents/2026-06-06-orchestrator-telegram-plugin-drop`]"
+            "(../../incidents/2026-06-06-orchestrator-telegram-plugin-drop/README.md).",
+        )
+
+    def test_recovery_pending_clause_in_paren_keeps_lineage(self) -> None:
+        self.assertEqual(
+            self._lifted(self.RECOVERY_LINE),
+            self._prefix() + "Drafted 2026-05-21 (filed from the 2026-05-21 "
+            "~14h Recovery outage). Author: Recovery.",
+        )
+
+    def test_paren_only_pending_drops_whole_paren(self) -> None:
+        self.assertEqual(
+            self._lifted("**Status:** Draft 2026-05-21 (pending the operator ratification). Author: Recovery."),
+            self._prefix() + "Drafted 2026-05-21. Author: Recovery.",
+        )
+
+    def test_unclosed_paren_after_cleaning_skips_and_warns(self) -> None:
+        # Nested paren: pass leaves it; sentence strip would truncate -> guard.
+        result, warnings = self._call(
+            "**Status:** Drafted 2026-05-21 (Author: Recovery (HO); x. Pending "
+            "the operator ratification.)\n", self.root)
+        self.assertIsNone(result)
+        self.assertTrue(any("HAND FLIP REQUIRED" in w for w in warnings), warnings)
+
+    def test_bold_dated_draft_stays_balanced(self) -> None:
+        self.assertEqual(
+            self._lifted("**Status:** **Draft 2026-10-22** (T-1)."),
+            self._prefix() + "**Drafted 2026-10-22** (T-1).",
+        )
+
+    def test_bold_draft_word_then_date_stays_balanced(self) -> None:
+        line = self._lifted("**Status:** **Draft** 2026-10-22 (T-1).")
+        self.assertEqual(line.count("**") % 2, 0, line)
+        self.assertIn("Drafted", line)
+        self.assertNotIn("Drafted** 2026", line.replace("**Drafted** 2026", ""))
+
+    def test_diagnosing_negated_awaiting_skipped_not_mangled(self) -> None:
+        result, warnings = self._call(self.DIAGNOSING_LINE + "\n", self.root)
+        self.assertIsNone(result)
+        self.assertTrue(any("HAND FLIP REQUIRED" in w for w in warnings), warnings)
+
+    def test_org095_draft_paren_lineage_kept(self) -> None:
+        line = self._lifted(self.ORG095_LINE)
+        self.assertEqual(
+            line,
+            self._prefix() + "Drafted (Authored 2026-09-06 by Orchestrator (HO); V3 "
+            "direction endorsed by the operator via recovery-relayed TG 6767/6768 "
+            "\u2014 automated-custody DEFAULT, offline-root demoted to "
+            "OPTIONAL hardened tier for technical operators; \u00a71 revised "
+            "2026-09-06 to reflect the two-tier model). **Date:** 2026-09-06 "
+            "**Author:** Orchestrator (HO) **HITL:** Ratify-required. **Related:** "
+            "[[ORG-047]] D5 (this ADR extracts + fully specifies), [[ORG-069]] "
+            "(Split D \u2014 content/tool authorization), [[ORG-070]] (Split E "
+            "\u2014 evidence & governance), [[ORG-071]] (Split B \u2014 "
+            "network capabilities), [[ORG-072]] (Split C \u2014 lifecycle "
+            "health & recovery), [[T-2803]] (security-considerations triage), "
+            "[[T-2810]] (V1+V2 envelope \u2014 DECIDED 2026-09-06 prefer-adr "
+            "TG 6755/6757/6759), [[T-2811]] (this ADR's scoping ticket), "
+            "[[T-3488]] (V3 redesign \u2014 direction endorsed TG "
+            "6767/6768; concrete model in \u00a71 below).",
+        )
+
+    def test_pure_qualifier_paren_still_removed(self) -> None:
+        line = self._lifted("**Status:** Proposed (agent-authored, unratified) \u2014 DRAFT. Authored 2026-05-01 (T-2).")
+        self.assertNotIn("agent-authored", line)
+        self.assertIn("Authored 2026-05-01 (T-2).", line)
+
+
+    def _assert_skipped(self, line: str) -> None:
+        result, warnings = self._call(line + "\n", self.root)
+        self.assertIsNone(result)
+        self.assertTrue(any("HAND FLIP REQUIRED" in w for w in warnings), warnings)
+
+    def test_weekly_arc_dated_head_in_pending_sentence_skips(self) -> None:
+        self._assert_skipped(self.WEEKLY_LINE)
+
+    def test_semicolon_outside_parens_date_loss_skips(self) -> None:
+        self._assert_skipped(
+            "**Status:** Draft 2026-05-01 (T-1); pending the operator ratification. Author: X.")
+
+    def test_nested_paren_date_loss_skips(self) -> None:
+        self._assert_skipped(
+            "**Status:** Draft 2026-05-01 (T-1 (HO); pending the operator ratification). Author: X.")
+
+    def test_date_in_kept_sentence_still_lifts(self) -> None:
+        line = self._lifted("**Status:** Drafted 2026-05-01 (T-3). Amended 2026-05-02 (T-4). Pending the operator ratification.")
+        self.assertIn("2026-05-01", line)
+        self.assertIn("2026-05-02", line)
+
+    def test_removed_paren_leaves_no_double_space(self) -> None:
+        line = self._lifted("**Status:** Drafted 2026-05-01 (pending the operator ratification) by Recovery.")
+        self.assertNotIn("  ", line)
+
+
 class TestRatifyLiftViaResolve(RatifyLiftUnitBase):
     """Integration-unit tests: resolve a ratify ticket and check doc is staged."""
 
@@ -761,6 +1039,34 @@ class TestRatifyLiftViaResolve(RatifyLiftUnitBase):
         finally:
             del os.environ["PANTHEON_ACTOR"]
 
+    def test_guard_warning_surfaced_on_stderr_and_resolve_proceeds(self) -> None:
+        """T-5373: residual-guard skip warns loudly on stderr; resolve succeeds."""
+        os.environ["PANTHEON_ACTOR"] = "orchestrator"
+        try:
+            tid = "T-0495"
+            doc_rel = "adr/guard.md"
+            doc_path = self.root / doc_rel
+            doc_path.parent.mkdir(parents=True, exist_ok=True)
+            content = "# Doc\n\n**Status:** Draft 2026-10-22 (T-1). Build ticket T-1 pending.\n"
+            doc_path.write_text(content, encoding="utf-8")
+            _write_ticket_file(
+                self.root / "tickets" / "active" / f"{tid}.md",
+                tid=tid,
+                ratifiable_files=[f"pantheon-config:{doc_rel}"],
+            )
+            import io
+            import contextlib
+            stderr_buf = io.StringIO()
+            with contextlib.redirect_stderr(stderr_buf):
+                rc = ticket.cmd_resolve(self._make_resolve_args(tid, "Ratified."))
+            self.assertEqual(rc, 0)
+            self.assertIn("warning: ratify-lift:", stderr_buf.getvalue())
+            self.assertIn("HAND FLIP", stderr_buf.getvalue())
+            self.assertEqual(doc_path.read_text(encoding="utf-8"), content)
+            self.assertTrue((self.root / "tickets" / "done" / f"{tid}.md").exists())
+        finally:
+            del os.environ["PANTHEON_ACTOR"]
+
     def test_idempotent_already_ratified_no_op(self) -> None:
         """Doc whose Status already starts with Ratified: no change, clean resolve."""
         os.environ["PANTHEON_ACTOR"] = "orchestrator"
@@ -916,6 +1222,9 @@ class TestRatifyLiftLayer3(unittest.TestCase):
                 args.ticket = tid
                 args.with_summary = "Ratified."
                 args.no_push = True
+                from tools.test_ticket import with_ruling  # T-5015
+                with_ruling(args, repo)
+                _git_setup(repo, ["notes/operator-decision-register.md"], "test: register")
                 rc = ticket.cmd_resolve(args)
             finally:
                 del os.environ["PANTHEON_ACTOR"]

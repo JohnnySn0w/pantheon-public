@@ -1,0 +1,20 @@
+[Unit]
+Description=Pantheon ORG-013 cascade sweep — every 15 min (T-4186)
+Documentation=file:///home/%u/pantheon-config/tools/cascade_sweep.py
+
+[Timer]
+# EVERY 15 MIN, offset from the round quarter-hours. This is a BACKSTOP: `ticket.py resolve`
+# already cascades immediately on the resolving seat, so the sweep only repairs tickets that reached
+# done/ some other way. Stale depends_on entries never block dispatch (inbox_consumer reads done/
+# directly), so latency is not critical; the cost is what sets the cadence. A steady-state tick is one
+# fetch plus a ~0.1s scan and makes ZERO commits. :04/:19/:34/:49 keeps it off the inbox-consumer's
+# 10-min tick and the :37 ci-audit probe, so the two never contend for git_mutation_lock at once.
+OnCalendar=*-*-* *:04,19,34,49:00
+# Catch up after a reboot: a reconcile loop that skips its window while the host was down is the
+# failure mode a level-triggered design exists to avoid.
+Persistent=true
+RandomizedDelaySec=60
+Unit=pantheon-cascade-sweep.service
+
+[Install]
+WantedBy=timers.target

@@ -4,7 +4,7 @@ Root cause of the containment defect this closes: `tools/test_a2a_orchestrator_
 client.py`'s `_LiveServerTestCase.setUpClass` called `specialist_seat_server.
 build_app()` with no `request_inbox`/`result_inbox` override, so it
 defaulted to `DEFAULT_REQUEST_INBOX`/`DEFAULT_RESULT_INBOX` — the REAL
-`/home/the-ancestor/mailbox/specialist`(-a2a) paths. BT-1..4's stub handler
+`/home/post-office/mailbox/specialist`(-a2a) paths (then `/home/the-ancestor/...`). BT-1..4's stub handler
 never called `mailbox.send()` at all, so that default was previously
 inert; BT-5's real `ResearchRequestExecutor._resume()` genuinely stages
 on approval, so two above-bar-then-resume tests each fired one real
@@ -17,9 +17,8 @@ send`/`consume` (module-attribute patch, so it protects every caller that
 does `mailbox.send(...)`/`mailbox.consume(...)` — including
 `specialist_seat_server.py`'s own production call sites, since attribute
 lookup happens at call time) to raise immediately if the resolved inbox
-path falls under `/home/the-ancestor` (the shared mailbox substrate root
-— see tools/mailbox.py's own docstring for the `/home/the-ancestor/
-mailbox/<agent>` layout), for the lifetime of the `with` block.
+path falls under `/home/post-office` (the live shared mailbox substrate root,
+T-2693) or the legacy `/home/the-ancestor` hub, for the lifetime of the `with` block.
 
 Every a2a `_LiveServerTestCase`-shaped base class (see the three existing
 a2a test modules) should wrap its `setUpClass`/`tearDownClass` span in
@@ -41,9 +40,12 @@ from unittest import mock
 from tools import mailbox
 
 # The shared mailbox substrate root (tools/mailbox.py docstring: each agent
-# owns `/home/the-ancestor/mailbox/<agent>/{tmp,new,cur}`). ANY path under
-# this root is a live sibling's real inbox — never a legitimate test target.
-FORBIDDEN_PREFIX = "/home/the-ancestor"
+# owns `<hub>/<agent>/{tmp,new,cur}`). ANY path under this root is a live sibling's
+# real inbox — never a legitimate test target. The live hub moved from /home/the-ancestor
+# to /home/post-office (T-2693); the legacy root stays guarded while that account exists
+# (T-3422 deletes it).
+FORBIDDEN_PREFIX = "/home/post-office"
+LEGACY_FORBIDDEN_PREFIX = "/home/the-ancestor"
 
 
 class LiveMailboxGuardError(AssertionError):
@@ -54,7 +56,7 @@ class LiveMailboxGuardError(AssertionError):
 
 def _assert_safe(path) -> None:
     resolved = str(path)
-    if resolved.startswith(FORBIDDEN_PREFIX):
+    if resolved.startswith((FORBIDDEN_PREFIX, LEGACY_FORBIDDEN_PREFIX)):
         raise LiveMailboxGuardError(
             f"a2a test attempted to touch a LIVE mailbox path {resolved!r} "
             f"— every a2a test must pass an explicit temp-maildir "
@@ -66,7 +68,7 @@ def _assert_safe(path) -> None:
 @contextlib.contextmanager
 def guard_live_mailbox():
     """Monkeypatches `tools.mailbox.send`/`consume` so any call whose
-    target inbox resolves under `/home/the-ancestor` raises
+    target inbox resolves under `/home/post-office` (or the legacy root) raises
     `LiveMailboxGuardError` immediately, for the duration of the `with`
     block. Wrap a test class's live-server lifetime in this."""
     real_send = mailbox.send

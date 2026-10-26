@@ -367,6 +367,51 @@ class TestResearchHandler(_SpineFixtureTestCase):
         self.assertEqual(len(beta), 1)
         self.assertIn("Beta survey on cybernetics", beta[0])
 
+    def test_research_handler_indexes_loose_top_level_md_notes_alongside_subdirs(self):
+        """T-3898: loose top-level *.md episodic notes must reach the index — the
+        README claims Auto-index authoritative but before this fix only subdirs
+        were emitted. Nine loose notes had accumulated at fix-time."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        # subdir with README
+        (root / "2026-01-01-alpha").mkdir()
+        (root / "2026-01-01-alpha" / "README.md").write_text("# A\n\nAlpha thing.\n")
+        # loose top-level notes
+        (root / "2026-01-02-beta.md").write_text("# B\n\nBeta note prose.\n")
+        (root / "2026-01-03-gamma.md").write_text("---\ntitle: Gamma frontmatter title\n---\n")
+        # README.md at root is the index itself — must NOT be self-indexed
+        (root / "README.md").write_text("# Index\n\nSelf-index disclaimer.\n")
+
+        rows = sig.research_handler(root)
+        joined = "\n".join(rows)
+        self.assertEqual(len(rows), 3, f"expected 1 subdir + 2 loose = 3 rows, got {len(rows)}: {rows}")
+        self.assertIn("2026-01-01-alpha/", joined)
+        self.assertIn("Alpha thing.", joined)
+        self.assertIn("2026-01-02-beta.md", joined)
+        self.assertIn("Beta note prose.", joined)
+        self.assertIn("2026-01-03-gamma.md", joined)
+        self.assertIn("Gamma frontmatter title", joined)
+        self.assertNotIn("| [`README.md`]", joined,
+                         "README.md must not self-index (it IS the index)")
+
+    def test_research_handler_sorts_subdirs_and_loose_notes_together_by_name(self):
+        """Deterministic ordering keeps the idempotent groomer stable and lets
+        date-prefixed entries interleave chronologically."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "2026-01-02-mid-dir").mkdir()
+        (root / "2026-01-02-mid-dir" / "README.md").write_text("# M\n\nMid dir.\n")
+        (root / "2026-01-01-first-note.md").write_text("# F\n\nEarliest.\n")
+        (root / "2026-01-03-last-note.md").write_text("# L\n\nLatest.\n")
+
+        rows = sig.research_handler(root)
+        self.assertEqual(len(rows), 3)
+        self.assertIn("2026-01-01-first-note.md", rows[0])
+        self.assertIn("2026-01-02-mid-dir/", rows[1])
+        self.assertIn("2026-01-03-last-note.md", rows[2])
+
 
 class TestDescriptionFallbackChain(unittest.TestCase):
     """T-2103 + T-2182: the fallback legs that stop a capture indexing as a bare
@@ -438,6 +483,42 @@ class TestDescriptionFallbackChain(unittest.TestCase):
         rows = sig.research_handler(self.root)
         self.assertIn("The real body.", rows[0])
         self.assertNotIn("banner line", rows[0])
+
+    def test_frontmatter_description_preferred_over_body_prose(self):
+        """T-4015: a curated frontmatter `description:` wins over lifting body
+        prose (which may be a heading or carry a broken relative link). The
+        t2107 reframe row had a description: that went unused."""
+        self._subdir("2026-02-01-topic", {
+            "README.md": "---\ndescription: The curated one-line summary.\n---\n"
+                         "# Title\n\nBody prose that should be ignored.\n",
+        })
+        rows = sig.research_handler(self.root)
+        self.assertIn("The curated one-line summary.", rows[0])
+        self.assertNotIn("Body prose that should be ignored.", rows[0])
+
+    def test_subheading_after_title_is_skipped_not_used_as_description(self):
+        """T-4015: `## The one-line answer` is document structure, not a
+        description — skip it and use the real prose (10 episodic rows had
+        regressed to indexing a bare heading)."""
+        self._subdir("2026-02-02-topic", {
+            "README.md": "# Title\n\n## The one-line answer\n\nThe actual prose.\n",
+        })
+        rows = sig.research_handler(self.root)
+        self.assertIn("The actual prose.", rows[0])
+        self.assertNotIn("The one-line answer", rows[0])
+
+    def test_relative_link_stripped_absolute_kept_in_description(self):
+        """T-4015: a relative markdown link is broken at the index row's depth —
+        strip it to its anchor text; an absolute (http) link stays intact. This
+        is the regression Recovery's daily groom kept re-introducing."""
+        self._subdir("2026-02-03-topic", {
+            "README.md": "# T\n\nSee [ORG-026](../../adr/ORG-026.md) and "
+                         "[site](https://x.io) for more.\n",
+        })
+        rows = sig.research_handler(self.root)
+        self.assertIn("See ORG-026 and", rows[0])
+        self.assertNotIn("../../adr/ORG-026.md", rows[0])
+        self.assertIn("https://x.io", rows[0])
 
     def test_unterminated_frontmatter_is_treated_as_opaque(self):
         self.assertEqual(sig._first_paragraph_from_top(["---", "title: x", "no closing fence"]), "")
@@ -653,6 +734,37 @@ class TestLedgerHandlerWeeklyShards(unittest.TestCase):
             sig._segment_spine_path(Path("/l"), "2026-W18"),
             Path("/l") / "2026-W18" / "SPINE.md",
         )
+
+    def test_id_less_entry_renders_with_ts_fallback_not_keyerror(self):
+        # T-3644: an entry lacking `id` (the recent HO slim-format
+        # cat-heredoc appends do this) must NOT crash the ledger handler
+        # with KeyError on `entry["id"]`. It must render into INDEX.md and
+        # SPINE.md rows keyed on ts as the fallback identity.
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = Path(tmp) / "ledger"
+            ledger.mkdir()
+            seg = "2026-W18"
+            (ledger / seg).mkdir()
+            id_less = json.dumps({
+                "ts": "2026-04-30T00:00:00Z",
+                "agent": "orchestrator",
+                "action": "slim_format_append",
+                "summary": "hand-appended without an id field",
+                "justifies_via": ["P4"],
+            })
+            (ledger / seg / f"{seg}.jsonl").write_text(id_less + "\n")
+            (ledger / "INDEX.md").write_text(self.INDEX_SEED)
+            with patch.object(sig, "_ledger_commit_and_push") as mock_commit:
+                sig.ledger_handler(ledger, cwd=Path(tmp))
+                self.assertEqual(mock_commit.call_count, 1)
+            # Row lands in INDEX.md keyed on ts as fallback identity.
+            after_index = (ledger / "INDEX.md").read_text()
+            self.assertIn("2026-04-30T00:00:00Z", after_index)
+            self.assertIn("slim_format_append", after_index)
+            # SPINE.md gets the row too.
+            spine = (ledger / seg / "SPINE.md").read_text()
+            self.assertIn("2026-04-30T00:00:00Z", spine)
+            self.assertIn("slim_format_append", spine)
 
     def test_ts_less_entry_spines_by_derived_id_ts_not_file_location(self):
         # T-1879: a ts-less entry with a valid id prefix must group by its
@@ -1343,7 +1455,7 @@ class TestPinnedRulesHandler(_SpineFixtureTestCase):
             d = Path(tmpdir) / "pinned-rules"
             d.mkdir()
             (d / "README.md").write_text("# Pinned Rules\nThis is the README.\n")
-            (d / "recovery.md").write_text("# Recovery\nWard description.\n")
+            (d / "recovery.md").write_text("# Recovery\nRecovery description.\n")
             rows = sig.pinned_rules_handler(d)
             self.assertEqual(len(rows), 1)
             self.assertIn("recovery.md", rows[0])
@@ -1355,7 +1467,7 @@ class TestPinnedRulesHandler(_SpineFixtureTestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             d = Path(tmpdir) / "pinned-rules"
             d.mkdir()
-            (d / "recovery.md").write_text("# Recovery\nWard idempotence test.\n")
+            (d / "recovery.md").write_text("# Recovery\nRecovery idempotence test.\n")
             readme = d / "README.md"
             rows = sig.pinned_rules_handler(d)
             region = "\n".join(rows) + ("\n" if rows else "")

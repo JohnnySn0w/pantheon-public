@@ -29,7 +29,9 @@ Decide returns state plus the opaque approval handle only.
 from __future__ import annotations
 
 import dataclasses
+import hmac
 import secrets
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Protocol
 
@@ -48,6 +50,7 @@ from tools.host_control.approval.contracts import (
     ApprovalStatus,
     ApproverDenied,
     DecisionResult,
+    ExpirySweepStatus,
     GrantRecord,
     HandoffLink,
     HandoffMismatch,
@@ -58,15 +61,38 @@ from tools.host_control.approval.contracts import (
     ReviewResult,
     StaleAuthorityState,
 )
+from tools.host_control.approval.human import (
+    HUMAN_AUDIT_ANCHOR,
+    MAX_CARD_SUMMARY_LENGTH,
+    MAX_PROVIDER_MESSAGE_REF_LENGTH,
+    MAX_SOURCE_EVENT_LENGTH,
+    AttestationRecord,
+    HumanDecisionRefused,
+    HumanDecisionResult,
+    HumanIngressRegistration,
+    HumanRequestRecord,
+    HumanRequestResult,
+)
 from tools.host_control.approval.journal import ApprovalJournal
+from tools.host_control.approval.presentation import (
+    AsyncHumanCardPresenter,
+    DeliveryScheduler,
+    HumanCardDelivery,
+    PresentCall,
+    PresentReply,
+    Settled,
+)
 from tools.host_control.contracts import (
     BindOutcome,
     HostControlError,
     IdempotencyConflict,
     InvalidTransition,
+    JournalBusy,
+    PolicyDenied,
     UnknownHandle,
     _closed_hex,
     _closed_string,
+    canonical_json,
 )
 
 
@@ -144,6 +170,56 @@ class ApproverAuthorizer(Protocol):
 
     def may_revoke(self, subject: str, grant: GrantRecord) -> PolicyVerdict: ...
 
+    def may_decide_human(
+        self,
+        human_subject: str,
+        review: ReviewRecord,
+        chain_participants: frozenset[str],
+    ) -> PolicyVerdict: ...
+
+    def may_withdraw(self, subject: str) -> PolicyVerdict: ...
+
+
+class HumanCardPresenter(Protocol):
+    """Seam for ``HostApprovalTelegram1.Ingress.Present`` (ORG-052 §5).
+
+    The real implementation is the D-Bus client in
+    ``tools.host_control.approval.telegram_presenter``; fakes supply it
+    in tests. Returns ``(state, provider_message_ref)``; any exception
+    means "not delivered" and the record stays ``pending`` (a
+    RequestHuman replay retries; the ingress dedupes by review handle so
+    exactly one card exists per record).
+
+    This SYNCHRONOUS seam is for in-process composition only. Over D-Bus
+    the service uses the non-blocking ``AsyncHumanCardPresenter`` plus a
+    ``DeliveryScheduler`` (``card_presenter=`` / ``delivery_scheduler=``):
+    the service itself then retries an undelivered card with bounded
+    backoff until it is presented, expired or withdrawn (T-5518)."""
+
+    def present(
+        self,
+        review_handle: str,
+        expected_digest: str,
+        summary_json: str,
+        callback_nonce: str,
+        expires_at: str,
+    ) -> tuple[str, str]: ...
+
+
+@dataclass(frozen=True)
+class ReviewExtras:
+    """Record-derived ReviewGet additions (T-2919 Q3): the opaque approval
+    handle once granted (never bearer authority, ORG-052 §5) and the human
+    request's handle/state/expiry. Never the nonce."""
+
+    approval_handle: str | None
+    human_request_handle: str | None
+    human_request_state: str | None
+    human_request_expires_at: str | None
+
+
+_TRUNCATION_MARKER = " [truncated]"
+
 
 class _DenyAllAuthorizer:
     """Shipped default: nobody may review, decide, or revoke (L9)."""
@@ -175,6 +251,17 @@ class _DenyAllAuthorizer:
     def may_revoke(self, subject: str, grant: GrantRecord) -> PolicyVerdict:
         return PolicyVerdict(False, "deny_all_default")
 
+    def may_decide_human(
+        self,
+        human_subject: str,
+        review: ReviewRecord,
+        chain_participants: frozenset[str],
+    ) -> PolicyVerdict:
+        return PolicyVerdict(False, "deny_all_default")
+
+    def may_withdraw(self, subject: str) -> PolicyVerdict:
+        return PolicyVerdict(False, "deny_all_default")
+
 
 DENY_ALL_AUTHORIZER: ApproverAuthorizer = _DenyAllAuthorizer()
 
@@ -185,6 +272,12 @@ def _require_allowed(verdict: PolicyVerdict, message: str) -> PolicyVerdict:
     if not verdict.allowed:
         raise ApproverDenied(message, reason_code=verdict.reason_code)
     return verdict
+
+
+def _nonce_matches(stored: str, presented: str) -> bool:
+    """Constant-time nonce comparison (single-use callback nonce)."""
+
+    return hmac.compare_digest(stored.encode("ascii"), presented.encode("ascii"))
 
 
 def default_handle_factory() -> str:
@@ -204,6 +297,7 @@ def transition_review_record(
     authority_source: str | None = None,
     audit_anchor: str | None = None,
     decide_idempotency_key: str | None = None,
+    source_event: str | None = None,
 ) -> ReviewRecord:
     """Pure review transition; raises InvalidTransition outside the table."""
 
@@ -227,6 +321,7 @@ def transition_review_record(
         audit_anchor=audit_anchor,
         decide_idempotency_key=decide_idempotency_key,
         decided_at=decided_at,
+        source_event=source_event,
     )
     return ReviewRecord.create(**values)
 
@@ -302,12 +397,62 @@ class ApprovalService:
         registered_consumer_uids: frozenset[int] = frozenset(),
         review_ttl: timedelta = timedelta(hours=1),
         grant_ttl: timedelta = timedelta(hours=1),
+        human_ingress: HumanIngressRegistration | None = None,
+        presenter: HumanCardPresenter | None = None,
+        human_card_ttl: timedelta = timedelta(minutes=15),
+        card_presenter: AsyncHumanCardPresenter | None = None,
+        delivery_scheduler: DeliveryScheduler | None = None,
     ) -> None:
         for uid in registered_consumer_uids:
             if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
                 raise HostControlError("invalid registered consumer uid")
         if review_ttl <= timedelta(0) or grant_ttl <= timedelta(0):
             raise HostControlError("invalid approval ttl")
+        if human_card_ttl <= timedelta(0):
+            raise HostControlError("invalid human card ttl")
+        if human_ingress is not None:
+            if not isinstance(human_ingress, HumanIngressRegistration):
+                raise HostControlError("invalid human ingress registration")
+            # construction-time cross-check (T-2919 §6): the registered
+            # human subject's policy trust domain IS the ingress uid, when
+            # the authorizer can answer (the real policy authorizer can)
+            subject_uid = getattr(authorizer, "subject_uid", None)
+            if subject_uid is not None and (
+                subject_uid(human_ingress.human_subject) != human_ingress.uid
+            ):
+                raise HostControlError(
+                    "human subject trust domain is not the ingress uid"
+                )
+            agent_on_uid = getattr(authorizer, "agent_approvers_on_uid", None)
+            if agent_on_uid is not None and agent_on_uid(human_ingress.uid):
+                # review finding 7: the network-facing ingress uid can
+                # never carry Reviewer standing
+                raise HostControlError(
+                    "an agent-source approver shares the ingress uid"
+                )
+            if human_ingress.uid in registered_consumer_uids:
+                raise HostControlError(
+                    "ingress uid must not be a registered consumer"
+                )
+        if (card_presenter is None) != (delivery_scheduler is None):
+            raise HostControlError(
+                "an async card presenter needs a delivery scheduler"
+            )
+        if card_presenter is not None and presenter is not None:
+            raise HostControlError("configure one card presenter, not two")
+        self._human_ingress = human_ingress
+        self._presenter = presenter
+        self._delivery = (
+            None
+            if card_presenter is None
+            else HumanCardDelivery(
+                presenter=card_presenter,
+                scheduler=delivery_scheduler,  # type: ignore[arg-type]
+                load=self._delivery_load,
+                complete=self._delivery_complete,
+            )
+        )
+        self._human_card_ttl = human_card_ttl
         self._journal = journal
         self._metadata_source = metadata_source
         self._clock = clock
@@ -316,6 +461,10 @@ class ApprovalService:
         self._consumer_uids = frozenset(registered_consumer_uids)
         self._review_ttl = review_ttl
         self._grant_ttl = grant_ttl
+        # expiry-sweep contention signal (T-4350): in-memory, single-writer
+        # (the journal connection is thread-affine, so is this service)
+        self._busy_sweeps_total = 0
+        self._consecutive_busy_sweeps = 0
 
     # ------------------------------------------------------------------
     # reviewer surface (HostApproval1.Reviewer shape; D-Bus wiring Unit 3)
@@ -687,6 +836,536 @@ class ApprovalService:
         )
 
     # ------------------------------------------------------------------
+    # human authority ingress (T-2919; ORG-052 §5 "Human authority
+    # ingress")
+    # ------------------------------------------------------------------
+
+    def request_human(
+        self,
+        approver_subject: str,
+        review_handle: str,
+        expected_digest: str,
+        idempotency_key: str,
+    ) -> HumanRequestResult:
+        """Create (or replay) the ONE pending human-review card for a
+        review, then ask the registered ingress to present it.
+
+        Mailbox/ticket-triggered calls can REQUEST review this way
+        (gate 22) but nothing here mints authority: the record is inert
+        until the provider-authenticated ingress consumes its nonce.
+        Disclosure order (gate 12) is preserved: the caller is authorized
+        against the stored review's minimal metadata before the redacted
+        summary is fetched."""
+
+        approver = _closed_string(approver_subject, "approver subject")
+        review_handle = _closed_hex(review_handle, "review handle")
+        expected_digest = _closed_hex(expected_digest, "plan digest")
+        idempotency_key = _closed_string(
+            idempotency_key, "human request idempotency key"
+        )
+        registration = self._human_ingress
+        if registration is None:
+            raise HumanDecisionRefused(reason_code="human_ingress_unconfigured")
+        review = self._journal.get_review(review_handle)
+        _require_allowed(
+            self._authorizer.may_review(approver, self._review_view(review)),
+            "approver may not request a human card for this review",
+        )
+        existing = self._journal.get_human_request_for_review(review_handle)
+        if existing is not None:
+            if expected_digest != existing.plan_digest:
+                raise HumanDecisionRefused(reason_code="digest_mismatch")
+            live = self._present(self._lazy_expire_human(existing))
+            return HumanRequestResult(live.request_handle, live.state, True)
+        review = self._lazy_expire_review(review)
+        if review.state == "expired":
+            raise HumanDecisionRefused(reason_code="review_expired")
+        if review.state != "open":
+            raise HumanDecisionRefused(reason_code="review_not_open")
+        if expected_digest != review.plan_digest:
+            raise HumanDecisionRefused(reason_code="digest_mismatch")
+        if not self._authorizer.may_decide_human(
+            registration.human_subject,
+            review,
+            self._chain_participants(review),
+        ).allowed:
+            raise HumanDecisionRefused(reason_code="no_human_approver")
+        recomputed, summary = self._metadata_source.plan_summary(
+            review.plan_handle, review.plan_digest
+        )
+        if recomputed != review.plan_digest:
+            raise HostControlError(
+                "plan summary digest does not match plan metadata"
+            )
+        summary = _closed_string(
+            summary, "plan summary", maximum=MAX_PLAN_SUMMARY_LENGTH
+        )
+        if len(summary) > MAX_CARD_SUMMARY_LENGTH:
+            summary = (
+                summary[: MAX_CARD_SUMMARY_LENGTH - len(_TRUNCATION_MARKER)]
+                + _TRUNCATION_MARKER
+            )
+        now = self._now()
+        expires = min(
+            datetime.fromisoformat(review.expires_at),
+            now + self._human_card_ttl,
+        )
+        record = HumanRequestRecord(
+            request_handle=self._new_handle(),
+            review_handle=review_handle,
+            requested_by=approver,
+            request_idempotency_key=idempotency_key,
+            plan_digest=review.plan_digest,
+            target_seat_id=review.target_seat_id,
+            operation_families=tuple(review.operation_families),
+            redacted_summary=summary,
+            nonce=self._new_handle(),
+            state="pending",
+            provider_message_ref=None,
+            created_at=now.isoformat(),
+            expires_at=expires.isoformat(),
+            presented_at=None,
+            updated_at=now.isoformat(),
+        )
+        stored, replayed = self._journal.put_human_request_or_replay(
+            record=record
+        )
+        live = self._present(stored)
+        return HumanRequestResult(live.request_handle, live.state, replayed)
+
+    def human_decision(
+        self,
+        authenticated_uid: int,
+        review_handle: str,
+        expected_digest: str,
+        decision: str,
+        source_event_handle: str,
+        callback_nonce: str,
+        idempotency_key: str,
+    ) -> HumanDecisionResult:
+        """Submit ONE provider-verified human decision (HumanIngress).
+
+        The uid gate is FIRST and is the only source of identity: the
+        bus-attested uid must equal the registered ingress uid, and the
+        provider + human subject come from the root-owned registration —
+        never from any argument (ORG-052 §5). Single-use: the nonce is
+        consumed atomically with the decision in one durable transaction;
+        a same-key identical replay returns the original outcome, any
+        other reuse is refused."""
+
+        registration = self._require_ingress_uid(authenticated_uid)
+        review_handle = _closed_hex(review_handle, "review handle")
+        expected_digest = _closed_hex(expected_digest, "plan digest")
+        if decision not in ("granted", "denied"):
+            raise HostControlError("invalid decision")
+        source_event_handle = _closed_string(
+            source_event_handle,
+            "source event handle",
+            maximum=MAX_SOURCE_EVENT_LENGTH,
+        )
+        callback_nonce = _closed_hex(callback_nonce, "callback nonce")
+        idempotency_key = _closed_string(
+            idempotency_key, "human decision idempotency key"
+        )
+        subject = registration.human_subject
+        replay = self._human_replay(
+            subject,
+            idempotency_key,
+            review_handle,
+            expected_digest,
+            decision,
+            source_event_handle,
+            callback_nonce,
+        )
+        if replay is not None:
+            return replay
+        request = self._journal.get_human_request_for_review(review_handle)
+        if request is None:
+            raise HumanDecisionRefused(reason_code="no_human_request")
+        request = self._lazy_expire_human(request)
+        if request.state == "pending":
+            raise HumanDecisionRefused(reason_code="human_request_not_presented")
+        if request.state == "expired":
+            raise HumanDecisionRefused(reason_code="human_request_expired")
+        if request.state != "presented":
+            raise HumanDecisionRefused(reason_code="human_request_closed")
+        if not _nonce_matches(request.nonce, callback_nonce):
+            raise HumanDecisionRefused(reason_code="human_nonce_mismatch")
+        review = self._journal.get_review(review_handle)
+        if not (
+            expected_digest == request.plan_digest == review.plan_digest
+        ):
+            raise HumanDecisionRefused(reason_code="digest_mismatch")
+        review = self._lazy_expire_review(review)
+        if review.state == "expired":
+            raise HumanDecisionRefused(reason_code="review_expired")
+        if review.state != "open":
+            raise HumanDecisionRefused(reason_code="review_not_open")
+        verdict = _require_allowed(
+            self._authorizer.may_decide_human(
+                subject, review, self._chain_participants(review)
+            ),
+            "human subject may not decide this review",
+        )
+        grant_ttl = self._grant_ttl
+        if verdict.max_ttl is not None:
+            grant_ttl = min(grant_ttl, verdict.max_ttl)
+        now = self._now()
+        attestation_handle = self._new_handle()
+        reason_code = "approved" if decision == "granted" else "rejected"
+        new_review = transition_review_record(
+            review,
+            decision,
+            decided_at=now.isoformat(),
+            decision=decision,
+            reason_code=reason_code,
+            approver_subject=subject,
+            authority_source="human",
+            audit_anchor=HUMAN_AUDIT_ANCHOR,
+            decide_idempotency_key=idempotency_key,
+            source_event=attestation_handle,
+        )
+        grant: GrantRecord | None = None
+        if decision == "granted":
+            grant = GrantRecord.create(
+                schema=GRANT_SCHEMA,
+                approval_handle=self._new_handle(),
+                review_handle=review_handle,
+                plan_handle=review.plan_handle,
+                plan_digest=review.plan_digest,
+                plan_owner=review.plan_owner,
+                performer=review.performer,
+                target_seat_id=review.target_seat_id,
+                operation_families=review.operation_families,
+                effect_digest=review.effect_digest,
+                manifest_revision=review.manifest_revision,
+                policy_revision=review.policy_revision,
+                handoff_kind=review.handoff_kind,
+                handoff=review.handoff,
+                approver_subject=subject,
+                authority_source="human",
+                audit_anchor=HUMAN_AUDIT_ANCHOR,
+                source_event=attestation_handle,
+                decision="granted",
+                reason_code=reason_code,
+                issued_at=now.isoformat(),
+                expires_at=(now + grant_ttl).isoformat(),
+                nonce=self._new_handle(),
+                idempotency_key=idempotency_key,
+                state="issued",
+                consuming_operation_handle=None,
+                authority_record_id=None,
+                updated_at=now.isoformat(),
+            )
+        attestation = AttestationRecord(
+            attestation_handle=attestation_handle,
+            review_handle=review_handle,
+            request_handle=request.request_handle,
+            provider=registration.provider,
+            provider_user_id=registration.provider_user_id,
+            provider_chat_id=registration.provider_chat_id,
+            provider_message_id=request.provider_message_ref,
+            callback_nonce=callback_nonce,  # the PRESENTED nonce: the journal keys consumption on it
+            source_event=source_event_handle,
+            decision=decision,
+            human_subject=subject,
+            idempotency_key=idempotency_key,
+            plan_digest=request.plan_digest,
+            created_at=now.isoformat(),
+        )
+        try:
+            self._journal.consume_human_nonce_and_decide(
+                request=request,
+                review_current=review,
+                review_new=new_review,
+                grant=grant,
+                attestation=attestation,
+                payload={
+                    "decision": decision,
+                    "reason_code": reason_code,
+                    "approver_subject": subject,
+                    "authority_source": "human",
+                    "attestation_handle": attestation_handle,
+                    "approver_policy_revision": verdict.policy_revision,
+                },
+            )
+        except StaleAuthorityState:
+            # lost a serialized race: an identical concurrent submission
+            # may have won (same key) — otherwise the nonce is spent
+            replay = self._human_replay(
+                subject,
+                idempotency_key,
+                review_handle,
+                expected_digest,
+                decision,
+                source_event_handle,
+                callback_nonce,
+            )
+            if replay is not None:
+                return replay
+            raise HumanDecisionRefused(reason_code="human_request_closed") from None
+        return HumanDecisionResult(
+            review_handle=review_handle,
+            state=new_review.state,
+            attestation_handle=attestation_handle,
+            replayed=False,
+        )
+
+    def deliver_human_request(
+        self,
+        request_handle: str,
+        on_settled: Settled | None = None,
+    ) -> bool:
+        """Start (or join) the asynchronous ``Present`` of a pending human
+        request (T-5518). Returns ``True`` when ``on_settled`` WILL be
+        called later with ``(request_handle, state)`` (or an error), on
+        the loop thread; ``False`` when no async presenter is configured
+        (the synchronous seam already ran inside ``request_human``).
+
+        A failed or timed-out attempt is retried by the service itself
+        with bounded backoff until the request is presented, expired or
+        withdrawn: recovery never depends on a RequestHuman replay."""
+
+        request_handle = _closed_hex(request_handle, "human request handle")
+        if self._delivery is None:
+            return False
+        self._delivery.deliver(request_handle, on_settled)
+        return True
+
+    def resume_human_deliveries(self, *, limit: int = 100) -> int:
+        """Re-arm delivery for every still-pending, unexpired human
+        request (service start, after a restart). Idempotent: a request
+        with an attempt in flight or a retry armed is not doubled.
+        Returns how many pending requests were found."""
+
+        if self._delivery is None:
+            return 0
+        handles = self._journal.pending_human_request_handles(
+            self._now().isoformat(), limit=limit
+        )
+        for handle in handles:
+            self._delivery.resume(handle)
+        return len(handles)
+
+    def withdraw_human_request(
+        self,
+        subject: str,
+        request_handle: str,
+    ) -> HumanRequestResult:
+        """In-process administrative withdrawal of a pending/presented
+        card (T-2919 Q6; no D-Bus method — gate 2's inventory is locked).
+        Gated by the policy's revokers list. A later callback for it is
+        refused (``human_request_closed``) and the nonce is never
+        consumable again."""
+
+        subject = _closed_string(subject, "withdrawing subject")
+        request_handle = _closed_hex(request_handle, "human request handle")
+        _require_allowed(
+            self._authorizer.may_withdraw(subject),
+            "subject may not withdraw human requests",
+        )
+        request = self._lazy_expire_human(
+            self._journal.get_human_request(request_handle)
+        )
+        if request.state not in ("pending", "presented"):
+            raise HumanDecisionRefused(reason_code="human_request_closed")
+        new = dataclasses.replace(
+            request, state="withdrawn", updated_at=self._now().isoformat()
+        )
+        try:
+            self._journal.transition_human_request(current=request, new=new)
+        except StaleAuthorityState:
+            raise HumanDecisionRefused(reason_code="human_request_closed") from None
+        return HumanRequestResult(new.request_handle, new.state, False)
+
+    def review_extras(self, review_handle: str) -> ReviewExtras:
+        """Record-derived ReviewGet additions (T-2919 Q3). Callers MUST
+        have authorized the reviewer first (``review_get`` does)."""
+
+        review_handle = _closed_hex(review_handle, "review handle")
+        grant = self._journal.get_grant_for_review(review_handle)
+        request = self._journal.get_human_request_for_review(review_handle)
+        if request is not None:
+            request = self._lazy_expire_human(request)
+        return ReviewExtras(
+            approval_handle=None if grant is None else grant.approval_handle,
+            human_request_handle=(
+                None if request is None else request.request_handle
+            ),
+            human_request_state=None if request is None else request.state,
+            human_request_expires_at=(
+                None if request is None else request.expires_at
+            ),
+        )
+
+    def _require_ingress_uid(
+        self,
+        authenticated_uid: object,
+    ) -> HumanIngressRegistration:
+        """The HumanIngress uid gate (domain tier; the transport gate in
+        dbus_service is the other, deliberately duplicated, half)."""
+
+        registration = self._human_ingress
+        if (
+            registration is None
+            or not isinstance(authenticated_uid, int)
+            or isinstance(authenticated_uid, bool)
+            or authenticated_uid != registration.uid
+        ):
+            raise PolicyDenied("subject_denied")
+        return registration
+
+    def _human_replay(
+        self,
+        subject: str,
+        idempotency_key: str,
+        review_handle: str,
+        expected_digest: str,
+        decision: str,
+        source_event_handle: str,
+        callback_nonce: str,
+    ) -> HumanDecisionResult | None:
+        attestation = self._journal.find_attestation_by_key(
+            subject, idempotency_key
+        )
+        if attestation is None:
+            return None
+        if not (
+            attestation.review_handle == review_handle
+            and attestation.decision == decision
+            and attestation.source_event == source_event_handle
+            and attestation.plan_digest == expected_digest
+            and _nonce_matches(attestation.callback_nonce, callback_nonce)
+        ):
+            raise IdempotencyConflict("human decision idempotency conflict")
+        review = self._journal.get_review(review_handle)
+        return HumanDecisionResult(
+            review_handle=review_handle,
+            state=review.state,
+            attestation_handle=attestation.attestation_handle,
+            replayed=True,
+        )
+
+    def _present(self, request: HumanRequestRecord) -> HumanRequestRecord:
+        """Deliver a still-pending card through the presenter seam.
+
+        Failure of ANY kind leaves the record pending (fail closed: an
+        undelivered card can never be decided)."""
+
+        if request.state != "pending" or self._presenter is None:
+            return request
+        try:
+            state, message_ref = self._presenter.present(
+                *self._present_call(request).args()
+            )
+        except Exception:
+            return request
+        return self._record_presented(request, state, message_ref)
+
+    @staticmethod
+    def _present_call(request: HumanRequestRecord) -> PresentCall:
+        return PresentCall(
+            request.review_handle,
+            request.plan_digest,
+            canonical_json(request.card_summary()),
+            request.nonce,
+            request.expires_at,
+        )
+
+    def _delivery_load(self, request_handle: str) -> tuple[str, PresentCall | None]:
+        request = self._lazy_expire_human(
+            self._journal.get_human_request(request_handle)
+        )
+        if request.state != "pending":
+            return (request.state, None)
+        return (request.state, self._present_call(request))
+
+    def _delivery_complete(
+        self,
+        request_handle: str,
+        reply: PresentReply,
+    ) -> tuple[str, str]:
+        request = self._lazy_expire_human(
+            self._journal.get_human_request(request_handle)
+        )
+        if reply.state:
+            request = self._record_presented(
+                request, reply.state, reply.message_ref
+            )
+        return (request.request_handle, request.state)
+
+    def _record_presented(
+        self,
+        request: HumanRequestRecord,
+        state: object,
+        message_ref: object,
+    ) -> HumanRequestRecord:
+        """The guarded pending -> presented transition for one reported
+        delivery; anything malformed (or a request no longer pending)
+        leaves the record as it is (fail closed)."""
+
+        if request.state != "pending":
+            return request
+        if (
+            state != "presented"
+            or not isinstance(message_ref, str)
+            or not 1 <= len(message_ref) <= MAX_PROVIDER_MESSAGE_REF_LENGTH
+            or not message_ref.isdigit()
+        ):
+            return request
+        now = self._now().isoformat()
+        new = dataclasses.replace(
+            request,
+            state="presented",
+            provider_message_ref=message_ref,
+            presented_at=now,
+            updated_at=now,
+        )
+        try:
+            self._journal.transition_human_request(current=request, new=new)
+        except StaleAuthorityState:
+            return self._journal.get_human_request(request.request_handle)
+        return new
+
+    def _lazy_expire_human(
+        self,
+        request: HumanRequestRecord,
+    ) -> HumanRequestRecord:
+        if request.state not in ("pending", "presented"):
+            return request
+        now = self._now()
+        if not self._is_past(request.expires_at, now):
+            return request
+        new = dataclasses.replace(
+            request, state="expired", updated_at=now.isoformat()
+        )
+        try:
+            self._journal.transition_human_request(current=request, new=new)
+        except StaleAuthorityState:
+            return self._journal.get_human_request(request.request_handle)
+        return new
+
+    def _chain_participants(self, review: ReviewRecord) -> frozenset[str]:
+        if review.handoff is None:
+            return frozenset()
+        return self._journal.handoff_chain_subjects(
+            review.handoff.request_plan_handle
+        )
+
+    @staticmethod
+    def _review_view(record: ReviewRecord) -> PlanMetadata:
+        return PlanMetadata(
+            owner=record.plan_owner,
+            performer=record.performer,
+            target_seat_id=record.target_seat_id,
+            operation_families=record.operation_families,
+            plan_digest=record.plan_digest,
+            effect_digest=record.effect_digest,
+            manifest_revision=record.manifest_revision,
+            policy_revision=record.policy_revision,
+        )
+
+    # ------------------------------------------------------------------
     # consumer surface (HostApproval1.Consumer shape; broker uid only)
     # ------------------------------------------------------------------
 
@@ -792,14 +1471,43 @@ class ApprovalService:
     def expire_due(self, *, limit: int = 100) -> tuple[str, ...]:
         """Bounded expiry sweep hook (L8).
 
-        For a FUTURE sweeper: no daemon and no timer are wired in this unit
-        (T-2914/T-2923 own wiring). Races with concurrent bind/revoke lose
-        cleanly through the same state-guarded UPDATE and are skipped.
+        Nothing calls this yet: no daemon and no timer runs it. Expiry is
+        enforced LAZILY at bind/decide/revoke/status time (an expired
+        grant or review is refused there regardless of what state the
+        journal still says), so a sweep only keeps ``pending_counts``
+        accurate; it is not a safety mechanism. Returns the handles this
+        sweep transitioned to ``expired``.
+
+        Races with concurrent bind/revoke lose cleanly through the same
+        state-guarded UPDATE (``StaleAuthorityState``) and that item is
+        skipped; the sweep continues.
+
+        Write-lock contention is different (T-4350): the sqlite write lock
+        covers the whole database, so a ``JournalBusy`` on one item means
+        every later item would wait out the same busy timeout, and a
+        per-item skip would cost up to ``limit`` x that timeout. The FIRST
+        ``JournalBusy`` therefore stops the sweep. It does not raise: the
+        handles already transitioned are returned, so partial progress is
+        never lost. Nothing was written for the item that hit busy, so it
+        and every later due item stay due and are retried by the next
+        sweep. Contention is not silent: ``expiry_sweep_status`` counts busy
+        sweeps, so a sweeper that is permanently contended (and expires
+        nothing) shows a growing ``consecutive_busy_sweeps``.
+
+        The return value alone CANNOT show contention: a busy sweep returns
+        a normal tuple, indistinguishable from "nothing was due". Whoever
+        wires a sweeper MUST expose ``consecutive_busy_sweeps`` (via
+        Health1) or the contention signal is lost.
+
+        Only ``JournalBusy`` stops the sweep quietly. Any other error (for
+        example a corrupted journal row) propagates: it is neither a clean
+        nor a busy sweep, and the counters are left untouched.
         """
 
         now = self._now()
         due = self._journal.due_for_expiry(now.isoformat(), limit=limit)
         transitioned: list[str] = []
+        busy = False
         for kind, handle in due:
             try:
                 if kind == "review":
@@ -827,14 +1535,41 @@ class ApprovalService:
                     )
             except StaleAuthorityState:
                 continue
+            except JournalBusy:
+                busy = True
+                break
             transitioned.append(handle)
+        if busy:
+            self._busy_sweeps_total += 1
+            self._consecutive_busy_sweeps += 1
+        else:
+            self._consecutive_busy_sweeps = 0
         return tuple(transitioned)
+
+    def expiry_sweep_status(self) -> ExpirySweepStatus:
+        """Bounded read-only expiry-sweep contention counters (T-4350).
+
+        Provide-the-read, defer-the-wiring, like ``pending_counts``.
+        Nothing calls ``expire_due`` or reads this yet (T-2914/T-2923 are
+        done): whoever wires a sweeper MUST expose
+        ``consecutive_busy_sweeps`` via Health1, because ``expire_due``'s
+        return value cannot show contention. Expiry itself is enforced
+        lazily at bind, so a stuck sweeper degrades count accuracy, not
+        safety. In-memory for the life of this service object; a durable
+        write is impossible in exactly the contended case.
+        """
+
+        return ExpirySweepStatus(
+            busy_sweeps_total=self._busy_sweeps_total,
+            consecutive_busy_sweeps=self._consecutive_busy_sweeps,
+        )
 
     def pending_counts(self) -> ApprovalCounts:
         """Bounded read-only counters (ORG-068 monitor leg).
 
         Provide-the-read, defer-the-wiring: the AB-1 ``pending_operations``
-        precedent. Wiring is owned by T-2914 + T-2923.
+        precedent. Nothing calls it yet (T-2914/T-2923 are done); whoever
+        wires the monitor leg must expose it via Health1.
         """
 
         return self._journal.counts()

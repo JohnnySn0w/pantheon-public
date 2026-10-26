@@ -175,9 +175,8 @@ class CheckTest(unittest.TestCase):
 
 
 class RemediateGateTest(unittest.TestCase):
-    """SHIP-DARK gate (T-1885 REBOUND round 1): matches ancestor_liveness_monitor's
-    / channel_liveness_monitor's PANTHEON_*_REMEDIATE_ENABLED shape — default OFF,
-    only the live `systemctl restart` is gated (detection/counter/dry-run unaffected)."""
+    """SHIP-DARK gate (T-1885 REBOUND round 1): matches channel_liveness_monitor's
+    PANTHEON_*_REMEDIATE_ENABLED shape — default OFF, only the live `systemctl restart` is gated (detection/counter/dry-run unaffected)."""
 
     def setUp(self):
         self._tmp = TemporaryDirectory()

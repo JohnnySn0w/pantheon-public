@@ -45,13 +45,28 @@ python3 tools/persona_cutover.sh --persona <name> --stamp <TS>
 
 This resolves identity (bespoke facts + the manifest-precondition check), then the install-done precondition (a read-only `persona_installer` preflight — catches a PATH/harness-not-found failure BEFORE anything is torn down), then prints the exact sequence of backup/disable/apply/verify steps it would run. Read it. If anything looks wrong, stop here — nothing has been touched yet.
 
+Then, BEFORE `--execute`, stage the disabled control-plane units into a durable checkpoint (T-2953 R5, T-3026 witness 2026-09-11):
+
+```bash
+# as the target account (same account persona_cutover.sh runs as):
+PATH="<target-account-npm-global-bin>:$PATH" python3 tools/t2611_recovery_persona_apply.py stage-disabled \
+    --manifest <target-account>/pantheon-config/instance.yaml \
+    --persona <name> --harness claude \
+    --repo-root <target-account>/pantheon-config \
+    --stamp <TS>
+```
+
+**Why this step is separate:** the persona-installer applies + validates the target consume units in a *disabled* state and writes a signed checkpoint at `<target-account>/.local/state/pantheon/personas/<name>/staged-cutover-<TS>.json`. `persona_cutover.sh --execute`'s first action is `check-staged` — it refuses to touch anything if the checkpoint is absent. The dry-run above does NOT create it; skipping this step aborts the fire cleanly with `staged checkpoint precondition failed` before any state mutation (no rollback needed, but a wasted fire cycle). **Expected output:** exit 0 + `STAGE_STATUS=applied` (or `noop` on re-run) + the checkpoint path.
+
+The stage-disabled step is safe to run repeatedly: it does NOT touch the still-live bespoke supervisor. It only writes the target-service units + checkpoint file.
+
 Then fire for real:
 
 ```bash
 python3 tools/persona_cutover.sh --persona <name> --stamp <TS> --execute
 ```
 
-Sequence: backs up the three bespoke files (`<file>.pre-cutover-<TS>`) → disables the bespoke service → kills the bespoke tmux session (aborts if it survives — never runs `apply` with a live bespoke claude still bound to the telegram bot) → runs `t2611_recovery_persona_apply.py apply` (installs/converges the consume units, fires the timer) → runs the full soak-crit-4 verify block: tmux session up, cgroup scope ownership, exact `--channels`/`--model`/`--permission-mode` launch flags, composer ready with no channels-startup dialog, telegram inbound poller present (bounded 90s retry, with a comms-dark diagnostic capture on failure).
+Sequence: verifies the staged checkpoint (aborts if absent — see above) → backs up the three bespoke files (`<file>.pre-cutover-<TS>`) → disables the bespoke service → kills the bespoke tmux session (aborts if it survives — never activates staged units with a live bespoke claude still bound to the telegram bot) → runs `t2611_recovery_persona_apply.py activate-staged` (activates from the checkpoint: enables + starts the consume timer/service, T-2953 R5) → runs the full soak-crit-4 verify block: tmux session up, cgroup scope ownership, exact `--channels`/`--model`/`--permission-mode` launch flags, composer ready with no channels-startup dialog, telegram inbound poller present (bounded 90s retry, with a comms-dark diagnostic capture on failure).
 
 Any verify FAIL, or an `apply` failure, prints an explicit pointer at the rollback command (see below) — the script never auto-rolls-back.
 

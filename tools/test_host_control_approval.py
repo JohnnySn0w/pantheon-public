@@ -30,6 +30,7 @@ per PO mandate:
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import hashlib
 import inspect
@@ -48,6 +49,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import tools.host_control.approval.journal as approval_journal_module
+import tools.host_control.journal as broker_journal_module
 from tools.host_control.approval.contracts import (
     APPROVAL_REASON_CODES,
     BIND_DENIAL_DIMENSIONS,
@@ -65,12 +68,14 @@ from tools.host_control.approval.contracts import (
     ApprovalStatus,
     ApproverDenied,
     DecisionResult,
+    ExpirySweepStatus,
     GrantRecord,
     MetadataUnavailable,
     PlanMetadata,
     PolicyVerdict,
     ReviewRecord,
     ReviewResult,
+    StaleAuthorityState,
 )
 from tools.host_control.approval.journal import (
     APPLICATION_ID,
@@ -83,15 +88,21 @@ from tools.host_control.approval.service import (
     DENY_ALL_AUTHORIZER,
     ApprovalService,
     ConsumerBinder,
+    ReviewExtras,
     default_handle_factory,
     transition_grant_record,
     transition_review_record,
+)
+from tools.host_control.approval.human import (
+    HumanDecisionResult,
+    HumanRequestResult,
 )
 from tools.host_control.contracts import (
     BindOutcome,
     HostControlError,
     IdempotencyConflict,
     InvalidTransition,
+    JournalBusy,
     UnknownHandle,
     canonical_json,
 )
@@ -128,10 +139,28 @@ BROKER_MODULE_FILES = (
 # approver-policy file trust instead of drifting a ~300-line duplicate.
 BROKER_ONLY_MODULES = frozenset(
     (
+        "tools.host_control.approval_client",
+        "tools.host_control.driver",
+        "tools.host_control.envelope",
+        "tools.host_control.execution_source",
+        "tools.host_control.executor",
+        "tools.host_control.executor.__main__",
+        "tools.host_control.executor.config",
+        "tools.host_control.executor.dbus_service",
+        "tools.host_control.executor.engine",
+        "tools.host_control.executor.identity",
+        "tools.host_control.executor.mailbox_probe",  # T-2917 5d.3
+        "tools.host_control.executor.seat_files",
+        "tools.host_control.executor.user_bus",  # T-2917 5c.2 (review L5)
+        "tools.host_control.executor.user_manager",
+        "tools.host_control.executor.wire",
+        "tools.host_control.executor_client",
         "tools.host_control.journal",
         "tools.host_control.operations",
         "tools.host_control.planner",
         "tools.host_control.policy",
+        "tools.host_control.ratelimit",
+        "tools.host_control.reconciler",  # T-2917 5d.2
         "tools.host_control.registry",
     )
 )
@@ -144,6 +173,7 @@ SHARED_SUBSTRATE_NAMES = frozenset(("contracts", "trusted_files"))
 APPROVAL_TABLES = [
     ("grant_events", 1),
     ("grants", 1),
+    ("human_requests", 1),
     ("journal_meta", 1),
     ("provider_attestations", 1),
     ("review_events", 1),
@@ -195,6 +225,28 @@ def _parent_package_violations(source: str) -> set[str]:
                     if alias.name == "host_control":
                         violations.add("tools.host_control")
     return violations
+
+
+@contextlib.contextmanager
+def held_write_lock(path: Path):
+    """Hold a journal's write lock from a second connection.
+
+    ``BEGIN IMMEDIATE`` returns only once the lock is actually held, so any
+    journal write attempted inside the with-block is guaranteed to contend
+    for as long as the block lasts: a deterministic handshake with no
+    sleeps and no dependence on host load.
+    """
+
+    holder = sqlite3.connect(path, isolation_level=None)
+    try:
+        holder.execute("BEGIN IMMEDIATE")
+        yield
+    finally:
+        try:
+            holder.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        holder.close()
 
 
 class FakeMetadataSource:
@@ -268,7 +320,7 @@ class PermissiveAuthorizer:
 
 class ApprovalCaseBase(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.journal_path = self.root / "approval.sqlite3"
@@ -279,8 +331,8 @@ class ApprovalCaseBase(unittest.TestCase):
         self.plan_digest = self.next_handle()
         self.effect_digest = self.next_handle()
         self.metadata = PlanMetadata(
-            owner="cairn",
-            performer="cairn",
+            owner="consultant",
+            performer="consultant",
             target_seat_id="recovery",
             operation_families=("persona.install",),
             plan_digest=self.plan_digest,
@@ -339,7 +391,7 @@ class ApprovalCaseBase(unittest.TestCase):
     def handoff_request_plan(
         self,
         plan_handle: str,
-        owner: str = "metis",
+        owner: str = "mason",
     ) -> str:
         """A request plan ALIGNED with plan_handle's full handoff tuple.
 
@@ -459,8 +511,8 @@ class ApprovalCaseBase(unittest.TestCase):
             "review_handle": self.next_handle(),
             "plan_handle": self.plan_handle,
             "plan_digest": self.plan_digest,
-            "plan_owner": "cairn",
-            "performer": "cairn",
+            "plan_owner": "consultant",
+            "performer": "consultant",
             "target_seat_id": "recovery",
             "operation_families": ("persona.install",),
             "effect_digest": self.effect_digest,
@@ -500,8 +552,8 @@ class ApprovalCaseBase(unittest.TestCase):
             "review_handle": self.next_handle(),
             "plan_handle": self.plan_handle,
             "plan_digest": self.plan_digest,
-            "plan_owner": "cairn",
-            "performer": "cairn",
+            "plan_owner": "consultant",
+            "performer": "consultant",
             "target_seat_id": "recovery",
             "operation_families": ("persona.install",),
             "effect_digest": self.effect_digest,
@@ -541,10 +593,13 @@ class SeparationTests(ApprovalCaseBase):
                 "broker_client.py",
                 "contracts.py",
                 "dbus_service.py",
+                "human.py",
                 "identity.py",
                 "journal.py",
                 "policy.py",
+                "presentation.py",
                 "service.py",
+                "telegram_presenter.py",
                 "wire.py",
             ],
         )
@@ -708,14 +763,49 @@ class JournalSchemaTests(ApprovalCaseBase):
                     ApprovalJournal.open(tampered_copy(mutate))
 
     def test_provider_attestations_table_shape_and_checks(self) -> None:
-        # L10: schema slot only. NO provider validation, NO callback-nonce
-        # checking, NO uid-to-human mapping in this unit (T-2919 owns those);
-        # no service path writes this table — proven structurally by the
-        # gate-28 method enumeration (no attestation method exists).
+        # T-2919 widened the table (journal v1 amended in place — valid only
+        # because no v1 approval journal was ever installed): the
+        # attestation binds ONE human request and ONE review, its decision,
+        # the registered human subject, and the ingress idempotency key.
+        # The only writer is consume_human_nonce_and_decide (service
+        # human_decision); these are the raw SQL-level CHECK/UNIQUE/FK
+        # guarantees under it.
         review = self.open_review()
+        request_handle = self.next_handle()
+        with sqlite3.connect(self.journal_path) as connection:
+            connection.execute(
+                "INSERT INTO human_requests (request_handle, review_handle, "
+                "requested_by, request_idempotency_key, plan_digest, "
+                "target_seat_id, operation_families, redacted_summary, nonce, "
+                "state, provider_message_ref, created_at, expires_at, "
+                "presented_at, updated_at) VALUES "
+                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    request_handle,
+                    review.review_handle,
+                    "specialist",
+                    "rh-1",
+                    review.plan_digest,
+                    review.target_seat_id,
+                    canonical_json(list(review.operation_families)),
+                    "summary",
+                    self.next_handle(),
+                    "presented",
+                    "42",
+                    FIXED_NOW.isoformat(),
+                    FIXED_NOW.isoformat(),
+                    FIXED_NOW.isoformat(),
+                    FIXED_NOW.isoformat(),
+                ),
+            )
+            connection.commit()
         base = {
             "attestation_handle": self.next_handle(),
             "review_handle": review.review_handle,
+            "request_handle": request_handle,
+            "decision": "granted",
+            "human_subject": "operator",
+            "idempotency_key": "tg-key-1",
             "provider": "telegram",
             "provider_user_id": "12345",
             "provider_chat_id": "67890",
@@ -776,7 +866,7 @@ class ReviewLifecycleTests(ApprovalCaseBase):
             first.review_handle, replay_result.record.review_handle
         )
         # a different requester's identical request is a DIFFERENT open review
-        other = self.open_review(approver="metis")
+        other = self.open_review(approver="mason")
         self.assertNotEqual(other.review_handle, first.review_handle)
         # deny the first; the ADR requires a NEW review for any later attempt
         denied = self.service.decide(
@@ -826,7 +916,7 @@ class ReviewLifecycleTests(ApprovalCaseBase):
             review.handoff.request_plan_digest,
             self.metadata_source.plans[request_plan].plan_digest,
         )
-        self.assertEqual(review.handoff.request_plan_owner, "metis")
+        self.assertEqual(review.handoff.request_plan_owner, "mason")
         self.assertEqual(review.handoff.handoff_anchor, "ticket:T-2911")
         direct = self.open_review(plan_handle=self.fresh_plan())
         self.assertEqual(direct.handoff_kind, "direct_no_handoff")
@@ -1437,7 +1527,7 @@ class Yes:
 
 journal = ApprovalJournal.open(Path(sys.argv[1]))
 metadata = PlanMetadata(
-    "cairn", "cairn", "recovery", ("persona.install",),
+    "consultant", "consultant", "recovery", ("persona.install",),
     sys.argv[4], sys.argv[5], "manifest-r1", "policy-r1",
 )
 service = ApprovalService(
@@ -1451,10 +1541,15 @@ sys.stdin.readline()
 """
             + (
                 """
-outcome = service.validate_and_bind(
-    2001, sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[6]
-)
-print("BIND", outcome.state, outcome.reason_code, flush=True)
+from tools.host_control.contracts import HostControlError
+
+try:
+    outcome = service.validate_and_bind(
+        2001, sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[6]
+    )
+    print("BIND", outcome.state, outcome.reason_code, flush=True)
+except HostControlError as exc:
+    print("BIND", "refused", type(exc).__name__, flush=True)
 """
                 if action == "bind"
                 else """
@@ -1518,14 +1613,29 @@ except Exception as exc:
                 "WHERE approval_handle=?",
                 (approval_handle,),
             ).fetchone()
+        # The loser refuses with a HostControlError either way: the plain
+        # one when it lost the state-guarded UPDATE, or JournalBusy (its
+        # subclass) when the winner held the write lock past the busy
+        # timeout on a loaded host. Never a raw sqlite3 error. The
+        # exactly-one-winner and final-state invariants carry the intent.
         if bind_out == "BIND bound bound":
             # bind won: the commit stands; revoke refused; grant consumed
-            self.assertEqual(revoke_out, "REVOKE refused HostControlError")
+            self.assertIn(
+                revoke_out,
+                (
+                    "REVOKE refused HostControlError",
+                    "REVOKE refused JournalBusy",
+                ),
+            )
             self.assertEqual(state, "bound")
             self.assertEqual(consumed, operation_handle)
         else:
-            # revoke won: bind denied with the revoked reason code
-            self.assertEqual(bind_out, "BIND denied revoked")
+            # revoke won: bind denied with the revoked reason code, or
+            # refused outright on lock contention; grant stays unconsumed
+            self.assertIn(
+                bind_out,
+                ("BIND denied revoked", "BIND refused JournalBusy"),
+            )
             self.assertEqual(revoke_out, "REVOKE ok revoked")
             self.assertEqual(state, "revoked")
             self.assertIsNone(consumed)
@@ -1568,6 +1678,354 @@ except Exception as exc:
         self.assertEqual(
             replay.authority_record_id, first.authority_record_id
         )
+
+
+class LockClassifierTests(ApprovalCaseBase):
+    """Both journals classify sqlite lock contention identically.
+
+    The classifier is duplicated per journal on purpose (L3: no import edge
+    across the authority boundary), so one sample table drives both copies:
+    drift between them fails here.
+    """
+
+    MODULES = (approval_journal_module, broker_journal_module)
+
+    def real_busy_error(self) -> sqlite3.OperationalError:
+        with held_write_lock(self.journal_path):
+            contender = sqlite3.connect(
+                self.journal_path, timeout=0, isolation_level=None
+            )
+            try:
+                contender.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                return exc
+            finally:
+                contender.close()
+        raise AssertionError("a held write lock did not block BEGIN IMMEDIATE")
+
+    def test_a_real_busy_error_is_lock_contention(self) -> None:
+        exc = self.real_busy_error()
+        # the classifier's real input: SQLITE_BUSY (5), wording as observed
+        self.assertEqual(exc.sqlite_errorcode & 0xFF, 5)
+        self.assertEqual(str(exc), "database is locked")
+        for module in self.MODULES:
+            with self.subTest(module=module.__name__):
+                self.assertTrue(module._is_lock_contention(exc))
+
+    def test_a_real_non_lock_operational_error_is_not_contention(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        try:
+            with self.assertRaises(sqlite3.OperationalError) as caught:
+                connection.execute("SELECT * FROM no_such_table")
+        finally:
+            connection.close()
+        for module in self.MODULES:
+            with self.subTest(module=module.__name__):
+                self.assertFalse(
+                    module._is_lock_contention(caught.exception)
+                )
+
+    def test_error_code_decides_and_message_is_only_a_fallback(self) -> None:
+        def coded(message: str, code: int) -> sqlite3.OperationalError:
+            exc = sqlite3.OperationalError(message)
+            exc.sqlite_errorcode = code
+            return exc
+
+        samples = (
+            # (exception, expected contention)
+            (coded("database is locked", 5), True),  # SQLITE_BUSY
+            (coded("database table is locked", 6), True),  # SQLITE_LOCKED
+            (coded("database is locked", 5 | (2 << 8)), True),  # extended
+            (coded("anything", 261), True),  # BUSY_RECOVERY extended code
+            (coded("database is locked", 1), False),  # code wins
+            (coded("disk I/O error", 10), False),
+            # no error code (older interpreters / hand-built): exact text
+            (sqlite3.OperationalError("database is locked"), True),
+            (sqlite3.OperationalError("database table is locked"), True),
+            (sqlite3.OperationalError("unable to open database file"), False),
+            (sqlite3.OperationalError("cannot rollback"), False),
+        )
+        for module in self.MODULES:
+            for exc, expected in samples:
+                with self.subTest(
+                    module=module.__name__,
+                    message=str(exc),
+                    code=getattr(exc, "sqlite_errorcode", None),
+                ):
+                    self.assertIs(module._is_lock_contention(exc), expected)
+
+
+class LockContentionTests(ApprovalCaseBase):
+    """Write-lock contention refuses with JournalBusy, never a raw sqlite
+    error (T-4334). Every test forces the contention deterministically:
+    a second connection HOLDS the write lock (handshake: BEGIN IMMEDIATE
+    has returned) while the journal under test has a 50 ms busy timeout,
+    so the outcome does not depend on host load.
+    """
+
+    BUSY_MS = 50
+
+    def setUp(self) -> None:
+        super().setUp()
+        # setup work runs through self.service (default 5 s timeout); only
+        # the act under contention goes through the short-timeout journal
+        self.short = ApprovalJournal.open(
+            self.journal_path, busy_timeout_ms=self.BUSY_MS
+        )
+        self.short_service = self.build_service(journal=self.short)
+
+    def tearDown(self) -> None:
+        self.short.close()
+        super().tearDown()
+
+    def assert_discloses_no_path(self, error: Exception) -> None:
+        # The message is the wire body (error_body_for, bounded but
+        # verbatim): server-authored, and it must never name where the
+        # journal lives. The root check also catches a parent-dir leak.
+        self.assertNotIn(str(self.journal_path), str(error))
+        self.assertNotIn(str(self.root), str(error))
+
+    def assert_nothing_written(self) -> None:
+        with sqlite3.connect(self.journal_path) as connection:
+            for table in (
+                "reviews",
+                "review_events",
+                "grants",
+                "grant_events",
+            ):
+                self.assertEqual(
+                    connection.execute(
+                        f"SELECT count(*) FROM {table}"
+                    ).fetchone()[0],
+                    0,
+                    table,
+                )
+
+    def test_revoke_refuses_with_journal_busy_when_lock_held_past_timeout(self) -> None:
+        plan_handle, approval_handle = self.issue_grant()
+        events_before = self.grant_events(approval_handle)
+        with held_write_lock(self.journal_path):
+            with self.assertRaises(JournalBusy) as caught:
+                self.short_service.revoke(
+                    "admin", approval_handle, "revoked_by_admin"
+                )
+        error = caught.exception
+        self.assertIsInstance(error, HostControlError)
+        # a lost LOCK is not a lost state-guarded UPDATE: callers must not
+        # re-read and classify against a winner that has not committed
+        self.assertNotIsInstance(error, StaleAuthorityState)
+        message = str(error)
+        self.assertIn("transition_grant[revoked]", message)
+        self.assertIn("lock contention", message)
+        self.assertIn(f"{self.BUSY_MS} ms", message)
+        self.assert_discloses_no_path(error)
+        self.assertIsInstance(error.__cause__, sqlite3.OperationalError)
+        self.assertEqual(error.__cause__.sqlite_errorcode & 0xFF, 5)
+        # fail closed with no partial write; retryable once the lock frees
+        self.assertEqual(self.grant_row(approval_handle)["state"], "issued")
+        self.assertEqual(self.grant_events(approval_handle), events_before)
+        status = self.short_service.revoke(
+            "admin", approval_handle, "revoked_by_admin"
+        )
+        self.assertEqual(status.state, "revoked")
+
+    def test_bind_refuses_with_journal_busy_and_leaves_the_grant_issued(self) -> None:
+        plan_handle, approval_handle = self.issue_grant()
+        events_before = self.grant_events(approval_handle)
+        with held_write_lock(self.journal_path):
+            with self.assertRaises(JournalBusy) as caught:
+                self.bind(
+                    plan_handle,
+                    approval_handle,
+                    service=self.short_service,
+                )
+        self.assertIn("transition_grant[bound]", str(caught.exception))
+        self.assertIn("lock contention", str(caught.exception))
+        self.assert_discloses_no_path(caught.exception)
+        row = self.grant_row(approval_handle)
+        self.assertEqual(row["state"], "issued")
+        self.assertIsNone(row["consuming_operation_handle"])
+        self.assertEqual(self.grant_events(approval_handle), events_before)
+        # retryable: the same bind succeeds once the lock frees
+        outcome = self.bind(
+            plan_handle, approval_handle, service=self.short_service
+        )
+        self.assertEqual(outcome.state, "bound")
+
+    def test_every_write_site_refuses_with_journal_busy_and_writes_nothing(self) -> None:
+        review = self.make_review_record("open")
+        granted = transition_review_record(
+            review,
+            "granted",
+            decision="granted",
+            reason_code="approved",
+            approver_subject="specialist",
+            authority_source="agent",
+            audit_anchor="anchor-1",
+            decide_idempotency_key="decide-x",
+            decided_at=FIXED_NOW.isoformat(),
+        )
+        grant = self.make_grant_record(
+            "issued", review_handle=review.review_handle
+        )
+        revoked = transition_grant_record(
+            grant, "revoked", updated_at=LATE_NOW.isoformat()
+        )
+        journal = self.short
+        sites = {
+            "put_review_or_replay": lambda: journal.put_review_or_replay(
+                record=review
+            ),
+            "record_decision": lambda: journal.record_decision(
+                current=review, new=granted, grant=grant, payload={}
+            ),
+            "transition_review[expired]": lambda: journal.transition_review(
+                current=review,
+                new=transition_review_record(review, "expired"),
+                event_kind="expired",
+                payload={},
+                created_at=LATE_NOW.isoformat(),
+            ),
+            "transition_grant[revoked]": lambda: journal.transition_grant(
+                current=grant,
+                new=revoked,
+                event_kind="revoked",
+                payload={},
+            ),
+            "append_grant_event[bind_denied]": lambda: (
+                journal.append_grant_event(
+                    current=grant,
+                    event_kind="bind_denied",
+                    payload={},
+                    created_at=LATE_NOW.isoformat(),
+                )
+            ),
+        }
+        for label, act in sites.items():
+            with self.subTest(site=label):
+                with held_write_lock(self.journal_path):
+                    with self.assertRaises(JournalBusy) as caught:
+                        act()
+                self.assertIn(label, str(caught.exception))
+                self.assertIn("lock contention", str(caught.exception))
+                self.assert_discloses_no_path(caught.exception)
+        self.assert_nothing_written()
+
+    def test_non_lock_operational_errors_surface_as_is(self) -> None:
+        class BeginFails:
+            """A connection whose BEGIN IMMEDIATE fails for a non-lock
+            reason; every other statement mimics 'no transaction'."""
+
+            def __init__(self, error: sqlite3.OperationalError) -> None:
+                self.error = error
+
+            def execute(self, sql: str, *args: object) -> None:
+                if sql == "BEGIN IMMEDIATE":
+                    raise self.error
+                raise sqlite3.OperationalError(
+                    "cannot rollback - no transaction is active"
+                )
+
+        error = sqlite3.OperationalError("unable to open database file")
+        journal = ApprovalJournal(self.journal_path, BeginFails(error))
+        grant = self.make_grant_record("issued")
+        with self.assertRaises(sqlite3.OperationalError) as caught:
+            journal.transition_grant(
+                current=grant,
+                new=transition_grant_record(
+                    grant, "revoked", updated_at=LATE_NOW.isoformat()
+                ),
+                event_kind="revoked",
+                payload={},
+            )
+        self.assertIs(caught.exception, error)
+        self.assertNotIsInstance(caught.exception, HostControlError)
+
+    def test_open_refuses_an_invalid_busy_timeout_and_allows_zero(self) -> None:
+        for journal_class in (ApprovalJournal, BrokerJournal):
+            for bad in (-1, True, 1.5, "50", None):
+                path = self.root / f"bad-{journal_class.__name__}-{bad!r}"
+                with self.subTest(journal=journal_class.__name__, value=bad):
+                    with self.assertRaises(HostControlError):
+                        journal_class.open(path, busy_timeout_ms=bad)
+                    # refused before any file was touched
+                    self.assertFalse(path.exists())
+            zero = self.root / f"zero-{journal_class.__name__}.sqlite3"
+            journal_class.open(zero, busy_timeout_ms=0).close()
+
+    def test_open_applies_the_injected_busy_timeout_to_the_connection(self) -> None:
+        # Pins the seam itself: the injected value must reach the live
+        # connection. Wall time alone cannot prove it (a hard-coded 5000
+        # would still lose the lock, only slower), so read the PRAGMA back
+        # on the journal's own connection (busy_timeout is per-connection).
+        for journal_class, module in (
+            (ApprovalJournal, approval_journal_module),
+            (BrokerJournal, broker_journal_module),
+        ):
+            for injected in (0, self.BUSY_MS, 1234):
+                path = (
+                    self.root
+                    / f"timeout-{journal_class.__name__}-{injected}.sqlite3"
+                )
+                with self.subTest(
+                    journal=journal_class.__name__, value=injected
+                ):
+                    journal = journal_class.open(path, busy_timeout_ms=injected)
+                    try:
+                        applied = journal._connection.execute(
+                            "PRAGMA busy_timeout"
+                        ).fetchone()[0]
+                    finally:
+                        journal.close()
+                    self.assertEqual(applied, injected)
+            # and the default is the documented 5 s, unchanged
+            default_path = self.root / f"default-{journal_class.__name__}.sqlite3"
+            journal = journal_class.open(default_path)
+            try:
+                self.assertEqual(
+                    journal._connection.execute(
+                        "PRAGMA busy_timeout"
+                    ).fetchone()[0],
+                    module.BUSY_TIMEOUT_MS,
+                )
+                self.assertEqual(module.BUSY_TIMEOUT_MS, 5000)
+            finally:
+                journal.close()
+
+    def test_no_raw_begin_immediate_remains_outside_the_helper(self) -> None:
+        # Structural guard (P1): a future write method that opens its
+        # transaction with a raw execute("BEGIN IMMEDIATE") would leak the
+        # sqlite error again. The broker's migration builder writes only a
+        # private tmp file and is already wrapped into HostControlError.
+        allowed = {"_begin_immediate", "_migrate_build_tmp"}
+        minimum_helper_calls = {
+            approval_journal_module.__file__: 5,
+            broker_journal_module.__file__: 7,
+        }
+        for module_file, minimum in minimum_helper_calls.items():
+            with self.subTest(module=Path(module_file).name):
+                tree = ast.parse(Path(module_file).read_text("utf-8"))
+                raw: set[str] = set()
+                helper_calls = 0
+                for function in ast.walk(tree):
+                    if not isinstance(function, ast.FunctionDef):
+                        continue
+                    for node in ast.walk(function):
+                        if not isinstance(node, ast.Call) or not isinstance(
+                            node.func, ast.Attribute
+                        ):
+                            continue
+                        if (
+                            node.func.attr == "execute"
+                            and node.args
+                            and isinstance(node.args[0], ast.Constant)
+                            and node.args[0].value == "BEGIN IMMEDIATE"
+                        ):
+                            raw.add(function.name)
+                        if node.func.attr == "_begin_immediate":
+                            helper_calls += 1
+                self.assertLessEqual(raw, allowed)
+                self.assertGreaterEqual(helper_calls, minimum)
 
 
 class DurabilityTests(ApprovalCaseBase):
@@ -1739,7 +2197,7 @@ class Meta:
 
 journal = ApprovalJournal.open(Path(sys.argv[1]))
 metadata = PlanMetadata(
-    "cairn", "cairn", "recovery", ("persona.install",),
+    "consultant", "consultant", "recovery", ("persona.install",),
     sys.argv[4], sys.argv[5], "manifest-r1", "policy-r1",
 )
 service = ApprovalService(
@@ -1890,7 +2348,16 @@ class Gate28SurfaceTests(ApprovalCaseBase):
         "as_binder": (ConsumerBinder,),
         "revoke": (ApprovalStatus,),
         "expire_due": (str,),
+        "expiry_sweep_status": (ExpirySweepStatus,),
         "pending_counts": (ApprovalCounts,),
+        # T-2919 human ingress: none carries a nonce or authority record
+        "request_human": (HumanRequestResult,),
+        "human_decision": (HumanDecisionResult,),
+        "withdraw_human_request": (HumanRequestResult,),
+        "review_extras": (ReviewExtras,),
+        # T-5518 async card delivery: a flag and a count, never a record
+        "deliver_human_request": (bool,),
+        "resume_human_deliveries": (int,),
     }
 
     def test_no_service_method_returns_authority_without_durable_bound_commit(self) -> None:
@@ -2023,8 +2490,9 @@ class ExpiryTests(ApprovalCaseBase):
         )
 
     def test_expire_due_sweeps_bounded(self) -> None:
-        # L8: a bounded expire_due for a FUTURE sweeper — no daemon, no
-        # timer is wired in this unit (T-2914/T-2923 own the wiring).
+        # L8: a bounded expire_due for a FUTURE sweeper — nothing calls it
+        # yet (no daemon, no timer); a future sweeper must expose
+        # consecutive_busy_sweeps via Health1 (T-4350).
         # Composition note (plan DECISIONS): the expiry transition goes
         # through the same state-guarded UPDATE as bind/revoke, so an expiry
         # racing a bind also serializes to exactly one winner.
@@ -2044,6 +2512,275 @@ class ExpiryTests(ApprovalCaseBase):
         self.assertEqual(late.expire_due(limit=100), ())
         counts = self.service.pending_counts()
         self.assertEqual(counts, ApprovalCounts(0, 0, 0))
+
+
+class SweepFaultJournal:
+    """Delegating journal proxy that injects faults into an expiry sweep.
+
+    Wraps the REAL journal under test and counts ``transition_*`` attempts.
+    ``lock_before`` (1-based attempt number) makes a REAL second sqlite
+    connection take the write lock (``BEGIN IMMEDIATE`` has returned, so
+    the lock is held) immediately before that attempt is delegated: the
+    JournalBusy then comes from real sqlite through the real
+    ``_begin_immediate`` mapping, with no sleeps. ``stale_on`` attempts
+    raise ``StaleAuthorityState`` instead (a lost state-guarded race).
+    """
+
+    def __init__(
+        self,
+        journal: ApprovalJournal,
+        *,
+        lock_before: int | None = None,
+        stale_on: frozenset[int] = frozenset(),
+    ) -> None:
+        self._journal = journal
+        self._lock_before = lock_before
+        self._stale_on = stale_on
+        self._holder: sqlite3.Connection | None = None
+        self.attempts = 0
+
+    def __getattr__(self, name: str):
+        return getattr(self._journal, name)
+
+    def _before_attempt(self) -> None:
+        self.attempts += 1
+        if self.attempts == self._lock_before and self._holder is None:
+            self._holder = sqlite3.connect(
+                self._journal.path, isolation_level=None
+            )
+            self._holder.execute("BEGIN IMMEDIATE")
+        if self.attempts in self._stale_on:
+            raise StaleAuthorityState("injected lost race")
+
+    def transition_review(self, **kwargs):
+        self._before_attempt()
+        return self._journal.transition_review(**kwargs)
+
+    def transition_grant(self, **kwargs):
+        self._before_attempt()
+        return self._journal.transition_grant(**kwargs)
+
+    def release(self) -> None:
+        holder, self._holder = self._holder, None
+        if holder is None:
+            return
+        try:
+            holder.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass
+        holder.close()
+
+
+class ExpiryLockContentionTests(ApprovalCaseBase):
+    """expire_due under write-lock contention (T-4350).
+
+    The sqlite write lock covers the whole database, so contention is
+    correlated across items: the first JournalBusy stops the sweep (a
+    per-item skip would cost up to limit x busy-timeout), the partial
+    progress is returned, and every remaining due item - including the one
+    that hit busy - retries on the next sweep. Contention stays observable
+    through ``expiry_sweep_status``.
+    """
+
+    BUSY_MS = 50
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.short = ApprovalJournal.open(
+            self.journal_path, busy_timeout_ms=self.BUSY_MS
+        )
+        self.faults: SweepFaultJournal | None = None
+
+    def tearDown(self) -> None:
+        if self.faults is not None:
+            self.faults.release()
+        self.short.close()
+        super().tearDown()
+
+    def make_due_items(self, reviews: int, grants: int) -> None:
+        for _ in range(reviews):
+            self.open_review(plan_handle=self.fresh_plan())
+        for _ in range(grants):
+            self.issue_grant()
+
+    def sweeper(self, **fault_kwargs) -> ApprovalService:
+        self.faults = SweepFaultJournal(self.short, **fault_kwargs)
+        return self.build_service(
+            journal=self.faults, clock=lambda: LATE_NOW
+        )
+
+    def due_items(self) -> tuple[tuple[str, str], ...]:
+        return self.journal.due_for_expiry(LATE_NOW.isoformat(), limit=100)
+
+    def due_handles(self) -> tuple[str, ...]:
+        return tuple(handle for _kind, handle in self.due_items())
+
+    def test_sweep_keeps_partial_progress_when_the_lock_is_taken_mid_sweep(self) -> None:
+        self.make_due_items(reviews=2, grants=2)
+        order = self.due_handles()
+        self.assertEqual(len(order), 4)
+        # reviews sweep first, so contention lands on a GRANT item here
+        # (the review kind is pinned by the stop-at-first-busy test)
+        self.assertEqual(
+            [kind for kind, _handle in self.due_items()],
+            ["review", "review", "grant", "grant"],
+        )
+        sweeper = self.sweeper(lock_before=3)
+        # no raise: the two items transitioned before contention survive
+        first = sweeper.expire_due(limit=100)
+        self.assertEqual(first, order[:2])
+        # the sweep stopped at the busy grant: attempts 1-2 committed,
+        # attempt 3 was the busy one, and the 4th item was never tried
+        self.assertEqual(self.faults.attempts, 3)
+        self.assertEqual(self.due_handles(), order[2:])
+        # the item that hit busy was not transitioned and is not returned
+        self.assertNotIn(order[2], first)
+        self.faults.release()
+        # the next sweep expires the rest, including the one that hit busy
+        second = sweeper.expire_due(limit=100)
+        self.assertEqual(second, order[2:])
+        self.assertEqual(self.due_handles(), ())
+        self.assertEqual(sweeper.expire_due(limit=100), ())
+        self.assertEqual(
+            self.service.pending_counts(), ApprovalCounts(0, 0, 0)
+        )
+
+    def test_sweep_stops_at_the_first_busy_and_does_not_try_the_rest(self) -> None:
+        self.make_due_items(reviews=2, grants=3)
+        order = self.due_handles()
+        self.assertEqual(len(order), 5)
+        sweeper = self.sweeper(lock_before=1)
+        self.assertEqual(sweeper.expire_due(limit=100), ())
+        # one attempt, not five: a per-item skip under a held lock would
+        # burn limit x busy-timeout before returning
+        self.assertEqual(self.faults.attempts, 1)
+        self.assertEqual(self.due_handles(), order)
+        self.faults.release()
+        self.assertEqual(sweeper.expire_due(limit=100), order)
+        self.assertEqual(self.due_handles(), ())
+
+    def test_stale_authority_state_still_skips_per_item_and_is_not_contention(self) -> None:
+        self.make_due_items(reviews=2, grants=2)
+        order = self.due_handles()
+        sweeper = self.sweeper(stale_on=frozenset((2,)))
+        # the lost-race item is skipped; the sweep keeps going after it
+        self.assertEqual(
+            sweeper.expire_due(limit=100),
+            (order[0], order[2], order[3]),
+        )
+        self.assertEqual(self.faults.attempts, 4)
+        self.assertEqual(sweeper.expiry_sweep_status(), ExpirySweepStatus(0, 0))
+
+    def test_contention_is_observable_and_resets_only_on_a_clean_sweep(self) -> None:
+        self.make_due_items(reviews=1, grants=2)
+        order = self.due_handles()
+        # a fresh service has seen no contention
+        self.assertEqual(
+            self.build_service().expiry_sweep_status(),
+            ExpirySweepStatus(busy_sweeps_total=0, consecutive_busy_sweeps=0),
+        )
+        sweeper = self.sweeper(lock_before=1)
+        self.assertEqual(sweeper.expire_due(limit=100), ())
+        self.assertEqual(sweeper.expiry_sweep_status(), ExpirySweepStatus(1, 1))
+        # still contended: a permanently busy sweeper is visibly stuck
+        self.assertEqual(sweeper.expire_due(limit=100), ())
+        self.assertEqual(sweeper.expiry_sweep_status(), ExpirySweepStatus(2, 2))
+        self.faults.release()
+        self.assertEqual(sweeper.expire_due(limit=100), order)
+        # consecutive resets on a clean sweep; the total never decreases
+        self.assertEqual(sweeper.expiry_sweep_status(), ExpirySweepStatus(2, 0))
+        # an idle clean sweep is not contention either
+        self.assertEqual(sweeper.expire_due(limit=100), ())
+        self.assertEqual(sweeper.expiry_sweep_status(), ExpirySweepStatus(2, 0))
+
+    def test_partial_progress_then_busy_still_counts_as_a_busy_sweep(self) -> None:
+        self.make_due_items(reviews=2, grants=1)
+        order = self.due_handles()
+        sweeper = self.sweeper(lock_before=2)
+        self.assertEqual(sweeper.expire_due(limit=100), order[:1])
+        self.assertEqual(sweeper.expiry_sweep_status(), ExpirySweepStatus(1, 1))
+
+    def test_idle_sweep_resets_a_latched_busy_count_after_another_drain(self) -> None:
+        # Failure mode: busy sweeps latch consecutive_busy_sweeps, the
+        # leftovers are then drained elsewhere (lazy bind-time expiry or
+        # another service on the same journal), and the sweeps go idle. An
+        # idle sweep is a clean sweep, so the health signal must clear
+        # instead of alarming falsely forever.
+        self.make_due_items(reviews=1, grants=2)
+        order = self.due_handles()
+        sweeper = self.sweeper(lock_before=1)
+        self.assertEqual(sweeper.expire_due(limit=100), ())
+        self.assertEqual(sweeper.expiry_sweep_status(), ExpirySweepStatus(1, 1))
+        self.faults.release()
+        # a SECOND service on the same journal file drains the leftovers
+        other = self.build_service(clock=lambda: LATE_NOW)
+        self.assertEqual(other.expire_due(limit=100), order)
+        self.assertEqual(self.due_handles(), ())
+        # the first service's sweep now finds nothing due
+        self.assertEqual(sweeper.expire_due(limit=100), ())
+        self.assertEqual(self.faults.attempts, 1)
+        self.assertEqual(sweeper.expiry_sweep_status(), ExpirySweepStatus(1, 0))
+
+    def test_non_busy_journal_error_propagates_and_is_not_counted_as_contention(self) -> None:
+        # JournalBusy IS-A HostControlError, so a broad catch would swallow
+        # journal-tamper detection and report it as lock contention. Two
+        # grants sweep first, then two reviews; tamper the first review so
+        # get_review raises (a real corrupted JSON mirror, not a fake).
+        for _ in range(2):
+            self.issue_grant()
+        for _ in range(2):
+            self.open_review(plan_handle=self.fresh_plan())
+        items = self.due_items()
+        self.assertEqual(
+            [kind for kind, _handle in items],
+            ["grant", "grant", "review", "review"],
+        )
+        tampered_index = 2
+        tampered_handle = items[tampered_index][1]
+        original = self.review_row(tampered_handle)["review_json"]
+        with sqlite3.connect(self.journal_path) as connection:
+            connection.execute(
+                "UPDATE reviews SET review_json=? WHERE review_handle=?",
+                (
+                    json.dumps(json.loads(original), indent=2),
+                    tampered_handle,
+                ),
+            )
+            connection.commit()
+        # LATCH a busy sweep first (contention lands on the first grant,
+        # before the tampered row is reached): a corruption incident must
+        # not clear a latched busy count, which "starting from (0, 0)" could
+        # not distinguish from a reset (a try/finally counter refactor).
+        sweeper = self.sweeper(lock_before=1)
+        self.assertEqual(sweeper.expire_due(limit=100), ())
+        self.assertEqual(sweeper.expiry_sweep_status(), ExpirySweepStatus(1, 1))
+        self.faults.release()
+        with self.assertRaises(HostControlError) as caught:
+            sweeper.expire_due(limit=100)
+        self.assertNotIsInstance(caught.exception, JournalBusy)
+        # neither clean nor busy: the raise itself is the signal, and the
+        # latched counters are exactly as the busy sweep left them
+        self.assertEqual(sweeper.expiry_sweep_status(), ExpirySweepStatus(1, 1))
+        # everything before the bad row committed and stays expired
+        for kind, handle in items[:tampered_index]:
+            row = (
+                self.review_row(handle)
+                if kind == "review"
+                else self.grant_row(handle)
+            )
+            self.assertEqual(row["state"], "expired", handle)
+        # the tampered row and everything after it were never transitioned
+        for kind, handle in items[tampered_index:]:
+            row = (
+                self.review_row(handle)
+                if kind == "review"
+                else self.grant_row(handle)
+            )
+            self.assertEqual(
+                row["state"],
+                "open" if kind == "review" else "issued",
+                handle,
+            )
 
 
 class DefaultsTests(ApprovalCaseBase):
@@ -2138,7 +2875,7 @@ class ConsumerContractTests(unittest.TestCase):
         from tools.persona_installer import Manifest, PersonaInstaller
         from tools.test_host_control_core import _manifest_dict
 
-        self.temp = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         manifest_path = self.root / "instance.yaml"
@@ -2158,9 +2895,9 @@ class ConsumerContractTests(unittest.TestCase):
             "schema": "pantheon-host-seat-registry/v1",
             "seats": [
                 {
-                    "seat_id": "cairn",
+                    "seat_id": "consultant",
                     "uid": self.BROKER_UID,
-                    "persona": "cairn",
+                    "persona": "consultant",
                     "role": "worker",
                     "instance": "test-instance",
                     "account": "codex",
@@ -2203,7 +2940,7 @@ class ConsumerContractTests(unittest.TestCase):
             "revision": "policy-r1",
             "grants": [
                 {
-                    "subject_seat_id": "cairn",
+                    "subject_seat_id": "consultant",
                     "action": "plan",
                     "target_seat_id": "recovery",
                     "manifest_revisions": ["manifest-r1"],
@@ -2257,8 +2994,8 @@ class ConsumerContractTests(unittest.TestCase):
         self.metadata_source = FakeMetadataSource()
         self.metadata_source.plans[self.plan_result.plan_handle] = (
             PlanMetadata(
-                owner="cairn",
-                performer="cairn",
+                owner="consultant",
+                performer="consultant",
                 target_seat_id="recovery",
                 operation_families=("persona.install",),
                 plan_digest=self.plan_result.plan_digest,
@@ -2362,13 +3099,13 @@ class ConsumerContractTests(unittest.TestCase):
 
     def _reissue_for_second_operation(self) -> str:
         review = self.approval_service.review(
-            "metis",
+            "mason",
             self.plan_result.plan_handle,
             self.plan_result.plan_digest,
             None,
         ).record
         result = self.approval_service.decide(
-            "metis",
+            "mason",
             review.review_handle,
             self.plan_result.plan_digest,
             "granted",

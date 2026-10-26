@@ -13,8 +13,8 @@ domain: pantheon, echo, git, github, https, ssh, push, transport, ho-env
 Isolating checks run the same session:
 
 - HTTPS **read** (`git ls-remote https://…@github.com/example-org/echo-prismatic.git HEAD`): **0.49s**. Fine.
-- SSH **read** (`git ls-remote github-pantheon-config:example-org/pantheon-config.git HEAD`): **0.53s**. Fine.
-- SSH **push** (pantheon-config `git push origin main` via the `github-pantheon-config` deploy-key alias): instant, same session. Fine.
+- SSH **read** (`git ls-remote github.com:example-org/pantheon-config.git HEAD`): **0.53s**. Fine.
+- SSH **push** (pantheon-config `git push origin main` via the `github.com` deploy-key alias): instant, same session. Fine.
 - HTTPS **push** (echo, PAT over https): **hung twice**.
 
 So the failure is specific to the HTTPS *upload* path, not github reachability, not auth (the PAT `ls-remote` authed fine), not writes-in-general (SSH push works).

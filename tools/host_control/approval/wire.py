@@ -57,6 +57,15 @@ REVIEWER_INTERFACE = "org.pantheon.HostApproval1.Reviewer"
 CONSUMER_INTERFACE = "org.pantheon.HostApproval1.Consumer"
 HUMAN_INGRESS_INTERFACE = "org.pantheon.HostApproval1.HumanIngress"
 
+# The separately supervised Telegram ingress's restricted internal
+# interface (ORG-052 §5 table: ``HostApprovalTelegram1.Ingress`` /
+# approval uid / ``Present`` "sssss" -> "ss"). Exported BY the ingress,
+# called ONLY by the approval-service uid (T-2919).
+TELEGRAM_INGRESS_BUS_NAME = "org.pantheon.HostApprovalTelegram1"
+TELEGRAM_INGRESS_OBJECT_PATH = "/org/pantheon/HostApprovalTelegram1"
+TELEGRAM_INGRESS_INTERFACE = "org.pantheon.HostApprovalTelegram1.Ingress"
+TELEGRAM_INGRESS_ERROR_NAMESPACE = "org.pantheon.HostApprovalTelegram1.Error"
+
 ERROR_NAMESPACE = "org.pantheon.HostApproval1.Error"
 
 APPROVER_DENIED_ERROR = f"{ERROR_NAMESPACE}.ApproverDenied"
@@ -193,7 +202,7 @@ def _bounded(encoded: str, context: str) -> str:
     return encoded
 
 
-def review_summary_json(record: ReviewRecord) -> str:
+def review_summary_json(record: ReviewRecord, extras: object = None) -> str:
     """Canonical bounded summary payload for ``ReviewGet`` (``"ss"``
     slot 2). PROVISIONAL-PENDING-RATIFICATION: ORG-052 §5 ratifies
     "review state and bounded non-secret summary" without naming the
@@ -246,6 +255,21 @@ def review_summary_json(record: ReviewRecord) -> str:
         "expires_at": record.expires_at,
         "decided_at": record.decided_at,
     }
+    # T-2919 Q3 (additive, provisional v1): the opaque approval handle once
+    # granted — not bearer authority (ORG-052 §5), and the requester's only
+    # way to learn it after a HUMAN grant — plus the human card's handle,
+    # state and expiry. Never the nonce, never the attestation.
+    payload["approval_handle"] = getattr(extras, "approval_handle", None)
+    request_handle = getattr(extras, "human_request_handle", None)
+    payload["human_request"] = (
+        None
+        if request_handle is None
+        else {
+            "request_handle": request_handle,
+            "state": getattr(extras, "human_request_state"),
+            "expires_at": getattr(extras, "human_request_expires_at"),
+        }
+    )
     return _bounded(canonical_json(payload), "review summary payload")
 
 

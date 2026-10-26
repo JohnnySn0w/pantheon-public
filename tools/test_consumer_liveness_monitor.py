@@ -44,7 +44,7 @@ class FakeOps:
         self.alerts.append((agent, vocab, msg))
 
 
-SUB = {"orchestrator": "claude", "recovery": "claude-fallback", "atlas": "suborch2"}
+SUB = {"orchestrator": "claude", "recovery": "claude-fallback", "artisan": "suborch2"}
 
 
 def _run(ops, agents, state_dir, **kw):
@@ -101,8 +101,8 @@ class TestVerdicts(unittest.TestCase):
     def test_no_timer_is_report_only(self):
         """delivery_reachability (MISSING) owns this — must NOT alert here (no double-page)."""
         with TemporaryDirectory() as d:
-            ops = FakeOps(enablement={"atlas": "missing"})
-            res = _run(ops, ["atlas"], d)
+            ops = FakeOps(enablement={"artisan": "missing"})
+            res = _run(ops, ["artisan"], d)
             self.assertEqual(res[0]["verdict"], clm.NO_TIMER)
             self.assertFalse(res[0]["alerted"])
             self.assertEqual(ops.alerts, [])

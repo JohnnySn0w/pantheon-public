@@ -26,10 +26,37 @@ set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SUT="${SCRIPT_DIR}/handoff_and_restart.sh"
+REAL_SUT="$SUT"
 
 PASS=0
 FAIL=0
 FAILED_TESTS=()
+
+# T-4230: FAIL-FAST. The positive cases wait on CONDITION POLLS with a wide, load-
+# tolerant bound (60s), which is free while the SUT is healthy and slow only when it
+# is broken: a SUT that never acks would burn the full window on each of ~30
+# positive cases, ~30 minutes to go red, which is the CI job timeout, so the red
+# would arrive as an unattributed timeout. A broken SUT fails EVERY case, so stop
+# once SUITE_MAX_FAILED_CASES cases have failed: the failures are already printed
+# inline, the abort line names them, and the run goes red in a few minutes with the
+# cause visible. One flaky case still just fails that case (1 < 3). Set
+# SUITE_MAX_FAILED_CASES=999 to see every failure. (Duplicated, not shared, in
+# test_pantheon_seat_relaunch.sh: each suite stays copy-and-runnable on its own.)
+SUITE_MAX_FAILED_CASES="${SUITE_MAX_FAILED_CASES:-3}"
+_FAILED_CASES=0
+_FAIL_AT_LAST_CASE_END=0
+suite_case_end() {
+  if (( FAIL > _FAIL_AT_LAST_CASE_END )); then _FAILED_CASES=$((_FAILED_CASES+1)); fi
+  _FAIL_AT_LAST_CASE_END=$FAIL
+  if (( _FAILED_CASES >= SUITE_MAX_FAILED_CASES )); then
+    echo
+    echo "aborting after $_FAILED_CASES failures (fail-fast, T-4230): the SUT looks broken, not slow."
+    echo "Failed cases:"
+    printf '  - %s\n' "${FAILED_TESTS[@]}"
+    echo "Results so far: $PASS passed, $FAIL failed (suite ABORTED, not completed)"
+    exit 1
+  fi
+}
 
 # ---------------------------------------------------------------------------
 # Sandbox + fake-bin construction.
@@ -46,7 +73,7 @@ setup_sandbox() {
   echo "active" > "$SBX/systemctl_state"    # what is-active will print
   echo "0" > "$SBX/restart_exitcode"        # what `systemctl restart` returns
   echo "0" > "$SBX/lock_held"               # 1 = flock should fail
-  echo "" > "$SBX/pane_text"                # what capture-pane will print
+  echo "idle pane, no composer text" > "$SBX/pane_text"  # T-5412: non-empty; an empty capture is now "unverified" (rc 2)
   echo "0" > "$SBX/pane_in_mode"            # T-2268: #{pane_in_mode} for display-message
   echo "0" > "$SBX/sendkeys_calls"          # incremented by send-keys fake
   : > "$SBX/sendkeys_args"                  # one line per send-keys invocation
@@ -104,6 +131,21 @@ case "\${args[0]:-}" in
     if [[ -f "$SBX/session_live_after_restart" ]]; then
       echo "\$(cat "$SBX/session_live_after_restart")" > "$SBX/session_live"
     fi
+    # T-5019: an optional per-case hook models what the real restart runs
+    # (e.g. the runtime controller's own H1 session-end hook).
+    if [[ -x "$SBX/on_restart" ]]; then "$SBX/on_restart"; fi
+    exit \$(cat "$SBX/restart_exitcode")
+    ;;
+  start)
+    # T-4309: control-plane step 5 starts the oneshot consume unit (twice)
+    # instead of restarting it. Same blocking model and exit code as restart.
+    echo "\${args[*]}" >> "$SBX/restart_args"
+    if [[ -f "$SBX/session_live_after_restart" ]]; then
+      echo "\$(cat "$SBX/session_live_after_restart")" > "$SBX/session_live"
+    fi
+    # T-5019: an optional per-case hook models what the real restart runs
+    # (e.g. the runtime controller's own H1 session-end hook).
+    if [[ -x "$SBX/on_restart" ]]; then "$SBX/on_restart"; fi
     exit \$(cat "$SBX/restart_exitcode")
     ;;
   *)
@@ -157,9 +199,10 @@ case "\${1:-}" in
     echo "\$((n+1))" > "$SBX/sendkeys_calls"
     text=\$(cat "$SBX/tmux_buffer" 2>/dev/null)
     { echo "\$* -- pasted:"; echo "\$text"; } >> "$SBX/sendkeys_args"
-    # T-0721: the boot-dialog dismiss is send_keys_submit "\$pane" "1", so the
-    # "1" is now PASTED rather than sent as \`-l 1\`. Detect it here.
-    if [[ "\$text" == "1" ]]; then echo 1 > "$SBX/boot_dismissed"; fi
+    # T-0721: the boot-dialog dismiss is send_keys_submit "\$pane" "1" (or "2"), so the
+    # digit is PASTED. T-4832 r1: like real tmux, the dialog STAYS on screen until the
+    # Enter lands (it used to clear on the paste, which hid a guard blocking that Enter).
+    if [[ "\$text" == "1" || "\$text" == "2" ]]; then echo 1 > "$SBX/boot_digit_pasted"; fi
     # T-0899: kick token likewise now arrives via the buffer.
     if [[ -f "$SBX/kick_busy_token" ]] && grep -qF "\$(cat "$SBX/kick_busy_token")" <<<"\$text"; then
       echo 1 > "$SBX/kick_sent"
@@ -173,10 +216,22 @@ case "\${1:-}" in
     # T-0721: flag the boot-dialog dismiss (send_keys_submit sends \`-l 1\`) so
     # capture-pane can model the dialog clearing (dialog -> idle).
     if [[ "\$*" == *"-l 1" ]]; then echo 1 > "$SBX/boot_dismissed"; fi
+    if [[ -f "$SBX/boot_digit_pasted" && "\$*" == *Enter* ]]; then echo 1 > "$SBX/boot_dismissed"; fi
     # T-0899: when the kick prompt (its unique token) is injected, mark kick-sent
     # so capture-pane can model the dispatched turn (idle -> busy 'esc to interrupt').
     if [[ -f "$SBX/kick_busy_token" ]] && grep -qF "\$(cat "$SBX/kick_busy_token")" <<<"\$*"; then
       echo 1 > "$SBX/kick_sent"
+    fi
+    # T-4828: model Escape cancelling a pre-restart permission dialog.
+    if [[ -f "$SBX/escape_clears_dialog" && "\$*" == *Escape* ]]; then
+      cp "$SBX/escape_clears_dialog" "$SBX/pane_text_pre"
+    fi
+    # T-4329: model the TUI submitting a stuck composer on Enter. The pane clears
+    # in the SAME call as the keypress, as a real TUI does, so a helper subshell
+    # can't lose a race with the next re-press check on a loaded box.
+    if [[ -f "$SBX/clear_composer_on_enter" && "\$*" == *Enter* ]]; then
+      cp "$SBX/clear_composer_on_enter" "$SBX/pane_text"
+      rm -f "$SBX/clear_composer_on_enter"
     fi
     exit 0
     ;;
@@ -186,7 +241,11 @@ case "\${1:-}" in
     # pane_text_busy; a test omits pane_text_busy to model a kick that drops.
     # T-0721: else, if a sequenced "after" pane is set, return it once the boot
     # dialog has been dismissed; otherwise the static pane_text (back-compat).
-    if [[ -f "$SBX/kick_sent" && -f "$SBX/pane_text_busy" ]]; then
+    # T-4828: an optional PRE-restart pane (the dying session that step 3 reads)
+    # is served until the fake systemctl restart runs (restart_args written).
+    if [[ -f "$SBX/pane_text_pre" && ! -s "$SBX/restart_args" ]]; then
+      cat "$SBX/pane_text_pre"
+    elif [[ -f "$SBX/kick_sent" && -f "$SBX/pane_text_busy" ]]; then
       cat "$SBX/pane_text_busy"
     elif [[ -f "$SBX/pane_text_after" && -f "$SBX/boot_dismissed" ]]; then
       cat "$SBX/pane_text_after"
@@ -307,6 +366,10 @@ EOF
   export PANTHEON_STATE_DIR="$SBX/pantheon_state"
   export PANE_LOG_DIR="$SBX/pane_logs"
   mkdir -p "$SBX/pane_logs"
+  # T-5016: the session-end Chronicle duty must not read the runner's real persona
+  # state or page Recovery from a smoke run.
+  export PANTHEON_PERSONA_STATE_DIR="$SBX/pantheon_state/personas"
+  export PANTHEON_SESSION_CHRONICLE_ALERT=off
 
   # T-0550: shorten the paste-mode settle delay for the test harness.
   # The fake tmux has no paste-mode debounce, so the production default
@@ -319,6 +382,11 @@ EOF
   # Production default is 3s; the fake pane is always ready, so the
   # settle is just wasted wall-clock. Specific tests opt in via override.
   export HANDOFF_RESTART_KICK_READINESS_SETTLE_SECS=0
+
+  # T-4456: the kick's render gate is off for smoke runs. The fake capture-pane
+  # never renders the pasted text, so the gate would wait its full bound on every
+  # kick. The production default (8s) is pinned by kick_render_wait_default.
+  export HANDOFF_RESTART_KICK_RENDER_WAIT=0
 
   # T-0899: step-8 now verify-and-re-fires the kick via kick_verify.py (settle ->
   # inject -> poll the pane for a started turn). Fast poll so smoke runs don't
@@ -344,7 +412,7 @@ EOF
 
 teardown_sandbox() {
   unset PANTHEON_STATE_DIR
-  unset PANE_LOG_DIR
+  unset PANE_LOG_DIR PANTHEON_PERSONA_STATE_DIR PANTHEON_SESSION_CHRONICLE_ALERT
   # T-0550: reap any still-running background bumper to prevent process
   # accumulation across tests (multiple live bumpers compete for CPU and
   # starve the current test's bumper, re-introducing the ack-timeout race).
@@ -371,15 +439,25 @@ run_test() {
   # Remaining args are passed to the SUT.
 
   setup_sandbox
+  # T-5300: a preflight may replace these to omit or change --handoff-file and to
+  # set the SUT's environment (e.g. HOME). Reset here so no case leaks into the next.
+  HANDOFF_ARGS=(--handoff-file "$HANDOFF")
+  SUT_ENV=()
+  SUT="$REAL_SUT"   # ORG-106 L3a: a preflight may point SUT at a sandbox copy with a stub seat_state.py
   # Allow the test body to override sandbox state via $SBX before we run.
   if declare -f "preflight_${name}" >/dev/null; then
     "preflight_${name}"
   fi
 
   local actual_exit=0
-  bash "$SUT" "$@" \
-    --handoff-file "$HANDOFF" \
+  env "${SUT_ENV[@]}" bash "$SUT" "$@" \
+    "${HANDOFF_ARGS[@]}" \
     >"$SBX/stdout" 2>"$SBX/stderr" || actual_exit=$?
+  # T-4230: tell the background bumpers the SUT is gone (see poll_until). A bumper
+  # that outlives its SUT can only wait out its window for a line that will never
+  # come, and postcheck_* `wait`s on it: that made a case whose SUT refuses at once
+  # (exit 64) cost the full 60s window instead of ~9s.
+  : > "$SBX/sut_done"
 
   if [[ "$actual_exit" -eq "$expected_exit" ]]; then
     # Allow optional postcondition check.
@@ -407,6 +485,7 @@ run_test() {
   fi
 
   teardown_sandbox
+  suite_case_end
 }
 
 # ---------------------------------------------------------------------------
@@ -417,19 +496,31 @@ run_test() {
 # Rationale: the sync-based bumper fires within ~0.1s of the ack-window
 # opening; however, integer-epoch deadline arithmetic plus load-induced
 # process scheduling jitter means a 2s window with 1s poll gives at most
-# two poll attempts — a single scheduling hiccup can miss both.  8s/0.5s
-# gives ~16 attempts; the bump lands in attempt 1-2 on any sane system.
-# Tests that expect ack-timeout failure (ack_timeout, skip_ack logic-checks)
-# are unaffected — they still exit=4 after the window expires, just take up
-# to 8s instead of 2s.  The overall suite wall-time increases by <10s total.
+# two poll attempts — a single scheduling hiccup can miss both.
+#
+# T-4230: the same reasoning, taken to its conclusion. Each window is a
+# CONDITION POLL that returns the moment its condition holds, so on a case that
+# EXPECTS the condition (the default) a wide window costs nothing and a narrow one
+# is a load-fragile flake: the 2s steady window failed boot_dialog_dismiss (exit 7)
+# every time the host was busy, because dismissing the dialog goes through
+# send_keys_submit, which starts a Python helper (~0.5s CPU idle, seconds under
+# load), against an integer-epoch deadline that is really 1-2s. So COMMON_ARGS is
+# generous (60s, the SUT's own steady default; 60s ack) and the cases that EXPECT
+# a timeout opt back into a short window with SHORT_ACK / SHORT_STEADY below.
+# A negative outcome cannot flip under load (a longer wait still times out), so a
+# short explicit window there is inherent wall time, not a flake. Last flag wins in
+# the SUT's arg parser, which is how the overrides take effect.
 COMMON_ARGS=(
   --service claude.service
   --mode user
   --target-pane main:0.0
-  --ack-timeout 8
-  --steady-timeout 2
+  --ack-timeout 60
+  --steady-timeout 60
   --poll-interval 0.5
 )
+# Negative-case windows: these cases assert that the wait TIMES OUT.
+SHORT_ACK=(--ack-timeout 2)
+SHORT_STEADY=(--steady-timeout 2)
 
 # ---------------------------------------------------------------------------
 # Test cases.
@@ -447,24 +538,41 @@ COMMON_ARGS=(
 # race that made kick_invocation (and every other ack-wait preflight) exit
 # 4 instead of the expected 6/7/0 on busy hosts.
 #
-# Cap: max 100 iterations × 0.05 s = 5 s.  If the SUT never prints the
-# line (genuine failure), the loop exits without bumping and the test fails
-# loudly with an ack-timeout rather than hanging.
+# Cap: a 60s WALL-CLOCK deadline (T-4230; was 100 iterations x 0.05s, which is a
+# count, not a duration: each iteration also forks grep, so under load it was both
+# unpredictable and, before the SUT's own python helper had even started, short).
+# If the SUT never prints the line (genuine failure), the loop returns without
+# bumping and the test fails loudly with an ack-timeout rather than hanging. It also
+# returns the moment the SUT has exited (poll_until), so a SUT that refuses before
+# delivering the prompt does not leave the bumper polling out its window.
 #
 # T-0550: replaces the former blind `sleep 1` across all 13 bump sites.
-wait_for_prompt_delivered() {
-  local stdout_file="$1"
-  local i=0
-  until grep -q "prompt delivered" "$stdout_file" 2>/dev/null; do
-    i=$((i + 1))
-    if [[ $i -ge 100 ]]; then
-      # SUT never printed the sync line; exit without bumping so the test
-      # fails with a clear ack-timeout rather than a silent hang.
-      return 1
-    fi
+
+# poll_until <timeout_secs> <cmd...>: run <cmd> every 50ms; return 0 the moment it
+# succeeds, 1 once <timeout_secs> of wall clock have passed OR the SUT has exited
+# (run_test drops $SBX/sut_done when it returns). A condition poll with a generous
+# upper bound (T-4230): free when the condition holds early, and immune to how slow
+# a loaded host makes each iteration. Its lifetime follows the SUT, not the wall
+# constant: once the SUT is gone the condition cannot become true for any reason the
+# bumper serves, and a case whose SUT refuses up front (exit 64, before it ever
+# delivers the prompt) must not pay the whole window. The condition gets one last
+# look after sut_done appears (the SUT may have written the line just before it
+# exited). $SECONDS is inherited by the bumper subshells, so this works inside
+# `( ... ) &` too.
+poll_until() {
+  local deadline=$((SECONDS + $1)); shift
+  local sut_gone=0
+  until "$@" 2>/dev/null; do
+    (( sut_gone )) && return 1
+    if [[ -e "$SBX/sut_done" ]]; then sut_gone=1; continue; fi
+    (( SECONDS >= deadline )) && return 1
     sleep 0.05
   done
   return 0
+}
+
+wait_for_prompt_delivered() {
+  poll_until 60 grep -q "prompt delivered" "$1"
 }
 
 # --- 1: Happy path. ---------------------------------------------------------
@@ -534,6 +642,75 @@ postcheck_no_restart() {
   return 0
 }
 
+# --- 1d (T-5300): no --handoff-file -> this account's $HOME/HANDOFF.md. ------
+# The 2026-10-19 incident: a hand-run specialist recovery omitted the flag and the old
+# hardcoded default (orchestrator's /home/claude/HANDOFF.md) reached specialist. Now the
+# default is the running account's own file: HOME points at the sandbox, so the
+# derived file IS $HANDOFF and the pause flow completes against it.
+preflight_handoff_default_is_own_home() {
+  preflight_no_restart
+  HANDOFF_ARGS=()
+  SUT_ENV=(HOME="$SBX")
+}
+postcheck_handoff_default_is_own_home() {
+  postcheck_no_restart || return 1
+  grep -qF "$SBX/HANDOFF.md" "$SBX/sendkeys_args" \
+    || { echo "    expected the prompt to name $SBX/HANDOFF.md"; return 1; }
+  if grep -qF "/home/claude/HANDOFF.md" "$SBX/sendkeys_args"; then
+    echo "    the prompt still names /home/claude/HANDOFF.md"; return 1
+  fi
+  return 0
+}
+
+# --- 1d2 (T-5349): ACE advisory carry-forward step. ----------------------------
+# Opted in (forced via env, the sandbox path resolves to no seat): the step runs
+# after the conservation check, prints [ace-carry] lines, writes its companions
+# only under the sandbox Chronicle root, never touches HANDOFF.md, and the pause
+# flow still completes. Live sends are suppressed by env.
+preflight_ace_carry_opted_in() {
+  preflight_no_restart
+  SUT_ENV=(PANTHEON_ACE_CARRY=on PANTHEON_ACE_CARRY_AGENT=sbxseat PANTHEON_DISABLE_LIVE_TELEGRAM=1)
+}
+postcheck_ace_carry_opted_in() {
+  postcheck_no_restart || return 1
+  grep -q "\[ace-carry\] ace_carry: sbxseat cycle 1" "$SBX/stdout" \
+    || { echo "    expected an [ace-carry] summary line in stdout"; return 1; }
+  compgen -G "$SBX/pantheon_state/chronicle/sbxseat/*/*.carry-state.json" >/dev/null \
+    || { echo "    expected a carry-state.json companion under the sandbox Chronicle"; return 1; }
+  [[ "$(cat "$HANDOFF")" == "old handoff content" ]] \
+    || { echo "    HANDOFF.md was modified"; return 1; }
+  return 0
+}
+# Default off: a seat without the opt-in sees no step output and no companions.
+preflight_ace_carry_off_noop() {
+  preflight_no_restart
+  SUT_ENV=(PANTHEON_ACE_CARRY_AGENT=sbxseat)
+}
+postcheck_ace_carry_off_noop() {
+  postcheck_no_restart || return 1
+  if grep -q "\[ace-carry\]" "$SBX/stdout"; then
+    echo "    off seat printed [ace-carry] output: $(grep '\[ace-carry\]' "$SBX/stdout")"; return 1
+  fi
+  if compgen -G "$SBX/pantheon_state/chronicle/sbxseat/*/*.carry-*" >/dev/null; then
+    echo "    off seat wrote carry companions"; return 1
+  fi
+  return 0
+}
+
+# --- 1e (T-5300): a handoff file the running account does not own -> 64. ------
+# '/' is root's; the case runs as a non-root user, so this is "another seat's
+# file". Refused before any prompt is sent.
+preflight_handoff_foreign_refused() {
+  HANDOFF_ARGS=(--handoff-file /HANDOFF.md)
+}
+postcheck_handoff_foreign_refused() {
+  grep -q "refusing: handoff file /HANDOFF.md is not owned by the running account" "$SBX/stderr" \
+    || { echo "    expected the T-5300 ownership refusal in stderr"; return 1; }
+  local n; n=$(cat "$SBX/sendkeys_calls")
+  [[ "$n" -eq 0 ]] || { echo "    expected no prompt sent, got sendkeys=$n"; return 1; }
+  return 0
+}
+
 # --- 1c (T-1049): --no-restart + --skip-ack are mutually exclusive. ---------
 postcheck_no_restart_skip_ack_rejected() {
   grep -q "mutually exclusive" "$SBX/stderr" \
@@ -555,6 +732,21 @@ postcheck_ack_timeout() {
   local n; n=$(cat "$SBX/sendkeys_calls")
   [[ "$n" -ge 1 ]] || return 1
   return 0
+}
+
+preflight_episode_ack() {
+  # The retry's pre-prompt stat is already 1000.  The same 1000 is nevertheless
+  # fresh for an episode that began at 900.
+  cat > "$SBX/pane_text" <<'EOF'
+some scrollback
+╭─────────────────────────────────────╮
+│ ❯ ready                             │
+╰─────────────────────────────────────╯
+EOF
+}
+postcheck_episode_ack() {
+  grep -q "restart claude.service" "$SBX/restart_args" || return 1
+  grep -q "episode-start=900" "$SBX/stdout"
 }
 
 # --- 4: Restart fails. ------------------------------------------------------
@@ -617,6 +809,14 @@ postcheck_control_plane_happy() {
   [[ "$n" -ge 1 ]] || { echo "    expected kill-session >=1, got $n"; return 1; }
   grep -q "pantheon-persona-consume@specialist.service" "$SBX/restart_args" \
     || { echo "    expected consume unit in restart_args: $(cat "$SBX/restart_args")"; return 1; }
+  # T-4309: `restart` would TERM a consume run the kill-session pulled forward
+  # (a false OnFailure page). The oneshot must be STARTED twice, never restarted.
+  if grep -q "^restart " "$SBX/restart_args"; then
+    echo "    control-plane must not 'systemctl restart' the consume unit: $(cat "$SBX/restart_args")"
+    return 1
+  fi
+  local starts; starts=$(grep -c "^start pantheon-persona-consume@specialist.service$" "$SBX/restart_args")
+  [[ "$starts" -eq 2 ]] || { echo "    expected 2 starts of the consume unit, got $starts"; return 1; }
   grep -q "control-plane: killed session" "$SBX/stdout" \
     || { echo "    expected 'control-plane: killed session' log line"; return 1; }
   grep -q "runtime scope/session live" "$SBX/stdout" \
@@ -666,7 +866,7 @@ preflight_control_plane_scope_timeout() {
   preflight_happy
   write_scope_fixture 777
   # No session_live_after_restart write: session stays dead post-restart, so
-  # the readiness poll exhausts STEADY_TIMEOUT (2s per COMMON_ARGS).
+  # the readiness poll exhausts STEADY_TIMEOUT (2s via SHORT_STEADY; COMMON_ARGS is 60s).
 }
 postcheck_control_plane_scope_timeout() {
   wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
@@ -774,6 +974,13 @@ postcheck_bare_horizontal() {
 # the `Esc to cancel` footer must reject it (DIALOG_EXCLUDE), and T-0721's inline
 # dismiss must NOT fire (boot sentinel absent) → exit 7, fail-closed.
 preflight_dialog_false_positive() {
+  # T-4828: the pre-restart pane is idle; the dialog below is the FRESH session's.
+  cat > "$SBX/pane_text_pre" <<'EOF'
+╭─────────────────────────────────────╮
+│ ❯ Try "what's the weather"          │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF
   (
     wait_for_prompt_delivered "$SBX/stdout" || exit 0
     echo "$(($(cat "$SBX/handoff_mtime") + 100))" > "$SBX/handoff_mtime"
@@ -805,9 +1012,53 @@ postcheck_dialog_false_positive() {
   return 0
 }
 
+# --- 11a (T-4646): Claude Code 2.1.289's auto-mode startup nudge. It draws the frame
+# run and a `❯` option cursor but NO confirm footer, so before T-4646 step 7 passed on
+# it and the kick's Enter picked "Yes" (specialist, 2026-10-05). Must exit 7 with no dismiss.
+preflight_auto_mode_nudge() {
+  # T-4828: the pre-restart pane is idle; the dialog below is the FRESH session's.
+  cat > "$SBX/pane_text_pre" <<'EOF'
+╭─────────────────────────────────────╮
+│ ❯ Try "what's the weather"          │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF
+  (
+    wait_for_prompt_delivered "$SBX/stdout" || exit 0
+    echo "$(($(cat "$SBX/handoff_mtime") + 100))" > "$SBX/handoff_mtime"
+  ) &
+  echo $! > "$SBX/bumper_pid"
+  cat > "$SBX/pane_text" <<'EOF'
+────────────────────────────────────────────────────────────────────────────────
+ Make auto mode your default permission mode?
+
+ Auto mode lets Claude handle permission prompts automatically. Claude checks each
+ tool call for risky actions and prompt injection before executing, runs the ones it
+ assesses as lower-risk, and blocks the rest.
+
+ ❯ Yes, set auto mode as my default permission mode
+   No, keep manual
+EOF
+}
+postcheck_auto_mode_nudge() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  if grep -q "dismissing inline" "$SBX/stdout"; then
+    echo "  (T-4646 violation: inline-dismissed the auto-mode nudge)"
+    return 1
+  fi
+  return 0
+}
+
 # --- 11b (T-0721): dev-channels startup dialog is DISMISSED inline, then step 7
 # passes once the pane clears to idle. Models dialog -> (press 1) -> idle.
 preflight_boot_dialog_dismiss() {
+  # T-4828: the pre-restart pane is idle; the dialog below is the FRESH session's.
+  cat > "$SBX/pane_text_pre" <<'EOF'
+╭─────────────────────────────────────╮
+│ ❯ Try "what's the weather"          │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF
   (
     wait_for_prompt_delivered "$SBX/stdout" || exit 0
     echo "$(($(cat "$SBX/handoff_mtime") + 100))" > "$SBX/handoff_mtime"
@@ -853,6 +1104,13 @@ postcheck_boot_dialog_dismiss() {
 # --- 11c (T-0721): boot sentinel co-present with a DANGEROUS confirm
 # (denylist) must NOT be dismissed → fail-closed exit 7.
 preflight_boot_dialog_denylist_blocks() {
+  # T-4828: the pre-restart pane is idle; the dialog below is the FRESH session's.
+  cat > "$SBX/pane_text_pre" <<'EOF'
+╭─────────────────────────────────────╮
+│ ❯ Try "what's the weather"          │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF
   (
     wait_for_prompt_delivered "$SBX/stdout" || exit 0
     echo "$(($(cat "$SBX/handoff_mtime") + 100))" > "$SBX/handoff_mtime"
@@ -1033,6 +1291,107 @@ postcheck_dismiss_modal_sends_escape() {
   return 0
 }
 
+# --- T-4828a: a permission dialog on the pane BEFORE step 3, no --dismiss-modal.
+# Typing + Enter would select "1. Yes" and approve the pending command blind
+# (orchestrator, 2026-10-09 23:20Z). The script must refuse at step 3: exit 3, nothing
+# pasted, no restart.
+preflight_inject_refused_on_permission_dialog() {
+  cat > "$SBX/pane_text_pre" <<'EOF'
+  Bash command
+    mkdir -p /var/lib/pantheon/x && chgrp pantheon-shared /var/lib/pantheon/x
+
+────────────────────────────────────────────────────────────────────────────────
+  Do you want to proceed?
+  ❯ 1. Yes
+    2. No
+
+  Esc to cancel · Tab to amend · ctrl+e to explain
+EOF
+}
+postcheck_inject_refused_on_permission_dialog() {
+  grep -q "refusing to inject" "$SBX/stderr" "$SBX/stdout" \
+    || { echo "    expected a 'refusing to inject' line"; return 1; }
+  if grep -q -- "-- pasted:" "$SBX/sendkeys_args" 2>/dev/null; then
+    echo "    the handoff prompt was pasted into the dialog"; return 1
+  fi
+  if grep -q "Enter" "$SBX/sendkeys_args" 2>/dev/null; then
+    echo "    an Enter was sent while a dialog was focused"; return 1
+  fi
+  [[ ! -s "$SBX/restart_args" ]] || { echo "    restart ran after a refused inject"; return 1; }
+  return 0
+}
+
+# --- T-4832: the plan-approval dialog (option labels from Claude Code's own strings;
+# no fleet pane log holds a live specimen). Its footer may carry no "Esc to cancel",
+# so DIALOG_EXCLUDE alone can miss it; the --enter-check pass must refuse.
+preflight_inject_refused_on_plan_dialog() {
+  cat > "$SBX/pane_text_pre" <<'EOF'
+ Ready to code?
+
+ Here is Claude's plan:
+ ╭──────────────────────────────────────────────────────────────────────────────╮
+ │ 1. Add the guard.                                                            │
+ ╰──────────────────────────────────────────────────────────────────────────────╯
+
+ Would you like to proceed?
+
+ ❯ 1. Yes, and auto-accept edits
+   2. Yes, manually approve edits
+   3. No, keep planning
+   4. Tell Claude what to change
+      shift+tab to approve with this feedback
+EOF
+}
+postcheck_inject_refused_on_plan_dialog() { postcheck_inject_refused_on_permission_dialog; }
+
+# --- T-4828b: the same dialog WITH --dismiss-modal: Escape cancels it (denies the
+# pending command), the guard then sees an idle pane, and the handoff proceeds.
+preflight_dismiss_modal_clears_permission_dialog() {
+  (
+    wait_for_prompt_delivered "$SBX/stdout" || exit 0
+    echo "$(($(cat "$SBX/handoff_mtime") + 100))" > "$SBX/handoff_mtime"
+  ) &
+  echo $! > "$SBX/bumper_pid"
+  cat > "$SBX/pane_text_pre" <<'EOF'
+  Bash command
+    mkdir -p /var/lib/pantheon/x && chgrp pantheon-shared /var/lib/pantheon/x
+
+────────────────────────────────────────────────────────────────────────────────
+  Do you want to proceed?
+  ❯ 1. Yes
+    2. No
+
+  Esc to cancel · Tab to amend · ctrl+e to explain
+EOF
+  cat > "$SBX/escape_clears_dialog" <<'EOF'
+╭─────────────────────────────────────╮
+│ ❯ Try "what's the weather"          │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF
+  # the fresh session after the restart is an idle prompt (step 7's sentinel)
+  cat > "$SBX/pane_text" <<'EOF'
+╭─────────────────────────────────────╮
+│ ❯ Try "what's the weather"          │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF
+}
+postcheck_dismiss_modal_clears_permission_dialog() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  if grep -q "refusing to inject" "$SBX/stderr" "$SBX/stdout"; then
+    echo "    refused although Escape cleared the dialog"; return 1
+  fi
+  local esc_line prompt_line
+  esc_line=$(grep -n "Escape" "$SBX/sendkeys_args" | head -1 | cut -d: -f1)
+  prompt_line=$(grep -n -- "-- pasted:" "$SBX/sendkeys_args" | head -1 | cut -d: -f1)
+  if [[ -z "$esc_line" || -z "$prompt_line" || "$esc_line" -ge "$prompt_line" ]]; then
+    echo "    Escape (line ${esc_line:-none}) must precede the pasted prompt (line ${prompt_line:-none})"
+    return 1
+  fi
+  return 0
+}
+
 # --- T-2829b: default (no --dismiss-modal) sends NO Escape. -----------------
 # Regression guard: the operator's attended manual restart must be byte-identical to
 # pre-T-2829 — no stray Escape into a healthy session.
@@ -1069,6 +1428,9 @@ postcheck_no_dismiss_modal_no_escape() {
 # leaving it wedged (the specialist modal-wedge hole).
 preflight_hard_restart_on_ack_timeout() {
   : # No bumper — mtime never changes, so step 4 times out.
+  # T-5016: the dying session's tap log, so the record can be attributed.
+  printf '[2026-07-07 23:00:01] wedged session output\n' \
+    > "$SBX/pane_logs/pane-timed-testagent.log"
   cat > "$SBX/pane_text" <<'EOF'
 ╭─────────────────────────────────────╮
 │ ❯ prompt                            │
@@ -1083,11 +1445,19 @@ postcheck_hard_restart_on_ack_timeout() {
   # The restart actually fired despite the ack timeout.
   grep -q "restart claude.service" "$SBX/restart_args" \
     || { echo "    expected 'restart claude.service' — fallback did not restart"; return 1; }
-  # No chronicle archive of a (nonexistent) fresh handoff on this path.
+  # No legacy chronicle.py archive on this path (T-2829) ...
   if grep -q "\[chronicle\] " "$SBX/stdout"; then
-    echo "    fallback path must NOT archive a handoff (none was written)"
+    echo "    fallback path must NOT run the legacy chronicle.py archive"
     return 1
   fi
+  # ... but T-5016: the session end IS recorded, as a forced restart whose handoff
+  # is NOT fresh (no fresh handoff was written), with its pane log.
+  grep -q "| session-end/forced-restart |" "$SBX/pantheon_state/chronicle/testagent/index.md" 2>/dev/null \
+    || { echo "    expected a session-end/forced-restart index line"; return 1; }
+  grep -q '"handoff_fresh": false' "$SBX"/pantheon_state/chronicle/testagent/*/*.session.json 2>/dev/null \
+    || { echo "    expected handoff_fresh false in the session.json"; return 1; }
+  compgen -G "$SBX/pantheon_state/chronicle/testagent/*/*.pane.log.gz" >/dev/null \
+    || { echo "    expected the pane log archived"; return 1; }
   return 0
 }
 
@@ -1194,6 +1564,115 @@ EOF
 }
 postcheck_busy_pane_no_false_pass() {
   wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# T-4117: prompt delivered to a BUSY pane. send_keys_submit returns 2 (verified
+# still pending: Claude Code queues input mid-turn). Before T-4117 the script
+# exited 3 and the agent later wrote a handoff nobody restarted on (the
+# 2026-09-28 orchestrator fire). Now it waits for the ack on the queued window.
+# ---------------------------------------------------------------------------
+_pending_pane() {
+  # The OLD boxed frame: no line starts with "❯", so the claude-code verifier sees no
+  # live composer and falls back to the whole pane, where the marker reads "still
+  # pending" (T-4293). On the current TUI a pending paste sits IN the composer line.
+  cat > "$SBX/pane_text" <<'EOF'
+Working on something...
+╭─────────────────────────────────────╮
+│ ❯                                   │
+╰─────────────────────────────────────╯
+[Pasted text #1 +4 lines]
+EOF
+}
+preflight_queued_submit_then_ack_restarts() {
+  _pending_pane
+  (
+    poll_until 60 grep -q "prompt queued" "$SBX/stdout" || exit 0
+    # The busy turn ends: the queued prompt runs, the agent writes its handoff,
+    # and the fresh session later comes up at an idle prompt.
+    cat > "$SBX/pane_text" <<'EOF'
+some scrollback
+╭─────────────────────────────────────╮
+│ ❯ Try "what's the weather"          │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF
+    echo "$(($(cat "$SBX/handoff_mtime") + 100))" > "$SBX/handoff_mtime"
+  ) &
+  echo $! > "$SBX/bumper_pid"
+}
+postcheck_queued_submit_then_ack_restarts() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  grep -q "prompt queued" "$SBX/stdout" \
+    || { echo "    expected 'prompt queued' in stdout"; return 1; }
+  ! grep -q "delivery/submit failed" "$SBX/stderr" \
+    || { echo "    queued submit must not be reported as a delivery failure"; return 1; }
+  # Count only the HANDOFF prompt: the post-restart resume kick is a second,
+  # legitimate paste into the same pane.
+  local pastes; pastes=$(grep -c -- "please write a fresh" "$SBX/sendkeys_args")
+  [[ "$pastes" -eq 1 ]] || { echo "    expected the handoff prompt pasted exactly once (no double delivery), got $pastes"; return 1; }
+  # T-4276: an agent already holding a fresh handoff must still REWRITE it (the ack is the mtime).
+  grep -q -- "even if nothing changed" "$SBX/sendkeys_args" \
+    || { echo "    expected the handoff prompt to ask for a rewrite even if nothing changed (T-4276)"; return 1; }
+  return 0
+}
+
+preflight_queued_submit_no_ack_times_out() {
+  _pending_pane
+}
+postcheck_queued_submit_no_ack_times_out() {
+  grep -q "prompt queued" "$SBX/stdout" \
+    || { echo "    expected 'prompt queued' in stdout"; return 1; }
+  grep -q "ack timeout after 4s" "$SBX/stderr" \
+    || { echo "    expected the ack window raised to the queued timeout (4s)"; return 1; }
+  local pastes; pastes=$(grep -c -- "please write a fresh" "$SBX/sendkeys_args")
+  [[ "$pastes" -eq 1 ]] || { echo "    expected exactly 1 paste (no double delivery), got $pastes"; return 1; }
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# T-4141: the prompt queues on a busy pane, then the pane stops being busy with the
+# prompt STILL in the composer (a queued or eaten submit). The ack wait must press
+# Enter once (never re-paste), and must not press while the pane is generating.
+# ---------------------------------------------------------------------------
+_stuck_composer_pane() {  # <footer>
+  local prompt="Recovery here — please write a fresh $SBX/HANDOFF.md capturing current state, in-flight work, and immediate next actions for the next session."
+  { echo "Working on something..."; printf '─%.0s' {1..60}; echo
+    echo "❯ $prompt"; printf '─%.0s' {1..60}; echo; echo "  $1"; } > "$SBX/pane_text"
+}
+preflight_queued_then_stuck_repressed_once() {
+  export HANDOFF_REPRESS_INTERVAL_SECS=1
+  _stuck_composer_pane "✻ Working… (esc to interrupt)"
+  (
+    poll_until 60 grep -q "prompt queued" "$SBX/stdout" || exit 0
+    sleep 2   # a generating pane: the ack wait must HOLD here
+    grep -c -- "Enter" "$SBX/sendkeys_args" > "$SBX/enters_before_idle"
+    # T-4329: arm the fake's Enter -> empty-composer transition BEFORE the pane goes
+    # idle, so the re-press clears the composer in the same tmux call. Rewriting the
+    # pane from here after seeing the Enter raced the 1s re-press interval: under load
+    # a second re-press landed first (reproduced with a 1.5s delay: 44/1).
+    cat > "$SBX/clear_composer_on_enter" <<'EOF2'
+some scrollback
+╭─────────────────────────────────────╮
+│ ❯ Try "what's the weather"          │
+╰─────────────────────────────────────╯
+  ? for shortcuts
+EOF2
+    _stuck_composer_pane "⏸ manual mode on · 2 shells · ↓ to manage"
+    enters_grew() { [[ $(grep -c -- "Enter" "$SBX/sendkeys_args") -gt $(cat "$SBX/enters_before_idle") ]]; }
+    poll_until 60 enters_grew || exit 0
+    echo "$(($(cat "$SBX/handoff_mtime") + 100))" > "$SBX/handoff_mtime"
+  ) &
+  echo $! > "$SBX/bumper_pid"
+}
+postcheck_queued_then_stuck_repressed_once() {
+  unset HANDOFF_REPRESS_INTERVAL_SECS
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  local presses; presses=$(grep -c "re-pressed Enter" "$SBX/stdout")
+  [[ "$presses" -eq 1 ]] || { echo "    expected exactly 1 re-press, got $presses"; return 1; }
+  local pastes; pastes=$(grep -c -- "please write a fresh" "$SBX/sendkeys_args")
+  [[ "$pastes" -eq 1 ]] || { echo "    expected the handoff prompt pasted once, got $pastes"; return 1; }
   return 0
 }
 
@@ -1357,6 +1836,42 @@ postcheck_kick_readiness_settle() {
     || { echo "    expected kick_verify 'settle=0.1s' (settle plumbed to kick_verify)"; return 1; }
   grep -q "post-restart kick delivered + dispatch-verified" "$SBX/stdout" \
     || { echo "    expected 'post-restart kick delivered + dispatch-verified' log"; return 1; }
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# T-4456: the step-8 kick is render-gated. The kick lands on a freshly booted TUI,
+# where an ungated Enter can beat the paste render and read as submitted while the
+# text sits unsent (T-4362, T-4455). _plumbed proves the gate reaches
+# send_keys_submit.sh itself: the fake pane never renders the paste, so the gate
+# waits out its (tiny) bound and says so on stderr, then presses Enter anyway, and
+# the kick still dispatch-verifies. _default pins the production 8s (and so waits
+# ~8s once, for the same reason).
+# ---------------------------------------------------------------------------
+preflight_kick_render_wait_plumbed() {
+  preflight_happy
+  export HANDOFF_RESTART_KICK_RENDER_WAIT=0.2
+}
+postcheck_kick_render_wait_plumbed() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  export HANDOFF_RESTART_KICK_RENDER_WAIT=0
+  grep -q "render_wait=0.2s" "$SBX/stdout" \
+    || { echo "    expected kick_verify 'render_wait=0.2s' (plumbed from the env)"; return 1; }
+  grep -q "render wait 0.2s" "$SBX/stderr" \
+    || { echo "    expected send_keys_submit's render gate to run ('render wait 0.2s')"; return 1; }
+  grep -q "post-restart kick delivered + dispatch-verified" "$SBX/stdout" \
+    || { echo "    expected 'post-restart kick delivered + dispatch-verified' log"; return 1; }
+  return 0
+}
+preflight_kick_render_wait_default() {
+  preflight_happy
+  unset HANDOFF_RESTART_KICK_RENDER_WAIT
+}
+postcheck_kick_render_wait_default() {
+  wait "$(cat "$SBX/bumper_pid")" 2>/dev/null || true
+  export HANDOFF_RESTART_KICK_RENDER_WAIT=0
+  grep -q "render_wait=8s" "$SBX/stdout" \
+    || { echo "    expected the production kick render gate 'render_wait=8s'"; return 1; }
   return 0
 }
 
@@ -1602,15 +2117,67 @@ postcheck_pane_log_companion() {
   if ! zcat "$gz" | grep -q "hello from the dying session"; then
     echo "  (companion gz missing the staged content)"; return 1
   fi
+  # T-5016: one session-end record (index line + HANDOFF snapshot + session.json),
+  # graceful (acked, fresh handoff), paired by stem with the pane log.
+  local n
+  n=$(grep -c "| session-end/graceful-restart |" "$SBX/pantheon_state/chronicle/testagent/index.md" 2>/dev/null)
+  [[ "$n" == "1" ]] || { echo "  (expected exactly 1 graceful-restart index line, got '$n')"; return 1; }
+  local stem="${gz%.pane.log.gz}"
+  [[ -f "$stem.md" && -f "$stem.session.json" ]] \
+    || { echo "  (snapshot/session.json not paired with $gz)"; return 1; }
+  grep -q '"handoff_fresh": true' "$stem.session.json" \
+    || { echo "  (expected handoff_fresh true)"; return 1; }
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# T-5019 item 2: the identity capture fails (no runtime.json yet, so it prints
+# '-'), then the restart runs the controller's H1 hook, which records
+# runtime.json, archives the staged log under ITS key and consumes the file.
+# The script's post-restart call must recognise that session end by the staged
+# log's first stamp (captured before the restart) and write no second record.
+# ---------------------------------------------------------------------------
+preflight_identity_failed_h1_archived() {
+  preflight_pane_log_companion
+  local st="$SBX/pantheon_state/personas/testagent/runtime-controller"
+  cat > "$SBX/on_restart" <<HOOK
+#!/bin/bash
+mkdir -p "$st"
+printf '{"persona": "testagent", "harness": "claude", "started_at": "2026-07-07T22:59:58Z"}\n' > "$st/runtime.json"
+python3 "$SCRIPT_DIR/session_chronicle.py" session-end --persona testagent --cause start-reconcile \
+  --stage --account-home "$SBX" --persona-state-dir "$SBX/pantheon_state/personas" \
+  --entrypoint runtime_controller:start >> "$SBX/h1_out" 2>&1
+HOOK
+  chmod +x "$SBX/on_restart"
+}
+postcheck_identity_failed_h1_archived() {
+  grep -q '"status": "archived"' "$SBX/h1_out" 2>/dev/null \
+    || { echo "  (the H1 stand-in did not archive: $(cat "$SBX/h1_out" 2>/dev/null))"; return 1; }
+  local n
+  n=$(grep -c "| session-end/" "$SBX/pantheon_state/chronicle/testagent/index.md" 2>/dev/null)
+  [[ "$n" == "1" ]] || { echo "  (expected exactly 1 session-end index line, got '$n')"; return 1; }
+  grep -q '"status": "already-archived"' "$SBX/stdout" \
+    || { echo "  (post-restart call did not report already-archived)"; return 1; }
   return 0
 }
 
 run_test happy 0 "${COMMON_ARGS[@]}"
+run_test identity_failed_h1_archived 0 "${COMMON_ARGS[@]}"
 run_test pane_log_companion 0 "${COMMON_ARGS[@]}"
 run_test no_restart 0 "${COMMON_ARGS[@]}" --no-restart                       # T-1049 pause mode
 run_test no_restart_skip_ack_rejected 64 "${COMMON_ARGS[@]}" --no-restart --skip-ack  # T-1049 mutual-exclusion
+run_test handoff_default_is_own_home 0 "${COMMON_ARGS[@]}" --no-restart          # T-5300
+run_test ace_carry_opted_in 0 "${COMMON_ARGS[@]}" --no-restart                # T-5349
+run_test ace_carry_off_noop 0 "${COMMON_ARGS[@]}" --no-restart                 # T-5349
+if [[ "$(id -u)" -ne 0 ]]; then
+  run_test handoff_foreign_refused 64 "${COMMON_ARGS[@]}"                        # T-5300
+else
+  echo "  SKIP: handoff_foreign_refused (running as root: '/' is not a foreign owner)"
+fi
 run_test lock_held 1 "${COMMON_ARGS[@]}"
-run_test ack_timeout 4 "${COMMON_ARGS[@]}"
+run_test ack_timeout 4 "${COMMON_ARGS[@]}" "${SHORT_ACK[@]}"
+run_test episode_ack 0 "${COMMON_ARGS[@]}" --episode-start 900
+run_test ack_timeout 4 "${COMMON_ARGS[@]}" "${SHORT_ACK[@]}" --episode-start 1100
 run_test restart_fail 5 "${COMMON_ARGS[@]}"
 run_test isactive_fail 6 "${COMMON_ARGS[@]}"
 # T-2658: control-plane branch (--supervisor control-plane). Later --service
@@ -1621,18 +2188,40 @@ run_test test_handoff_restart_refuses_legacy_predecessor_when_codex_receiver_pre
   --service claude-telegram.service --supervisor control-plane
 run_test control_plane_kill_survives 5 "${COMMON_ARGS[@]}" \
   --service pantheon-persona-consume@specialist.service --supervisor control-plane
-run_test control_plane_scope_timeout 6 "${COMMON_ARGS[@]}" \
+run_test control_plane_scope_timeout 6 "${COMMON_ARGS[@]}" "${SHORT_STEADY[@]}" \
   --service pantheon-persona-consume@specialist.service --supervisor control-plane
-run_test steady_timeout 7 "${COMMON_ARGS[@]}"
+run_test steady_timeout 7 "${COMMON_ARGS[@]}" "${SHORT_STEADY[@]}"
 run_test custom_pattern 0 "${COMMON_ARGS[@]}" --verify-pattern "FRESH_HO_READY_TOKEN_42"
 run_test dry_run 0 "${COMMON_ARGS[@]}" --dry-run
+
+# ORG-106 L3a (T-5526): the launch-check gate. A sandbox copy of the SUT runs against a stub
+# seat_state.py whose exit code is the launch-check verdict: 3 = deep-sleep (refuse), anything
+# else = allowed (0) or a reader fault (fail-open).
+_stage_launch_check_stub() {
+  mkdir -p "$SBX/tools"
+  cp "$SCRIPT_DIR/handoff_and_restart.sh" "$SCRIPT_DIR/send_keys_submit.sh" \
+     "$SCRIPT_DIR/t2590_cutover_verify_lib.sh" "$SBX/tools/"
+  printf 'import sys\nsys.stderr.write("launch-check stub\\n")\nsys.exit(%s)\n' "$1" > "$SBX/tools/seat_state.py"
+  SUT="$SBX/tools/handoff_and_restart.sh"
+}
+preflight_launch_check_blocks_deep_sleep() { _stage_launch_check_stub 3; }
+postcheck_launch_check_blocks_deep_sleep() {
+  grep -q "deep-sleep" "$SBX/stderr" || { echo "  (refusal message missing)"; return 1; }
+  [[ ! -s "$SBX/restart_args" ]] || { echo "  (systemctl restart ran despite the refusal)"; return 1; }
+}
+preflight_launch_check_allows() { _stage_launch_check_stub 0; }
+preflight_launch_check_fails_open_on_fault() { _stage_launch_check_stub 1; }
+run_test launch_check_blocks_deep_sleep 75 "${COMMON_ARGS[@]}" --dry-run
+run_test launch_check_allows 0 "${COMMON_ARGS[@]}" --dry-run
+run_test launch_check_fails_open_on_fault 0 "${COMMON_ARGS[@]}" --dry-run
 run_test missing_service 64 \
   --mode user --target-pane main:0.0 --ack-timeout 2 --steady-timeout 2
 run_test bare_horizontal 0 "${COMMON_ARGS[@]}"
 # T-0172 (A) sentinel-tightening + (B) post-step-7 kick:
-run_test dialog_false_positive 7 "${COMMON_ARGS[@]}"
+run_test dialog_false_positive 7 "${COMMON_ARGS[@]}" "${SHORT_STEADY[@]}"
+run_test auto_mode_nudge 7 "${COMMON_ARGS[@]}" "${SHORT_STEADY[@]}"   # T-4646
 run_test boot_dialog_dismiss 0 "${COMMON_ARGS[@]}"           # T-0721
-run_test boot_dialog_denylist_blocks 7 "${COMMON_ARGS[@]}"  # T-0721
+run_test boot_dialog_denylist_blocks 7 "${COMMON_ARGS[@]}" "${SHORT_STEADY[@]}"  # T-0721
 run_test kick_invocation 0 "${COMMON_ARGS[@]}"
 run_test no_kick 0 "${COMMON_ARGS[@]}" --no-kick
 run_test custom_idle_sentinel 0 "${COMMON_ARGS[@]}" --idle-sentinel "CUSTOM_IDLE_TOKEN_99"
@@ -1641,17 +2230,29 @@ run_test skip_ack 0 "${COMMON_ARGS[@]}" --skip-ack
 
 # T-2829: modal-wedge recovery for the graceful restart path.
 run_test dismiss_modal_sends_escape 0 "${COMMON_ARGS[@]}" --dismiss-modal
+run_test inject_refused_on_permission_dialog 3 "${COMMON_ARGS[@]}"   # T-4828
+run_test inject_refused_on_plan_dialog 3 "${COMMON_ARGS[@]}"         # T-4832
+run_test dismiss_modal_clears_permission_dialog 0 "${COMMON_ARGS[@]}" --dismiss-modal   # T-4828
 run_test no_dismiss_modal_no_escape 0 "${COMMON_ARGS[@]}"
 run_test hard_restart_on_ack_timeout 0 "${COMMON_ARGS[@]}" --ack-timeout 2 --hard-restart-on-ack-timeout
 # T-0543 — stale IDLE_SENTINEL fix (Claude Code 2.1.x):
 run_test idle_sentinel_default_v21x 0 "${COMMON_ARGS[@]}"
-run_test idle_sentinel_old_default_would_fail 7 "${COMMON_ARGS[@]}" \
+run_test idle_sentinel_old_default_would_fail 7 "${COMMON_ARGS[@]}" "${SHORT_STEADY[@]}" \
   --idle-sentinel '\? for shortcuts|ctrl\+t to hide tasks'
-run_test busy_pane_no_false_pass 7 "${COMMON_ARGS[@]}"
+run_test busy_pane_no_false_pass 7 "${COMMON_ARGS[@]}" "${SHORT_STEADY[@]}"
+# T-4117: a busy pane queues the prompt; wait for the ack instead of exiting 3.
+run_test queued_submit_then_ack_restarts 0 "${COMMON_ARGS[@]}"
+run_test queued_submit_no_ack_times_out 4 "${COMMON_ARGS[@]}" --ack-timeout 2 --queued-ack-timeout 4
+run_test queued_ack_timeout_non_integer 64 "${COMMON_ARGS[@]}" --queued-ack-timeout 4s
+# T-4141: a stuck composer on a no-longer-busy pane gets ONE extra Enter.
+run_test queued_then_stuck_repressed_once 0 "${COMMON_ARGS[@]}" --queued-ack-timeout 60
 # T-0528 — disabling DIALOG_EXCLUDE demonstrates the false-pass the new
 # negative prong prevents. Same dialog fixture as case 11; without the
-# exclusion the conjunction of positives matches → exit 0.
-run_test dialog_exclude_disabled 0 "${COMMON_ARGS[@]}" --dialog-exclude 'NEVER_MATCH_THIS'
+# exclusion the conjunction of positives matched → exit 0, with the handoff text
+# + Enter typed INTO the dialog. T-4832: send_keys_submit now re-checks the pane
+# bottom before every Enter, independently of --dialog-exclude, so even this
+# disabled configuration refuses (exit 3) instead of answering the dialog.
+run_test dialog_exclude_disabled 3 "${COMMON_ARGS[@]}" --dialog-exclude 'NEVER_MATCH_THIS'
 # T-0584 Layer 1 — wall-clock watchdog. The fires test hangs send-keys 60s;
 # the watchdog's pkill -P kills the hung tmux, the script then naturally
 # fails step 3 (send-keys error) and exits 3 — that's the clean recovery
@@ -1672,6 +2273,8 @@ run_test pid_change_unchanged_fails 7 "${COMMON_ARGS[@]}"
 run_test pid_change_skipped_when_no_baseline 0 "${COMMON_ARGS[@]}"
 # T-0590 (a) — kick-readiness settle closes the silent-kick-drop window.
 run_test kick_readiness_settle 0 "${COMMON_ARGS[@]}"
+run_test kick_render_wait_plumbed 0 "${COMMON_ARGS[@]}"    # T-4456: env -> kick_verify -> send_keys_submit gate
+run_test kick_render_wait_default 0 "${COMMON_ARGS[@]}"    # T-4456: production default 8s
 run_test kick_drops_refires 8 "${COMMON_ARGS[@]}"          # T-0899: dropped kick → bounded re-fire → exit 8
 # T-0584 Layer 2 — stale-flock takeover. Pass the shared lockfile path
 # defined alongside the preflights so the SUT operates on it.

@@ -77,7 +77,6 @@ from tools.host_control.contracts import (
 from tools.host_control.trusted_files import RootOwnedFileLoader
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
 FIXED_NOW = datetime(2026, 8, 12, 15, 0, tzinfo=timezone.utc)
 CONSUMER_UID = 2001
 
@@ -149,8 +148,8 @@ def base_policy() -> dict[str, object]:
         "subjects": {
             "specialist": 1001,
             "specialist-twin": 1001,
-            "metis": 1002,
-            "cairn": 1003,
+            "mason": 1002,
+            "consultant": 1003,
             "hekate": 1004,
             "nyx": 1005,
             "human-operator": 1006,
@@ -178,7 +177,7 @@ def base_policy() -> dict[str, object]:
                 "decision_source": "agent",
                 "grants": _grants("persona.install"),
             },
-            "metis": {
+            "mason": {
                 "decision_source": "agent",
                 "grants": _grants("persona.install"),
             },
@@ -199,7 +198,7 @@ class PolicyCaseBase(unittest.TestCase):
     """Temp-dir journal + spy seam + REAL PolicyApproverAuthorizer."""
 
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.journal_path = self.root / "approval.sqlite3"
@@ -239,7 +238,7 @@ class PolicyCaseBase(unittest.TestCase):
     def new_plan(
         self,
         *,
-        owner: str = "cairn",
+        owner: str = "consultant",
         performer: str | None = None,
         target: str = "recovery",
         families: tuple[str, ...] = (REAL_FAMILY,),
@@ -257,7 +256,7 @@ class PolicyCaseBase(unittest.TestCase):
         )
         return plan_handle
 
-    def aligned_request(self, plan_handle: str, owner: str = "metis") -> str:
+    def aligned_request(self, plan_handle: str, owner: str = "mason") -> str:
         """A request plan matching plan_handle's full handoff tuple."""
 
         base = self.source.plans[plan_handle]
@@ -585,7 +584,7 @@ class PolicyLoadTests(unittest.TestCase):
     """The root-owned file trust boundary (reused trusted_files, M4)."""
 
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.path = self.root / "approver-policy.json"
@@ -630,8 +629,8 @@ class PolicyLoadTests(unittest.TestCase):
         verdict = DENY_ALL_AUTHORIZER.may_review(
             "specialist",
             PlanMetadata(
-                owner="cairn",
-                performer="cairn",
+                owner="consultant",
+                performer="consultant",
                 target_seat_id="recovery",
                 operation_families=(REAL_FAMILY,),
                 plan_digest="0" * 64,
@@ -734,7 +733,7 @@ class SeparationOfDutyTests(PolicyCaseBase):
         )
 
     def test_approver_equal_to_performer_denied(self) -> None:
-        plan = self.new_plan(owner="cairn", performer="specialist")
+        plan = self.new_plan(owner="consultant", performer="specialist")
         self.assert_denied(
             "approver_is_performer", self.open_review, "specialist", plan
         )
@@ -750,7 +749,7 @@ class SeparationOfDutyTests(PolicyCaseBase):
             "specialist",
             owner_side,
         )
-        performer_side = self.new_plan(owner="cairn", performer="specialist-twin")
+        performer_side = self.new_plan(owner="consultant", performer="specialist-twin")
         self.assert_denied(
             "approver_shares_trust_domain",
             self.open_review,
@@ -789,21 +788,21 @@ class SeparationOfDutyTests(PolicyCaseBase):
         )
 
     def test_third_party_chain_participant_cannot_approve_sibling(self) -> None:
-        # Chain: request plan RQ (owner metis) already links a review whose
+        # Chain: request plan RQ (owner mason) already links a review whose
         # performer plan is owned by NYX. A SECOND performer plan (owner
-        # cairn) joins the same chain; nyx — a participant in the chain via
+        # consultant) joins the same chain; nyx — a participant in the chain via
         # the first review — attempts to review and to decide the sibling.
         # Both are attacked and DENIED (gate 13 "any participant in the
         # same server-linked request-plan handoff").
         plan_one = self.new_plan(owner="nyx")
-        request = self.aligned_request(plan_one, owner="metis")
+        request = self.aligned_request(plan_one, owner="mason")
         self.open_review("hekate", plan_one, request)
-        plan_two = self.new_plan(owner="cairn")
+        plan_two = self.new_plan(owner="consultant")
         # align the second plan to the SAME request plan tuple
         self.source.plans[plan_two] = dataclasses.replace(
             self.source.plans[request],
-            owner="cairn",
-            performer="cairn",
+            owner="consultant",
+            performer="consultant",
             plan_digest=self.digest_of(plan_two),
         )
         self.assert_denied(
@@ -864,27 +863,27 @@ class SeparationOfDutyTests(PolicyCaseBase):
         )
 
     def test_circular_approval_via_chain_closure_denied(self) -> None:
-        # The circle: metis requests RQ; nyx performs P1 (granted by
+        # The circle: mason requests RQ; nyx performs P1 (granted by
         # hekate); now every member of the closed chain — the requester,
         # the performer, and any same-uid shadow — is barred from
         # approving anything else in that chain.
         plan_one = self.new_plan(owner="nyx")
-        request = self.aligned_request(plan_one, owner="metis")
+        request = self.aligned_request(plan_one, owner="mason")
         review_one = self.open_review("hekate", plan_one, request).record
         self.decide(
             "hekate", review_one.review_handle, plan_one, key="decide-circ-1"
         )
-        plan_two = self.new_plan(owner="cairn")
+        plan_two = self.new_plan(owner="consultant")
         self.source.plans[plan_two] = dataclasses.replace(
             self.source.plans[request],
-            owner="cairn",
-            performer="cairn",
+            owner="consultant",
+            performer="consultant",
             plan_digest=self.digest_of(plan_two),
         )
         self.assert_denied(
             "approver_is_request_plan_owner",
             self.open_review,
-            "metis",
+            "mason",
             plan_two,
             request,
         )
@@ -1175,11 +1174,11 @@ class HandoffLinkTests(PolicyCaseBase):
         # it; there exists no parameter through which a caller could
         # assert requester or performer identity
         plan = self.new_plan()
-        request = self.aligned_request(plan, owner="metis")
+        request = self.aligned_request(plan, owner="mason")
         review = self.open_review("hekate", plan, request).record
-        self.assertEqual(review.handoff.request_plan_owner, "metis")
-        self.assertEqual(review.plan_owner, "cairn")
-        self.assertEqual(review.performer, "cairn")
+        self.assertEqual(review.handoff.request_plan_owner, "mason")
+        self.assertEqual(review.plan_owner, "consultant")
+        self.assertEqual(review.performer, "consultant")
         parameters = set(inspect.signature(ApprovalService.review).parameters)
         self.assertEqual(
             parameters
@@ -1202,10 +1201,10 @@ class HandoffLinkTests(PolicyCaseBase):
 
     def test_handoff_requester_equal_to_performer_refused(self) -> None:
         # a "handoff" whose requester IS the performer is identity
-        # laundering, not a handoff: cairn requesting work that cairn
+        # laundering, not a handoff: consultant requesting work that consultant
         # performs must use the direct path under its own identity
-        plan = self.new_plan()  # owner/performer cairn
-        request = self.aligned_request(plan, owner="cairn")
+        plan = self.new_plan()  # owner/performer consultant
+        request = self.aligned_request(plan, owner="consultant")
         self.assert_handoff_mismatch(
             "handoff_requester_is_performer",
             self.open_review,
@@ -1253,8 +1252,8 @@ class HandoffLinkTests(PolicyCaseBase):
         # ...but weightless: identity fields untouched, provider pointer
         # NULL, and the decide verdict is IDENTICAL to the anchor-free flow
         self.assertIsNone(row["source_event"])
-        self.assertEqual(review.plan_owner, "cairn")
-        self.assertEqual(review.handoff.request_plan_owner, "metis")
+        self.assertEqual(review.plan_owner, "consultant")
+        self.assertEqual(review.handoff.request_plan_owner, "mason")
         result = self.decide(
             "hekate", review.review_handle, plan, key="decide-anchor-adv"
         )
@@ -1321,15 +1320,15 @@ class HandoffLinkTests(PolicyCaseBase):
         self.assertEqual(
             row["request_plan_digest"], self.digest_of(request)
         )
-        self.assertEqual(row["request_plan_owner"], "metis")
+        self.assertEqual(row["request_plan_owner"], "mason")
         self.assertEqual(
             row["shared_effect_digest"],
             self.source.plans[plan].effect_digest,
         )
         self.assertEqual(row["handoff_anchor"], "ticket:T-2911")
         self.assertEqual(row["plan_handle"], plan)
-        self.assertEqual(row["plan_owner"], "cairn")
-        self.assertEqual(row["performer"], "cairn")
+        self.assertEqual(row["plan_owner"], "consultant")
+        self.assertEqual(row["performer"], "consultant")
 
     def test_bind_vanished_request_plan_raises_grant_stays_issued(self) -> None:
         # PO override 2: the request-plan handle comes from the GRANT
@@ -1378,7 +1377,7 @@ class HandoffLinkTests(PolicyCaseBase):
         # participants from a DIFFERENT request plan; and it counts
         # participants regardless of review state (fail-closed, OQ8).
         plan_one = self.new_plan(owner="nyx")
-        request_one = self.aligned_request(plan_one, owner="metis")
+        request_one = self.aligned_request(plan_one, owner="mason")
         review_one = self.open_review("hekate", plan_one, request_one).record
         # terminal state: deny it — participants must STILL count
         self.service.decide(
@@ -1390,13 +1389,13 @@ class HandoffLinkTests(PolicyCaseBase):
             "anchor-p",
             "decide-scope-1",
         )
-        plan_two = self.new_plan(owner="cairn")
+        plan_two = self.new_plan(owner="consultant")
         request_two = self.aligned_request(plan_two, owner="specialist")
         self.open_review("hekate", plan_two, request_two)
         chain_one = self.journal.handoff_chain_subjects(request_one)
         chain_two = self.journal.handoff_chain_subjects(request_two)
-        self.assertEqual(chain_one, frozenset(("nyx", "metis")))
-        self.assertEqual(chain_two, frozenset(("cairn", "specialist")))
+        self.assertEqual(chain_one, frozenset(("nyx", "mason")))
+        self.assertEqual(chain_two, frozenset(("consultant", "specialist")))
         self.assertEqual(
             self.journal.handoff_chain_subjects(self.next_handle()),
             frozenset(),

@@ -1,0 +1,29 @@
+[Unit]
+Description=Pantheon git reconciler — ff-only two-way GitHub/Forgejo sync (ORG-101 §3, T-4690)
+Documentation=file:///home/%u/pantheon-config/architecture/adr/ORG-101-git-redundancy-write-path-and-sync.md
+After=network-online.target
+Wants=network-online.target
+
+# A crash of the reconciler is the silent failure that must not be quiet: the hosts would
+# drift apart with nobody moving refs. Findings (DIVERGED / REPLAY_PENDING / per-repo ERROR)
+# are mailed to Recovery by the tool itself, deduplicated per state, so they exit 0 here
+# (--findings-exit-zero) and do not re-page through OnFailure every 5 minutes.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# `sg pantheon-mailbox -c` REQUIRED (T-1015): the ORG-026 hub is mode-2770 group
+# pantheon-mailbox and user-mode systemd cannot grant supplementary groups. Without the wrap
+# every alert dies with PermissionError (T-4690 review finding 1); the tool now exits 3 on an
+# undeliverable alert, so this unit's OnFailure (Telegram fallback) would still carry it.
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/git_reconciler.py --findings-exit-zero"
+StandardOutput=journal
+StandardError=journal
+# Two ls-remotes per repo, a fetch and a push only when one side moved. One repo today
+# (pantheon-config); headroom for the batch rollout.
+TimeoutStartSec=15min
+
+[Install]
+WantedBy=default.target

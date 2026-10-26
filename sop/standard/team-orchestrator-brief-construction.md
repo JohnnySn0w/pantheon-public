@@ -5,6 +5,10 @@ Authored 2026-05-07 post-T-0113 retrospective. Captures the structural rules HO 
 > **Amended 2026-06-05 (T-0611, ratified by the operator):** added §Directives in force (item 4 — per-ticket-class D-id map so implementer DECISIONS cite by id; closes the T-0603 gap where D11 was in the skill but never named for the class) + the §Memory composition anti-drift layering. The directive↔skill auto-sync structural fix is deferred to a sibling ticket.
 >
 > **Amended 2026-06-16 (T-1199, ORG-012 outflow of the already-ratified ORG-034):** briefs now OPEN with an arc-intent line, and §DECISIONS minimums is intent-first (intent/goal-served first, P/D-ids as the how). Propagates `architecture/adr/ORG-034` + the D7 amendment into the operational SOP — the ratified decision predates this SOP's prior revision, so a brief built from the template was missing the mandatory intent-first opening.
+>
+> **Amended 2026-09-13 (T-3166, ORG-054 D2-writer contract per the T-2414 implementation plan):** the opening contract also names `project_id`/`nearest_intent_ref`/the resolved upward chain terminus/current developmental mode (see §Canonical structure); §Acceptance gains a reviewer-mechanical-resolve requirement. Propagates `architecture/adr/ORG-054` into brief-construction the same way T-1199 propagated ORG-034.
+>
+> **Amended 2026-10-13 (T-4903):** adds a lightweight §Delegation invariants slot so subagent briefs state authority boundaries, stop/escalate operations, and independent-verification requirements before work begins.
 
 ## When this applies
 
@@ -13,6 +17,12 @@ Multi-step build arcs going via Team + project-orchestrator (per `rulebook/direc
 ## Canonical structure
 
 Every brief **OPENS with its arc-intent line** (per `architecture/adr/ORG-034` + `rulebook/directives.md` D7 — intent-first justification, ratified 2026-06-12): one sentence stating the outcome this arc/ticket is for + which north star (`rulebook/goals.md`) or parent arc-intent it serves, in outcome language ("installer never ships ahead of the daemon wire shape"). It is the brief's first line, before §Ask. "Goal-neutral maintenance" is the honest cite when the arc is hygiene / tooling / process — name it as such, never dress it up. The arc-intent cites the north star; leaf DECISIONS cite the *arc-intent*, not the north star directly (pasting north stars into leaf DECISIONS is how the middle tier becomes ceremony).
+
+A build brief also names `project_id` (or an explicit formation/probe/
+maintenance exemption), a typed `nearest_intent_ref`, the resolved upward
+chain terminus, and the project's current developmental mode. The chain is
+resolved from canonical records; do not paste the root into leaf decisions.
+Rootless projects terminate at their own telos. Multiple roots are valid.
 
 Then these sections, in this order:
 
@@ -51,15 +61,21 @@ Then these sections, in this order:
    Always in force: D2 (don't edit hand-curated docs — propose instead), D6 (plan-first; no push/merge), HERMES byte-sequence rule, chain-of-justification.
    ~~~
 
-5. **§DECISIONS minimums** — list of choice points the implementer must justify-via, **intent-first** (per `architecture/adr/ORG-034`): each material call names the arc-intent / goal served FIRST (or "goal-neutral maintenance" honestly), with P/D ids as **the how** — methodology compliance, no longer carrying the why. When methodology and intent genuinely conflict mid-arc, intent binds and the deviation is FLAGGED per D6 (the licensed-deviation seam — the flag is mandatory, not an escape hatch). Don't enumerate every possible choice; list the architecturally-load-bearing ones. Implementer adds more as they encounter.
+5. **§Delegation invariants** — three-line checklist for every worker/subagent brief:
 
-6. **§Acceptance** — smoke loops + test-count delta + byte-sequence-guard + hand-curated-doc-protection + scope-bounds. One bulleted list. Refer to standing discipline in `~/CLAUDE.md` + memory pins instead of restating.
+   - **Authority boundary:** what this worker may decide/do; what must return to the dispatcher/operator; any off-limit repos, accounts, services, or surfaces.
+   - **Sensitive operations:** spend, secrets/credentials, access grants, external messages, live-service changes, destructive operations, and cross-seat actions are stop-and-report unless the brief explicitly authorizes them.
+   - **Independent verification:** material claims and externally visible effects require fresh evidence gathered by the worker; unverified claims must be labeled, not passed upward as facts.
 
-7. **§Plan-first contract** — implementer returns plan inline FULL BODY (per `rulebook/directives.md` D6 — plan-first protocol + locked-answer-deviation handling; D5 — smoke verification discipline / literal output rule). Plan = (a) file paths, (b) test-name→body-shape mapping, (c) DECISIONS list, intent-first (arc-intent/goal served + P/D-as-how, per ORG-034), (d) plan-flags.
+6. **§DECISIONS minimums** — list of choice points the implementer must justify-via, **intent-first** (per `architecture/adr/ORG-034`): each material call names the arc-intent / goal served FIRST (or "goal-neutral maintenance" honestly), with P/D ids as **the how** — methodology compliance, no longer carrying the why. When methodology and intent genuinely conflict mid-arc, intent binds and the deviation is FLAGGED per D6 (the licensed-deviation seam — the flag is mandatory, not an escape hatch). Don't enumerate every possible choice; list the architecturally-load-bearing ones. Implementer adds more as they encounter.
 
-8. **§Dispatch pattern** — orchestrator Agent-`name` (NOT `team-lead` — that's the session-lead's own identity), implementer name, reviewer is HO-on-demand. (Agent-spawned teammates; no TeamCreate.)
+7. **§Acceptance** — smoke loops + test-count delta + byte-sequence-guard + hand-curated-doc-protection + scope-bounds + project/purpose-chain mechanical-resolve check. The last means: the reviewer can mechanically resolve the same `project_id`/`nearest_intent_ref` chain the brief names, and the brief does not infer project identity from repository, persona, or daemon naming. One bulleted list. Refer to standing discipline in `~/CLAUDE.md` + memory pins instead of restating.
 
-9. **§3-REBOUND budget** + chain-of-justification propagation reference (one line each).
+8. **§Plan-first contract** — implementer returns plan inline FULL BODY (per `rulebook/directives.md` D6 — plan-first protocol + locked-answer-deviation handling; D5 — smoke verification discipline / literal output rule). Plan = (a) file paths, (b) test-name→body-shape mapping, (c) DECISIONS list, intent-first (arc-intent/goal served + P/D-as-how, per ORG-034), (d) plan-flags.
+
+9. **§Dispatch pattern** — orchestrator Agent-`name` (NOT `team-lead` — that's the session-lead's own identity), implementer name, reviewer is HO-on-demand. (Agent-spawned teammates; no TeamCreate.)
+
+10. **§3-REBOUND budget** + chain-of-justification propagation reference (one line each).
 
 That's the whole brief. ~1-2 pages typical.
 
@@ -136,6 +152,7 @@ The one-line principle: directives.md is canonical; the skill summarizes it; the
 ## Cross-references
 
 - `architecture/adr/ORG-034` (two-layer goal architecture — arc-intents as the missing justification tier; the brief's intent-first opening + DECISIONS intent-first derive from here)
+- `architecture/adr/ORG-054-project-ontology-and-upward-justification.md` (project ontology — `project_id`/`nearest_intent_ref`/developmental-mode chain named in the opening contract) + `sop/standard/project-lifecycle.md` (formation/transition/closure procedure that chain resolves against)
 - `rulebook/goals.md` (north stars — layer 1, the operator's; arc-intents nest under these)
 - `rulebook/principles.md` P1 (architecture over policy), P2 (principles-first, re-grounded as intent-first per ORG-034), P3, P4, P5
 - `rulebook/directives.md` D1 (the operator's bandwidth), D2 (hand-curated docs), D3 (autonomy bar), D4 (brief quality bar — verify symbols at source; coverage cross-check; e2e smoke for read-paths), D5 (smoke verification discipline — literal output, orchestrator runs smokes directly, IPC wet-run), D6 (plan-first protocol + locked-answer-deviation handling), D7 (decision flow execution — Team-pattern dispatch; D2 dynamic scope-split; 3-REBOUND budget; bubble-up criteria), D8 (HO self-discipline — sticky-belief at N=2 → fresh-context redispatch), D9 (orchestrator response contract + inbox discipline), D10 (context-frugality / minimum-traversal-to-precise-info), D11 (third-party / outbound-API surface — read the authoritative spec; fixtures from the real surface, never hand-invented)

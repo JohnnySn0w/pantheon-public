@@ -24,7 +24,7 @@ from tools.t2582_live_telegram_accept import (
     run_live_accept,
 )
 
-REAL_OPERATOR_CHAT_ID = "456474197"
+REAL_OPERATOR_CHAT_ID = "424242424"
 
 
 def _ok_send(*, message_id: str = "6", chat_id: str | None = None):

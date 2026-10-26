@@ -5,6 +5,8 @@ root so a re-provision can no longer silently disarm the monitor legs.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -21,7 +23,7 @@ class ProvisionVerify(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.root = Path(self._tmp.name)
-        self.total = len(prov.AGENTS) * len(prov.DROPINS)
+        self.total = sum(1 for _ in prov.expected_legs())
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -29,13 +31,62 @@ class ProvisionVerify(unittest.TestCase):
     def test_provision_creates_all_legs(self):
         written = prov.provision(self.root, daemon_reload=False)
         self.assertEqual(len(written), self.total)
-        # Every (agent, detector) file exists with its expected env token.
-        for agent in prov.AGENTS:
-            for name, (envvar, _note) in prov.DROPINS.items():
-                p = prov.dropin_path(self.root, agent, name)
-                self.assertTrue(p.exists(), f"{p} should exist")
-                self.assertIn(prov.expected_token(envvar), p.read_text())
+        # Every expected (agent, detector) file exists with its expected env token.
+        for agent, name, leg in prov.expected_legs():
+            p = prov.dropin_path(self.root, agent, name)
+            self.assertTrue(p.exists(), f"{p} should exist")
+            self.assertIn(prov.expected_token(leg.envvar), p.read_text())
         self.assertEqual(prov.verify(self.root), [])
+
+    # ----- per-leg agent scope (T-3314) -----
+
+    def test_original_three_legs_unchanged_fleet_wide(self):
+        expected = {
+            "enable.conf": "PANTHEON_API_HEALTH_ENABLED",
+            "staleness.conf": "PANTHEON_STALENESS_ENABLED",
+            "model-outage.conf": "PANTHEON_MODEL_OUTAGE_ENABLED",
+        }
+        for name, envvar in expected.items():
+            self.assertEqual(prov.DROPINS[name].envvar, envvar)
+            self.assertEqual(prov.DROPINS[name].agents, ("orchestrator", "specialist", "recovery"))
+        prov.provision(self.root, daemon_reload=False)
+        for agent in ("orchestrator", "specialist", "recovery"):
+            for name in expected:
+                self.assertTrue(prov.dropin_path(self.root, agent, name).exists())
+
+    def test_every_leg_subset_is_within_agents(self):
+        # A subset naming an agent outside AGENTS would be silently never armed.
+        for name, leg in prov.DROPINS.items():
+            self.assertTrue(leg.agents, f"{name} has an empty agent subset")
+            self.assertTrue(set(leg.agents) <= set(prov.AGENTS), name)
+
+    def test_repo_audit_leg_provisioned_only_for_orchestrator(self):
+        leg = prov.DROPINS["repo-audit.conf"]
+        self.assertEqual(leg.envvar, "PANTHEON_REPO_AUDIT_ENABLED")
+        self.assertEqual(leg.agents, ("orchestrator",))
+        prov.provision(self.root, daemon_reload=False)
+        orchestrator = prov.dropin_path(self.root, "orchestrator", "repo-audit.conf")
+        self.assertTrue(orchestrator.exists())
+        self.assertIn("Environment=PANTHEON_REPO_AUDIT_ENABLED=1", orchestrator.read_text())
+        for agent in ("specialist", "recovery"):
+            self.assertFalse(prov.dropin_path(self.root, agent, "repo-audit.conf").exists())
+        self.assertEqual(self.total, 3 * 3 + 1)
+
+    def test_verify_flags_missing_repo_audit_for_orchestrator_only(self):
+        prov.provision(self.root, daemon_reload=False)
+        prov.dropin_path(self.root, "orchestrator", "repo-audit.conf").unlink()
+        missing = prov.verify(self.root)
+        self.assertEqual(missing, ["orchestrator/repo-audit.conf (PANTHEON_REPO_AUDIT_ENABLED)"])
+
+    def test_verify_does_not_expect_repo_audit_on_specialist_recovery(self):
+        prov.provision(self.root, daemon_reload=False)
+        # Absent for specialist/recovery is the expected state, so verify stays clean.
+        self.assertEqual(prov.verify(self.root), [])
+        missing_all = prov.verify(Path(self._tmp.name) / "empty")
+        self.assertNotIn("specialist/repo-audit.conf", " ".join(missing_all))
+        self.assertNotIn("recovery/repo-audit.conf", " ".join(missing_all))
+        self.assertIn("orchestrator/repo-audit.conf", " ".join(missing_all))
+        self.assertEqual(len(missing_all), self.total)
 
     def test_provision_is_idempotent(self):
         prov.provision(self.root, daemon_reload=False)
@@ -62,7 +113,7 @@ class ProvisionVerify(unittest.TestCase):
         # A leg with DIFFERENT comments but the right env token still counts armed
         # (the live files carry per-agent history comments).
         agent, name = "recovery", "staleness.conf"
-        envvar = prov.DROPINS[name][0]
+        envvar = prov.DROPINS[name].envvar
         p = prov.dropin_path(self.root, agent, name)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(f"[Service]\n# totally different historical comment\n{prov.expected_token(envvar)}\n")
@@ -88,6 +139,19 @@ class ProvisionVerify(unittest.TestCase):
         rc = prov.main(["--provision", "--no-reload", "--config-root", str(self.root)])
         self.assertEqual(rc, 0)
         self.assertEqual(prov.verify(self.root), [])
+
+    def test_main_counts_respect_leg_subsets(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = prov.main(["--provision", "--no-reload", "--config-root", str(self.root)])
+        self.assertEqual(rc, 0)
+        self.assertIn(f"{self.total} drop-in(s) (re)created", out.getvalue())
+        self.assertIn(f"verified {self.total} enablement leg(s) armed", out.getvalue())
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = prov.main(["--verify", "--config-root", str(self.root / "empty")])
+        self.assertEqual(rc, 1)
+        self.assertIn(f"{self.total}/{self.total}", err.getvalue())
 
 
 if __name__ == "__main__":

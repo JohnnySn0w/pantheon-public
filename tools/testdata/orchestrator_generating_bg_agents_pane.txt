@@ -1,0 +1,24 @@
+     error: state-mismatch: T-4283 is in `inbox`, resolve requires `active`
+
+● Bash(python3 tools/ticket.py list --target orchestrator --state active 2>&1 | head
+      -5; python3 - <<'PY'
+      import subprocess…)
+  ⎿  (no tickets)
+     claim T-4283 → tickets/active/T-4283.md
+     resolve T-4283 → tickets/done/T-4283.md
+
+✻ Doodling… (2m 19s · ↓ 2.3k tokens · thinking with xhigh effort)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's
+     current work
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · 2 monitors · esc to interrupt · ← for agents · ↓ to mana…
+
+  ● main
+  ◯ rev-t4220   INTENT: a cascade sweep that sil…                         idle
+  ◯ rev-t4226   INTENT: code reaches main only t…                         idle
+  ◯ impl-t4230  Verifying test_handoff_and_resta… 2h 42m 50s · ↓ 384.5k tokens
+  ◯ rev-t4284   INTENT: mail (especially URGENT)…                         idle
+

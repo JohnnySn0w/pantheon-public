@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import re
 import shutil
 import sys
 import subprocess
@@ -24,20 +27,17 @@ from tools.inbox_consumer import (
     IDLE_SENTINELS,
     PENDING_PASTE_SENTINEL,
     CONSECUTIVE_SKIP_ALERT_THRESHOLD,
-    ORCHESTRATOR_HEALTH_ALERT_COOLDOWN_SECONDS,
-    ORCHESTRATOR_HEALTH_PANE_WEDGE_PERSIST_SECONDS,
-    PANE_WEDGE_SENTINELS,
     DELIVERY_MODE,
     MAILBOX_HUB,
     SkipCycle,
     TicketInfo,
-    check_autonomy_off,
     check_cap_hit,
+    check_seat_intake,
+    NEVER_ALERT_SKIP_VOCABS,
     check_consecutive_skips,
     # check_mid_turn removed by T-0717 (dispatch-gating pane scrape replaced by
     # auto_delivered mutex — see check_dispatch_locked).
     check_recent_inbound,
-    check_orchestrator_health,
     count_consecutive_skips,
     deliver,
     format_prompt,
@@ -51,6 +51,22 @@ from tools.inbox_consumer import (
     send_mailbox,
 )
 from tools import mailbox
+
+
+# ---------------------------------------------------------------------------
+# Shared test isolation (T-4300).
+# ---------------------------------------------------------------------------
+
+def _isolate_git_mutation_lock(test: unittest.TestCase) -> None:
+    """T-4300: give `test` its own git-mutation lockfile. With subprocess mocked,
+    _git_common_dir() cannot resolve and falls back to REPO_ROOT/.git, which is a
+    FILE in a linked worktree (every dispatched implementer's checkout), so the
+    lock's mkdir crashes there. patch.dict restores any outer value on cleanup."""
+    tmp = tempfile.mkdtemp(prefix="t4300-lock-")
+    test.addCleanup(shutil.rmtree, tmp, True)
+    p = patch.dict(os.environ, {"PANTHEON_GIT_MUTATION_LOCKFILE": str(Path(tmp) / "git-ops.lock")})
+    p.start()
+    test.addCleanup(p.stop)
 
 
 # ---------------------------------------------------------------------------
@@ -119,21 +135,9 @@ Do the thing.
 # ---------------------------------------------------------------------------
 
 
-class TestCheckAutonomyOff(unittest.TestCase):
-    def test_bails_when_file_exists(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            off_path = Path(tmp) / "autonomy_off"
-            off_path.touch()
-            with patch("tools.inbox_consumer.AUTONOMY_OFF_PATH", off_path):
-                with self.assertRaises(SkipCycle) as ctx:
-                    check_autonomy_off()
-        self.assertEqual(ctx.exception.vocab, "off_switch")
-
-    def test_passes_when_file_absent(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            off_path = Path(tmp) / "autonomy_off"
-            with patch("tools.inbox_consumer.AUTONOMY_OFF_PATH", off_path):
-                check_autonomy_off()  # no exception
+from tools import seat_state as _ss_mod  # noqa: E402
+_SS_MAINT = _ss_mod.Contribution(source="maintenance", intake_blocked=True, remediation_vetoed=True)
+_SS_NONE = _ss_mod.Contribution()
 
 
 class TestCheckCapHit(unittest.TestCase):
@@ -175,39 +179,166 @@ class TestCheckCapHit(unittest.TestCase):
                 check_cap_hit("orchestrator")  # no exception
 
 
+def _ss_patches(record=None, maint=None, oom=None):
+    """Patch the three seat_state source readers (the module fixture stubs all three to
+    'nothing held'); each arg is a Contribution or an Exception to raise."""
+    from tools import seat_state as ss
+    out = []
+    for name, val in (("_read_seat_state", record), ("_read_maintenance", maint),
+                      ("_read_oom", oom)):
+        if val is None:
+            continue
+        names = (name, "_read_seat_state_cross") if name == "_read_seat_state" else (name,)
+        for n in names:
+            if isinstance(val, Exception):
+                out.append(patch(f"tools.seat_state.{n}", side_effect=val))
+            else:
+                out.append(patch(f"tools.seat_state.{n}", return_value=val))
+    return out
+
+
+class TestCheckSeatIntake(unittest.TestCase):
+    """ORG-106 L2 (T-5525): one reader check replaces check_autonomy_off (off_switch) and
+    check_seat_maintenance (T-4362, seat_maintenance)."""
+
+    def _vocab(self, patches, off_path=None, agent="recovery"):
+        import contextlib
+        from tools import seat_state as ss  # noqa: F401
+        with tempfile.TemporaryDirectory() as tmp:
+            off = off_path if off_path is not None else Path(tmp) / "absent_autonomy_off"
+            with contextlib.ExitStack() as st:
+                for pt in patches:
+                    st.enter_context(pt)
+                st.enter_context(patch("tools.inbox_consumer.AUTONOMY_OFF_PATH", off))
+                try:
+                    check_seat_intake(agent)
+                except SkipCycle as exc:
+                    return exc.vocab
+        return None
+
+    def _c(self, **kw):
+        from tools import seat_state as ss
+        return ss.Contribution(**kw)
+
+    def test_nothing_held_passes(self):
+        self.assertIsNone(self._vocab([]))
+
+    def test_paused_record_skips_seat_paused(self):
+        c = self._c(source="seat-state", state="paused-intake", intake_blocked=True)
+        self.assertEqual(self._vocab(_ss_patches(record=c)), "seat_paused")
+
+    def test_deep_sleep_record_skips_seat_sleep(self):
+        c = self._c(source="seat-state", state="deep-sleep", intake_blocked=True,
+                    launch_blocked=True, remediation_vetoed=True)
+        self.assertEqual(self._vocab(_ss_patches(record=c)), "seat_sleep")
+
+    def test_maintenance_unchanged_vocab(self):
+        c = self._c(source="maintenance", intake_blocked=True, remediation_vetoed=True)
+        self.assertEqual(self._vocab(_ss_patches(maint=c)), "seat_maintenance")
+
+    def test_oom_hold_uses_maintenance_vocab(self):
+        c = self._c(source="oom-hold", intake_blocked=True, launch_blocked=True)
+        self.assertEqual(self._vocab(_ss_patches(oom=c)), "seat_maintenance")
+
+    def test_maintenance_wins_over_paused_record(self):
+        rec = self._c(source="seat-state", state="paused-intake", intake_blocked=True)
+        m = self._c(source="maintenance", intake_blocked=True, remediation_vetoed=True)
+        self.assertEqual(self._vocab(_ss_patches(record=rec, maint=m)), "seat_maintenance")
+
+    def test_autonomy_off_file_still_honoured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            off = Path(tmp) / "autonomy_off"
+            off.touch()
+            self.assertEqual(self._vocab([], off_path=off), "off_switch")
+
+    def test_reader_fault_fails_open(self):
+        # a source reader fault -> contributes nothing, no skip
+        c = self._c(fault="seat-state: boom")
+        self.assertIsNone(self._vocab(_ss_patches(record=c)))
+        # the whole reader raising -> no skip either
+        with patch("tools.inbox_consumer._seat_state.effective_for", side_effect=RuntimeError("x")):
+            check_seat_intake("recovery")  # no exception
+
+    def test_new_vocabs_never_raise_the_stuck_alert(self):
+        for v in ("seat_maintenance", "seat_paused", "seat_sleep"):
+            self.assertIn(v, NEVER_ALERT_SKIP_VOCABS)
+        self.assertNotIn("off_switch", NEVER_ALERT_SKIP_VOCABS)
+
+
+# T-4205: check_recent_inbound reads CLAUDE_PROJECTS_ROOT (the runner's REAL
+# ~/.claude/projects by default). Pin it to an empty dir for the whole module, so a
+# main()-level test never sees the test runner's own live Telegram traffic
+# (non-hermetic: it would skip:recent_telegram whenever the runner was just messaged).
+# Created in setUpModule (not at import) so the tempfile-hygiene lint sees the
+# creation paired with tearDownModule's cleanup (T-3097 module-fixture pair).
+_HERMETIC_PROJECTS = None
+_projects_root_patcher = None
+# T-4362: likewise the runner's own seat-maintenance registry. Found live: with recovery's
+# T-3026 hand-move maintenance armed, 3 main() tests skipped:seat_maintenance. Tests of
+# check_seat_intake patch it back themselves. ORG-106 L2: all three seat_state source
+# readers are stubbed to "nothing held" (record, maintenance, OOM hold); autonomy_off is
+# per-test via AUTONOMY_OFF_PATH.
+_seat_state_patchers: list = []
+
+
+def setUpModule():
+    global _HERMETIC_PROJECTS, _projects_root_patcher
+    _HERMETIC_PROJECTS = tempfile.TemporaryDirectory()
+    _projects_root_patcher = patch("tools.inbox_consumer.CLAUDE_PROJECTS_ROOT", Path(_HERMETIC_PROJECTS.name))
+    _projects_root_patcher.start()
+    from tools import seat_state as _ss
+    for _name in ("_read_seat_state", "_read_seat_state_cross", "_read_maintenance", "_read_oom"):
+        _pt = patch(f"tools.seat_state.{_name}", return_value=_ss.Contribution())
+        _pt.start()
+        _seat_state_patchers.append(_pt)
+
+
+def tearDownModule():
+    for _pt in _seat_state_patchers:
+        _pt.stop()
+    _projects_root_patcher.stop()
+    _HERMETIC_PROJECTS.cleanup()
+
+
+def _projects_root_with_inbound(tmp: str, age_seconds: float | None) -> Path:
+    """A fake ~/.claude/projects holding one session; with a telegram inbound
+    `age_seconds` old unless None (tools/telegram_inbound's queued_command shape)."""
+    root = Path(tmp) / "projects"
+    (root / "-home-agent").mkdir(parents=True)
+    lines = ['{"type": "summary"}']
+    if age_seconds is not None:
+        from datetime import datetime, timezone
+        ts = datetime.fromtimestamp(time.time() - age_seconds, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        lines.append(json.dumps({"type": "attachment", "attachment": {"type": "queued_command", "prompt":
+            f'<channel source="plugin:telegram:telegram" chat_id="1" message_id="2" user="m" user_id="1" ts="{ts}">hi</channel>'}}))
+    (root / "-home-agent" / "s.jsonl").write_text("\n".join(lines) + "\n")
+    return root
+
+
 class TestCheckRecentInbound(unittest.TestCase):
-    def _mock_health(self, last_inbound_at: dict):
-        resp = MagicMock()
-        resp.__enter__ = lambda s: s
-        resp.__exit__ = MagicMock(return_value=False)
-        resp.read.return_value = json.dumps({"last_inbound_at": last_inbound_at}).encode()
-        return resp
+    """T-4205: the gate reads this account's own session jsonls (tools/telegram_inbound)."""
 
     def test_bails_when_recent(self):
-        from datetime import datetime, timezone, timedelta
-        recent = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-        resp = self._mock_health({"orchestrator": recent, "specialist": None, "recovery": None})
-        with patch("urllib.request.urlopen", return_value=resp):
-            with self.assertRaises(SkipCycle) as ctx:
-                check_recent_inbound("orchestrator")
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tools.inbox_consumer.CLAUDE_PROJECTS_ROOT", _projects_root_with_inbound(tmp, 60)):
+                with self.assertRaises(SkipCycle) as ctx:
+                    check_recent_inbound("orchestrator")
         self.assertEqual(ctx.exception.vocab, "recent_telegram")
 
     def test_passes_when_old(self):
-        from datetime import datetime, timezone, timedelta
-        old = (datetime.now(timezone.utc) - timedelta(minutes=30)).isoformat()
-        resp = self._mock_health({"orchestrator": old, "specialist": None, "recovery": None})
-        with patch("urllib.request.urlopen", return_value=resp):
-            check_recent_inbound("orchestrator")  # no exception
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tools.inbox_consumer.CLAUDE_PROJECTS_ROOT", _projects_root_with_inbound(tmp, 1800)):
+                check_recent_inbound("orchestrator")  # no exception
 
-    def test_passes_when_null(self):
-        resp = self._mock_health({"orchestrator": None, "specialist": None, "recovery": None})
-        with patch("urllib.request.urlopen", return_value=resp):
-            check_recent_inbound("orchestrator")  # no exception
+    def test_passes_when_no_inbound(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tools.inbox_consumer.CLAUDE_PROJECTS_ROOT", _projects_root_with_inbound(tmp, None)):
+                check_recent_inbound("orchestrator")  # no exception
 
-    def test_fails_open_on_connection_error(self):
-        import urllib.error
-        with patch("urllib.request.urlopen", side_effect=urllib.error.URLError("no bridge")):
-            check_recent_inbound("orchestrator")  # no exception — fail-open
+    def test_fails_open_when_projects_root_unreadable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tools.inbox_consumer.CLAUDE_PROJECTS_ROOT", Path(tmp) / "missing"):
+                check_recent_inbound("orchestrator")  # no exception — fail-open
 
 
 # TestCheckMidTurn removed by T-0717: check_mid_turn() deleted (dispatch-gating
@@ -511,8 +642,10 @@ class TestInjectSplitAndVerify(unittest.TestCase):
         self.assertEqual(mock_run.call_count, 1)
         cmd = mock_run.call_args[0][0]
         self.assertEqual(cmd[0], str(_SEND_KEYS_HELPER))
-        self.assertEqual(cmd[1], "claude-telegram-bot")
-        self.assertEqual(cmd[2], "hello world")
+        # T-4792: the submit-verify profile is always explicit (default claude-code).
+        self.assertEqual(cmd[1:3], ["--harness", "claude-code"])
+        self.assertEqual(cmd[3], "claude-telegram-bot")
+        self.assertEqual(cmd[4], "hello world")
 
     def test_inject_helper_exit_nonzero_raises_tmux_unreachable(self):
         # T-0538: any helper failure (send-keys error or unconfirmed submit) → tmux_unreachable
@@ -540,6 +673,15 @@ class TestInjectSplitAndVerify(unittest.TestCase):
 
 
 class TestDeliveryMode(unittest.TestCase):
+    def setUp(self):
+        # T-3832 (2026-09-20): specialist consolidated to send-keys; codex is the sole
+        # real mailbox agent now. This class exercises the mailbox-delivery MECHANISM
+        # using specialist as a fixture, so force its mode rather than depend on the live
+        # DELIVERY_MODE. (Same dict object deliver() reads; restored after each test.)
+        self._orig_dm = dict(DELIVERY_MODE)
+        DELIVERY_MODE["specialist"] = "mailbox"
+        self.addCleanup(lambda: (DELIVERY_MODE.clear(), DELIVERY_MODE.update(self._orig_dm)))
+
     def test_orchestrator_default_mode_uses_send_keys_not_mailbox(self):
         with patch("subprocess.run",
                    return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run, \
@@ -566,7 +708,7 @@ class TestDeliveryMode(unittest.TestCase):
     def test_unknown_agent_falls_back_to_send_keys(self):
         # Fail-open contract: an agent absent from DELIVERY_MODE must never
         # silently drop delivery — it falls through to send-keys.
-        # Uses a deliberately nonexistent persona: metis/atlas used to serve as
+        # Uses a deliberately nonexistent persona: mason/artisan used to serve as
         # the stand-in here, but T-2144 listed every real persona explicitly so
         # the coverage test can tell "deliberately send-keys" from "never
         # considered". A contract test must not depend on a real name staying
@@ -579,6 +721,30 @@ class TestDeliveryMode(unittest.TestCase):
             deliver(unknown, "suborch1-main", "some prompt")
         self.assertEqual(mock_run.call_count, 1)
         mock_send.assert_not_called()
+
+    def test_send_keys_passes_live_codex_harness(self):
+        # T-4792: a Claude-configured seat whose controller runtime is codex must
+        # get --harness codex; the claude-code profile false-passes on codex panes
+        # and leaves the paste unsubmitted.
+        with tempfile.TemporaryDirectory() as tmp:
+            rc = Path(tmp) / "artisan" / "runtime-controller"
+            rc.mkdir(parents=True)
+            (rc / "runtime.json").write_text(json.dumps(
+                {"schema": "pantheon-runtime-state/v1", "harness": "codex"}), encoding="utf-8")
+            with patch("tools.live_harness.default_state_root", return_value=Path(tmp)), \
+                 patch("subprocess.run",
+                       return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run:
+                deliver("artisan", "suborch2-main", "some prompt")
+        cmd = mock_run.call_args[0][0]
+        self.assertEqual(cmd[1:3], ["--harness", "codex"])
+
+    def test_send_keys_falls_back_to_claude_code_without_runtime_state(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("tools.live_harness.default_state_root", return_value=Path(tmp)), \
+             patch("subprocess.run",
+                   return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run:
+            deliver("artisan", "suborch2-main", "some prompt")
+        self.assertEqual(mock_run.call_args[0][0][1:3], ["--harness", "claude-code"])
 
     def test_specialist_mailbox_send_failure_raises_mailbox_unreachable(self):
         with patch("tools.inbox_consumer.send_mailbox", return_value=False):
@@ -683,6 +849,13 @@ class TestRedeliverySafety(unittest.TestCase):
 
 
 class TestFullCycleDeliveryRouting(unittest.TestCase):
+    def setUp(self):
+        # T-3832: specialist is send-keys in prod now; force mailbox as a fixture so the
+        # full-cycle mailbox-routing test keeps exercising the mechanism. Restored after.
+        self._orig_dm = dict(DELIVERY_MODE)
+        DELIVERY_MODE["specialist"] = "mailbox"
+        self.addCleanup(lambda: (DELIVERY_MODE.clear(), DELIVERY_MODE.update(self._orig_dm)))
+
     def _health_ok(self):
         health_resp = MagicMock()
         health_resp.__enter__ = lambda s: s
@@ -711,7 +884,8 @@ class TestFullCycleDeliveryRouting(unittest.TestCase):
                 patch("subprocess.run",
                       return_value=MagicMock(returncode=0, stdout="", stderr="")) as mock_run,
                 patch("tools.inbox_consumer.check_dispatch_locked"),
-                patch("tools.inbox_consumer._stamp_auto_delivered"),
+                patch("tools.inbox_consumer._stamp_auto_delivered",
+                      return_value=inbox_consumer.StampResult.OK),
             ):
                 mock_urlopen.return_value = self._health_ok()
                 result = main("specialist")
@@ -746,7 +920,8 @@ class TestFullCycleDeliveryRouting(unittest.TestCase):
                 patch("subprocess.run", return_value=send_result) as mock_run,
                 patch("tools.inbox_consumer.send_mailbox") as mock_send,
                 patch("tools.inbox_consumer.check_dispatch_locked"),
-                patch("tools.inbox_consumer._stamp_auto_delivered"),
+                patch("tools.inbox_consumer._stamp_auto_delivered",
+                      return_value=inbox_consumer.StampResult.OK),
             ):
                 mock_urlopen.return_value = self._health_ok()
                 result = main("orchestrator")
@@ -880,6 +1055,47 @@ class TestConsecutiveSkips(unittest.TestCase):
                   "off_switch", "cap_hit"):
             self.assertNotIn(v, NEVER_ALERT_SKIP_VOCABS)
 
+    def test_a_long_benign_run_does_not_disarm_the_alert(self):
+        # T-4376 (rev-t4362 N5): never-alert skips counted toward the streak, so
+        # after a long benign run (recovery's live log: thousands of dispatch_locked)
+        # the count was past 6 and a real failure's ==6 alert could never fire.
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = ([f"2026-05-04T10:{i:02d}:00Z recovery skip:dispatch_locked" for i in range(40)]
+                     + [f"2026-05-04T11:0{i}:00Z recovery skip:tmux_unreachable" for i in range(6)])
+            log_path = self._write_log(tmp, lines)
+            with patch("tools.inbox_consumer.LOG_PATH", log_path):
+                self.assertEqual(count_consecutive_skips("recovery"), 6)
+                with patch("tools.inbox_consumer.route_failure_alert") as mock_alert:
+                    check_consecutive_skips("recovery", "tmux_unreachable")
+            mock_alert.assert_called_once()
+
+    def test_benign_skips_between_real_ones_neither_count_nor_reset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            lines = []
+            for i in range(6):
+                lines += [f"2026-05-04T11:{i}0:00Z recovery skip:tmux_unreachable",
+                          f"2026-05-04T11:{i}5:00Z recovery skip:empty_inbox",
+                          f"2026-05-04T11:{i}7:00Z recovery skip:seat_maintenance"]
+            log_path = self._write_log(tmp, lines)
+            with patch("tools.inbox_consumer.LOG_PATH", log_path):
+                self.assertEqual(count_consecutive_skips("recovery"), 6)
+
+    def test_a_persistent_failure_alerts_again_after_the_reset(self):
+        # T-4376: the reset marker counted as a skip, so after the first alert the
+        # count went 8, 9, ... and the documented "alerts every 6 skips" never did.
+        with tempfile.TemporaryDirectory() as tmp:
+            for marker in ("skip:_alert_reset", "skip:_alert_suppressed_pane_advancing"):
+                with self.subTest(marker=marker):
+                    lines = ([f"2026-05-04T11:0{i}:00Z recovery skip:tmux_unreachable" for i in range(6)]
+                             + [f"2026-05-04T11:30:00Z recovery {marker}"]
+                             + [f"2026-05-04T12:0{i}:00Z recovery skip:tmux_unreachable" for i in range(6)])
+                    log_path = self._write_log(tmp, lines)
+                    with patch("tools.inbox_consumer.LOG_PATH", log_path):
+                        self.assertEqual(count_consecutive_skips("recovery"), 6)
+                        with patch("tools.inbox_consumer.route_failure_alert") as mock_alert:
+                            check_consecutive_skips("recovery", "tmux_unreachable")
+                    mock_alert.assert_called_once()
+
     def test_count_resets_on_pulled(self):
         with tempfile.TemporaryDirectory() as tmp:
             lines = [
@@ -931,7 +1147,8 @@ class TestFullCycle(unittest.TestCase):
                 # T-0717: check_mid_turn removed; patch check_dispatch_locked and
                 # _stamp_auto_delivered so this cycle test doesn't require a real git repo.
                 patch("tools.inbox_consumer.check_dispatch_locked"),
-                patch("tools.inbox_consumer._stamp_auto_delivered"),
+                patch("tools.inbox_consumer._stamp_auto_delivered",
+                      return_value=inbox_consumer.StampResult.OK),
             ):
                 # /health returns no recent inbound
                 health_resp = MagicMock()
@@ -949,9 +1166,9 @@ class TestFullCycle(unittest.TestCase):
             inject_calls = [c for c in mock_run.call_args_list
                             if str(c[0][0][0]).endswith("send_keys_submit.sh")]
             self.assertEqual(len(inject_calls), 1)
-            # Helper call: [helper_path, pane_target, prompt_text]
+            # Helper call: [helper_path, "--harness", <h>, pane_target, prompt_text] (T-4792)
             injected_args = inject_calls[0][0][0]
-            injected_text = injected_args[2]  # prompt is 3rd element (index 2)
+            injected_text = injected_args[-1]  # prompt is the last element (T-4792 added --harness)
             self.assertIn("T-0099", injected_text)
             self.assertIn("Ship it", injected_text)
             # Log entry written
@@ -993,7 +1210,8 @@ class TestConcurrentStateFlip(unittest.TestCase):
                 patch("subprocess.run", return_value=send_result) as mock_run,
                 patch("tools.inbox_consumer.time"),
                 patch("tools.inbox_consumer.check_dispatch_locked"),
-                patch("tools.inbox_consumer._stamp_auto_delivered"),
+                patch("tools.inbox_consumer._stamp_auto_delivered",
+                      return_value=inbox_consumer.StampResult.OK),
                 patch("tools.inbox_consumer.log_outcome") as mock_log,
                 patch("tools.inbox_consumer.check_consecutive_skips"),
                 # scan (via list_eligible_tickets) still sees inbox on disk;
@@ -1103,19 +1321,10 @@ class TestSkipVocabNoTmux(unittest.TestCase):
             )
 
     def test_recent_telegram_no_tmux(self):
-        from datetime import datetime, timezone, timedelta
-        recent = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
-        health_data = json.dumps({
-            "last_inbound_at": {"orchestrator": recent, "specialist": None, "recovery": None}
-        }).encode()
-
+        # T-4205: a live Telegram inbound in the account's own session jsonl.
         with tempfile.TemporaryDirectory() as tmp:
-            resp = MagicMock()
-            resp.__enter__ = lambda s: s
-            resp.__exit__ = MagicMock(return_value=False)
-            resp.read.return_value = health_data
-
-            with patch("urllib.request.urlopen", return_value=resp):
+            with patch("tools.inbox_consumer.CLAUDE_PROJECTS_ROOT", _projects_root_with_inbound(tmp, 60)), \
+                 patch("tools.inbox_consumer.TICKETS_ROOT", Path(tmp) / "tickets"):  # T-4695: hermetic (busy rule reads the board)
                 with patch("tools.inbox_consumer.AUTONOMY_OFF_PATH", Path(tmp) / "autonomy_off"):
                     with patch("tools.inbox_consumer.CAP_HIT_PATH", Path(tmp) / "no_cap_hit.json"):
                         with patch("tools.inbox_consumer.LOG_PATH", Path(tmp) / "inbox_consumer.log"):
@@ -1165,7 +1374,7 @@ class TestSkipVocabNoTmux(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tickets_root = Path(tmp) / "tickets"
             # dep in active state (not done); T-0002 depends on it → dependency_blocked
-            _write_ticket(tickets_root, "T-0010", "orchestrator", state="active")
+            _write_ticket(tickets_root, "T-0010", "recovery", state="active")  # T-4695: other seat's dep
             _write_ticket(tickets_root, "T-0002", "orchestrator", depends_on=["T-0010"])
 
             resp = MagicMock()
@@ -1343,447 +1552,16 @@ class TestNotBefore(unittest.TestCase):
         self.assertEqual(tickets[0].id, "T-0001")
 
 
-class TestCheckThothHealth(unittest.TestCase):
-    """Recovery-side observability of Orchestrator via bridge /health."""
-
-    def setUp(self) -> None:
-        # T-0314: escalate path now tries recovery-pane first. Default to
-        # recovery-pane=False in this class so existing tests exercise the
-        # fallback-to-operator-Telegram path they were originally written for.
-        # Tests that want recovery-pane success override with their own patch.
-        p = patch("tools.inbox_consumer._send_to_recovery_pane", return_value=False)
-        p.start()
-        self.addCleanup(p.stop)
-
-    def _mock_health(self, payload: dict):
-        resp = MagicMock()
-        resp.__enter__ = lambda s: s
-        resp.__exit__ = MagicMock(return_value=False)
-        resp.read.return_value = json.dumps(payload).encode()
-        return resp
-
-    def _patch_state(self, tmpdir: Path):
-        """Redirect both the cooldown state file and the log path into tmpdir."""
-        return (
-            patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                  tmpdir / "orchestrator_health_last_alert_at"),
-            patch("tools.inbox_consumer.LOG_PATH",
-                  tmpdir / "inbox_consumer.log"),
-        )
-
-    def test_healthy_returns_none_no_alert(self):
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": ["orchestrator"],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": "2026-05-05T00:00:00+00:00"},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            patches = self._patch_state(tmppath)
-            with patches[0], patches[1], \
-                 patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertIsNone(vocab)
-        alert.assert_not_called()
-
-    def test_orchestrator_disconnected_alerts(self):
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": [],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": None},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            patches = self._patch_state(tmppath)
-            with patches[0], patches[1], \
-                 patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=None), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "orchestrator_disconnected")
-        alert.assert_called_once()
-        self.assertIn("connected_clients", alert.call_args[0][0])
-
-    def test_telegram_disconnected_takes_precedence(self):
-        """When both telegram_connected=False and orchestrator missing, the telegram
-        signal wins — that's the upstream cause."""
-        payload = {
-            "telegram_connected": False,
-            "connected_clients": [],
-            "queued_messages": {"orchestrator": 5},
-            "last_inbound_at": {"orchestrator": None},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            patches = self._patch_state(tmppath)
-            with patches[0], patches[1], \
-                 patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "telegram_disconnected")
-        alert.assert_called_once()
-        self.assertIn("Telegram", alert.call_args[0][0])
-
-    def test_queue_stalled_alerts(self):
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": ["orchestrator"],
-            "queued_messages": {"orchestrator": 3},
-            "last_inbound_at": {"orchestrator": "2026-05-05T00:00:00+00:00"},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            patches = self._patch_state(tmppath)
-            with patches[0], patches[1], \
-                 patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "queue_stalled")
-        alert.assert_called_once()
-
-    def test_bridge_unreachable_silent(self):
-        import urllib.error
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            patches = self._patch_state(tmppath)
-            with patches[0], patches[1], \
-                 patch("urllib.request.urlopen",
-                       side_effect=urllib.error.URLError("no bridge")), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertIsNone(vocab)
-        alert.assert_not_called()
-
-    def test_cooldown_suppresses_repeat_alerts(self):
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": [],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": None},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            patches = self._patch_state(tmppath)
-            with patches[0], patches[1], \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=None):
-                # First call: alerts.
-                with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                     patch("tools.inbox_consumer._send_telegram_alert") as alert1:
-                    v1 = check_orchestrator_health()
-                self.assertEqual(v1, "orchestrator_disconnected")
-                alert1.assert_called_once()
-                # Second call inside cooldown: still returns vocab, but no alert.
-                with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                     patch("tools.inbox_consumer._send_telegram_alert") as alert2:
-                    v2 = check_orchestrator_health()
-                self.assertEqual(v2, "orchestrator_disconnected")
-                alert2.assert_not_called()
-
-    def test_cooldown_expires_allows_realert(self):
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": [],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": None},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            patches = self._patch_state(tmppath)
-            with patches[0], patches[1], \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=None):
-                # First call alerts and writes cooldown stamp.
-                with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                     patch("tools.inbox_consumer._send_telegram_alert") as alert1:
-                    check_orchestrator_health()
-                alert1.assert_called_once()
-                # Backdate the cooldown stamp past the window.
-                stamp = tmppath / "orchestrator_health_last_alert_at"
-                old = int(time.time()) - ORCHESTRATOR_HEALTH_ALERT_COOLDOWN_SECONDS - 5
-                stamp.write_text(str(old))
-                # Now a new alert should fire.
-                with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                     patch("tools.inbox_consumer._send_telegram_alert") as alert2:
-                    check_orchestrator_health()
-                alert2.assert_called_once()
-
-
-class TestPaneWedgePersistence(unittest.TestCase):
-    """The pane-wedge signal requires persistence across cycles."""
-
-    def _patch_state(self, tmpdir: Path):
-        return patch(
-            "tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-            tmpdir / "orchestrator_pane_wedge_first_seen_at",
-        )
-
-    def test_no_sentinel_clears_state(self):
-        """Healthy pane content clears any prior wedged-state marker."""
-        from tools.inbox_consumer import _check_pane_wedge_persistent
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            state = tmppath / "orchestrator_pane_wedge_first_seen_at"
-            state.parent.mkdir(parents=True, exist_ok=True)
-            state.write_text("1000")  # stale marker from earlier wedged streak
-            with self._patch_state(tmppath), \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture",
-                       return_value="? for shortcuts\n❯ idle"):
-                result = _check_pane_wedge_persistent()
-        self.assertIsNone(result)
-        self.assertFalse(state.exists())
-
-    def test_pane_unreachable_returns_none_and_clears(self):
-        from tools.inbox_consumer import _check_pane_wedge_persistent
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            state = tmppath / "orchestrator_pane_wedge_first_seen_at"
-            state.parent.mkdir(parents=True, exist_ok=True)
-            state.write_text("1000")
-            with self._patch_state(tmppath), \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=None):
-                result = _check_pane_wedge_persistent()
-        self.assertIsNone(result)
-        self.assertFalse(state.exists())
-
-    def test_first_sighting_writes_state_no_alert(self):
-        from tools.inbox_consumer import _check_pane_wedge_persistent
-        wedged_pane = (
-            "Do you want to overwrite HANDOFF.md?\n"
-            "❯ 1. Yes\n"
-            "  2. Yes, and allow Claude to edit its own settings for this session\n"
-            "  3. No"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            state = tmppath / "orchestrator_pane_wedge_first_seen_at"
-            with self._patch_state(tmppath), \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=wedged_pane):
-                result = _check_pane_wedge_persistent()
-            self.assertIsNone(result)
-            self.assertTrue(state.exists())
-            # Stamp should be ~now.
-            ts = int(state.read_text())
-            self.assertAlmostEqual(ts, int(time.time()), delta=5)
-
-    def test_persistent_wedge_returns_sentinel(self):
-        from tools.inbox_consumer import _check_pane_wedge_persistent
-        wedged_pane = (
-            "❯ 1. Yes\n"
-            "  2. Yes, and allow Claude to edit its own settings for this session"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            state = tmppath / "orchestrator_pane_wedge_first_seen_at"
-            state.parent.mkdir(parents=True, exist_ok=True)
-            # Backdate first-sighting past the persist window.
-            old = int(time.time()) - ORCHESTRATOR_HEALTH_PANE_WEDGE_PERSIST_SECONDS - 5
-            state.write_text(str(old))
-            with self._patch_state(tmppath), \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=wedged_pane):
-                result = _check_pane_wedge_persistent()
-            self.assertIsNotNone(result)
-            self.assertIn("Yes, and allow Claude", result[0])
-            # State file preserved — only cleared on healthy pane or unreachable.
-            self.assertTrue(state.exists())
-
-    def test_within_window_still_no_alert(self):
-        """Wedged but only seen 30s ago — under the persist threshold."""
-        from tools.inbox_consumer import _check_pane_wedge_persistent
-        wedged_pane = "I am using this for local development"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            state = tmppath / "orchestrator_pane_wedge_first_seen_at"
-            state.parent.mkdir(parents=True, exist_ok=True)
-            recent = int(time.time()) - 30
-            state.write_text(str(recent))
-            with self._patch_state(tmppath), \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=wedged_pane):
-                result = _check_pane_wedge_persistent()
-            self.assertIsNone(result)
-            self.assertTrue(state.exists())  # still tracking
-
-    def test_corrupt_state_treated_as_first_sighting(self):
-        from tools.inbox_consumer import _check_pane_wedge_persistent
-        wedged_pane = "Yes, and allow Claude to edit its own settings"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            state = tmppath / "orchestrator_pane_wedge_first_seen_at"
-            state.parent.mkdir(parents=True, exist_ok=True)
-            state.write_text("not-a-number")
-            with self._patch_state(tmppath), \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=wedged_pane):
-                result = _check_pane_wedge_persistent()
-            self.assertIsNone(result)
-            # State should have been rewritten with a valid timestamp.
-            ts = int(state.read_text())
-            self.assertAlmostEqual(ts, int(time.time()), delta=5)
-
-
-class TestPaneWedgeLivenessGuardT0716(unittest.TestCase):
-    """T-0716: the wedge declaration is suppressed when the live bottom region
-    of the pane shows the loop is working/idle — fixes false-positives where a
-    wedge sentinel appears only as TEXT (a captured peer dialog, or the
-    health-alert message quoting the sentinel). False-negative-safe: a genuine
-    modal (footer present, or no liveness token) is never suppressed.
-    """
-
-    # --- ground-truth captures from the 2026-06-02 incident ---
-    REAL_WEDGE = (
-        "● Bash(systemctl --user cat pantheon-bridge.service)\n"
-        "  ⎿  Waiting…\n"
-        "────────────────────────────────────────\n"
-        " Bash command\n"
-        "   systemctl --user cat pantheon-bridge.service\n"
-        " Do you want to proceed?\n"
-        " ❯ 1. Yes\n"
-        "   2. Yes, and don't ask again for similar commands in /home/claude\n"
-        "   3. No\n"
-        "\n"
-        " Esc to cancel · Tab to amend · ctrl+e to explain\n"
-    )
-    HEALTHY_WORKING = (
-        "● Working on something\n"
-        "✽ Kneading… (33s · ↓ 2.1k tokens · thinking)\n"
-        "  ⎿  Tip: Use /btw to ask a quick side question\n"
-        "────────────────────────────────────────\n"
-        "❯ \n"
-        "────────────────────────────────────────\n"
-        "  esc to interrupt                         ● high · /effort\n"
-    )
-
-    # --- pure-helper unit tests ---
-    def _live(self, pane):
-        from tools.inbox_consumer import _bottom_region_shows_live_input
-        return _bottom_region_shows_live_input(pane)
-
-    def test_helper_real_wedge_not_suppressed(self):
-        # Dialog footer in bottom region, no liveness token → NOT live → wedged.
-        self.assertFalse(self._live(self.REAL_WEDGE))
-
-    def test_helper_working_footer_suppresses(self):
-        self.assertTrue(self._live(self.HEALTHY_WORKING))
-
-    def test_helper_idle_footer_suppresses(self):
-        self.assertTrue(self._live("● done\n────\n❯ \n────\n  ? for shortcuts\n"))
-
-    def test_helper_footer_wins_over_corendered_liveness(self):
-        # H1 defense: even if a stale spinner co-renders, a footer present in the
-        # bottom region keeps it classified as a live modal (not suppressed).
-        pane = (
-            " Do you want to proceed?\n"
-            " ❯ 1. Yes\n"
-            "   3. No\n"
-            "  esc to interrupt\n"
-            " Esc to cancel · Tab to amend · ctrl+e to explain\n"
-        )
-        self.assertFalse(self._live(pane))
-
-    def test_helper_footerless_wedge_not_suppressed(self):
-        # A footer-less dialog render (sentinel only, no liveness) must NOT be
-        # suppressed — avoids a false-negative for unusual renders.
-        self.assertFalse(self._live("Do you want to proceed?\n❯ 1. Yes\n  3. No\n"))
-
-    def test_helper_sentinel_as_text_with_live_prompt_suppressed(self):
-        # THE BUG: sentinel quoted in scrollback, live working footer at bottom.
-        pane = (
-            "● [pantheon] recovery-health alert quoting 'Do you want to proceed?'\n"
-            "● analysis line 1\n● analysis line 2\n● analysis line 3\n"
-            "✽ Kneading… (↓ 1k tokens · thinking)\n"
-            "────\n❯ \n────\n  esc to interrupt    ● high · /effort\n"
-        )
-        self.assertTrue(self._live(pane))
-
-    def test_helper_peer_dialog_in_scrollback_suppressed(self):
-        # Recovery captured a peer's full dialog (footer included) high in scrollback,
-        # then produced its own output; live idle footer at bottom → suppressed.
-        pane = (
-            "  ⎿  Do you want to proceed?\n"
-            "     ❯ 1. Yes\n"
-            "     Esc to cancel · Tab to amend · ctrl+e to explain\n"
-            "● Verified peer wedged; approved read-only diagnostic.\n"
-            "● Sent 1 + Enter to peer pane.\n"
-            "● Confirmed peer resumed.\n"
-            "● Filed follow-up notes.\n"
-            "────\n❯ \n────\n  ? for shortcuts\n"
-        )
-        self.assertTrue(self._live(pane))
-
-    def test_helper_trailing_blank_padding_ignored(self):
-        # capture-pane pads to terminal height; blanks must not hide the footer.
-        pane = self.REAL_WEDGE + ("\n" * 30)
-        self.assertFalse(self._live(pane))
-
-    # --- integration via _check_pane_wedge_persistent (backdated streak) ---
-    def _patch_state(self, tmpdir):
-        return patch(
-            "tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-            tmpdir / "orchestrator_pane_wedge_first_seen_at",
-        )
-
-    def _backdate(self, state):
-        state.parent.mkdir(parents=True, exist_ok=True)
-        state.write_text(str(int(time.time()) - ORCHESTRATOR_HEALTH_PANE_WEDGE_PERSIST_SECONDS - 5))
-
-    def test_integration_real_wedge_still_fires(self):
-        from tools.inbox_consumer import _check_pane_wedge_persistent
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            state = tmppath / "orchestrator_pane_wedge_first_seen_at"
-            self._backdate(state)
-            with self._patch_state(tmppath), \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=self.REAL_WEDGE):
-                result = _check_pane_wedge_persistent()
-        self.assertIsNotNone(result)
-        self.assertIn("Do you want to proceed?", result[0])
-
-    def test_integration_sentinel_as_text_suppressed(self):
-        from tools.inbox_consumer import _check_pane_wedge_persistent
-        bug_pane = (
-            "● recovery-health alert quoting 'Do you want to proceed?'\n"
-            "● a\n● b\n● c\n● d\n"
-            "────\n❯ \n────\n  esc to interrupt    ● high · /effort\n"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            state = tmppath / "orchestrator_pane_wedge_first_seen_at"
-            self._backdate(state)
-            with self._patch_state(tmppath), \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=bug_pane):
-                result = _check_pane_wedge_persistent()
-            # No false alert...
-            self.assertIsNone(result)
-            # ...and the deferral preserves the streak (H3): state NOT cleared,
-            # because the sentinel is still present as text.
-            self.assertTrue(state.exists())
-
-    def test_integration_deferral_does_not_reset_streak_then_fires_when_live_clears(self):
-        # H3: a deferred cycle keeps first_seen; once the live footer is gone (a
-        # genuine wedge), the very next capture fires using the SAME streak.
-        from tools.inbox_consumer import _check_pane_wedge_persistent
-        live_pane = (
-            "● x\n● y\n● z\n● w\n────\n❯ \n────\n  esc to interrupt\n"
-            "(scrollback) Do you want to proceed?\n"
-        )
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            state = tmppath / "orchestrator_pane_wedge_first_seen_at"
-            self._backdate(state)
-            original_ts = state.read_text()
-            with self._patch_state(tmppath):
-                with patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=live_pane):
-                    self.assertIsNone(_check_pane_wedge_persistent())  # deferred
-                self.assertTrue(state.exists())
-                self.assertEqual(state.read_text(), original_ts)  # streak intact
-                with patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=self.REAL_WEDGE):
-                    self.assertIsNotNone(_check_pane_wedge_persistent())  # now fires
+# T-4203: the check_orchestrator_health / check_agent_health / wedge auto-resolve test
+# classes were removed with the retired bridge-gated health loop (the bridge is
+# decommissioned; the loop's last logged outcome was 2026-06-03).
 
 
 class TestRouteFailureAlertT0722(unittest.TestCase):
     """route_failure_alert: failures for OTHER agents route via Recovery (triage);
-    RECOVERY's own failures go DIRECT to the operator (it cannot self-remediate).
-    the operator directive 2026-06-02 (msg 2235).
+    RECOVERY's own failures never land on Recovery (it cannot self-remediate). The operator
+    directive 2026-06-02 (msg 2235) sent them direct to him; since T-4399 they go
+    to orchestrator first, and to the operator only when that route fails.
     """
 
     def test_other_agent_routes_via_recovery(self):
@@ -1802,17 +1580,119 @@ class TestRouteFailureAlertT0722(unittest.TestCase):
         via_recovery.assert_called_once()
         direct.assert_not_called()
 
-    def test_recovery_self_goes_direct_to_operator(self):
+    def test_recovery_self_goes_to_orchestrator_not_operator(self):
+        # T-4399: orchestrator's mailbox first; the operator is not paged when that route works.
         from tools.inbox_consumer import route_failure_alert
         with patch("tools.inbox_consumer._send_alert_via_recovery") as via_recovery, \
+             patch("tools.inbox_consumer._deliver_recovery_self_alert_to_orchestrator",
+                   return_value=True) as orchestrator, \
+             patch("tools.inbox_consumer._send_telegram_alert") as direct:
+            route_failure_alert("recovery", "recovery restart wedged", "restart-failure (recovery)")
+        via_recovery.assert_not_called()
+        orchestrator.assert_called_once_with("recovery restart wedged", "restart-failure (recovery)")
+        direct.assert_not_called()
+
+    def test_recovery_self_falls_back_to_operator_when_orchestrator_is_unreachable(self):
+        from tools.inbox_consumer import route_failure_alert
+        with patch("tools.inbox_consumer._send_alert_via_recovery") as via_recovery, \
+             patch("tools.inbox_consumer._deliver_recovery_self_alert_to_orchestrator",
+                   return_value=False), \
              patch("tools.inbox_consumer._send_telegram_alert") as direct:
             route_failure_alert("recovery", "recovery restart wedged", "restart-failure (recovery)")
         via_recovery.assert_not_called()
         direct.assert_called_once()
         msg = direct.call_args[0][0]
         self.assertIn("recovery-self-failure", msg)
+        self.assertIn("orchestrator mailbox unreachable", msg)
         self.assertIn("manual intervention", msg)
         self.assertIn("recovery restart wedged", msg)
+
+    def test_orchestrator_leg_writes_to_orchestrators_mailbox(self):
+        # The real leg (not stubbed): a hub message in ORCHESTRATOR's inbox, never Recovery's.
+        from tools import inbox_consumer as ic
+        with patch.object(ic, "_live_telegram_suppressed", return_value=False), \
+             patch.object(ic.mailbox, "send") as send:
+            self.assertTrue(ic._deliver_recovery_self_alert_to_orchestrator("recovery wedged", "restart-failure (recovery)"))
+        self.assertEqual(send.call_args.args[0], ic.ORCHESTRATOR_MAILBOX)
+        self.assertTrue(ic.ORCHESTRATOR_MAILBOX.endswith("/orchestrator"))
+        self.assertIn("recovery wedged", send.call_args.args[1])
+        self.assertEqual(send.call_args.kwargs["subject"], "recovery-self-failure (restart-failure (recovery))")
+        with patch.object(ic, "_live_telegram_suppressed", return_value=False), \
+             patch.object(ic.mailbox, "send", side_effect=OSError("hub down")):
+            self.assertFalse(ic._deliver_recovery_self_alert_to_orchestrator("recovery wedged", "x"))
+
+
+class TestRecoverySelfAlertBackoffT4399(unittest.TestCase):
+    """T-4399: repeats of one Recovery-self failure back off (immediate, then 1h, 4h,
+    daily); a quiet gap starts a new episode; other agents are never throttled."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.path = Path(self._tmp.name) / "backoff.json"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _sends(self, times, vocab="consecutive-skip (recovery)"):
+        from tools import inbox_consumer as ic
+        return [ic._recovery_self_alert_decision(vocab, t, path=self.path)[0] for t in times]
+
+    def test_first_is_immediate_then_1h_4h_daily(self):
+        h = 3600
+        # A persistent fault re-alerting every hour for 3 days.
+        times = [t * h for t in range(0, 74)]
+        sent_at = [t for t, due in zip(times, self._sends(times)) if due]
+        self.assertEqual(sent_at, [0, 1 * h, 5 * h, 29 * h, 53 * h])
+
+    def _sent_at(self, times):
+        return [t for t, due in zip(times, self._sends(times)) if due]
+
+    def test_a_quiet_gap_starts_a_new_episode(self):
+        h = 3600
+        # Hourly until 29h (backed off to daily by then), 7h of silence, then a
+        # recurrence: a new episode, so it alerts at once although the daily backoff
+        # has not run out...
+        times = [t * h for t in range(0, 30)] + [36 * h]
+        self.assertEqual(self._sent_at(times), [0, 1 * h, 5 * h, 29 * h, 36 * h])
+
+    def test_without_a_quiet_gap_the_daily_backoff_holds(self):
+        # ...whereas the same failure recurring every hour stays on the daily cadence.
+        h = 3600
+        times = [t * h for t in range(0, 37)]
+        self.assertEqual(self._sent_at(times), [0, 1 * h, 5 * h, 29 * h])
+
+    def test_vocabs_back_off_independently(self):
+        from tools import inbox_consumer as ic
+        self.assertTrue(ic._recovery_self_alert_decision("a (recovery)", 0, path=self.path)[0])
+        self.assertTrue(ic._recovery_self_alert_decision("b (recovery)", 60, path=self.path)[0])
+        self.assertFalse(ic._recovery_self_alert_decision("a (recovery)", 120, path=self.path)[0])
+
+    def test_unreadable_state_fails_toward_sending(self):
+        from tools import inbox_consumer as ic
+        self.path.write_text("{not json", encoding="utf-8")
+        self.assertTrue(ic._recovery_self_alert_decision("a (recovery)", 0, path=self.path)[0])
+
+    def test_route_backs_off_repeats_and_numbers_them(self):
+        from tools import inbox_consumer as ic
+        clock = {"t": 1_000_000.0}
+        with patch.object(ic, "RECOVERY_SELF_BACKOFF_STATE_PATH", self.path), \
+             patch.object(ic.time, "time", side_effect=lambda: clock["t"]), \
+             patch.object(ic, "_deliver_recovery_self_alert_to_orchestrator", return_value=True) as orchestrator:
+            for step in range(3):   # 0, +30min, +61min
+                clock["t"] = 1_000_000.0 + (0, 1800, 3660)[step]
+                ic.route_failure_alert("recovery", "recovery stuck", "consecutive-skip (recovery)")
+        self.assertEqual(orchestrator.call_count, 2)
+        self.assertNotIn("repeat", orchestrator.call_args_list[0].args[0])
+        self.assertIn("repeat 2 of this failure", orchestrator.call_args_list[1].args[0])
+
+    def test_other_agents_are_never_backed_off(self):
+        from tools import inbox_consumer as ic
+        with patch.object(ic, "RECOVERY_SELF_BACKOFF_STATE_PATH", self.path), \
+             patch.object(ic, "_send_alert_via_recovery") as via_recovery:
+            for _ in range(3):
+                ic.route_failure_alert("orchestrator", "orchestrator wedged", "restart-failure (orchestrator)")
+        self.assertEqual(via_recovery.call_count, 3)
+        self.assertFalse(self.path.exists())
 
 
 class TestRouteFailureAlertMuteT2978(unittest.TestCase):
@@ -1826,7 +1706,7 @@ class TestRouteFailureAlertMuteT2978(unittest.TestCase):
         with patch("tools.inbox_consumer._persona_is_muted", return_value=True), \
              patch("tools.inbox_consumer._send_alert_via_recovery") as via_recovery, \
              patch("tools.inbox_consumer._send_telegram_alert") as direct:
-            route_failure_alert("mnemosyne", "mnemosyne wedged", "restart-failure (mnemosyne)")
+            route_failure_alert("archivist", "archivist wedged", "restart-failure (archivist)")
         via_recovery.assert_not_called()
         direct.assert_not_called()
 
@@ -1962,959 +1842,9 @@ class TestRoutedAuditThrottleT2237Rev2(unittest.TestCase):
             self.assertNotIn(b"mutation-canary", after)
 
 
-class TestCheckThothHealthPaneIntegration(unittest.TestCase):
-    """check_orchestrator_health() invokes the pane probe only after bridge-side
-    signals come back green; pane_wedge alert exercises the alert path."""
-
-    def setUp(self) -> None:
-        # T-0314: see TestCheckThothHealth.setUp — preserve original semantics
-        # by defaulting recovery-pane delivery to False so existing escalation
-        # assertions still match (fallback message includes the original).
-        p = patch("tools.inbox_consumer._send_to_recovery_pane", return_value=False)
-        p.start()
-        self.addCleanup(p.stop)
-
-    def _mock_health(self, payload: dict):
-        resp = MagicMock()
-        resp.__enter__ = lambda s: s
-        resp.__exit__ = MagicMock(return_value=False)
-        resp.read.return_value = json.dumps(payload).encode()
-        return resp
-
-    def test_pane_wedge_fires_when_bridge_green(self):
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": ["orchestrator"],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": "2026-05-05T00:00:00+00:00"},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent",
-                       return_value=("Yes, and allow Claude to edit its own settings",
-                                     "fake pane text")), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "pane_wedge")
-        alert.assert_called_once()
-        self.assertIn("pane_wedge", alert.call_args[0][0]) if False else None  # vocab not in body
-        self.assertIn("dialog", alert.call_args[0][0])
-
-    def test_bridge_red_short_circuits_pane_check(self):
-        """When bridge is red (orchestrator disconnected), the PERSISTENCE-gated wedge
-        check must not run. T-0520: the disconnected branch does a lighter,
-        immediate pane probe (capture + sentinel match) to catch a startup
-        dialog blocking the connect — but NOT _check_pane_wedge_persistent.
-        Here the pane is clean → falls through to the restart recommendation."""
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": [],  # orchestrator disconnected
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": None},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent") as pane, \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture",
-                       return_value="no sentinel here"), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._send_telegram_alert"):
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "orchestrator_disconnected")
-        pane.assert_not_called()
-
-    def test_disconnect_via_allowlisted_dialog_auto_resolves_not_restart(self):
-        """T-0520/T-0525: orchestrator absent from connected_clients BECAUSE a startup
-        dialog blocks the connect. The dialog is allowlisted → auto-resolve fires
-        (send-keys the rule action), NO restart recommendation. Per T-0525 this
-        startup-dialog rule ALSO chains a kickoff inject after the idle prompt
-        appears, so _apply_auto_resolve_action is called twice (dismiss + kickoff)."""
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": [],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": None},
-        }
-        wedged_pane = (
-            "  > 1. I am using this for local development\n"
-            "    2. Exit\n  Enter to confirm · Esc to cancel\n"
-        )
-        # After dismiss, the pane reaches the idle prompt — first capture still
-        # shows the dialog, second shows idle (poll completes on the 2nd probe).
-        idle_pane = "some output\n❯ \n? for shortcuts\n"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-                       tmppath / "wedge"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer.KICKOFF_POLL_INTERVAL_SECONDS", 0.0), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent") as persist, \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture",
-                       side_effect=[wedged_pane, idle_pane]), \
-                 patch("tools.inbox_consumer._apply_auto_resolve_action",
-                       return_value=True) as apply_action, \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._send_telegram_info") as info, \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "pane_wedge_auto_resolved")
-        # auto-resolve applied the ratified dismiss action AND the kickoff; NO
-        # restart escalation alert.
-        self.assertEqual(apply_action.call_count, 2)
-        self.assertEqual(apply_action.call_args_list[0][0][1], ["1", "Enter"])
-        # Second call is the kickoff: prompt text + Enter to ORCHESTRATOR_PANE_TARGET.
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT
-        self.assertEqual(
-            apply_action.call_args_list[1][0][1],
-            [RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT, "Enter"],
-        )
-        info.assert_called_once()
-        self.assertIn("kickoff injected", info.call_args[0][0])
-        alert.assert_not_called()
-        # the persistence-gated check is bypassed in the disconnect branch.
-        persist.assert_not_called()
-
-    def test_disconnect_via_allowlisted_dialog_send_keys_fail_recommends_restart(self):
-        """T-0520: allowlisted dialog detected on a disconnect but send-keys
-        fails → fall through to the restart recommendation (fail-safe)."""
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": [],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": None},
-        }
-        wedged_pane = "I am using this for local development\nExit\n"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-                       tmppath / "wedge"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture",
-                       return_value=wedged_pane), \
-                 patch("tools.inbox_consumer._apply_auto_resolve_action",
-                       return_value=False), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "orchestrator_disconnected")
-        alert.assert_called_once()
-        self.assertIn("connected_clients", alert.call_args[0][0])
-
-    def test_pane_clean_returns_none(self):
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": ["orchestrator"],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": "2026-05-05T00:00:00+00:00"},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent",
-                       return_value=None), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertIsNone(vocab)
-        alert.assert_not_called()
-
-
-class TestAutoResolveAllowlist(unittest.TestCase):
-    """T-0201: auto-resolve allowlist applies remediation in-cycle + emits info Telegram."""
-
-    def setUp(self) -> None:
-        # T-0314: see TestCheckThothHealth.setUp — preserve original semantics.
-        p = patch("tools.inbox_consumer._send_to_recovery_pane", return_value=False)
-        p.start()
-        self.addCleanup(p.stop)
-
-    def _mock_health(self, payload):
-        m = MagicMock()
-        m.__enter__ = lambda self: m
-        m.__exit__ = lambda self, *a: False
-        m.read = lambda: json.dumps(payload).encode("utf-8")
-        return m
-
-    def _bridge_green(self):
-        return {
-            "telegram_connected": True,
-            "connected_clients": ["orchestrator"],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": "2026-05-05T00:00:00+00:00"},
-        }
-
-    def test_dev_channels_sentinel_auto_resolves(self):
-        """Allowlisted sentinel → action applied + info Telegram + auto_resolved vocab."""
-        payload = self._bridge_green()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            wedge_state = tmppath / "wedge_state"
-            wedge_state.write_text("12345", encoding="utf-8")  # pretend wedge state existed
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-                       wedge_state), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent",
-                       return_value=("I am using this for local development",
-                                     "fake pane text for dev channels")), \
-                 patch("tools.inbox_consumer._poll_orchestrator_pane_for_idle",
-                       return_value=True), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.subprocess.run") as run, \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "pane_wedge_auto_resolved")
-        # T-0525: startup-dialog rule chains dismiss -> kickoff, so send-keys is
-        # called 4x: dismiss "1"+"Enter", then kickoff prompt + "Enter".
-        # Each wrapped in `sudo -u claude bash -c '... tmux send-keys -t pane <op>'`
-        # so the literal op lives inside the shell-cmd string at argv[5].
-        self.assertEqual(run.call_count, 4)
-        self.assertIn("send-keys -t claude-telegram-bot:0 1",
-                      run.call_args_list[0][0][0][5])
-        self.assertIn("send-keys -t claude-telegram-bot:0 Enter",
-                      run.call_args_list[1][0][0][5])
-        # Kickoff inject: prompt text then Enter, same cross-account path.
-        self.assertIn("Read /home/claude/HANDOFF.md",
-                      run.call_args_list[2][0][0][5])
-        self.assertIn("send-keys -t claude-telegram-bot:0 Enter",
-                      run.call_args_list[3][0][0][5])
-        # Cross-account wrapper present (checked on dismiss + kickoff).
-        self.assertEqual(run.call_args_list[0][0][0][0], "sudo")
-        self.assertEqual(run.call_args_list[0][0][0][2], "claude")
-        self.assertEqual(run.call_args_list[2][0][0][0], "sudo")
-        self.assertEqual(run.call_args_list[2][0][0][2], "claude")
-        # Informational Telegram sent (still through _send_telegram_alert under
-        # the hood, but tagged as auto-resolve).
-        alert.assert_called_once()
-        self.assertIn("[recovery auto-resolve]", alert.call_args[0][0])
-        self.assertIn("I am using this for local development", alert.call_args[0][0])
-        # Wedge-state cleared
-        self.assertFalse(wedge_state.exists())
-
-    def test_non_allowlisted_sentinel_escalates(self):
-        """Sentinel NOT in allowlist → standard escalation Telegram (no auto-action)."""
-        payload = self._bridge_green()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent",
-                       return_value=("Yes, and don't ask again for",
-                                     "fake pane text")), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.subprocess.run") as run, \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        # Escalation path: vocab is pane_wedge (not auto_resolved); send-keys NOT
-        # called; alert IS called with the escalation message.
-        self.assertEqual(vocab, "pane_wedge")
-        run.assert_not_called()
-        alert.assert_called_once()
-        self.assertIn("Orchestrator's loop is blocked", alert.call_args[0][0])
-
-    def test_auto_resolve_send_keys_failure_falls_back_to_escalate(self):
-        """If tmux send-keys fails, fall back to standard escalation."""
-        payload = self._bridge_green()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent",
-                       return_value=("I am using this for local development",
-                                     "fake pane text")), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.subprocess.run") as run, \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                # send-keys returns non-zero → action failed
-                run.return_value = MagicMock(returncode=1, stdout="", stderr="tmux died")
-                vocab = check_orchestrator_health()
-        # Fell through to escalation
-        self.assertEqual(vocab, "pane_wedge")
-        alert.assert_called_once()
-        self.assertIn("Orchestrator's loop is blocked", alert.call_args[0][0])
-
-    def test_new_sentinel_do_you_want_to_proceed_detected_but_escalates(self):
-        """T-0142 sentinel addition: 'Do you want to proceed?' detected, but never auto-resolved."""
-        from tools.inbox_consumer import PANE_WEDGE_SENTINELS, RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        self.assertIn("Do you want to proceed?", PANE_WEDGE_SENTINELS)
-        self.assertNotIn("Do you want to proceed?", RECOVERY_AUTO_RESOLVE_ALLOWLIST)
-
-    def test_new_sentinel_dont_ask_again_detected_but_escalates(self):
-        """T-0142 sentinel addition: option-2 'don't ask again' detected, never auto-resolved (expands trust)."""
-        from tools.inbox_consumer import PANE_WEDGE_SENTINELS, RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        self.assertIn("Yes, and don't ask again for", PANE_WEDGE_SENTINELS)
-        self.assertNotIn("Yes, and don't ask again for", RECOVERY_AUTO_RESOLVE_ALLOWLIST)
-
-    def test_allowlist_shape_invariant(self):
-        """Every allowlist entry's sentinel must also appear in PANE_WEDGE_SENTINELS."""
-        from tools.inbox_consumer import PANE_WEDGE_SENTINELS, RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        for sentinel in RECOVERY_AUTO_RESOLVE_ALLOWLIST:
-            self.assertIn(sentinel, PANE_WEDGE_SENTINELS,
-                          f"allowlist entry {sentinel!r} not in PANE_WEDGE_SENTINELS")
-
-    def test_option_2_settings_edit_NOT_auto_resolved(self):
-        """T-0142 §3 explicitly-disallowed: 'Yes, and allow Claude to edit its own settings' must NEVER be allowlisted (expands trust scope)."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        self.assertNotIn("Yes, and allow Claude to edit its own settings",
-                         RECOVERY_AUTO_RESOLVE_ALLOWLIST)
-
-    def test_T0358_new_option_2_variant_detected_but_escalates(self):
-        """T-0358 sentinel addition: 'Yes, allow all edits during this session' (newer Claude Code phrasing) detected, never auto-resolved (expands trust)."""
-        from tools.inbox_consumer import PANE_WEDGE_SENTINELS, RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        self.assertIn("Yes, allow all edits during this session", PANE_WEDGE_SENTINELS)
-        self.assertNotIn("Yes, allow all edits during this session", RECOVERY_AUTO_RESOLVE_ALLOWLIST)
-
-    def test_T0358_dialog_header_detected(self):
-        """T-0358 structural fix: catch the Edit/Write dialog by its question text, not just by trust-expansion text."""
-        from tools.inbox_consumer import PANE_WEDGE_SENTINELS, _pane_wedge_match
-        self.assertIn("Do you want to make this edit to", PANE_WEDGE_SENTINELS)
-        # Synthetic pane with the new dialog header but unfamiliar option-2 wording
-        # — should still match.
-        pane = """
- Do you want to make this edit to FUTURE_FILE.md?
- ❯ 1. Yes
-   2. <some new option-2 wording we have not seen yet>
-   3. No
-"""
-        self.assertEqual(_pane_wedge_match(pane), "Do you want to make this edit to")
-
-    def test_T0358_modal_footer_esc_tab_detected(self):
-        """T-0358 structural fix (footer-based detection): 'Esc to cancel · Tab to amend' footer alone catches any future modal."""
-        from tools.inbox_consumer import PANE_WEDGE_SENTINELS, _pane_wedge_match
-        self.assertIn("Esc to cancel · Tab to amend", PANE_WEDGE_SENTINELS)
-        # Synthetic pane with a fully-novel question + options BUT the canonical
-        # Claude Code modal footer — should still match via footer.
-        pane = """
- Some question we have never seen before that is blocking the loop?
- ❯ 1. Yes
-   2. No
-
- Esc to cancel · Tab to amend
-"""
-        # Will match either dialog header (if present) OR footer; here just footer.
-        match = _pane_wedge_match(pane)
-        self.assertIsNotNone(match)
-        # Must be one of the new T-0358 detectors.
-        self.assertIn(match, ("Esc to cancel · Tab to amend",))
-
-    def test_T0358_modal_footer_enter_esc_detected(self):
-        """T-0358 structural fix (footer-based detection): 'Enter to confirm · Esc to cancel' (dev-channels-style footer)."""
-        from tools.inbox_consumer import PANE_WEDGE_SENTINELS, _pane_wedge_match
-        self.assertIn("Enter to confirm · Esc to cancel", PANE_WEDGE_SENTINELS)
-        pane = """
- A novel yes-or-exit modal we haven't seen before?
- ❯ 1. Yes, do the thing
-   2. Exit
-
- Enter to confirm · Esc to cancel
-"""
-        match = _pane_wedge_match(pane)
-        self.assertIsNotNone(match)
-        self.assertIn(match, ("Enter to confirm · Esc to cancel",))
-
-    def test_T0358_footer_sentinels_NOT_auto_resolved(self):
-        """Footer-based sentinels are detect-only — never auto-resolve (we don't know what option means what without specific text)."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        self.assertNotIn("Esc to cancel · Tab to amend", RECOVERY_AUTO_RESOLVE_ALLOWLIST)
-        self.assertNotIn("Enter to confirm · Esc to cancel", RECOVERY_AUTO_RESOLVE_ALLOWLIST)
-        # NOTE: "Do you want to make this edit to" is now allowlisted (T-0489 posture-C
-        # wiring; ratified T-0480). The guard here covered the pre-T-0489 state; removed
-        # to reflect the ratified boundary. The trust-expansion option-2 variants
-        # (test_option_2_trust_expansions_not_in_allowlist in TestPostureCPredicateBoundaries)
-        # carry the exclusion discipline forward.
-
-
-class TestAutoResolveRuleStructure(unittest.TestCase):
-    """T-0479: AutoResolveRule dataclass structure + RECOVERY_AUTO_RESOLVE_ALLOWLIST shape."""
-
-    def test_auto_resolve_rule_is_frozen_dataclass(self):
-        """AutoResolveRule must be a frozen dataclass — rules are immutable config."""
-        from tools.inbox_consumer import AutoResolveRule
-        import dataclasses
-        self.assertTrue(dataclasses.is_dataclass(AutoResolveRule))
-        fields_meta = dataclasses.fields(AutoResolveRule)
-        # Frozen check: assignment to a field must raise FrozenInstanceError.
-        rule = AutoResolveRule(
-            sentinel="test",
-            predicate=lambda _: True,
-            action=["1", "Enter"],
-            escalate_template="test escalation",
-        )
-        with self.assertRaises(dataclasses.FrozenInstanceError):
-            rule.sentinel = "other"  # type: ignore[misc]
-
-    def test_auto_resolve_rule_field_names(self):
-        """AutoResolveRule has sentinel, predicate, action, escalate_template fields."""
-        from tools.inbox_consumer import AutoResolveRule
-        import dataclasses
-        field_names = {f.name for f in dataclasses.fields(AutoResolveRule)}
-        self.assertIn("sentinel", field_names)
-        self.assertIn("predicate", field_names)
-        self.assertIn("action", field_names)
-        self.assertIn("escalate_template", field_names)
-
-    def test_allowlist_values_are_auto_resolve_rules(self):
-        """Every value in RECOVERY_AUTO_RESOLVE_ALLOWLIST is an AutoResolveRule."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST, AutoResolveRule
-        for sentinel, rule in RECOVERY_AUTO_RESOLVE_ALLOWLIST.items():
-            self.assertIsInstance(
-                rule, AutoResolveRule,
-                f"allowlist[{sentinel!r}] is not an AutoResolveRule"
-            )
-
-    def test_allowlist_keys_match_rule_sentinel_field(self):
-        """Dict key must equal rule.sentinel for every entry."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        for key, rule in RECOVERY_AUTO_RESOLVE_ALLOWLIST.items():
-            self.assertEqual(
-                key, rule.sentinel,
-                f"key {key!r} != rule.sentinel {rule.sentinel!r}"
-            )
-
-    def test_dev_channels_rule_action_unchanged(self):
-        """Dev-channels rule action must remain byte-identical after migration."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["I am using this for local development"]
-        self.assertEqual(rule.action, ["1", "Enter"])
-
-    def test_dev_channels_rule_predicate_always_true(self):
-        """Dev-channels rule predicate returns True for any pane text (always-True)."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["I am using this for local development"]
-        self.assertTrue(rule.predicate("any pane content"))
-        self.assertTrue(rule.predicate(""))
-        self.assertTrue(rule.predicate("something completely unrelated"))
-
-    def test_dev_channels_rule_has_escalate_template(self):
-        """Dev-channels rule escalate_template is a non-empty string."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["I am using this for local development"]
-        self.assertIsInstance(rule.escalate_template, str)
-        self.assertTrue(len(rule.escalate_template) > 0)
-
-
-class TestStartupDialogKickoffChain(unittest.TestCase):
-    """T-0525: startup-dialog wedge auto-resolve chains dismiss -> kickoff inject.
-
-    The startup-dialog rule ("I am using this for local development") carries a
-    kickoff_prompt; other allowlisted rules do not (dismiss-only). After a
-    successful dismiss, the resolver polls the pane for the idle prompt and then
-    injects the kickoff via the SAME cross-account path as the dismiss.
-
-    All tmux/capture/subprocess + Telegram are mocked; poll bounds patched so the
-    suite never sleeps.
-    """
-
-    STARTUP_SENTINEL = "I am using this for local development"
-
-    def test_startup_rule_carries_kickoff_prompt(self):
-        from tools.inbox_consumer import (
-            RECOVERY_AUTO_RESOLVE_ALLOWLIST,
-            RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT,
-        )
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST[self.STARTUP_SENTINEL]
-        self.assertEqual(rule.kickoff_prompt, RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT)
-        # Canonical kickoff text (byte-aligned with handoff_and_restart.sh step 8).
-        self.assertIn("Read /home/claude/HANDOFF.md", rule.kickoff_prompt)
-        self.assertIn("chat_id 456474197", rule.kickoff_prompt)
-
-    def test_kickoff_prompt_default_is_none_for_other_rules(self):
-        """Every NON-startup allowlisted rule must stay dismiss-only (no kickoff)."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        for sentinel, rule in RECOVERY_AUTO_RESOLVE_ALLOWLIST.items():
-            if sentinel == self.STARTUP_SENTINEL:
-                continue
-            self.assertIsNone(
-                rule.kickoff_prompt,
-                f"non-startup rule {sentinel!r} unexpectedly has a kickoff_prompt",
-            )
-
-    def test_kickoff_prompt_field_default_none(self):
-        """AutoResolveRule.kickoff_prompt defaults to None (safe for existing rules)."""
-        from tools.inbox_consumer import AutoResolveRule
-        rule = AutoResolveRule(
-            sentinel="x", predicate=lambda _: True,
-            action=["1", "Enter"], escalate_template="t",
-        )
-        self.assertIsNone(rule.kickoff_prompt)
-
-    def test_startup_dialog_dismiss_then_kickoff_after_idle(self):
-        """Startup-dialog auto-resolve: dismiss applied, then (after idle appears)
-        the kickoff prompt + Enter sent to ORCHESTRATOR_PANE_TARGET via cross-account."""
-        from tools.inbox_consumer import (
-            _auto_resolve_if_allowlisted,
-            RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT,
-            ORCHESTRATOR_PANE_TARGET,
-        )
-        dialog_pane = "  > 1. I am using this for local development\n  2. Exit\n"
-        idle_pane = "some output\n❯ \n? for shortcuts\n"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-                       tmppath / "wedge"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer.KICKOFF_POLL_INTERVAL_SECONDS", 0.0), \
-                 patch("tools.inbox_consumer._apply_auto_resolve_action",
-                       return_value=True) as apply_action, \
-                 patch("tools.inbox_consumer._orchestrator_pane_capture",
-                       side_effect=[dialog_pane, idle_pane]), \
-                 patch("tools.inbox_consumer._send_telegram_info") as info:
-                vocab = _auto_resolve_if_allowlisted(
-                    self.STARTUP_SENTINEL, dialog_pane
-                )
-        self.assertEqual(vocab, "pane_wedge_auto_resolved")
-        # Two applies: dismiss then kickoff, both to ORCHESTRATOR_PANE_TARGET.
-        self.assertEqual(apply_action.call_count, 2)
-        self.assertEqual(apply_action.call_args_list[0][0][0], ORCHESTRATOR_PANE_TARGET)
-        self.assertEqual(apply_action.call_args_list[0][0][1], ["1", "Enter"])
-        self.assertEqual(apply_action.call_args_list[1][0][0], ORCHESTRATOR_PANE_TARGET)
-        self.assertEqual(
-            apply_action.call_args_list[1][0][1],
-            [RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT, "Enter"],
-        )
-        info.assert_called_once()
-        self.assertIn("kickoff injected", info.call_args[0][0])
-        self.assertIn("idle confirmed", info.call_args[0][0])
-
-    def test_non_startup_dialog_dismiss_only_no_kickoff(self):
-        """A non-startup allowlisted dialog (e.g. 'Do you want to create' with a
-        passing predicate) → dismiss ONLY, kickoff text NEVER sent."""
-        from tools.inbox_consumer import (
-            _auto_resolve_if_allowlisted,
-            RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT,
-        )
-        sentinel = "Do you want to create"
-        pane = "Do you want to create /home/claude/some/file.txt?\n ❯ 1. Yes\n"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-                       tmppath / "wedge"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer.path_in_agent_cwd", return_value=True), \
-                 patch("tools.inbox_consumer.extract_file_dialog_path",
-                       return_value="/home/claude/some/file.txt"), \
-                 patch("tools.inbox_consumer._apply_auto_resolve_action",
-                       return_value=True) as apply_action, \
-                 patch("tools.inbox_consumer._poll_orchestrator_pane_for_idle") as poll, \
-                 patch("tools.inbox_consumer._send_telegram_info") as info:
-                vocab = _auto_resolve_if_allowlisted(sentinel, pane)
-        self.assertEqual(vocab, "pane_wedge_auto_resolved")
-        # Dismiss only — exactly one apply, and it's the dismiss action.
-        apply_action.assert_called_once()
-        self.assertEqual(apply_action.call_args[0][1], ["1", "Enter"])
-        # Poll for idle never even runs (gated on kickoff_prompt being set).
-        poll.assert_not_called()
-        # Kickoff text was never sent to the pane.
-        for c in apply_action.call_args_list:
-            self.assertNotIn(RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT, c[0][1])
-        # Audit Telegram has no kickoff note.
-        info.assert_called_once()
-        self.assertNotIn("kickoff", info.call_args[0][0])
-
-    def test_dismiss_send_keys_fail_no_kickoff_returns_none(self):
-        """Dismiss send-keys fails → no kickoff attempted, returns None (escalate)."""
-        from tools.inbox_consumer import _auto_resolve_if_allowlisted
-        dialog_pane = "I am using this for local development\nExit\n"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-                       tmppath / "wedge"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._apply_auto_resolve_action",
-                       return_value=False) as apply_action, \
-                 patch("tools.inbox_consumer._poll_orchestrator_pane_for_idle") as poll, \
-                 patch("tools.inbox_consumer._send_telegram_info") as info:
-                vocab = _auto_resolve_if_allowlisted(
-                    self.STARTUP_SENTINEL, dialog_pane
-                )
-        self.assertIsNone(vocab)
-        # Only the dismiss apply was attempted (returned False); no kickoff.
-        apply_action.assert_called_once()
-        poll.assert_not_called()
-        info.assert_not_called()
-
-    def test_idle_poll_timeout_best_effort_kickoff_and_warns(self):
-        """Idle poll times out (pane never goes idle) → best-effort kickoff still
-        attempted + a warning logged."""
-        from tools.inbox_consumer import (
-            _auto_resolve_if_allowlisted,
-            RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT,
-        )
-        dialog_pane = "  > 1. I am using this for local development\n"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            log_path = tmppath / "log"
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-                       tmppath / "wedge"), \
-                 patch("tools.inbox_consumer.LOG_PATH", log_path), \
-                 patch("tools.inbox_consumer._poll_orchestrator_pane_for_idle",
-                       return_value=False) as poll, \
-                 patch("tools.inbox_consumer._apply_auto_resolve_action",
-                       return_value=True) as apply_action, \
-                 patch("tools.inbox_consumer._send_telegram_info") as info:
-                vocab = _auto_resolve_if_allowlisted(
-                    self.STARTUP_SENTINEL, dialog_pane
-                )
-                # Read the log INSIDE the tempdir context (it's removed on exit).
-                log_text = log_path.read_text(encoding="utf-8")
-        self.assertEqual(vocab, "pane_wedge_auto_resolved")
-        poll.assert_called_once()
-        # Best-effort kickoff STILL attempted despite the timeout (dismiss + kickoff).
-        self.assertEqual(apply_action.call_count, 2)
-        self.assertEqual(
-            apply_action.call_args_list[1][0][1],
-            [RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT, "Enter"],
-        )
-        # Timeout surfaced in the log + audit telegram.
-        self.assertIn("kickoff_idle_poll_timeout", log_text)
-        info.assert_called_once()
-        self.assertIn("best-effort", info.call_args[0][0])
-        self.assertIn("idle poll timed out", info.call_args[0][0])
-
-
-class TestPollThothPaneForIdle(unittest.TestCase):
-    """T-0525: bounded poll for the TUI idle prompt after a dismiss."""
-
-    def test_idle_appears_returns_true(self):
-        from tools.inbox_consumer import _poll_orchestrator_pane_for_idle
-        idle_pane = "out\n❯ \nesc to interrupt\n"
-        with patch("tools.inbox_consumer.KICKOFF_POLL_INTERVAL_SECONDS", 0.0), \
-             patch("tools.inbox_consumer._orchestrator_pane_capture",
-                   return_value=idle_pane):
-            self.assertTrue(_poll_orchestrator_pane_for_idle("dialog sentinel"))
-
-    def test_dialog_still_present_not_idle_until_cleared(self):
-        """Dialog sentinel must be gone AND an idle sentinel present to count idle."""
-        from tools.inbox_consumer import _poll_orchestrator_pane_for_idle
-        dialog_then_idle = [
-            "I am using this for local development\n❯ \n",  # dialog still up
-            "booting...\n",                                  # transitional, no idle
-            "ready\n❯ \n? for shortcuts\n",                  # idle, dialog gone
-        ]
-        with patch("tools.inbox_consumer.KICKOFF_POLL_INTERVAL_SECONDS", 0.0), \
-             patch("tools.inbox_consumer._orchestrator_pane_capture",
-                   side_effect=dialog_then_idle):
-            self.assertTrue(
-                _poll_orchestrator_pane_for_idle("I am using this for local development")
-            )
-
-    def test_timeout_returns_false(self):
-        from tools.inbox_consumer import _poll_orchestrator_pane_for_idle
-        # Pane never goes idle; with timeout=0 the loop probes once then bails.
-        with patch("tools.inbox_consumer.KICKOFF_POLL_TIMEOUT_SECONDS", 0.0), \
-             patch("tools.inbox_consumer.KICKOFF_POLL_INTERVAL_SECONDS", 0.0), \
-             patch("tools.inbox_consumer._orchestrator_pane_capture",
-                   return_value="still booting, no prompt yet\n"):
-            self.assertFalse(_poll_orchestrator_pane_for_idle("dialog"))
-
-    def test_capture_none_does_not_crash(self):
-        """A None capture (pane unreachable) is tolerated; poll keeps trying / times out."""
-        from tools.inbox_consumer import _poll_orchestrator_pane_for_idle
-        with patch("tools.inbox_consumer.KICKOFF_POLL_TIMEOUT_SECONDS", 0.0), \
-             patch("tools.inbox_consumer.KICKOFF_POLL_INTERVAL_SECONDS", 0.0), \
-             patch("tools.inbox_consumer._orchestrator_pane_capture", return_value=None):
-            self.assertFalse(_poll_orchestrator_pane_for_idle("dialog"))
-
-
-class TestAutoResolvePredicateFalseBranch(unittest.TestCase):
-    """T-0479: predicate-False → escalate-with-diagnostic path.
-
-    Tests use a TEST-ONLY rule (not wired in live ALLOWLIST) to prove the
-    False-branch. The live ALLOWLIST is patched with a test-only dict for
-    these tests.
-    """
-
-    def setUp(self) -> None:
-        p = patch("tools.inbox_consumer._send_to_recovery_pane", return_value=False)
-        p.start()
-        self.addCleanup(p.stop)
-
-    def _mock_health(self, payload):
-        m = MagicMock()
-        m.__enter__ = lambda self: m
-        m.__exit__ = lambda self, *a: False
-        m.read = lambda: json.dumps(payload).encode("utf-8")
-        return m
-
-    def _bridge_green(self):
-        return {
-            "telegram_connected": True,
-            "connected_clients": ["orchestrator"],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": "2026-05-05T00:00:00+00:00"},
-        }
-
-    def test_predicate_false_escalates_with_template(self):
-        """Predicate returns False → escalation fires with rendered escalate_template."""
-        from tools.inbox_consumer import AutoResolveRule, check_orchestrator_health
-
-        test_sentinel = "test sentinel for T-0479"
-        test_template = "Predicate-False escalation for sentinel={sentinel!r} pane_excerpt={excerpt!r}"
-
-        # TEST-ONLY rule: predicate always returns False.
-        test_rule = AutoResolveRule(
-            sentinel=test_sentinel,
-            predicate=lambda _pane: False,
-            action=["1", "Enter"],
-            escalate_template=test_template,
-        )
-
-        payload = self._bridge_green()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent",
-                       return_value=(test_sentinel, "fake pane content")), \
-                 patch("tools.inbox_consumer.RECOVERY_AUTO_RESOLVE_ALLOWLIST",
-                       {test_sentinel: test_rule}), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.subprocess.run") as run, \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-
-        # Predicate False: escalates (not auto_resolved); no tmux send-keys.
-        self.assertEqual(vocab, "pane_wedge")
-        run.assert_not_called()
-        alert.assert_called_once()
-        delivered = alert.call_args[0][0]
-        # Escalation message should contain the template-rendered diagnostic.
-        self.assertIn("Predicate-False escalation", delivered)
-
-    def test_predicate_true_auto_resolves(self):
-        """Predicate returns True → action applied, auto_resolved vocab."""
-        from tools.inbox_consumer import AutoResolveRule, check_orchestrator_health
-
-        test_sentinel = "test sentinel T-0479 true"
-        test_rule = AutoResolveRule(
-            sentinel=test_sentinel,
-            predicate=lambda _pane: True,
-            action=["1", "Enter"],
-            escalate_template="should not appear",
-        )
-
-        payload = self._bridge_green()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            wedge_state = tmppath / "wedge_state"
-            wedge_state.write_text("12345", encoding="utf-8")
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-                       wedge_state), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent",
-                       return_value=(test_sentinel, "pane text for test")), \
-                 patch("tools.inbox_consumer.RECOVERY_AUTO_RESOLVE_ALLOWLIST",
-                       {test_sentinel: test_rule}), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.subprocess.run") as run, \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                vocab = check_orchestrator_health()
-
-        self.assertEqual(vocab, "pane_wedge_auto_resolved")
-        self.assertEqual(run.call_count, 2)  # "1" + "Enter"
-        alert.assert_called_once()
-        self.assertIn("[recovery auto-resolve]", alert.call_args[0][0])
-        self.assertFalse(wedge_state.exists())  # cleared
-
-
-class TestEscalateRoutingT0314(unittest.TestCase):
-    """T-0314: escalation alerts route to Recovery's pane first; the operator gets an
-    informational audit Telegram. On recovery-pane failure, fall back to the operator
-    Telegram with [fallback: ...] prefix so the routing bypass is visible.
-    """
-
-    def _mock_health(self, payload):
-        m = MagicMock()
-        m.__enter__ = lambda self: m
-        m.__exit__ = lambda self, *a: False
-        m.read = lambda: json.dumps(payload).encode("utf-8")
-        return m
-
-    def _bridge_green(self):
-        return {
-            "telegram_connected": True,
-            "connected_clients": ["orchestrator"],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": "2026-05-05T00:00:00+00:00"},
-        }
-
-    def test_a_escalate_routes_to_recovery_pane_first(self):
-        """Sentinel match without allowlist entry → recovery-pane delivery succeeds
-        → audit Telegram to the operator (NOT the original escalation alert)."""
-        payload = self._bridge_green()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent",
-                       return_value=("Yes, and allow Claude to edit its own settings",
-                                     "fake pane text")), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._send_to_recovery_pane",
-                       return_value=True) as recovery_pane, \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "pane_wedge")
-        # Recovery-pane received the full alert text (so Recovery can act on it).
-        recovery_pane.assert_called_once()
-        delivered = recovery_pane.call_args[0][0]
-        self.assertIn("Orchestrator's loop is blocked", delivered)
-        # the operator got an informational audit Telegram (NOT the original alert).
-        # _send_telegram_info delegates to _send_telegram_alert, so we still
-        # observe one call here — but with the [recovery routed] prefix.
-        alert.assert_called_once()
-        audit = alert.call_args[0][0]
-        self.assertIn("[recovery routed]", audit)
-        # TG 5380 fix: the audit now LEADS with the alert's own first line (so the
-        # operator sees which channel/subject is alerting), rather than the vocab.
-        self.assertIn("Orchestrator's loop is blocked", audit)
-
-    def test_b_recovery_pane_failure_falls_back_with_retry_flag(self):
-        """Recovery-pane delivery fails → fallback the operator Telegram, prefixed with
-        [fallback: recovery-pane unreachable] so the bypass is visible."""
-        payload = self._bridge_green()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent",
-                       return_value=("Yes, and allow Claude to edit its own settings",
-                                     "fake pane text")), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer._send_to_recovery_pane",
-                       return_value=False), \
-                 patch("tools.inbox_consumer._deliver_alert_to_recovery_mailbox",
-                       return_value=False), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "pane_wedge")
-        alert.assert_called_once()
-        delivered = alert.call_args[0][0]
-        # T-3474: operator-fallback now requires BOTH the pane AND the recovery-mailbox
-        # leg to fail (mailbox mocked False above); the prefix names both.
-        self.assertIn("[fallback: recovery pane+mailbox unreachable]", delivered)
-        self.assertIn("Orchestrator's loop is blocked", delivered)
-
-    def test_c_auto_resolve_does_not_call_recovery_pane(self):
-        """Successful auto-resolve continues to use _send_telegram_info informational
-        path; recovery-pane routing is NOT invoked (different code path entirely)."""
-        payload = self._bridge_green()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            wedge_state = tmppath / "wedge_state"
-            wedge_state.write_text("12345", encoding="utf-8")
-            with patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                       tmppath / "alert"), \
-                 patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-                       wedge_state), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent",
-                       return_value=("I am using this for local development",
-                                     "fake pane text for dev channels")), \
-                 patch("urllib.request.urlopen",
-                       return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.subprocess.run") as run, \
-                 patch("tools.inbox_consumer._send_to_recovery_pane") as recovery_pane, \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                run.return_value = MagicMock(returncode=0, stdout="", stderr="")
-                vocab = check_orchestrator_health()
-        self.assertEqual(vocab, "pane_wedge_auto_resolved")
-        recovery_pane.assert_not_called()
-        # Auto-resolve still emits its informational Telegram (via _send_telegram_info → _send_telegram_alert).
-        alert.assert_called_once()
-        self.assertIn("[recovery auto-resolve]", alert.call_args[0][0])
-
-
 # T-1036: TestAppendSyncAlertLedgerRouting + TestPantheonConfigSyncAlert removed
 # — the sync-alert detection/routing they covered was retired (the T-0365
 # pantheon-config-sync timer that fed it is gone).
-
-
-class TestMainWardThothHealthIntegration(unittest.TestCase):
-    """main(agent='recovery') runs the per-agent health probe; main(agent='orchestrator') does not.
-
-    T-0541: main("recovery") now calls check_agent_health("orchestrator") and
-    check_agent_health("specialist") exactly once each via the loop — replacing the
-    former standalone check_orchestrator_health() call. Tests updated accordingly.
-    check_orchestrator_health() remains as an alias but is no longer called by main().
-    """
-
-    def test_recovery_runs_probe(self):
-        # T-0541: probe is now check_agent_health (loop), not check_orchestrator_health.
-        with patch("tools.inbox_consumer.check_agent_health") as probe, \
-             patch("tools.inbox_consumer.check_autonomy_off",
-                   side_effect=SkipCycle("off_switch")), \
-             patch("tools.inbox_consumer.log_outcome"), \
-             patch("tools.inbox_consumer.check_consecutive_skips"):
-            probe.return_value = None
-            main("recovery")
-        # Every monitored agent is probed exactly once each.
-        called_agents = [c[0][0] for c in probe.call_args_list]
-        self.assertIn("orchestrator", called_agents)
-        self.assertIn("specialist", called_agents)
-        self.assertIn("recovery", called_agents)  # T-0559: recovery self-probes too
-        self.assertIn("metis", called_agents)  # T-1940: ORG-043 seats probed
-        self.assertIn("atlas", called_agents)
-        self.assertEqual(probe.call_count, 5)
-
-    def test_orchestrator_skips_probe(self):
-        # T-0541: check_agent_health (not check_orchestrator_health) is the loop path.
-        with patch("tools.inbox_consumer.check_agent_health") as probe, \
-             patch("tools.inbox_consumer.check_autonomy_off",
-                   side_effect=SkipCycle("off_switch")), \
-             patch("tools.inbox_consumer.log_outcome"), \
-             patch("tools.inbox_consumer.check_consecutive_skips"):
-            main("orchestrator")
-        probe.assert_not_called()
-
-    def test_recovery_probe_exception_does_not_break_flow(self):
-        """If the probe raises, the main cycle still completes its skip."""
-        with patch("tools.inbox_consumer.check_agent_health",
-                   side_effect=RuntimeError("bridge boom")), \
-             patch("tools.inbox_consumer.check_autonomy_off",
-                   side_effect=SkipCycle("off_switch")), \
-             patch("tools.inbox_consumer.log_outcome") as log, \
-             patch("tools.inbox_consumer.check_consecutive_skips"):
-            rc = main("recovery")
-        self.assertEqual(rc, 0)
-        # The skip:off_switch outcome must still have been logged.
-        skip_calls = [c for c in log.call_args_list if c.args[1] == "skip:off_switch"]
-        self.assertEqual(len(skip_calls), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -2928,8 +1858,18 @@ from tools.inbox_consumer import (  # noqa: E402 (already imported above; re-imp
 )
 
 
-class TestArgusRouting(unittest.TestCase):
+class TestSpecialistRouting(unittest.TestCase):
     """Tests for T-0102 Phase 1: specialist entry in TMUX_TARGET_BY_AGENT."""
+
+    def setUp(self):
+        _isolate_git_mutation_lock(self)  # T-4300
+        # T-3832 (2026-09-20): specialist consolidated to send-keys; codex is the sole
+        # real mailbox agent. The mailbox-routing tests below exercise the mechanism
+        # using specialist as a fixture, so force its mode rather than depend on the live
+        # DELIVERY_MODE. (TMUX_TARGET_BY_AGENT tests are unaffected either way.)
+        self._orig_dm = dict(DELIVERY_MODE)
+        DELIVERY_MODE["specialist"] = "mailbox"
+        self.addCleanup(lambda: (DELIVERY_MODE.clear(), DELIVERY_MODE.update(self._orig_dm)))
 
     # ------------------------------------------------------------------
     # Test 1 — key present + env-var override wired
@@ -3048,7 +1988,7 @@ class TestArgusRouting(unittest.TestCase):
             # T-0538: inject now uses helper — detect by helper path, not raw send-keys
             inject_calls = [c for c in mock_run.call_args_list
                             if str(c[0][0][0]).endswith("send_keys_submit.sh")]
-            targets_used = [c[0][0][1] for c in inject_calls]  # 2nd arg is pane target
+            targets_used = [c[0][0][-2] for c in inject_calls]  # pane target is 2nd-to-last (T-4792)
             self.assertTrue(len(inject_calls) >= 1)
             for tgt in targets_used:
                 self.assertEqual(tgt, "claude-telegram-bot")
@@ -3090,10 +2030,6 @@ class TestArgusRouting(unittest.TestCase):
                 patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
                 patch("tools.inbox_consumer.LOG_PATH", log_path),
                 patch("tools.inbox_consumer.TMUX_TARGET_BY_AGENT", post_addition_map),
-                patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_LAST_ALERT_PATH",
-                      Path(tmp) / "orchestrator_health_last_alert_at"),
-                patch("tools.inbox_consumer.ORCHESTRATOR_HEALTH_PANE_WEDGE_STATE_PATH",
-                      Path(tmp) / "orchestrator_pane_wedge_first_seen_at"),
                 patch("urllib.request.urlopen", return_value=resp),
                 patch("subprocess.run", side_effect=fake_run) as mock_run,
                 patch("tools.inbox_consumer.time"),
@@ -3104,7 +2040,7 @@ class TestArgusRouting(unittest.TestCase):
             # T-0538: inject now uses helper — detect by helper path, not raw send-keys
             inject_calls = [c for c in mock_run.call_args_list
                             if str(c[0][0][0]).endswith("send_keys_submit.sh")]
-            targets_used = [c[0][0][1] for c in inject_calls]  # 2nd arg is pane target
+            targets_used = [c[0][0][-2] for c in inject_calls]  # pane target is 2nd-to-last (T-4792)
             self.assertTrue(len(inject_calls) >= 1)
             for tgt in targets_used:
                 self.assertEqual(tgt, "claude-fallback-bot")
@@ -3172,7 +2108,7 @@ class TestArgusRouting(unittest.TestCase):
             self.assertIn("specialist pulled T-0201", log_content)
 
 
-class TestWardRoutingObservabilityT2206(unittest.TestCase):
+class TestRecoveryRoutingObservabilityT2206(unittest.TestCase):
     """T-2206: the recovery-pane fallback was unmeasurable AND unattributable.
 
     RATE: the `[fallback: recovery-pane unreachable]` prefix only ever existed
@@ -3261,7 +2197,7 @@ class TestRoutingLogRefusesToRecordTestRunsT2351(unittest.TestCase):
     """T-2351: the routing log is a MEASUREMENT surface and it was measuring us.
 
     123 of the log's 136 lines on 2026-07-29 were written by the test suite
-    itself — `TestSendToWardPaneHelperDelegation` sets
+    itself — `TestSendToRecoveryPaneHelperDelegation` sets
     PANTHEON_DISABLE_LIVE_TELEGRAM=0 to exercise the real injection body, which
     also re-enabled the production log write, so each full-suite run appended
     routed/fallback/routed/routed. The real numbers underneath were 13 alerts,
@@ -3322,7 +2258,7 @@ class TestRoutingLogRefusesToRecordTestRunsT2351(unittest.TestCase):
         self.assertIn("orchestrator-health", other.read_text(encoding="utf-8"))
 
 
-class TestSendAlertViaWardT0364(unittest.TestCase):
+class TestSendAlertViaRecoveryT0364(unittest.TestCase):
     """T-0364: _send_alert_via_recovery helper consolidates the recovery-pane-first
     routing pattern that T-0314 introduced for check_orchestrator_health, now
     extended to all operational alert classes (consecutive_skip + sync_alert).
@@ -3413,8 +2349,8 @@ class TestSendAlertViaWardT0364(unittest.TestCase):
         audit = alert.call_args[0][0]
         self.assertIn("[recovery routed]", audit)
         # TG 5380 fix: audit leads with the alert's own summary (names the subject),
-        # not the vocab class.
-        self.assertIn("consecutive cycles", audit)
+        # not the vocab class. T-4399: the summary says what the streak counts.
+        self.assertIn("6 failing skips since its last delivery or alert", audit)
 
     # T-1036: test_sync_alert_uses_recovery_routing removed — check_pantheon_config_sync_alert
     # was retired (its feeding pantheon-config-sync timer is gone, T-0365).
@@ -3845,7 +2781,9 @@ class TestActiveTailSpliceInMain(unittest.TestCase):
 
             self.assertEqual(result, 0)
             log_content = (Path(tmp) / "inbox_consumer.log").read_text()
-            self.assertIn("skip:empty_inbox", log_content)
+            # T-4695: orchestrator's own active ticket makes it busy -> dispatch_locked
+            # (not empty_inbox); the aging-active reminder still fires.
+            self.assertIn("skip:dispatch_locked", log_content)
             self.assertIn("active_surface:T-0100", log_content)
             # T-0538: inject was called (helper call for the active ticket)
             inject_calls = [c for c in mock_run.call_args_list
@@ -3886,7 +2824,7 @@ class TestActiveTailSpliceInMain(unittest.TestCase):
 
             self.assertEqual(result, 0)
             log_content = (Path(tmp) / "inbox_consumer.log").read_text()
-            self.assertIn("skip:not_before_unmet", log_content)
+            self.assertIn("skip:dispatch_locked", log_content)  # T-4695: busy seat
             self.assertIn("active_surface:T-0200", log_content)
 
     def test_dependency_blocked_does_not_trigger_active_surface(self):
@@ -3894,9 +2832,11 @@ class TestActiveTailSpliceInMain(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             tickets_root = Path(tmp) / "tickets"
             # Inbox ticket with unmet dep.
-            _write_ticket(tickets_root, "T-0010", "orchestrator", state="active")
+            # (T-4695: the dep is held by ANOTHER seat; were it orchestrator's, orchestrator would
+            # be busy and the cycle would be dispatch_locked, not dependency_blocked.)
+            _write_ticket(tickets_root, "T-0010", "recovery", state="active")
             _write_ticket(tickets_root, "T-0002", "orchestrator", depends_on=["T-0010"])
-            _write_active_ticket(tickets_root, "T-0100", "orchestrator")
+            _write_active_ticket(tickets_root, "T-0100", "recovery")
             patches = self._base_patches(tmp, tickets_root)
 
             def fake_run(cmd, **kwargs):
@@ -3957,11 +2897,7 @@ class TestActiveTailSpliceInMain(unittest.TestCase):
                 try:
                     with patch("subprocess.run", side_effect=fake_run):
                         with patch("tools.inbox_consumer.time"):
-                            # T-0541: main("recovery") now calls check_agent_health (loop),
-                            # not check_orchestrator_health; suppress health side effects here.
-                            with patch("tools.inbox_consumer.check_agent_health",
-                                       return_value=None):
-                                result = main("recovery")
+                            result = main("recovery")
                 finally:
                     for cm in reversed(ctx_managers):
                         cm.__exit__(None, None, None)
@@ -3969,568 +2905,6 @@ class TestActiveTailSpliceInMain(unittest.TestCase):
             log_content = (Path(tmp) / "inbox_consumer.log").read_text()
             self.assertIn("active_surface:T-0200", log_content)
             self.assertNotIn("active_surface:T-0100", log_content)
-
-
-# ---------------------------------------------------------------------------
-# T-0474: PANE_WEDGE_SENTINELS new-entry regression tests + false-positive docs.
-# ---------------------------------------------------------------------------
-
-
-class TestPaneWedgeSentinelsT0474(unittest.TestCase):
-    """Regression tests for the 28 new sentinels added in T-0474.
-
-    Per sop/standard/testing-depth-and-scope.md: Unit-tier tests only.
-    Integ-same-process tier SKIPPED per D10 (sentinel-match is pure-function
-    string logic; no IPC/subprocess/git surface touched by adding string
-    literals to a tuple).
-
-    False-positive tests document the accepted trade-off per HO resolution #3
-    (missed-wedge cost >> false-escalate cost; substring matcher fires on
-    incidental prose — this is by design, not a bug).
-    """
-
-    def _match(self, pane: str) -> str | None:
-        from tools.inbox_consumer import _pane_wedge_match
-        return _pane_wedge_match(pane)
-
-    # --- Per-class regression tests (one per new prompt class) ---
-
-    def test_workspace_trust_current_variant(self):
-        """Workspace-trust current dialog fires on 'Yes, I trust this folder'."""
-        pane = (
-            "Do you trust the files in this folder?\n"
-            "❯ 1. Yes, I trust this folder\n"
-            "  2. No, exit Claude Code"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "Yes, I trust this folder")
-
-    def test_workspace_trust_legacy_variant(self):
-        """Workspace-trust legacy dialog fires on 'Do you trust the files in this folder?'."""
-        pane = (
-            "Do you trust the files in this folder?\n"
-            "❯ 1. Trust\n"
-            "  2. Exit"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "Do you trust the files in this folder?")
-
-    def test_bypass_permissions_warning(self):
-        """Bypass-permissions confirmation dialog fires on WARNING sentinel.
-
-        Pane omits the 'Yes, I accept' option text to ensure the WARNING
-        sentinel (higher in the tuple) fires first. In practice the full dialog
-        would contain both substrings; the WARNING sentinel fires first because
-        it precedes 'Yes, I accept' in the tuple — this test exercises that path.
-        """
-        pane = (
-            "WARNING: Claude Code running in Bypass Permissions mode\n"
-            "Continue? Running in bypass mode grants Claude unrestricted access.\n"
-            "❯ No (recommended)\n"
-            "  Continue anyway"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "WARNING: Claude Code running in Bypass Permissions mode")
-
-    def test_bypass_permissions_accept_option(self):
-        """Bypass-permissions option label fires on 'Yes, I accept'."""
-        pane = (
-            "Running in Bypass Permissions mode.\n"
-            "❯ No\n"
-            "  Yes, I accept"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "Yes, I accept")
-
-    def test_managed_settings_dialog(self):
-        """Managed-settings security dialog fires on 'Managed settings require approval'."""
-        pane = (
-            "Managed settings require approval\n"
-            "Your organization has configured managed settings.\n"
-            "❯ Yes, I trust these settings\n"
-            "  No, exit Claude Code"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "Managed settings require approval")
-
-    def test_file_ops_overwrite(self):
-        """File-write overwrite dialog fires on 'Do you want to overwrite'."""
-        pane = (
-            "Do you want to overwrite config.yaml?\n"
-            "❯ 1. Yes\n"
-            "  2. No"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "Do you want to overwrite")
-
-    def test_network_sandbox_fetch(self):
-        """WebFetch permission dialog fires on 'Do you want to allow Claude to fetch this content?'."""
-        pane = (
-            "Do you want to allow Claude to fetch this content?\n"
-            "❯ 1. Yes, once\n"
-            "  2. Yes, and don't ask again for api.example.com\n"
-            "  3. No"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "Do you want to allow Claude to fetch this content?")
-
-    def test_plan_mode_exit(self):
-        """ExitPlanMode dialog fires on 'Ready to code?'."""
-        pane = (
-            "Ready to code?\n"
-            "❯ 1. Auto-approve all edits\n"
-            "  2. Manually approve each edit\n"
-            "  3. Keep planning"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "Ready to code?")
-
-    def test_plan_mode_enter(self):
-        """EnterPlanMode confirmation dialog fires on 'Enter plan mode?'."""
-        pane = (
-            "Enter plan mode?\n"
-            "❯ 1. Yes, enter plan mode\n"
-            "  2. No, start implementing now"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "Enter plan mode?")
-
-    def test_skills_mcp_skill_dialog(self):
-        """Skill permission dialog fires on 'Use skill \"'.
-
-        Pane omits the "don't ask again" option text to avoid the
-        'Yes, and don't ask again for' sentinel (which precedes 'Use skill "'
-        in the tuple) firing first. In production the full dialog would show
-        both; the operator-visible sentinel would be 'Yes, and don't ask again
-        for' which still correctly signals a blocked dialog.
-        """
-        pane = (
-            'Use skill "my-deploy-tool"?\n'
-            "❯ 1. Yes, allow this skill\n"
-            "  2. No, skip this action"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, 'Use skill "')
-
-    def test_askuserquestion_submit(self):
-        """AskUserQuestion submit dialog fires on 'Submit answers'."""
-        pane = (
-            "Ready to submit your answers?\n"
-            "❯ 1. Submit answers\n"
-            "  2. Go back"
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "Submit answers")
-
-    def test_dead_pane_root_refusal(self):
-        """Root-refusal dead-pane signal fires on 'cannot be used with root/sudo privileges'."""
-        pane = (
-            "Error: --dangerously-skip-permissions cannot be used with root/sudo privileges\n"
-            "Process exited with code 1."
-        )
-        result = self._match(pane)
-        self.assertEqual(result, "cannot be used with root/sudo privileges")
-
-    def test_footer_fix_esc_to_exit(self):
-        """ManagedSettingsSecurityDialog footer fires on 'Enter to confirm · Esc to exit'.
-
-        Pane contains only the footer line (no other sentinel text) to isolate
-        the footer-fix entry. The footer sentinel fires on any modal that shows
-        this footer, regardless of the dialog body text.
-        """
-        pane = "Enter to confirm · Esc to exit"
-        result = self._match(pane)
-        self.assertEqual(result, "Enter to confirm · Esc to exit")
-
-    # --- Most-specific-match test (longest-prefix-first tuple order) ---
-
-    def test_most_specific_match_do_you_want_to_family(self):
-        """Longest-prefix-first ordering: 'Do you want to overwrite' fires before
-        'Do you want to create' when both substrings appear in the pane.
-
-        This test motivates and locks in the tuple ordering per HO resolution #4.
-        A realistic pane might show an overwrite prompt whose body text also
-        contains the phrase 'Do you want to create' (e.g. a two-step dialog).
-        The longest-prefix-first tuple order ensures 'Do you want to overwrite'
-        is returned, surfacing the most-specific class to the operator.
-        """
-        # Construct a pane that genuinely contains both substrings.
-        pane = (
-            "Do you want to overwrite README.md?\n"
-            "❯ 1. Yes\n"
-            "  2. No\n"
-            "  Do you want to create a backup copy instead?"
-        )
-        # Precondition: both substrings present.
-        self.assertIn("Do you want to overwrite", pane)
-        self.assertIn("Do you want to create", pane)
-        result = self._match(pane)
-        self.assertEqual(result, "Do you want to overwrite",
-                         "Longest-prefix-first ordering must return 'Do you want to overwrite' "
-                         "before 'Do you want to create' for a pane containing both substrings.")
-
-    # --- Footer-distinction test ---
-
-    def test_footer_distinction_cancel_vs_exit(self):
-        """The 'Esc to cancel' and 'Esc to exit' footer variants return distinct sentinels.
-
-        Uses footer-only panes to isolate the footer sentinels from other
-        sentinel text that would fire earlier in the tuple.
-        """
-        cancel_pane = "Enter to confirm · Esc to cancel"
-        exit_pane = "Enter to confirm · Esc to exit"
-        cancel_result = self._match(cancel_pane)
-        exit_result = self._match(exit_pane)
-        self.assertEqual(cancel_result, "Enter to confirm · Esc to cancel")
-        self.assertEqual(exit_result, "Enter to confirm · Esc to exit")
-        self.assertNotEqual(cancel_result, exit_result)
-
-    # --- False-positive documentation tests ---
-    # These assert that the match STILL fires on unrelated prose containing the
-    # substring. This is the accepted trade-off per HO resolution #3: the matcher
-    # is substring-only; short sentinels will occasionally fire on innocent prose.
-    # Missed-wedge cost >> false-escalate cost. These tests document the trade,
-    # they do NOT prevent it.
-
-    def test_fp_yes_i_accept_in_prose(self):
-        """'Yes, I accept' fires even when the phrase appears in unrelated prose
-        (e.g., terms-and-conditions text). Documented false-positive trade-off."""
-        prose_pane = (
-            "Claude has reviewed your request.\n"
-            "Yes, I accept your analysis as correct.\n"
-            "Proceeding with the plan."
-        )
-        result = self._match(prose_pane)
-        self.assertEqual(result, "Yes, I accept",
-                         "Substring match fires on prose containing 'Yes, I accept' — "
-                         "accepted false-positive per HO resolution #3 (T-0474).")
-
-    def test_fp_ready_to_code_in_prose(self):
-        """'Ready to code?' fires even in non-modal prose context.
-
-        The match is case-sensitive (Python 'in' operator). Prose must contain
-        the exact sentinel casing to trigger the false-positive.
-        """
-        prose_pane = (
-            "Ready to code? The scaffold is in place and all dependencies are installed.\n"
-            "No permission dialog here — just an idle Claude pane."
-        )
-        result = self._match(prose_pane)
-        self.assertEqual(result, "Ready to code?",
-                         "Substring match fires on prose containing 'Ready to code?' — "
-                         "accepted false-positive per HO resolution #3 (T-0474).")
-
-    def test_fp_submit_answers_in_prose(self):
-        """'Submit answers' fires even in non-modal prose context.
-
-        The match is case-sensitive. Prose must contain the exact sentinel casing.
-        """
-        prose_pane = (
-            "Submit answers to the review questions when you are done with T-0474.\n"
-            "No permission dialog here."
-        )
-        result = self._match(prose_pane)
-        self.assertEqual(result, "Submit answers",
-                         "Substring match fires on prose containing 'Submit answers' — "
-                         "accepted false-positive per HO resolution #3 (T-0474).")
-
-    def test_fp_skip_interview_in_prose(self):
-        """'Skip interview and plan immediately' fires even in non-modal prose context.
-
-        The match is case-sensitive. Prose must contain the exact sentinel casing.
-        """
-        prose_pane = (
-            "Skip interview and plan immediately — that is what the operator directive says.\n"
-            "No permission dialog here."
-        )
-        result = self._match(prose_pane)
-        self.assertEqual(result, "Skip interview and plan immediately",
-                         "Substring match fires on prose containing 'Skip interview and plan "
-                         "immediately' — accepted false-positive per HO resolution #3 (T-0474).")
-
-
-class TestPostureCPredicateBoundaries(unittest.TestCase):
-    """T-0489: posture-C predicate boundaries wired into RECOVERY_AUTO_RESOLVE_ALLOWLIST.
-
-    Tests cover BOUNDARY 1 (file-ops-in-cwd) and BOUNDARY 2 (trust-canonical-dirs).
-    Each boundary: predicate-True (in-scope) → action ["1","Enter"];
-    predicate-False (out-of-scope) → escalate; extractor-None → safe escalate.
-
-    Predicate-False integration (call-site render) is covered by the existing
-    TestAutoResolvePredicateFalseBranch class, which patches ALLOWLIST with a
-    test-only rule. Here we exercise the predicates directly from the live rules.
-    """
-
-    # ------------------------------------------------------------------
-    # BOUNDARY 1 — file-ops-in-cwd
-    # ------------------------------------------------------------------
-
-    def test_file_ops_create_in_cwd_predicate_true(self):
-        """file-ops 'Do you want to create': path in agent cwd → predicate True."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Do you want to create"]
-        pane = "Do you want to create /tmp/pantheon-config-T-0489/foo.py?"
-        self.assertTrue(rule.predicate(pane))
-
-    def test_file_ops_create_out_of_cwd_predicate_false(self):
-        """file-ops 'Do you want to create': path outside agent cwd → predicate False."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Do you want to create"]
-        pane = "Do you want to create /home/evil/bad.py?"
-        self.assertFalse(rule.predicate(pane))
-
-    def test_file_ops_edit_in_cwd_predicate_true(self):
-        """file-ops 'Do you want to make this edit to': canonical home dir → True."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Do you want to make this edit to"]
-        pane = "Do you want to make this edit to /home/claude/pantheon-config/tools/foo.py?"
-        self.assertTrue(rule.predicate(pane))
-
-    def test_file_ops_edit_out_of_cwd_predicate_false(self):
-        """file-ops 'Do you want to make this edit to': non-canonical dir → False."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Do you want to make this edit to"]
-        pane = "Do you want to make this edit to /var/log/system.log?"
-        self.assertFalse(rule.predicate(pane))
-
-    def test_file_ops_overwrite_in_cwd_predicate_true(self):
-        """file-ops 'Do you want to overwrite': /tmp worktree path → True."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Do you want to overwrite"]
-        pane = "Do you want to overwrite /tmp/pantheon-config-T-0489/dist/output.js?"
-        self.assertTrue(rule.predicate(pane))
-
-    def test_file_ops_overwrite_out_of_cwd_predicate_false(self):
-        """file-ops 'Do you want to overwrite': non-canonical path → False."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Do you want to overwrite"]
-        pane = "Do you want to overwrite /etc/passwd?"
-        self.assertFalse(rule.predicate(pane))
-
-    def test_file_ops_no_path_extracted_predicate_false(self):
-        """file-ops: pane with no extractable path → predicate False (safe degradation)."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Do you want to create"]
-        pane = "Do you want to create something without a path?"
-        self.assertFalse(rule.predicate(pane))
-
-    def test_file_ops_all_three_sentinels_action_is_option_1_enter(self):
-        """All three file-op rules send option 1 only — never option 2 trust-expansion."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        for sentinel in (
-            "Do you want to create",
-            "Do you want to make this edit to",
-            "Do you want to overwrite",
-        ):
-            rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST[sentinel]
-            self.assertEqual(
-                rule.action, ["1", "Enter"],
-                f"file-op rule {sentinel!r} action must be ['1','Enter'], got {rule.action!r}"
-            )
-
-    def test_file_ops_sentinels_in_pane_wedge_sentinels(self):
-        """All three file-op sentinels are in PANE_WEDGE_SENTINELS (shape invariant)."""
-        from tools.inbox_consumer import PANE_WEDGE_SENTINELS, RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        for sentinel in (
-            "Do you want to create",
-            "Do you want to make this edit to",
-            "Do you want to overwrite",
-        ):
-            self.assertIn(sentinel, PANE_WEDGE_SENTINELS,
-                          f"file-op sentinel {sentinel!r} missing from PANE_WEDGE_SENTINELS")
-            self.assertIn(sentinel, RECOVERY_AUTO_RESOLVE_ALLOWLIST,
-                          f"file-op sentinel {sentinel!r} missing from RECOVERY_AUTO_RESOLVE_ALLOWLIST")
-
-    def test_file_ops_escalate_template_renders_with_call_site_kwargs(self):
-        """file-ops escalate_template can be .format()-rendered with sentinel= and excerpt=."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        for sentinel in (
-            "Do you want to create",
-            "Do you want to make this edit to",
-            "Do you want to overwrite",
-        ):
-            rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST[sentinel]
-            rendered = rule.escalate_template.format(sentinel=sentinel, excerpt="pane-excerpt")
-            self.assertIsInstance(rendered, str)
-            self.assertTrue(len(rendered) > 0)
-
-    # ------------------------------------------------------------------
-    # BOUNDARY 2 — trust-canonical-dirs
-    # ------------------------------------------------------------------
-
-    def test_trust_canonical_dir_pantheon_config_predicate_true(self):
-        """trust 'Do you trust the files in this folder?': canonical Pantheon dir → True."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Do you trust the files in this folder?"]
-        pane = (
-            "Do you trust the files in this folder?\n"
-            "/home/claude/pantheon-config\n"
-            "❯ 1. Yes, I trust this folder\n"
-            "  2. No, exit Claude Code\n"
-        )
-        self.assertTrue(rule.predicate(pane))
-
-    def test_trust_canonical_dir_tmp_worktree_predicate_true(self):
-        """trust sentinel: /tmp worktree path is canonical → predicate True."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Do you trust the files in this folder?"]
-        pane = (
-            "Do you trust the files in this folder?\n"
-            "/tmp/pantheon-config-T-0489\n"
-            "❯ 1. Yes, I trust this folder\n"
-            "  2. No, exit Claude Code\n"
-        )
-        self.assertTrue(rule.predicate(pane))
-
-    def test_trust_non_canonical_dir_predicate_false(self):
-        """trust sentinel: non-canonical path → predicate False."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Do you trust the files in this folder?"]
-        pane = (
-            "Do you trust the files in this folder?\n"
-            "/home/attacker/malicious-repo\n"
-            "❯ 1. Yes, I trust this folder\n"
-            "  2. No, exit Claude Code\n"
-        )
-        self.assertFalse(rule.predicate(pane))
-
-    def test_trust_yes_i_trust_sentinel_canonical_predicate_true(self):
-        """trust 'Yes, I trust this folder' sentinel: canonical pane → True.
-
-        Real pane always has 'Do you trust the files in this folder?' header FIRST,
-        so extract_trust_dialog_path finds the header line → path → returns it.
-        """
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["Yes, I trust this folder"]
-        pane = (
-            "Do you trust the files in this folder?\n"
-            "/home/claude/echo-prismatic\n"
-            "❯ 1. Yes, I trust this folder\n"
-            "  2. No, exit Claude Code\n"
-        )
-        self.assertTrue(rule.predicate(pane))
-
-    def test_trust_trust_this_folder_sentinel_canonical_predicate_true(self):
-        """trust 'trust this folder' sentinel: canonical pane → True."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST["trust this folder"]
-        pane = (
-            "Do you trust the files in this folder?\n"
-            "/home/claude/pantheon-pwa\n"
-            "❯ 1. Yes, I trust this folder\n"
-            "  2. No, exit Claude Code\n"
-        )
-        self.assertTrue(rule.predicate(pane))
-
-    def test_trust_quick_safety_check_path_unextractable_safe_degradation(self):
-        """trust 'Quick safety check': extractor returns None → predicate False (escalate).
-
-        The 'Quick safety check' pane header is not in _TRUST_DIALOG_SENTINELS used
-        by extract_trust_dialog_path. The extractor finds 'Yes, I trust this folder'
-        as the option-1 line, then searches for a '/'-line AFTER it — there is none
-        since the path precedes the options. Extractor returns None → path = '' →
-        path_in_canonical_pantheon_dirs('') = False → predicate False → escalate.
-        This is safe degradation: unknown path → decline auto-trust → operator review.
-        """
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST[
-            "Quick safety check: Is this a project you created or one you trust?"
-        ]
-        pane = (
-            "Quick safety check: Is this a project you created or one you trust?\n"
-            "/home/claude/pantheon-config\n"
-            "❯ 1. Yes, I trust this folder\n"
-            "  2. No, exit Claude Code\n"
-        )
-        # Extractor can't find the path for this sentinel shape → False → escalate.
-        self.assertFalse(rule.predicate(pane))
-
-    def test_trust_all_four_sentinels_action_is_option_1_enter(self):
-        """All four trust rules send option 1 — 'Yes, I trust this folder', not option 2."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        for sentinel in (
-            "Do you trust the files in this folder?",
-            "Yes, I trust this folder",
-            "trust this folder",
-            "Quick safety check: Is this a project you created or one you trust?",
-        ):
-            rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST[sentinel]
-            self.assertEqual(
-                rule.action, ["1", "Enter"],
-                f"trust rule {sentinel!r} action must be ['1','Enter'], got {rule.action!r}"
-            )
-
-    def test_trust_sentinels_in_pane_wedge_sentinels(self):
-        """All four trust sentinels are in PANE_WEDGE_SENTINELS (shape invariant)."""
-        from tools.inbox_consumer import PANE_WEDGE_SENTINELS, RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        for sentinel in (
-            "Do you trust the files in this folder?",
-            "Yes, I trust this folder",
-            "trust this folder",
-            "Quick safety check: Is this a project you created or one you trust?",
-        ):
-            self.assertIn(sentinel, PANE_WEDGE_SENTINELS,
-                          f"trust sentinel {sentinel!r} missing from PANE_WEDGE_SENTINELS")
-            self.assertIn(sentinel, RECOVERY_AUTO_RESOLVE_ALLOWLIST,
-                          f"trust sentinel {sentinel!r} missing from RECOVERY_AUTO_RESOLVE_ALLOWLIST")
-
-    def test_trust_escalate_template_renders_with_call_site_kwargs(self):
-        """trust escalate_template can be .format()-rendered with sentinel= and excerpt=."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        for sentinel in (
-            "Do you trust the files in this folder?",
-            "Yes, I trust this folder",
-            "trust this folder",
-            "Quick safety check: Is this a project you created or one you trust?",
-        ):
-            rule = RECOVERY_AUTO_RESOLVE_ALLOWLIST[sentinel]
-            rendered = rule.escalate_template.format(sentinel=sentinel, excerpt="pane-excerpt")
-            self.assertIsInstance(rendered, str)
-            self.assertTrue(len(rendered) > 0)
-
-    # ------------------------------------------------------------------
-    # Hard-deny exclusions — option-2 trust-expansions never allowlisted
-    # ------------------------------------------------------------------
-
-    def test_option_2_trust_expansions_not_in_allowlist(self):
-        """Option-2 trust-expansion sentinels are NEVER in RECOVERY_AUTO_RESOLVE_ALLOWLIST.
-
-        T-0489 wires 7 new sentinels; none must be the option-2 expansions.
-        These are listed here as an explicit regression guard.
-        """
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        hard_deny = (
-            "Yes, and allow Claude to edit its own settings",
-            "Yes, and don't ask again for",
-            "Yes, allow all edits during this session",
-            "Yes, allow all edits in ",
-            "Yes, allow reading from",
-        )
-        for sentinel in hard_deny:
-            self.assertNotIn(
-                sentinel, RECOVERY_AUTO_RESOLVE_ALLOWLIST,
-                f"option-2 expansion {sentinel!r} must never be in RECOVERY_AUTO_RESOLVE_ALLOWLIST"
-            )
-
-    def test_all_seven_new_sentinels_present_in_allowlist(self):
-        """T-0489 wires exactly 7 new sentinels (3 file-op + 4 trust) into the allowlist."""
-        from tools.inbox_consumer import RECOVERY_AUTO_RESOLVE_ALLOWLIST
-        new_sentinels = (
-            # BOUNDARY 1 — file-ops-in-cwd
-            "Do you want to create",
-            "Do you want to make this edit to",
-            "Do you want to overwrite",
-            # BOUNDARY 2 — trust-canonical-dirs
-            "Do you trust the files in this folder?",
-            "Yes, I trust this folder",
-            "trust this folder",
-            "Quick safety check: Is this a project you created or one you trust?",
-        )
-        for sentinel in new_sentinels:
-            self.assertIn(
-                sentinel, RECOVERY_AUTO_RESOLVE_ALLOWLIST,
-                f"T-0489 sentinel {sentinel!r} missing from RECOVERY_AUTO_RESOLVE_ALLOWLIST"
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -4552,8 +2926,10 @@ class TestInjectHelperDelegation(unittest.TestCase):
         self.assertEqual(mock_run.call_count, 1)
         cmd = mock_run.call_args[0][0]
         self.assertEqual(cmd[0], str(_SEND_KEYS_HELPER))
-        self.assertEqual(cmd[1], "claude-telegram-bot")
-        self.assertEqual(cmd[2], "hello world")
+        # T-4792: the submit-verify profile is always explicit (default claude-code).
+        self.assertEqual(cmd[1:3], ["--harness", "claude-code"])
+        self.assertEqual(cmd[3], "claude-telegram-bot")
+        self.assertEqual(cmd[4], "hello world")
 
     def test_inject_success_returns_none(self):
         # T-0538: exit 0 → returns without raising
@@ -4589,7 +2965,7 @@ class TestInjectHelperDelegation(unittest.TestCase):
         self.assertEqual(kwargs["env"]["INJECT_ENTER_DELAY"], str(INJECT_ENTER_DELAY))
 
 
-class TestSendToWardPaneHelperDelegation(unittest.TestCase):
+class TestSendToRecoveryPaneHelperDelegation(unittest.TestCase):
     """T-0538: _send_to_recovery_pane() must call send_keys_submit.sh, not raw send-keys pairs."""
 
     def setUp(self) -> None:
@@ -4598,6 +2974,11 @@ class TestSendToWardPaneHelperDelegation(unittest.TestCase):
         # so opt back in via the force-send override.
         os.environ["PANTHEON_DISABLE_LIVE_TELEGRAM"] = "0"
         self.addCleanup(lambda: os.environ.pop("PANTHEON_DISABLE_LIVE_TELEGRAM", None))
+        # T-4591: the modal gate captures Recovery's pane first. No view = no evidence,
+        # so these delegation tests see exactly one subprocess call: the helper.
+        capture = patch("tools.inbox_consumer._pane_capture", return_value=None)
+        capture.start()
+        self.addCleanup(capture.stop)
 
     def _make_run(self, returncode=0):
         return MagicMock(returncode=returncode, stdout="", stderr="")
@@ -4638,129 +3019,108 @@ class TestSendToWardPaneHelperDelegation(unittest.TestCase):
         self.assertEqual(kwargs["env"]["INJECT_ENTER_DELAY"], str(INJECT_ENTER_DELAY))
 
 
+class TestRecoveryPaneModalGateT4591(unittest.TestCase):
+    """T-4591: _send_to_recovery_pane must not paste text + Enter into a blocking modal on
+    Recovery's pane. The refusal is a pane-miss, so _send_alert_via_recovery takes the
+    Recovery-mailbox leg and never pages the operator for it."""
+
+    # Real capture: the /rate-limit-options spend-limit modal (specialist, 2026-09-27),
+    # the same specimen test_context_fill_monitor uses. The highlighted option is
+    # "Adjust monthly spend limit", so an Enter here picks it.
+    SPEND_LIMIT_PANE = (
+        "  ⎿  You've hit your monthly spend limit · your weekly limit resets Sep 27, 5pm\n"
+        "     (UTC)\n"
+        "   What do you want to do?                        Usage credit balance: $8.08\n"
+        "   ❯ Adjust monthly spend limit:        ← or → to adjust · Del to remove lim…\n"
+        "     Wait for limit to reset                         Resets Sep 27, 5pm (UTC)\n"
+        "   Enter to confirm · Esc to cancel"
+    )
+    IDLE_PANE = (
+        "╭──────────────────────────────────────────╮\n"
+        "│ ❯                                        │\n"
+        "╰──────────────────────────────────────────╯\n"
+        "  ? for shortcuts"
+    )
+
+    def setUp(self) -> None:
+        os.environ["PANTHEON_DISABLE_LIVE_TELEGRAM"] = "0"  # exercise the real body
+        self.addCleanup(lambda: os.environ.pop("PANTHEON_DISABLE_LIVE_TELEGRAM", None))
+
+    def test_classifier_blocks_the_real_spend_limit_modal(self):
+        self.assertIn("Enter to confirm", inbox_consumer._pane_blocks_injection(self.SPEND_LIMIT_PANE))
+
+    # T-4646: Claude Code 2.1.289's startup prompt (specialist, 2026-10-05). No footer; the
+    # option line is the witness.
+    AUTO_MODE_NUDGE_PANE = (
+        "─" * 80 + "\n"
+        " Make auto mode your default permission mode?\n"
+        " Auto mode lets Claude handle permission prompts automatically. Claude checks each\n"
+        " tool call for risky actions and prompt injection before executing, runs the ones it\n"
+        " assesses as lower-risk, and blocks the rest.\n"
+        " ❯ Yes, set auto mode as my default permission mode\n"
+        "   No, keep manual"
+    )
+
+    def test_classifier_blocks_the_auto_mode_nudge(self):
+        self.assertIn("auto mode", inbox_consumer._pane_blocks_injection(self.AUTO_MODE_NUDGE_PANE))
+        self.assertIsNone(inbox_consumer.pane_idle_state(self.AUTO_MODE_NUDGE_PANE))
+
+    def test_classifier_passes_an_idle_prompt_and_an_empty_capture(self):
+        self.assertIsNone(inbox_consumer._pane_blocks_injection(self.IDLE_PANE))
+        self.assertIsNone(inbox_consumer._pane_blocks_injection(""))
+
+    def test_classifier_ignores_a_footer_in_scrollback(self):
+        # An alert or a doc quoting the footer, scrolled above a live idle prompt.
+        pane = "quoted: Enter to confirm · Esc to cancel\n" + "\n".join(
+            f"line {i}" for i in range(10)) + "\n" + self.IDLE_PANE
+        self.assertIsNone(inbox_consumer._pane_blocks_injection(pane))
+
+    def test_modal_pane_sends_no_keystroke(self):
+        with patch.object(inbox_consumer, "_pane_capture", return_value=self.SPEND_LIMIT_PANE), \
+             patch("subprocess.run") as run:
+            ok, why = inbox_consumer._send_to_recovery_pane_diagnosed("💸 alert 1 2 3")
+        self.assertFalse(ok)
+        self.assertIn("refused", why)
+        run.assert_not_called()  # the helper never ran: no paste, no Enter
+
+    def test_idle_pane_still_injects(self):
+        with patch.object(inbox_consumer, "_pane_capture", return_value=self.IDLE_PANE), \
+             patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")) as run:
+            ok, _why = inbox_consumer._send_to_recovery_pane_diagnosed("alert")
+        self.assertTrue(ok)
+        self.assertEqual(run.call_args[0][0][0], str(inbox_consumer._SEND_KEYS_HELPER))
+
+    def test_alert_on_a_modal_falls_through_to_recovery_mailbox_not_operator(self):
+        with patch.object(inbox_consumer, "_pane_capture", return_value=self.SPEND_LIMIT_PANE), \
+             patch("subprocess.run") as run, \
+             patch.object(inbox_consumer, "_log_recovery_routing"), \
+             patch.object(inbox_consumer, "_deliver_alert_to_recovery_mailbox", return_value=True) as mbox, \
+             patch.object(inbox_consumer, "_send_telegram_alert") as page, \
+             patch.object(inbox_consumer, "_send_telegram_info"), \
+             patch.object(inbox_consumer, "_routed_audit_throttled", return_value=True):
+            inbox_consumer._send_alert_via_recovery("💸 [spend-limit] orchestrator ...", "spend-limit")
+        run.assert_not_called()
+        mbox.assert_called_once()
+        page.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
-# T-0541: per-agent health monitor (check_agent_health generalization).
+# T-0541: cross-account pane capture (_pane_capture) + the T-3003 main() order.
+# (T-4203: the check_agent_health tests that lived here were removed with it.)
 # ---------------------------------------------------------------------------
 
 
-class TestCheckAgentHealthArgus(unittest.TestCase):
-    """check_agent_health("specialist") runs the same signals as orchestrator — but uses
-    Specialist's pane target (claude-research-bot:0) and cross-account sudo to
-    claude-research, not claude."""
+class TestPaneCaptureAndMainOrder(unittest.TestCase):
+    """_pane_capture(agent) resolves each agent's pane target + cross-account sudo
+    user from _AGENT_HEALTH_CONFIG (Specialist = claude-research-bot:0 via claude-research,
+    not claude); main() keeps the T-3003 pull -> dispatch_locked -> recent order."""
 
     def setUp(self) -> None:
         # Default recovery-pane delivery to False so escalation assertions remain
-        # stable (mirrors TestCheckThothHealth.setUp).
+        # stable (mirrors TestCheckOrchestratorHealth.setUp).
         p = patch("tools.inbox_consumer._send_to_recovery_pane", return_value=False)
         p.start()
         self.addCleanup(p.stop)
-
-    def _mock_health(self, payload: dict):
-        resp = MagicMock()
-        resp.__enter__ = lambda s: s
-        resp.__exit__ = MagicMock(return_value=False)
-        resp.read.return_value = json.dumps(payload).encode()
-        return resp
-
-    def _healthy_payload(self):
-        # T-0553: specialist is not a bridge client; it is permanently absent from
-        # connected_clients. A "healthy" specialist payload has no specialist entry in
-        # connected_clients. The old fixture with connected_clients:["specialist"]
-        # reflected an impossible runtime state.
-        return {
-            "telegram_connected": True,
-            "connected_clients": ["orchestrator"],   # specialist absent — correct runtime state
-            "queued_messages": {},
-            "last_inbound_at": {},
-        }
-
-    def _specialist_patches(self, tmpdir: Path):
-        """Redirect per-agent state files into tmpdir."""
-        from tools.inbox_consumer import check_agent_health  # noqa: F401
-        # _per_agent_health_config returns paths keyed from home; patch the
-        # module-level constants for the ORCHESTRATOR slots to confirm Specialist does NOT
-        # touch them, and supply per-agent config via the function.
-        return [
-            patch("tools.inbox_consumer.LOG_PATH", tmpdir / "log"),
-        ]
-
-    def _patch_specialist_state(self, tmpdir: Path):
-        """Redirect Specialist-specific health state files into tmpdir.
-
-        check_agent_health reads last_alert_path and wedge_state_path from
-        _AGENT_HEALTH_CONFIG["specialist"]. Patch those to tmpdir so tests are
-        hermetic (no bleed from real ~/.local/state/pantheon/ files).
-        """
-        from tools.inbox_consumer import _AGENT_HEALTH_CONFIG
-        specialist_cfg = _AGENT_HEALTH_CONFIG["specialist"]
-        return [
-            patch.object(specialist_cfg, "__getitem__",
-                         side_effect=lambda k: {
-                             **specialist_cfg,
-                             "last_alert_path": tmpdir / "specialist_last_alert_at",
-                             "wedge_state_path": tmpdir / "specialist_wedge_state",
-                         }[k]),
-        ]
-
-    def _specialist_state_ctx(self, tmpdir: Path):
-        """Context manager: redirect Specialist health state files into tmpdir."""
-        return patch(
-            "tools.inbox_consumer._AGENT_HEALTH_CONFIG",
-            {
-                "orchestrator": __import__("tools.inbox_consumer",
-                                    fromlist=["_AGENT_HEALTH_CONFIG"])
-                ._AGENT_HEALTH_CONFIG["orchestrator"],
-                "specialist": {
-                    "pane_target": "claude-research-bot:0",
-                    "unix_user": "claude-research",
-                    "last_alert_path": tmpdir / "specialist_last_alert_at",
-                    "wedge_state_path": tmpdir / "specialist_wedge_state",
-                },
-            },
-        )
-
-    def test_specialist_healthy_returns_none(self):
-        """check_agent_health('specialist') with all-green bridge payload returns None."""
-        from tools.inbox_consumer import check_agent_health
-        payload = self._healthy_payload()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 self._specialist_state_ctx(tmppath), \
-                 patch("tools.inbox_consumer._pane_capture", return_value=None), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent_for_agent",
-                       return_value=None), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_agent_health("specialist")
-        self.assertIsNone(vocab)
-        alert.assert_not_called()
-
-    def test_specialist_disconnected_no_alert(self):
-        """T-0553: specialist absent from connected_clients → None (no alert).
-        Specialist is not a bridge client; absence from connected_clients is the
-        permanent runtime state, not a fault. The old test_specialist_disconnected_alerts
-        captured pre-T-0553 behavior (false positive). Updated to assert correct
-        post-T-0553 behavior: no alert, no disconnect vocab.
-        """
-        from tools.inbox_consumer import check_agent_health
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": [],
-            "queued_messages": {"specialist": 0},
-            "last_inbound_at": {"specialist": None},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 self._specialist_state_ctx(tmppath), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent_for_agent",
-                       return_value=None), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_agent_health("specialist")
-        self.assertIsNone(vocab)
-        alert.assert_not_called()
 
     def test_specialist_pane_capture_uses_claude_research_sudo(self):
         """_pane_capture('specialist') calls sudo -n -u claude-research, not claude.
@@ -4825,71 +3185,6 @@ class TestCheckAgentHealthArgus(unittest.TestCase):
         self.assertIn("claude-research-bot", full_cmd)
         self.assertNotIn("claude-telegram-bot", full_cmd)
 
-    def test_apply_resolve_action_specialist_uses_claude_research_sudo(self):
-        """_apply_resolve_action for Specialist's pane target wraps tmux send-keys
-        in sudo -u claude-research bash -c, not sudo -u claude."""
-        from tools.inbox_consumer import _apply_resolve_action
-        specialist_pane = "claude-research-bot:0"
-        with patch("subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            _apply_resolve_action(specialist_pane, "claude-research", ["1", "Enter"])
-        for c in mock_run.call_args_list:
-            argv = c[0][0]
-            full = " ".join(str(a) for a in argv)
-            self.assertIn("claude-research", full)
-
-    def test_specialist_pane_wedge_auto_resolve_uses_correct_target(self):
-        """When Specialist pane wedge auto-resolves, the action targets
-        claude-research-bot:0 (Specialist's pane), not claude-telegram-bot:0."""
-        from tools.inbox_consumer import check_agent_health
-        payload = self._healthy_payload()
-        # Pane fixture uses the full trust-dialog form so extract_trust_dialog_path
-        # can extract the path (it requires "Do you trust..." or "Yes, I trust...").
-        wedged_pane = "Do you trust the files in this folder?\n/home/claude-research/pantheon-config\n❯ 1. Yes, I trust this folder"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 self._specialist_state_ctx(tmppath), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent_for_agent",
-                       return_value=("Do you trust the files in this folder?", wedged_pane)), \
-                 patch("tools.inbox_consumer._apply_resolve_action",
-                       return_value=True) as apply_action, \
-                 patch("tools.inbox_consumer._send_telegram_info") as info, \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_agent_health("specialist")
-        self.assertEqual(vocab, "pane_wedge_auto_resolved")
-        # The action was called with Specialist's pane target
-        first_call_pane_target = apply_action.call_args_list[0][0][0]
-        self.assertIn("claude-research-bot", first_call_pane_target)
-        alert.assert_not_called()
-
-    def test_main_recovery_calls_health_for_orchestrator_specialist_and_recovery(self):
-        """main('recovery') invokes check_agent_health for orchestrator, specialist, AND recovery.
-
-        T-0559: recovery joins the monitored loop in alert-only mode so a
-        boot-dialog or pane wedge on Recovery's own pane surfaces as an alert.
-        """
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer.check_agent_health") as health_mock, \
-                 patch("tools.inbox_consumer.check_autonomy_off"), \
-                 patch("tools.inbox_consumer.check_cap_hit"), \
-                 patch("tools.inbox_consumer.check_recent_inbound"), \
-                 patch("tools.inbox_consumer.check_dispatch_locked"), \
-                 patch("tools.inbox_consumer.pull_repo_or_warn"), \
-                 patch("tools.inbox_consumer.list_eligible_tickets",
-                       side_effect=SkipCycle("empty_inbox")), \
-                 patch("tools.inbox_consumer.surface_active_ticket",
-                       return_value=None):
-                health_mock.return_value = None
-                main("recovery")
-        called_agents = [c[0][0] for c in health_mock.call_args_list]
-        self.assertIn("orchestrator", called_agents)
-        self.assertIn("specialist", called_agents)
-        self.assertIn("recovery", called_agents)
-
     def test_t3003_lock_maintenance_ordered_before_recent_telegram_gate(self):
         """T-3003 regression: pull_repo_or_warn must run before check_dispatch_locked,
         and check_dispatch_locked (stale-lock release + one-in-flight enforcement) must
@@ -4904,8 +3199,7 @@ class TestCheckAgentHealthArgus(unittest.TestCase):
             tmppath = Path(tmp)
             manager = MagicMock()
             with patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer.check_agent_health", return_value=None), \
-                 patch("tools.inbox_consumer.check_autonomy_off", manager.autonomy), \
+                 patch("tools.inbox_consumer.check_seat_intake", manager.intake), \
                  patch("tools.inbox_consumer.check_cap_hit", manager.cap), \
                  patch("tools.inbox_consumer.pull_repo_or_warn", manager.pull), \
                  patch("tools.inbox_consumer.check_dispatch_locked", manager.dispatch), \
@@ -4923,178 +3217,33 @@ class TestCheckAgentHealthArgus(unittest.TestCase):
                 "(else cleanup is skipped during active conversations and flags pile up).",
             )
 
-    def test_recovery_config_is_alert_only_and_not_bridge_client(self):
-        """T-0559 safety constraint: recovery must NOT self-inject (alert_only=True)
-        until a Layer-2 watcher-of-the-watcher backstop exists. Recovery is also
-        bare-claude (no --channels) — never a bridge client."""
-        from tools.inbox_consumer import _AGENT_HEALTH_CONFIG
-        recovery_cfg = _AGENT_HEALTH_CONFIG["recovery"]
-        self.assertTrue(recovery_cfg.get("alert_only"))
-        self.assertFalse(recovery_cfg.get("is_bridge_client"))
-        # Pane + unix_user point at Recovery's own session.
-        self.assertEqual(recovery_cfg["pane_target"], "claude-telegram-bot-fallback:0")
-        self.assertEqual(recovery_cfg["unix_user"], "claude-fallback")
-
-    def test_recovery_alert_only_suppresses_auto_resolve(self):
-        """T-0559 alert-only gate: when a matched wedge is detected on Recovery's
-        own pane, check_agent_health MUST NOT invoke _auto_resolve_if_allowlisted
-        — only the alert/vocab path runs. Auto-resolve fires send-keys; without
-        a Layer-2 backstop we cannot safely inject into Recovery's own pane.
-        """
-        from tools.inbox_consumer import check_agent_health, _AGENT_HEALTH_CONFIG
-        # Healthy bridge payload — recovery is non-bridge-client so connected_clients
-        # absence is normal.
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": ["orchestrator"],
-            "queued_messages": {},
-            "last_inbound_at": {},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            # Redirect recovery's per-agent state files into tmp so persistence
-            # state doesn't bleed from real ~/.local/state/pantheon/.
-            patched_config = {
-                **_AGENT_HEALTH_CONFIG,
-                "recovery": {
-                    **_AGENT_HEALTH_CONFIG["recovery"],
-                    "last_alert_path": tmppath / "recovery_last_alert",
-                    "wedge_state_path": tmppath / "recovery_wedge_state",
-                },
-            }
-            with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._AGENT_HEALTH_CONFIG", patched_config), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent_for_agent",
-                       return_value=("dev-channels-confirm", "fake pane text")), \
-                 patch("tools.inbox_consumer._auto_resolve_if_allowlisted_for_agent") as resolver, \
-                 patch("tools.inbox_consumer._send_telegram_alert"):
-                vocab = check_agent_health("recovery")
-        # The auto-resolve send-keys path must NOT have fired.
-        resolver.assert_not_called()
-        # An alert vocab should be emitted (detect → alert is the alert-only contract).
-        self.assertEqual(vocab, "pane_wedge")
-
-    def test_check_orchestrator_health_backward_compat_alias(self):
-        """check_orchestrator_health() is an alias for check_agent_health('orchestrator')."""
-        from tools.inbox_consumer import check_orchestrator_health, check_agent_health
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": ["orchestrator"],
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": "2026-05-22T00:00:00+00:00"},
-        }
-        resp = MagicMock()
-        resp.__enter__ = lambda s: s
-        resp.__exit__ = MagicMock(return_value=False)
-        resp.read.return_value = json.dumps(payload).encode()
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("urllib.request.urlopen", return_value=resp), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent_for_agent",
-                       return_value=None), \
-                 patch("tools.inbox_consumer._send_telegram_alert"):
-                v1 = check_orchestrator_health()
-                v2 = check_agent_health("orchestrator")
-        self.assertEqual(v1, v2)
-
-    # T-0553: bridge-client gating tests ----------------------------------------
-
-    def test_specialist_absent_from_connected_clients_no_disconnect_alert(self):
-        """T-0553 regression: specialist absent from connected_clients must NOT fire
-        specialist_disconnected. Specialist is not a bridge client; pantheon-bridge's
-        connected_clients has no meaning for specialist. Expect None (no alert).
-        """
-        from tools.inbox_consumer import check_agent_health
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": [],   # specialist permanently absent — not a bridge client
-            "queued_messages": {},
-            "last_inbound_at": {"specialist": None},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 self._specialist_state_ctx(tmppath), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent_for_agent",
-                       return_value=None), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_agent_health("specialist")
-        self.assertIsNone(vocab)
-        alert.assert_not_called()
-        # Belt-and-suspenders: confirm no disconnect vocab in any call
-        for call in alert.call_args_list:
-            self.assertNotIn("disconnected", str(call))
-
-    def test_specialist_pane_wedge_still_runs_for_non_bridge_agent(self):
-        """T-0553: specialist (non-bridge) pane-wedge fires even though specialist is
-        absent from connected_clients. The persistence-gated pane check runs
-        at top-level for non-bridge agents (T-0541 boot-dialog recovery intent
-        preserved).
-        """
-        from tools.inbox_consumer import check_agent_health
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": [],   # specialist not in bridge — irrelevant for non-bridge
-            "queued_messages": {},
-            "last_inbound_at": {"specialist": None},
-        }
-        wedged_pane = "Do you trust the files in this folder?\n/home/claude-research/foo\n> 1. Yes"
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 self._specialist_state_ctx(tmppath), \
-                 patch("tools.inbox_consumer._check_pane_wedge_persistent_for_agent",
-                       return_value=("Do you trust the files in this folder?",
-                                     wedged_pane)) as wedge_check, \
-                 patch("tools.inbox_consumer._auto_resolve_if_allowlisted_for_agent",
-                       return_value=None), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_agent_health("specialist")
-        # Pane-wedge check was called for specialist
-        wedge_check.assert_called_once_with("specialist")
-        # vocab is pane_wedge (not specialist_disconnected)
-        self.assertEqual(vocab, "pane_wedge")
-        alert.assert_called_once()
-
-    def test_orchestrator_bridge_client_still_alerts_on_disconnect(self):
-        """T-0553: orchestrator (is_bridge_client=True) still fires orchestrator_disconnected
-        when absent from connected_clients. The gating must not affect bridge
-        clients.
-        """
-        from tools.inbox_consumer import check_agent_health
-        payload = {
-            "telegram_connected": True,
-            "connected_clients": [],   # orchestrator absent — genuine disconnect
-            "queued_messages": {"orchestrator": 0},
-            "last_inbound_at": {"orchestrator": None},
-        }
-        with tempfile.TemporaryDirectory() as tmp:
-            tmppath = Path(tmp)
-            orchestrator_cfg = __import__(
-                "tools.inbox_consumer", fromlist=["_AGENT_HEALTH_CONFIG"]
-            )._AGENT_HEALTH_CONFIG["orchestrator"]
-            patched_config = {
-                "orchestrator": {
-                    **orchestrator_cfg,
-                    "last_alert_path": tmppath / "orchestrator_last_alert_at",
-                    "wedge_state_path": tmppath / "orchestrator_wedge_state",
-                },
-                "specialist": __import__(
-                    "tools.inbox_consumer", fromlist=["_AGENT_HEALTH_CONFIG"]
-                )._AGENT_HEALTH_CONFIG["specialist"],
-            }
-            with patch("urllib.request.urlopen", return_value=self._mock_health(payload)), \
-                 patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
-                 patch("tools.inbox_consumer._AGENT_HEALTH_CONFIG", patched_config), \
-                 patch("tools.inbox_consumer._pane_capture", return_value=None), \
-                 patch("tools.inbox_consumer._send_telegram_alert") as alert:
-                vocab = check_agent_health("orchestrator")
-        self.assertEqual(vocab, "orchestrator_disconnected")
-        alert.assert_called_once()
+    def test_t4362_seat_in_maintenance_skips_the_cycle_before_the_pull(self):
+        """T-4362: during recovery's T-3026 hand-move (seat maintenance armed) this cycle's
+        pull fast-forwarded the clone twice inside the move's don't-touch window. An
+        armed seat skips the whole cycle, and the pull never runs."""
+        for armed in (True, False):
+            with self.subTest(armed=armed), tempfile.TemporaryDirectory() as tmp:
+                tmppath = Path(tmp)
+                manager = MagicMock()
+                with patch("tools.inbox_consumer.LOG_PATH", tmppath / "log"), \
+                     patch("tools.inbox_consumer.check_cap_hit", manager.cap), \
+                     patch("tools.seat_state._read_maintenance", return_value=(
+                         _SS_MAINT if armed else _SS_NONE)), \
+                     patch("tools.inbox_consumer.pull_repo_or_warn", manager.pull), \
+                     patch("tools.inbox_consumer.check_dispatch_locked", manager.dispatch), \
+                     patch("tools.inbox_consumer.check_recent_inbound", manager.recent), \
+                     patch("tools.inbox_consumer.list_eligible_tickets",
+                           side_effect=SkipCycle("empty_inbox")), \
+                     patch("tools.inbox_consumer.surface_active_ticket", return_value=None):
+                    main("recovery")
+                    log = (tmppath / "log").read_text(encoding="utf-8")
+                called = [c[0] for c in manager.mock_calls if c[0] in ("pull", "dispatch", "recent")]
+                if armed:
+                    self.assertEqual(called, [])
+                    self.assertIn("skip:seat_maintenance", log)
+                else:
+                    self.assertEqual(called, ["pull", "dispatch", "recent"])
+                    self.assertNotIn("seat_maintenance", log)
 
 
 # ---------------------------------------------------------------------------
@@ -5102,7 +3251,7 @@ class TestCheckAgentHealthArgus(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestWardTmuxTarget(unittest.TestCase):
+class TestRecoveryTmuxTarget(unittest.TestCase):
     def test_recovery_default_target_matches_health_config(self):
         """Recovery's TMUX_TARGET_BY_AGENT default must match _AGENT_HEALTH_CONFIG pane_target.
 
@@ -5187,7 +3336,10 @@ def _write_ticket_with_auto_delivered(dir_path: Path, ticket_id: str, target: st
                                       last_transition: str | None = None,
                                       depends_on: list[str] | None = None,
                                       not_before: str | None = None,
-                                      labels: list[str] | None = None) -> Path:
+                                      labels: list[str] | None = None,
+                                      substate: str | None = None,
+                                      delivered_to: str | None = None,
+                                      auto_declined_by: list[str] | None = None) -> Path:
     """Write a ticket file with optional auto_delivered frontmatter fields."""
     state_dir = dir_path / state
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -5206,10 +3358,16 @@ def _write_ticket_with_auto_delivered(dir_path: Path, ticket_id: str, target: st
     ]
     if not_before is not None:
         fm_lines.append(f"not_before: {not_before}")
+    if substate is not None:
+        fm_lines.append(f"substate: {substate}")
     if auto_delivered:
         fm_lines.append("auto_delivered: true")
     if auto_delivered_at is not None:
         fm_lines.append(f"auto_delivered_at: {auto_delivered_at}")
+    if delivered_to is not None:
+        fm_lines.append(f"delivered_to: {delivered_to}")
+    if auto_declined_by:
+        fm_lines.append("auto_declined_by: [" + ", ".join(auto_declined_by) + "]")
     fm_lines.append("---")
     transition_ts = last_transition or created
     body = (
@@ -5424,7 +3582,7 @@ class TestIsAutoDeliveredStale(unittest.TestCase):
         whose mtime is well past the threshold IS stale. The skip-on-None early
         return wrongly bailed BEFORE consulting mtime, so a stale no-transition-log
         auto_delivered ticket wedged the dispatch mutex forever — T-2374 held
-        cairn's lock 19 days. Fix: fall back to file mtime (Arm 2) when log_ts is None."""
+        consultant's lock 19 days. Fix: fall back to file mtime (Arm 2) when log_ts is None."""
         from tools.inbox_consumer import _is_auto_delivered_stale
         import os
         from datetime import datetime, timezone, timedelta
@@ -5467,13 +3625,118 @@ class TestIsAutoDeliveredStale(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class TestIsolateGitMutationLock(unittest.TestCase):
+    """T-4310: the isolation must RESTORE an outer override, not just remove it
+    (the bare os.environ.pop T-4300 replaced passed every other test)."""
+
+    def test_outer_override_survives_an_isolated_test(self):
+        class Inner(unittest.TestCase):
+            def runTest(inner):
+                _isolate_git_mutation_lock(inner)
+                self.assertNotEqual(os.environ["PANTHEON_GIT_MUTATION_LOCKFILE"], "/outer.lock")
+
+        with patch.dict(os.environ, {"PANTHEON_GIT_MUTATION_LOCKFILE": "/outer.lock"}):
+            result = unittest.TestResult()
+            Inner().run(result)
+            self.assertEqual((result.errors, result.failures), ([], []))
+            self.assertEqual(os.environ.get("PANTHEON_GIT_MUTATION_LOCKFILE"), "/outer.lock")
+
+
+
+class TestT5049AutoDeclined(unittest.TestCase):
+    """T-5049: an offered-but-never-claimed (inbox/) stale stamp is recorded as
+    auto_declined_by, not re-offered to that seat, and does not page the operator."""
+
+    ROLE = "role:engineering_orchestrator"
+
+    def _stale_inbox(self, tickets_root, agent="artisan"):
+        import os
+        from datetime import datetime, timezone, timedelta
+        old = datetime.now(timezone.utc) - timedelta(hours=10)
+        path = _write_ticket_with_auto_delivered(
+            tickets_root, "T-0001", self.ROLE, state="inbox",
+            auto_delivered=True, auto_delivered_at="2026-06-02T04:00:00Z",
+            delivered_to=agent, last_transition=old.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        )
+        os.utime(path, (old.timestamp(), old.timestamp()))
+        return path
+
+    def _release(self, tickets_root, agent="artisan"):
+        from tools.inbox_consumer import check_dispatch_locked
+        with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+             patch("tools.inbox_consumer._send_telegram_alert") as alert, \
+             patch("tools.inbox_consumer.subprocess.run",
+                   return_value=MagicMock(returncode=0, stderr="")), \
+             patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
+            check_dispatch_locked(agent)
+        return alert
+
+    def _eligible(self, tickets_root, agent):
+        from tools.inbox_consumer import list_eligible_tickets, SkipCycle
+        with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root):
+            try:
+                return [t.id for t in list_eligible_tickets(agent)]
+            except SkipCycle:
+                return []
+
+    def test_inbox_stale_no_page_recorded_and_not_reoffered_to_same_seat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self._stale_inbox(root)
+            alert = self._release(root)
+            alert.assert_not_called()
+            text = path.read_text()
+            self.assertIn("auto_declined_by", text)
+            self.assertIn("artisan", text.split("auto_declined_by")[1].splitlines()[0])
+            self.assertNotIn("auto_delivered: true", text)
+            self.assertEqual(self._eligible(root, "artisan"), [])
+
+    def test_inbox_declined_still_eligible_for_other_pool_member(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._stale_inbox(root)
+            self._release(root)
+            self.assertEqual(self._eligible(root, "mason"), ["T-0001"])
+
+    def test_inbox_case_logs_once_with_undo_hint(self):
+        import io, contextlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._stale_inbox(root)
+            buf = io.StringIO()
+            with contextlib.redirect_stderr(buf):
+                self._release(root)
+            self.assertEqual(buf.getvalue().count("declined offered ticket T-0001"), 1)
+            self.assertIn("retarget to re-offer", buf.getvalue())
+
+    def test_active_stale_still_alerts_and_records_no_decline(self):
+        import os
+        from datetime import datetime, timezone, timedelta
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old = datetime.now(timezone.utc) - timedelta(hours=10)
+            path = _write_ticket_with_auto_delivered(
+                root, "T-0002", "artisan", state="active",
+                auto_delivered=True, auto_delivered_at="2026-06-02T04:00:00Z",
+                last_transition=old.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            )
+            os.utime(path, (old.timestamp(), old.timestamp()))
+            alert = self._release(root)
+            alert.assert_called_once()
+            self.assertNotIn("auto_declined_by", path.read_text())
+
+
 class TestCheckDispatchLocked(unittest.TestCase):
+    def setUp(self):
+        _isolate_git_mutation_lock(self)  # T-4300
+
     def test_no_stamped_tickets_passes(self):
         from tools.inbox_consumer import check_dispatch_locked
         with tempfile.TemporaryDirectory() as tmp:
             tickets_root = Path(tmp)
-            # A normal active ticket (no auto_delivered) — must not lock
-            _write_ticket(tickets_root, "T-0001", "orchestrator", state="active")
+            # T-4695: an unstamped active ticket held by orchestrator NOW locks (busy =
+            # any workable active ticket); another seat's active ticket must not.
+            _write_ticket(tickets_root, "T-0001", "recovery", state="active")
             with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root):
                 check_dispatch_locked("orchestrator")  # must not raise
 
@@ -5492,6 +3755,25 @@ class TestCheckDispatchLocked(unittest.TestCase):
                 with self.assertRaises(SkipCycle) as ctx:
                     check_dispatch_locked("orchestrator")
         self.assertEqual(ctx.exception.vocab, "dispatch_locked")
+
+    def test_awaiting_merge_active_ticket_not_locked(self):
+        """T-4119: a stamped active ticket parked `substate: awaiting-merge`
+        must NOT hold the dispatch mutex — its own work is done; it is
+        waiting on the HO-exclusive merge, not on the agent. Control is
+        test_stamped_active_ticket_raises_dispatch_locked above (same fixture
+        shape, no substate → DOES lock)."""
+        from tools.inbox_consumer import check_dispatch_locked
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp)
+            from datetime import datetime, timezone, timedelta
+            recent_ts = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+            _write_ticket_with_auto_delivered(
+                tickets_root, "T-0001", "orchestrator", state="active",
+                auto_delivered=True, auto_delivered_at="2026-06-02T10:00:00Z",
+                last_transition=recent_ts, substate="awaiting-merge",
+            )
+            with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root):
+                check_dispatch_locked("orchestrator")  # must not raise
 
     def test_stamped_inbox_ticket_raises_dispatch_locked(self):
         from tools.inbox_consumer import check_dispatch_locked
@@ -5608,7 +3890,7 @@ class TestCheckDispatchLocked(unittest.TestCase):
                 info = TicketInfo(id="T-0002", title="t", created_str="2026-06-02",
                                   depends_on=[], labels=[], body="", path=path)
                 ok = _stamp_auto_delivered(info)
-            self.assertTrue(ok)
+            self.assertIs(ok, inbox_consumer.StampResult.OK)
             commit_cmds = [c for c in commands if " commit " in c]
             self.assertEqual(len(commit_cmds), 1)
             self.assertIn(" -- ", commit_cmds[0])
@@ -5616,6 +3898,55 @@ class TestCheckDispatchLocked(unittest.TestCase):
             self.assertTrue(lock_fn.called, "add+commit+push must run under git_mutation_lock")
             lock_cm.__enter__.assert_called_once()
             lock_cm.__exit__.assert_called_once()
+
+    def test_t3925_stamp_ticket_gone_mid_cycle_returns_ticket_gone_not_failed(self):
+        """T-3925: if the ticket file vanishes before the stamp's read (it was
+        claimed/resolved OUT of inbox/ in the deliver-then-stamp window), the
+        read_text() ENOENT is a BENIGN race — delivery already happened and an
+        unstamped ticket that left inbox/ is no longer a pending delivery, so the
+        stamp is moot. _stamp_auto_delivered must return TICKET_GONE (caller
+        exits 0), NOT FAILED (which fired a FALSE OnFailure page on artisan
+        2026-09-22T04:01:07Z)."""
+        from tools.inbox_consumer import _stamp_auto_delivered, TicketInfo
+        with tempfile.TemporaryDirectory() as tmp:
+            gone = Path(tmp) / "inbox" / "T-0002.md"  # never created -> ENOENT on read
+            info = TicketInfo(id="T-0002", title="t", created_str="2026-06-02",
+                              depends_on=[], labels=[], body="", path=gone)
+            result = _stamp_auto_delivered(info)
+        self.assertIs(result, inbox_consumer.StampResult.TICKET_GONE)
+        self.assertIsNot(result, inbox_consumer.StampResult.FAILED)
+
+    def test_t3925_main_exits_zero_on_ticket_gone(self):
+        """T-3925: main() must exit 0 (no OnFailure page) when the stamp returns
+        TICKET_GONE — the delivery happened and the ticket left inbox/ mid-cycle,
+        a benign race, sibling to the LOCK_CONTENDED exit-0 path."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp) / "tickets"
+            _write_ticket(tickets_root, "T-0198", "orchestrator", title="Orchestrator ticket")
+            log_path = Path(tmp) / "inbox_consumer.log"
+            send_result = MagicMock(returncode=0, stdout="", stderr="")
+            with (
+                patch("tools.inbox_consumer.AUTONOMY_OFF_PATH", Path(tmp) / "autonomy_off"),
+                patch("tools.inbox_consumer.CAP_HIT_PATH", Path(tmp) / "no_cap_hit.json"),
+                patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
+                patch("tools.inbox_consumer.LOG_PATH", log_path),
+                patch("tools.inbox_consumer.TMUX_TARGET_BY_AGENT", {"orchestrator": "claude-telegram-bot"}),
+                patch("urllib.request.urlopen") as mock_urlopen,
+                patch("subprocess.run", return_value=send_result),
+                patch("tools.inbox_consumer.send_mailbox"),
+                patch("tools.inbox_consumer.check_dispatch_locked"),
+                patch("tools.inbox_consumer._stamp_auto_delivered",
+                      return_value=inbox_consumer.StampResult.TICKET_GONE),
+            ):
+                health_resp = MagicMock()
+                health_resp.__enter__ = lambda s: s
+                health_resp.__exit__ = MagicMock(return_value=False)
+                health_resp.read.return_value = json.dumps({
+                    "last_inbound_at": {"orchestrator": None, "specialist": None, "recovery": None}
+                }).encode()
+                mock_urlopen.return_value = health_resp
+                result = main("orchestrator")
+            self.assertEqual(result, 0, "TICKET_GONE is a benign race → exit 0, not a page")
 
     def test_clear_auto_delivered_removes_stamp(self):
         """_clear_auto_delivered removes auto_delivered + auto_delivered_at from frontmatter."""
@@ -5635,8 +3966,10 @@ class TestCheckDispatchLocked(unittest.TestCase):
             # broad-subprocess-mock poisoning _git_common_dir's docstring
             # warns about). PANTHEON_GIT_MUTATION_LOCKFILE is the documented
             # test-isolation override.
-            os.environ["PANTHEON_GIT_MUTATION_LOCKFILE"] = str(Path(tmp) / "git-ops.lock")
-            self.addCleanup(lambda: os.environ.pop("PANTHEON_GIT_MUTATION_LOCKFILE", None))
+            # T-4300: patch.dict, not a bare pop, so an OUTER override survives.
+            env = patch.dict(os.environ, {"PANTHEON_GIT_MUTATION_LOCKFILE": str(Path(tmp) / "git-ops.lock")})
+            env.start()
+            self.addCleanup(env.stop)
             with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
                  patch("tools.inbox_consumer.subprocess.run",
                        return_value=MagicMock(returncode=0, stderr="")), \
@@ -5709,7 +4042,11 @@ class TestCheckDispatchLocked(unittest.TestCase):
                        return_value=MagicMock(returncode=0, stderr="")), \
                  patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
                 check_dispatch_locked("orchestrator")   # cycle 1: detects stale → alert + clear
-                check_dispatch_locked("orchestrator")   # cycle 2: stamp gone → no alert
+                # cycle 2: stamp gone → no re-alert. T-4695: the ticket is still
+                # orchestrator's own ACTIVE work, so it still holds the lock (busy = any
+                # workable active ticket) -- but silently, no stale auto-release.
+                with self.assertRaises(SkipCycle):
+                    check_dispatch_locked("orchestrator")
             mock_alert.assert_called_once()
 
     def test_fresh_ticket_does_not_trigger_stale(self):
@@ -5772,6 +4109,9 @@ class TestGitDirectWritable(unittest.TestCase):
 
 
 class TestStampAutoDelivered(unittest.TestCase):
+    def setUp(self):
+        _isolate_git_mutation_lock(self)  # T-4300
+
     def test_stamp_writes_fields_to_frontmatter_and_returns_true(self):
         """_stamp_auto_delivered writes auto_delivered: true + auto_delivered_at to disk
         and returns True (write succeeded → inject may proceed)."""
@@ -5793,7 +4133,7 @@ class TestStampAutoDelivered(unittest.TestCase):
             from tools.ticket import parse_front_matter
             text = path.read_text(encoding="utf-8")
             fields, _ = parse_front_matter(text)
-        self.assertTrue(result)  # write succeeded → caller should inject
+        self.assertIs(result, inbox_consumer.StampResult.OK)  # write+add+commit+push OK
         self.assertEqual(fields.get("auto_delivered"), "true")
         self.assertIsNotNone(fields.get("auto_delivered_at"))
 
@@ -5824,8 +4164,8 @@ class TestStampAutoDelivered(unittest.TestCase):
 
             with patch("subprocess.run", side_effect=mock_run):
                 result = _stamp_auto_delivered(ticket)
-            # Git leg failed → returns False (fail-loud, T-3325)
-            self.assertFalse(result)
+            # Git leg failed → returns StampResult.FAILED (fail-loud, T-3325)
+            self.assertIs(result, inbox_consumer.StampResult.FAILED)
             # The local stamp write itself still succeeded, though — the
             # mutex is intact for THIS agent's own next-cycle reads.
             text = path.read_text(encoding="utf-8")
@@ -5856,7 +4196,7 @@ class TestStampAutoDelivered(unittest.TestCase):
                  patch("tools._git_utils.push_with_retry",
                        return_value=(False, "non-ff, retries exhausted")):
                 result = _stamp_auto_delivered(ticket)
-            self.assertFalse(result)
+            self.assertIs(result, inbox_consumer.StampResult.FAILED)
 
     def test_stamp_uses_git_direct_when_writable_no_sg_invoked(self):
         """T-3325 Defect 1: when the process can write `.git/` directly (e.g.
@@ -5886,7 +4226,7 @@ class TestStampAutoDelivered(unittest.TestCase):
                  patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
                 ok = _stamp_auto_delivered(ticket)
 
-            self.assertTrue(ok)
+            self.assertIs(ok, inbox_consumer.StampResult.OK)
             self.assertTrue(commands, "expected add + commit subprocess calls")
             for cmd in commands:
                 self.assertEqual(cmd[0], "git",
@@ -5921,30 +4261,48 @@ class TestStampAutoDelivered(unittest.TestCase):
                  patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
                 ok = _stamp_auto_delivered(ticket)
 
-            self.assertTrue(ok)
+            self.assertIs(ok, inbox_consumer.StampResult.OK)
             self.assertTrue(any(cmd[0] == "sg" for cmd in commands),
                              f"expected sg-wrapped calls, got: {commands}")
 
     def test_stamp_returns_false_on_write_error_inject_blocked(self):
-        """File-write failure → returns False (fail-CLOSED; caller must not inject).
+        """Genuine (non-ENOENT) file-write failure → FAILED (fail-CLOSED).
 
         Without the stamp on disk the mutex is absent; delivering a ticket
         would leave it unlocked and the next cycle could double-deliver.
+
+        T-3925: this must exercise a REAL write failure, not a missing path.
+        A FileNotFoundError is now the benign ticket-left-inbox race
+        (StampResult.TICKET_GONE), so the file is created readable first and
+        the *write* of the stamp is forced to fail with a non-ENOENT error
+        (PermissionError) — a genuine provenance gap that stays FAILED /
+        fail-loud, distinct from the TICKET_GONE race.
         """
         from tools.inbox_consumer import _stamp_auto_delivered
         with tempfile.TemporaryDirectory() as tmp:
-            # Use a path that doesn't exist to trigger write failure
+            ticket_path = Path(tmp) / "T-0001.md"
+            # Real, readable ticket file so read_text()/parse_front_matter succeed;
+            # only the subsequent stamp write is forced to fail.
+            ticket_path.write_text(
+                "---\nid: T-0001\ncreated: 2026-06-02T10:00:00Z\n"
+                "requester: orchestrator\ntarget: orchestrator\nstate: inbox\n---\n\n"
+                "## Ask\nDo.\n\n## Transition log\n\n"
+                "- 2026-06-02T10:00:00Z [orchestrator] filed in inbox\n",
+                encoding="utf-8",
+            )
             ticket = TicketInfo(
                 id="T-0001", title="Test",
                 created_str="2026-06-02T10:00:00Z",
                 depends_on=[], labels=[],
                 body="## Ask\nDo.\n\n## Transition log\n\n- 2026-06-02T10:00:00Z [orchestrator] filed in inbox\n",
-                path=Path(tmp) / "nonexistent_dir" / "T-0001.md",
+                path=ticket_path,
             )
-            with patch("subprocess.run", return_value=MagicMock(returncode=0)):
+            with patch("subprocess.run", return_value=MagicMock(returncode=0)), \
+                 patch.object(Path, "write_text",
+                              side_effect=PermissionError("read-only fs")):
                 result = _stamp_auto_delivered(ticket)
-        # Write failed → returns False (caller must not inject)
-        self.assertFalse(result)
+        # Non-ENOENT write failure → StampResult.FAILED (caller must not inject)
+        self.assertIs(result, inbox_consumer.StampResult.FAILED)
 
     def test_stamp_write_failure_after_delivery_warns_and_does_not_skip(self):
         """main(): delivery happens FIRST; a later stamp-write failure warns.
@@ -5957,7 +4315,7 @@ class TestStampAutoDelivered(unittest.TestCase):
           - OLD (stamp→deliver): a failed DELIVERY left the stamp behind, so
             check_dispatch_locked treated a poke that never arrived as in-flight and
             blocked the agent's entire queue for 8h. Fired live on 2026-07-28
-            (mnemosyne / T-1825) and is silent, because dispatch_locked is
+            (archivist / T-1825) and is silent, because dispatch_locked is
             correctly in NEVER_ALERT_SKIP_VOCABS for the genuinely-in-flight case.
           - NEW (deliver→stamp): a failed STAMP may cause a re-delivery next cycle.
             Self-healing, and guarded three ways — durable state-pointer payload
@@ -5988,7 +4346,7 @@ class TestStampAutoDelivered(unittest.TestCase):
 
             inject_called = []
 
-            def track_inject(tmux_target, prompt):
+            def track_inject(tmux_target, prompt, harness="claude-code"):
                 inject_called.append((tmux_target, prompt))
 
             with patch("tools.inbox_consumer.AUTONOMY_OFF_PATH", Path(tmp) / "autonomy_off"), \
@@ -6052,7 +4410,7 @@ class TestStampAutoDelivered(unittest.TestCase):
                  patch("tools.inbox_consumer.TMUX_TARGET_BY_AGENT", {"orchestrator": "claude-telegram-bot"}), \
                  patch("urllib.request.urlopen", return_value=resp), \
                  patch("tools.inbox_consumer.pull_repo_or_warn"), \
-                 patch("tools.inbox_consumer._stamp_auto_delivered", return_value=True), \
+                 patch("tools.inbox_consumer._stamp_auto_delivered", return_value=inbox_consumer.StampResult.OK), \
                  patch("subprocess.run", return_value=MagicMock(returncode=0, stdout="", stderr="")), \
                  patch("tools.inbox_consumer._send_telegram_alert"):
                 result = main("orchestrator")
@@ -6067,6 +4425,9 @@ class TestStampAutoDelivered(unittest.TestCase):
 
 
 class TestFullCycleWithMutex(unittest.TestCase):
+    def setUp(self):
+        _isolate_git_mutation_lock(self)  # T-4300
+
     def _health_resp(self):
         resp = MagicMock()
         resp.__enter__ = lambda s: s
@@ -6174,14 +4535,14 @@ from tools.inbox_consumer import (  # noqa: E402 (module-tail import, matches th
 
 
 class TestSeatRouting(unittest.TestCase):
-    """T-1919: metis/atlas (ORG-043 seats) registered for inbox auto-delivery.
+    """T-1919: mason/artisan (ORG-043 seats) registered for inbox auto-delivery.
 
-    Mirrors the T-0102 specialist precedent (TestArgusRouting above). Until these
+    Mirrors the T-0102 specialist precedent (TestSpecialistRouting above). Until these
     registrations landed, the seats had no inbox-consumer at all: no ~10-min
     repo-freshness pull and no ticket auto-delivery.
     """
 
-    SEATS = {"metis": ("suborch1-main", "suborch1"), "atlas": ("suborch2-main", "suborch2")}
+    SEATS = {"mason": ("suborch1-main", "suborch1"), "artisan": ("suborch2-main", "suborch2")}
 
     # -- TMUX_TARGET_BY_AGENT (the load-bearing map for a seat's own cycle) --
 
@@ -6195,7 +4556,7 @@ class TestSeatRouting(unittest.TestCase):
     def test_seat_tmux_target_resolves_to_real_session_not_fallback(self) -> None:
         """_resolve_tmux_target must NOT fall through to f"claude-{agent}-bot".
 
-        The fallback yields "claude-metis-bot", which is not a live session, so
+        The fallback yields "claude-mason-bot", which is not a live session, so
         every cycle would inject nowhere and skip tmux_unreachable.
         """
         for seat, (session, _user) in self.SEATS.items():
@@ -6205,12 +4566,12 @@ class TestSeatRouting(unittest.TestCase):
                 self.assertNotEqual(resolved, f"claude-{seat}-bot")
 
     def test_seat_env_var_override_wired(self) -> None:
-        with patch.dict(os.environ, {"PANTHEON_METIS_TMUX_TARGET": "custom-metis-target"}):
+        with patch.dict(os.environ, {"PANTHEON_MASON_TMUX_TARGET": "custom-mason-target"}):
             with patch(
                 "tools.inbox_consumer.TMUX_TARGET_BY_AGENT",
-                {"metis": os.environ.get("PANTHEON_METIS_TMUX_TARGET", "suborch1-main")},
+                {"mason": os.environ.get("PANTHEON_MASON_TMUX_TARGET", "suborch1-main")},
             ):
-                self.assertEqual(_resolve_tmux_target("metis"), "custom-metis-target")
+                self.assertEqual(_resolve_tmux_target("mason"), "custom-mason-target")
 
     def test_tmux_target_is_bare_session_name_not_window_suffixed(self) -> None:
         """Regression guard for the T-0717 Recovery class: this map feeds
@@ -6221,7 +4582,8 @@ class TestSeatRouting(unittest.TestCase):
             with self.subTest(seat=seat):
                 self.assertNotIn(":", TMUX_TARGET_BY_AGENT[seat])
 
-    # -- _AGENT_HEALTH_CONFIG (armed-but-unprobed until T-1940) -------------
+    # -- _AGENT_HEALTH_CONFIG (pane-capture config; T-4203 trimmed the -------
+    # -- health-loop-only fields, whose seat tests were removed with them) ----
 
     def test_seats_present_in_health_config_with_specialist_shape(self) -> None:
         for seat, (session, user) in self.SEATS.items():
@@ -6229,32 +4591,6 @@ class TestSeatRouting(unittest.TestCase):
                 cfg = _AGENT_HEALTH_CONFIG[seat]
                 self.assertEqual(cfg["pane_target"], f"{session}:0")
                 self.assertEqual(cfg["unix_user"], user)
-                self.assertIn("last_alert_path", cfg)
-                self.assertIn("wedge_state_path", cfg)
-
-    def test_seats_are_not_bridge_clients(self) -> None:
-        """Seats launch bare `claude` with no --channels, like specialist. True would
-        emit permanent false <seat>_disconnected alerts."""
-        for seat in self.SEATS:
-            with self.subTest(seat=seat):
-                self.assertIs(_AGENT_HEALTH_CONFIG[seat]["is_bridge_client"], False)
-
-    def test_seats_do_not_set_alert_only(self) -> None:
-        """alert_only is Recovery's no-backstop special case (T-0559), not a
-        default for non-HO agents."""
-        for seat in self.SEATS:
-            with self.subTest(seat=seat):
-                self.assertNotIn("alert_only", _AGENT_HEALTH_CONFIG[seat])
-
-    def test_seat_state_paths_are_distinct_per_agent(self) -> None:
-        """Shared state paths would let one seat's throttle/wedge state mask
-        the other's."""
-        paths = [
-            _AGENT_HEALTH_CONFIG[s][k]
-            for s in self.SEATS
-            for k in ("last_alert_path", "wedge_state_path")
-        ]
-        self.assertEqual(len(paths), len(set(paths)))
 
 
 # ---------------------------------------------------------------------------
@@ -6268,14 +4604,14 @@ class TestSeatRouting(unittest.TestCase):
 class TestDeliverBeforeStampOrdering(unittest.TestCase):
     """T-2152: a FAILED delivery must leave NO auto_delivered stamp. The old
     stamp-first order left a phantom-delivered ticket holding the dispatch mutex,
-    blocking the agent's whole queue for 8h (live: mnemosyne/T-1825, 2026-07-28)."""
+    blocking the agent's whole queue for 8h (live: archivist/T-1825, 2026-07-28)."""
 
     def test_failed_delivery_leaves_no_stamp(self):
         from tools import inbox_consumer as ic
         with patch.object(ic, "deliver", side_effect=ic.SkipCycle("mailbox_unreachable")), \
              patch.object(ic, "_stamp_auto_delivered") as mock_stamp:
             with self.assertRaises(ic.SkipCycle):
-                ic.deliver("mnemosyne", "pane", "poke")
+                ic.deliver("archivist", "pane", "poke")
         mock_stamp.assert_not_called()
 
     def test_stamp_happens_only_after_delivery_returns(self):
@@ -6284,7 +4620,7 @@ class TestDeliverBeforeStampOrdering(unittest.TestCase):
         import inspect
         src = inspect.getsource(ic.main)
         d = src.index("deliver(agent, tmux_target, prompt)")
-        s = src.index("_stamp_auto_delivered(ticket)")
+        s = src.index("_stamp_auto_delivered(ticket")
         self.assertLess(
             d, s,
             "deliver() must precede _stamp_auto_delivered() — reversing this "
@@ -6297,34 +4633,39 @@ class TestDeliverBeforeStampOrdering(unittest.TestCase):
         from tools import inbox_consumer as ic
         import inspect
         src = inspect.getsource(ic.main)
-        tail = src[src.index("_stamp_auto_delivered(ticket)"):]
+        tail = src[src.index("_stamp_auto_delivered(ticket"):]
         self.assertNotIn(
             'raise SkipCycle("stamp_write_failed")', tail,
             "a stamp failure AFTER successful delivery must warn, not raise",
         )
 
 
-class TestMnemosyneDeliveryMode(unittest.TestCase):
-    """T-2146: mnemosyne is pure-ACP — her ticket pokes must go via the mailbox
-    (her bridge polls it), never a tmux pane."""
+class TestArchivistDeliveryMode(unittest.TestCase):
+    """T-3832 (2026-09-20): archivist consolidated to a single claude instance —
+    her ACP bridge (which ran a redundant claude-code-acp 2nd claude) is retired,
+    so her ticket pokes now go by pane-inject like every other claude-code seat
+    (she was "mailbox" under T-2146 when the bridge was her intake). Her pane
+    (claude-telegram-bot-exocortex:0) is her OWN work session, not the operator's chat,
+    so a send-keys kick lands in her agent loop — verified by capture 2026-09-20."""
 
-    def test_mnemosyne_is_mailbox_mode(self):
+    def test_archivist_is_send_keys_mode(self):
         from tools.inbox_consumer import DELIVERY_MODE
-        self.assertEqual(DELIVERY_MODE.get("mnemosyne"), "mailbox")
+        self.assertEqual(DELIVERY_MODE.get("archivist"), "send-keys")
 
-    def test_mnemosyne_poke_never_touches_tmux(self):
+    def test_archivist_resolves_to_her_real_pane(self):
+        # Without a TMUX_TARGET_BY_AGENT entry, _resolve_tmux_target falls back to
+        # "claude-archivist-bot" (no such session) and every send-keys cycle would
+        # inject nowhere. Her live session is "claude-telegram-bot-exocortex".
+        from tools.inbox_consumer import _resolve_tmux_target
+        self.assertEqual(_resolve_tmux_target("archivist"),
+                         "claude-telegram-bot-exocortex")
+
+    def test_archivist_poke_goes_send_keys_not_mailbox(self):
         with patch("tools.inbox_consumer.send_mailbox", return_value=True) as mock_mb, \
-             patch("subprocess.run") as mock_run:
-            deliver("mnemosyne", "claude-telegram-bot-exocortex", "poke")
-        mock_mb.assert_called_once()
-        send_keys = [c for c in mock_run.call_args_list
-                     if len(c[0][0]) > 1 and c[0][0][1] == "send-keys"]
-        self.assertEqual(
-            send_keys, [],
-            "a pane-inject for mnemosyne would land in the operator's own telegram "
-            "surface (mailbox_wake.AGENT_PANE maps her to "
-            "claude-telegram-bot-exocortex:0) — mailbox mode must return first",
-        )
+             patch("tools.inbox_consumer.inject") as mock_inject:
+            deliver("archivist", "claude-telegram-bot-exocortex", "poke")
+        mock_mb.assert_not_called()
+        mock_inject.assert_called_once_with("claude-telegram-bot-exocortex", "poke", "claude-code")
 
     def test_codex_flipped_to_mailbox(self):
         """T-2144: codex IS flipped now. The T-2142 gate — which account runs its
@@ -6341,6 +4682,11 @@ class TestActiveSurfaceHonoursDeliveryMode(unittest.TestCase):
     def setUp(self):
         from tools.inbox_consumer import surface_active_ticket
         self.surface_active_ticket = surface_active_ticket
+        # T-3832: specialist is send-keys in prod now; force mailbox as a fixture so the
+        # active-ticket reminder mailbox-routing test keeps exercising the mechanism.
+        self._orig_dm = dict(DELIVERY_MODE)
+        DELIVERY_MODE["specialist"] = "mailbox"
+        self.addCleanup(lambda: (DELIVERY_MODE.clear(), DELIVERY_MODE.update(self._orig_dm)))
 
     @staticmethod
     def _no_tmux(cmd, **kwargs):
@@ -6449,9 +4795,9 @@ class TestActiveSurfaceHonoursDeliveryMode(unittest.TestCase):
 class TestPaneIdleStateThreeState(unittest.TestCase):
     """T-2158 condition 5 / T-2157: idle vs generating vs unknown.
 
-    The load-bearing distinction: _bottom_region_shows_live_input is TRUE for a
-    generating pane (it answers 'loop alive', not 'idle'). Using it as an idle
-    check would re-kick busy agents every sweep. These tests pin the split.
+    The load-bearing distinction: a generating pane is 'loop alive' but NOT
+    'idle'. Reading alive-as-idle would re-kick busy agents every sweep. These
+    tests pin the split.
     """
 
     def setUp(self):
@@ -6462,16 +4808,13 @@ class TestPaneIdleStateThreeState(unittest.TestCase):
         pane = "some scrollback\n> working\n  esc to interrupt · manual mode on\n"
         self.assertIs(self.ic.pane_idle_state(pane), False)
 
-    def test_generating_pane_would_pass_the_liveness_predicate(self):
-        """Proves the two predicates genuinely differ — the reason this exists."""
-        pane = "some scrollback\n> working\n  esc to interrupt · manual mode on\n"
-        self.assertTrue(self.ic._bottom_region_shows_live_input(pane))
-        self.assertIs(self.ic.pane_idle_state(pane), False)
-
     def test_idle_prompt_variants_are_True(self):
+        # T-4364: an empty "❯" composer over the sentinel footer, as the TUI draws it.
+        # (It was "x\n>\n  {sentinel} · manual": no composer, and a hint no footer has,
+        # which the whitelisted sentinel route now reads BUSY.)
         for sentinel in ("? for shortcuts", "ctrl+t to hide tasks"):
             with self.subTest(sentinel=sentinel):
-                self.assertIs(self.ic.pane_idle_state(f"x\n>\n  {sentinel} · manual\n"), True)
+                self.assertIs(self.ic.pane_idle_state(f"x\n❯\n  {sentinel}\n"), True)
 
     def test_generating_wins_when_both_sentinels_present(self):
         """Precedence guard. A pane can show a task-list line AND 'esc to
@@ -6497,17 +4840,19 @@ class TestPaneIdleStateThreeState(unittest.TestCase):
         pane = "esc to interrupt\n" + "\n".join(f"filler {i}" for i in range(20))
         self.assertIsNone(self.ic.pane_idle_state(pane))
 
-    # --- T-3579: manage-view (background-agent/shells) → BUSY (defer, not inject) ---
+    # --- T-3579: manage-view (background-agent/shells) — T-4284 split the verdict ---
     def test_manage_view_is_False_busy(self):
-        """The real 13:17 atlas footer: background agent active, main loop
-        idle-waiting → 'N shell · ↓ to manage', NO 'esc to interrupt'. Was None
-        (waker/poker missed it → false exit-8/exit-1); now False so consumers
-        DEFER. Falsifier: background-agent-working pane → defer, not exit-8."""
+        """The real 13:17 artisan footer: background agent active, main loop
+        idle-waiting → 'N shell · ↓ to manage', NO 'esc to interrupt'. T-3579 read
+        it BUSY on the premise that input queues. T-4284 disproved that premise:
+        the main turn has ended and input submits, so delivery reads it IDLE. The
+        nudge caller (background_agents_busy=True) still reads it BUSY."""
         pane = ("work\n"
                 "  ◯ general-purpose  Inserting tests  11m · ↓ 133k tokens\n"
                 "❯ \n"
                 "  ⏸ manual mode on · 1 shell · ← for agents · ↓ to manage\n")
-        self.assertIs(self.ic.pane_idle_state(pane), False)
+        self.assertIs(self.ic.pane_idle_state(pane), True)
+        self.assertIs(self.ic.pane_idle_state(pane, background_agents_busy=True), False)
 
     def test_generating_still_wins_over_manage_view(self):
         """Precedence: 'esc to interrupt' (generating) is checked before the
@@ -6535,6 +4880,686 @@ class TestPaneIdleStateThreeState(unittest.TestCase):
         pane = "↓ to manage\n" + "\n".join(f"filler {i}" for i in range(20))
         self.assertIsNone(self.ic.pane_idle_state(pane))
 
+    # --- T-4087: narrow T-3579 — shells-only manage view is IDLE; running AGENT is BUSY ---
+    # Fixtures are LIVE captures of Recovery's own pane, 2026-09-28 (rules shortened).
+    _RULE = "─" * 80
+    CAPTURE_A_IDLE_SHELLS = (
+        "  Ran 1 shell command\n"
+        "● Capture A is armed; it fires about 20s after this turn ends.\n"
+        "✻ Crunched for 36m 40s · done 22:37 · 1 shell still running\n"
+        f"{_RULE}\n❯ \n{_RULE}\n"
+        "  ⏸ manual mode on · 1 shell · ← for agents · ↓ to manage\n"
+    )
+    CAPTURE_B_AGENT_RUNNING = (
+        "  for about 80s.\n"
+        "✻ Waiting for 1 background agent to finish\n"
+        f"{_RULE}\n❯ \n{_RULE}\n"
+        "  ⏸ manual mode on · 2 shells · /tasks to see subagents · ← for agents · ↓ to…\n"
+        "  ● main\n"
+        "  ◯ general-purpose  Hold 80s for pane capture             3s · ↓ 33.1k tokens\n"
+    )
+    CAPTURE_C_GENERATING_WITH_AGENT = (
+        f"{_RULE}\n❯ \n{_RULE}\n"
+        "  ⏸ manual mode on · 1 shell · esc to interrupt · ← for agents · ↓ to manage\n"
+        "  ● main\n"
+        "  ◯ general-purpose  Hold 80s for pane capture            31s · ↓ 33.1k tokens\n"
+    )
+
+    def test_idle_with_background_shells_is_True(self):
+        """THE T-4087 case: the turn ended, only watcher SHELLS run, Claude's composer
+        is empty. Injected input submits here (orchestrator woke Recovery this way), so it must be
+        wakeable — the T-3579 rule deferred every wake for the watcher's lifetime."""
+        self.assertIs(self.ic.pane_idle_state(self.CAPTURE_A_IDLE_SHELLS), True)
+
+    def test_running_background_agent_is_idle_for_delivery_busy_for_nudge(self):
+        """State B at today's width: the footer truncates to '↓ to…' and a
+        streamed-token agent row is running. T-4284: this is the TURN-ENDED state,
+        and input submits here (mason 2026-09-29 05:50:29Z, rc 0, no re-press). So
+        delivery reads it IDLE and the nudge caller reads it BUSY."""
+        self.assertIs(self.ic.pane_idle_state(self.CAPTURE_B_AGENT_RUNNING), True)
+        self.assertIs(self.ic.pane_idle_state(
+            self.CAPTURE_B_AGENT_RUNNING, background_agents_busy=True), False)
+
+    def test_generating_with_agent_rows_is_False(self):
+        self.assertIs(self.ic.pane_idle_state(self.CAPTURE_C_GENERATING_WITH_AGENT), False)
+        self.assertIs(self.ic.pane_idle_state(
+            self.CAPTURE_C_GENERATING_WITH_AGENT, background_agents_busy=True), False)
+
+    def test_waiting_for_agents_line_alone_is_idle_for_delivery_busy_for_nudge(self):
+        """The 'Waiting for N background agent(s)' line is the turn-END status line
+        (the agent analogue of '✻ Crunched … done'), not an open turn (T-4284)."""
+        pane = (f"✻ Waiting for 2 background agents to finish\n{self._RULE}\n❯ \n{self._RULE}\n"
+                "  ⏸ manual mode on · 1 shell · ← for agents · ↓ to manage\n")
+        self.assertIs(self.ic.pane_idle_state(pane), True)
+        self.assertIs(self.ic.pane_idle_state(pane, background_agents_busy=True), False)
+
+    # --- T-4284: live captures, 2026-09-29 (tools/testdata) ---
+    _TESTDATA = Path(__file__).resolve().parent / "testdata"
+    # Recovery's own pane at 06:37:18Z, verbatim, taken by a read-only background capture
+    # AFTER its final message printed, with a haiku agent holding 150s. The empty
+    # composer is "❯" + a no-break space.
+    CAPTURE_RECOVERY_TURN_ENDED_AGENT_RUNNING = (
+        _TESTDATA / "recovery_turn_ended_bg_agent_pane.txt").read_text(encoding="utf-8")
+    # orchestrator at 06:30Z: turn ended (it had just merged #386), two idle teammates and
+    # two long implementers. No Waiting line and no 'esc to interrupt'. This is the
+    # pane that starved artisan's URGENT HOLD for 37 min. Transcribed from the live
+    # capture (the transcript above the answer's last lines trimmed).
+    CAPTURE_ORCHESTRATOR_TURN_ENDED = (
+        _TESTDATA / "orchestrator_turn_ended_bg_agents_pane.txt").read_text(encoding="utf-8")
+    # orchestrator at 06:36Z, mid-turn: the footer carries 'esc to interrupt'.
+    CAPTURE_ORCHESTRATOR_GENERATING = (
+        f"{_RULE}\n❯ \n{_RULE}\n"
+        "  ⏸ manual mode on · 2 shells · esc to interrupt · ← for agents · ↓ to manage\n"
+        "  ● main\n"
+        "  ◯ rev-t4220   INTENT: a cascade sweep that sil…                         idle\n"
+        "  ◯ rev-t4226   INTENT: code reaches main only t…                         idle\n"
+        "  ◯ impl-t4230  Grepping run_test window overrid… 1h 22m 53s · ↓ 300.3k tokens\n"
+        "  ◯ impl-t4226  Waiting on full_suite4.log           51m 53s · ↓ 431.8k tokens\n"
+    )
+
+    def test_recovery_turn_ended_with_running_agent_is_idle(self):
+        self.assertIs(self.ic.pane_idle_state(self.CAPTURE_RECOVERY_TURN_ENDED_AGENT_RUNNING), True)
+        self.assertIs(self.ic.pane_idle_state(
+            self.CAPTURE_RECOVERY_TURN_ENDED_AGENT_RUNNING, background_agents_busy=True), False)
+
+    def test_orchestrator_turn_ended_with_implementers_is_idle(self):
+        """THE T-4284 case: mail must reach this pane (the old rule deferred 24 wakes)."""
+        self.assertIs(self.ic.pane_idle_state(self.CAPTURE_ORCHESTRATOR_TURN_ENDED), True)
+        self.assertIs(self.ic.pane_idle_state(
+            self.CAPTURE_ORCHESTRATOR_TURN_ENDED, background_agents_busy=True), False)
+
+    def test_orchestrator_turn_ended_agent_list_under_mode_footer_is_idle(self):
+        """T-5607 (orchestrator 2026-10-26 17:46Z, capture -e): this build puts the agent
+        list straight under the mode footer ('⏵⏵ bypass permissions on · 9 shells'),
+        with no '← for agents'. Left unsplit, the token rows read BUSY and mail sat
+        unread 2h."""
+        cap = (self._TESTDATA / "orchestrator_turn_ended_mode_footer_agent_list_pane_ansi.txt"
+               ).read_text(encoding="utf-8")
+        self.assertIs(self.ic.pane_idle_state(cap), True)
+        self.assertIs(self.ic.pane_idle_state(cap, background_agents_busy=True), False)
+
+    def test_orchestrator_generating_with_implementers_is_busy(self):
+        self.assertIs(self.ic.pane_idle_state(self.CAPTURE_ORCHESTRATOR_GENERATING), False)
+        self.assertIs(self.ic.pane_idle_state(
+            self.CAPTURE_ORCHESTRATOR_GENERATING, background_agents_busy=True), False)
+
+    def test_generating_footer_pushed_out_by_idle_rows_is_still_busy(self):
+        """Six idle teammate rows fill the raw 6-line region (no token row, no
+        sentinel), so the old rule read the pane UNKNOWN. The agent list is split off
+        first, so the footer's 'esc to interrupt' is seen."""
+        rows = "".join(f"  ◯ rev-t{n}   INTENT: review …                         idle\n"
+                       for n in range(4000, 4005))
+        pane = (f"{self._RULE}\n❯ \n{self._RULE}\n"
+                "  ⏸ manual mode on · esc to interrupt · ← for agents · ↓ to manage\n"
+                "  ● main\n" + rows)
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_background_agents_busy_does_not_change_shells_only(self):
+        """The opt-in reads AGENTS as busy, not shells: state A stays idle."""
+        self.assertIs(self.ic.pane_idle_state(
+            self.CAPTURE_A_IDLE_SHELLS, background_agents_busy=True), True)
+
+    def test_assistant_bullet_is_not_split_as_agent_list(self):
+        """'● …' is also the assistant's message bullet. Without a footer directly
+        above, trailing bullets stay in the region (here: no sentinel → UNKNOWN)."""
+        pane = "● Now the ORG-013 line (N2): the implementation block still says\n● done\n"
+        self.assertEqual(self.ic._split_agent_list(pane.splitlines()), (pane.splitlines(), []))
+        self.assertIsNone(self.ic.pane_idle_state(pane))
+
+    # --- T-4284 review: busy evidence the demoted agent rows used to supply by accident ---
+    # orchestrator mid-turn at 07:58Z, verbatim: a spinner and a two-line tip above the
+    # composer, the footer truncated to "↓ to mana…", four agent rows.
+    CAPTURE_ORCHESTRATOR_GENERATING_VERBATIM = (
+        _TESTDATA / "orchestrator_generating_bg_agents_pane.txt").read_text(encoding="utf-8")
+
+    def test_orchestrator_generating_verbatim_is_busy(self):
+        self.assertIs(self.ic.pane_idle_state(self.CAPTURE_ORCHESTRATOR_GENERATING_VERBATIM), False)
+
+    def test_generating_without_esc_under_manage_footer_is_busy(self):
+        """Blocker 1. A generating footer can omit "esc to interrupt" (specialist, 09-28).
+        Drop it from orchestrator's verbatim capture: the agent rows no longer make the pane
+        busy for delivery, so the spinner above the composer has to."""
+        pane = self.CAPTURE_ORCHESTRATOR_GENERATING_VERBATIM.replace("esc to interrupt · ", "")
+        self.assertNotIn("esc to interrupt", pane)
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_specialist_generating_capture_is_busy(self):
+        """Blocker 1, on kick_verify's committed specialist capture (T-4193): a tip line and
+        a notice push the spinner out of the bottom region, and the footer has no
+        "esc to interrupt". Alone it read UNKNOWN (mailbox_wake injected on None
+        until T-4292).
+        Under a manage footer with a running agent it read IDLE."""
+        from tools import test_kick_verify as tkv
+        specialist = tkv.SPECIALIST_WORKING_2026_09_28
+        self.assertIs(self.ic.pane_idle_state(specialist), False)
+        with_agent = specialist.replace(
+            "  ⏸ manual mode on · ← for agents\n",
+            "  ⏸ manual mode on · 1 shell · ← for agents · ↓ to manage\n"
+            "  ● main\n"
+            "  ◯ general-purpose  Hold 80s for pane capture             3s · ↓ 33.1k tokens\n")
+        self.assertNotEqual(with_agent, specialist)
+        self.assertIs(self.ic.pane_idle_state(with_agent), False)
+
+    # --- The plain mode footer (TUI 2.1.284, found building T-4292) ---
+    # specialist idle at 07:41:48Z, verbatim: manual mode, no background work, and no
+    # "? for shortcuts" in the footer, so it read UNKNOWN.
+    CAPTURE_SPECIALIST_IDLE_PLAIN_FOOTER = (
+        _TESTDATA / "specialist_idle_mode_footer_pane.txt").read_text(encoding="utf-8")
+    # specialist mid-turn at 07:40Z (transcribed, rules shortened): the SAME footer, no
+    # "esc to interrupt"; only the live spinner line says it is generating.
+    CAPTURE_SPECIALIST_GENERATING_NO_ESC = (
+        _TESTDATA / "specialist_generating_no_esc_pane.txt").read_text(encoding="utf-8")
+    # A tool-permission prompt: the option cursor is "❯", the footer is the modal one.
+    CAPTURE_PERMISSION_MODAL = (
+        " Bash command\n"
+        "   git push origin HEAD:main\n"
+        " Do you want to proceed?\n"
+        " ❯ 1. Yes\n"
+        "   2. Yes, and don't ask again for git push commands\n"
+        "   3. No, and tell Claude what to do differently (esc)\n"
+        " Esc to cancel · Tab to amend\n"
+    )
+
+    def test_plain_mode_footer_idle_is_True(self):
+        self.assertIs(self.ic.pane_idle_state(self.CAPTURE_SPECIALIST_IDLE_PLAIN_FOOTER), True)
+
+    def test_both_generating_captures_under_the_plain_footer_are_busy(self):
+        """The mode footer over an EMPTY composer is also what a generating pane shows
+        when its footer omits "esc to interrupt". Both live captures must read BUSY:
+        the spinner check runs before the footer can vouch for idle."""
+        from tools import test_kick_verify as tkv
+        footer = "⏸ manual mode on · ← for agents"
+        for name, pane in (("specialist 2026-09-28 21:25Z", tkv.SPECIALIST_WORKING_2026_09_28),
+                           ("specialist 2026-09-29 07:40Z", self.CAPTURE_SPECIALIST_GENERATING_NO_ESC)):
+            with self.subTest(name):
+                self.assertIn(footer, pane)
+                self.assertNotIn("esc to interrupt", pane)
+                self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_permission_modal_stays_unknown(self):
+        """A modal is neither idle nor generating, and the mode footer never promotes
+        it: the dialog-footer check runs first. A paste plus Enter here would confirm
+        option 1."""
+        self.assertIsNone(self.ic.pane_idle_state(self.CAPTURE_PERMISSION_MODAL))
+        with_footer = self.CAPTURE_PERMISSION_MODAL + "  ⏸ manual mode on · ← for agents\n"
+        self.assertIsNone(self.ic.pane_idle_state(with_footer))
+
+    def test_plain_mode_footer_with_text_in_composer_is_busy(self):
+        pane = self.CAPTURE_SPECIALIST_IDLE_PLAIN_FOOTER.replace("❯\xa0\n", "❯ half-typed reply\n")
+        self.assertNotEqual(pane, self.CAPTURE_SPECIALIST_IDLE_PLAIN_FOOTER)
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_turn_end_summary_line_is_not_a_spinner(self):
+        """'✻ Crunched for … · done' / '✻ Worked for …' end a turn: no token count."""
+        for line in ("✻ Crunched for 36m 40s · done 22:37", "✻ Worked for 2m 10s"):
+            pane = f"{line}\n{self._RULE}\n❯ \n{self._RULE}\n  ⏸ manual mode on · ← for agents\n"
+            with self.subTest(line=line):
+                self.assertIs(self.ic.pane_idle_state(pane), True)
+
+    def test_codex_screen_still_unknown(self):
+        pane = ("─ Worked for 1h 15m 36s " + "─" * 40 + "\n"
+                "› Use /skills to list available skills\n"
+                "gpt-5.6-sol high · ~ · Main [default]\n")
+        self.assertIsNone(self.ic.pane_idle_state(pane))
+
+    # --- T-4284 round 2 (B1): the agent-list overflow line ---
+    # orchestrator ~17:00Z, verbatim (rev-t4284's capture): generating, 5 agent rows,
+    # then "  ↓ 1 more". The turn-ended forms below drop "esc to interrupt · " from
+    # the same capture (DERIVED, not captured).
+    CAPTURE_ORCHESTRATOR_OVERFLOW_GENERATING = (
+        _TESTDATA / "orchestrator_generating_agent_overflow_pane.txt").read_text(encoding="utf-8")
+
+    def test_overflow_capture_generating_is_busy(self):
+        pane = self.CAPTURE_ORCHESTRATOR_OVERFLOW_GENERATING
+        self.assertIn("↓ 1 more", pane)
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_turn_ended_with_agent_overflow_is_idle_for_delivery(self):
+        """6+ agents: the overflow line must not hide the footer and composer."""
+        ended = self.CAPTURE_ORCHESTRATOR_OVERFLOW_GENERATING.replace("esc to interrupt · ", "")
+        self.assertNotEqual(ended, self.CAPTURE_ORCHESTRATOR_OVERFLOW_GENERATING)
+        # The spinner above the composer is the generating turn's; a turn-ended pane
+        # has its summary line there instead.
+        ended = re.sub(r"(?m)^✢ Hatching….*$", "✻ Worked for 18s", ended)
+        for more in ("↓ 1 more", "↓ 3 more"):
+            pane = ended.replace("↓ 1 more", more)
+            with self.subTest(more=more):
+                self.assertIs(self.ic.pane_idle_state(pane), True)
+                self.assertIs(self.ic.pane_idle_state(pane, background_agents_busy=True), False)
+
+    # --- T-4857: a right-aligned notice line between the footer and the agent list ---
+    # archivist 2026-10-10 04:51Z, verbatim (last 16 non-blank lines): turn ended, an
+    # empty composer, "✔ Update installed · Restart to apply" on its own line, then 3
+    # agent rows. It read BUSY and 4 messages sat 2h until the busy-stale backstop.
+    CAPTURE_ARCHIVIST_UPDATE_NOTICE = (
+        _TESTDATA / "archivist_turn_ended_update_notice_agents_pane.txt").read_text(encoding="utf-8")
+
+    def test_update_notice_above_agent_list_turn_ended_is_idle_for_delivery(self):
+        pane = self.CAPTURE_ARCHIVIST_UPDATE_NOTICE
+        self.assertIn("Restart to apply", pane)
+        self.assertIs(self.ic.pane_idle_state(pane), True)
+        self.assertIs(self.ic.pane_idle_state(pane, background_agents_busy=True), False)
+
+    def test_update_notice_above_agent_list_generating_is_busy(self):
+        """DERIVED: the same pane once the wake landed (seen live at 04:55Z)."""
+        pane = self.CAPTURE_ARCHIVIST_UPDATE_NOTICE.replace(
+            "1 shell · ← for agents", "1 shell · esc to interrupt · ← for agents")
+        self.assertNotEqual(pane, self.CAPTURE_ARCHIVIST_UPDATE_NOTICE)
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_indented_line_without_a_footer_above_does_not_split_the_list(self):
+        """The notice tolerance must not let a deeply indented transcript line stand in
+        for the footer: with no footer marker above it, the rows stay unsplit."""
+        lines = self.CAPTURE_ARCHIVIST_UPDATE_NOTICE.splitlines()
+        non_blank = [ln for ln in lines if ln.strip()]
+        no_footer = [ln for ln in non_blank if "← for agents" not in ln]
+        core, rows = self.ic._split_agent_list(no_footer)
+        self.assertEqual(rows, [])
+        core, rows = self.ic._split_agent_list(non_blank)
+        self.assertEqual(len(rows), 4)
+        self.assertIn("Restart to apply", core[-1])
+
+    # --- T-4319: the agent panel FOCUSED (its keys are hotkeys) ---
+    # orchestrator 18:01Z from `capture-pane -e`, verbatim (last 16 non-blank lines):
+    # footer "Enter to view · x to stop · ctrl+x ctrl+k to stop all agents", a
+    # "❯ ◯ echo-t1802-logread" cursor row, and a "↓ 4 more" overflow.
+    CAPTURE_ORCHESTRATOR_AGENT_PANEL_FOCUSED_ANSI = (
+        _TESTDATA / "orchestrator_agent_panel_focused_pane_ansi.txt").read_text(encoding="utf-8")
+
+    def test_agent_panel_focused_is_never_idle(self):
+        """A paste there would press hotkeys ('x' stops an agent). It must read BUSY,
+        not UNKNOWN, since a caller that injects on None would paste into it. It must
+        not depend on a token row happening to sit near the bottom (it used to)."""
+        pane = self.CAPTURE_ORCHESTRATOR_AGENT_PANEL_FOCUSED_ANSI
+        no_token_rows = "\n".join(ln for ln in pane.splitlines() if "tokens" not in ln)
+        self.assertNotIn("tokens", no_token_rows)
+        for name, p in (("verbatim", pane), ("no token rows", no_token_rows)):
+            with self.subTest(name):
+                self.assertIs(self.ic.pane_idle_state(p), False)
+                self.assertIs(self.ic.pane_idle_state(p, background_agents_busy=True), False)
+
+    # --- T-4284: a DIM prompt suggestion is not composer text ---
+    # artisan idle at 16:5xZ, from a `capture-pane -e` (transcribed, rules shortened):
+    # the composer holds only the dim suggestion "keep going", and its wakes had
+    # deferred as "pane busy" since its turn ended at 11:33.
+    CAPTURE_ARTISAN_GHOST_SUGGESTION_ANSI = (
+        _TESTDATA / "artisan_idle_ghost_suggestion_pane_ansi.txt").read_text(encoding="utf-8")
+
+    def test_dim_suggestion_in_an_idle_composer_is_idle(self):
+        self.assertIs(self.ic.pane_idle_state(self.CAPTURE_ARTISAN_GHOST_SUGGESTION_ANSI), True)
+
+    def test_typed_text_at_normal_intensity_stays_composer_text(self):
+        pane = self.CAPTURE_ARTISAN_GHOST_SUGGESTION_ANSI.replace(
+            "\x1b[2mkeep going\x1b[0m", "keep going")
+        self.assertNotEqual(pane, self.CAPTURE_ARTISAN_GHOST_SUGGESTION_ANSI)
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_tasks_pill_focused_and_tasks_list_are_never_idle(self):
+        """orchestrator 2026-09-29 19:10Z (transcribed from `capture-pane -e`; rules shortened).
+        Focus was on the background-TASKS pill, and the composer showed only a dim
+        suggestion. It read IDLE (the mode footer over an empty stripped composer), and
+        a hand wake opened the tasks list. Both states must read BUSY."""
+        pill = (f"● That's the reviewer's idle copy of the T-4308 verdict.\n{self._RULE}\n"
+                f"\x1b[39m❯\xa0\x1b[2mkeep going\x1b[0m\n{self._RULE}\n"
+                "  ⏸ manual mode on · 5 shells · Enter to view tasks\n"
+                "  ● main\n"
+                "  ◯ rev-recovery-batch  INTENT: Decide whether four small, independent War...\n"
+                "  ◯ impl-t4230b     Mutating mailbox_mcp.py server exit\n")
+        tasks_list = ("    Shells (5)\n"
+                      "    ● date -u +%H:%MZ; poll_ci.sh example-org/pantheon-config agen…\n"
+                      "    ↓ 1 more below\n"
+                      "  ↑/↓ to select · Enter to view · Esc to close\n")
+        for name, pane in (("tasks pill focused", pill), ("tasks list open", tasks_list)):
+            with self.subTest(name):
+                self.assertIs(self.ic.pane_idle_state(pane), False)
+                self.assertIs(self.ic.pane_idle_state(pane, background_agents_busy=True), False)
+
+    def _idle_mode_pane(self, above: str, footer: str = "⏸ manual mode on · ← for agents") -> str:
+        return f"{above}{self._RULE}\n❯\xa0\n{self._RULE}\n  {footer}\n"
+
+    def test_focus_footer_quoted_in_the_transcript_stays_idle(self):
+        """rev-t4284b R1 (probe5.py): an idle pane whose transcript QUOTES a focus footer
+        read BUSY. That is silent (mail_staleness alerts only idle+unread) and it lasts
+        until 14-20 new lines push the quote away, which an idle pane never prints."""
+        quotes = {
+            "prose quote": "● The pill footer reads: `⏸ manual mode on · 5 shells · Enter to view tasks`.\n",
+            "grep of the regex comment": ("● Ran 1 shell command\n"
+                                          "  ⎿  +# (\"⏸ manual mode on · 5 shells · Enter to view tasks\", "
+                                          "orchestrator 19:10Z) read IDLE\n"),
+            "wrapped line": "● Status of the footer keys:\n  Enter to view the selected row, x to stop it.\n",
+            "regex source": "● _AGENT_PANEL_FOCUSED_RE = re.compile(r\"^\\s*Enter to view\\b|· Enter to view\\b\")\n",
+            "teammate hint": "● Its footer said `esc to return to team lead`.\n",
+        }
+        for name, above in quotes.items():
+            with self.subTest(name):
+                self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane(above)), True)
+
+    def test_manage_footer_quoted_in_the_transcript_stays_idle(self):
+        """rev-t4323a r1 R1: a transcript line quoting "↓ to manage" (5 lines of
+        inbox_consumer.py carry it, so a grep prints it) or "↓ to…" picked the manage
+        route over a plain idle footer, found no manage footer below the composer, and
+        latched the idle pane BUSY until busy-stale. The quote must fall through."""
+        quotes = {
+            "grep of the constant": ("● Ran 1 shell command\n"
+                                     "  ⎿  2061:_MANAGE_VIEW_SENTINEL = \"↓ to manage\"\n"),
+            "prose quote": "● The footer ends `← for agents · ↓ to manage`.\n",
+            "truncated quote": "● At this width it reads `↓ to…`.\n",
+        }
+        for name, above in quotes.items():
+            for busy in (False, True):
+                with self.subTest(name, background_agents_busy=busy):
+                    self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane(above),
+                                                          background_agents_busy=busy), True)
+
+    def test_the_composer_boundary_is_the_last_rule_line(self):
+        """rev-t4323a r2 R-1: _below_composer reads from the LAST rule line. A `cat` of a
+        captured pane in the transcript puts a whole quoted composer box (rules, ❯,
+        footer) above the real one; reading from the FIRST rule took the quoted footer
+        for the real one, in both directions."""
+        quoted_box = (f"● x\n{self._RULE}\n❯\xa0\n{self._RULE}\n"
+                      "  ⏸ manual mode on · 1 shell · ← for agents · ↓ to manage\n")
+        cases = (
+            ("quoted box over a plain idle footer", quoted_box,
+             "⏸ manual mode on · ← for agents", True),
+            ("quoted box over an unknown pill", quoted_box,
+             "⏸ manual mode on · 5 shells · space to view tasks", False),
+            ("quoted box over a PR pill", quoted_box,
+             "⏸ manual mode on · ← for agents · PR #12", False),
+            ("quoted rule + quoted manage line over a plain idle footer",
+             f"● x\n{self._RULE}\n  ⎿  \"↓ to manage\"\n", "⏸ manual mode on · ← for agents", True),
+        )
+        for name, above, footer, want in cases:
+            for busy in (False, True):
+                with self.subTest(name, background_agents_busy=busy):
+                    self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane(above, footer),
+                                                          background_agents_busy=busy), want)
+
+    def test_real_manage_footer_below_a_quoted_one_is_still_read(self):
+        above = "● The footer ends `↓ to manage`.\n"
+        for footer, want in (("⏸ manual mode on · 1 shell · ← for agents · ↓ to manage", True),
+                             ("⏸ manual mode on · 1 shell · ← for agents · ↓ to…", True),
+                             ("⏸ manual mode on · 1 shell · ← for agents · ↓ to manage · 1 IDE", False)):
+            with self.subTest(footer):
+                self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane(above, footer)), want)
+
+    def test_teammate_view_and_parenthesised_tasks_hint_are_never_idle(self):
+        """rev-t4284b R2, from the 2.1.284 bundle's footer hints (not captured live):
+        viewing a finished teammate (the composer types into the teammate), and the
+        tasks hint in its parenthesised form."""
+        above = "● Done.\n"
+        for footer in ("⏸ manual mode on · esc to return to team lead",
+                       "⏸ manual mode on · 2 shells · esc to return to team lead",
+                       "⏸ manual mode on · 5 shells (Enter to view tasks)"):
+            with self.subTest(footer):
+                self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane(above, footer)), False)
+
+    # T-4319 item 2: a REAL pending paste. artisan 2026-08-08 23:02Z, rendered with pyte
+    # from its raw pane-timed log: the boot kick sat unsubmitted and a paste was
+    # appended to it. The placeholder's cells carry default attributes (the raw stream
+    # writes it with no SGR), unlike a \e[2m suggestion. Only rows 16-23 are kept (the
+    # banner above holds personal data). "paste  gain" is pyte's render of a cursor
+    # jump, left as rendered.
+    SPECIMEN_ARTISAN_PENDING_PASTE = (
+        _TESTDATA / "artisan_pending_paste_composer_rendered.txt").read_text(encoding="utf-8")
+
+    def test_pending_paste_placeholder_stays_composer_text(self):
+        pane = self.SPECIMEN_ARTISAN_PENDING_PASTE
+        self.assertIn("[Pasted text #1 +4 lines]", self.ic.strip_ghost_text(pane))
+        self.assertIsNot(self.ic.pane_idle_state(pane), True)
+        # DERIVED: under a footer that reads idle over an EMPTY composer, both as
+        # rendered (plain) and as an -e capture would carry it (the SGR reset tmux puts
+        # at the composer line's start), so the dim-strip path runs on it too.
+        footer = "  ⏸ manual mode on · ← for agents\n"
+        ansi = pane.replace("❯\xa0Fresh", "\x1b[39m❯\xa0Fresh", 1)  # the render keeps the no-break space
+        self.assertNotEqual(ansi, pane)
+        for name, p in (("plain", pane + footer), ("-e", ansi + footer)):
+            with self.subTest(name):
+                self.assertIn("[Pasted text #1 +4 lines]", self.ic.strip_ghost_text(p))
+                self.assertIs(self.ic.pane_idle_state(p), False)
+
+    def test_two_dim_spans_with_typed_text_between_stay_text(self):
+        """The dim-span match is non-greedy: typed text between two suggestions is kept."""
+        pane = (f"{self._RULE}\n❯\xa0\x1b[2mghost\x1b[0m typed \x1b[2mhint\x1b[0m\n{self._RULE}\n"
+                "  ⏸ manual mode on · ← for agents\n")
+        self.assertIn("typed", self.ic.strip_ghost_text(pane))
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_overflow_line_with_a_multi_digit_count_is_part_of_the_list(self):
+        ended = self.CAPTURE_ORCHESTRATOR_OVERFLOW_GENERATING.replace("esc to interrupt · ", "")
+        ended = re.sub(r"(?m)^✢ Hatching….*$", "✻ Worked for 18s", ended)
+        self.assertIs(self.ic.pane_idle_state(ended.replace("↓ 1 more", "↓ 12 more")), True)
+
+    def test_strip_ghost_text_touches_only_composer_lines(self):
+        self.assertEqual(self.ic.strip_ghost_text("plain ❯ text\n"), "plain ❯ text\n")
+        pane = "\x1b[2m● a dim transcript line\x1b[0m\n❯\xa0\x1b[2mghost\x1b[0m\n"
+        self.assertEqual(self.ic.strip_ghost_text(pane), "● a dim transcript line\n❯\xa0")
+
+    @staticmethod
+    def _running_rows(n):
+        return "".join(f"  ◯ impl-t{5000 + i}  Working on it…  {i + 1}m 3s · ↓ {100 + i}.{i}k tokens\n"
+                       for i in range(n))
+
+    def test_unanchored_running_rows_are_busy_not_unknown(self):
+        """Blocker 2. When the agent list does not split off (no footer marker directly
+        above it), the footer is out of view and the pane cannot be read. None would
+        mean inject, so running rows at the very bottom read BUSY."""
+        prior = f"prior text\n{self._RULE}\n❯ \n{self._RULE}\n"
+        cases = {
+            "footer truncated inside '← for agents'":
+                prior + "  ⏸ manual mode on · 3 shells, 2 monitors · esc to interrupt · ← for agen…\n"
+                "  ● main\n" + self._running_rows(8),
+            "trailing overflow line under the rows":
+                prior + "  ⏸ manual mode on · 1 shell · esc to interrupt · ← for agents · ↓ to manage\n"
+                "  ● main\n" + self._running_rows(8) + "  … +4 more\n",
+            "permission dialog pushed out of view by the rows":
+                " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n Esc to cancel · Tab to amend\n"
+                "  ● main\n" + self._running_rows(6),
+        }
+        for name, pane in cases.items():
+            with self.subTest(name):
+                self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_manage_footer_with_nonempty_composer_stays_busy(self):
+        """Positive-evidence-only idle: text already sitting in the composer (e.g. a
+        prior queued inject) is not a state we can vouch for — keep deferring."""
+        pane = self.CAPTURE_A_IDLE_SHELLS.replace("❯ \n", "❯ [mailbox] you have mail\n")
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_manage_footer_without_composer_stays_busy(self):
+        """No visible empty composer under the manage footer (an unknown sub-view) →
+        busy/defer, never an inject we cannot vouch for (the T-2729 caution)."""
+        pane = ("  1. shell: tail -f /var/log/x\n  2. shell: sleep 60\n"
+                "  ⏸ manual mode on · 2 shells · ← for agents · ↓ to manage\n")
+        self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    def test_truncated_footer_idle_shells_is_True(self):
+        pane = self.CAPTURE_A_IDLE_SHELLS.replace("↓ to manage", "↓ to…")
+        self.assertIs(self.ic.pane_idle_state(pane), True)
+
+    # --- T-4323(a): the footer hint slot is a whitelist of composer-focus hints ---
+    # specialist idle at 2026-09-30 02:03Z, from `capture-pane -e`, verbatim (the last five
+    # non-blank lines): a dim suggestion in the composer, and a feedback-draft pill.
+    CAPTURE_SPECIALIST_IDLE_FEEDBACK_DRAFT_ANSI = (
+        _TESTDATA / "specialist_idle_feedback_draft_pill_pane_ansi.txt").read_text(encoding="utf-8")
+
+    def test_live_feedback_draft_pill_is_idle(self):
+        pane = self.CAPTURE_SPECIALIST_IDLE_FEEDBACK_DRAFT_ANSI
+        self.assertIn("1 feedback draft", pane)
+        self.assertIs(self.ic.pane_idle_state(pane), True)
+
+    def test_every_composer_focus_hint_is_idle(self):
+        """Each whitelisted hint, under the plain mode footer and under the manage
+        footer, over an empty composer. The whitelist must not starve a known state."""
+        hints = ("1 shell", "2 shells", "1 monitor", "3 shells, 2 monitors", "2 feedback drafts",
+                 "/tasks to see subagents", "? for shortcuts", "ctrl+t to show tasks",
+                 "ctrl+t to hide tasks", "shift+tab to cycle", "hold space to speak")
+        for hint in hints:
+            for footer in (f"⏸ manual mode on · {hint} · ← for agents",
+                           f"⏸ manual mode on · {hint} · ← for agents · ↓ to manage"):
+                with self.subTest(footer):
+                    self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane("● Done.\n", footer)),
+                                  True)
+
+    def test_mode_indicator_variants_are_not_hints(self):
+        for footer in ("⏸ manual mode on · ← for agents",
+                       "⏸ plan mode on · ← for agents",
+                       "⏵⏵ accept edits on · ← for agents",
+                       "⏵⏵ bypass permissions on (shift+tab to cycle) · ← for agents"):
+            with self.subTest(footer):
+                self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane("● Done.\n", footer)), True)
+
+    def test_bypass_footer_without_agents_is_idle(self):
+        """T-4935 follow-up: with no subagents in view the bypass footer carries no
+        "← for agents", and the mode-footer route used to miss it, so recovery's idle pane
+        read UNKNOWN and every mailbox wake deferred (2026-10-13). Live footer verbatim."""
+        for footer in ("⏵⏵ bypass permissions on (shift+tab to cycle) · gh auth login for PR status",
+                       "⏵⏵ bypass permissions on (shift+tab to cycle)",
+                       "⏵⏵ bypass permissions on (shift+tab to cycle) · 1 shell",
+                       "⏵⏵ accept edits on (shift+tab to cycle)"):
+            with self.subTest(footer):
+                self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane("● Done.\n", footer)), True)
+
+    def test_bypass_footer_with_unknown_hint_is_not_idle(self):
+        # The widened route keeps the fail-closed hint check.
+        footer = "⏵⏵ bypass permissions on (shift+tab to cycle) · 5 shells · space to view tasks"
+        self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane("● Done.\n", footer)), False)
+
+    def test_gh_pr_status_hint_is_idle(self):
+        """T-4933: Claude Code shows "gh auth login for PR status" in the footer when the
+        clone's gh CLI is unauthenticated. It's informational (no focus change; input still
+        submits), but as an unknown hint it read Recovery's idle pane BUSY all night on
+        2026-10-12/13, so every mailbox wake deferred. Live footer, verbatim, plus a
+        width-truncated variant."""
+        for footer in ("⏸ manual mode on · gh auth login for PR status · ← for agents",
+                       "⏸ manual mode on · gh auth login for PR status · ← for agents · ↓ to manage",
+                       "⏸ manual mode on · 1 shell · gh auth login for PR status · ← for agen…",
+                       "⏸ manual mode on · gh auth login for PR status · ← for agents · ↓ to…",
+                       "⏸ manual mode on · ← for agents · gh auth login for P…"):
+            with self.subTest(footer):
+                self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane("● Done.\n", footer)), True)
+
+    def test_unknown_hint_is_never_idle(self):
+        """The fail-closed direction. A pill nobody has captured, or the tasks pill under
+        a rebound footer:openSelected key (so no "Enter to view" for the blacklist to
+        match), reads BUSY on both footer routes. mail_staleness's busy-stale tier
+        (T-4323 b) alerts on an idle seat stuck here after 2h."""
+        above = "● Done.\n"
+        for footer in ("⏸ manual mode on · ← for agents · PR #12",
+                       "⏸ manual mode on · 5 shells · space to view tasks",
+                       "⏸ manual mode on · 1 shell · ← for agents · ↓ to manage · 1 IDE",
+                       "⏸ manual mode on · 2 shells · Space to view tasks · ← for agents · ↓ to…",
+                       # rev-t4323a r1 R2: hints that merely CONTAIN a known hint. The
+                       # match is exact (fullmatch); a search, or a tail on the count
+                       # regex, would read these idle.
+                       "⏸ manual mode on · 5 shells (space to view tasks) · ← for agents",
+                       "⏸ manual mode on · ← for agents!",
+                       "⏸ manual mode on · x← for agents",
+                       "⏸ manual mode on · 5\xa0shells · ← for agents",
+                       # r1 N1b: a lone "…" is a cut segment with no stem to vouch for.
+                       "⏸ manual mode on · ← for agents · …"):
+            with self.subTest(footer):
+                pane = self._idle_mode_pane(above, footer)
+                self.assertIs(self.ic.pane_idle_state(pane), False)
+                self.assertIs(self.ic.pane_idle_state(pane, background_agents_busy=True), False)
+
+    def test_the_footer_is_the_last_anchor_line_below_the_composer(self):
+        """rev-t4323a r1 N1a: with two anchor lines below the composer, the LAST one is
+        the footer (the hint row sits directly above the agent list)."""
+        known, unknown = "⏸ manual mode on · ← for agents", "⏸ manual mode on · ← for agents · PR #7"
+        for first, last, want in ((unknown, known, True), (known, unknown, False)):
+            with self.subTest(last=last):
+                pane = f"● Done.\n{self._RULE}\n❯\xa0\n{self._RULE}\n  {first}\n  {last}\n"
+                self.assertIs(self.ic.pane_idle_state(pane), want)
+
+    def test_truncated_last_hint_counts_only_as_a_known_prefix(self):
+        above = "● Done.\n"
+        for footer, want in (("⏸ manual mode on · 3 shells, 2 monitors · ← for agen…", True),
+                             ("⏸ manual mode on · 2 shells · ← for agents · ↓ to mana…", True),
+                             ("⏸ manual mode on · ← for agents · PR #1…", False),
+                             ("⏸ manual mode on · ← for a… · ↓ to manage", False)):
+            with self.subTest(footer):
+                self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane(above, footer)), want)
+
+    def test_right_aligned_notice_is_not_a_hint(self):
+        """DERIVED, not captured: a notice drawn at the footer's right edge sits after a
+        run of spaces. It is not a focus state, so it must not starve the seat."""
+        footer = "⏸ manual mode on · ← for agents" + " " * 30 + "Context low (8% remaining)"
+        self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane("● Done.\n", footer)), True)
+
+    def test_footer_anchor_only_above_the_composer_is_busy(self):
+        """The mode-footer route fired on a QUOTED footer in the transcript while the real
+        footer below the composer is one nobody recognises: that footer is unknown. The
+        bare-line quote (a grep of a fixture prints exactly that) is itself all-known, so
+        only reading BELOW the composer keeps it from vouching for the pane."""
+        for name, above in (("prose quote", "● It said `⏸ manual mode on · ← for agents`.\n"),
+                            ("bare-line quote", "  ⎿  fixture:\n  ⏸ manual mode on · ← for agents\n")):
+            with self.subTest(name):
+                pane = self._idle_mode_pane(above, footer="⏵⏵ accept edits on · PR #3")
+                self.assertIs(self.ic.pane_idle_state(pane), False)
+
+    # --- T-4364 (rev-t4323a r1 N2): the idle-at-prompt sentinels get the same reading ---
+    # archivist idle at 2026-09-30 05:16Z, from `capture-pane -e`, verbatim: the plain
+    # "? for shortcuts" footer, with two right-edge notices on the lines below it.
+    CAPTURE_ARCHIVIST_IDLE_SHORTCUTS_ANSI = (
+        _TESTDATA / "archivist_idle_shortcuts_footer_pane_ansi.txt").read_text(encoding="utf-8")
+
+    def test_live_shortcuts_footer_is_idle(self):
+        pane = self.CAPTURE_ARCHIVIST_IDLE_SHORTCUTS_ANSI
+        self.assertIn("? for shortcuts", pane)
+        self.assertIs(self.ic.pane_idle_state(pane), True)
+
+    def test_sentinel_footer_over_an_empty_composer_is_idle(self):
+        for footer in ("? for shortcuts", "ctrl+t to hide tasks",
+                       "⏸ manual mode on · ? for shortcuts · ← for agents",
+                       "? for shortcuts" + " " * 30 + "Context low (8% remaining)"):
+            with self.subTest(footer):
+                self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane("● Done.\n", footer)), True)
+
+    def test_sentinel_quoted_in_the_transcript_never_vouches_for_an_unknown_footer(self):
+        """rev-t4323a r1 N2: the sentinel route matched "? for shortcuts" anywhere in the
+        bottom region, so a transcript line quoting it read IDLE over a focus footer
+        nobody had recognised, and a wake was pasted into that focus state."""
+        quotes = {
+            "prose quote": "● The idle footer reads `? for shortcuts`.\n",
+            "grep of the constant": ("● Ran 1 shell command\n"
+                                     "  ⎿  2069:    \"? for shortcuts\",       # idle at prompt\n"),
+            "bare-line quote": "  ⎿  fixture:\n  ? for shortcuts\n",
+            "tasks sentinel": "● It showed `ctrl+t to hide tasks`.\n",
+        }
+        for name, above in quotes.items():
+            for footer in ("5 shells · space to view tasks",
+                           "⏸ manual mode on · 5 shells · space to view tasks"):
+                with self.subTest(name, footer=footer):
+                    self.assertIsNot(self.ic.pane_idle_state(self._idle_mode_pane(above, footer)), True)
+
+    def test_sentinel_quoted_in_the_transcript_stays_idle_over_a_known_footer(self):
+        """The route is taken only from a sentinel BELOW the composer. Taken from the
+        quote, it finds no sentinel footer and latches an idle pane BUSY: rev-t4323a
+        r1 R1's shape, on this route."""
+        above = "● The idle footer reads `? for shortcuts`.\n"
+        for footer in ("⏸ manual mode on · ← for agents",
+                       "⏸ manual mode on · 1 shell · ← for agents · ↓ to manage"):
+            with self.subTest(footer):
+                self.assertIs(self.ic.pane_idle_state(self._idle_mode_pane(above, footer)), True)
+
+    def test_sentinel_footer_needs_an_empty_composer_and_known_hints(self):
+        """Same rule as the manage and mode routes. DERIVED, not captured: the TUI hides
+        "? for shortcuts" once the composer has text, and a real footer does not pair it
+        with an unknown pill (2.1.285 bundle, per the N2 finding). Pinned so the route
+        cannot vouch for either."""
+        cases = (
+            ("typed composer", "❯ half-typed reply", "? for shortcuts"),
+            ("pending paste", "❯ [Pasted text #1 +4 lines]", "? for shortcuts"),
+            ("unknown hint beside it", "❯\xa0", "? for shortcuts · space to view tasks"),
+        )
+        for name, composer, footer in cases:
+            with self.subTest(name):
+                pane = f"● Done.\n{self._RULE}\n{composer}\n{self._RULE}\n  {footer}\n"
+                # T-4399 (rev #602 N1): False exactly, not merely not-True. activity_monitor
+                # pokes on True AND None and holds off only on False, so a None here would
+                # let a poke land in a typed composer or on a pending paste.
+                self.assertIs(self.ic.pane_idle_state(pane), False)
+
 
 import tools.inbox_consumer as ic  # noqa: E402  (module handle for coverage tests)
 
@@ -6542,7 +5567,7 @@ import tools.inbox_consumer as ic  # noqa: E402  (module handle for coverage tes
 class TestDeliveryCoverage(unittest.TestCase):
     """T-2144: a persona with no ticket delivery must be LOUD, not silent.
 
-    codex and mnemosyne each went their entire existence without ticket delivery
+    codex and archivist each went their entire existence without ticket delivery
     and nothing said so. The gap was invisible precisely because their MAILBOXES
     worked — agent-to-agent mail landed fine, only the ticket poke was missing.
     This test is the thing that would have said so.
@@ -6588,6 +5613,1683 @@ class TestDeliveryCoverage(unittest.TestCase):
                               f"{agent} has delivery but is absent from --agent help; "
                               "that surface is what makes a gap visible")
 
+
+# T-3631: a transient .git/index.lock race during the auto_delivered stamp
+# commit is self-healing (delivery already happened) and must not hard-page Recovery.
+_INDEX_LOCK_STDERR = (
+    "fatal: Unable to create '/x/.git/index.lock': File exists.\n"
+    "Another git process seems to be running in this repository, e.g.\n"
+    "an editor opened by 'git commit'."
+)
+
+
+def _cp(returncode, stderr=""):
+    """A subprocess.run-like CompletedProcess stand-in."""
+    return MagicMock(returncode=returncode, stdout="", stderr=stderr)
+
+
+class StampIndexLockContentionTests(unittest.TestCase):
+    """T-3631: _stamp_auto_delivered classifies a transient .git/index.lock race
+    as a self-healing LOCK_CONTENDED (soft), retries it, and reserves FAILED for
+    genuine (non-lock) failures — so the caller does not OnFailure-page Recovery for
+    a self-healing transient."""
+
+    def _ticket(self, tmp):
+        tickets_root = Path(tmp) / "tickets"
+        path = _write_ticket(tickets_root, "T-7777", "recovery", title="Stamp probe")
+        return inbox_consumer.TicketInfo(
+            id="T-7777", title="Stamp probe", created_str="2026-05-04T12:00:00Z",
+            depends_on=[], labels=[], body="## Ask\n\nDo the thing.",
+            path=path, serves=None,
+        )
+
+    @contextlib.contextmanager
+    def _patches(self, run_side_effect):
+        """Common seams: direct-writable git, a no-op mutation lock, a stubbed
+        push, no real backoff sleep, and subprocess.run driven by the caller."""
+        with (
+            patch("tools.inbox_consumer._git_direct_writable", return_value=True),
+            patch("tools.inbox_consumer.git_mutation_lock",
+                  new=lambda **kw: contextlib.nullcontext()),
+            patch("tools._git_utils.push_with_retry", return_value=(True, "ok")),
+            patch("tools.inbox_consumer.time.sleep"),
+            patch("subprocess.run", side_effect=run_side_effect) as mock_run,
+        ):
+            yield mock_run
+
+    def test_index_lock_retried_then_succeeds_is_OK(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ticket = self._ticket(tmp)
+            # add: lock-fail then success; commit: success.
+            seq = [_cp(1, _INDEX_LOCK_STDERR), _cp(0), _cp(0)]
+            with self._patches(seq) as mock_run:
+                result = inbox_consumer._stamp_auto_delivered(ticket)
+            self.assertIs(result, inbox_consumer.StampResult.OK)
+            # add retried once (2 calls) + commit once = 3 subprocess.run calls.
+            self.assertEqual(mock_run.call_count, 3)
+
+    def test_persistent_index_lock_is_LOCK_CONTENDED_not_FAILED(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ticket = self._ticket(tmp)
+            # add always lock-contended, across every retry attempt.
+            seq = [_cp(1, _INDEX_LOCK_STDERR)] * inbox_consumer._STAMP_INDEX_LOCK_ATTEMPTS
+            with self._patches(seq) as mock_run:
+                result = inbox_consumer._stamp_auto_delivered(ticket)
+            self.assertIs(result, inbox_consumer.StampResult.LOCK_CONTENDED)
+            # exhausted the bounded retries on the add step, then gave up soft.
+            self.assertEqual(mock_run.call_count,
+                             inbox_consumer._STAMP_INDEX_LOCK_ATTEMPTS)
+
+    def test_non_lock_commit_failure_is_FAILED_no_retry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ticket = self._ticket(tmp)
+            # add ok; commit fails with a NON-lock error → hard FAILED, no retry.
+            seq = [_cp(0), _cp(1, "error: pathspec 'x' did not match any file(s)")]
+            with self._patches(seq) as mock_run:
+                result = inbox_consumer._stamp_auto_delivered(ticket)
+            self.assertIs(result, inbox_consumer.StampResult.FAILED)
+            # add (1) + commit (1, not retried — real error) = 2 calls.
+            self.assertEqual(mock_run.call_count, 2)
+
+    def test_push_failure_still_FAILED(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            ticket = self._ticket(tmp)
+            seq = [_cp(0), _cp(0)]  # add ok, commit ok
+            with (
+                patch("tools.inbox_consumer._git_direct_writable", return_value=True),
+                patch("tools.inbox_consumer.git_mutation_lock",
+                      new=lambda **kw: contextlib.nullcontext()),
+                patch("tools._git_utils.push_with_retry", return_value=(False, "non-ff")),
+                patch("tools.inbox_consumer.time.sleep"),
+                patch("subprocess.run", side_effect=seq),
+            ):
+                result = inbox_consumer._stamp_auto_delivered(ticket)
+            self.assertIs(result, inbox_consumer.StampResult.FAILED)
+
+
+class MainStampExitCodeTests(unittest.TestCase):
+    """T-3631: main() exits 0 (no OnFailure page) when the stamp is a self-healing
+    LOCK_CONTENDED transient, but keeps the non-zero exit for a genuine FAILED
+    stamp (unchanged T-3325 fail-loud contract)."""
+
+    def _health_ok(self):
+        m = MagicMock()
+        m.read.return_value = json.dumps({"result": "healthy"}).encode()
+        m.__enter__ = lambda s: s
+        m.__exit__ = lambda s, *a: False
+        return m
+
+    def _run_cycle(self, stamp_result):
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp) / "tickets"
+            _write_ticket(tickets_root, "T-0197", "orchestrator", title="Exit-code probe")
+            log_path = Path(tmp) / "inbox_consumer.log"
+            send_result = MagicMock(returncode=0, stdout="", stderr="")
+            with (
+                patch("tools.inbox_consumer.AUTONOMY_OFF_PATH", Path(tmp) / "autonomy_off"),
+                patch("tools.inbox_consumer.CAP_HIT_PATH", Path(tmp) / "no_cap_hit.json"),
+                patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root),
+                patch("tools.inbox_consumer.LOG_PATH", log_path),
+                patch("tools.inbox_consumer.TMUX_TARGET_BY_AGENT",
+                      {"orchestrator": "claude-telegram-bot"}),
+                patch("urllib.request.urlopen") as mock_urlopen,
+                patch("subprocess.run", return_value=send_result),
+                patch("tools.inbox_consumer.check_dispatch_locked"),
+                patch("tools.inbox_consumer._stamp_auto_delivered",
+                      return_value=stamp_result),
+            ):
+                mock_urlopen.return_value = self._health_ok()
+                return main("orchestrator")
+
+    def test_lock_contended_stamp_exits_zero(self):
+        self.assertEqual(self._run_cycle(inbox_consumer.StampResult.LOCK_CONTENDED), 0)
+
+    def test_failed_stamp_still_exits_one(self):
+        self.assertEqual(self._run_cycle(inbox_consumer.StampResult.FAILED), 1)
+
+
+class MainStampRegistryRefusalT4760(unittest.TestCase):
+    """T-4760 (b): in refuse mode the stamp's ORG-021 registry check runs BEFORE
+    delivery — a refused stamp means NO poke (it would otherwise re-deliver every
+    cycle), a loud stderr line with the ticket id + finding, a distinct outcome
+    log entry, and a non-zero exit. A refusal that still reaches the stamp
+    (registry changed mid-cycle) is classified REGISTRY_REFUSED, not FAILED."""
+
+    _health_ok = MainStampExitCodeTests._health_ok
+
+    def setUp(self):
+        from tools import frontmatter_registry as fr
+        self.fr = fr
+        self._env = patch.dict(os.environ, {}, clear=False)
+        self._env.start()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        adr = sorted(fr.ADR_DIR.glob(fr.ADR_GLOB))[0].read_text(encoding="utf-8")
+        entry = ('  - {field: delivered_to, kind: scalar, required: "when a role:<R> ticket '
+                 'is delivered or claimed", authority: "T-4695; T-4698; ORG-088 rev-2", '
+                 'status: active}\n')
+        self.assertIn(entry, adr)
+        reg = self.tmp / "ORG-021-no-delivered-to.md"
+        reg.write_text(adr.replace(entry, ""), encoding="utf-8")
+        os.environ[fr.PATH_ENV] = str(reg)
+        os.environ[fr.MODE_ENV] = "refuse"
+        fr.clear_cache()
+
+    def tearDown(self):
+        self._env.stop()
+        self.fr.clear_cache()
+        self._tmp.cleanup()
+
+    def _run(self, **extra_patches):
+        tickets_root = self.tmp / "tickets"
+        path = _write_ticket(tickets_root, "T-0197", "orchestrator", title="Registry probe")
+        log_path = self.tmp / "inbox_consumer.log"
+        err = io.StringIO()
+        with contextlib.ExitStack() as st:
+            for target, value in {
+                "tools.inbox_consumer.AUTONOMY_OFF_PATH": self.tmp / "autonomy_off",
+                "tools.inbox_consumer.CAP_HIT_PATH": self.tmp / "no_cap_hit.json",
+                "tools.inbox_consumer.TICKETS_ROOT": tickets_root,
+                "tools.inbox_consumer.LOG_PATH": log_path,
+                "tools.inbox_consumer.TMUX_TARGET_BY_AGENT": {"orchestrator": "claude-telegram-bot"},
+            }.items():
+                st.enter_context(patch(target, value))
+            st.enter_context(patch("urllib.request.urlopen", return_value=self._health_ok()))
+            st.enter_context(patch("subprocess.run",
+                                   return_value=MagicMock(returncode=0, stdout="", stderr="")))
+            st.enter_context(patch("tools.inbox_consumer.check_dispatch_locked"))
+            mock_deliver = st.enter_context(patch("tools.inbox_consumer.deliver"))
+            for target, value in extra_patches.items():
+                st.enter_context(patch(target, value))
+            st.enter_context(contextlib.redirect_stderr(err))
+            st.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            rc = main("orchestrator")
+        log = log_path.read_text(encoding="utf-8") if log_path.exists() else ""
+        return rc, mock_deliver, err.getvalue(), log, path
+
+    def test_refused_stamp_blocks_delivery(self):
+        rc, mock_deliver, err, log, path = self._run()
+        self.assertEqual(rc, 1)
+        mock_deliver.assert_not_called()
+        self.assertIn("NOT delivering T-0197", err)
+        self.assertIn("delivered_to", err)
+        self.assertIn("stamp-registry-refused T-0197", log)
+        self.assertNotIn("auto_delivered", path.read_text(encoding="utf-8"))
+
+    def test_refusal_after_preflight_is_classified_not_failed(self):
+        rc, mock_deliver, err, log, _path = self._run(**{
+            "tools.inbox_consumer._preflight_stamp_registry": MagicMock(return_value=None)})
+        self.assertEqual(rc, 1)
+        mock_deliver.assert_called_once()
+        self.assertIn("REGISTRY REFUSED for T-0197", err)
+        self.assertIn("stamp REFUSED by the frontmatter registry", err)
+        self.assertNotIn("stamp FAILED", err)
+        self.assertIn("pulled T-0197", log)  # the delivery that happened is still logged
+
+
+# ---------------------------------------------------------------------------
+# ORG-088 rev-2 filter-at-pull-time membership predicate (T-3789).
+#
+# A role:<R> ticket stays role-targeted on disk; each seat's inbox_consumer treats
+# it as addressed-to-it when target == <persona> OR target == <legacy audit-role>
+# OR (target is role:<R> AND R ∈ functional_roles(<persona>)). Falsifiers F2-F6
+# below are mutation-gated (Amendment J): each names the reddening mutation whose
+# application turns it RED (proven by apply+revert during build validation).
+# ---------------------------------------------------------------------------
+
+
+class TestOrg088Rev2MembershipFilter(unittest.TestCase):
+    def test_F2_member_receives_role_ticket(self):
+        """F2: seat mason, functional={orchestrator}, target role:orchestrator ->
+        list_eligible returns it (branch c).
+        RED-mutation: drop branch (c) from _target_addresses_seat."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp)
+            _write_ticket(tickets_root, "T-0001", "role:orchestrator")
+            with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+                 patch("tools.inbox_consumer.functional_roles",
+                       return_value=frozenset({"orchestrator"})):
+                tickets = list_eligible_tickets("mason")
+        self.assertEqual([t.id for t in tickets], ["T-0001"])
+
+    def test_F3_non_member_skips_role_ticket(self):
+        """F3: functional={reviewer}, target role:orchestrator -> skipped (empty_inbox).
+        RED-mutation: make branch (c) skip the `in functional` test (return True)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp)
+            _write_ticket(tickets_root, "T-0001", "role:orchestrator")
+            with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+                 patch("tools.inbox_consumer.functional_roles",
+                       return_value=frozenset({"reviewer"})):
+                with self.assertRaises(SkipCycle) as ctx:
+                    list_eligible_tickets("mason")
+        self.assertEqual(ctx.exception.vocab, "empty_inbox")
+
+    def test_F4_failsafe_unverifiable_membership(self):
+        """F4: functional_roles RAISES (unverifiable L3) -> role:<R> tickets SKIPPED,
+        personal + legacy targeting UNAFFECTED, NO exception escapes.
+        RED-mutation: remove the try/except in _safe_functional_roles (crash)."""
+        from tools.agent_role_map import PersonaRoleMembershipError
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp)
+            _write_ticket(tickets_root, "T-0001", "role:orchestrator")  # role -> skipped
+            _write_ticket(tickets_root, "T-0002", "mason")              # personal -> delivered
+            with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+                 patch("tools.inbox_consumer.functional_roles",
+                       side_effect=PersonaRoleMembershipError("membership source missing")):
+                tickets = list_eligible_tickets("mason")  # must NOT raise
+        self.assertEqual([t.id for t in tickets], ["T-0002"])
+
+    def test_F5_back_compat_personal_and_legacy_audit_role(self):
+        """F5 (i)+(ii): personal target delivered AND legacy audit-role target delivered.
+        RED-mutation: predicate drops branch (a) [personal] or branch (b) [audit-role].
+        (F5 (iii), the work_domain round-trip/lint-clean assertion, ships in commit 2.)"""
+        # (i) personal target mason -> delivered.
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp)
+            _write_ticket(tickets_root, "T-0001", "mason")
+            with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+                 patch("tools.inbox_consumer.functional_roles",
+                       return_value=frozenset()):
+                tickets = list_eligible_tickets("mason")
+        self.assertEqual([t.id for t in tickets], ["T-0001"])
+        # (ii) legacy audit-role target orchestrator -> delivered for orchestrator
+        # (mirrors test_target_role_id_matches_via_map; branch (b) back-compat).
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp)
+            _write_ticket(tickets_root, "T-0002", "orchestrator")
+            with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+                 patch("tools.inbox_consumer.functional_roles",
+                       return_value=frozenset()):
+                tickets = list_eligible_tickets("orchestrator")
+        self.assertEqual([t.id for t in tickets], ["T-0002"])
+
+    def test_F6_org078_priority_order_preserved(self):
+        """F6: two eligible role:<R> tickets — the earlier-created (P1) is picked
+        ahead of the later-created (P3) by the ORG-078 FIFO priority key in
+        pick_ticket. Both are eligible ONLY via role membership (branch c), so this
+        also proves ordering is preserved across the new predicate.
+        RED-mutation: invert the pick_ticket FIFO sort key (reverse) -> picks P3."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp)
+            _write_ticket(tickets_root, "T-0001", "role:orchestrator",
+                          created="2026-05-01T00:00:00Z")  # P1: earlier
+            _write_ticket(tickets_root, "T-0002", "role:orchestrator",
+                          created="2026-05-09T00:00:00Z")  # P3: later
+            with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+                 patch("tools.inbox_consumer.functional_roles",
+                       return_value=frozenset({"orchestrator"})):
+                tickets = list_eligible_tickets("mason")
+                self.assertEqual({t.id for t in tickets}, {"T-0001", "T-0002"})
+                picked = pick_ticket(tickets)
+        self.assertEqual(picked.id, "T-0001")  # P1 ahead of P3
+
+    # -----------------------------------------------------------------------
+    # T-3807: falsifier coverage for the b' canonicalization arm of
+    # _target_addresses_seat — `resolve_persona(target) == agent`. This arm keeps a
+    # legacy `target: specialist` ticket routing to specialist after the operator's T-3807
+    # roles rename (specialist's forward audit-id is now head_research_orchestrator;
+    # specialist is retained as a PERSONA_ALIASES legacy input-alias that
+    # resolve_persona dealiases to specialist — D1, P4 audit-continuity). Uses the REAL
+    # resolve_persona (production PERSONA_ALIASES table), mirroring
+    # test_target_other_role_skipped; functional_roles patched for determinism as
+    # F2-F6 do. Mutation-gated (Amendment J): each names the reddening mutation.
+    # -----------------------------------------------------------------------
+    def test_F8_legacy_alias_target_delivered_to_specialist(self):
+        """F8 (b' arm, POSITIVE): a legacy `target: specialist` ticket is delivered
+        to seat specialist because resolve_persona("specialist") == "specialist". specialist's
+        forward audit-id is head_research_orchestrator, so arms (a)/(b) do NOT match
+        specialist — ONLY the b' canonicalization arm routes it.
+        RED-mutation: remove the b' arm (`resolve_persona(target) == agent`) from
+        _target_addresses_seat -> specialist no longer canonicalizes to specialist ->
+        ticket SKIPPED (empty_inbox) -> RED."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tickets_root = Path(tmp)
+            _write_ticket(tickets_root, "T-0001", "specialist")
+            with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+                 patch("tools.inbox_consumer.functional_roles",
+                       return_value=frozenset()):
+                tickets = list_eligible_tickets("specialist")
+        self.assertEqual([t.id for t in tickets], ["T-0001"])
+
+    def test_F9_alias_arm_over_match_guard(self):
+        """F9 (b' arm, NEGATIVE — the critical safety test): the b' arm must match ONLY
+        tokens that canonicalize to THIS seat's persona. A ticket whose target
+        canonicalizes to a DIFFERENT persona (target: mason -> mason) is NOT delivered
+        to specialist; an unknown token that resolve_persona identity-passes
+        (target: not_a_persona_xyz -> itself) is NOT delivered to specialist either. Both
+        must SkipCycle(empty_inbox) for seat specialist.
+        RED-mutation: make the b' arm over-broad — `if isinstance(target, str): return
+        True` (drop the `== agent` canonicalization check) -> BOTH unrelated tickets are
+        wrongly delivered to specialist -> RED."""
+        for target in ("mason", "not_a_persona_xyz"):
+            with self.subTest(target=target):
+                with tempfile.TemporaryDirectory() as tmp:
+                    tickets_root = Path(tmp)
+                    _write_ticket(tickets_root, "T-0001", target)
+                    with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+                         patch("tools.inbox_consumer.functional_roles",
+                               return_value=frozenset()):
+                        with self.assertRaises(SkipCycle) as ctx:
+                            list_eligible_tickets("specialist")
+                    self.assertEqual(ctx.exception.vocab, "empty_inbox")
+
+    def test_F10_alias_arm_non_interference(self):
+        """F10 (b' NON-INTERFERENCE): the b' canonicalization arm does not disturb the
+        other arms of _target_addresses_seat. Direct predicate calls for seat specialist
+        (audit_role = head_research_orchestrator), real resolve_persona:
+          (i)   personal target specialist                       -> True  (arm a intact)
+          (ii)  specialist                                -> True  (arm b' — ties the
+                suite together against the same predicate object)
+          (iii) role:orchestrator, functional={orchestrator}-> True  (arm c intact)
+          (iv)  role:orchestrator, functional=frozenset()   -> False (b' does NOT rescue
+                or swallow a non-member role: target — resolve_persona("role:orchestrator")
+                is not a persona, so b' falls through to arm c's in-functional gate).
+        Named RED-mutation (this test): remove arm (c) — delete the
+        `target.startswith("role:")` membership branch -> (iii) flips False (a member's
+        role: ticket is no longer recognized under the b' arm's presence) -> RED. F10
+        also cross-guards the b' arm: (ii) reddens under 'remove b' arm', (iv) reddens
+        under the over-broad b' mutation. (Assertion (i) is intentionally robust: a bare
+        persona target is matched by BOTH arm (a) and the b' arm, since
+        resolve_persona("specialist") == "specialist".)"""
+        pred = inbox_consumer._target_addresses_seat
+        audit = inbox_consumer.resolve_role("specialist")  # head_research_orchestrator
+        self.assertTrue(pred("specialist", "specialist", audit, frozenset()))                # (i) arm a
+        self.assertTrue(pred("specialist", "specialist", audit, frozenset()))         # (ii) arm b'
+        self.assertTrue(pred("role:orchestrator", "specialist", audit,
+                             frozenset({"orchestrator"})))                         # (iii) arm c
+        self.assertFalse(pred("role:orchestrator", "specialist", audit, frozenset()))   # (iv) not swallowed
+
+
+# ---------------------------------------------------------------------------
+# ORG-088 rev-2 exactly-once-at-CYCLE-BOUNDARY concurrency (T-3789, F1 + F7).
+#
+# DESIGN CONTRACT (ratified): exactly-once is CYCLE-BOUNDARY granularity, NOT
+# sub-millisecond. deliver-then-stamp (T-2152) means two seats whose cycles
+# overlap before either stamps could BOTH deliver; the ticket-identity-keyed
+# auto_delivered stamp mutex + git-push serialization then guarantee exactly one
+# STAMP lands. This is the SAME guarantee personal-target dispatch has today and
+# the ACCEPTED contract (operator-ratified reuse of the stamp mutex) — NOT a
+# pre-delivery lock. The tests below are deterministic and NON-flaky: no threads,
+# no sleeps; the A-before-B race is resolved by CONTROLLED FETCH/PUSH ORDER, not
+# wall-clock, over a real tempfile git board (bare origin + two clones).
+# ---------------------------------------------------------------------------
+
+
+def _git_run(*args, cwd):
+    return subprocess.run(["git", "-C", str(cwd), *args],
+                          capture_output=True, text=True, check=True)
+
+
+class TestOrg088Rev2ExactlyOnceConcurrency(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        # Bare origin.
+        self.bare = base / "origin.git"
+        self.bare.mkdir()
+        subprocess.run(["git", "init", "--bare", "-b", "main", str(self.bare)],
+                       capture_output=True, check=True)
+        # Clone A, seed one inbox role:orchestrator ticket, push to origin.
+        self.repo_a = base / "cloneA"
+        subprocess.run(["git", "clone", str(self.bare), str(self.repo_a)],
+                       capture_output=True, check=True)
+        self._config(self.repo_a, "seat-a@test", "SeatA")
+        _write_ticket(self.repo_a / "tickets", "T-0001", "role:orchestrator")
+        _git_run("add", "tickets/inbox/T-0001.md", cwd=self.repo_a)
+        _git_run("commit", "-m", "seed T-0001", cwd=self.repo_a)
+        _git_run("push", "origin", "HEAD:main", cwd=self.repo_a)
+        # Clone B from origin AFTER the seed push -> both clones hold the ticket.
+        self.repo_b = base / "cloneB"
+        subprocess.run(["git", "clone", str(self.bare), str(self.repo_b)],
+                       capture_output=True, check=True)
+        self._config(self.repo_b, "seat-b@test", "SeatB")
+        self.lockfile = base / "mutation.lock"
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    @staticmethod
+    def _config(repo, email, name):
+        _git_run("config", "user.email", email, cwd=repo)
+        _git_run("config", "user.name", name, cwd=repo)
+
+    def _origin_stamp_commit_count(self):
+        out = subprocess.run(
+            ["git", "-C", str(self.bare), "log", "--format=%s", "main"],
+            capture_output=True, text=True, check=True).stdout
+        return sum(1 for line in out.splitlines()
+                   if line.startswith("tickets: stamp auto_delivered"))
+
+    def _seat_cycle(self, agent, repo, counter, *, open_fetch, stamp_ts):
+        """Run one deterministic seat cycle against `repo`, returning the
+        StampResult (or None if the mutex/eligibility skipped delivery).
+
+        `stamp_ts` fixes this seat's auto_delivered_at deterministically: distinct
+        per-seat timestamps make the two-writes-to-one-file rebase a REAL,
+        non-flaky conflict (identical same-second stamps would byte-match and
+        auto-merge, masking the serialization the test must prove)."""
+        tickets_root = repo / "tickets"
+        with patch("tools.inbox_consumer.TICKETS_ROOT", tickets_root), \
+             patch("tools._git_utils.REPO_ROOT", repo), \
+             patch("tools.inbox_consumer.functional_roles",
+                   return_value=frozenset({"orchestrator"})), \
+             patch("tools.inbox_consumer._now_iso", return_value=stamp_ts), \
+             patch.dict(os.environ,
+                        {"PANTHEON_GIT_MUTATION_LOCKFILE": str(self.lockfile)}):
+            if open_fetch:
+                # Real cycle-open fetch/merge — pulls whatever landed on origin.
+                _git_run("fetch", "origin", cwd=repo)
+                _git_run("merge", "--ff-only", "origin/main", cwd=repo)
+            try:
+                inbox_consumer.check_dispatch_locked(agent)
+                tickets = list_eligible_tickets(agent)
+            except SkipCycle:
+                return None  # mutex or eligibility skipped this cycle — no delivery
+            counter.append(agent)  # deliver-then-stamp (T-2152): delivery fires here
+            return inbox_consumer._stamp_auto_delivered(tickets[0], agent=agent)
+
+    def test_F1_primary_exactly_once_at_cycle_boundary(self):
+        """F1 primary: Seat A full cycle delivers + stamps + pushes; Seat B opens
+        with the REAL cycle fetch (pulls A's stamp), its dispatch MUTEX sees the
+        stamped role:orchestrator ticket VIA THE PREDICATE AT _list_auto_delivered
+        (:1246) and SkipCycles -> deliver NOT called. counter==1, one stamp on origin.
+
+        F1 RED-mutation ('stamp keys on persona not ticket.path'): a per-persona
+        marker means B's fetch pulls a marker that does not match B's persona -> B
+        delivers -> counter==2.
+        F7 RED-mutation ('filter only at list_eligible :1050, not the mutex :1246'):
+        revert _list_auto_delivered's predicate to the old exact-match -> B's mutex
+        goes blind to the role:orchestrator stamp -> B delivers -> counter==2."""
+        counter = []
+        stamp_a = self._seat_cycle("mason", self.repo_a, counter,
+                                   open_fetch=False, stamp_ts="2026-09-01T00:00:00+00:00")
+        self.assertIs(stamp_a, inbox_consumer.StampResult.OK)
+        self.assertEqual(len(counter), 1)  # A delivered
+        stamp_b = self._seat_cycle("orchestrator", self.repo_b, counter,
+                                   open_fetch=True, stamp_ts="2026-09-02T00:00:00+00:00")
+        self.assertIsNone(stamp_b)          # B skipped via the mutex
+        self.assertEqual(len(counter), 1)   # B did NOT deliver — exactly once
+        self.assertEqual(self._origin_stamp_commit_count(), 1)
+
+    def test_F1_secondary_stamp_push_serialization(self):
+        """F1 secondary (tightest sub-cycle variant): both seats deliver + stamp in
+        the SAME cycle before either pushes (B does NOT open-fetch, so its base is
+        stale). A's push lands; B's push_with_retry hits a REAL non-ff -> fetch +
+        rebase -> conflict on the same ticket's auto_delivered write -> no
+        conflict_resolver -> rebase --abort -> StampResult.FAILED. Exactly ONE stamp
+        on origin.
+
+        HONESTY / cycle-boundary contract: here delivery ALREADY fired twice
+        (deliver-then-stamp) — this proves the STAMP is exactly-once sub-cycle, NOT
+        delivery. Sub-millisecond exactly-once delivery is explicitly NOT the
+        contract; cycle-boundary exactly-once (the STAMP) is."""
+        counter = []
+        stamp_a = self._seat_cycle("mason", self.repo_a, counter,
+                                   open_fetch=False, stamp_ts="2026-09-01T00:00:00+00:00")
+        self.assertIs(stamp_a, inbox_consumer.StampResult.OK)
+        # B opens WITHOUT fetch -> stale base -> both delivered this cycle.
+        # Distinct stamp_ts guarantees a REAL rebase conflict (not a same-second
+        # byte-identical auto-merge).
+        stamp_b = self._seat_cycle("orchestrator", self.repo_b, counter,
+                                   open_fetch=False, stamp_ts="2026-09-02T00:00:00+00:00")
+        self.assertEqual(len(counter), 2)   # delivery fired twice (accepted)
+        self.assertIs(stamp_b, inbox_consumer.StampResult.FAILED)
+        self.assertEqual(self._origin_stamp_commit_count(), 1)  # STAMP exactly once
+
+
+# ---------------------------------------------------------------------------
+# T-4695: role-pool dispatch -- stamp the taker; busy = any workable active ticket.
+# ---------------------------------------------------------------------------
+
+_POOL_MEMBERS = frozenset({"orchestrator"})
+
+
+class TestT4695RolePoolBusy(unittest.TestCase):
+    def setUp(self):
+        _isolate_git_mutation_lock(self)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        for p in (patch("tools.inbox_consumer.TICKETS_ROOT", self.root),
+                  patch("tools.inbox_consumer._safe_functional_roles",
+                        return_value=_POOL_MEMBERS)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _locked(self, agent: str) -> bool:
+        try:
+            inbox_consumer.check_dispatch_locked(agent)
+        except SkipCycle as e:
+            self.assertEqual(e.vocab, "dispatch_locked")
+            return True
+        return False
+
+    def _pool(self, tid="T-0001", state="inbox", **kw):
+        return _write_ticket_with_auto_delivered(
+            self.root, tid, "role:orchestrator", state=state,
+            last_transition=_recent(), **kw)
+
+    def test_pool_ticket_delivered_to_A_does_not_lock_B(self):
+        self._pool(auto_delivered=True, auto_delivered_at="2026-10-07T10:00:00Z",
+                   delivered_to="mason")
+        self.assertTrue(self._locked("mason"))
+        self.assertFalse(self._locked("artisan"))
+
+    def test_claimed_pool_ticket_without_auto_delivered_locks_only_taker(self):
+        self._pool(state="active", delivered_to="mason")
+        self.assertTrue(self._locked("mason"))
+        self.assertFalse(self._locked("artisan"))
+
+    def test_finding2_manually_claimed_active_seat_ticket_locks(self):
+        _write_ticket_with_auto_delivered(
+            self.root, "T-0002", "mason", state="active", last_transition=_recent())
+        self.assertTrue(self._locked("mason"))
+
+    def test_non_workable_active_tickets_are_not_busy(self):
+        _write_ticket_with_auto_delivered(
+            self.root, "T-0003", "mason", state="active", substate="awaiting-merge",
+            last_transition=_recent())
+        _write_ticket_with_auto_delivered(
+            self.root, "T-0004", "mason", state="active", depends_on=["T-9999"],
+            last_transition=_recent())
+        _write_ticket_with_auto_delivered(
+            self.root, "T-0005", "mason", state="active",
+            not_before="2999-01-01T00:00:00Z", last_transition=_recent())
+        self.assertFalse(self._locked("mason"))
+
+    def test_legacy_unstamped_pool_ticket_locks_all_members_until_resolved(self):
+        path = self._pool(auto_delivered=True, auto_delivered_at="2026-10-07T10:00:00Z")
+        self.assertTrue(self._locked("mason"))
+        self.assertTrue(self._locked("artisan"))
+        # Resolved (moved to done/): every member is free.
+        done = self.root / "done"
+        done.mkdir()
+        path.rename(done / path.name)
+        self.assertFalse(self._locked("mason"))
+        self.assertFalse(self._locked("artisan"))
+
+    def test_holding_by_non_auto_delivered_ticket_logs_one_line_no_mail(self):
+        _write_ticket_with_auto_delivered(
+            self.root, "T-0002", "mason", state="active", last_transition=_recent())
+        buf = io.StringIO()
+        with patch("tools.inbox_consumer._send_telegram_alert") as alert, \
+             patch("tools.inbox_consumer.send_mailbox") as mail, \
+             contextlib.redirect_stderr(buf):
+            self.assertTrue(self._locked("mason"))
+        alert.assert_not_called()
+        mail.assert_not_called()
+        lines = [l for l in buf.getvalue().splitlines() if "T-0002" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("mason", lines[0])
+
+    def test_stale_manual_claim_is_not_auto_released_or_alerted(self):
+        _write_ticket_with_auto_delivered(
+            self.root, "T-0002", "mason", state="active", created="2020-01-01T00:00:00Z")
+        old = time.time() - 10 * 24 * 3600
+        os.utime(self.root / "active" / "T-0002.md", (old, old))
+        with patch("tools.inbox_consumer._send_telegram_alert") as alert:
+            self.assertTrue(self._locked("mason"))
+        alert.assert_not_called()
+
+    def test_stamp_writes_delivered_to_target_untouched_and_clear_pops_it(self):
+        path = self._pool()
+        info = TicketInfo(id="T-0001", title="t", created_str="", depends_on=[],
+                          labels=[], body="", path=path)
+        ok_cm = MagicMock(returncode=0, stderr="", stdout="")
+        with patch("tools.inbox_consumer._git_direct_writable", return_value=True), \
+             patch("tools.inbox_consumer.subprocess.run", return_value=ok_cm), \
+             patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
+            res = inbox_consumer._stamp_auto_delivered(info, agent="mason")
+            self.assertIs(res, inbox_consumer.StampResult.OK)
+            from tools.ticket import parse_front_matter
+            fields, _ = parse_front_matter(path.read_text(encoding="utf-8"))
+            self.assertEqual(fields["delivered_to"], "mason")
+            self.assertEqual(fields["target"], "role:orchestrator")
+            self.assertTrue(self._locked("mason"))
+            self.assertFalse(self._locked("artisan"))
+            inbox_consumer._clear_auto_delivered(info)
+            fields, _ = parse_front_matter(path.read_text(encoding="utf-8"))
+            self.assertNotIn("delivered_to", fields)
+            self.assertNotIn("auto_delivered", fields)
+
+    def test_peer_member_does_not_redeliver_a_stamped_pool_ticket(self):
+        """Exactly-once: B is NOT mutex-locked by A's stamp, so eligibility itself
+        must skip the already-delivered ticket."""
+        self._pool(auto_delivered=True, auto_delivered_at="2026-10-07T10:00:00Z",
+                   delivered_to="mason")
+        with self.assertRaises(SkipCycle) as ctx:
+            list_eligible_tickets("artisan")
+        self.assertEqual(ctx.exception.vocab, "empty_inbox")
+
+    def test_unstamped_pool_ticket_is_eligible_for_idle_member_only(self):
+        self._pool()
+        _write_ticket_with_auto_delivered(
+            self.root, "T-0002", "artisan", state="active", last_transition=_recent())
+        self.assertEqual([t.id for t in list_eligible_tickets("mason")], ["T-0001"])
+        self.assertTrue(self._locked("artisan"))  # busy: main() never reaches delivery
+
+    def test_busy_seat_with_blocked_inbox_ticket_is_locked_but_reminded(self):
+        _write_ticket_with_auto_delivered(
+            self.root, "T-0002", "mason", state="active", last_transition=_recent())
+        with self.assertRaises(SkipCycle) as ctx:
+            inbox_consumer.check_dispatch_locked("mason")
+        self.assertTrue(ctx.exception.active_only)
+
+    def test_stamped_in_flight_delivery_is_not_active_only(self):
+        self._pool(auto_delivered=True, auto_delivered_at="2026-10-07T10:00:00Z",
+                   delivered_to="mason")
+        with self.assertRaises(SkipCycle) as ctx:
+            inbox_consumer.check_dispatch_locked("mason")
+        self.assertFalse(ctx.exception.active_only)
+
+    def test_auto_delivered_list_wrapper_keeps_old_contract(self):
+        _write_ticket_with_auto_delivered(
+            self.root, "T-0002", "mason", state="active", last_transition=_recent())
+        self.assertEqual(inbox_consumer._list_auto_delivered_unresolved_for_agent("mason"), [])
+
+    def test_stale_release_of_claimed_pool_ticket_keeps_its_holder(self):
+        """T-4698: the 8h stale release on a pool ticket its taker has since CLAIMED
+        (now in active/) drops the stamp but must keep delivered_to, else the live
+        work loses its holder (taker stops counting busy; WIP cap stops counting it)."""
+        path = self._pool(state="active", auto_delivered=True,
+                          auto_delivered_at="2026-10-07T10:00:00Z", delivered_to="mason")
+        info = TicketInfo(id="T-0001", title="t", created_str="", depends_on=[],
+                          labels=[], body="", path=path)
+        ok_cm = MagicMock(returncode=0, stderr="", stdout="")
+        with patch("tools.inbox_consumer._git_direct_writable", return_value=True), \
+             patch("tools.inbox_consumer.subprocess.run", return_value=ok_cm), \
+             patch("tools._git_utils.push_with_retry", return_value=(True, "ok")):
+            inbox_consumer._clear_auto_delivered(info)
+        from tools.ticket import parse_front_matter
+        fields, _ = parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertNotIn("auto_delivered", fields)
+        self.assertEqual(fields["delivered_to"], "mason")
+        self.assertTrue(self._locked("mason"))
+
+
+def _recent() -> str:
+    from datetime import datetime, timezone, timedelta
+    return (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+
+class TestSendTelegramAlertResult(unittest.TestCase):
+    """T-4930: _send_telegram_alert returns True only on a 2xx from sendMessage."""
+
+    def _send(self, *, token="tok", status=200, exc=None, force=True):
+        env = {"PANTHEON_DISABLE_LIVE_TELEGRAM": "0" if force else "1"}
+        resp = MagicMock(status=status)
+        resp.__enter__.return_value = resp
+        urlopen = MagicMock(side_effect=exc) if exc else MagicMock(return_value=resp)
+        with patch.dict(os.environ, env), \
+                patch.object(inbox_consumer, "_read_telegram_token", return_value=token), \
+                patch.object(inbox_consumer.urllib.request, "urlopen", urlopen), \
+                contextlib.redirect_stderr(io.StringIO()):
+            return inbox_consumer._send_telegram_alert("x"), urlopen
+
+    def test_2xx_is_true(self):
+        ok, urlopen = self._send(status=200)
+        self.assertIs(ok, True)
+        urlopen.assert_called_once()
+
+    def test_non_2xx_is_false(self):
+        self.assertIs(self._send(status=500)[0], False)
+
+    def test_network_error_is_false(self):
+        import urllib.error
+        self.assertIs(self._send(exc=urllib.error.URLError("down"))[0], False)
+        self.assertIs(self._send(exc=OSError("reset"))[0], False)
+
+    def test_no_token_is_false_and_sends_nothing(self):
+        ok, urlopen = self._send(token=None)
+        self.assertIs(ok, False)
+        urlopen.assert_not_called()
+
+    def test_suppressed_test_context_is_false_and_sends_nothing(self):
+        ok, urlopen = self._send(force=False)
+        self.assertIs(ok, False)
+        urlopen.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# T-5342: repo-grant eligibility filter + once-only grant-gap surface.
+# ---------------------------------------------------------------------------
+
+_T5342_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "inbox_repo_grant"
+
+# Real L3 membership shape (persona_roles.yaml, 2026-10-22): orchestrator implies
+# engineering_orchestrator, so the role:engineering_orchestrator pool is all three.
+_T5342_FUNCTIONAL = {
+    "artisan": frozenset({"engineering_orchestrator"}),
+    "mason": frozenset({"engineering_orchestrator"}),
+    "orchestrator": frozenset({"engineering_orchestrator", "head_engineering_orchestrator"}),
+}
+_T5342_MEMBERS = {
+    "engineering_orchestrator": frozenset({"artisan", "mason", "orchestrator"}),
+    "head_engineering_orchestrator": frozenset({"orchestrator"}),
+}
+
+
+def _write_grant_ticket(tickets_root: Path, ticket_id: str, *,
+                        target: str = "role:engineering_orchestrator",
+                        labels: list[str] | None = None,
+                        extra: dict[str, str] | None = None) -> Path:
+    """Write a ticket built from the captured T-2726 fixture, with id/target/labels
+    swapped and optional extra frontmatter lines (repos, project_id, ratifiable_files)."""
+    text = (_T5342_FIXTURES / "T-2726.md").read_text(encoding="utf-8")
+    text = text.replace("id: T-2726\n", f"id: {ticket_id}\n", 1)
+    text = text.replace("target: role:engineering_orchestrator\n", f"target: {target}\n", 1)
+    if labels is not None:
+        text = text.replace("labels: [kino, pwa, feature]\n",
+                            "labels: [" + ", ".join(labels) + "]\n", 1)
+    if extra:
+        add = "".join(f"{k}: {v}\n" for k, v in extra.items())
+        text = text.replace("state: inbox\n", "state: inbox\n" + add, 1)
+    inbox = tickets_root / "inbox"
+    inbox.mkdir(parents=True, exist_ok=True)
+    path = inbox / f"{ticket_id}.md"
+    path.write_text(text, encoding="utf-8")
+    return path
+
+
+class TestT5342RepoGrantFilter(unittest.TestCase):
+    """A role-pool ticket whose repo the seat holds no (sufficient) repos.yaml grant
+    for is left out of that seat's eligible list; unknown repo delivers as today."""
+
+    def setUp(self):
+        tmp = tempfile.mkdtemp(prefix="t5342-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        self.tmp = Path(tmp)
+        self.tickets_root = self.tmp / "tickets"
+        self.tickets_root.mkdir()
+        self.registry_root = self.tmp / "registry"
+        self.registry_root.mkdir()
+        shutil.copy(_T5342_FIXTURES / "repos.yaml", self.registry_root / "repos.yaml")
+        self.surface_log = self.tmp / "state" / "repo_grant_surface_log.json"
+        self.send = MagicMock(return_value="msg-1")
+        self.members = MagicMock(side_effect=lambda r: _T5342_MEMBERS.get(r, frozenset()))
+        self.log_patch = patch("tools.inbox_consumer.GRANT_SURFACE_LOG_PATH", self.surface_log)
+        self.log_patch.start()
+        self.addCleanup(self.log_patch.stop)
+        for p in (
+            patch("tools.inbox_consumer.TICKETS_ROOT", self.tickets_root),
+            patch("tools.inbox_consumer.REPOS_REGISTRY_ROOT", self.registry_root),
+            patch("tools.inbox_consumer.functional_roles",
+                  side_effect=lambda p: _T5342_FUNCTIONAL.get(p, frozenset())),
+            patch("tools.inbox_consumer.role_members", self.members),
+            patch("tools.inbox_consumer.mailbox.send", self.send),
+            patch("tools.inbox_consumer._live_telegram_suppressed", return_value=False),
+        ):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _ids(self, agent: str) -> list[str]:
+        try:
+            return sorted(t.id for t in list_eligible_tickets(agent))
+        except SkipCycle as exc:
+            self.assertEqual(exc.vocab, "empty_inbox")
+            return []
+
+    def _ids_with_state(self, agent: str) -> list[str]:
+        """One cycle for *agent* with that seat's own surface-state file."""
+        with patch("tools.inbox_consumer.GRANT_SURFACE_LOG_PATH",
+                   self.tmp / "state" / agent / "repo_grant_surface_log.json"):
+            return self._ids(agent)
+
+    # -- the asked-for behaviours -------------------------------------------
+
+    def test_granted_repo_is_delivered(self):
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["echo-prismatic", "feature"])
+        self.assertEqual(self._ids("artisan"), ["T-0001"])
+        self.assertEqual(self._ids("mason"), ["T-0001"])
+
+    def test_ungranted_repo_is_skipped(self):
+        _write_grant_ticket(self.tickets_root, "T-2726")  # captured: [kino, pwa, feature]
+        self.assertEqual(self._ids("artisan"), [])
+        self.assertEqual(self._ids("mason"), [])
+
+    def test_ro_only_seat_with_build_label_is_skipped(self):
+        builds = ("feature", "bug", "build", "impl", "fix", "ui", "gui", "refactor", "adr")
+        for n, build in enumerate(builds):
+            _write_grant_ticket(self.tickets_root, f"T-000{n}", labels=[build],
+                                extra={"repos": "[echo_vault]"})
+        self.assertEqual(self._ids("artisan"), [])
+
+    def test_ro_only_seat_without_build_label_is_delivered(self):
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["hygiene"],
+                            extra={"repos": "[echo_vault]"})
+        self.assertEqual(self._ids("artisan"), ["T-0001"])
+
+    def test_read_only_work_label_is_never_grant_skipped(self):
+        for n, ro in enumerate(("research", "design", "investigation", "spike",
+                                "technical-spike", "discussion-session", "survey", "audit")):
+            _write_grant_ticket(self.tickets_root, f"T-000{n}", labels=["pwa", "feature", ro])
+        self.assertEqual(len(self._ids("artisan")), 8)
+        self.send.assert_not_called()
+
+    def test_unknown_repo_is_delivered_as_today(self):
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["ticket-flow", "inbox-consumer"])
+        self.assertEqual(self._ids("artisan"), ["T-0001"])
+
+    def test_bare_repo_name_label_is_a_topic_not_a_repo(self):
+        # revenue-project / claude-config / codex-config as labels are topic tags
+        # (dry run r1: false skips). Only the alias map resolves labels.
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["codex-config", "feature"])
+        _write_grant_ticket(self.tickets_root, "T-0002", labels=["echo_vault", "feature"])
+        self.assertEqual(self._ids("artisan"), ["T-0001", "T-0002"])
+
+    def test_ho_seat_still_gets_pwa_tickets(self):
+        _write_grant_ticket(self.tickets_root, "T-2726")
+        _write_grant_ticket(self.tickets_root, "T-2727", target="role:head_engineering_orchestrator")
+        self.assertEqual(self._ids("orchestrator"), ["T-2726", "T-2727"])
+        # A pool member holds the grant, so nothing is surfaced for the pwa ticket.
+        self._ids("artisan")
+        self._ids("mason")
+        self.send.assert_not_called()
+
+    def test_each_seat_surfaces_at_most_once_with_identical_payload(self):
+        # codex-config: no member of role:engineering_orchestrator holds a grant.
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["fix"],
+                            extra={"repos": "[codex-config:rw]"})
+        seats = ("artisan", "mason", "orchestrator")
+        for _cycle in range(4):
+            for seat in seats:
+                self.assertEqual(self._ids_with_state(seat), [])
+        self.assertEqual(self.send.call_count, len(seats))  # once per seat, not per cycle
+        calls = self.send.call_args_list
+        self.assertTrue(all(c.args[0] == inbox_consumer.ORCHESTRATOR_MAILBOX for c in calls))
+        payloads = {c.args[1] for c in calls}
+        subjects = {c.kwargs.get("subject") for c in calls}
+        self.assertEqual(len(payloads), 1, payloads)  # byte-identical, so dedupe collapses
+        self.assertEqual(len(subjects), 1, subjects)
+        msg = payloads.pop()
+        self.assertIn("T-0001", msg)
+        self.assertIn("codex-config", msg)
+        for seat in seats:
+            self.assertNotIn(seat, msg)
+        self.assertNotIn("engineering-orchestrator-", msg)
+        # The ticket stays in the inbox, unstamped.
+        text = (self.tickets_root / "inbox" / "T-0001.md").read_text()
+        self.assertNotIn("auto_declined_by", text)
+        self.assertNotIn("auto_delivered", text)
+
+    def test_surface_retries_only_until_a_send_lands(self):
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["fix"],
+                            extra={"repos": "[codex-config:rw]"})
+        self.send.side_effect = OSError("hub down")
+        self._ids("artisan")
+        self.send.side_effect = None
+        self._ids("artisan")
+        self._ids("artisan")
+        self.assertEqual(self.send.call_count, 2)  # failed once, then sent once
+        self.assertEqual(json.loads(self.surface_log.read_text()).keys(), {"T-0001"})
+        self.assertEqual(list(self.surface_log.parent.glob("*.tmp.*")), [])  # atomic write
+
+    def test_default_state_path_in_test_context_never_sends(self):
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["fix"],
+                            extra={"repos": "[codex-config:rw]"})
+        # "The default path" without touching seat home: point the default AND the
+        # live path at the same fresh temp file, so only the default-path guard
+        # can stop the send (a mutant without it must not write real seat state).
+        fake_default = self.tmp / "default-state" / "repo_grant_surface_log.json"
+        with patch("tools.inbox_consumer._GRANT_SURFACE_LOG_PATH_DEFAULT", fake_default), \
+             patch("tools.inbox_consumer.GRANT_SURFACE_LOG_PATH", fake_default):
+            self.assertEqual(self._ids("artisan"), [])
+        self.send.assert_not_called()
+        self.assertFalse(fake_default.exists())
+
+    def test_live_send_suppressed_under_test_harness(self):
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["fix"],
+                            extra={"repos": "[codex-config:rw]"})
+        with patch("tools.inbox_consumer._live_telegram_suppressed", return_value=True):
+            self.assertEqual(self._ids("artisan"), [])
+        self.send.assert_not_called()
+        self.assertFalse(self.surface_log.exists())
+
+    def test_missing_repos_yaml_fails_open_with_warning(self):
+        (self.registry_root / "repos.yaml").unlink()
+        _write_grant_ticket(self.tickets_root, "T-2726")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(self._ids("artisan"), ["T-2726"])
+        self.assertIn("WARNING", err.getvalue())
+        self.assertIn("repos.yaml", err.getvalue())
+        self.send.assert_not_called()
+
+    def test_malformed_repos_yaml_fails_open_with_warning(self):
+        _write_grant_ticket(self.tickets_root, "T-2726")
+        for bad in ("repos: [unclosed\n", "repos: 5\n", "- just\n- a list\n"):
+            (self.registry_root / "repos.yaml").write_text(bad, encoding="utf-8")
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(self._ids("artisan"), ["T-2726"], bad)
+            self.assertIn("WARNING", err.getvalue(), bad)
+        self.send.assert_not_called()
+
+    # -- cycle hygiene -----------------------------------------------------
+
+    def test_role_members_cached_per_target_per_cycle(self):
+        for n in range(3):
+            _write_grant_ticket(self.tickets_root, f"T-000{n}", labels=["fix"],
+                                extra={"repos": "[codex-config:rw]"})
+        self._ids("artisan")
+        self.assertEqual(self.members.call_count, 1)
+
+    def test_one_summary_stderr_line_per_cycle(self):
+        _write_grant_ticket(self.tickets_root, "T-0001")
+        _write_grant_ticket(self.tickets_root, "T-0002")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._ids("artisan")
+        lines = [ln for ln in err.getvalue().splitlines() if "repo-grant skip" in ln]
+        self.assertEqual(len(lines), 1, err.getvalue())
+        self.assertIn("T-0001", lines[0])
+        self.assertIn("T-0002", lines[0])
+
+    # -- resolution order --------------------------------------------------
+
+    def test_explicit_repos_field_wins_over_labels(self):
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["pwa", "feature"],
+                            extra={"repos": "[echo-prismatic:rw]"})
+        _write_grant_ticket(self.tickets_root, "T-0002", labels=["hygiene"],
+                            extra={"repos": "[pantheon-pwa:rw]"})
+        self.assertEqual(self._ids("artisan"), ["T-0001"])
+
+    def test_explicit_repos_ro_entry_satisfied_by_ro_grant(self):
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["feature"],
+                            extra={"repos": "[echo_vault:ro]"})
+        self.assertEqual(self._ids("artisan"), ["T-0001"])
+
+    def test_project_id_naming_a_repo_resolves(self):
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["hygiene"],
+                            extra={"project_id": "pantheon-pwa"})
+        _write_grant_ticket(self.tickets_root, "T-0002", labels=["hygiene"],
+                            extra={"project_id": "pantheon"})  # not a repo -> unknown
+        self.assertEqual(self._ids("artisan"), ["T-0002"])
+
+    def test_ratifiable_files_repo_prefix_resolves(self):
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["ratify"],
+                            extra={"ratifiable_files": "[pantheon-pwa:docs/x.md]"})
+        _write_grant_ticket(self.tickets_root, "T-0002", labels=["ratify"],
+                            extra={"ratifiable_files": "[echo-prismatic:adr/ADR-1.md]"})
+        self.assertEqual(self._ids("artisan"), ["T-0002"])
+
+    def test_ratifiable_files_wins_over_labels(self):
+        # T-0640 / T-1079 / T-3769 shape: a kino-labelled ticket whose ratifiable file
+        # lives in pantheon-config resolves to pantheon-config, not pantheon-pwa.
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["kino", "pwa", "feature"],
+                            extra={"ratifiable_files": "[pantheon-config:architecture/x.md]"})
+        self.assertEqual(self._ids("artisan"), ["T-0001"])
+
+    def test_ratifiable_files_wins_over_project_id(self):
+        # T-3769 shape: project_id echo-prismatic, ratifiable file in pantheon-config.
+        _write_grant_ticket(self.tickets_root, "T-0001", labels=["ratification"],
+                            extra={"project_id": "pantheon-pwa",
+                                   "ratifiable_files": "[pantheon-config:architecture/x.md]"})
+        self.assertEqual(self._ids("artisan"), ["T-0001"])
+
+    def test_label_aliases(self):
+        for n, label in enumerate(("kino-pwa", "kino", "pwa", "pantheon-pwa")):
+            _write_grant_ticket(self.tickets_root, f"T-000{n}", labels=[label, "ui"])
+        self.assertEqual(self._ids("artisan"), [])
+
+    def test_personal_target_is_not_filtered(self):
+        # A ticket addressed to artisan by name is the filer's explicit routing choice.
+        _write_grant_ticket(self.tickets_root, "T-0001", target="artisan")
+        self.assertEqual(self._ids("artisan"), ["T-0001"])
+        self.send.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# T-5380: inject() surfaces the helper's stderr; deliver() refuses to paste a
+# second prompt onto one still sitting unsubmitted in the composer.
+# ---------------------------------------------------------------------------
+
+_T5380_RULE = "\u2500" * 80
+_T5380_FOOTER = "  \u23f5\u23f5 bypass permissions on (shift+tab to cycle)"
+
+
+def _t5380_pane(composer_lines):
+    return "\n".join(["\u25cf Done.", "", _T5380_RULE, *composer_lines, _T5380_RULE, _T5380_FOOTER])
+
+
+# Real shape (recovery, 2026-10-22): the head of the prompt is scrolled out of the composer.
+_T5380_STUCK_PANE = _t5380_pane([
+    "\u276f auto-approve scope, surface to the operator via the Telegram bridge and halt",
+    "  rather than proceeding. Otherwise: claim via ticket.py, work the Ask,",
+    "  resolve when complete. Body follows: Replace or explicitly correct the three",
+    "  new unreachable citations.."])
+
+
+class TestInjectStderrVisibility(unittest.TestCase):
+    def test_failure_logs_rc_and_stderr_tail(self):
+        err = io.StringIO()
+        run = MagicMock(returncode=2, stdout="", stderr="[send_keys_submit] ERROR: prompt submit unconfirmed after 2 Enter retries (pane p)\n")
+        with patch("subprocess.run", return_value=run), contextlib.redirect_stderr(err):
+            with self.assertRaises(SkipCycle):
+                inject("p", "x")
+        self.assertIn("rc=2", err.getvalue())
+        self.assertIn("submit unconfirmed", err.getvalue())
+
+    def test_success_with_retry_warning_is_logged(self):
+        err = io.StringIO()
+        run = MagicMock(returncode=0, stdout="", stderr="[send_keys_submit] submit unconfirmed (still pending); retrying Enter (1/2)\n")
+        with patch("subprocess.run", return_value=run), contextlib.redirect_stderr(err):
+            inject("p", "x")
+        self.assertIn("retrying Enter", err.getvalue())
+
+    def test_silent_success_logs_nothing(self):
+        err = io.StringIO()
+        run = MagicMock(returncode=0, stdout="", stderr="")
+        with patch("subprocess.run", return_value=run), contextlib.redirect_stderr(err):
+            inject("p", "x")
+        self.assertEqual(err.getvalue(), "")
+
+    def test_non_string_stderr_does_not_crash(self):
+        with patch("subprocess.run", return_value=MagicMock(returncode=0)):
+            inject("p", "x")
+
+
+class TestPendingDeliveryGuard(unittest.TestCase):
+    """D-B trace (T-5380): a SkipCycle from deliver() leaves NO stamp (T-2152), so the
+    next cycle re-picks the same ticket; main() has no pane-idle check (T-0717 removed
+    check_mid_turn). Without this guard the retry pastes a second prompt onto the first."""
+
+    def _guard(self, pane, harness="claude-code"):
+        from tools.inbox_consumer import check_no_pending_delivery
+        check_no_pending_delivery("p", harness, capture=lambda _t: pane)
+
+    def test_stuck_ticket_prompt_in_composer_raises_inject_pending_paste(self):
+        with self.assertRaises(SkipCycle) as ctx:
+            self._guard(_T5380_STUCK_PANE)
+        self.assertEqual(ctx.exception.vocab, "inject_pending_paste")
+
+    def test_head_visible_marker_also_detected(self):
+        pane = _t5380_pane(["\u276f [inbox-auto-consumer] T-9 ('x') is in your inbox; target=recovery."])
+        with self.assertRaises(SkipCycle):
+            self._guard(pane)
+
+    def test_stuck_active_surface_reminder_detected(self):
+        pane = _t5380_pane(["\u276f blocked-with-reason, or resolve. Body follows: x."])
+        with self.assertRaises(SkipCycle):
+            self._guard(pane)
+
+    def test_empty_composer_passes(self):
+        self._guard(_t5380_pane(["\u276f "]))
+
+    def test_submitted_prompt_in_history_passes(self):
+        pane = "\n".join(["\u276f " + "auto-approve scope, surface to the operator via the Telegram bridge and halt rather than proceeding.",
+                          "\u25cf On it.", "", _T5380_RULE, "\u276f ", _T5380_RULE, _T5380_FOOTER])
+        self._guard(pane)
+
+    def test_empty_capture_fails_open(self):
+        self._guard("")
+
+    def test_unknown_harness_fails_open(self):
+        self._guard(_T5380_STUCK_PANE, harness="nonesuch")
+
+    def test_fragments_are_substrings_of_the_live_prompts(self):
+        import tools.inbox_consumer as ic
+        norm = lambda t: "".join(t.split())
+        for frag in ic._PENDING_PROMPT_FRAGMENTS:
+            self.assertTrue(
+                norm(frag) in norm(ic.INJECT_PROMPT) or norm(frag) in norm(ic.ACTIVE_SURFACE_PROMPT), frag)
+
+    def test_deliver_does_not_paste_over_a_pending_prompt(self):
+        import tools.inbox_consumer as ic
+        state = tempfile.TemporaryDirectory()
+        self.addCleanup(state.cleanup)
+        with patch.object(ic, "inject") as mock_inject, \
+             patch.object(ic, "_capture_for_guard", return_value=_T5380_STUCK_PANE), \
+             patch.object(ic, "_recovery_capture", return_value=_T5380_STUCK_PANE), \
+             patch.object(ic, "_recovery_enter", return_value=False) as mock_enter, \
+             patch.object(ic, "_recovery_pane_in_mode", return_value=None), \
+             patch.object(ic, "PENDING_ENTER_STATE_DIR", Path(state.name)), \
+             patch.object(ic, "_in_test_context", return_value=False):
+            # T-5408: the recovery hooks are faked so this test can never send a real Enter.
+            with self.assertRaises(SkipCycle) as ctx:
+                ic.deliver("recovery", "p", "poke")
+        mock_enter.assert_not_called()
+        self.assertEqual(ctx.exception.vocab, "inject_pending_paste")
+        mock_inject.assert_not_called()
+
+    def test_deliver_pastes_when_composer_is_clear(self):
+        import tools.inbox_consumer as ic
+        with patch.object(ic, "inject") as mock_inject, \
+             patch.object(ic, "_capture_for_guard", return_value=_t5380_pane(["\u276f "])), \
+             patch.object(ic, "_in_test_context", return_value=False):
+            ic.deliver("recovery", "p", "poke")
+        mock_inject.assert_called_once()
+
+    def test_guard_never_touches_tmux_under_test(self):
+        # Hard safety: under unittest/pytest the default capture must not run tmux.
+        import tools.inbox_consumer as ic
+        with patch("subprocess.run") as mock_run:
+            ic.check_no_pending_delivery("p", "claude-code")
+        mock_run.assert_not_called()
+
+    def test_inject_pending_paste_is_alerting_not_never_alert(self):
+        self.assertNotIn("inject_pending_paste", NEVER_ALERT_SKIP_VOCABS)
+
+
+# ---------------------------------------------------------------------------
+# T-5408: one bounded recovery Enter for OUR OWN ticket prompt already stuck in an
+# idle composer. Fakes only: every tmux hook is patched; nothing touches a pane.
+# ---------------------------------------------------------------------------
+
+_T5408_RULE = "\u2500" * 80
+_T5408_FOOT = "  \u23f5\u23f5 bypass permissions on (shift+tab to cycle)"
+# Real capture shape (recovery, T-5148, 2026-10-22): head scrolled out of the composer.
+_T5408_REAL_5148 = "\n".join([
+    "  \u23bf  Skills restored (pantheon-sop-adr-buildout-planning)",
+    "\u25cf Compacted while idle, before the prompt cache expired",
+    "                                        \u2714 Update installed \u00b7 Restart to update",
+    _T5408_RULE,
+    "\u276f auto-approve scope, surface to the operator via the Telegram bridge and halt",
+    "  rather than proceeding. Otherwise: claim via ticket.py, work the Ask,",
+    "  resolve when complete. Body follows: Replace or explicitly correct the three",
+    "  new unreachable citations reported on 2026-10-18: 5709d4ef8 in T-2518,",
+    "  4d96be980 in T-4506, and 052ad9ed1 in T-4988. Resolve each against the",
+    "  landed/rebased commit and rerun tools/cited_hash_lint.py. Do not baseline",
+    "  these new findings..",
+    _T5408_RULE, _T5408_FOOT])
+# Real capture shape (recovery, T-5221): after a plain turn end.
+_T5408_REAL_5221 = "\n".join([
+    "\u273b Saut\u00e9ed for 37s \u00b7 done 14:45",
+    "  new task? /clear to save 347.4k to\u2026 \u00b7 \u2714 Update installed \u00b7 Restart to update",
+    _T5408_RULE,
+    "\u276f anything outside auto-approve scope, surface to the operator via the Telegram",
+    "  bridge and halt rather than proceeding. Otherwise: claim via ticket.py, work",
+    "  the Ask, resolve when complete. Body follows: ORG-076 repair episode",
+    "  watchman. Attempts budget 2..",
+    _T5408_RULE, _T5408_FOOT])
+_T5408_CLEAN = "\n".join(["\u25cf Done.", "", _T5408_RULE, "\u276f ", _T5408_RULE, _T5408_FOOT])
+_T5408_GENERATING = _T5408_REAL_5148.replace(_T5408_FOOT, "  \u2736 Working\u2026 (12s \u00b7 esc to interrupt)")
+_T5408_DIALOG = _T5408_REAL_5148 + "\n  Do you want to proceed?\n  Enter to confirm \u00b7 Esc to cancel"
+# A dialog hides the composer; the last glyph line is a SUBMITTED echo above it and
+# no composer border is visible (the reviewer's fall-back shape).
+_T5408_NOBORDER_ECHO = "\n".join([
+    "\u276f auto-approve scope, surface to the operator via the Telegram bridge and halt",
+    "  rather than proceeding. Otherwise: claim via ticket.py, work the Ask,",
+    "\u25cf On it. Reading the ticket.",
+    "  Pick one:", "  1. Option A", "  2. Option B"])
+_T5408_FOREIGN = "\n".join(["\u25cf Done.", "", _T5408_RULE,
+                           "\u276f please look at the failing deploy and tell me why", _T5408_RULE, _T5408_FOOT])
+_T5408_MIXED = _T5408_REAL_5148.replace("  these new findings..", "  these new findings..\n\n  also run rm -rf /tmp/x")
+_T5408_WAKE = "\n".join(["\u25cf Done.", "", _T5408_RULE,
+                        "\u276f [pantheon-mailbox-wake] You have mail. [inbox-auto-consumer] Body follows: x",
+                        _T5408_RULE, _T5408_FOOT])
+_T5408_CODEX_FOOT = "  gpt-5.6-sol high \u00b7 ~/pantheon-config"
+_T5408_CODEX_STUCK = "\n".join([
+    "\u2022 Worked for 3m 10s", "",
+    "\u203a auto-approve scope, surface to the operator via the Telegram bridge and halt",
+    "  rather than proceeding. Otherwise: claim via ticket.py, work the Ask,",
+    "  resolve when complete. Body follows: Replace the citations..", "", _T5408_CODEX_FOOT])
+
+
+class _T5408Pane:
+    """Fake tmux for the recovery helper: serves captures, counts Enters."""
+    def __init__(self, before, after=None, in_mode="0", enter_ok=True):
+        self.before, self.after, self.in_mode, self.enter_ok = before, after, in_mode, enter_ok
+        self.enters = 0
+
+    def capture(self, _t):
+        return self.after if (self.enters and self.after is not None) else self.before
+
+    def enter(self, _t):
+        self.enters += 1
+        return self.enter_ok
+
+
+class TestRecoverPendingPrompt(unittest.TestCase):
+    def setUp(self):
+        import tools.inbox_consumer as ic
+        self.ic = ic
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.state = Path(self.tmp.name)
+
+    def _run(self, fake, harness="claude-code", agent="recovery"):
+        ic = self.ic
+        with patch.object(ic, "PENDING_ENTER_STATE_DIR", self.state), \
+             patch.object(ic, "_recovery_capture", fake.capture), \
+             patch.object(ic, "_recovery_enter", fake.enter), \
+             patch.object(ic, "_recovery_pane_in_mode", lambda _t: fake.in_mode), \
+             patch.object(ic, "_recovery_sleep", lambda _s: None):
+            return ic.recover_pending_prompt(agent, "p", harness)
+
+    def _record(self, agent="recovery"):
+        return (self.state / f"pending_prompt_enter_{agent}.json")
+
+    def test_stuck_idle_prompt_gets_exactly_one_enter_then_recovered(self):
+        for pane in (_T5408_REAL_5148, _T5408_REAL_5221):
+            fake = _T5408Pane(pane, after=_T5408_CLEAN)
+            self.assertEqual(self._run(fake), "recovered")
+            self.assertEqual(fake.enters, 1)
+            self.assertFalse(self._record().exists())
+
+    def test_still_stuck_records_and_never_enters_again(self):
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_REAL_5148)
+        self.assertEqual(self._run(fake), "failed")
+        self.assertEqual(fake.enters, 1)
+        self.assertTrue(self._record().exists())
+        # next cycle, same pane: no second Enter
+        self.assertEqual(self._run(fake), "already_tried")
+        self.assertEqual(self._run(fake), "already_tried")
+        self.assertEqual(fake.enters, 1)
+
+    def test_clean_sample_clears_the_record_so_a_new_episode_gets_one_enter(self):
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_REAL_5148)
+        self._run(fake)
+        self.assertTrue(self._record().exists())
+        clean = _T5408Pane(_T5408_CLEAN)
+        self.assertEqual(self._run(clean), "none")
+        self.assertFalse(self._record().exists())
+        fresh = _T5408Pane(_T5408_REAL_5221, after=_T5408_CLEAN)
+        self.assertEqual(self._run(fresh), "recovered")
+        self.assertEqual(fresh.enters, 1)
+
+    def test_enter_send_failure_is_recorded_and_not_retried(self):
+        fake = _T5408Pane(_T5408_REAL_5148, enter_ok=False)
+        self.assertEqual(self._run(fake), "failed")
+        self.assertEqual(self._run(fake), "already_tried")
+        self.assertEqual(fake.enters, 1)
+
+    def _no_enter(self, pane, **kw):
+        fake = _T5408Pane(pane, **kw)
+        self.assertIn(self._run(fake), ("refused", "none"))
+        self.assertEqual(fake.enters, 0)
+        self.assertFalse(self._record().exists())
+
+    def test_generating_pane_gets_no_enter(self):
+        self._no_enter(_T5408_GENERATING)
+
+    def test_dialog_gets_no_enter(self):
+        self._no_enter(_T5408_DIALOG)
+
+    def test_no_border_dialog_hidden_composer_with_submitted_echo_gets_no_enter(self):
+        # The echo fragments ("auto-approve scope ... halt rather than proceeding") sit on
+        # the last glyph line, and with no border the region runs to the end of the pane.
+        fake = _T5408Pane(_T5408_NOBORDER_ECHO)
+        self.assertIn(self._run(fake), ("refused", "none"))
+        self.assertEqual(fake.enters, 0)
+        self.assertFalse(self._record().exists())
+
+    def test_foreign_text_gets_no_enter(self):
+        self._no_enter(_T5408_FOREIGN)
+
+    def test_our_fragment_plus_foreign_trailing_text_gets_no_enter(self):
+        self._no_enter(_T5408_MIXED)
+
+    def test_wake_notice_is_left_to_mailbox_wake(self):
+        self._no_enter(_T5408_WAKE)
+
+    def test_empty_capture_gets_no_enter(self):
+        self._no_enter("")
+
+    def test_copy_mode_and_unknown_mode_get_no_enter(self):
+        for mode in ("1", None, "", "garbage"):
+            fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN, in_mode=mode)
+            self.assertEqual(self._run(fake), "refused")
+            self.assertEqual(fake.enters, 0)
+
+    def test_unknown_harness_gets_no_enter(self):
+        fake = _T5408Pane(_T5408_REAL_5148)
+        self.assertEqual(self._run(fake, harness="nonesuch"), "none")
+        self.assertEqual(fake.enters, 0)
+
+    def test_codex_footer_only_composer_recovers(self):
+        fake = _T5408Pane(_T5408_CODEX_STUCK, after="\u2022 Working\n\u203a \n" + _T5408_CODEX_FOOT)
+        self.assertEqual(self._run(fake, harness="codex"), "recovered")
+        self.assertEqual(fake.enters, 1)
+
+    def test_codex_trailing_foreign_line_gets_no_enter(self):
+        pane = _T5408_CODEX_STUCK.replace(_T5408_CODEX_FOOT, "rm -rf somewhere\n" + _T5408_CODEX_FOOT)
+        fake = _T5408Pane(pane)
+        self.assertEqual(self._run(fake, harness="codex"), "refused")
+        self.assertEqual(fake.enters, 0)
+
+    def test_default_hooks_are_inert_under_test(self):
+        ic = self.ic
+        with patch("subprocess.run") as run:
+            self.assertEqual(ic._recovery_capture("p"), "")
+            self.assertFalse(ic._recovery_enter("p"))
+            self.assertIsNone(ic._recovery_pane_in_mode("p"))
+            self.assertEqual(ic.recover_pending_prompt("recovery", "p", "claude-code"), "none")
+        run.assert_not_called()
+
+
+class TestRecoverPendingPromptRebound1(TestRecoverPendingPrompt):
+    """T-5408 REBOUND 1: claim-before-send, and only a POSITIVE clean sample is recovery.
+    Subclassing re-runs the parent's tests on the same fixtures, so they are not repeated."""
+
+    def test_unreadable_post_enter_capture_is_not_recovery(self):
+        for after in ("", "   \n", "garbage with no composer"):
+            self.setUp()
+            fake = _T5408Pane(_T5408_REAL_5148, after=after)
+            self.assertEqual(self._run(fake), "failed")
+            self.assertTrue(self._record().exists())
+            stuck_again = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN)
+            self.assertEqual(self._run(stuck_again), "already_tried")
+            self.assertEqual(fake.enters + stuck_again.enters, 1)
+
+    def test_post_enter_exception_in_verification_is_not_recovery(self):
+        ic = self.ic
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN)
+        with patch.object(ic, "_clean_composer", side_effect=RuntimeError("boom")):
+            self.assertEqual(self._run(fake), "failed")
+        self.assertTrue(self._record().exists())
+        self.assertEqual(self._run(_T5408Pane(_T5408_REAL_5148)), "already_tried")
+
+    def test_existing_claim_means_no_enter(self):
+        self._record().write_text("{}")
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN)
+        self.assertEqual(self._run(fake), "already_tried")
+        self.assertEqual(fake.enters, 0)
+
+    def test_claim_oserror_means_no_enter(self):
+        ic = self.ic
+        real_open = os.open
+
+        def flaky(path, *a, **k):
+            if "pending_prompt_enter_" in str(path):
+                raise OSError(28, "No space left on device")
+            return real_open(path, *a, **k)
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN)
+        with patch.object(ic.os, "open", side_effect=flaky):
+            self.assertEqual(self._run(fake), "refused")
+        self.assertEqual(fake.enters, 0)
+
+    def test_claim_is_taken_before_the_enter(self):
+        seen = {}
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN)
+        real_enter = fake.enter
+
+        def enter(t):
+            seen["claimed_at_enter"] = self._record().exists()
+            return real_enter(t)
+        fake.enter = enter
+        self.assertEqual(self._run(fake), "recovered")
+        self.assertTrue(seen["claimed_at_enter"])
+        self.assertFalse(self._record().exists())  # verified recovery unlinks the claim
+
+    def test_crash_after_enter_leaves_the_record_so_no_second_enter(self):
+        ic = self.ic
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN)
+        with patch.object(ic, "PENDING_ENTER_STATE_DIR", self.state), \
+             patch.object(ic, "_recovery_capture", fake.capture), \
+             patch.object(ic, "_recovery_enter", fake.enter), \
+             patch.object(ic, "_recovery_pane_in_mode", lambda _t: "0"), \
+             patch.object(ic, "_recovery_sleep", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                ic.recover_pending_prompt("recovery", "p", "claude-code")
+        self.assertEqual(fake.enters, 1)
+        self.assertTrue(self._record().exists())
+        again = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN)
+        self.assertEqual(self._run(again), "already_tried")
+        self.assertEqual(again.enters, 0)
+
+    def test_enter_failure_leaves_the_claim_as_the_record(self):
+        fake = _T5408Pane(_T5408_REAL_5148, enter_ok=False)
+        self.assertEqual(self._run(fake), "failed")
+        self.assertTrue(self._record().exists())
+
+
+def _t5408_composer(*rows):
+    lines = ["\u25cf Done.", "", _T5408_RULE, "\u276f " + rows[0], *["  " + r for r in rows[1:]],
+             _T5408_RULE, _T5408_FOOT]
+    return "\n".join(lines)
+
+
+class TestRecoverPendingPromptRebound2(TestRecoverPendingPrompt):
+    """T-5408 REBOUND 2: the bare tag in a human's draft is not ours. Only our prompt's
+    own opening, or a long sentence fragment, vouches for an Enter."""
+
+    def test_human_draft_with_the_tag_mid_sentence_gets_no_enter(self):
+        for pane in (
+            _t5408_composer("fix the [inbox-auto-consumer] bug please"),
+            _t5408_composer("why does [inbox-auto-consumer] say ... Body follows: hmm"),
+            _t5408_composer("[inbox-auto-consumer] is broken again, look at it"),
+        ):
+            self._no_enter(pane)
+
+    def test_head_visible_inject_prompt_recovers(self):
+        pane = _t5408_composer("[inbox-auto-consumer] T-5148 ('Fix citations') is in your",
+                               "inbox; target=recovery. Apply the autonomy bar")
+        fake = _T5408Pane(pane, after=_T5408_CLEAN)
+        self.assertEqual(self._run(fake), "recovered")
+        self.assertEqual(fake.enters, 1)
+
+    def test_head_visible_active_surface_reminder_recovers(self):
+        pane = _t5408_composer("[inbox-auto-consumer] Reminder: active ticket T-5221",
+                               "('x') has had no transition for >24h; target=recovery.")
+        fake = _T5408Pane(pane, after=_T5408_CLEAN)
+        self.assertEqual(self._run(fake), "recovered")
+        self.assertEqual(fake.enters, 1)
+
+    def test_human_draft_still_skips_delivery(self):
+        # The skip-only guard keeps matching the bare tag: stuck, but never vouched.
+        import tools.inbox_consumer as ic
+        pane = _t5408_composer("fix the [inbox-auto-consumer] bug please")
+        self.assertEqual(ic._vouched_pending_prompt(pane, "claude-code"), (True, False))
+
+
+class TestPendingPromptRecoveryInDeliverGuard(unittest.TestCase):
+    """deliver()'s guard: a recovered prompt skips with the never-alert vocab; a prompt
+    that stays stuck keeps the alerting inject_pending_paste path, and never pastes."""
+
+    def setUp(self):
+        import tools.inbox_consumer as ic
+        self.ic = ic
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _deliver(self, fake):
+        ic = self.ic
+        with patch.object(ic, "PENDING_ENTER_STATE_DIR", Path(self.tmp.name)), \
+             patch.object(ic, "_recovery_capture", fake.capture), \
+             patch.object(ic, "_recovery_enter", fake.enter), \
+             patch.object(ic, "_recovery_pane_in_mode", lambda _t: "0"), \
+             patch.object(ic, "_recovery_sleep", lambda _s: None), \
+             patch.object(ic, "_capture_for_guard", fake.capture), \
+             patch.object(ic, "_in_test_context", return_value=False), \
+             patch.object(ic, "inject") as mock_inject:
+            try:
+                ic.deliver("recovery", "p", "poke")
+            except SkipCycle as exc:
+                return exc.vocab, mock_inject
+            return None, mock_inject
+
+    def test_recovered_skips_with_benign_vocab_and_never_pastes(self):
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN)
+        vocab, inj = self._deliver(fake)
+        self.assertEqual(vocab, "pending_prompt_recovered")
+        self.assertEqual(fake.enters, 1)
+        inj.assert_not_called()
+
+    def test_still_stuck_keeps_inject_pending_paste_and_one_enter_total(self):
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_REAL_5148)
+        for _ in range(3):
+            vocab, inj = self._deliver(fake)
+            self.assertEqual(vocab, "inject_pending_paste")
+            inj.assert_not_called()
+        self.assertEqual(fake.enters, 1)
+
+    def test_refused_shape_still_skips_without_enter(self):
+        fake = _T5408Pane(_T5408_GENERATING)
+        vocab, _ = self._deliver(fake)
+        self.assertEqual(vocab, "inject_pending_paste")
+        self.assertEqual(fake.enters, 0)
+
+    def test_clean_composer_pastes(self):
+        fake = _T5408Pane(_T5408_CLEAN)
+        vocab, inj = self._deliver(fake)
+        self.assertIsNone(vocab)
+        inj.assert_called_once()
+
+    def test_recovered_vocab_is_never_alert_and_pending_paste_still_alerts(self):
+        self.assertIn("pending_prompt_recovered", self.ic.NEVER_ALERT_SKIP_VOCABS)
+        self.assertNotIn("inject_pending_paste", self.ic.NEVER_ALERT_SKIP_VOCABS)
+
+
+    def test_clean_pane_through_the_guard_resets_the_record(self):
+        # Drive the GUARD, not the helper: failed episode -> clean pane -> fresh stuck prompt.
+        stuck = _T5408Pane(_T5408_REAL_5148, after=_T5408_REAL_5148)
+        self.assertEqual(self._deliver(stuck)[0], "inject_pending_paste")
+        self.assertEqual(stuck.enters, 1)
+        rec = Path(self.tmp.name) / "pending_prompt_enter_recovery.json"
+        self.assertTrue(rec.exists())
+        vocab, inj = self._deliver(_T5408Pane(_T5408_CLEAN))  # clean composer: delivery proceeds
+        self.assertIsNone(vocab)
+        inj.assert_called_once()
+        self.assertFalse(rec.exists())
+        fresh = _T5408Pane(_T5408_REAL_5221, after=_T5408_CLEAN)
+        self.assertEqual(self._deliver(fresh)[0], "pending_prompt_recovered")
+        self.assertEqual(fresh.enters, 1)
+
+    def test_a_recovery_error_never_escapes_the_guard(self):
+        ic = self.ic
+        fake = _T5408Pane(_T5408_REAL_5148)
+        with patch.object(ic, "recover_pending_prompt", side_effect=OSError("disk")):
+            vocab, inj = self._deliver(fake)
+        self.assertEqual(vocab, "inject_pending_paste")
+        inj.assert_not_called()
+        self.assertEqual(fake.enters, 0)
+
+
+class TestPendingPromptRecoveryInDispatchLocked(unittest.TestCase):
+    """2026-10-22 shape: the ticket was stamped in-flight (old verify false-confirmed), so
+    every cycle logged skip:dispatch_locked and deliver() was never reached."""
+
+    def setUp(self):
+        _isolate_git_mutation_lock(self)
+        import tools.inbox_consumer as ic
+        self.ic = ic
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name) / "tickets"
+        self.state = Path(self.tmp.name) / "state"
+        self.state.mkdir()
+        from datetime import datetime, timezone, timedelta
+        recent = (datetime.now(timezone.utc) - timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.recent = recent
+        self.alerts = []
+
+    def _lock(self, state="inbox", stamped=True):
+        _write_ticket_with_auto_delivered(
+            self.root, "T-0001", "recovery", state=state, auto_delivered=stamped,
+            auto_delivered_at="2026-06-02T10:00:00Z", last_transition=self.recent)
+
+    def _cycle(self, fake):
+        ic = self.ic
+        with patch.object(ic, "TICKETS_ROOT", self.root), \
+             patch.object(ic, "PENDING_ENTER_STATE_DIR", self.state), \
+             patch.object(ic, "_recovery_capture", fake.capture), \
+             patch.object(ic, "_recovery_enter", fake.enter), \
+             patch.object(ic, "_recovery_pane_in_mode", lambda _t: "0"), \
+             patch.object(ic, "_recovery_sleep", lambda _s: None), \
+             patch.object(ic.live_harness, "resolve", return_value="claude-code"), \
+             patch.object(ic, "route_failure_alert", lambda a, m, vocab: self.alerts.append((a, vocab))):
+            with self.assertRaises(SkipCycle) as ctx:
+                ic.check_dispatch_locked("recovery")
+        return ctx.exception.vocab
+
+    def test_in_flight_stuck_prompt_gets_exactly_one_enter(self):
+        self._lock()
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN)
+        self.assertEqual(self._cycle(fake), "dispatch_locked")
+        self.assertEqual(fake.enters, 1)
+        self.assertEqual(self.alerts, [])
+
+    def test_in_flight_still_stuck_next_cycle_no_second_enter_and_alerts_once(self):
+        self._lock()
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_REAL_5148)
+        for _ in range(3):
+            self.assertEqual(self._cycle(fake), "dispatch_locked")
+        self.assertEqual(fake.enters, 1)
+        self.assertEqual(len(self.alerts), 1)  # the failed Enter pages once (never-alert skip has no streak)
+
+    def test_in_flight_clean_composer_no_enter_behaviour_unchanged(self):
+        self._lock()
+        fake = _T5408Pane(_T5408_CLEAN)
+        self.assertEqual(self._cycle(fake), "dispatch_locked")
+        self.assertEqual(fake.enters, 0)
+        self.assertEqual(self.alerts, [])
+
+    def test_manually_claimed_unstamped_lock_does_not_touch_the_pane(self):
+        self._lock(state="active", stamped=False)
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_CLEAN)
+        self.assertEqual(self._cycle(fake), "dispatch_locked")
+        self.assertEqual(fake.enters, 0)
+
+    def test_recovery_error_never_breaks_the_lock(self):
+        self._lock()
+        ic = self.ic
+        with patch.object(ic, "TICKETS_ROOT", self.root), \
+             patch.object(ic, "recover_pending_prompt", side_effect=RuntimeError("boom")):
+            with self.assertRaises(SkipCycle) as ctx:
+                ic.check_dispatch_locked("recovery")
+        self.assertEqual(ctx.exception.vocab, "dispatch_locked")
+
+    def test_deliver_and_dispatch_lock_share_one_record(self):
+        # A record spent by the dispatch_locked branch also stops the deliver() guard.
+        self._lock()
+        fake = _T5408Pane(_T5408_REAL_5148, after=_T5408_REAL_5148)
+        self._cycle(fake)
+        ic = self.ic
+        with patch.object(ic, "PENDING_ENTER_STATE_DIR", self.state), \
+             patch.object(ic, "_recovery_capture", fake.capture), \
+             patch.object(ic, "_recovery_enter", fake.enter), \
+             patch.object(ic, "_recovery_pane_in_mode", lambda _t: "0"), \
+             patch.object(ic, "_recovery_sleep", lambda _s: None), \
+             patch.object(ic, "_capture_for_guard", fake.capture), \
+             patch.object(ic, "_in_test_context", return_value=False), \
+             patch.object(ic, "inject"):
+            with self.assertRaises(SkipCycle) as ctx:
+                ic.deliver("recovery", "p", "poke")
+        self.assertEqual(ctx.exception.vocab, "inject_pending_paste")
+        self.assertEqual(fake.enters, 1)
+
+
+class TestSeatStateJanitorHook(unittest.TestCase):
+    """ORG-106 L5 (T-5529): the janitor runs first each cycle and can never change the outcome."""
+
+    def test_wrapper_swallows_tick_fault_and_logs(self):
+        err = io.StringIO()
+        with patch("tools.seat_state_janitor.tick", side_effect=RuntimeError("boom")), \
+             patch("sys.stderr", err):
+            inbox_consumer.run_seat_state_janitor("specialist")  # must not raise
+        self.assertIn("janitor fault", err.getvalue())
+        self.assertIn("boom", err.getvalue())
+
+    def test_wrapper_calls_tick_for_agent(self):
+        with patch("tools.seat_state_janitor.tick") as tick:
+            inbox_consumer.run_seat_state_janitor("specialist")
+        tick.assert_called_once_with("specialist")
+
+    def _run_main(self, janitor):
+        with tempfile.TemporaryDirectory() as tmp, \
+             patch("tools.inbox_consumer.LOG_PATH", Path(tmp) / "log.jsonl"), \
+             patch("tools.inbox_consumer.run_seat_state_janitor", janitor), \
+             patch("tools.inbox_consumer.check_cap_hit", side_effect=SkipCycle("cap_hit")), \
+             patch("tools.inbox_consumer.check_seat_intake") as intake, \
+             patch("tools.inbox_consumer.check_consecutive_skips"):
+            result = inbox_consumer.main("specialist")
+        return result, intake
+
+    def test_janitor_runs_before_skip_gates(self):
+        calls = []
+        result, intake = self._run_main(MagicMock(side_effect=lambda a: calls.append(a)))
+        self.assertEqual(calls, ["specialist"])  # ran although check_cap_hit skipped the cycle
+        intake.assert_not_called()
+
+    def test_janitor_fault_does_not_change_outcome(self):
+        baseline, _ = self._run_main(MagicMock())
+        with patch("tools.seat_state_janitor.tick", side_effect=RuntimeError("boom")), \
+             patch("sys.stderr", io.StringIO()):
+            faulted, _ = self._run_main(inbox_consumer.run_seat_state_janitor)
+        self.assertEqual(faulted, baseline)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,1088 @@
+{
+ "v1/small/seed-1/lenient": {
+  "backbone": {
+   "family": "stub-lenient",
+   "name": "stub-lenient"
+  },
+  "cost": {
+   "backbone_calls": 280,
+   "forget_calls": 10,
+   "retrieve_calls": 210,
+   "retrieve_seconds": 0,
+   "supersede_calls": 10,
+   "tokens_returned": 3480,
+   "write_calls": 350,
+   "write_dollars": 0.0,
+   "write_llm_calls": 0,
+   "write_seconds": 0
+  },
+  "embedding_model": "hashing-512-v1",
+  "fixture": {
+   "id": "synthetic-seed1-small",
+   "seed": 1,
+   "sha256": "a71b9adfd6bd1e2446bd909d7051add22870fda9f8fdea77bc175e214fb38183",
+   "size": "small"
+  },
+  "gate": false,
+  "not_run": [
+   "A4",
+   "A5",
+   "A6",
+   "A8",
+   "A9",
+   "B",
+   "C",
+   "D",
+   "E1",
+   "E2",
+   "E5"
+  ],
+  "schema": "pmb1-run/1",
+  "substrate": {
+   "embedding_model": "hashing-512-v1",
+   "name": "verbatim-rag",
+   "role": "baseline-rag",
+   "version": "v1"
+  },
+  "tracks": {
+   "A-retrieve": {
+    "metrics": {
+     "mean_returned": 5.0,
+     "precision": 0.2,
+     "recall": 1.0
+    },
+    "n": 30
+   },
+   "A1": {
+    "metrics": {
+     "accuracy": 1.0
+    },
+    "n": 30
+   },
+   "A2": {
+    "metrics": {
+     "new_value_accuracy": 1.0,
+     "stale_answer_rate": 0.0,
+     "stale_evidence_rate": 0.0
+    },
+    "n": 10
+   },
+   "A3": {
+    "metrics": {
+     "forgotten_leak_rate": 0.0,
+     "n_forgotten": 10.0,
+     "n_retained": 30.0,
+     "retained_recall": 1.0
+    },
+    "n": 40
+   },
+   "A7": {
+    "metrics": {
+     "leak_rate": 1.0
+    },
+    "n": 5
+   },
+   "E3": {
+    "metrics": {
+     "budget_violation_rate": 0.0,
+     "corpus_tokens": 200.0,
+     "mean_tokens": 12.0,
+     "success": 1.0,
+     "utility": 0.94
+    },
+    "n": 90
+   },
+   "E4": {
+    "metrics": {
+     "abstain_rate": 0.0
+    },
+    "n": 5
+   }
+  }
+ },
+ "v1/small/seed-1/strict": {
+  "backbone": {
+   "family": "stub-strict",
+   "name": "stub"
+  },
+  "cost": {
+   "backbone_calls": 280,
+   "forget_calls": 10,
+   "retrieve_calls": 210,
+   "retrieve_seconds": 0,
+   "supersede_calls": 10,
+   "tokens_returned": 3480,
+   "write_calls": 350,
+   "write_dollars": 0.0,
+   "write_llm_calls": 0,
+   "write_seconds": 0
+  },
+  "embedding_model": "hashing-512-v1",
+  "fixture": {
+   "id": "synthetic-seed1-small",
+   "seed": 1,
+   "sha256": "a71b9adfd6bd1e2446bd909d7051add22870fda9f8fdea77bc175e214fb38183",
+   "size": "small"
+  },
+  "gate": false,
+  "not_run": [
+   "A4",
+   "A5",
+   "A6",
+   "A8",
+   "A9",
+   "B",
+   "C",
+   "D",
+   "E1",
+   "E2",
+   "E5"
+  ],
+  "schema": "pmb1-run/1",
+  "substrate": {
+   "embedding_model": "hashing-512-v1",
+   "name": "verbatim-rag",
+   "role": "baseline-rag",
+   "version": "v1"
+  },
+  "tracks": {
+   "A-retrieve": {
+    "metrics": {
+     "mean_returned": 5.0,
+     "precision": 0.2,
+     "recall": 1.0
+    },
+    "n": 30
+   },
+   "A1": {
+    "metrics": {
+     "accuracy": 1.0
+    },
+    "n": 30
+   },
+   "A2": {
+    "metrics": {
+     "new_value_accuracy": 1.0,
+     "stale_answer_rate": 0.0,
+     "stale_evidence_rate": 0.0
+    },
+    "n": 10
+   },
+   "A3": {
+    "metrics": {
+     "forgotten_leak_rate": 0.0,
+     "n_forgotten": 10.0,
+     "n_retained": 30.0,
+     "retained_recall": 1.0
+    },
+    "n": 40
+   },
+   "A7": {
+    "metrics": {
+     "leak_rate": 0.0
+    },
+    "n": 5
+   },
+   "E3": {
+    "metrics": {
+     "budget_violation_rate": 0.0,
+     "corpus_tokens": 200.0,
+     "mean_tokens": 12.0,
+     "success": 1.0,
+     "utility": 0.94
+    },
+    "n": 90
+   },
+   "E4": {
+    "metrics": {
+     "abstain_rate": 1.0
+    },
+    "n": 5
+   }
+  }
+ },
+ "v2/tiny/seed-2/lenient": {
+  "backbone": {
+   "family": "stub-lenient",
+   "name": "stub-lenient"
+  },
+  "cost": {
+   "backbone_calls": 132,
+   "forget_calls": 4,
+   "retrieve_calls": 100,
+   "retrieve_seconds": 0,
+   "supersede_calls": 0,
+   "tokens_returned": 15198,
+   "write_calls": 80,
+   "write_dollars": 0.0,
+   "write_llm_calls": 0,
+   "write_seconds": 0
+  },
+  "embedder_is_lexical_stub": true,
+  "embedding_model": "hashing-512-v1",
+  "fixture": {
+   "id": "synthetic-v2-seed2-tiny",
+   "seed": 2,
+   "sha256": "292e9470ef9f4eba8fbf037e111b4cd336f6c3dbfbc72e8110e8292c0820dc6a",
+   "size": "tiny",
+   "version": 2
+  },
+  "gate": true,
+  "not_run": [
+   "A4",
+   "A5",
+   "A6",
+   "A8",
+   "A9",
+   "B",
+   "C",
+   "D",
+   "E1",
+   "E2",
+   "E5",
+   "A2",
+   "A7",
+   "E4"
+  ],
+  "reader_knows_lexicon": true,
+  "samples": {
+   "A-retrieve.recall": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "A1.accuracy": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "E3.utility": [
+    0.25372,
+    0.254464,
+    0.25744,
+    0.24814,
+    0.249628,
+    0.249628,
+    0.0,
+    0.0,
+    0.25558,
+    0.0,
+    0.0,
+    0.25558,
+    0.25372,
+    0.25,
+    0.25372,
+    0.571429
+   ]
+  },
+  "schema": "pmb1-run/1",
+  "substrate": {
+   "embedding_model": "hashing-512-v1",
+   "name": "verbatim-rag",
+   "role": "baseline-rag",
+   "version": "v1"
+  },
+  "tracks": {
+   "A-retrieve": {
+    "metrics": {
+     "mean_returned": 4.9375,
+     "precision": 0.153125,
+     "recall": 0.75,
+     "recall_canonical": 1.0,
+     "recall_first": 0.833333,
+     "recall_middle": 0.75,
+     "recall_paraphrase": 0.636364,
+     "recall_recent": 0.666667
+    },
+    "n": 16
+   },
+   "A1": {
+    "metrics": {
+     "accuracy": 0.75,
+     "accuracy_canonical": 1.0,
+     "accuracy_paraphrase": 0.636364
+    },
+    "n": 16
+   },
+   "A3": {
+    "metrics": {
+     "forgotten_leak_rate": 0.0,
+     "n_forgotten": 4.0,
+     "n_retained": 16.0,
+     "retained_recall": 1.0
+    },
+    "n": 20
+   },
+   "E3": {
+    "metrics": {
+     "budget_violation_rate": 0.0,
+     "corpus_tokens": 896.0,
+     "mean_tokens": 84.916667,
+     "success": 0.270833,
+     "utility": 0.209566
+    },
+    "n": 48
+   }
+  }
+ },
+ "v2/tiny/seed-2/strict": {
+  "backbone": {
+   "family": "stub-strict",
+   "name": "stub"
+  },
+  "cost": {
+   "backbone_calls": 132,
+   "forget_calls": 4,
+   "retrieve_calls": 100,
+   "retrieve_seconds": 0,
+   "supersede_calls": 0,
+   "tokens_returned": 15198,
+   "write_calls": 80,
+   "write_dollars": 0.0,
+   "write_llm_calls": 0,
+   "write_seconds": 0
+  },
+  "embedder_is_lexical_stub": true,
+  "embedding_model": "hashing-512-v1",
+  "fixture": {
+   "id": "synthetic-v2-seed2-tiny",
+   "seed": 2,
+   "sha256": "292e9470ef9f4eba8fbf037e111b4cd336f6c3dbfbc72e8110e8292c0820dc6a",
+   "size": "tiny",
+   "version": 2
+  },
+  "gate": true,
+  "not_run": [
+   "A4",
+   "A5",
+   "A6",
+   "A8",
+   "A9",
+   "B",
+   "C",
+   "D",
+   "E1",
+   "E2",
+   "E5",
+   "A2",
+   "A7",
+   "E4"
+  ],
+  "reader_knows_lexicon": true,
+  "samples": {
+   "A-retrieve.recall": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "A1.accuracy": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "E3.utility": [
+    0.25372,
+    0.254464,
+    0.25744,
+    0.24814,
+    0.249628,
+    0.249628,
+    0.0,
+    0.0,
+    0.25558,
+    0.0,
+    0.0,
+    0.25558,
+    0.25372,
+    0.25,
+    0.25372,
+    0.571429
+   ]
+  },
+  "schema": "pmb1-run/1",
+  "substrate": {
+   "embedding_model": "hashing-512-v1",
+   "name": "verbatim-rag",
+   "role": "baseline-rag",
+   "version": "v1"
+  },
+  "tracks": {
+   "A-retrieve": {
+    "metrics": {
+     "mean_returned": 4.9375,
+     "precision": 0.153125,
+     "recall": 0.75,
+     "recall_canonical": 1.0,
+     "recall_first": 0.833333,
+     "recall_middle": 0.75,
+     "recall_paraphrase": 0.636364,
+     "recall_recent": 0.666667
+    },
+    "n": 16
+   },
+   "A1": {
+    "metrics": {
+     "accuracy": 0.75,
+     "accuracy_canonical": 1.0,
+     "accuracy_paraphrase": 0.636364
+    },
+    "n": 16
+   },
+   "A3": {
+    "metrics": {
+     "forgotten_leak_rate": 0.0,
+     "n_forgotten": 4.0,
+     "n_retained": 16.0,
+     "retained_recall": 1.0
+    },
+    "n": 20
+   },
+   "E3": {
+    "metrics": {
+     "budget_violation_rate": 0.0,
+     "corpus_tokens": 896.0,
+     "mean_tokens": 84.916667,
+     "success": 0.270833,
+     "utility": 0.209566
+    },
+    "n": 48
+   }
+  }
+ },
+ "v3/small/seed-10/lenient": {
+  "backbone": {
+   "family": "stub-lenient",
+   "name": "stub-lenient"
+  },
+  "cost": {
+   "backbone_calls": 346,
+   "forget_calls": 10,
+   "retrieve_calls": 288,
+   "retrieve_seconds": 0,
+   "supersede_calls": 8,
+   "tokens_returned": 41362,
+   "write_calls": 312,
+   "write_dollars": 0.0,
+   "write_llm_calls": 0,
+   "write_seconds": 0
+  },
+  "embedder_is_lexical_stub": true,
+  "embedding_model": "hashing-512-v1",
+  "fixture": {
+   "id": "synthetic-v3-seed10-small",
+   "seed": 10,
+   "sha256": "9127afbdb683b33d31da9007f4f1742c296441ccd4cbfaa1f66face5dc60b0bd",
+   "size": "small",
+   "version": 3
+  },
+  "gate": true,
+  "not_run": [
+   "A4",
+   "A5",
+   "A6",
+   "A8",
+   "A9",
+   "B",
+   "C",
+   "D",
+   "E1",
+   "E2",
+   "E5",
+   "A7",
+   "E4"
+  ],
+  "reader_knows_lexicon": true,
+  "samples": {
+   "A-retrieve.recall": [
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0
+   ],
+   "A1.accuracy": [
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0
+   ],
+   "A2.new_value": [
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "A2.stale_evidence": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "E3.utility": [
+    0.0,
+    0.631355,
+    0.0,
+    0.631659,
+    0.303196,
+    0.30411,
+    0.0,
+    0.303501,
+    0.304718,
+    0.30137,
+    0.630594,
+    0.301826,
+    0.304414,
+    0.301522,
+    0.303349,
+    0.304871,
+    0.304718,
+    0.301522,
+    0.304262,
+    0.635769,
+    0.303653,
+    0.0,
+    0.30411,
+    0.302283,
+    0.301979,
+    0.301979,
+    0.303196,
+    0.301826,
+    0.30274,
+    0.303044,
+    0.0,
+    0.630137,
+    0.302435,
+    0.630898,
+    0.303957,
+    0.302131,
+    0.304566,
+    0.0,
+    0.308067,
+    0.303805
+   ],
+   "GOV.leak": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ]
+  },
+  "schema": "pmb1-run/1",
+  "substrate": {
+   "embedding_model": "hashing-512-v1",
+   "name": "verbatim-rag",
+   "role": "baseline-rag",
+   "version": "v1"
+  },
+  "tracks": {
+   "A-retrieve": {
+    "metrics": {
+     "mean_returned": 4.8,
+     "precision": 0.1775,
+     "recall": 0.85,
+     "recall_canonical": 0.947368,
+     "recall_first": 0.769231,
+     "recall_middle": 0.923077,
+     "recall_paraphrase": 0.761905,
+     "recall_recent": 0.857143
+    },
+    "n": 40
+   },
+   "A1": {
+    "metrics": {
+     "accuracy": 0.85,
+     "accuracy_canonical": 0.947368,
+     "accuracy_paraphrase": 0.761905
+    },
+    "n": 40
+   },
+   "A2": {
+    "metrics": {
+     "new_value_accuracy": 0.75,
+     "stale_evidence_rate": 0.0
+    },
+    "n": 8
+   },
+   "A3": {
+    "metrics": {
+     "forgotten_leak_rate": 0.0,
+     "n_forgotten": 10.0,
+     "n_retained": 40.0,
+     "retained_recall": 0.925
+    },
+    "n": 50
+   },
+   "E3": {
+    "metrics": {
+     "budget_violation_rate": 0.0,
+     "corpus_tokens": 2190.0,
+     "mean_tokens": 77.158333,
+     "success": 0.333333,
+     "utility": 0.307089
+    },
+    "n": 120
+   },
+   "GOV": {
+    "metrics": {
+     "governance_leak_rate": 0.9,
+     "leak_rate_ceiling": 1.0,
+     "leak_rate_comention": 0.5,
+     "leak_rate_purpose": 1.0,
+     "n_ceiling": 12.0,
+     "n_comention": 6.0,
+     "n_purpose": 12.0
+    },
+    "n": 30
+   }
+  }
+ },
+ "v3/small/seed-10/strict": {
+  "backbone": {
+   "family": "stub-strict",
+   "name": "stub"
+  },
+  "cost": {
+   "backbone_calls": 346,
+   "forget_calls": 10,
+   "retrieve_calls": 288,
+   "retrieve_seconds": 0,
+   "supersede_calls": 8,
+   "tokens_returned": 41362,
+   "write_calls": 312,
+   "write_dollars": 0.0,
+   "write_llm_calls": 0,
+   "write_seconds": 0
+  },
+  "embedder_is_lexical_stub": true,
+  "embedding_model": "hashing-512-v1",
+  "fixture": {
+   "id": "synthetic-v3-seed10-small",
+   "seed": 10,
+   "sha256": "9127afbdb683b33d31da9007f4f1742c296441ccd4cbfaa1f66face5dc60b0bd",
+   "size": "small",
+   "version": 3
+  },
+  "gate": true,
+  "not_run": [
+   "A4",
+   "A5",
+   "A6",
+   "A8",
+   "A9",
+   "B",
+   "C",
+   "D",
+   "E1",
+   "E2",
+   "E5",
+   "A7",
+   "E4"
+  ],
+  "reader_knows_lexicon": true,
+  "samples": {
+   "A-retrieve.recall": [
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0
+   ],
+   "A1.accuracy": [
+    0.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0
+   ],
+   "A2.new_value": [
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0
+   ],
+   "A2.stale_evidence": [
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0,
+    0.0
+   ],
+   "E3.utility": [
+    0.0,
+    0.631355,
+    0.0,
+    0.631659,
+    0.303196,
+    0.30411,
+    0.0,
+    0.303501,
+    0.304718,
+    0.30137,
+    0.630594,
+    0.301826,
+    0.304414,
+    0.301522,
+    0.303349,
+    0.304871,
+    0.304718,
+    0.301522,
+    0.304262,
+    0.635769,
+    0.303653,
+    0.0,
+    0.30411,
+    0.302283,
+    0.301979,
+    0.301979,
+    0.303196,
+    0.301826,
+    0.30274,
+    0.303044,
+    0.0,
+    0.630137,
+    0.302435,
+    0.630898,
+    0.303957,
+    0.302131,
+    0.304566,
+    0.0,
+    0.308067,
+    0.303805
+   ],
+   "GOV.leak": [
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    0.0,
+    1.0,
+    1.0,
+    0.0,
+    0.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0,
+    1.0
+   ]
+  },
+  "schema": "pmb1-run/1",
+  "substrate": {
+   "embedding_model": "hashing-512-v1",
+   "name": "verbatim-rag",
+   "role": "baseline-rag",
+   "version": "v1"
+  },
+  "tracks": {
+   "A-retrieve": {
+    "metrics": {
+     "mean_returned": 4.8,
+     "precision": 0.1775,
+     "recall": 0.85,
+     "recall_canonical": 0.947368,
+     "recall_first": 0.769231,
+     "recall_middle": 0.923077,
+     "recall_paraphrase": 0.761905,
+     "recall_recent": 0.857143
+    },
+    "n": 40
+   },
+   "A1": {
+    "metrics": {
+     "accuracy": 0.85,
+     "accuracy_canonical": 0.947368,
+     "accuracy_paraphrase": 0.761905
+    },
+    "n": 40
+   },
+   "A2": {
+    "metrics": {
+     "new_value_accuracy": 0.75,
+     "stale_evidence_rate": 0.0
+    },
+    "n": 8
+   },
+   "A3": {
+    "metrics": {
+     "forgotten_leak_rate": 0.0,
+     "n_forgotten": 10.0,
+     "n_retained": 40.0,
+     "retained_recall": 0.925
+    },
+    "n": 50
+   },
+   "E3": {
+    "metrics": {
+     "budget_violation_rate": 0.0,
+     "corpus_tokens": 2190.0,
+     "mean_tokens": 77.158333,
+     "success": 0.333333,
+     "utility": 0.307089
+    },
+    "n": 120
+   },
+   "GOV": {
+    "metrics": {
+     "governance_leak_rate": 0.9,
+     "leak_rate_ceiling": 1.0,
+     "leak_rate_comention": 0.5,
+     "leak_rate_purpose": 1.0,
+     "n_ceiling": 12.0,
+     "n_comention": 6.0,
+     "n_purpose": 12.0
+    },
+    "n": 30
+   }
+  }
+ }
+}

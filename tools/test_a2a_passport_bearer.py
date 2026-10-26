@@ -27,7 +27,7 @@ if _HAVE:
         verify_bearer_jwt,
     )
 
-DID = "did:web:snowis.me"
+DID = "did:web:your-domain.example"
 AUD = "did:web:us.example"
 KID = f"{DID}#k1"
 
@@ -181,6 +181,21 @@ class TestLiveBearerAdapter(unittest.TestCase):
     def test_verify_rejects_did_mismatch(self):
         a = LiveBearerAdapter(_token(self.key), self.doc, audience=AUD)
         self.assertFalse(a.verify("did:web:evil.com", self.entry))
+
+    def test_without_doc_needs_run_doc_and_plain_verify_refuses(self):
+        a = LiveBearerAdapter(_token(self.key), audience=AUD)
+        self.assertTrue(a.needs_did_doc)
+        self.assertFalse(a.verify(DID, self.entry))
+
+    def test_with_doc_does_not_need_run_doc(self):
+        a = LiveBearerAdapter(_token(self.key), self.doc, audience=AUD)
+        self.assertFalse(a.needs_did_doc)
+
+    def test_verify_with_doc_happy_and_did_mismatch(self):
+        a = LiveBearerAdapter(_token(self.key), audience=AUD)
+        self.assertTrue(a.verify_with_doc(DID, self.entry, self.doc))
+        b = LiveBearerAdapter(_token(self.key, jti="j2"), audience=AUD)
+        self.assertFalse(b.verify_with_doc("did:web:evil.com", self.entry, self.doc))
 
     def test_composes_into_handshake_admit(self):
         from tools.a2a.passport_handshake import (

@@ -1,0 +1,16 @@
+[Unit]
+Description=Pantheon fleet health exporter, every minute (T-4884 B2)
+Documentation=file:///home/%u/pantheon-config/notes/2026-10-12-t4884-codex-recovery-seat-design.md
+
+# NOT auto-installed by this build. Template only; enable after root has
+# provisioned /run/pantheon-health (tmpfiles, B7/B11). The exporter's own
+# heartbeat file (_exporter.json) going stale is itself a watcher signal.
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=pantheon-health-export.service
+
+[Install]
+WantedBy=timers.target

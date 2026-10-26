@@ -1,6 +1,6 @@
 # Ratifiable-ADR shape — the altitude rule + the clutter rule
 
-Two operator-ratified rules govern what an ADR looks like when it is handed to him for ratification. They are the same steer class, so they live together here rather than scattered across `adr/README.md` §Format. This SOP is the discovery surface; `adr/README.md` §Format remains the authoritative statement of each rule and the echo-prismatic `adr/TEMPLATE.md` carries the inline reminders for project ADRs.
+Two operator-ratified rules govern what an ADR looks like when it is handed to him for ratification. They are the same steer class, so they live together here rather than scattered across `architecture/adr/README.md` §Format. This SOP is the discovery surface; `architecture/adr/README.md` §Format remains the authoritative statement of each rule and the echo-prismatic `adr/TEMPLATE.md` carries the inline reminders for project ADRs.
 
 ## When to use this
 
@@ -46,13 +46,13 @@ Worked examples: `notes/2026-09-06-org088-review-history.md` (ORG-041 REBOUND lo
 
 ## Boundary
 
-This SOP governs ADR shape only. It does not change what gets ratified (that authority is the operator's), and it does not touch the ORG-089 requirement that the viability fields exist. Grooming enforcement of empty or boilerplate Appetite / Riskiest-assumption fields is ORG-089 §Surface 4a, not this SOP. Project ADR directories inherit these rules via the echo-prismatic `TEMPLATE.md` reminders; the authoritative wording is `adr/README.md` §Format.
+This SOP governs ADR shape only. It does not change what gets ratified (that authority is the operator's), and it does not touch the ORG-089 requirement that the viability fields exist. Grooming enforcement of empty or boilerplate Appetite / Riskiest-assumption fields is ORG-089 §Surface 4a, not this SOP. Project ADR directories inherit these rules via the echo-prismatic `TEMPLATE.md` reminders; the authoritative wording is `architecture/adr/README.md` §Format.
 
 Adopted at methodology tier, below the goal-level bar per amended D3 (the two underlying rules are already operator-ratified; this SOP only consolidates and makes them discoverable). Precedent for agent-adopted methodology SOPs: `refreshing-an-org-039-release-mirror.md`.
 
 ## Cross-references
 
-- `adr/README.md` §Format — authoritative statement of the altitude rule, the clutter rule, and the ORG-089 required fields.
+- `architecture/adr/README.md` §Format — authoritative statement of the altitude rule, the clutter rule, and the ORG-089 required fields.
 - `architecture/adr/ORG-089-*.md` — the deference heuristic; the worked example that dogfoods the viability fields and the altitude rule (rev-3 shape-strip).
 - `architecture/adr/ORG-072-passport-lifecycle-health-recovery.md` + `notes/2026-09-06-org072-normative-additions-relocated.md` — the relocate mechanism.
 - `notes/2026-09-06-org088-review-history.md` — the clutter-strip mechanism.

@@ -103,12 +103,12 @@ class SendStickerHappy(unittest.TestCase):
             captured["argv"] = argv
             return subprocess.CompletedProcess(argv, 0, stdout=json.dumps({"ok": True, "result": {"message_id": 42}}), stderr="")
         with mock.patch.object(ss.subprocess, "run", side_effect=fake_run):
-            resp = ss.send_sticker("orchestrator", "approved", "456474197",
+            resp = ss.send_sticker("orchestrator", "approved", "424242424",
                                     token_file=self.token, manifest_path=self.manifest)
         self.assertTrue(resp.get("ok"))
         self.assertEqual(resp["result"]["message_id"], 42)
         self.assertIn("FID_APPROVED", " ".join(captured["argv"]))
-        self.assertIn("456474197", " ".join(captured["argv"]))
+        self.assertIn("424242424", " ".join(captured["argv"]))
         self.assertIn("sendSticker", " ".join(captured["argv"]))
         # Token lives only in the URL, not as a separate argv token.
         self.assertNotIn("SECRET_TOKEN", [a for a in captured["argv"] if a == "SECRET_TOKEN"])
@@ -121,6 +121,16 @@ class SendStickerHappy(unittest.TestCase):
                                     token_file=self.token, manifest_path=self.manifest)
         self.assertFalse(resp.get("ok"))
         self.assertIn("chat not found", resp.get("description", ""))
+
+    def test_transport_timeout_raises_token_free_error(self):
+        # T-1024 review: str(TimeoutExpired) embeds the argv, whose URL carries the token.
+        def fake_run(argv, **kw):
+            raise subprocess.TimeoutExpired(argv, 30)
+        with mock.patch.object(ss.subprocess, "run", side_effect=fake_run):
+            with self.assertRaises(RuntimeError) as cm:
+                ss.send_sticker("orchestrator", "approved", "1", token_file=self.token, manifest_path=self.manifest)
+        self.assertNotIn("SECRET_TOKEN", str(cm.exception))
+        self.assertIn("TimeoutExpired", str(cm.exception))
 
     def test_non_json_response_wrapped_not_raises(self):
         def fake_run(argv, **kwargs):

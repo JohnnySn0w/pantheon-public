@@ -1,0 +1,50 @@
+
+  Standing: at the 2-active cap (T-2675 umbrella + T-3497, slice-1 implementer running). Next: implementer returns → my review → merge-req (stopping the per-PR rerun cost). Then T-3497 slice 2 — the main
+  deliverable: the cargo-llvm-cov + --timings coverage/timing prune-list, producing candidates to the ticket for the operator/HO review. Queue behind: T-3538 (ADR-247 correction — now I know to include the
+  Vault-conformance line), T-3027 (installer ADR); T-3483 Sub-C pairing held pending the operator's verdict; two operator-ratifies (T-2728, T-1812/ADR-246) batched. Everything synced; nothing stranded.
+
+✻ Crunched for 3m 10s
+
+● Agent "Widen health::tests flaky timeouts" finished · 3h 20m 3s
+
+● The flake-widen completed and does exactly what I diagnosed. But the report surfaces something my review must weigh: single_miss_does_not_trigger_wedge now takes ~5s per run (its task never self-terminates
+  on a single miss, so it always hits the outer timeout — 250ms→5s makes it 20x slower). That's mildly counterproductive for T-3497's test-time-reduction goal. Let me verify the diff, then weigh it.
+
+  Ran 1 shell command
+
+● The diff is exactly as diagnosed — only the 2 outer timeouts + comments, inner PingConfig and all assertions untouched, merge-clean, byte-seq clean. Review = APPROVE (correct, assertions preserved, flake
+  eliminated).
+
+  My decision on the single_miss-now-5s concern: ship the widen now, flag the 5s as a slice-2 optimization candidate. Reasoning: the widen is low-risk and eliminates the ~14min-rerun-per-PR bleed now (a
+  massively net-positive trade — +4.75s on one test vs 14min reruns avoided); consecutive_misses isn't slowed (its task self-terminates in ~100ms, 5s is just a ceiling); and single_miss's new 5s is exactly the
+  "slow test worth optimizing" that T-3497 slice-2's --timings pass exists to surface — fixable there via poll-until-watchdog-fires (fast common case + safe under load), a moderate test restructure better
+  done deliberately than bolted onto the bleed-stopper. Shipping a safe fix now + optimizing with real timings data is the lower-risk sequence.
+
+  Let me record and route the merge-req.
+
+  Made 1 scratchpad edit +20, ran 2 shell commands
+
+● Merge-req sent, synced. T-3497 slice 1 handed off.
+
+  Turn summary
+
+  T-3497 slice 1 (the health-flake bleed-stopper) reviewed and merge-req'd. The implementer applied exactly my diagnosed fix — widen the two outer tokio::time::timeout harness bounds (200ms/250ms → 5s), inner
+  PingConfig timings and all assertions byte-identical. Verified against the diff, merge-clean, byte-seq clean; the implementer ran the health tests 4× green. This eliminates the ~14-min-rerun-per-PR flake
+  that hit T-3500 (3 reruns) and PR#293/294/295.
+
+  My review caught (and I handled honestly) the one trade-off: single_miss_does_not_trigger_wedge now always takes ~5s (its task never self-terminates, so it always hits the outer timeout). I judged the trade
+  massively net-positive (+4.75s on one test vs 14-min reruns eliminated), shipped the low-risk widen now, and flagged the 5s as a slice-2 optimization candidate — it's precisely the "slow test worth
+  optimizing" that T-3497's --timings pass targets, fixable via poll-until-watchdog-fires (fast common case + safe under load), a deliberate restructure better done with real timings data than bolted onto the
+  bleed-stopper. I gave orchestrator the full reasoning rather than quietly shipping a self-inflicted slow test.
+
+  Standing: at the 2-active cap (T-2675 umbrella + T-3497, slice-1 awaiting merge). Next: orchestrator's merge → then T-3497 slice 2 (the main deliverable: cargo-llvm-cov + --timings coverage/timing prune-list →
+  candidates to the ticket for the operator/HO review, including the single_miss poll-restructure). Queue: T-3538 (ADR-247 correction), T-3027 (installer ADR); T-3483 Sub-C pairing held pending the operator; two
+  operator-ratifies (T-2728, T-1812/ADR-246) batched. Everything synced; nothing stranded. Next trigger: orchestrator's T-3497 slice-1 merge.
+
+✻ Crunched for 3h 25m 16s
+
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯
+─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ? for shortcuts · ← for agents
+  ⧉  t2738-preview · ctrl+] to open

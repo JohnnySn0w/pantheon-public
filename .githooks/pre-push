@@ -6,11 +6,14 @@
 # Behavior:
 #   - Fetch remote; warn + allow if fetch fails (fail-open — don't block on
 #     transient network errors).
-#   - On detached HEAD: skip check and allow push.
+#   - On detached HEAD: skip the freshness check (and the contract gate and
+#     warnings) and allow push. The seat CODE-path guard below still runs.
 #   - If local is behind remote tip: rebase onto tip via
-#     `git pull --rebase --autostash`.
+#     `git rebase --autostash <remote>/<branch>` (FETCH_HEAD-free, T-5575).
 #   - If rebase succeeds: allow push (exit 0).
 #   - If rebase fails (conflict): block push (exit 1) with resolve hint.
+#   - An agent/* branch whose remote tip has DIVERGED (stale same-named
+#     attempt): block (exit 1) instead of rebasing onto it (T-5160).
 #
 # Activation:
 #   git config core.hooksPath .githooks
@@ -20,26 +23,185 @@ set -euo pipefail
 REMOTE="$1"
 URL="$2"
 
-# Detect current branch first. On detached HEAD, symbolic-ref returns empty.
-# Check before fetch so detached-HEAD pushes are never delayed by a network call.
-CURRENT_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo "")"
-if [[ -z "${CURRENT_BRANCH}" ]]; then
-    # Detached HEAD — skip freshness check.
-    exit 0
-fi
-
 # stdin carries the ref updates git is about to push, one line each:
 #   <local ref> <local oid> <remote ref> <remote oid>
 # TWO blocks below consume them — the T-1961 freshness gate here and the T-1937
-# seat CODE-path guard later. stdin is a stream, readable ONCE: read it a single
-# time into ${_REF_LINES} and share it. Reading twice leaves the second reader
-# empty (the consolidation this prevents). Defensive read (T-1937 lesson):
-# tty-skip a hand-run hook, timeout-cap, empty-tolerant — a hook that blocks on
-# absent stdin bricks every push.
+# seat CODE-path guard (_seat_code_guard(), defined next). stdin is a stream,
+# readable ONCE: read it a single time into ${_REF_LINES} and share it. Reading
+# twice leaves the second reader empty (the consolidation this prevents).
+# Defensive read (T-1937 lesson): tty-skip a hand-run hook, timeout-cap,
+# empty-tolerant — a hook that blocks on absent stdin bricks every push.
+# T-4226: read BEFORE the detached-HEAD check below, because the seat guard must
+# still run on a detached HEAD and needs the ref lines to do so.
 _REF_LINES=""
 if [[ ! -t 0 ]]; then
     _REF_LINES="$(timeout 5 cat 2>/dev/null || true)"
 fi
+
+# --- seat CODE-path-to-main guard (T-1937, extended T-4226) ------------------
+# Seats hold a deploy key that BYPASSES main's branch-protection ruleset, but a
+# deploy key is git-transport only and cannot reach the GitHub API — so a seat
+# can push code to main while being structurally unable to open the PR that
+# should carry it. The sanctioned path is unavailable and the unsanctioned one
+# succeeds silently. This makes PR-only-for-code structural for seats, with
+# zero new credentials.
+#
+# WHO IS A SEAT (T-4226): every unix user EXCEPT `claude`, HO's account. The
+# test was originally the two-name allowlist suborch1|suborch2, so Recovery
+# (claude-fallback, T-4205, turned main red) and Codex (T-4219) pushed code
+# straight to main. Inverted, an account nobody has created yet is fail-closed
+# by construction, and HO alone is the explicit allow: HO merges through the
+# GitHub API, so its own git pushes to main are ticket/ledger/stamp only.
+#
+# The bypass itself is deliberately NOT blocked: it is load-bearing for the
+# fleet's parallel ticket/ledger writers (accept-and-monitor per the T-1922
+# ruling). So this discriminates CODE paths from ticket/ledger paths rather
+# than blocking main pushes wholesale.
+#
+# WHERE IT RUNS (T-4226): early — after the single stdin read and after the T-1961
+# freshness CLASSIFICATION (below), but before the detached-HEAD exit and before the
+# freshness fetch/rebase. It keys on the REMOTE ref (refs/heads/main), never on the
+# local branch, and works from the stdin shas and the object store (it fetches
+# itself, with a 30s cap, only if the remote tip is not local). It used to sit
+# behind both: the detached-HEAD early exit let a seat push code with
+# `git checkout --detach; git push origin HEAD:main`, and on a named branch a failed
+# fetch exited 0 before it ever ran.
+# WHAT CHANGED for everything else: the T-1961 classification now runs before the
+# guard instead of inside the freshness step (same code, same result — the guard's
+# fetch would otherwise have made the remote tip local first and flipped every
+# behind seat to "deliberate rewrite", see ORDER MATTERS below). The freshness
+# fetch + rebase, the contract gate and the warnings are unchanged, and still
+# skipped on detached HEAD.
+#
+# Fail posture mirrors the T-1084 gate below: fail-OPEN on any anomaly (a broken
+# guard must NEVER brick the fleet's ability to push) — including an
+# unresolvable user name — fail-CLOSED only on a clean CODE-path determination.
+_seat_code_guard() {
+    local SEAT_USER IS_SEAT
+    SEAT_USER="$(id -un 2>/dev/null || echo "")"
+    case "${SEAT_USER}" in
+        claude|"") IS_SEAT=0 ;;   # HO; or unresolvable identity -> fail open
+        *)         IS_SEAT=1 ;;
+    esac
+    [[ "${IS_SEAT}" -eq 1 ]] || return 0
+
+    # Ref updates come from the shared ${_REF_LINES} read at the top of the hook
+    # (T-1961 consolidated the two stdin reads into one — stdin is drain-once, so
+    # this guard must NOT re-read it or it would see empty and silently no-op).
+    # Same "<local_ref> <local_sha> <remote_ref> <remote_sha>" per line; empty
+    # ${_REF_LINES} → the guard no-ops (fail-open, as before).
+    [[ -n "${_REF_LINES}" ]] || return 0
+
+    local CODE_RE KNOWN_RE CODE_EXEMPT_RE
+    CODE_RE='^(tools/|\.github/|\.githooks/|harness/)'
+    KNOWN_RE='^(tools/|\.github/|\.githooks/|harness/|tickets/|ledger/)'
+    # ONE exact-path exemption from CODE_RE: the tools spine README.
+    #   WHY: tools/spine_index_groom.py's tools_handler rewrites the generated
+    #   AUTOGEN sentinel region of tools/README.md and pushes it to main from a
+    #   detached worktree. It runs as Recovery's pantheon-spine-index-groom.timer
+    #   (claude-fallback, daily 12:30Z). With the seat guard running on detached
+    #   HEAD and Recovery a seat, that daily push would be blocked; it is a doc
+    #   region, not executable code, and it is not a PR-shaped change.
+    #   RETIRES WHEN: the groom stops writing tools/README.md (its tools_handler
+    #   moves to a non-code index location), or the groom runs on HO's seat
+    #   instead of Recovery's. Delete this exemption then. Keep it an EXACT path —
+    #   never widen it to a prefix or to other READMEs.
+    CODE_EXEMPT_RE='^tools/README\.md$'
+
+    local _L_REF L_SHA R_REF R_SHA p n
+    local -a code_hits unknown
+    while read -r _L_REF L_SHA R_REF R_SHA; do
+        [[ "${R_REF}" == "refs/heads/main" ]] || continue
+        # All-zero local sha = ref deletion; all-zero remote sha = brand-new
+        # main. Neither is a code push we can range-diff — fail open.
+        [[ "${L_SHA}" =~ ^0+$ ]] && continue
+        [[ "${R_SHA}" =~ ^0+$ ]] && continue
+
+        # Three-dot: diff from merge-base(R, L) to L — only what THIS push
+        # adds. The two-dot R..L tree diff also lists paths another writer
+        # landed on origin after our base, so a seat's ticket-only push that
+        # raced a code merge was blocked for someone else's code (T-4104).
+        # --no-renames: a code file renamed out of tools/ still names it.
+        # Scope: this names code the seat INTRODUCES. A seat FORCE-push that
+        # drops a foreign code commit from main is not caught (the old tree
+        # diff did catch it); that is history destruction, not unreviewed
+        # code landing, and is out of this guard's scope.
+        #
+        # The remote tip may not be in the local object store yet: git hands the hook
+        # the REMOTE's real tip, and a clone that is behind (the parallel-writer
+        # case) has not fetched it. The freshness step below fetches — but it runs
+        # AFTER this guard now, so fetch here, only when needed, best-effort. If the
+        # tip is still missing (fetch failed) the diff is unreadable -> fail open.
+        # `timeout 30`: a wedged remote must not hang every seat push behind a guard
+        # that is meant to be cheap; a timeout is just another failed fetch (rc 124,
+        # swallowed) -> unreadable range -> fail open.
+        if ! git cat-file -e "${R_SHA}^{commit}" 2>/dev/null; then
+            timeout 30 git fetch --quiet "${REMOTE}" 2>/dev/null || true
+        fi
+
+        # HOW NAMES ARE MATCHED (T-4226): `-z` output read back with
+        # `read -r -d ''` and matched with bash's own `=~` on each WHOLE name.
+        # Two earlier shapes under-matched, both reproduced:
+        #   - the default output C-quotes a path holding a non-ASCII byte, a
+        #     double quote or a backslash ("tools/caf\303\251.py"); the quoted
+        #     form starts with `"`, not `tools/`, so a seat could name a file to
+        #     walk past the guard;
+        #   - `-z | tr '\0' '\n' | grep` fixed that but split a name containing a
+        #     newline into two lines (`tools/README.md<LF>x` -> the exempt path
+        #     plus `x`, so the exemption leaked) and let GNU grep call a name
+        #     holding an invalid-UTF-8 byte a "binary file" under a UTF-8 locale
+        #     (no line printed -> no hit -> rc=0).
+        # Guarantee: every path git reports is classified as ONE string, whatever
+        # bytes it holds; nothing is split, quoted or run through grep's
+        # text-file heuristics. The exemption applies only when the ENTIRE name is
+        # exactly the exempt path (bash `$` anchors the end of the string).
+        code_hits=()
+        unknown=()
+        n=0
+        while IFS= read -r -d '' p; do
+            n=$((n + 1))
+            if [[ "${p}" =~ ${CODE_RE} && ! "${p}" =~ ${CODE_EXEMPT_RE} ]]; then
+                code_hits+=("${p}")
+            fi
+            if [[ ! "${p}" =~ ${KNOWN_RE} ]]; then
+                unknown+=("${p}")
+            fi
+        done < <(git diff -z --name-only --no-renames "${R_SHA}...${L_SHA}" 2>/dev/null)
+        [[ "${n}" -gt 0 ]] || continue   # unreadable range / empty diff -> fail open
+
+        if [[ "${#code_hits[@]}" -gt 0 ]]; then
+            echo "pre-push: BLOCKED — CODE-path push to main from a seat clone (${SEAT_USER})." >&2
+            echo "pre-push: offending path(s):" >&2
+            printf 'pre-push:   %s\n' "${code_hits[@]}" >&2
+            echo "pre-push:" >&2
+            echo "pre-push: Seats push code on a branch; the HO opens the PR and merges." >&2
+            echo "pre-push:   git push origin agent/T-NNNN   # then mailbox orchestrator for PR+merge" >&2
+            echo "pre-push:" >&2
+            echo "pre-push: If your LOCAL main already carries this code commit, move it off main or" >&2
+            echo "pre-push: your ticket/ledger pushes from this clone stay blocked too. Commit or stash" >&2
+            echo "pre-push: first (the reset discards uncommitted work), and check what main holds" >&2
+            echo "pre-push: (git log origin/main..main): EVERY unpushed commit on main, ticket commits" >&2
+            echo "pre-push: included, moves to the branch. Then:" >&2
+            echo "pre-push:   git fetch origin && git branch agent/T-NNNN && git reset --hard origin/main   # then push the branch" >&2
+            echo "pre-push:" >&2
+            echo "pre-push: ticket/ledger pushes to main are UNAFFECTED and remain the convention." >&2
+            echo "pre-push: (Emergency bypass: git push --no-verify — say so in your report.)" >&2
+            exit 1
+        fi
+
+        # Paths in neither set: surface loudly, do not block. A new
+        # top-level directory must not silently inherit either posture.
+        if [[ "${#unknown[@]}" -gt 0 ]]; then
+            echo "pre-push: NOTE — path(s) classified as neither code nor ticket/ledger; allowing:" >&2
+            printf 'pre-push:   %s\n' "${unknown[@]}" >&2
+        fi
+    done <<< "${_REF_LINES}"
+}
+# --- end seat guard definition -----------------------------------------------
+
+# Detect current branch first. On detached HEAD, symbolic-ref returns empty.
+# Check before fetch so detached-HEAD pushes are never delayed by a network call.
+CURRENT_BRANCH="$(git symbolic-ref --short HEAD 2>/dev/null || echo "")"
 
 # T-1961: consult the ref updates to decide whether the
 # freshness auto-rebase applies. Two cases must NOT trigger it:
@@ -56,40 +218,106 @@ fi
 # remote oid IS an ancestor of the local oid → freshness runs unchanged. A
 # rewrite OVERWRITES it → remote oid is not an ancestor → warn and skip.
 #
+# ORDER MATTERS (T-4226 review B1): this classification asks "is the remote tip
+# ALREADY local?" (`git cat-file -e` below), so it must run BEFORE the seat guard,
+# whose own fetch (only when the tip is not local) makes the tip local. Run after
+# that fetch, every behind seat looked like a deliberate rewrite and was never
+# auto-rebased (nor on retry: the tip stayed local). It is computed here from the
+# stdin shas and consumed by the freshness step further down.
+#
 # Stdin is read DEFENSIVELY (T-1937 lesson): tty-skip (hand-run hook), timeout-
 # cap, empty-tolerant — a hook that blocks on absent stdin bricks every push.
-# Empty/unparseable stdin → fall through to the existing check (fail-safe toward
-# current behavior, never toward skipping a needed freshness rebase).
+# Empty stdin → fall through to the existing check (fail-safe toward current
+# behavior, never toward skipping a needed freshness rebase). A malformed
+# non-empty line counts as a non-delete ref line that does not target the
+# current branch, so it reads as "otherref" below; real git never sends one.
+#
+# T-4374 "otherref": the freshness rebase acts on CURRENT_BRANCH, not on the ref
+# being pushed. When stdin has at least one NON-delete line but NONE targets
+# refs/heads/${CURRENT_BRANCH} (e.g. `git push origin feature` while on main),
+# the current branch is not part of this push, and rebasing it — possibly over
+# local commits — is unrequested harm (the T-1961 delete argument). Skip.
+# Empty stdin is deliberately NOT "otherref": a behind single-branch push of
+# the current branch reaches the hook with EMPTY stdin (git drops the rejected
+# non-ff line, T-4290), and that path must keep self-healing via freshness.
+# Accepted trade-off (same shape as the T-4366 won't-fix): `git push origin
+# main feature` from a behind clone shows the hook only the feature line, so
+# the hook cannot tell "main was rejected" from "main was not pushed" and does
+# NOT rebase main on that push. A plain retry of `git push origin main` (empty
+# stdin) rebases it as before. The same holds for a single-branch push that
+# carries a tag via `push.followTags` (only the tag line arrives); the tag has
+# landed by the retry, so the retry's stdin is empty and it rebases.
+#
+# Classification is independent of ref-line order (T-4374). Delete lines are
+# only counted inside the loop. After it: "delete" applies only when EVERY line
+# was a delete; "otherref" when there are non-delete lines but none targets the
+# current branch; otherwise the current-branch line's own classification ("",
+# "newbranch", "rewrite") decides. So `main` (extends) + `:old` runs freshness
+# in either order, exactly like a main-only push, and `:old` + a force-rewrite
+# of main is "rewrite" in either order.
 _ZERO_RE='^0+$'
-_skip_freshness=""      # "", "delete", "newbranch", or "rewrite"
+_skip_freshness=""      # "", "delete", "newbranch", "rewrite", or "otherref"
 _saw_nondelete=0
+_saw_delete=0
+_saw_current=0
 if [[ -n "${_REF_LINES}" ]]; then
     while read -r _lref _loid _rref _roid; do
         [[ -z "${_lref}${_loid}" ]] && continue
         if [[ "${_loid}" =~ ${_ZERO_RE} ]]; then
-            # a delete line (local oid all-zeros)
-            [[ -z "${_skip_freshness}" ]] && _skip_freshness="delete"
+            # a delete line (local oid all-zeros): only counted here; whether
+            # "delete" applies is decided after the loop (order-independent).
+            _saw_delete=1
             continue
         fi
         _saw_nondelete=1
         # Only the branch actually being pushed as the current branch matters for
         # the CURRENT_BRANCH-keyed freshness rebase below.
         if [[ "${_rref}" == "refs/heads/${CURRENT_BRANCH}" ]]; then
+            _saw_current=1
             if [[ "${_roid}" =~ ${_ZERO_RE} ]]; then
                 _skip_freshness="newbranch"   # no upstream to be behind
             elif git merge-base --is-ancestor "${_roid}" "${_loid}" 2>/dev/null; then
                 _skip_freshness=""            # extends known remote → freshness runs
             elif git cat-file -e "${_roid}" 2>/dev/null; then
+                # Force-push only (T-4290): on a NON-force push git drops a
+                # rejected non-fast-forward ref from this stdin (verified on
+                # git 2.43), so for a behind clone — even one that already
+                # fetched the newer tip — that ref's line is absent, and it
+                # takes the freshness path below and is rebased there. A line
+                # reaching this branch in practice carries force, where
+                # "rewrite" is the right reading.
                 _skip_freshness="rewrite"     # known remote tip present but NOT an ancestor
             else
                 _skip_freshness=""            # remote oid not local → can't judge; be conservative, run freshness
             fi
         fi
     done <<< "${_REF_LINES}"
-    # A push whose only ref updates are deletions: nothing to check.
-    if [[ "${_saw_nondelete}" -eq 0 && -n "${_skip_freshness}" ]]; then
-        _skip_freshness="delete"
+    if [[ "${_saw_nondelete}" -eq 0 ]]; then
+        # A push whose only ref updates are deletions: nothing to check.
+        [[ "${_saw_delete}" -eq 1 ]] && _skip_freshness="delete"
+    elif [[ "${_saw_current}" -eq 0 ]]; then
+        # T-4374: non-delete refs pushed, none of them the current branch →
+        # the current branch is not being pushed; do not rebase it.
+        _skip_freshness="otherref"
     fi
+    # Otherwise the current-branch line's own classification ("", newbranch,
+    # rewrite) stands; any delete lines alongside it do not change it.
+fi
+
+# Run the guard NOW, before the detached-HEAD check and before any freshness fetch
+# (T-4226). It works from the stdin shas and the object store (fetching itself only
+# when the remote tip is not local yet), so nothing below depends on it having run
+# late — and it must not sit behind a step that can exit 0: on a named branch a
+# failed fetch used to `exit 0` before the guard ran, so an unreachable origin
+# silently switched the guard off. It runs AFTER the classification above on purpose
+# (see ORDER MATTERS there).
+_seat_code_guard
+
+if [[ -z "${CURRENT_BRANCH}" ]]; then
+    # Detached HEAD — skip the freshness check, the contract gate and the
+    # warnings (the seat guard already ran above; it keys on the remote ref, and
+    # every with_worktree cron push, and any hand-detached push, is detached).
+    exit 0
 fi
 
 if [[ -n "${_skip_freshness}" ]]; then
@@ -100,6 +328,8 @@ if [[ -n "${_skip_freshness}" ]]; then
             echo "pre-push: new remote branch — skipping freshness check (no upstream to be behind)." >&2 ;;
         rewrite)
             echo "pre-push: NOTE — ${CURRENT_BRANCH} is not a descendant of its remote tip; treating as a deliberate history rewrite and NOT auto-rebasing (that would re-apply commits you rewrote away). A force-push proceeds; the remote's own non-fast-forward check still guards you." >&2 ;;
+        otherref)
+            echo "pre-push: NOTE — no pushed ref targets the current branch (${CURRENT_BRANCH}); skipping freshness check (not rebasing a branch you did not push). If ${CURRENT_BRANCH} was also pushed and rejected, retry \`git push ${REMOTE} ${CURRENT_BRANCH}\` to rebase it." >&2 ;;
     esac
 else
     # Normal / parallel-writer push: the freshness auto-rebase applies unchanged.
@@ -112,11 +342,26 @@ else
     UPSTREAM="${REMOTE}/${CURRENT_BRANCH}"
     BEHIND_COUNT="$(git rev-list --count "HEAD..${UPSTREAM}" 2>/dev/null || echo "0")"
 
+    # T-5160: an agent/* branch has one writer, so a remote counterpart that has
+    # DIVERGED (not an ancestor of HEAD) is a stale same-named attempt or a second
+    # writer, never the parallel-writer case this rebase exists for. Rebasing onto
+    # it replays every main commit since the stale tip (158 picks, 2026-10-18).
+    # Refuse; a plain behind agent branch (HEAD is an ancestor) still fast-forwards.
+    if [[ "${BEHIND_COUNT}" -gt 0 && "${CURRENT_BRANCH}" == agent/* ]] \
+        && ! git merge-base --is-ancestor HEAD "${UPSTREAM}" 2>/dev/null; then
+        echo "pre-push: BLOCKED — ${UPSTREAM} exists and is not an ancestor of ${CURRENT_BRANCH}; NOT auto-rebasing onto it." >&2
+        echo "pre-push: if it is a stale earlier attempt, push under a new name (e.g. ${CURRENT_BRANCH}-v2) or delete it first (\`git push ${REMOTE} --delete ${CURRENT_BRANCH}\`); if it is a second writer's work, reconcile by hand." >&2
+        exit 1
+    fi
+
     if [[ "${BEHIND_COUNT}" -gt 0 ]]; then
         echo "pre-push: local is ${BEHIND_COUNT} commit(s) behind ${UPSTREAM}." >&2
         echo "pre-push: rebasing local onto ${UPSTREAM} before push..." >&2
         # Run rebase; capture exit code explicitly before pipefail can interfere.
-        git pull --rebase --autostash "${REMOTE}" "${CURRENT_BRANCH}" 2>&1 | sed 's/^/pre-push: /' >&2 || {
+        # T-5575: rebase onto the remote-tracking ref the fetch above just refreshed, never
+        # `git pull --rebase` (which reads FETCH_HEAD). A concurrent fetch in this clone can
+        # leave FETCH_HEAD multi-entry -> "Cannot rebase onto multiple branches" (T-0218 class).
+        git rebase --autostash "${UPSTREAM}" 2>&1 | sed 's/^/pre-push: /' >&2 || {
             echo "pre-push: rebase FAILED — resolve conflicts, then retry push." >&2
             exit 1
         }
@@ -153,75 +398,6 @@ if [[ -n "${REPO_ROOT}" && -f "${LINTER}" ]]; then
 fi
 # --- end contract gate -------------------------------------------------------
 
-# --- seat CODE-path-to-main guard (T-1937) -----------------------------------
-# Seats hold a deploy key that BYPASSES main's branch-protection ruleset, but a
-# deploy key is git-transport only and cannot reach the GitHub API — so a seat
-# can push code to main while being structurally unable to open the PR that
-# should carry it. The sanctioned path is unavailable and the unsanctioned one
-# succeeds silently. This makes PR-only-for-code structural for seats, with
-# zero new credentials.
-#
-# The bypass itself is deliberately NOT blocked: it is load-bearing for the
-# fleet's parallel ticket/ledger writers (accept-and-monitor per the T-1922
-# ruling). So this discriminates CODE paths from ticket/ledger paths rather
-# than blocking main pushes wholesale.
-#
-# Fail posture mirrors the T-1084 gate above: fail-OPEN on any anomaly (a
-# broken guard must NEVER brick the fleet's ability to push), fail-CLOSED only
-# on a clean CODE-path determination.
-SEAT_USER="$(id -un 2>/dev/null || echo "")"
-case "${SEAT_USER}" in
-    suborch1|suborch2) IS_SEAT=1 ;;
-    *)                 IS_SEAT=0 ;;
-esac
-
-if [[ "${IS_SEAT}" -eq 1 ]]; then
-    # Ref updates come from the shared ${_REF_LINES} read at the top of the hook
-    # (T-1961 consolidated the two stdin reads into one — stdin is drain-once, so
-    # this guard must NOT re-read it or it would see empty and silently no-op).
-    # Same "<local_ref> <local_sha> <remote_ref> <remote_sha>" per line; empty
-    # ${_REF_LINES} → the guard no-ops (fail-open, as before).
-    REF_LINES="${_REF_LINES}"
-
-    if [[ -n "${REF_LINES}" ]]; then
-        CODE_RE='^(tools/|\.github/|\.githooks/)'
-        KNOWN_RE='^(tools/|\.github/|\.githooks/|tickets/|ledger/)'
-        while read -r _L_REF L_SHA R_REF R_SHA; do
-            [[ "${R_REF}" == "refs/heads/main" ]] || continue
-            # All-zero local sha = ref deletion; all-zero remote sha = brand-new
-            # main. Neither is a code push we can range-diff — fail open.
-            [[ "${L_SHA}" =~ ^0+$ ]] && continue
-            [[ "${R_SHA}" =~ ^0+$ ]] && continue
-
-            CHANGED="$(git diff --name-only "${R_SHA}..${L_SHA}" 2>/dev/null || true)"
-            [[ -z "${CHANGED}" ]] && continue   # unreadable range -> fail open
-
-            CODE_HITS="$(printf '%s\n' "${CHANGED}" | grep -E "${CODE_RE}" || true)"
-            if [[ -n "${CODE_HITS}" ]]; then
-                echo "pre-push: BLOCKED — CODE-path push to main from a seat clone (${SEAT_USER})." >&2
-                echo "pre-push: offending path(s):" >&2
-                printf '%s\n' "${CODE_HITS}" | sed 's/^/pre-push:   /' >&2
-                echo "pre-push:" >&2
-                echo "pre-push: Seats push code on a branch; the HO opens the PR and merges." >&2
-                echo "pre-push:   git push origin agent/T-NNNN   # then mailbox orchestrator for PR+merge" >&2
-                echo "pre-push:" >&2
-                echo "pre-push: ticket/ledger pushes to main are UNAFFECTED and remain the convention." >&2
-                echo "pre-push: (Emergency bypass: git push --no-verify — say so in your report.)" >&2
-                exit 1
-            fi
-
-            # Paths in neither set: surface loudly, do not block. A new
-            # top-level directory must not silently inherit either posture.
-            UNKNOWN="$(printf '%s\n' "${CHANGED}" | grep -vE "${KNOWN_RE}" || true)"
-            if [[ -n "${UNKNOWN}" ]]; then
-                echo "pre-push: NOTE — path(s) classified as neither code nor ticket/ledger; allowing:" >&2
-                printf '%s\n' "${UNKNOWN}" | sed 's/^/pre-push:   /' >&2
-            fi
-        done <<< "${REF_LINES}"
-    fi
-fi
-# --- end seat guard ----------------------------------------------------------
-
 # --- ledger shard-placement WARN (T-2077) ------------------------------------
 # New ledger entries occasionally land in the wrong ISO-week shard: appending
 # to the PREVIOUS week's shard by session habit near the Monday 00:00Z ISO
@@ -254,5 +430,38 @@ if [[ -n "${REPO_ROOT}" && -f "${LEDGER_LINT}" && -n "${_REF_LINES}" ]]; then
     done <<< "${_REF_LINES}"
 fi
 # --- end ledger placement warn -----------------------------------------------
+
+# --- ADR parallel-arc WARN (incidents/2026-09-11-t2944-preempts-t3302) --------
+# When a push touches architecture/adr/ORG-NNN-*.md, surface any OPEN tickets
+# (inbox/ or active/) that reference the same ORG-NNN. The 2026-09-11 T-2944
+# incident had a rev-3 ADR push land while T-3302 (operator-desk disposition on
+# T-3263, a parallel author-arc) was in-flight — the reverify-state pin fires
+# advisory-only, so the class needs a structural check on the touched-file
+# surface itself.
+#
+# WARN, never block. Many open tickets legitimately reference an ADR (routine
+# implements/relates edges, build children, exec follow-ups). False-positives
+# on WARN are cheap (2-second glance to dismiss); false-negatives on BLOCK
+# would be catastrophic. Point is operator awareness on the touched-file
+# surface, not machine gating.
+#
+# Fail posture mirrors the gates above: any anomaly is fail-open — a guard
+# that bricks pushes defeats itself.
+ADR_LINT="${REPO_ROOT}/tools/adr_parallel_arc_lint.py"
+if [[ -n "${REPO_ROOT}" && -f "${ADR_LINT}" && -n "${_REF_LINES}" ]]; then
+    while read -r _AL_LREF AL_LSHA AL_RREF AL_RSHA; do
+        [[ "${AL_RREF}" == "refs/heads/main" ]] || continue
+        [[ "${AL_LSHA}" =~ ^0+$ ]] && continue   # ref deletion — nothing pushed
+        [[ "${AL_RSHA}" =~ ^0+$ ]] && continue   # brand-new main — no base range
+        ADR_WARN="$(python3 "${ADR_LINT}" --range "${AL_RSHA}" "${AL_LSHA}" 2>/dev/null || true)"
+        if [[ -n "${ADR_WARN}" ]]; then
+            echo "pre-push: NOTE — this push touches ADR(s) that have OPEN tickets referencing them:" >&2
+            printf '%s\n' "${ADR_WARN}" | sed 's/^/pre-push:   /' >&2
+            echo "pre-push: verify none of these are parallel author-arcs your push would preempt." >&2
+            echo "pre-push: (2026-09-11 incident: rev-3 pushed while T-3302 disposition was pending.)" >&2
+        fi
+    done <<< "${_REF_LINES}"
+fi
+# --- end ADR parallel-arc warn -----------------------------------------------
 
 exit 0

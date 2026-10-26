@@ -14,7 +14,7 @@ Environment=PATH=%h/.npm-global/bin:%h/.bun/bin:/usr/local/bin:/usr/bin:/bin
 # (it stays in new/ for the next wake). See tools/mailbox_wake.py.
 #
 # `sg pantheon-mailbox -c` is REQUIRED (T-1015, 2026-06-09): the Path-A hub
-# (/home/the-ancestor/mailbox/%i/new) is mode-2770 group pantheon-mailbox, but a
+# (/home/post-office/mailbox/%i/new) is mode-2770 group pantheon-mailbox, but a
 # user-mode systemd service runs with ONLY the account's primary group — user
 # systemd cannot grant supplementary groups (SupplementaryGroups= fails 216 on
 # --user units). Without the wrap the waker dies with `PermissionError: ... hub/new`

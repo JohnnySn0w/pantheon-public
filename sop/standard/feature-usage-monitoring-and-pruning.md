@@ -151,6 +151,6 @@ downgrade it; "which capabilities exist" is his call regardless.
 
 - **T-2214** — the-ancestor daemon decommission; the worked example this SOP generalizes.
 - **T-2213** — the memory incident that made the 348 MB legible as a real cost.
-- `sop/standard/venerating-ancestors.md` — **RETIRED** with T-2214; kept for history only.
+- `sop/standard/venerating-ancestors.md` — **RETIRED** with T-2214; kept for history only. Its code (`tools/veneration.py`, `tools/ancestor_consume.py`) was removed under T-4741 (#835).
 - `architecture/adr/ORG-026-inter-agent-message-passing-substrate.md` — the hub that was correctly kept.
 - `feedback_reviewer_step_valuable_even_for_one_offs`, `feedback_verify_root_cause_before_asserting`.

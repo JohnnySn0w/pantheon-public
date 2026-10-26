@@ -5,9 +5,9 @@ title: "Deference heuristic — viability pass on reserved-set operator directiv
 status: >-
   Ratified 2026-09-06 by the operator via Telegram 9047 ("looks good tbh"). Rev-3
   landed at commit f9ca0b98b1 after the operator steer TG 9040 to strip the
-  impl-tier over-spec that grew across Cairn round-1/2 REBOUND responses;
+  impl-tier over-spec that grew across Consultant round-1/2 REBOUND responses;
   keep only design-level claims that invalidate ratifiable-decision altitude.
-  Cairn ORG-041 review chain: rev-0 REBOUND round-1, rev-1 REBOUND round-2,
+  Consultant ORG-041 review chain: rev-0 REBOUND round-1, rev-1 REBOUND round-2,
   rev-2 CAP-EXHAUSTED round-3 (superseded by the operator steer at his tier before
   the round-3 verdict reached HO — audit chain preserved in T-3431 transition
   log).
@@ -18,7 +18,7 @@ supersedes: none
 relates: ORG-041, ORG-021, ORG-034, D3, D1, P3, P4
 build_disposition: needs-build
 scoping_ticket: T-3431
-registers_components: none
+registers_components: []
 appetite: 7
 ---
 
@@ -135,11 +135,11 @@ The build ticket for the ORG-021 amendment enumerates the consumer-code updates 
 
 ### Surface 5 — ACTOR: SOP + Claude-side priming; Codex reach honestly narrowed
 
-**5a.** New SOP `sop/standard/shaping-and-viability.md`. The how-to for running the pass: three viability questions, material-change filter, surface-shape (reasoned lean, not bare question, not ritual contrarianism), field-shape (§Appetite + §Riskiest-assumption sections + frontmatter integer). The drafter's reference when the trigger fires. Cairn's ORG-041 review checklist points at it.
+**5a.** New SOP `sop/standard/shaping-and-viability.md`. The how-to for running the pass: three viability questions, material-change filter, surface-shape (reasoned lean, not bare question, not ritual contrarianism), field-shape (§Appetite + §Riskiest-assumption sections + frontmatter integer). The drafter's reference when the trigger fires. Consultant's ORG-041 review checklist points at it.
 
 **5b.** Add `shaping-and-viability` as a policy-trigger cheat-sheet entry in `rulebook/persona-orientation/manifest.yaml` (Claude-adapter path). Re-renders reach every Claude-side drafter + reviewer per T-3339 + T-3432.
 
-**5c. Codex reach.** Codex adapter integration is TBD-phase-2 (per T-3338). Until Phase-2 lands, the manifest re-render doesn't prime Codex/Cairn — the standing ORG-041 reviewer. This ADR does not solve that; the honest disposition is that the Surface 2 amendment to [[ORG-041]] IS Cairn's authoritative surface for this ADR class. Phase-2 follow-up is T-3338 scope, not carried here.
+**5c. Codex reach.** Codex adapter integration is TBD-phase-2 (per T-3338). Until Phase-2 lands, the manifest re-render doesn't prime Codex/Consultant — the standing ORG-041 reviewer. This ADR does not solve that; the honest disposition is that the Surface 2 amendment to [[ORG-041]] IS Consultant's authoritative surface for this ADR class. Phase-2 follow-up is T-3338 scope, not carried here.
 
 ## Consequences
 
@@ -189,7 +189,7 @@ The build ticket for the ORG-021 amendment enumerates the consumer-code updates 
 - **D-N. `substate: dropped` frontmatter (in `tickets/done/`), not a 4th directory.** ORG-021 mandates exactly 3 directories + frontmatter-only future substates; that's the binding constraint. Dropped ≠ resolved: no dependency satisfaction, no obligation satisfaction, distinct digest surface, reopen-by-re-earn. Implementation of the completion-predicate refactor is build-tier scope, not this ADR.
 - **D-O. Completeness check + overrun check are distinct grooming surfaces.** Proposal notes.md:60-64 required both; collapsing them loses the completeness signal. Completeness is always-on (legacy-grandfathered by ratify-date); overrun is calibration-gated.
 - **D-P. Re-decision commands are dedicated verbs (re-earn / drop / adjust-appetite), not resolve-overloaded.** Resolve stays terminal. The three re-decision verbs each carry a rationale + a state effect (re-earn/adjust: stays active with new budget; drop: terminal). Preserves semantic hygiene.
-- **D-Q. Codex/Cairn reach is via ORG-041 amendment (Surface 2), not persona-orientation manifest re-render.** Codex adapter is TBD-phase-2 (T-3338); the manifest can't prime Cairn today. The Surface 2 amendment to ORG-041 IS Cairn's authoritative surface for this ADR class. Phase-2 follow-up filed under T-3338.
+- **D-Q. Codex/Consultant reach is via ORG-041 amendment (Surface 2), not persona-orientation manifest re-render.** Codex adapter is TBD-phase-2 (T-3338); the manifest can't prime Consultant today. The Surface 2 amendment to ORG-041 IS Consultant's authoritative surface for this ADR class. Phase-2 follow-up filed under T-3338.
 
 ## Build plan
 
@@ -215,8 +215,8 @@ Each surface's build ticket owns the implementation contract (typed field schema
 
 ## Revision history
 
-- **2026-09-05 rev-0** — Autonomous draft by Orchestrator from Specialist's ratified-in-principle proposal + appetite-scale spec. Cairn ORG-041 REBOUND (3 blockers + 3 material findings).
-- **2026-09-05 rev-1** — Orchestrator-authored response addressing Cairn round-1. Grew into implementation-contract detail on some fixes.
-- **2026-09-06 rev-2 (retired)** — Orchestrator-authored response addressing Cairn round-2 (4 blockers + 2 material). Grew further into impl-tier over-spec (~500 lines, method signatures, line-numbered code references, 21-step build plan). The operator steer TG 9040: "far too overgrown, revert the changes and include only things you find pass the critique bar."
+- **2026-09-05 rev-0** — Autonomous draft by Orchestrator from Specialist's ratified-in-principle proposal + appetite-scale spec. Consultant ORG-041 REBOUND (3 blockers + 3 material findings).
+- **2026-09-05 rev-1** — Orchestrator-authored response addressing Consultant round-1. Grew into implementation-contract detail on some fixes.
+- **2026-09-06 rev-2 (retired)** — Orchestrator-authored response addressing Consultant round-2 (4 blockers + 2 material). Grew further into impl-tier over-spec (~500 lines, method signatures, line-numbered code references, 21-step build plan). The operator steer TG 9040: "far too overgrown, revert the changes and include only things you find pass the critique bar."
 - **2026-09-06 rev-3** — Reverted to rev-0 baseline (195 lines); applied targeted design-level fixes only for findings that genuinely invalidate ratifiable-decision altitude. Kept: YAML frontmatter fix, RECORD/SURFACE mode split, completeness check as distinct grooming surface, `substate: dropped` picked (not "whichever pattern"), enforcing gate with honest resolve-boundary limitation named, dedicated re-decision commands (resolve not overloaded), appetite re-scored 6→7, multi-repo transaction (not "one commit"), Codex reach narrowed to ORG-041 amendment (not universal manifest reach). Dropped: state-machine specs, method signatures, per-consumer line-numbered enumeration, 21-step build plan, appetite-ledger schema. Those belong in build-tier tickets per T-3439 (planning-phase-review scope-bounds work sibling arc). Landed at 218 lines.
 - **2026-09-06 RATIFIED** — the operator via Telegram 9047 ("looks good tbh"). Doc surfaces landed same-session; code surfaces filed as build tickets per §Build plan.

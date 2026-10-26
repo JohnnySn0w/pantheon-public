@@ -161,8 +161,8 @@ def read_doc(path: Path) -> _Doc:
 # DERIVED (T-2256), and it was returning WRONG ANSWERS before it was. The list
 # was hand-carried and stopped at the pre-ORG-042 three, so the ORG-042/ORG-043
 # seats had no group at all — and alias_group() falls back to self, silently.
-# Measured 2026-07-29 on the live tree: `touched-by mnemosyne` matched only
-# `[mnemosyne]` lines and missed all 80 `[exocortex]` ones; `touched-by atlas`
+# Measured 2026-07-29 on the live tree: `touched-by archivist` matched only
+# `[archivist]` lines and missed all 80 `[exocortex]` ones; `touched-by artisan`
 # missed 10 `[suborch2]` ones. Not a latent risk — wrong output, and the gap grew
 # with every transition log anyone wrote. Deriving from the persona registry plus
 # the instance.yaml account bindings means a new seat is grouped at registration.

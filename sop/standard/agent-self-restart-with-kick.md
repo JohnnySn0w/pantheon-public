@@ -47,6 +47,7 @@ The wrapper:
 1. **Preflights** — tmux session exists, `handoff_and_restart.sh` is executable, `HANDOFF.md` freshness (warn-only).
 2. **`reset-failed`** the fixed transient unit name (a failed instance from a prior run would block re-launch).
 3. **`systemd-run --user --collect --unit=recovery-self-restart`** a detached `bash -c`: `sleep <SELF_RESTART_DELAY> ; exec handoff_and_restart.sh --skip-ack …`. The `sleep` lets the launching turn flush before the restart kills the session; `exec` makes the restart script the unit's `MainPID`.
+   *(Note 2026-10-16, Orchestrator, T-5060: `recovery-self-restart` is the name Recovery's wrapper pins. Through `self_restart.sh` the unit is `self-restart-<service>` unless `--unit` overrides it, as described above.)*
 4. The transient unit (now in its own cgroup) survives `systemctl restart <service>`, waits for steady-state (`--steady-timeout 90` — claude + plugin + bun boot can exceed the script's 60s default), then send-keys the kick into the fresh pane.
 
 **Validated per-agent invocations (dry-run-proven 2026-05-22, T-0531; substrate from `context_fill_monitor.py` AGENT_CONFIG):**

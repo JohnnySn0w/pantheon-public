@@ -1,0 +1,45 @@
+[Unit]
+Description=Pantheon fleet health collector: one enum-only aggregate of org.pantheon.Health1 + PersonaController1 (T-5395)
+Documentation=file:///home/%u/pantheon-config/architecture/rfc/RFC-004-fleet-health-and-repair-mechanism.md
+
+# NOT INSTALLED BY THIS STEP. Template only (T-5395, ORG-068 E10). The ORG-080 registry
+# component `health-collector`. Runs on the Recovery account (claude-fallback), exactly like
+# pantheon-health-export.service. Not installing the paired timer IS the dark gate.
+#
+# Output: /run/pantheon-health/fleet-health.json (mode 0644, atomic rename). The directory is
+# created by root via tmpfiles (same provisioning as the health exporter, B7/B11):
+#     d  /run/pantheon-health 2750 claude-fallback pantheon-health -
+# kino (uid kino, not in group pantheon-health) reads the file through a directory ACL. The
+# EXACT grant, to persist across reboot, is this tmpfiles line:
+#     a+ /run/pantheon-health - - - - u:kino:r-x
+# (the live directory already carries user:kino:r-x; the tmpfiles line only persists it).
+#
+# PREREQUISITES, checked from the repo (nothing was read from /etc and no sudo was run):
+#  1. Cross-account session-bus reads run `sudo -n -u <acct> env DBUS_SESSION_BUS_ADDRESS=...
+#     busctl --user ... GetAll`. Recovery's documented grants are blanket per-account rules of the
+#     form `claude-fallback ALL=(<acct>) NOPASSWD: ALL` (notes/2026-06-03-bringup-substrate-ground-truth.md
+#     section 3; notes/t4027-fleet-uid-cordon-audit.md: "Recovery's blanket account sudo ... operator-accepted,
+#     T-2654"), so no new sudoers rule is expected for busctl. UNVERIFIED: that every fleet account in
+#     instance.yaml is covered by such a rule. Check `sudo -l -U claude-fallback` for each account
+#     fleet_personas() returns. A command-scoped grant would instead need, per account:
+#         claude-fallback ALL=(<acct>) NOPASSWD: /usr/bin/env DBUS_SESSION_BUS_ADDRESS=unix\:path=/run/user/<uid>/bus XDG_RUNTIME_DIR=/run/user/<uid> /usr/bin/busctl --user --json=short call org.pantheon.PersonaController.<persona> /org/pantheon/PersonaController/<persona> org.freedesktop.DBus.Properties GetAll s org.pantheon.PersonaController1
+#  2. The system-bus Health1 reads (org.pantheon.HostBroker1 / HostApproval1) are authorized by
+#     the broker's `monitor_uids` set (tools/host_control/health_dbus.py: Health1Object refuses an
+#     empty set and any caller uid outside it with AccessDenied). The collector's uid, claude-fallback,
+#     must be in that set. UNVERIFIED: no production wiring of monitor_uids exists in the repo (only
+#     tests construct Health1Object), so check the broker install when it lands. Until then the
+#     collector reports host-broker / host-approval as `no_service` or `denied`, never `ready`.
+#
+# Until /run/pantheon-health exists the service exits 2 ("out dir not writable"), the intended
+# loud failure.
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/health_collector.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=50s

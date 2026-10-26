@@ -46,6 +46,22 @@ from tools.harness_adapter.types import TmuxTarget
 from tools.submit_verify import ready_for_submission
 
 
+# T-5317: the drivers converge the worker-guard hook (real codex binary) before
+# the config snapshot. These tests use fake bindings and mock the startup
+# writers, so stub it module-wide; TestT5317Converge covers the call itself.
+_converge_patches = [mock.patch.object(hcr, "converge_worker_guard_hook"), mock.patch.object(hrc, "converge_worker_guard_hook")]
+
+
+def setUpModule() -> None:
+    for p in _converge_patches:
+        p.start()
+
+
+def tearDownModule() -> None:
+    for p in reversed(_converge_patches):
+        p.stop()
+
+
 def _skip_unless_disposable_tmux_available(test: unittest.TestCase) -> None:
     if shutil.which("tmux") is None or shutil.which("systemd-run") is None:
         test.skipTest("tmux/systemd-run not available in this environment")
@@ -566,7 +582,7 @@ def _write_temp_stand_in() -> Path:
 class ManifestFixtureTest(unittest.TestCase):
     def test_manifest_carries_production_faithful_native_config(self) -> None:
         text = hcr._fixture_manifest_text(persona="p", account="claude")
-        self.assertIn("sandbox: workspace-write", text)
+        self.assertIn("sandbox: danger-full-access", text)
         self.assertIn("approval_policy: never", text)
 
 
@@ -629,10 +645,15 @@ class CodexAcceptanceConfigGuardIntegrationTest(unittest.TestCase):
                  mock.patch.object(hcr.persona_bringup, "load_binding", return_value=binding(ready_work)), \
                  mock.patch.object(hcr.persona_bringup, "build_adapter", return_value=ready_adapter), \
                  mock.patch.object(hcr, "_wait_for_codex_ready", return_value=READY_COMPOSER_AFTER_DISMISS), \
-                 mock.patch.object(hcr, "_teardown_disposable_tmux_context", return_value=[]):
+                 mock.patch.object(hcr, "_teardown_disposable_tmux_context", return_value=[]), \
+                 mock.patch.object(hcr, "converge_worker_guard_hook") as ready_converge:
                 hcr.run_codex_ready_bringup(work_root=ready_work, account="testaccount")
 
             self.assertEqual(_config_fingerprint(config_path), before)
+            # T-5317: the driver really wires converge, with its own binding.
+            ready_converge.assert_called_once()
+            self.assertEqual(ready_converge.call_args.args[0], codex_home)
+            self.assertEqual(ready_converge.call_args.args[1].launch_cwd, ready_work)
 
             fake_readiness = rc.RuntimeInputReadiness(
                 ready=True,
@@ -645,8 +666,12 @@ class CodexAcceptanceConfigGuardIntegrationTest(unittest.TestCase):
                  mock.patch.object(hrc.persona_bringup, "build_adapter", return_value=rc_adapter), \
                  mock.patch.object(rc, "_capture_visible_runtime_pane", return_value=MODAL_CURSOR_ON_OPTION_3), \
                  mock.patch.object(rc, "_wait_for_runtime_input_ready", return_value=fake_readiness), \
-                 mock.patch.object(hrc, "_teardown_disposable_tmux_context", return_value=[]):
+                 mock.patch.object(hrc, "_teardown_disposable_tmux_context", return_value=[]), \
+                 mock.patch.object(hrc, "converge_worker_guard_hook") as rc_converge:
                 hrc.run_codex_rc_ready_bringup(work_root=rc_work, account="testaccount")
+            rc_converge.assert_called_once()
+            self.assertEqual(rc_converge.call_args.args[0], codex_home)
+            self.assertEqual(rc_converge.call_args.args[1].launch_cwd, rc_work)
 
             self.assertEqual(config_path.read_text(encoding="utf-8"), original)
             self.assertEqual(_config_fingerprint(config_path), before)
@@ -925,6 +950,102 @@ class CodexReadyDisposableScopeLiveTests(unittest.TestCase):
             )
             self.assertNotEqual(has_session.returncode, 0)
 
+
+class TestT5317Converge(unittest.TestCase):
+    def test_converge_runs_before_snapshot_so_in_run_writer_is_a_noop(self) -> None:
+        """A writer outside the modeled prefixes (the worker-guard hook) would
+        make restore refuse with drift; converging it first keeps the post-run
+        config on a modeled prefix and restores to the converged bytes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config_path = codex_home / "config.toml"
+            config_path.write_text('approval_policy = "never"\n', encoding="utf-8")
+            project_cwd = root / "project"
+            project_cwd.mkdir()
+            hook_block = '\n[hooks.fake_guard]\ncommand = "guard"\n'
+
+            def hook_writer() -> None:  # idempotent, like ensure_worker_guard_hook
+                text = config_path.read_text(encoding="utf-8")
+                if hook_block not in text:
+                    config_path.write_text(text + hook_block, encoding="utf-8")
+
+            calls: list[str] = []
+            guard = config_guard.ReversibleAcceptanceConfigGuard(
+                codex_home=codex_home, project_cwd=project_cwd, owner="test",
+                converge=lambda: (calls.append("converge"), hook_writer()),
+            )
+            guard.__enter__()
+            self.assertEqual(calls, ["converge"])
+            converged = config_path.read_bytes()
+            # The run: the replayed writers, then the hook writer again (no-op).
+            ensure_project_trusted(codex_home, project_cwd)
+            hook_writer()
+            guard.restore()
+            self.assertEqual(config_path.read_bytes(), converged)
+
+    def test_without_converge_an_unmodeled_writer_is_refused_as_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            codex_home.mkdir()
+            config_path = codex_home / "config.toml"
+            config_path.write_text('approval_policy = "never"\n', encoding="utf-8")
+            project_cwd = root / "project"
+            project_cwd.mkdir()
+            guard = config_guard.ReversibleAcceptanceConfigGuard(
+                codex_home=codex_home, project_cwd=project_cwd, owner="test",
+            )
+            guard.__enter__()
+            ensure_project_trusted(codex_home, project_cwd)
+            with config_path.open("a", encoding="utf-8") as fh:
+                fh.write('\n[hooks.fake_guard]\ncommand = "guard"\n')
+            with self.assertRaises(config_guard.AcceptanceConfigGuardError):
+                guard.restore()
+
+    def test_converge_runs_before_the_expectation_is_built(self) -> None:
+        order: list[str] = []
+        guard = config_guard.ReversibleAcceptanceConfigGuard(
+            codex_home=Path("/h/.codex"), project_cwd=Path("/p"), owner="t",
+            converge=lambda: order.append("converge"),
+        )
+        with mock.patch.object(
+            config_guard, "build_startup_config_expectation",
+            side_effect=lambda **_: order.append("snapshot"),
+        ):
+            guard.__enter__()
+        self.assertEqual(order, ["converge", "snapshot"])
+
+    def test_fallback_swap_guard_converges_the_codex_binding(self) -> None:
+        from tools.bringup_acceptance import harness_fallback_swap as hfs
+
+        def binding(harness: str) -> SimpleNamespace:
+            return SimpleNamespace(
+                selected_harness=harness, account_home=Path("/acct"),
+                launch_cwd=Path("/work"), controller=SimpleNamespace(tmux=None),
+                launch=SimpleNamespace(executable=f"/bin/{harness}"),
+            )
+
+        claude_b, codex_b = binding("claude"), binding("codex")
+        adapter = mock.Mock()
+        adapter.build_interactive_launch.return_value = SimpleNamespace(cwd="/work")
+        with mock.patch.object(hfs.persona_bringup, "build_adapter", return_value=adapter):
+            guard = hfs._codex_config_guard(claude_b, codex_b)
+        self.assertIsNotNone(guard.converge)
+        with mock.patch.object(hfs, "converge_worker_guard_hook") as conv:
+            guard.converge()
+        conv.assert_called_once_with(Path("/acct/.codex"), codex_b)
+
+    def test_converge_helper_passes_the_bindings_account_and_executable(self) -> None:
+        binding = SimpleNamespace(
+            account_home=Path("/acct"), launch=SimpleNamespace(executable="/bin/codex-x"),
+        )
+        with mock.patch("tools.harness_adapter.codex.ensure_worker_guard_hook") as hook:
+            config_guard.converge_worker_guard_hook(Path("/acct/.codex"), binding)
+        hook.assert_called_once_with(
+            Path("/acct/.codex"), Path("/acct"), executable=Path("/bin/codex-x"),
+        )
 
 if __name__ == "__main__":
     unittest.main()

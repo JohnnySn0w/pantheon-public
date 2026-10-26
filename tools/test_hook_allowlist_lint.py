@@ -113,6 +113,47 @@ class FormatFailureTest(unittest.TestCase):
         self.assertIn("--no-verify", msg)
 
 
+class PluginDirT4577Test(unittest.TestCase):
+    """T-4577: mods loaded via settings.json env CLAUDE_CODE_PLUGIN_DIRS."""
+
+    def test_failure_message_names_the_plugin_allowlist(self):
+        dev = hal.PLUGIN_DEVIATION_PREFIX + "'/tmp/evil' (not an allowlisted in-repo mod dir)"
+        msg = hal.format_failure("recovery", [dev])
+        self.assertIn("PLUGIN_DIR_ALLOWLIST['recovery']", msg)
+        self.assertIn("--no-verify", msg)
+        self.assertNotIn("PLUGIN_DIR_ALLOWLIST", hal.format_failure("recovery", ["a.sh"]))
+
+    def test_every_repo_mod_keeps_its_modules_inside_its_dir(self):
+        """The allowlist trusts tools/mods/<name> as reviewed code, so each mod's
+        hooks.json modules must resolve inside its own dir, with no symlink anywhere
+        in it that could point a reviewed name at unreviewed code."""
+        import json
+        import os
+        mods = REPO_ROOT / "tools" / "mods"
+        self.assertTrue(any(mods.iterdir()), "no mods: this guard would be vacuous")
+        for mod in sorted(p for p in mods.iterdir() if p.is_dir()):
+            with self.subTest(mod=mod.name):
+                for root, dirs, files in os.walk(mod):
+                    for name in dirs + files:
+                        self.assertFalse(os.path.islink(os.path.join(root, name)),
+                                         f"symlink in mod: {os.path.join(root, name)}")
+                hooks = mod / "hooks" / "hooks.json"
+                self.assertTrue(hooks.is_file(), f"{mod.name}: no hooks/hooks.json")
+                modules = json.loads(hooks.read_text())["modules"]
+                self.assertTrue(modules)
+                for m in modules:
+                    target = Path(os.path.normpath(hooks.parent / m))
+                    self.assertTrue(target.is_file(), f"{mod.name}: {m} missing")
+                    self.assertTrue(str(target).startswith(str(mod) + os.sep),
+                                    f"{mod.name}: {m} escapes the mod dir")
+
+    def test_every_allowlisted_mod_name_exists_in_the_repo(self):
+        mods = REPO_ROOT / "tools" / "mods"
+        for agent, names in hal.PLUGIN_DIR_ALLOWLIST.items():
+            for name in names:
+                self.assertTrue((mods / name).is_dir(), f"{agent}: {name} not in tools/mods/")
+
+
 class RealEnvSmokeTest(unittest.TestCase):
     """Exercises the real predicate against the real local env (no mocks).
 

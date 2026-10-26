@@ -61,6 +61,7 @@ if str(_REPO_ROOT) not in sys.path:
 
 from tools.agent_role_map import control_plane_consume_service as _control_plane_consume_service  # noqa: E402  (needs sys.path above)
 from tools.agent_role_map import instance_binding as _instance_binding  # noqa: E402  (needs sys.path above)
+from tools import seat_state  # noqa: E402  (needs sys.path above)
 
 
 def _consume_timer(persona: str) -> str:
@@ -89,9 +90,9 @@ def _liveness_services(persona: str, bespoke: list[str]) -> list[str]:
     already branch the restart mechanism on (T-2658/T-2684), so this can't
     drift independently of a persona's actual control-plane status the way a
     second, FLEET-local flag could. Returns *bespoke* unchanged for any seat
-    without supervisor == "control-plane" (orchestrator pre-T-2953 and recovery pre-
-    T-3026 today, both pending their own cutover; a completed cutover flips
-    the persona to the timer automatically)."""
+    without supervisor == "control-plane" (orchestrator pre-T-2953 today, pending
+    its own cutover; recovery flipped on its T-3026 cutover 2026-09-29, and a
+    completed cutover flips the persona to the timer automatically)."""
     if _instance_binding(persona).get("supervisor") == "control-plane":
         return [_consume_timer(persona)]
     return bespoke
@@ -126,7 +127,7 @@ FLEET = {
     # 2026-08-08 (T-2677). Mailbox-first — NO telegram channel, so no poller/
     # bridge unit belongs here. _liveness_services would normally auto-derive
     # the consume timer from instance.yaml's `supervisor: control-plane`
-    # marker (as it does for recovery/specialist below), but metis/atlas's `roles:`
+    # marker (as it does for recovery/specialist below), but mason/artisan's `roles:`
     # binding does not yet carry that field even though T-2677 moved them onto
     # the control plane (T-2677 only filled the separate harness_runtime
     # launch-profile stanza, not the roles: binding block agent_role_map.py
@@ -134,32 +135,48 @@ FLEET = {
     # fix). So the bespoke list is supplied explicitly instead of relying on
     # auto-derivation; the timer name is verified live-armed per T-2677's
     # resolve note ("both timers armed... fires green").
-    "metis": {
+    "mason": {
         "user": "suborch1",
         "session": "suborch1-main",
-        "services": _liveness_services("metis", ["pantheon-persona-consume@metis.timer"]),
+        "services": _liveness_services("mason", ["pantheon-persona-consume@mason.timer"]),
     },
-    "atlas": {
+    "artisan": {
         "user": "suborch2",
         "session": "suborch2-main",
-        "services": _liveness_services("atlas", ["pantheon-persona-consume@atlas.timer"]),
+        "services": _liveness_services("artisan", ["pantheon-persona-consume@artisan.timer"]),
     },
-    # Mnemosyne — the second head (ORG-042), resident on the `exocortex`
+    # Archivist — the second head (ORG-042), resident on the `exocortex`
     # account. Bespoke-telegram-service shape (T-2690 signal), NOT the consume
     # control plane — her instance.yaml binding has no `supervisor:
     # control-plane` marker (confirmed against agent_role_map.py), so
     # _liveness_services resolves to the bespoke list unchanged -- same
-    # mechanism as any pre-cutover bespoke seat (orchestrator pre-T-2953, recovery
-    # pre-T-3026); a completed cutover flips the persona to the timer
-    # automatically.
-    "mnemosyne": {
+    # mechanism as any pre-cutover bespoke seat (orchestrator pre-T-2953); a
+    # completed cutover flips the persona to the timer automatically (recovery,
+    # T-3026, 2026-09-29).
+    "archivist": {
         "user": "exocortex",
         "session": "claude-telegram-bot-exocortex",
-        "services": _liveness_services("mnemosyne", ["claude-telegram-exocortex.service"]),
+        "services": _liveness_services("archivist", ["claude-telegram-exocortex.service"]),
+    },
+    # Watchman (T-4884 B6) — codex-primary recovery seat on `codex-fallback`, born on
+    # the control plane (instance.yaml roles.system-orchestrator-1 carries
+    # `supervisor: control-plane`), so _liveness_services derives the consume timer.
+    # The bespoke list is empty: there was never a bespoke unit, and no Telegram
+    # poller (partial seating, design §6). A codex TUI, but NOT bwrap-flagged: it
+    # runs sandbox danger-full-access (instance.yaml harness_runtime), so the
+    # userns probe the peer daemon's workspace-write sandbox needs does not apply.
+    "watchman": {
+        "user": "codex-fallback",
+        "session": "codex-fallback-main",
+        "services": _liveness_services("watchman", []),
     },
 }
 
 OK, WARN, FAIL, PAUSED = "OK", "WARN", "FAIL", "PAUSED"
+# ORG-106 L4b (T-5527): a seat in an expected deep-sleep (phase asleep) with nothing running.
+# Bucketed like PAUSED: visible, never a FAIL, never DEGRADED. A sleeping seat that is NOT
+# down is a FAIL instead (check "sleep_breach").
+ASLEEP = "ASLEEP"
 
 
 # sudo, under -n, never prompts, and prefixes its OWN diagnostics with "sudo:".
@@ -290,7 +307,46 @@ def _format_skip_duration(seconds: float) -> str:
     return f"{hours / 24:.1f}d"
 
 
-def _policy_skip_check(persona: str, user: str, *, run=_run) -> dict | None:
+def _seat_in_maintenance(persona: str) -> bool:
+    """T-5285: is *persona* in an ACTIVE maintenance window right now? Any fault
+    (unreadable registry, import error) reads False, so the row falls through to
+    WARN -- the safe direction for a monitor. (ORG-106 L4b: shim over the shared
+    seat_state.maintenance_active; same registry, same fail-open.)"""
+    return seat_state.maintenance_active(persona)
+
+
+def _seat_note(e) -> dict | None:
+    """The always-visible seat-state annotation row for a paused / draining seat, or None."""
+    if e is None:
+        return None
+    until = e.expires or "no expiry"
+    who = f"{e.owner or '?'}: {e.reason or '-'}"
+    if e.state == seat_state.STATE_PAUSED_INTAKE:
+        return {"name": "seat-state", "status": OK,
+                "detail": f"paused (intake held; {who}; until {until})"}
+    if e.state == seat_state.STATE_DEEP_SLEEP:
+        return {"name": "seat-state", "status": OK,
+                "detail": f"draining toward deep-sleep ({who}; until {until})"}
+    return None
+
+
+def _session_live(user: str, cfg: dict, run) -> bool | None:
+    """Is anything of this seat running (a load-bearing service active or its tmux session)?
+    True on any positive signal; None when no probe could run (unknown)."""
+    ran_any = False
+    for svc in cfg["services"]:
+        rc, out, ran = run(user, f"systemctl --user is-active {svc}")
+        ran_any = ran_any or ran
+        if ran and out == "active":
+            return True
+    rc, out, ran = run(user, f"tmux has-session -t {cfg['session']} 2>/dev/null && echo yes || echo no")
+    ran_any = ran_any or ran
+    if ran and out.endswith("yes"):
+        return True
+    return False if ran_any else None
+
+
+def _policy_skip_check(persona: str, user: str, *, run=_run, seat=None) -> dict | None:
     """Render a check for *persona* iff its consume is CURRENTLY mid a
     consecutive policy-skip streak at or past POLICY_SKIP_ROW_MIN_FIRES.
     Returns None below the floor or when there is no counter file at all --
@@ -318,7 +374,17 @@ def _policy_skip_check(persona: str, user: str, *, run=_run) -> dict | None:
         except ValueError:
             pass
     expected = _instance_binding(persona).get("expected_policy_skip")
-    if expected == reason:
+    if reason == "all_runtimes_held":
+        # T-5285: every configured runtime is operator-held -- a deliberate state.
+        status, tail = OK, "expected (all runtimes held)"
+    elif reason == "seat_maintenance" and _seat_in_maintenance(persona):
+        # Only while the window is live: a stale streak after it ends is NOT expected.
+        status, tail = OK, "expected (seat maintenance window)"
+    elif reason == "seat_paused" and seat is not None and seat.state == seat_state.STATE_PAUSED_INTAKE:
+        status, tail = OK, "expected (seat paused)"
+    elif reason == "seat_sleep" and seat is not None and seat.state == seat_state.STATE_DEEP_SLEEP:
+        status, tail = OK, "expected (seat in deep-sleep)"
+    elif expected == reason:
         status, tail = OK, "expected (manifest expected_policy_skip)"
     elif expected:
         status, tail = WARN, f"unexpected (manifest expects {expected})"
@@ -326,6 +392,50 @@ def _policy_skip_check(persona: str, user: str, *, run=_run) -> dict | None:
         status, tail = WARN, "unexpected"
     detail = f"policy-skipped {reason} for {duration} ({count} fires) — {tail}"
     return {"name": "consume:policy-skip", "status": status, "detail": detail}
+
+
+_HARNESS_OVERRIDES_SPLIT = "@@T5028@@"
+
+
+def _harness_overrides_check(persona: str, user: str, *, run=_run) -> dict | None:
+    """T-5028 (f)/(f+): one cross-account read of the seat's harness-override
+    spool (unlanded.jsonl), quarantine (quarantine.jsonl) and the override rows
+    of its controller-evidence log. A WARN row only when something needs a
+    human: an unlanded or open quarantined ledger entry, or an override with no
+    outcome after the grace (a swap/restart that died mid-way). Unreadable or
+    clean renders no row, the same fail-safe posture as _read_policy_skip."""
+    from tools import harness_state
+
+    base = "~/.local/state/pantheon"
+    evidence = f"{base}/personas/{persona}/runtime-controller/controller-evidence.jsonl"
+    sep = _HARNESS_OVERRIDES_SPLIT
+    rc, out, ran = run(
+        user,
+        f"tail -c 2000000 {base}/harness-overrides/unlanded.jsonl 2>/dev/null; echo {sep}; "
+        f"tail -c 2000000 {base}/harness-overrides/quarantine.jsonl 2>/dev/null; echo {sep}; "
+        f"tail -c 2000000 {evidence} 2>/dev/null | grep -h '\"event\": \"operator_swap_hold_overrid' "
+        "| tail -n 400",
+    )
+    del rc
+    if not ran or out.count(sep) != 2:
+        return None
+    unlanded_text, quarantine_text, override_text = out.split(sep)
+    unlanded = sum(1 for line in unlanded_text.splitlines() if line.strip().startswith("{"))
+    quarantined = len(harness_state.open_quarantine_rows(quarantine_text.splitlines()))
+    orphans = harness_state.orphan_override_rows(override_text.splitlines(), now=datetime.now(timezone.utc))
+    if not (unlanded or quarantined or orphans):
+        return None
+    parts = []
+    if unlanded:
+        parts.append(f"{unlanded} unlanded ledger entr{'y' if unlanded == 1 else 'ies'} (retried by the next harness run)")
+    if quarantined:
+        parts.append(f"{quarantined} quarantined (`harness {persona} quarantine list`)")
+    if orphans:
+        parts.append(
+            f"{len(orphans)} hold override(s) with no outcome: "
+            + ", ".join(f"{o.get('destination')} {o.get('correlation_id')}" for o in orphans[:3])
+        )
+    return {"name": "harness-overrides", "status": WARN, "detail": "; ".join(parts)}
 
 
 def check_agent(name: str, cfg: dict, *, run=_run) -> dict:
@@ -337,10 +447,30 @@ def check_agent(name: str, cfg: dict, *, run=_run) -> dict:
     user = cfg["user"]
     checks: list[dict] = []
 
+    # ORG-106 L4b (T-5527): the seat's declared state, read ONCE and BEFORE every early
+    # return below. A broken sleep (expected_down but something is running) is evaluated
+    # first so no other branch (a disabled unit reading as PAUSED, a hold) can hide it.
+    seat = seat_state.safe_effective_for(name)
+    if seat is not None and seat.expected_down:
+        live = _session_live(user, cfg, run)
+        who = f"{seat.owner or '?'}: {seat.reason or '-'}; until {seat.expires or 'no expiry'}"
+        if live:
+            checks.append({"name": "sleep_breach", "status": FAIL,
+                           "detail": f"declared asleep ({who}) but a session or service is running"})
+            # fall through: the ordinary checks below add the evidence
+        else:
+            checks.append({"name": "seat-state", "status": OK,
+                           "detail": f"asleep (deep-sleep, expected down; {who})"})
+            return {"agent": name, "status": ASLEEP, "checks": checks}
+    else:
+        note = _seat_note(seat)
+        if note is not None:
+            checks.append(note)
+
     session_owning_svc = cfg["services"][0] if cfg.get("services") else None
     if session_owning_svc is not None:
         paused = _is_paused(user, session_owning_svc, run)
-        if paused:
+        if paused and not any(c["name"] == "sleep_breach" for c in checks):
             checks.append({"name": f"paused:{session_owning_svc}", "status": PAUSED,
                            "detail": f"{session_owning_svc} disabled — seat "
                            "deliberately paused, not judging further"})
@@ -385,9 +515,13 @@ def check_agent(name: str, cfg: dict, *, run=_run) -> dict:
                            "detail": "uid map denied — check "
                            "kernel.apparmor_restrict_unprivileged_userns (=0?)"})
 
-    policy_skip = _policy_skip_check(name, user, run=run)
+    policy_skip = _policy_skip_check(name, user, run=run, seat=seat)
     if policy_skip is not None:
         checks.append(policy_skip)
+
+    overrides = _harness_overrides_check(name, user, run=run)
+    if overrides is not None:
+        checks.append(overrides)
 
     order = {OK: 0, WARN: 1, FAIL: 2}
     worst = max((c["status"] for c in checks), key=lambda s: order[s], default=OK)
@@ -461,8 +595,46 @@ def failed_units_sweep(agents: list[str], *, run=_run) -> list[dict]:
     return records
 
 
+def chronicle_coverage_sweep(agents: list[str], *, run=_run) -> list[dict]:
+    """T-5016: per seat, is its last session end archived to its Chronicle?
+
+    Runs tools/session_chronicle.py `coverage` AS the seat's account (its own
+    Chronicle and runtime state live in its 700 home), the same cross-account
+    `_run` posture as every other check here. Read-only. Kept as its own sweep
+    (not a check_agent row) so the per-agent liveness verdicts stay exactly what
+    they were. A check that cannot run is a WARN, never a FAIL."""
+    records: list[dict] = []
+    for agent in agents:
+        user = FLEET[agent]["user"]
+        rc, out, ran = run(user, "python3 ~/pantheon-config/tools/session_chronicle.py "
+                                 f"coverage --persona {agent} --tmux-target {FLEET[agent]['session']}")
+        if not ran:
+            records.append({"agent": agent, "status": WARN, "detail": "could not query (sudo/timeout)"})
+            continue
+        try:
+            parsed = json.loads((out or "").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            records.append({"agent": agent, "status": WARN, "detail": "unreadable coverage output"})
+            continue
+        status = parsed.get("status") if parsed.get("status") in (OK, WARN, FAIL) else WARN
+        records.append({"agent": agent, "status": status,
+                        "detail": f"{parsed.get('detail', '?')} (last restart {parsed.get('last_restart')}, "
+                                  f"latest archive {parsed.get('latest_archive')})"})
+    return records
+
+
+def render_chronicle(records: list[dict]) -> str:
+    glyph = {OK: "✓", WARN: "!", FAIL: "✗"}
+    lines = [f"[{glyph[r['status']]}] chronicle {r['agent']:9} {r['status']}: {r['detail']}"
+             for r in records if r["status"] != OK]
+    fails = [r["agent"] for r in records if r["status"] == FAIL]
+    lines.append(f"CHRONICLE: no archive after last restart on {', '.join(fails)}" if fails
+                 else "CHRONICLE: every checked seat's last session end is archived (or unknowable)")
+    return "\n".join(lines)
+
+
 def render(results: list[dict], failed: list[dict] | None = None) -> str:
-    glyph = {OK: "✓", WARN: "!", FAIL: "✗", PAUSED: "⏸"}
+    glyph = {OK: "✓", WARN: "!", FAIL: "✗", PAUSED: "⏸", ASLEEP: "z"}
     lines = []
     for r in results:
         lines.append(f"[{glyph[r['status']]}] {r['agent']:6} {r['status']}")
@@ -471,7 +643,7 @@ def render(results: list[dict], failed: list[dict] | None = None) -> str:
             # the expected-not-cut-over RECORD once a seat's skip streak
             # clears the visibility floor, not merely a pass/fail probe like
             # every other OK check here (which stays suppressed as noise).
-            if c["status"] != OK or c["name"] == "consume:policy-skip":
+            if c["status"] != OK or c["name"] in ("consume:policy-skip", "seat-state"):
                 lines.append(f"      {glyph[c['status']]} {c['name']}: {c['detail']}")
 
     failed_units_present = []
@@ -489,7 +661,9 @@ def render(results: list[dict], failed: list[dict] | None = None) -> str:
     # it's surfaced for visibility only, appended to whichever summary line
     # actually fires below.
     paused = [r["agent"] for r in results if r["status"] == PAUSED]
-    paused_note = f" ({', '.join(paused)} paused)" if paused else ""
+    asleep = [r["agent"] for r in results if r["status"] == ASLEEP]
+    paused_note = (f" ({', '.join(paused)} paused)" if paused else "") + (
+        f" ({', '.join(asleep)} asleep)" if asleep else "")
     lines.append("")
     if fails or failed_units_present:
         bits = []
@@ -516,18 +690,27 @@ def main(argv=None) -> int:
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--no-failed-sweep", action="store_true",
                     help="skip the blanket `systemctl --failed` sweep (T-1053 detection habit)")
+    ap.add_argument("--chronicle", action="store_true",
+                    help="T-5016: also check every seat's Chronicle archive after its last restart")
     args = ap.parse_args(argv)
 
     agents = [args.agent] if args.agent else list(FLEET)
     results = sweep(agents)
     failed = None if args.no_failed_sweep else failed_units_sweep(agents)
+    chronicle_records = chronicle_coverage_sweep(agents) if args.chronicle else None
     if args.json:
-        print(json.dumps({"agents": results, "failed_units": failed}, indent=2))
+        payload = {"agents": results, "failed_units": failed}
+        if chronicle_records is not None:
+            payload["chronicle"] = chronicle_records
+        print(json.dumps(payload, indent=2))
     else:
         print(render(results, failed))
+        if chronicle_records is not None:
+            print(render_chronicle(chronicle_records))
     agent_fail = any(r["status"] == FAIL for r in results)
     units_fail = bool(failed) and any(fr["status"] == FAIL for fr in failed)
-    return 1 if (agent_fail or units_fail) else 0
+    chronicle_fail = bool(chronicle_records) and any(r["status"] == FAIL for r in chronicle_records)
+    return 1 if (agent_fail or units_fail or chronicle_fail) else 0
 
 
 if __name__ == "__main__":

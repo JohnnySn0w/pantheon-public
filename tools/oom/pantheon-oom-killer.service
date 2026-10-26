@@ -1,0 +1,26 @@
+[Unit]
+Description=Pantheon early-OOM killer (T-5227, ORG-104): protect a list of seat sessions, kill the largest unprotected process, hold the seat
+Documentation=file:///home/claude/pantheon-config/tools/oom/pantheon_oom_killer.py
+After=local-fs.target
+# A crash loop must never park the killer in "failed": no start-rate limit at all.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=PANTHEON_CONFIG_DIR=/home/claude/pantheon-config
+ExecStart=/usr/bin/python3 /usr/local/sbin/pantheon_oom_killer.py
+Restart=always
+RestartSec=1
+# The killer must be the last thing any kernel OOM pass picks, and must stay small itself.
+OOMScoreAdjust=-1000
+MemoryMax=96M
+MemorySwapMax=0
+Nice=-5
+NoNewPrivileges=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/pantheon
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -68,7 +68,7 @@ entries:
     on_failure: standard
     owner: recovery
     serves: "fleet watchdog"
-    system: "Harness Manager — persona seats: install/launch/supervise"
+    system: harness-manager
 """
         )
         self.write_persona(
@@ -82,7 +82,7 @@ entries:
     on_failure: standard
     owner: specialist
     serves: "specialist cadence"
-    system: "Watch / research pipeline"
+    system: watch
 """,
         )
         spec = self.load()

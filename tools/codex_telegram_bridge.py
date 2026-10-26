@@ -2,7 +2,8 @@
 """Target-local Codex Telegram bridge controls for T-2950.
 
 This module deliberately keeps the live surface narrow: deploy verified
-codex-config artifacts, wrap the Telegram token without persisting it, and
+codex bridge artifacts (pinned harness/codex objects of pantheon-config
+since T-4790; codex-config objects before), wrap the Telegram token without persisting it, and
 perform receiver handoff through fixed operations instead of target LLM
 cooperation.
 """
@@ -25,6 +26,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import math
 import time
 import tomllib
 import urllib.error
@@ -44,7 +46,11 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools import mailbox as pantheon_mailbox  # noqa: E402
-from tools.codex_telegram_actions import receiver_handoff_actions  # noqa: E402
+from tools.codex_telegram_actions import (  # noqa: E402
+    HEALTH_409_ERROR_PREFIX,
+    PRIOR_RUNTIME_CHOICES,
+    receiver_handoff_actions,
+)
 from tools.mailbox_writable_roots import (  # noqa: E402
     MailboxWritableRootError,
     resolve_mailbox_writable_roots,
@@ -57,7 +63,13 @@ from tools.harness_permission_posture import (  # noqa: E402
 from tools.persona_apply_path import controlled_apply_environment  # noqa: E402
 
 
-CODEX_TELEGRAM_SOURCE_REVISION = "1266588b7fada4fb517c5621726b67e35beab141"
+#: T-4790 (T-4750 C4b-3): the pin is pantheon-config's own harness/codex tree at
+#: the C4b-2 merge 0f4d81d99, 13 paths (adds codex_telegram/persona_orientation.py,
+#: which the poller imports; the previous 12-path pin at codex-config 1f84f64,
+#: subdir "", could not import its poller). Approved manifest_sha256
+#: e21ea6f9; see APPROVED_BRIDGE_MANIFEST_SHA256 in tools/test_codex_telegram_bridge.py.
+CODEX_TELEGRAM_SOURCE_REVISION = "0f4d81d99b06837efbc0e836264f0bd85617e3b9"
+CODEX_TELEGRAM_SOURCE_SUBDIR = "harness/codex"
 CODEX_TELEGRAM_SOURCE_PATHS = (
     "codex_telegram/__init__.py",
     "codex_telegram/active_step.py",
@@ -65,6 +77,7 @@ CODEX_TELEGRAM_SOURCE_PATHS = (
     "codex_telegram/codex_hooks.py",
     "codex_telegram/config.py",
     "codex_telegram/keepgoing.py",
+    "codex_telegram/persona_orientation.py",
     "codex_telegram/poller.py",
     "codex_telegram/server.py",
     "codex_telegram/standing_instructions.py",
@@ -74,18 +87,23 @@ CODEX_TELEGRAM_SOURCE_PATHS = (
 )
 CODEX_TELEGRAM_SOURCE_SHA256 = {
     "codex_telegram/__init__.py": "1471d4fbf3b6e95c5a796d8ec67afaecb4c99a3077836961b2b77c659573eb13",
-    "codex_telegram/active_step.py": "03e71be7a8a2bb202e54c621f53e07c1e8f08b7ee021f302e987cfd635be4b72",
+    "codex_telegram/active_step.py": "e27c2c2dc4e72b9d9a825aa6de6580a684aecfe29f0e26afc8c2a49f66730304",
     "codex_telegram/allowlist.py": "ca802c955f258b781f1d23fbc73183e3c70077c1b231338e99182af1be6a472f",
-    "codex_telegram/codex_hooks.py": "c8c83c8c04a99df706d551f3d74843fe601eae541827c53604d9be4260ea0f33",
-    "codex_telegram/config.py": "7db8a5119411ec9982b1c70d16f2f1236706aa416e5e346e8b2ee5474fc97630",
-    "codex_telegram/keepgoing.py": "74ce1429e6b352f1271972dd05dfe40aae2b316db7766484488fb394e47079ed",
-    "codex_telegram/poller.py": "e5213a603c2f32223d24fb7e21197a707d29bd207556bef96ef99d68d06b27cf",
+    "codex_telegram/codex_hooks.py": "0cf372040124ffd816d12105d203f1ae5d80e738c1610608c8c2c0e552464abf",
+    "codex_telegram/config.py": "f5f44bb64379129646ec99c38a033a36c243730f72e56efa9fda02f1b64d2bdd",
+    "codex_telegram/keepgoing.py": "f84d768e750d8f855ae85dc52c118aeb7f9b98dc370929461eb0e14da5c4d7ce",
+    "codex_telegram/persona_orientation.py": "c0552ba19e7bfc30ef1e2ba2d4adfbf2aed2940969a076c6c8993367a3d9a811",
+    "codex_telegram/poller.py": "533484213902c12a3af1569572c8dafb84529d5b82017ecb40873da956e93078",
     "codex_telegram/server.py": "02bda3340d5dc4e0d64bd20b2514504188b6139ff3298ed3911ec1bdefdee38b",
-    "codex_telegram/standing_instructions.py": "3d93291014778078ba6e3e0ea6cb976fcab2abb9acdc6d0d4c70d961acb4752d",
+    "codex_telegram/standing_instructions.py": "885f566c065db6c733cbce850cfd65322d9800e22a8e09ce74849b17ea83b118",
     "codex_telegram/submit_verify.py": "1f913de5d9c6eef8967f033642abb12664ba617e47a27556e0b445b5775be9d0",
     "run_poller.py": "4802329fad20ee1a30ecfd729803244ac858365b4ba6dce898e8dd64c0fd12ef",
     "run_server.py": "2c21a2d2a4df17e2704bddbc2eefa1ac453216d30be657c961be362f8affea74",
 }
+#: T-4770 (T-4750 C4b-1): the archive is built from the pantheon-config clone,
+#: which holds codex-config's full history (T-4755 import). T-4790 (C4b-3) then
+#: moved the pin itself into pantheon-config's harness/codex tree.
+CODEX_TELEGRAM_SOURCE_REPO = "pantheon-config"
 BRIDGE_SCHEMA = "pantheon-codex-telegram-bridge/v1"
 COMMAND_SHEET_SCHEMA = "pantheon-codex-telegram-command-sheet/v2"
 SOURCE_CURRENCY_SCHEMA = "pantheon-source-currency/v1"
@@ -123,7 +141,7 @@ CODEX_INSTRUCTION_DISCOVERY_PROMPT = (
     "Telegram reply mapping mcp__telegram__reply; canonical Orchestrator rules remain source-of-truth. "
     "If any item is absent or ambiguous, say so explicitly."
 )
-OPERATOR_CHAT_ID = 456474197
+OPERATOR_CHAT_ID = 424242424
 HEX_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 TOKEN_RE = re.compile(r"^[0-9]+:[A-Za-z0-9_-]+$")
 TELEGRAM_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
@@ -165,6 +183,39 @@ class CodexTelegramSource:
     sha256: Mapping[str, str]
     owner_account: str | None = None
     source_root: Path | None = None
+    #: Tree prefix of ``paths`` inside ``revision`` ("" = the commit's root, true
+    #: for codex-config's own commits such as the historical 1f84f64 pin;
+    #: "harness/codex" for the T-4790 pin). Archive member names stay the
+    #: unprefixed ``paths`` either way (T-4770).
+    subdir: str = ""
+
+    def object_path(self, relative: str) -> str:
+        """The ``git show <revision>:<object_path>`` spec for one deploy path."""
+        return f"{self.subdir}/{relative}" if self.subdir else relative
+
+
+def parse_source_subdir(raw: Any) -> str:
+    """Validate a bridge ``source.subdir``: "" or a clean relative POSIX path."""
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        raise BridgeError("codex telegram source subdir must be a string")
+    if raw == "":
+        return ""
+    parts = raw.split("/")
+    if raw.startswith("/") or raw.endswith("/") or any(part in ("", ".", "..") for part in parts):
+        raise BridgeError("codex telegram source subdir must be a clean relative path")
+    return raw
+
+
+def default_source_root(owner_account: str | None) -> Path:
+    """The source clone the archive is built from when the binding names none."""
+    return Path("/home") / (owner_account or "codex") / CODEX_TELEGRAM_SOURCE_REPO
+
+
+def source_repo_root(source: CodexTelegramSource) -> Path:
+    """The ``--source-repo`` for archive builds, derived from the binding."""
+    return source.source_root or default_source_root(source.owner_account)
 
 
 @dataclass(frozen=True)
@@ -185,6 +236,22 @@ class CodexTelegramBinding:
     mcp_name: str
     source: CodexTelegramSource
     unattended_telegram_tools: bool = False
+    # T-5038: a role may launch Claude from a configured executable (recovery runs
+    # the root-owned /opt copy) instead of the npm path. None = npm path only.
+    claude_executable: Path | None = None
+
+    @property
+    def claude_receiver_argv0s(self) -> frozenset[str]:
+        npm = str(self.account_home / ".npm-global" / "bin" / "claude")
+        if self.claude_executable is None:
+            return frozenset({npm})
+        return frozenset({npm, str(self.claude_executable)})
+
+    @property
+    def claude_pane_commands(self) -> frozenset[str]:
+        if self.claude_executable is None:
+            return frozenset({"claude"})
+        return frozenset({"claude", self.claude_executable.name})
 
     @property
     def current_release(self) -> Path:
@@ -304,12 +371,19 @@ def _archive_sha256(path: Path) -> str:
     return _sha256_bytes(path.read_bytes())
 
 
-def handoff_actions(binding: CodexTelegramBinding, direction: str, phase: str) -> tuple[str, ...]:
+def handoff_actions(
+    binding: CodexTelegramBinding,
+    direction: str,
+    phase: str,
+    *,
+    prior_runtime: str = "live",
+) -> tuple[str, ...]:
     return receiver_handoff_actions(
         claude_receiver_topology=binding.claude_receiver_topology,
         watchdog_units=binding.watchdog_units,
         direction=direction,
         phase=phase,
+        prior_runtime=prior_runtime,  # type: ignore[arg-type]
     )
 
 
@@ -520,14 +594,17 @@ def parse_bridge_block(raw: Mapping[str, Any]) -> tuple[CodexTelegramSource, Map
         raise BridgeError("codex_telegram_bridge source/personas missing")
     paths = tuple(source_raw.get("paths", ()))
     hashes = source_raw.get("sha256")
-    if source_raw.get("repo") != "codex-config":
-        raise BridgeError("codex telegram source repo must be codex-config")
+    if source_raw.get("repo") != CODEX_TELEGRAM_SOURCE_REPO:
+        raise BridgeError(f"codex telegram source repo must be {CODEX_TELEGRAM_SOURCE_REPO}")
     if source_raw.get("revision") != CODEX_TELEGRAM_SOURCE_REVISION:
         raise BridgeError("codex telegram source revision does not match T-2950 pin")
     if paths != CODEX_TELEGRAM_SOURCE_PATHS:
         raise BridgeError("codex telegram source paths do not match approved deploy set")
     if hashes != CODEX_TELEGRAM_SOURCE_SHA256:
         raise BridgeError("codex telegram source hashes do not match approved pin")
+    subdir = parse_source_subdir(source_raw.get("subdir"))
+    if subdir != CODEX_TELEGRAM_SOURCE_SUBDIR:
+        raise BridgeError("codex telegram source subdir does not match approved pin")
     owner_account = source_raw.get("owner_account")
     if owner_account is not None and not (isinstance(owner_account, str) and owner_account):
         raise BridgeError("codex telegram source owner_account must be a non-empty string")
@@ -536,12 +613,13 @@ def parse_bridge_block(raw: Mapping[str, Any]) -> tuple[CodexTelegramSource, Map
         if not isinstance(source_root, str) or not Path(source_root).is_absolute():
             raise BridgeError("codex telegram source_root must be an absolute path")
     source = CodexTelegramSource(
-        "codex-config",
+        CODEX_TELEGRAM_SOURCE_REPO,
         CODEX_TELEGRAM_SOURCE_REVISION,
         paths,
         dict(hashes),
         owner_account=owner_account,
         source_root=Path(source_root) if source_root is not None else None,
+        subdir=subdir,
     )
     if not personas:
         raise BridgeError("codex telegram personas must not be empty")
@@ -602,7 +680,29 @@ def binding_from_manifest(manifest: Any, persona: str, *, root: Path = Path("/")
         mcp_name=str(raw.get("mcp_name", "telegram")),
         source=source,
         unattended_telegram_tools=unattended_telegram_tools,
+        claude_executable=_manifest_role_claude_executable(manifest, role=str(role_binding.role)),
     )
+
+
+def _manifest_role_claude_executable(manifest: Any, *, role: str) -> Path | None:
+    runtime = getattr(manifest, "harness_runtime", {})
+    if not isinstance(runtime, Mapping):
+        return None
+    roles = runtime.get("roles")
+    if not isinstance(roles, Mapping):
+        return None
+    role_raw = roles.get(role)
+    if not isinstance(role_raw, Mapping):
+        return None
+    claude_raw = role_raw.get("claude")
+    if not isinstance(claude_raw, Mapping):
+        return None
+    executable = claude_raw.get("executable")
+    if executable is None:
+        return None
+    if not isinstance(executable, str) or not executable.startswith("/") or "{" in executable:
+        raise BridgeError("claude executable must be an absolute literal path")
+    return Path(executable)
 
 
 def _manifest_role_requires_unattended_telegram(manifest: Any, *, role: str) -> bool:
@@ -702,7 +802,7 @@ def credential_check_receipt(binding: CodexTelegramBinding, *, expected_uid: int
 def compute_source_hashes(source_root: Path, source: CodexTelegramSource) -> SourceHashReceipt:
     hashes: dict[str, str] = {}
     for relative in source.paths:
-        path = source_root / relative
+        path = source_root / source.object_path(relative)
         if not path.is_file():
             raise BridgeError(f"source path missing: {relative}")
         hashes[relative] = _sha256_bytes(path.read_bytes())
@@ -741,7 +841,7 @@ def _git_bytes(repo: Path, *args: str) -> bytes:
 def verify_git_object_at_pin(repo: Path, source: CodexTelegramSource) -> None:
     commit = _git_text(repo, "rev-parse", f"{source.revision}^{{commit}}").strip()
     if commit != source.revision:
-        raise BridgeError("codex-config pinned object does not resolve exactly")
+        raise BridgeError("codex telegram source pinned object does not resolve exactly")
 
 
 def create_verified_source_archive(
@@ -756,7 +856,7 @@ def create_verified_source_archive(
     try:
         with tarfile.open(temporary, "w") as archive:
             for relative in source.paths:
-                content = _git_bytes(source_repo, "show", f"{source.revision}:{relative}")
+                content = _git_bytes(source_repo, "show", f"{source.revision}:{source.object_path(relative)}")
                 digest = _sha256_bytes(content)
                 if digest != source.sha256[relative]:
                     raise BridgeError(f"pinned object hash mismatch: {relative}")
@@ -799,7 +899,7 @@ def source_check_receipt(
             schema="pantheon-codex-telegram-source-receipt/v1",
             revision=source.revision,
             file_sha256={
-                relative: _sha256_bytes(_git_bytes(source_repo, "show", f"{source.revision}:{relative}"))
+                relative: _sha256_bytes(_git_bytes(source_repo, "show", f"{source.revision}:{source.object_path(relative)}"))
                 for relative in source.paths
             },
             manifest_sha256="",
@@ -831,19 +931,32 @@ def source_check_receipt(
     return result
 
 
-def verify_archive(archive_path: Path, source: CodexTelegramSource) -> SourceHashReceipt:
-    with tarfile.open(archive_path, "r:*") as archive:
-        members = [item for item in archive.getmembers() if item.isfile()]
+def _open_archive(archive: Path | bytes) -> tarfile.TarFile:
+    if isinstance(archive, (bytes, bytearray)):
+        return tarfile.open(fileobj=io.BytesIO(archive), mode="r:*")
+    return tarfile.open(archive, "r:*")
+
+
+def _check_member_path(name: str) -> None:
+    path = Path(name)
+    if path.is_absolute() or ".." in path.parts:
+        raise BridgeError("source archive contains escaping path")
+
+
+def verify_archive(archive: Path | bytes, source: CodexTelegramSource) -> SourceHashReceipt:
+    """Verify an archive (a path, or bytes already read) against the pinned source.
+    stage_archive_release passes BYTES so that what is verified is exactly what is
+    extracted (T-4860)."""
+    with _open_archive(archive) as tar:
+        members = [item for item in tar.getmembers() if item.isfile()]
         names = [item.name for item in members]
         for name in names:
-            path = Path(name)
-            if path.is_absolute() or ".." in path.parts:
-                raise BridgeError("source archive contains escaping path")
+            _check_member_path(name)
         if set(names) != set(source.paths):
             raise BridgeError("source archive path set does not match manifest")
         hashes = {}
         for member in members:
-            handle = archive.extractfile(member)
+            handle = tar.extractfile(member)
             if handle is None:
                 raise BridgeError("source archive member unreadable")
             hashes[member.name] = _sha256_bytes(handle.read())
@@ -876,7 +989,11 @@ def _fault(name: str, fault_after: str | None) -> None:
 
 
 def stage_archive_release(archive_path: Path, binding: CodexTelegramBinding, *, fault_after: str | None = None) -> Mapping[str, Any]:
-    receipt = verify_archive(archive_path, binding.source)
+    # T-4860: read the archive ONCE, and verify and extract that same buffer. Re-opening
+    # the path to extract left a window in which another local account could swap a
+    # predictable /tmp archive after verification (unpinned code, pinned-hash evidence).
+    data = archive_path.read_bytes()
+    receipt = verify_archive(data, binding.source)
     release_dir = binding.release_root / "releases" / binding.source.revision
     prior = None
     if binding.current_release.is_symlink():
@@ -888,10 +1005,11 @@ def stage_archive_release(archive_path: Path, binding: CodexTelegramBinding, *, 
     allow_before = _file_snapshot(allowlist)
     current_before = _file_snapshot(binding.current_release)
     try:
-        with tarfile.open(archive_path, "r:*") as archive:
+        with _open_archive(data) as archive:
             for member in archive.getmembers():
                 if not member.isfile():
                     continue
+                _check_member_path(member.name)  # re-checked at the write, not only at verify
                 target = tmp / member.name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 handle = archive.extractfile(member)
@@ -958,10 +1076,9 @@ def _process_snapshot_from_line(line: str) -> ProcessSnapshot | None:
 
 def _is_exact_claude_receiver(binding: CodexTelegramBinding, process: ProcessSnapshot) -> bool:
     argv = _parse_process_args(process.args)
-    expected = str(binding.account_home / ".npm-global" / "bin" / "claude")
     return (
         bool(argv)
-        and argv[0] == expected
+        and argv[0] in binding.claude_receiver_argv0s
         and any(
             item == "--channels" and index + 1 < len(argv) and argv[index + 1] == "plugin:telegram@claude-plugins-official"
             for index, item in enumerate(argv)
@@ -969,8 +1086,17 @@ def _is_exact_claude_receiver(binding: CodexTelegramBinding, process: ProcessSna
     )
 
 
+def _is_shell_box_wrapper(process: ProcessSnapshot) -> bool:
+    """T-5481: the CLAUDE_CODE_SHELL_PREFIX wrapper (`bash .../pantheon-shell-box.sh <cmd...>`)
+    carries the plugin's bun command line in its own args, so a substring match would count it
+    as a second launcher. Its boxed child is the real launcher."""
+    return any(token.endswith("/pantheon-shell-box.sh") for token in _parse_process_args(process.args)[:2])
+
+
 def _is_plugin_launcher(binding: CodexTelegramBinding, process: ProcessSnapshot) -> bool:
     args = process.args
+    if _is_shell_box_wrapper(process):
+        return False
     return (
         str(binding.account_home / ".claude") in args
         and "claude-plugins-official" in args
@@ -1034,6 +1160,26 @@ def _plugin_descendants(binding: CodexTelegramBinding, processes: Sequence[Proce
     return tuple(launchers), tuple(servers)
 
 
+def _is_direct_spawn_plugin_launcher(process: ProcessSnapshot) -> bool:
+    # T-4461: `<bun> run --cwd <plugin> --silent server.ts` (recovery's T-2624 .mcp.json) IS the
+    # server; upstream's `... --silent start` wrapper forks a separate `bun server.ts` child.
+    return "server.ts" in _parse_process_args(process.args)
+
+
+def _plugin_group_shape(
+    launchers: Sequence[ProcessSnapshot],
+    servers: Sequence[ProcessSnapshot],
+) -> tuple[str, str]:
+    """Return ("direct-spawn"|"wrapper", "") for a complete group, else ("", "duplicate"|"not present")."""
+    if len(launchers) > 1 or len(servers) > 1:
+        return "", "duplicate"
+    if len(launchers) != 1:
+        return "", "not present"
+    if _is_direct_spawn_plugin_launcher(launchers[0]):
+        return ("", "duplicate") if servers else ("direct-spawn", "")
+    return ("wrapper", "") if servers else ("", "not present")
+
+
 def _plugin_remnants(binding: CodexTelegramBinding, processes: Sequence[ProcessSnapshot]) -> tuple[ProcessSnapshot, ...]:
     by_pid = {process.pid: process for process in processes}
     plugin_roots = frozenset(process.pid for process in processes if _is_plugin_launcher(binding, process))
@@ -1045,8 +1191,8 @@ def _plugin_remnants(binding: CodexTelegramBinding, processes: Sequence[ProcessS
     )
 
 
-def _any_claude_tmux_pane(tmux: TmuxPaneSnapshot) -> bool:
-    return tmux.exists and not tmux.dead and tmux.command == "claude" and tmux.pane_pid > 0
+def _any_claude_tmux_pane(binding: CodexTelegramBinding, tmux: TmuxPaneSnapshot) -> bool:
+    return tmux.exists and not tmux.dead and tmux.command in binding.claude_pane_commands and tmux.pane_pid > 0
 
 
 def _cgroup_path_components(path: str) -> frozenset[str]:
@@ -1109,7 +1255,7 @@ def _evaluate_runtime_owned_claude_state(
     claude_processes = tuple(process for process in processes if _is_exact_claude_receiver(binding, process))
     plugin_roots = tuple(process for process in processes if _is_plugin_launcher(binding, process))
     plugin_remnants = _plugin_remnants(binding, processes)
-    pane_is_claude = _any_claude_tmux_pane(tmux)
+    pane_is_claude = _any_claude_tmux_pane(binding, tmux)
     plugin_launchers, plugin_servers = _plugin_descendants(binding, processes, pane_pid=tmux.pane_pid if pane_is_claude else 0)
     anchored_group = set(plugin_launchers) | set(plugin_servers)
     orphan_plugins = tuple(process for process in plugin_remnants if process not in anchored_group)
@@ -1139,12 +1285,12 @@ def _evaluate_runtime_owned_claude_state(
             raise BridgeError("runtime-owned Claude receiver process is not present")
         if len(claude_processes) != 1 or claude_processes[0].pid != tmux.pane_pid:
             raise BridgeError("runtime-owned Claude receiver process is not uniquely anchored to tmux")
-        if len(plugin_launchers) > 1 or len(plugin_servers) > 1:
-            raise BridgeError("runtime-owned Claude Telegram plugin group is duplicate")
-        if len(plugin_launchers) != 1 or len(plugin_servers) != 1:
-            raise BridgeError("runtime-owned Claude Telegram plugin group is not present")
+        shape, shape_error = _plugin_group_shape(plugin_launchers, plugin_servers)
+        if shape_error:
+            raise BridgeError(f"runtime-owned Claude Telegram plugin group is {shape_error}")
         if orphan_plugins:
             raise BridgeError("runtime-owned Claude Telegram plugin has orphan supervisor")
+        evidence["plugin_group_shape"] = shape
         return evidence
     if claude_processes or plugin_roots or plugin_remnants or pane_is_claude:
         raise BridgeError("runtime-owned Claude receiver still present")
@@ -1167,10 +1313,10 @@ def _evaluate_systemd_user_claude_state(
     unit_pid = int(unit_probe.main_pid) if unit_probe.main_pid.isdigit() else 0
     server_descendants = _descendant_pids(tmux.server_pid, processes) if tmux.server_pid else frozenset()
     anchored = tuple(process for process in claude_processes if process.pid == tmux.pane_pid and process.pid in server_descendants)
-    plugin_launchers, plugin_servers = _plugin_descendants(binding, processes, pane_pid=tmux.pane_pid if _any_claude_tmux_pane(tmux) else 0)
+    plugin_launchers, plugin_servers = _plugin_descendants(binding, processes, pane_pid=tmux.pane_pid if _any_claude_tmux_pane(binding, tmux) else 0)
     anchored_group = set(plugin_launchers) | set(plugin_servers)
     orphan_plugins = tuple(process for process in plugin_remnants if process not in anchored_group)
-    if _any_claude_tmux_pane(tmux):
+    if _any_claude_tmux_pane(binding, tmux):
         if len(claude_processes) != 1 or tmux.pane_pid != claude_processes[0].pid:
             raise BridgeError("systemd Claude receiver has ambiguous tmux second supervisor")
         if tmux.pane_pid not in server_descendants:
@@ -1205,20 +1351,20 @@ def _evaluate_systemd_user_claude_state(
         if not _cgroup_contains_unit_component(tmux_server_cgroup, binding.claude_receiver_unit):
             raise BridgeError("systemd Claude tmux server is outside service cgroup")
         evidence["tmux_server_cgroup_match"] = "true"
-        if not _any_claude_tmux_pane(tmux):
+        if not _any_claude_tmux_pane(binding, tmux):
             raise BridgeError("systemd Claude tmux pane is not present")
         if len(claude_processes) != 1:
             raise BridgeError("claude receiver process is not unique")
         if len(anchored) != 1:
             raise BridgeError("claude receiver process is not anchored to tmux server")
-        if len(plugin_launchers) > 1 or len(plugin_servers) > 1:
-            raise BridgeError("systemd Claude Telegram plugin group is duplicate")
-        if len(plugin_launchers) != 1 or len(plugin_servers) != 1:
-            raise BridgeError("systemd Claude Telegram plugin group is not present")
+        shape, shape_error = _plugin_group_shape(plugin_launchers, plugin_servers)
+        if shape_error:
+            raise BridgeError(f"systemd Claude Telegram plugin group is {shape_error}")
         if orphan_plugins:
             raise BridgeError("systemd Claude Telegram plugin has orphan supervisor")
+        evidence["plugin_group_shape"] = shape
         return evidence
-    if active or claude_processes or plugin_remnants or _any_claude_tmux_pane(tmux):
+    if active or claude_processes or plugin_remnants or _any_claude_tmux_pane(binding, tmux):
         raise BridgeError("claude receiver still present")
     return evidence
 
@@ -1241,6 +1387,14 @@ def _runtime_owned_error_is_transient(message: str) -> bool:
     return any(fragment in message for fragment in transient_fragments)
 
 
+#: T-4184: what the codex poller logs on a getUpdates 409 (codex-config
+#: codex_telegram/poller.py: log.error("409 Conflict — another getUpdates poller
+#: holds the token; ...")). Matched instead of a bare "409".
+CODEX_POLLER_CONFLICT_MARKER = "409 Conflict"
+#: Two or more conflict lines in the current run = sustained (unchanged semantics).
+CODEX_POLLER_CONFLICT_THRESHOLD = 2
+
+
 class LocalReceiverBackend:
     def __init__(self, *, timeout_seconds: int = 90, proc_root: Path = Path("/proc")):
         self.timeout_seconds = timeout_seconds
@@ -1260,6 +1414,20 @@ class LocalReceiverBackend:
         if result.returncode != 0:
             raise BridgeError(f"systemctl {' '.join(args)} failed: {result.stderr.strip()}")
         return result
+
+    def _stop_unit_tolerating_not_found(self, unit: str) -> None:
+        """`systemctl --user stop`, except a unit that does not exist on this
+        account (LoadState=not-found; `stop` exits 5) counts as already
+        stopped (T-4158): there is nothing to stop, and the absence probe that
+        follows (ActiveState/MainPID plus a process scan) still decides. Any
+        other stop failure raises, as `_systemctl` always has."""
+        result = self._run(("systemctl", "--user", "stop", unit))
+        if result.returncode == 0:
+            return
+        load = self._run(("systemctl", "--user", "show", unit, "-p", "LoadState", "--value"))
+        if load.returncode == 0 and load.stdout.strip() == "not-found":
+            return
+        raise BridgeError(f"systemctl stop {unit} failed: {result.stderr.strip()}")
 
     def _unit_probe(self, unit: str) -> UnitProbe:
         result = self._systemctl("show", unit, "-p", "ActiveState", "-p", "SubState", "-p", "MainPID")
@@ -1583,6 +1751,44 @@ class LocalReceiverBackend:
                 raise BridgeError("runtime-owned dormant Claude receiver restore would start/enable unit")
         self._restore_units(binding, units_to_restore=(binding.claude_receiver_unit,))
 
+    def _unit_active_enter_epoch(self, unit: str) -> float:
+        """Wall-clock epoch of `unit`'s current activation (T-4184), derived
+        from ActiveEnterTimestampMonotonic (format-free, same clock as
+        time.monotonic()). Raises when the unit has no current activation."""
+        result = self._systemctl("show", unit, "-p", "ActiveEnterTimestampMonotonic", "--value")
+        raw = result.stdout.strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            raise BridgeError(f"{unit} has no current activation timestamp")
+        return time.time() - (time.monotonic() - int(raw) / 1_000_000)
+
+    def _codex_poller_conflicts_since_start(self, binding: CodexTelegramBinding) -> int:
+        """T-4184: count getUpdates 409 Conflict lines the codex poller logged
+        during its CURRENT run. Bounded by the unit's activation time (earlier
+        runs' 409s, e.g. from a resolved double-poller incident, never count),
+        message bodies only (`-o cat`, so a journal PID such as 140923 cannot
+        match), and matched on the poller's conflict text
+        (`CODEX_POLLER_CONFLICT_MARKER`), not a bare "409"."""
+        since = math.ceil(self._unit_active_enter_epoch(binding.codex_receiver_unit))
+        journal = self._run(
+            (
+                "journalctl", "--user", "-u", binding.codex_receiver_unit,
+                "--since", f"@{since}", "-o", "cat", "-n", "200", "--no-pager",
+            )
+        )
+        if journal.returncode != 0:
+            return 0
+        return sum(1 for line in journal.stdout.splitlines() if CODEX_POLLER_CONFLICT_MARKER in line)
+
+    def receiver_topology_snapshot_pending(self, binding: CodexTelegramBinding) -> bool:
+        """Read-only (T-4178): True when a claude-to-codex pre phase left an
+        INCOMPLETE receiver topology snapshot, i.e. there is saved unit state
+        that a codex-to-claude post phase must restore and complete. A missing
+        snapshot, or one already completed, is False: the post phase would
+        refuse on it, and there is nothing to restore. An unreadable or
+        foreign-identity snapshot raises BridgeError (never guessed)."""
+        self._require_current_account(binding)
+        return self._read_topology_snapshot(binding).get("complete") is not True
+
     def _complete_topology_snapshot(self, binding: CodexTelegramBinding) -> None:
         payload = self._read_topology_snapshot(binding, require_existing=True)
         updated = dict(payload)
@@ -1613,7 +1819,7 @@ class LocalReceiverBackend:
         elif action == "probe-claude-absent":
             self._require_absent(binding, kind="claude")
         elif action == "stop-codex-poller":
-            self._systemctl("stop", binding.codex_receiver_unit)
+            self._stop_unit_tolerating_not_found(binding.codex_receiver_unit)
         elif action == "probe-codex-absent":
             self._require_absent(binding, kind="codex")
         elif action == "start-codex-poller":
@@ -1622,9 +1828,12 @@ class LocalReceiverBackend:
             self._require_present(binding, kind="codex")
         elif action == "health-codex-no-409":
             self._require_present(binding, kind="codex")
-            journal = self._run(("journalctl", "--user", "-u", binding.codex_receiver_unit, "-n", "80", "--no-pager"))
-            if journal.returncode == 0 and journal.stdout.count("409") >= 2:
-                raise BridgeError("sustained Telegram getUpdates 409 observed")
+            conflicts = self._codex_poller_conflicts_since_start(binding)
+            if conflicts >= CODEX_POLLER_CONFLICT_THRESHOLD:
+                raise BridgeError(
+                    f"{HEALTH_409_ERROR_PREFIX}: {conflicts} getUpdates 409 Conflict lines "
+                    "since the poller's current start"
+                )
         elif action == "enable-claude-receiver":
             self._systemctl("enable", binding.claude_receiver_unit)
         elif action == "start-claude-receiver":
@@ -1648,17 +1857,6 @@ class LocalReceiverBackend:
         else:
             raise BridgeError(f"unsupported receiver handoff action {action!r}")
         return {"action": action, "ok": "true"}
-
-
-def verify_git_checkout_at_pin(repo: Path) -> None:
-    result = subprocess.run(
-        ("git", "-C", str(repo), "rev-parse", "HEAD"),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0 or result.stdout.strip() != CODEX_TELEGRAM_SOURCE_REVISION:
-        raise BridgeError("codex-config checkout HEAD does not equal T-2950 pin")
 
 
 def render_unit(binding: CodexTelegramBinding) -> str:
@@ -1758,6 +1956,58 @@ def mcp_registration_compatibility(
         if existing_tool.get("approval_mode") != expected_tool.get("approval_mode"):
             return False
     return True
+
+
+@dataclass(frozen=True)
+class ReadinessCheck:
+    name: str
+    ok: bool
+    detail: str
+
+
+def receiver_readiness(
+    binding: CodexTelegramBinding,
+    *,
+    managed_marker: str,
+    poller_unit: Path | None = None,
+    codex_config: Path | None = None,
+) -> list[ReadinessCheck]:
+    """T-5451: is the codex Telegram receiver installed well enough for a claude->codex
+    swap to hand comms over? The ONE shared definition, used by the runtime controller
+    (mid-session cap swap gate) and `persona_installer_verify_seat` (post-install check).
+
+    Pure file inspection, no side effects. Paths default to the binding's own account
+    home; verify-seat passes the plan's resolved targets. `managed_marker` is the
+    installer banner (passed in: this module cannot import persona_installer).
+    """
+    unit = poller_unit or (binding.account_home / ".config" / "systemd" / "user" / binding.codex_receiver_unit)
+    try:
+        banner = unit.is_file() and unit.read_text(encoding="utf-8", errors="replace").startswith(f"# {managed_marker}")
+    except OSError:
+        banner = False
+    checks = [ReadinessCheck("poller-unit-installed", bool(banner), str(unit))]
+
+    current = binding.current_release
+    if current.is_symlink():
+        target = Path(os.readlink(current))
+        checks.append(ReadinessCheck(
+            "release-current-pinned", target.name == binding.source.revision,
+            f"current -> {target}; pinned {binding.source.revision}"))
+    else:
+        checks.append(ReadinessCheck("release-current-pinned", False, f"{current} is not a symlink"))
+
+    config = codex_config or (binding.account_home / ".codex" / "config.toml")
+    try:
+        data = tomllib.loads(config.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        checks.append(ReadinessCheck("codex-mcp-registered", False, f"codex config unreadable: {exc}"))
+    else:
+        verdict = mcp_registration_compatibility(
+            data, mcp_name=binding.mcp_name, expected_table=_expected_mcp_table(binding))
+        checks.append(ReadinessCheck(
+            "codex-mcp-registered", verdict is True,
+            {True: "registered", False: "differs from expected", None: "absent"}[verdict]))
+    return checks
 
 
 def ensure_mcp_registration(path: Path, binding: CodexTelegramBinding) -> McpRegistrationReceipt:
@@ -2134,6 +2384,10 @@ def precutover_mailbox_probe(persona: str, mailbox_root: Path) -> Mapping[str, A
 def _rooted_path(root: Path, absolute: Path) -> Path:
     if not absolute.is_absolute():
         raise BridgeError(f"path must be absolute: {absolute}")
+    # "//"-prefixed paths survive normpath unchanged (POSIX) but name the same
+    # file as "/"; refused as a typed error, not relative_to's ValueError (T-4963)
+    if str(absolute).startswith("//") or str(root).startswith("//"):
+        raise BridgeError(f"path must not start with '//': {absolute}")
     if root == Path("/"):
         return absolute
     return root / absolute.relative_to("/")
@@ -2505,7 +2759,8 @@ def _default_manifest_path() -> Path:
 def _load_manifest(path: Path) -> Any:
     from tools.persona_installer import Manifest
 
-    return Manifest.load(path)
+    # lenient: the poller/MCP server/stage commands run live; a flip-key violation is not theirs to enforce
+    return Manifest.load(path, strict_flip_keys=False)
 
 
 def binding_for_current_account(
@@ -2662,8 +2917,51 @@ def _instruction_target_proof(
     }
 
 
-def _sudo_bash(account: str, inner: str) -> str:
-    return shlex.join(("sudo", "-iu", account, "bash", "-lc", inner))
+def _sudo_bash(account: str, inner: str, *, trailing_arg: str | None = None) -> str:
+    command = shlex.join(("sudo", "-iu", account, "bash", "-lc", inner))
+    # trailing_arg is a raw (operator-shell expanded) positional for the inner shell: $1.
+    return command if trailing_arg is None else f"{command} _ {trailing_arg}"
+
+
+# T-5066: archives are staged in private mktemp dirs, never at a fixed /tmp path.
+_STAGE_SRC_VAR = "CODEX_TG_SRC_DIR"
+_STAGE_DST_VAR = "CODEX_TG_DST_DIR"
+
+
+def _staged_archive_refs(persona: str) -> tuple[str, str]:
+    """Operator-shell references (expanded at paste time) for the source and target archives."""
+    stem = f"codex-telegram-{persona}-{CODEX_TELEGRAM_SOURCE_REVISION}"
+    return f'"${_STAGE_SRC_VAR}/{stem}.codex.tar"', f'"${_STAGE_DST_VAR}/{stem}.tar"'
+
+
+def _staging_dirs_prefix(target_account: str, *, source_account: str | None = None) -> str:
+    """mktemp -d (0700, unpredictable) dirs, each owned by the user who writes into it.
+
+    The source dir belongs to the operator who runs source-check; root's install reads it.
+    The target dir belongs to the seat account, which reads it for bridge-stage; root's
+    install -o writes it. No other local user can create, swap or traverse either dir.
+    """
+    # T-5068: when a different account writes the source archive (orchestrator: the codex
+    # clone owner), that account must own the dir; otherwise the operator does.
+    src_maker = "mktemp -d" if source_account is None else f"sudo -u {shlex.quote(source_account)} mktemp -d"
+    return (
+        f"{_STAGE_SRC_VAR}=$({src_maker}) && "
+        f"{_STAGE_DST_VAR}=$(sudo -u {shlex.quote(target_account)} mktemp -d) && "
+    )
+
+
+def _staging_cleanup_suffix(*, source_account: str | None = None) -> str:
+    src_rm = "rm" if source_account is None else "sudo rm"  # dir owned by another account
+    return (
+        f' && {src_rm} -rf -- "${{{_STAGE_SRC_VAR}:?}}"'
+        f' && sudo rm -rf -- "${{{_STAGE_DST_VAR}:?}}"'
+        f" && unset {_STAGE_SRC_VAR} {_STAGE_DST_VAR}"
+    )
+
+
+def _staged_install_command(source_gate: str, account: str, source_ref: str, target_ref: str) -> str:
+    install = shlex.join(("sudo", "install", "-o", account, "-g", account, "-m", "0600"))
+    return f"{source_gate} && {install} {source_ref} {target_ref}"
 
 
 def _source_currency_inner(bridge_tool: Path, repo: Path, expected_head: str) -> str:
@@ -2697,8 +2995,8 @@ def _target_account_env_prefix(account: str, account_home: Path) -> tuple[str, .
     return tuple(f"{key}={value}" for key, value in env.items())
 
 
-def _target_account_shell_command(account: str, account_home: Path, command: str) -> str:
-    return shlex.join(
+def _target_account_shell_command(account: str, account_home: Path, command: str, *, forward_arg: bool = False) -> str:
+    wrapped = shlex.join(
         (
             "/usr/bin/env",
             *_target_account_env_prefix(account, account_home),
@@ -2707,6 +3005,8 @@ def _target_account_shell_command(account: str, account_home: Path, command: str
             command,
         )
     )
+    # forward_arg: hand the login shell's $1 on to the command's own $1 (T-5066).
+    return f'{wrapped} _ "$1"' if forward_arg else wrapped
 
 
 def _target_account_argv_command(account: str, account_home: Path, argv: Sequence[str | Path]) -> str:
@@ -2753,9 +3053,10 @@ def _target_gate(account: str, account_home: Path, bridge_tool: Path, repo: Path
     return _sudo_bash(account, inner)
 
 
-def _gated_target_command(account: str, account_home: Path, bridge_tool: Path, repo: Path, expected_head: str, command: str) -> str:
+def _gated_target_command(account: str, account_home: Path, bridge_tool: Path, repo: Path, expected_head: str, command: str, *, trailing_arg: str | None = None) -> str:
     compound = f"set -euo pipefail; {_source_currency_inner(bridge_tool, repo, expected_head)} && {command}"
-    return _sudo_bash(account, _target_account_shell_command(account, account_home, compound))
+    inner = _target_account_shell_command(account, account_home, compound, forward_arg=trailing_arg is not None)
+    return _sudo_bash(account, inner, trailing_arg=trailing_arg)
 
 
 def _operator_command(swap_tool: Path, state_root: Path, persona: str, destination: str, correlation_id: str) -> str:
@@ -2811,12 +3112,11 @@ def amendment_i_remediation(persona: str, binding: CodexTelegramBinding, *, expe
     account = binding.account
     repo = binding.account_home / "pantheon-config"
     bridge_tool = repo / "tools" / "codex_telegram_bridge.py"
-    source_archive = f"/tmp/codex-telegram-{persona}-{CODEX_TELEGRAM_SOURCE_REVISION}.codex.tar"
-    target_archive = f"/tmp/codex-telegram-{persona}-{CODEX_TELEGRAM_SOURCE_REVISION}.tar"
+    source_archive, target_archive = _staged_archive_refs(persona)
     snapshot_dir = binding.state_dir / "receipts" / "amendment-i-pane-restage"
     offset_path = binding.state_dir / "poller.offset"
     source_gate = _target_gate(account, binding.account_home, bridge_tool, repo, expected)
-    install_archive = f"{source_gate} && {shlex.join(('sudo', 'install', '-o', account, '-g', account, '-m', '0600', source_archive, target_archive))}"
+    install_archive = _staged_install_command(source_gate, account, source_archive, target_archive)
     def receiver(kind: str, expected_state: str, *, topology_phase: TopologyPhase | None = None) -> str:
         argv = [
             "python3",
@@ -2858,7 +3158,8 @@ def amendment_i_remediation(persona: str, binding: CodexTelegramBinding, *, expe
         _command_step(
             "ai-01-source-archive",
             "amendment-i-preflight",
-            shlex.join(
+            _staging_dirs_prefix(account)
+            + shlex.join(
                 (
                     "python3",
                     "/home/codex/pantheon-config/tools/codex_telegram_bridge.py",
@@ -2866,11 +3167,11 @@ def amendment_i_remediation(persona: str, binding: CodexTelegramBinding, *, expe
                     "--persona",
                     persona,
                     "--source-repo",
-                    "/home/codex/codex-config",
+                    str(source_repo_root(binding.source)),
                     "--archive",
-                    source_archive,
                 )
-            ),
+            )
+            + f" {source_archive}",
         ),
         _command_step("ai-02-install-archive", "amendment-i-preflight", install_archive),
         _command_step("ai-03-snapshot-unit-offset", "amendment-i-preflight", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, snapshot)),
@@ -2886,8 +3187,10 @@ def amendment_i_remediation(persona: str, binding: CodexTelegramBinding, *, expe
                 bridge_tool,
                 repo,
                 expected,
-                shlex.join(("python3", str(bridge_tool), "bridge-stage", "--persona", persona, "--archive", target_archive, "--json")),
-            ),
+                shlex.join(("python3", str(bridge_tool), "bridge-stage", "--persona", persona, "--archive")) + ' "$1" --json',
+                trailing_arg=target_archive,
+            )
+            + _staging_cleanup_suffix(),
         ),
         _command_step("ai-08-daemon-reload", "amendment-i-restart", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, shlex.join(("systemctl", "--user", "daemon-reload")))),
         _command_step("ai-09-start-codex", "amendment-i-restart", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, shlex.join(("systemctl", "--user", "start", binding.codex_receiver_unit)))),
@@ -3496,22 +3799,21 @@ def _legacy_command_sheet(
     state_root = home / ".local" / "state" / "pantheon" / "personas"
     bridge_tool = home / "pantheon-config" / "tools" / "codex_telegram_bridge.py"
     swap_tool = home / "pantheon-config" / "tools" / "proactive_swap_init.py"
-    source_archive = f"/tmp/codex-telegram-{persona}-{CODEX_TELEGRAM_SOURCE_REVISION}.codex.tar"
-    target_archive = f"/tmp/codex-telegram-{persona}-{CODEX_TELEGRAM_SOURCE_REVISION}.tar"
+    source_archive, target_archive = _staged_archive_refs(persona)
     to_codex = f"t2950-{persona}-to-codex"
     to_claude = f"t2950-{persona}-to-claude"
     codex_operator = _operator_command(swap_tool, state_root, persona, "codex/interactive-chatgpt", to_codex)
     claude_operator = _operator_command(swap_tool, state_root, persona, "claude/interactive-subscription", to_claude)
     source_gate = _target_gate(account, home, bridge_tool, repo, expected)
-    install = f"{source_gate} && {shlex.join(('sudo', 'install', '-o', account, '-g', account, '-m', '0600', source_archive, target_archive))}"
+    install = _staged_install_command(source_gate, account, source_archive, target_archive)
     codex_consume = shlex.join(("/usr/bin/env", f"PANTHEON_PERSONA_STATE_DIR={state_root}", "systemctl", "--user", "start", f"pantheon-persona-consume@{persona}.service"))
     steps = [
         _command_step("01-credential-check", "preflight", _sudo_bash(account, _target_account_shell_command(account, home, f"set -euo pipefail; {shlex.join(('python3', str(bridge_tool), 'credential-check', '--persona', persona, '--json'))}"))),
         _command_step("02-telegram-preflight", "preflight", _sudo_bash(account, _target_account_shell_command(account, home, f"set -euo pipefail; {shlex.join(('python3', str(bridge_tool), 'telegram-preflight', '--persona', persona, '--json'))}"))),
         _operator_gate("03-precutover-mailbox-delivery", "preflight", {"kind": "mailbox-durable-delivery", "runtime": "precutover", "consumption_verified": False}),
-        _command_step("04-source-archive", "stage", shlex.join(("python3", "/home/codex/pantheon-config/tools/codex_telegram_bridge.py", "source-check", "--persona", persona, "--source-repo", "/home/codex/codex-config", "--archive", source_archive))),
+        _command_step("04-source-archive", "stage", _staging_dirs_prefix(account) + shlex.join(("python3", "/home/codex/pantheon-config/tools/codex_telegram_bridge.py", "source-check", "--persona", persona, "--source-repo", str(source_repo_root(binding.source)), "--archive")) + f" {source_archive}"),
         _command_step("05-install-archive", "stage", install),
-        _command_step("06-bridge-stage", "stage", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, shlex.join(("python3", str(bridge_tool), "bridge-stage", "--persona", persona, "--archive", target_archive, "--json")))),
+        _command_step("06-bridge-stage", "stage", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, shlex.join(("python3", str(bridge_tool), "bridge-stage", "--persona", persona, "--archive")) + ' "$1" --json', trailing_arg=target_archive) + _staging_cleanup_suffix()),
         _command_step("07-swap-to-codex", "codex-cutover", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, codex_operator)),
         _command_step("08-start-codex-consume", "codex-cutover", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, codex_consume)),
         _command_step("09-gate-codex-completed", "codex-cutover", _operator_gate_compound(account, home, bridge_tool, swap_tool, repo, state_root, persona=persona, destination="codex/interactive-chatgpt", correlation_id=to_codex, expected_head=expected)),
@@ -3569,7 +3871,7 @@ def command_sheet(
         raise BridgeError(f"codex standing instructions missing for {persona!r}")
     account = binding.account
     source_account = binding.source.owner_account or "codex"
-    source_root = binding.source.source_root or Path("/home") / source_account / "codex-config"
+    source_root = source_repo_root(binding.source)
     home = binding.account_home
     repo = home / "pantheon-config"
     state_root = home / ".local" / "state" / "pantheon" / "personas"
@@ -3577,12 +3879,11 @@ def command_sheet(
     swap_tool = home / "pantheon-config" / "tools" / "proactive_swap_init.py"
     apply_tool = repo / "tools" / "t2611_recovery_persona_apply.py"
     cutover_tool = repo / "tools" / "persona_cutover.sh"
-    source_archive = f"/tmp/codex-telegram-{persona}-{CODEX_TELEGRAM_SOURCE_REVISION}.codex.tar"
-    target_archive = f"/tmp/codex-telegram-{persona}-{CODEX_TELEGRAM_SOURCE_REVISION}.tar"
+    source_archive, target_archive = _staged_archive_refs(persona)  # T-5068: private mktemp dirs
     to_claude = f"t2953-{persona}-to-claude"
     claude_operator = _operator_command(swap_tool, state_root, persona, "claude/interactive-subscription", to_claude)
     source_gate = _target_gate(account, home, bridge_tool, repo, expected)
-    install = f"{source_gate} && {shlex.join(('sudo', 'install', '-o', account, '-g', account, '-m', '0600', source_archive, target_archive))}"
+    install = _staged_install_command(source_gate, account, source_archive, target_archive)
     def receiver(kind: str, expected_state: str, *, topology_phase: TopologyPhase | None = None) -> str:
         argv = [
             "python3",
@@ -3607,7 +3908,7 @@ def command_sheet(
         proof="source",
     )
     stage1_dry = shlex.join(("bash", str(cutover_tool), "--persona", persona, "--stamp", "<operator-stamp>", "--manifest", str(repo / "instance.yaml")))
-    stage_disabled = shlex.join(("python3", str(apply_tool), "stage-disabled", "--manifest", str(repo / "instance.yaml"), "--persona", persona, "--harness", "claude", "--repo-root", str(repo), "--stamp", "<operator-stamp>"))
+    stage_disabled = shlex.join(("python3", str(apply_tool), "stage-disabled", "--manifest", str(repo / "instance.yaml"), "--persona", persona, "--harness", "claude", "--repo-root", str(repo), "--stamp", "<operator-stamp>", "--codex-telegram-archive-dir")) + ' "$1"'
     stage1_execute = shlex.join(("bash", str(cutover_tool), "--persona", persona, "--stamp", "<operator-stamp>", "--manifest", str(repo / "instance.yaml"), "--execute"))
     instruction_discovery = _codex_instruction_discovery_command(repo)
     initial_viability = _repo_module_command(
@@ -3697,10 +3998,21 @@ def command_sheet(
         _command_step("02-telegram-preflight", "preflight", _sudo_bash(account, _target_account_shell_command(account, home, f"set -euo pipefail; {shlex.join(('python3', str(bridge_tool), 'telegram-preflight', '--persona', persona, '--json'))}"))),
         _operator_gate("03-precutover-mailbox-delivery", "preflight", {"kind": "mailbox-durable-delivery", "runtime": "precutover", "consumption_verified": False}),
         _command_step("04-instruction-source-check", "stage", _sudo_bash(account, _target_account_shell_command(account, home, f"set -euo pipefail; {instruction_source_check}"))),
-        _command_step("05-source-archive", "stage", _sudo_bash(source_account, f"set -euo pipefail; {shlex.join(('python3', str(Path('/home') / source_account / 'pantheon-config' / 'tools' / 'codex_telegram_bridge.py'), 'source-check', '--persona', persona, '--source-repo', str(source_root), '--archive', source_archive, '--json'))}")),
+        _command_step(
+            "05-source-archive",
+            "stage",
+            _staging_dirs_prefix(account, source_account=source_account)
+            + _sudo_bash(
+                source_account,
+                "set -euo pipefail; "
+                + shlex.join(('python3', str(Path('/home') / source_account / 'pantheon-config' / 'tools' / 'codex_telegram_bridge.py'), 'source-check', '--persona', persona, '--source-repo', str(source_root), '--archive'))
+                + ' "$1" --json',
+                trailing_arg=source_archive,
+            ),
+        ),
         _command_step("06-install-archive", "stage", install),
         _command_step("07-stage1-cutover-dry-run", "stage1-controller-claude", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, stage1_dry)),
-        _command_step("08-stage-disabled-instructions-and-bridge", "stage1-controller-claude", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, stage_disabled)),
+        _command_step("08-stage-disabled-instructions-and-bridge", "stage1-controller-claude", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, stage_disabled, trailing_arg=f'"${_STAGE_DST_VAR}"')),
         _command_step("09-postinstall-instruction-target", "stage1-postinstall-proof", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, _instruction_proof_command(bridge_tool, persona=persona, manifest_path=repo / "instance.yaml", root=root, proof="target"))),
         _command_step("10-codex-instruction-discovery", "stage1-postinstall-proof", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, instruction_discovery)),
         _operator_gate(
@@ -3721,7 +4033,7 @@ def command_sheet(
         ),
         _command_step("12-prove-codex-absent", "stage1-postinstall-proof", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, receiver("codex", "absent"))),
         _command_step("13-gate-claude-present", "stage1-postinstall-proof", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, receiver("claude", "present", topology_phase="predecessor"))),
-        _command_step("14-stage1-cutover-execute", "codex-cutover", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, stage1_execute)),
+        _command_step("14-stage1-cutover-execute", "codex-cutover", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, stage1_execute) + _staging_cleanup_suffix(source_account=source_account)),
         _command_step("15-gate-initial-viability", "codex-cutover", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, initial_viability)),
         _command_step("16-prove-claude-absent", "codex-acceptance", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, receiver("claude", "absent", topology_phase="managed"))),
         _command_step("17-prove-codex-present", "codex-acceptance", _gated_target_command(account, binding.account_home, bridge_tool, repo, expected, receiver("codex", "present"))),
@@ -3926,6 +4238,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     handoff.add_argument("--phase", required=True)
     handoff.add_argument("--reason", required=True)
     handoff.add_argument("--timeout-seconds", type=int, default=90)
+    # T-4184: "unproven" = the prior runtime may be dead or capped (controller
+    # codex launch); see codex_telegram_actions.PriorRuntime.
+    handoff.add_argument("--prior-runtime", choices=PRIOR_RUNTIME_CHOICES, default="live")
     handoff.add_argument("--manifest", type=Path, default=_default_manifest_path())
     handoff.add_argument("--json", action="store_true")
     receiver_state = sub.add_parser("receiver-state")
@@ -3935,6 +4250,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     receiver_state.add_argument("--topology-phase", choices=("managed", "predecessor"), default=None)
     receiver_state.add_argument("--manifest", type=Path, default=_default_manifest_path())
     receiver_state.add_argument("--json", action="store_true")
+    snapshot_state = sub.add_parser("topology-snapshot-state")
+    snapshot_state.add_argument("--persona", required=True)
+    snapshot_state.add_argument("--manifest", type=Path, default=_default_manifest_path())
+    snapshot_state.add_argument("--json", action="store_true")
     telegram_evidence = sub.add_parser("telegram-unattended-evidence")
     telegram_evidence.add_argument("--action", choices=("prepare", "record"), required=True)
     telegram_evidence.add_argument("--persona", required=True)
@@ -4051,7 +4370,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             binding = binding_for_current_account(args.manifest, args.persona)
             backend = LocalReceiverBackend(timeout_seconds=args.timeout_seconds)
             operations = []
-            actions = handoff_actions(binding, args.direction, args.phase)
+            actions = handoff_actions(binding, args.direction, args.phase, prior_runtime=args.prior_runtime)
             try:
                 for action in actions:
                     backend.execute(action, binding)
@@ -4090,6 +4409,26 @@ def main(argv: Sequence[str] | None = None) -> int:
                 error=f"{type(exc).__name__}: {exc}",
             )
             print(json.dumps(redact_secrets(dataclasses.asdict(receipt), ()), sort_keys=True))
+            return 1
+    if args.command == "topology-snapshot-state":
+        try:
+            binding = binding_for_current_account(args.manifest, args.persona)
+            pending = LocalReceiverBackend().receiver_topology_snapshot_pending(binding)
+            print(json.dumps({
+                "schema": "pantheon-codex-telegram-topology-snapshot-state/v1",
+                "persona": binding.persona,
+                "account": binding.account,
+                "ok": True,
+                "pending": pending,
+            }, sort_keys=True))
+            return 0
+        except Exception as exc:
+            print(json.dumps({
+                "schema": "pantheon-codex-telegram-topology-snapshot-state/v1",
+                "persona": args.persona,
+                "ok": False,
+                "error": f"{type(exc).__name__}: {exc}",
+            }, sort_keys=True))
             return 1
     if args.command == "receiver-state":
         try:

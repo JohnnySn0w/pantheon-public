@@ -1,0 +1,20 @@
+{
+  "schema": "pantheon.quant.delivery.repos/v1",
+  "repos": [
+    {
+      "name": "pantheon-config",
+      "github": "example-org/pantheon-config",
+      "local_path": "/home/suborch1/pantheon-config"
+    },
+    {
+      "name": "echo-prismatic",
+      "github": "example-org/echo-prismatic",
+      "local_path": "/home/suborch1/echo-prismatic"
+    },
+    {
+      "name": "pantheon-pwa",
+      "github": "example-org/pantheon-pwa",
+      "local_path": "/home/suborch1/pantheon-pwa"
+    }
+  ]
+}

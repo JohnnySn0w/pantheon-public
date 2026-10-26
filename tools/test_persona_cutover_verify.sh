@@ -50,6 +50,10 @@ check_contains() { # <desc> <haystack> <needle>
   if [[ "$2" == *"$3"* ]]; then pass=$((pass+1)); echo "PASS: $1";
   else fail=$((fail+1)); echo "FAIL: $1 (did not find '$3' in: $2)"; fi
 }
+check_not_contains() { # <desc> <haystack> <needle>
+  if [[ "$2" != *"$3"* ]]; then pass=$((pass+1)); echo "PASS: $1";
+  else fail=$((fail+1)); echo "FAIL: $1 (unexpectedly found '$3' in: $2)"; fi
+}
 skip() { skipped=$((skipped+1)); echo "SKIP: $1"; } # <desc>
 
 # T-2731 (ORG-066 Rung-1 isolation, T-2443 shape): the case-6 cutover / missing-backup
@@ -304,7 +308,7 @@ manifest = {
                 "claude": {
                     "profile": "interactive-subscription",
                     "model": None,
-                    "native": {"permission_mode": "default"},
+                    "native": {"permission_mode": "bypassPermissions"},
                 }
             }
         },
@@ -350,13 +354,16 @@ run_cutover_case() { # <persona> <account> <uid> <supervise-basename>
   check "cutover(${persona}): stale target manifest dies with rc 1" "$rc" "1"
   check_contains "cutover(${persona}): stale manifest message" "$out" "not synced for persona"
 
-  # 5. SYNCED manifest (this repo's own, real) + real (non-stubbed) uid ->
-  #    manifest precondition PASSES, then the REAL uid-guard rejects (we are
-  #    genuinely not $uid on this box).
-  out="$(bash "$CUTOVER" --persona "$persona" --stamp t1 --manifest "$INSTANCE_YAML" --unit-file "$unit_file" 2>&1)"; rc=$?
-  check "cutover(${persona}): synced manifest, real (wrong) uid dies with rc 1" "$rc" "1"
+  # 5. SYNCED manifest (this repo's own, real) + a WRONG uid -> manifest
+  #    precondition PASSES, then the real uid-guard rejects. `id -u` is stubbed
+  #    to a uid that is not $uid: on the persona's own seat the real caller IS
+  #    $uid, and the guard would rightly pass (T-4342).
+  local wrong_uid=65534
+  [[ "$uid" == "$wrong_uid" ]] && wrong_uid=65533
+  out="$(FAKE_UID="$wrong_uid" PATH="$FAKEBIN2:$PATH" bash "$CUTOVER" --persona "$persona" --stamp t1 --manifest "$INSTANCE_YAML" --unit-file "$unit_file" 2>&1)"; rc=$?
+  check "cutover(${persona}): synced manifest, wrong uid dies with rc 1" "$rc" "1"
   check_contains "cutover(${persona}): manifest precondition OK printed" "$out" "manifest precondition OK"
-  check_contains "cutover(${persona}): uid-guard rejects real caller" "$out" "must run as ${account} (uid ${uid})"
+  check_contains "cutover(${persona}): uid-guard rejects a wrong uid" "$out" "must run as ${account} (uid ${uid}); got uid ${wrong_uid}"
 
   # 6. SYNCED manifest + STUBBED uid (id -u -> the target's own uid) -> the
   #    uid-guard now PASSES, XRD /run/user/<uid> exists on this box for real
@@ -413,11 +420,18 @@ run_rollback_case() { # <persona> <account> <uid> <supervise-basename>
     skip "rollback(${persona}): missing-backup checkpoint (no user bus /run/user/${uid} — needs linger, T-2731)"
   fi
 
-  # --manifest is accepted but unused (no manifest dependency) -- must still
-  # reach the SAME missing-backup abort, not error out on the flag itself.
+  # T-4848: --manifest is now LOAD-BEARING for the staged-checkpoint rollback
+  # (it pins the checkpoint's allowed write roots; break-glass is the explicit
+  # --break-glass-no-manifest). It is still ACCEPTED here and must reach the
+  # SAME early abort (missing backup / absent user bus), not error out on the
+  # flag itself. The pin itself runs only AFTER those preconditions and the
+  # teardown, so this sandbox cannot reach a pin-specific line; assert instead
+  # that the pre-T-4848 "ignoring" note is gone (the old contract), and cover
+  # the pin/break-glass behavior in test_persona_installer.py's script-level
+  # rollback tests plus the DRY-RUN structural check below.
   out="$(FAKE_UID="$uid" PATH="$FAKEBIN2:$PATH" bash "$ROLLBACK" --persona "$persona" --stamp definitely-no-such-stamp --manifest "$STALE_DIR/${persona}-stale.yaml" --unit-file "$unit_file" 2>&1)"; rc=$?
   check "rollback(${persona}): --manifest accepted, still reaches missing-backup" "$rc" "1"
-  check_contains "rollback(${persona}): --manifest ignored-note printed" "$out" "ignoring"
+  check_not_contains "rollback(${persona}): no stale --manifest ignored-note (T-4848: manifest is the pin)" "$out" "ignoring"
 
   rm -f "$unit_file"
 }
@@ -437,6 +451,7 @@ rm -rf "$FAKEBIN2" "$STALE_DIR"
 DRYRUN_BLOCK="$(sed -n '/DRY-RUN — would then run/,/Dry-run OK/p' "$ROLLBACK")"
 check_contains "rollback DRY-RUN block mentions control-plane scope teardown" "$DRYRUN_BLOCK" "RUNTIME_SCOPE_UNIT"
 check_contains "rollback DRY-RUN block mentions tmux kill-session guard" "$DRYRUN_BLOCK" "kill-session"
+check_contains "rollback DRY-RUN block shows the manifest pin and break-glass mode (T-4848)" "$DRYRUN_BLOCK" "--break-glass-no-manifest"
 
 echo "----------------------------------------"
 echo "$pass passed, $fail failed, $skipped skipped"

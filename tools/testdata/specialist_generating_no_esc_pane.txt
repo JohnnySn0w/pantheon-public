@@ -1,0 +1,9 @@
+  ⎿  $ timeout 40 ssh host 'cd ~/pipeline && sed -n "106,116p"
+     pipeline.py' 2>&1
+✽ Clauding… (2m 23s · ↓ 9.8k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's
+     current work
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · ← for agents

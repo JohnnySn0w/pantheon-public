@@ -163,7 +163,7 @@ def load_seat_context(
     repo_root: Path,
     home: Path,
 ) -> SeatContext:
-    manifest = Manifest.load(manifest_path)
+    manifest = Manifest.load(manifest_path, strict_flip_keys=False)
     try:
         binding = manifest.binding(persona)
     except ManifestError as exc:
@@ -507,7 +507,7 @@ def verify(ctx: SeatContext, runner: CommandRunner) -> tuple[VerifyCheck, ...]:
     argv_ok = (
         bool(argv.strip())
         and f"--model {model}" in argv
-        and "--permission-mode default" in argv
+        and "--permission-mode bypassPermissions" in argv
         and "--channels" not in argv
     )
     checks.append(

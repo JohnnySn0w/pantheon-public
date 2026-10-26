@@ -1,0 +1,16 @@
+[Unit]
+Description=Pantheon recovery-seat watcher, every 2 minutes, DRY-RUN (T-4884 B3)
+Documentation=file:///home/%u/pantheon-config/notes/2026-10-12-t4884-codex-recovery-seat-design.md
+
+# NOT auto-installed by this build. Template only; enable on codex-fallback after
+# B7 creates the account and root provisions /run/recovery-seat-health (tmpfiles).
+# Its heartbeat (/run/recovery-seat-health/watcher.json) going stale is Recovery's signal.
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Unit=pantheon-recovery-watcher.service
+
+[Install]
+WantedBy=timers.target

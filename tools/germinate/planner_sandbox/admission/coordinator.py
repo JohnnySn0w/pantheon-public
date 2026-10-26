@@ -3,7 +3,7 @@
 Real-primitive mechanism: a filesystem-atomic claim. A claim's EXISTENCE
 on disk is the mechanism-of-record -- no process needs to stay alive to
 "hold" it, so it survives caller-process exit (including SIGKILL) by
-construction. This is the ref-impl's answer to the Cairn v9 BLOCK-1
+construction. This is the ref-impl's answer to the Consultant v9 BLOCK-1
 finding (a caller-held ``flock(2)`` releases automatically when the
 holding process exits, which breaks C1's "across process lifecycle
 boundaries" requirement). See T-3292 DECISIONS for the flock/broker
@@ -147,7 +147,7 @@ def claim(
     on disk; the caller holds admission until ``release()`` is called
     explicitly, by the run's own finalize step, NEVER automatically on
     process exit. This is the load-bearing property that survives the
-    Cairn v9 BLOCK-1 witness.
+    Consultant v9 BLOCK-1 witness.
     """
 
     leaf = _leaf_dir(system_dir, instance, component)

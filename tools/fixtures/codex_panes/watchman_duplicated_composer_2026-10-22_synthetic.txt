@@ -1,0 +1,47 @@
+
+  - Root cause: claude-fallback lingering is disabled. Its user manager—and ORG-
+    076 timer—dies when the last SSH session closes.
+
+  - Runner cycles themselves showed no refusals.
+  - Watchman lacks the required root privilege to restore linger; no repair
+    attempt was consumed.
+
+  - The operator received a Telegram action alert with the exact reversible command
+    and verification gate.
+
+  - T-5030 was retargeted to the operator in inbox/.
+  - The stale consultant@codex routing fix remains pending until the root repair is
+    completed and the ticket returns to Watchman.
+
+  The ticket-flow skill required the evidence-first diagnosis and retargeting
+  instead of leaving an operator-blocked ticket active.
+
+─ Worked for 4m 03s ────────────────────────────────────────────────────────────
+
+
+› [pantheon-mailbox-wake] You have 1 unread inter-agent message in your mailbox
+  (from inbox_consumer).
+  QUEUED, oldest first — READ THIS BEFORE ACTING ON ANY ONE OF THEM. Delivery is
+  FIFO, so a correction is always consumed AFTER the claim it corrects; if a
+  later subject retracts an earlier one, honour the later one.
+    1. inbox_consumer: ticket poke T-5401
+  Drain them: `python3 -c "import sys; sys.path.insert(0,'/home/codex-
+  fallback/pantheon-config/tools'); import mailbox;
+  print(mailbox.consume('/home/post-office/mailbox/watchman', lambda m:
+  print(m['sender'], m['subject'], m['payload'])))"` to inspect+ack, or read
+  /home/codex-fallback/pantheon-config/tools/mailbox.py and consume with a
+  handler that acts on each payload. Your inbox is /home/post-
+  office/mailbox/watchman (the shared /home/the-ancestor hub, ORG-026 Path A).
+  NOTE: if a bare run hits PermissionError on the hub, wrap it `sg pantheon-
+  mailbox -c '<the python command above>'` — a live session-process that
+  predates the pantheon-mailbox-group grant needs it (T-1016 / a user-manager
+  restart removes this need). Messages stay in new/ until you consume them, so
+  nothing is lost if you finish your current turn first.
+
+  gpt-5.6-sol high · ~/pantheon-config
+› (from inbox_consumer).
+  QUEUED, oldest first — READ THIS BEFORE ACTING ON ANY ONE OF THEM. Delivery is
+  FIFO, so a correction is always consumed AFTER the claim it corrects; if a
+  later subject retracts an earlier one, honour the later one.
+    1. inbox_consumer: ticket poke T-5401
+  Drain them: `python3 -c "import sys; s

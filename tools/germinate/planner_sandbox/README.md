@@ -1,6 +1,6 @@
 # planner_sandbox — germination-engine sandbox+admission reference-implementation
 
-**Intent.** Prove — mechanically, against a real Linux host — that the sandbox+admission subsystem of the germination engine can satisfy commitments C1–C5 of [[adr/ORG-080-germination-engine.md]]. Where the ADR names specific implementation mechanisms (`systemd-run --user` invocations, mode-0644 gate leaves at specific paths, tmpfs marker byte contents, seccomp closure sequences), those are documentary reference; this reference-implementation is free to demonstrate an equally-valid mechanism against real host semantics. Where documentary prose conflicts with what this ref-impl proves, the ref-impl wins on mechanism; where either conflicts with C1–C5, the ADR §Architectural-tier scope carve wins on outcome.
+**Intent.** Prove — mechanically, against a real Linux host — that the sandbox+admission subsystem of the germination engine can satisfy commitments C1–C5 of [[architecture/adr/ORG-080-germination-engine.md]]. Where the ADR names specific implementation mechanisms (`systemd-run --user` invocations, mode-0644 gate leaves at specific paths, tmpfs marker byte contents, seccomp closure sequences), those are documentary reference; this reference-implementation is free to demonstrate an equally-valid mechanism against real host semantics. Where documentary prose conflicts with what this ref-impl proves, the ref-impl wins on mechanism; where either conflicts with C1–C5, the ADR §Architectural-tier scope carve wins on outcome.
 
 **Why a ref-impl and not more ADR prose.** The T-3273→T-3274 pivot fired because prose-only iteration kept surfacing POSIX/systemd/state-machine facts one round too late (v8 seat-home traverse + system↔user-manager ordering; v9 flock cross-process lifecycle + N-gate cardinality + systemd unit-tier vs command-tier enforcement + state-machine reconciliation). ADR iteration cannot mechanically discover the next-depth-level provider fact in advance; a minimal running implementation exercising real primitives can.
 
@@ -12,11 +12,11 @@ Each subsection maps a commitment to the mechanism this ref-impl demonstrates an
 
 **Outcome required.** For any `(instance, component)` pair and any admission-eligible verb, exactly one run holds admission at any moment across ALL scopes/uids that can hold or read the coordination primitive, across process-lifecycle boundaries (caller-exit while run persists), fail-closed if the primitive is unreachable.
 
-**Mechanism this ref-impl demonstrates.** A single-holder coordination primitive whose hold survives the caller process's exit and is visible to every uid that can invoke the engine on the component. Candidate primitives to trial in red-before-green order: (a) `flock(2)` on a root-owned world-readable leaf held by a persistent helper (long-lived holder, not the caller — Cairn v9 BLOCK-1's finding is that the caller's process-exit release breaks single-run when the writer becomes the holder), (b) a broker-daemon-mediated lease with the broker as sole holder, (c) a filesystem-atomic rename claim with fsync-boundary lifecycle. The ref-impl picks one and PROVES it; alternatives are documented as considered-and-rejected with the failure signature.
+**Mechanism this ref-impl demonstrates.** A single-holder coordination primitive whose hold survives the caller process's exit and is visible to every uid that can invoke the engine on the component. Candidate primitives to trial in red-before-green order: (a) `flock(2)` on a root-owned world-readable leaf held by a persistent helper (long-lived holder, not the caller — Consultant v9 BLOCK-1's finding is that the caller's process-exit release breaks single-run when the writer becomes the holder), (b) a broker-daemon-mediated lease with the broker as sole holder, (c) a filesystem-atomic rename claim with fsync-boundary lifecycle. The ref-impl picks one and PROVES it; alternatives are documented as considered-and-rejected with the failure signature.
 
 **Red-before-green tests.**
 1. **Cross-uid concurrent-claim.** Two processes under distinct uids attempt admission on the same `(instance, component)`; exactly one succeeds, the other refuses at the admission tier BEFORE any mutation-tier code runs. Instrument: strace both callers to prove the losing caller never opens a mutation-tier path.
-2. **Caller-exit persistence (Cairn v9 BLOCK-1 witness).** Caller A claims admission, exec's a plan phase, then exits (SIGKILL from outside — no chance to clean up). Caller B under distinct uid attempts admission on the same `(instance, component)` — MUST still refuse until the run's mechanism-of-record itself transitions out of the admitting-state, regardless of caller-A's process lifecycle.
+2. **Caller-exit persistence (Consultant v9 BLOCK-1 witness).** Caller A claims admission, exec's a plan phase, then exits (SIGKILL from outside — no chance to clean up). Caller B under distinct uid attempts admission on the same `(instance, component)` — MUST still refuse until the run's mechanism-of-record itself transitions out of the admitting-state, regardless of caller-A's process lifecycle.
 3. **Primitive-unreachable fail-closed.** Remove/corrupt the primitive underneath a live engine invocation; the next admission attempt refuses with a clearly-typed error, not a permit.
 4. **N-scope enumeration.** With `system-scope + seat-<uid1> + seat-<uid2>` all having gates in the tree, admission for `(instance, component)` is single-run across all three; the "two-gate admission" prose in ADR §Base engine mechanics is documentary — this test proves the actual invariant regardless of scope count.
 
@@ -28,7 +28,7 @@ Each subsection maps a commitment to the mechanism this ref-impl demonstrates an
 
 **Red-before-green tests.**
 1. **Coverage exhaustion.** Every state in the enum appears in at least one `test_transition_from_<state>_admits_<successor>` case; a `pytest --collect-only`-style check counts states vs. covered states and REFUSES the suite if any state has zero outgoing tests (except explicitly-named terminals).
-2. **Reboot-recovery trace (Cairn v9 BLOCK-2 witness).** Persist a record at `ACTIVE`; simulate `system-reboot` (`HALTED reason: system-reboot`, `boot_id` differs from `/proc/sys/kernel/random/boot_id`); run reconciler; assert record ends at `ACTIVE` again via the documented `HALTED → PARKED → ACTIVE` path, with the transitions logged in order.
+2. **Reboot-recovery trace (Consultant v9 BLOCK-2 witness).** Persist a record at `ACTIVE`; simulate `system-reboot` (`HALTED reason: system-reboot`, `boot_id` differs from `/proc/sys/kernel/random/boot_id`); run reconciler; assert record ends at `ACTIVE` again via the documented `HALTED → PARKED → ACTIVE` path, with the transitions logged in order.
 3. **PARKING_FAILED escape.** Persist a record at `PARKING_FAILED`; the ONLY admissible operator verb is `germinate rollback --run <run_id>`; every other verb refuses at the state-machine gate (not at some later admission tier).
 4. **Malformed-record refusal.** Persist a record with an unenumerated `state:` value; reconciler returns `REFUSE_MALFORMED` and does NOT invent a next state.
 
@@ -40,7 +40,7 @@ Each subsection maps a commitment to the mechanism this ref-impl demonstrates an
 
 **Red-before-green tests.**
 1. **CLI surface refusal.** Before postboot marker exists, `germinate <verb>` for any admission-eligible verb refuses with a typed "postboot precondition unmet" error.
-2. **Systemd unit surface refusal (Cairn v9 BLOCK-3 witness).** A component unit whose `ExecStart` bypasses the CLI (invokes engine internals directly) MUST fail to start until the postboot-completion primitive is reached. Test installs a minimal component unit, verifies it stays in `activating`/`inactive` until the postboot precondition holds.
+2. **Systemd unit surface refusal (Consultant v9 BLOCK-3 witness).** A component unit whose `ExecStart` bypasses the CLI (invokes engine internals directly) MUST fail to start until the postboot-completion primitive is reached. Test installs a minimal component unit, verifies it stays in `activating`/`inactive` until the postboot precondition holds.
 3. **Library-call surface refusal.** A Python process directly imports and invokes an engine internal; the internal refuses at the postboot gate. The gate lives INSIDE the library, not at the CLI wrapper.
 4. **Boot-id staleness.** Marker exists but its body ≠ `/proc/sys/kernel/random/boot_id`; every surface refuses (marker treated as stale, not present).
 
@@ -94,8 +94,8 @@ Per F5 chain-of-justification, the project-orchestrator brief carries C1–C5 fo
 
 ## Refs
 
-- **[[adr/ORG-080-germination-engine.md]]** — the ratified §Architectural-tier scope carve is the source of truth for C1–C5.
-- **[[adr/ORG-081-system-registry.md]]** — coverage registry the engine reads.
-- **[[adr/ORG-082-broker-daemon-exposed-surface-amendment.md]]** — the substrate broker the engine's typed executor uses for runtime-seat actuation.
+- **[[architecture/adr/ORG-080-germination-engine.md]]** — the ratified §Architectural-tier scope carve is the source of truth for C1–C5.
+- **[[architecture/adr/ORG-081-system-registry.md]]** — coverage registry the engine reads.
+- **[[architecture/adr/ORG-082-broker-daemon-exposed-surface-amendment.md]]** — the substrate broker the engine's typed executor uses for runtime-seat actuation.
 - **T-3273** — the v9 predecessor whose findings triggered the pivot.
 - **T-3274** — this ref-impl's umbrella ticket (retargeted orchestrator 2026-08-26).

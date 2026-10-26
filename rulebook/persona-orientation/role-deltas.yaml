@@ -12,7 +12,7 @@
 #     excerpt AND inline commentary, e.g. project_orchestrator's
 #     chain_of_justification below).
 #
-# Cairn roles (cairn_worker, cairn_reviewer, cairn_temp_backup_orchestrator)
+# Consultant roles (consultant_worker, consultant_reviewer, consultant_temp_backup_orchestrator)
 # are declared in manifest.yaml's roles list but intentionally have NO entry
 # here — Phase 5 gates on the T-3333 charter ruling. Do not populate.
 
@@ -45,6 +45,10 @@ roles:
         sha-stamped — no ratified rulebook/sop source exists yet for this
         specific five-phase framing; the text above restates the memory pin,
         it does not invent new content.
+    worktree_stash_hygiene:
+      extract: heading-region
+      source: sop/standard/pre-implementation-reviewer-discipline.md
+      heading: "## Worktree git-hygiene: never bare `git stash` (it is repo-wide, not worktree-scoped)"
 
   reviewer:
     preimplementation:
@@ -53,7 +57,7 @@ roles:
     codex_spec_review:
       extract: full-file
       source: sop/standard/codex-planning-spec-review.md
-    three_methodologies:
+    review_methodologies:
       extract: full-file
       source: sop/standard/reviewer-methodologies.md
 
@@ -73,30 +77,35 @@ roles:
       - extract: heading-region
         source: rulebook/principles.md
         heading: "## P3 — Decisions justify upward"
-      - extract: inline
-        body: |
-          Operationalized: every dispatch brief explicitly requires the
-          dispatchee to (a) emit a DECISIONS section justifying-via P/D ids
-          on every material call, (b) recursively require the same of anyone
-          they in turn dispatch, (c) report back with the chain intact so it
-          can be lifted into the ledger. Do not rely on
-          inheritance-by-reference — a restart-fresh dispatchee may not load
-          a file merely named in the brief; spell the requirement out
-          operationally at every dispatch boundary. Full operational text:
-          `~/CLAUDE.md` section "Chain of justification" (user-scope, outside
-          this repo's git tree — not sha-stamped here; P3 above is the
-          stamped principle-tier anchor for the same rule).
+      # The former inline text + FIX-SOON (no repo-stampable home for the
+      # operational rule) is resolved by T-2892: the operational form now
+      # lives in sop/standard/orchestrator-standing-rules.md.
+      - extract: heading-region
+        source: sop/standard/orchestrator-standing-rules.md
+        heading: "## Chain of justification"
 
-          FIX-SOON: no dedicated repo-stampable SOP exists for this
-          cross-cutting rule — several SOPs (team-orchestrator-brief
-          -construction.md, team-orchestrator-dispatch-checklist.md,
-          plan-first-dispatch.md, retask-dispatch.md) each restate it inline
-          and point back to CLAUDE.md rather than to a shared source. HO
-          decision, out of Phase 1 scope: consider landing a
-          `sop/standard/orchestrator-standing-rules.md` (or similar) as
-          a repo-stampable home for load-bearing HO-pinned rules.
+  # T-2892 (ORG-075 D2/E2 deliverable b): the seat-loadable HO playbook for
+  # mason + artisan (persona_roles.yaml: engineering_orchestrator). Precision
+  # over bulk — team mechanics stay in pantheon-role-project-orchestrator,
+  # which the standing-rules SOP tells a seat to load when it runs a team.
+  engineering_orchestrator:
+    standing_rules:
+      extract: full-file
+      source: sop/standard/orchestrator-standing-rules.md
+    autonomy_calibration:
+      extract: heading-region
+      source: rulebook/policies/trust-posture.md
+      heading: "## Act-vs-park calibration — the deferred-judgment reframe (amendment, Ratified 2026-06-10 by the operator, Telegram 3096)"
+    ticket_routing:
+      extract: heading-region
+      source: sop/standard/ticket-flow.md
+      heading: "## The load-bearing rule: who claims what"
+    push_merge_boundary:
+      extract: heading-region
+      source: sop/standard/retask-dispatch.md
+      heading: "## Push/merge boundary"
 
-  orchestrator:
+  head_engineering_orchestrator:
     autonomy_calibration:
       extract: heading-region
       source: rulebook/policies/trust-posture.md

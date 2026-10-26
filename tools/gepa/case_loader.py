@@ -30,7 +30,7 @@ from typing import Any, Mapping
 
 from tools.ticket import REPO_ROOT
 
-EVAL_SET_DIR = REPO_ROOT / "knowledge" / "eval" / "reviewer-v1"
+EVAL_SET_DIR = REPO_ROOT / "knowledge" / "eval" / "reviewer-v2"
 CASES_DIR = EVAL_SET_DIR / "cases"
 MANIFEST_PATH = EVAL_SET_DIR / "manifest.json"
 

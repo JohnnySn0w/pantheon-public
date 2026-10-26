@@ -118,7 +118,7 @@ class TestEndToEndSubprocess(unittest.TestCase):
         obj = json.loads(out)
         hso = obj["hookSpecificOutput"]
         self.assertEqual(hso["hookEventName"], "PreToolUse")
-        self.assertEqual(hso["permissionDecision"], "allow")
+        self.assertNotIn("permissionDecision", hso)  # T-4650: context only, no approval
         self.assertIn("recovery", hso["additionalContext"])
         self.assertIn("disk 91% WARN", hso["additionalContext"])
         self.assertFalse((self.inbox / umi._MARKER_NAME).exists(),

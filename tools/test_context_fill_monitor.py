@@ -116,11 +116,12 @@ def _dispatch_joined(mock_run) -> str:
 class ActiveHarnessGateTests(unittest.TestCase):
     def test_orchestrator_codex_active_gates_claude_only_continuity_monitors(self) -> None:
         cfg = dict(cfm.AGENT_CONFIG["orchestrator"])
+        # Own-account case: the env override applies only to the monitoring account.
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
             os.environ,
             {"PANTHEON_PERSONA_STATE_DIR": tmp},
             clear=False,
-        ):
+        ), patch.object(cfm, "_current_user", return_value=cfg["sudo_user"]):
             state = Path(tmp) / "orchestrator" / "runtime-controller" / "runtime.json"
             state.parent.mkdir(parents=True)
             state.write_text(
@@ -155,6 +156,141 @@ class ActiveHarnessGateTests(unittest.TestCase):
             self.assertEqual(malformed_gate.active_harness, "")
 
 
+class ActiveHarnessGateCrossAccountT5024(unittest.TestCase):
+    """T-5024: recovery runs every agent's monitor. Another agent's runtime.json is read
+    under THAT account's home, as that account, and any read failure fails closed."""
+
+    def _gate(self, rc: int, stdout: str = "", env: dict | None = None):
+        cfg = dict(cfm.AGENT_CONFIG["specialist"])
+        done = subprocess.CompletedProcess([], rc, stdout=stdout, stderr="")
+        clean = {k: v for k, v in os.environ.items() if k != "PANTHEON_STATE_DIR"}
+        with patch.dict(os.environ, {**clean, **(env or {})}, clear=True), \
+                patch.object(cfm, "_current_user", return_value="claude-fallback"), \
+                patch.object(cfm.subprocess, "run", return_value=done) as run:
+            gate = cfm.active_harness_monitor_gate("specialist", cfg)
+        return gate, run
+
+    def test_reads_the_agents_own_home_as_that_account_despite_monitor_env(self) -> None:
+        state = json.dumps({"schema": "pantheon-runtime-state/v1", "harness": "codex"})
+        gate, run = self._gate(0, state, env={
+            "PANTHEON_PERSONA_STATE_DIR": "/home/claude-fallback/.local/state/pantheon/personas"})
+        self.assertEqual((gate.status, gate.active_harness), ("disabled", "codex"))
+        argv = run.call_args.args[0]
+        self.assertEqual(argv[:3], ["sudo", "-nu", "claude-research"])
+        self.assertEqual(
+            argv[-1],
+            "/home/claude-research/.local/state/pantheon/personas/specialist/runtime-controller/runtime.json",
+        )
+
+    def test_positive_missing_is_pre_controller(self) -> None:
+        gate, _ = self._gate(cfm._RUNTIME_STATE_MISSING_RC)
+        self.assertEqual((gate.status, gate.source), ("enabled", "pre-controller"))
+
+    def test_unreadable_fails_closed(self) -> None:
+        gate, _ = self._gate(1)
+        self.assertEqual((gate.status, gate.source), ("disabled", "runtime-json"))
+
+    def test_sudo_raising_fails_closed(self) -> None:
+        cfg = dict(cfm.AGENT_CONFIG["specialist"])
+        clean = {k: v for k, v in os.environ.items() if k != "PANTHEON_STATE_DIR"}
+        with patch.dict(os.environ, clean, clear=True), \
+                patch.object(cfm, "_current_user", return_value="claude-fallback"), \
+                patch.object(cfm.subprocess, "run", side_effect=subprocess.TimeoutExpired("sudo", 15)):
+            gate = cfm.active_harness_monitor_gate("specialist", cfg)
+        self.assertEqual(gate.status, "disabled")
+
+
+class ManifestRuntimeReferencesCodexParseRoutingT4298(unittest.TestCase):
+    """T-4298: _manifest_runtime_references_codex routes its instance.yaml parse
+    through agent_role_map's content-keyed cache instead of a per-fire safe_load.
+    Pins the PRE-routing contract on every failure input (each -> False, never an
+    exception), per-call freshness (an edit between two calls is observed, even a
+    same-size edit with the mtime restored), and that the shared cached document
+    is never mutated."""
+
+    def setUp(self) -> None:
+        from tools.agent_role_map import resolve_instance_role
+
+        self.role = resolve_instance_role("orchestrator")
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = Path(self.tmp.name) / "instance.yaml"
+
+    def _manifest(self, fallback: str) -> str:
+        return (
+            "harness_runtime:\n  roles:\n"
+            f"    {self.role}:\n      fallbacks:\n        - {fallback}/x\n"
+        )
+
+    def _refs(self) -> bool:
+        return cfm._manifest_runtime_references_codex("orchestrator", self.path)
+
+    def test_failure_inputs_all_return_false(self) -> None:
+        # missing file (OSError)
+        self.assertIs(self._refs(), False)
+        cases = {
+            "malformed yaml (YAMLError)": b"harness_runtime: [1, 2\n",
+            "invalid utf-8 (UnicodeDecodeError)": b"harness_runtime: \xff\xfe\n",
+            "empty document (None)": b"",
+            "non-mapping top level (list)": b"- codex/x\n",
+            "non-mapping harness_runtime": b"harness_runtime: codex\n",
+            "non-mapping roles": b"harness_runtime:\n  roles: [codex]\n",
+        }
+        for label, content in cases.items():
+            with self.subTest(label):
+                self.path.write_bytes(content)
+                self.assertIs(self._refs(), False)
+        # unreadable: a directory at the manifest path (IsADirectoryError)
+        self.path.unlink()
+        self.path.mkdir()
+        self.assertIs(self._refs(), False)
+
+    def test_codex_fallback_and_codex_block_detected(self) -> None:
+        self.path.write_text(self._manifest("codex"), encoding="utf-8")
+        self.assertIs(self._refs(), True)
+        self.path.write_text(
+            f"harness_runtime:\n  roles:\n    {self.role}:\n      codex: {{}}\n",
+            encoding="utf-8",
+        )
+        self.assertIs(self._refs(), True)
+
+    def test_edit_between_calls_is_observed_same_size_same_mtime(self) -> None:
+        self.path.write_text(self._manifest("codex"), encoding="utf-8")
+        st = self.path.stat()
+        self.assertIs(self._refs(), True)
+        # "codex" -> "claud": identical byte length; restore mtime so only a
+        # CONTENT-keyed read can see the change (the T-4279 stat-key rebound).
+        self.path.write_text(self._manifest("claud"), encoding="utf-8")
+        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(self.path.stat().st_size, st.st_size)
+        self.assertIs(self._refs(), False)
+        self.path.write_text(self._manifest("codex"), encoding="utf-8")
+        self.assertIs(self._refs(), True)
+        # Break it after a good read: the failure is seen, not a cached True.
+        self.path.write_text("harness_runtime: [\n", encoding="utf-8")
+        self.assertIs(self._refs(), False)
+
+    def test_routed_through_cache_not_safe_load_and_never_mutates(self) -> None:
+        import copy
+
+        import yaml
+
+        self.path.write_text(self._manifest("codex"), encoding="utf-8")
+
+        def _boom(*_a, **_k):
+            raise AssertionError("yaml.safe_load must not be called (T-4298)")
+
+        with patch.object(yaml, "safe_load", _boom):
+            self.assertIs(self._refs(), True)
+            try:
+                from agent_role_map import _parse_manifest
+            except ImportError:  # pragma: no cover - tools/ not on sys.path
+                from tools.agent_role_map import _parse_manifest
+            before = copy.deepcopy(_parse_manifest(self.path))
+            self.assertIs(self._refs(), True)
+            self.assertEqual(_parse_manifest(self.path), before)
+
+
 # ---------------------------------------------------------------------------
 # compute_fill_tokens
 # ---------------------------------------------------------------------------
@@ -166,7 +302,7 @@ class CapabilityCapGuidanceIsCorrectT2290(unittest.TestCase):
 
     All three were wrong. The text says 'monthly spend limit' but the binding
     constraint is the CURRENT TIME WINDOW (the operator, 2026-07-29), and it clears
-    on its own — orchestrator/metis/atlas each lost ~2h on 2026-07-29 and all resumed
+    on its own — orchestrator/mason/artisan each lost ~2h on 2026-07-29 and all resumed
     unaided. Acting on the old guidance cost a false escalation and three
     corrections. An alert that names the wrong remediation is the T-2310 class:
     confidently wrong beats silent.
@@ -188,7 +324,7 @@ class CapabilityCapGuidanceIsCorrectT2290(unittest.TestCase):
         self.assertIn("DEFAULT ACTION: WAIT", self.src)
 
     def test_still_names_the_subagent_consequence(self):
-        """atlas's finding: the cap kills dispatched subagents while the main
+        """artisan's finding: the cap kills dispatched subagents while the main
         loop keeps working, so a seat can look healthy while its work dies."""
         self.assertIn("DISPATCHED SUBAGENTS", self.src)
 
@@ -731,6 +867,237 @@ class TestDeadTranscriptGuardMainFlow(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Stale-jsonl guard (T-4088)
+# ---------------------------------------------------------------------------
+
+
+class TestPaneProcessStartEpoch(unittest.TestCase):
+    def _run(self, stdout: str, returncode: int = 0):
+        return MagicMock(returncode=returncode, stdout=stdout, stderr="")
+
+    def test_start_is_now_minus_etimes(self) -> None:
+        with patch("tools.context_fill_monitor.subprocess.run") as m:
+            m.return_value = self._run("1700001000     500\n")   # ps pads etimes
+            self.assertEqual(cfm._pane_process_start_epoch("s:0", "suborch1", "mason"), 1700000500.0)
+
+    def test_none_on_nonzero_rc(self) -> None:
+        with patch("tools.context_fill_monitor.subprocess.run") as m:
+            m.return_value = self._run("", returncode=1)
+            self.assertIsNone(cfm._pane_process_start_epoch("s:0", "suborch1", "mason"))
+
+    def test_none_on_missing_etimes(self) -> None:
+        # pid resolved but ps printed nothing (process gone between the two reads).
+        with patch("tools.context_fill_monitor.subprocess.run") as m:
+            m.return_value = self._run("1700001000 \n")
+            self.assertIsNone(cfm._pane_process_start_epoch("s:0", "suborch1", "mason"))
+
+    def test_none_on_garbage_or_negative(self) -> None:
+        for out in ("abc def\n", "1700001000 -5\n"):
+            with patch("tools.context_fill_monitor.subprocess.run") as m:
+                m.return_value = self._run(out)
+                self.assertIsNone(cfm._pane_process_start_epoch("s:0", "suborch1", "mason"), out)
+
+    def test_none_on_subprocess_error(self) -> None:
+        with patch("tools.context_fill_monitor.subprocess.run") as m:
+            m.side_effect = subprocess.TimeoutExpired(cmd="bash", timeout=30)
+            self.assertIsNone(cfm._pane_process_start_epoch("s:0", "suborch1", "mason"))
+
+    def test_cross_account_probe_is_sudoed_and_reads_pane_pid(self) -> None:
+        with patch("tools.context_fill_monitor.subprocess.run") as m, \
+             patch("tools.context_fill_monitor._current_user", return_value="claude-fallback"):
+            m.return_value = self._run("1700001000 500\n")
+            cfm._pane_process_start_epoch("suborch1-main:0.0", "suborch1", "mason")
+        argv = m.call_args[0][0]
+        self.assertEqual(argv[:3], ["sudo", "-nu", "suborch1"])
+        self.assertIn("#{pane_pid}", argv[-1])
+        self.assertIn("etimes=", argv[-1])
+
+
+class TestStaleJsonlSessionStart(unittest.TestCase):
+    CFG = {"sudo_user": "suborch1", "restart_target_pane": "suborch1-main:0.0"}
+
+    def _check(self, start, mtime, cfg=None):
+        with patch.object(cfm, "_pane_process_start_epoch", return_value=start), \
+             patch.object(cfm, "_jsonl_mtime", return_value=mtime):
+            return cfm.stale_jsonl_session_start(Path("/p/a.jsonl"), cfg or self.CFG, "mason")
+
+    def test_written_before_process_start_returns_the_start(self) -> None:
+        self.assertEqual(self._check(start=1700000500.0, mtime=1700000000.0), 1700000500.0)
+
+    def test_written_after_process_start_is_live(self) -> None:
+        self.assertIsNone(self._check(start=1700000500.0, mtime=1700000600.0))
+
+    def test_same_second_is_live(self) -> None:
+        self.assertIsNone(self._check(start=1700000500.0, mtime=1700000500.0))
+
+    def test_fail_open_on_unknowns(self) -> None:
+        self.assertIsNone(self._check(start=None, mtime=1700000000.0))
+        self.assertIsNone(self._check(start=1700000500.0, mtime=None))
+
+    def test_no_pane_configured_never_probes(self) -> None:
+        with patch.object(cfm, "_pane_process_start_epoch") as probe:
+            self.assertIsNone(cfm.stale_jsonl_session_start(
+                Path("/p/a.jsonl"), {"sudo_user": "suborch1"}, "mason"))
+        probe.assert_not_called()
+
+
+class TestIdleSuccessorAlert(unittest.TestCase):
+    """T-4088 review: a successor that never writes a transcript (kick dropped, exit 10)
+    is now invisible to the threshold path, so alert ONCE per session past the bound."""
+    CFG = {"sudo_user": "suborch1", "restart_target_pane": "suborch1-main:0.0",
+           "handoff_file": "/home/suborch1/HANDOFF.md"}
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        os.environ["PANTHEON_STATE_DIR"] = self._tmp.name
+        self.addCleanup(os.environ.pop, "PANTHEON_STATE_DIR", None)
+        self._mute = patch.object(cfm, "_seat_muted", return_value=False)
+        self._mute.start()
+        self.addCleanup(self._mute.stop)
+        # T-5146: never capture a live pane from a test; an uncapturable pane is not busy.
+        self._cap = patch.object(cfm, "_capture_pane_text", return_value=None)
+        self._cap.start()
+        self.addCleanup(self._cap.stop)
+
+    def _alert(self, idle_seconds: float, session_start: float | None = None):
+        start = session_start if session_start is not None else time.time() - idle_seconds
+        with patch("tools.inbox_consumer.route_failure_alert") as route:
+            sent = cfm.maybe_alert_idle_successor("mason", self.CFG, start)
+        return sent, route
+
+    def test_under_bound_no_alert(self) -> None:
+        sent, route = self._alert(cfm.IDLE_SUCCESSOR_ALERT_SECONDS - 60)
+        self.assertFalse(sent)
+        route.assert_not_called()
+
+    def test_past_bound_alerts_once_per_session(self) -> None:
+        start = time.time() - cfm.IDLE_SUCCESSOR_ALERT_SECONDS - 60
+        sent, route = self._alert(0, session_start=start)
+        self.assertTrue(sent)
+        route.assert_called_once()
+        agent, text = route.call_args[0][:2]
+        self.assertEqual(agent, "mason")
+        self.assertIn("send_keys_submit.sh suborch1-main:0.0", text)
+        self.assertIn("/home/suborch1/HANDOFF.md", text)
+        # Next cycle, same session: no re-alert.
+        sent2, route2 = self._alert(0, session_start=start)
+        self.assertFalse(sent2)
+        route2.assert_not_called()
+
+    def test_a_new_session_alerts_again(self) -> None:
+        old = time.time() - cfm.IDLE_SUCCESSOR_ALERT_SECONDS - 600
+        self._alert(0, session_start=old)
+        sent, route = self._alert(0, session_start=old + 300)
+        self.assertTrue(sent, "a different (newer) idle session is a new incident")
+        route.assert_called_once()
+
+    def test_muted_seat_suppressed(self) -> None:
+        with patch.object(cfm, "_seat_muted", return_value=True):
+            sent, route = self._alert(cfm.IDLE_SUCCESSOR_ALERT_SECONDS + 60)
+        self.assertFalse(sent)
+        route.assert_not_called()
+
+
+class TestCapSweepSkipsStaleJsonl(unittest.TestCase):
+    """T-4088 review: Recovery's cap-detector sweep must apply the same stale guard."""
+    CFG = {"sudo_user": "suborch1", "restart_target_pane": "suborch1-main:0.0",
+           "jsonl_dir": Path("/home/suborch1/.claude/projects/x")}
+
+    def _sweep(self, stale_start):
+        with patch.object(cfm, "find_latest_jsonl", return_value=Path("/p/a.jsonl")), \
+             patch.object(cfm, "stale_jsonl_session_start", return_value=stale_start), \
+             patch.object(cfm, "_maybe_fire_capability_cap") as cap, \
+             patch.object(cfm, "_maybe_fire_consent_fallback") as consent, \
+             patch.object(cfm, "_maybe_fire_spend_limit") as spend:
+            cfm._sweep_cap_detectors_for("mason", self.CFG)
+        return cap, consent, spend
+
+    def test_stale_jsonl_skips_jsonl_detectors_keeps_pane_scrape(self) -> None:
+        cap, consent, spend = self._sweep(stale_start=1700000500.0)
+        cap.assert_not_called()
+        consent.assert_not_called()
+        spend.assert_called_once()
+
+    def test_live_jsonl_runs_all(self) -> None:
+        cap, consent, spend = self._sweep(stale_start=None)
+        cap.assert_called_once()
+        consent.assert_called_once()
+        spend.assert_called_once()
+
+
+class TestStaleJsonlGuardMainFlow(unittest.TestCase):
+    """T-4088 incident reproduction: mason 2026-09-28 relaunched cleanly, the fresh
+    session sat idle (no jsonl), and the predecessor's 77% transcript — last written
+    ~13 min past the fire-time mtime, OUTSIDE the T-1328 tolerance — still ranked
+    newest. main() must not fire the threshold restart off it."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["PANTHEON_STATE_DIR"] = str(Path(self._tmp.name) / "state")
+        os.environ["PANTHEON_CONTEXT_WINDOW"] = "1000"
+        os.environ["CONTEXT_FILL_RESTART_ABSOLUTE_TOKENS"] = "500"
+        os.environ["CONTEXT_FILL_IDLE_VELOCITY_TOKENS"] = "60"
+        self._notify_patch = patch.object(cfm, "notify_restart_success")
+        self._notify_patch.start()
+        self.addCleanup(self._notify_patch.stop)
+        # Fixture epochs are years old, so the real alert WOULD fire — and for recovery it
+        # routes straight to the operator's Telegram. Never let a test send it.
+        self._idle_patch = patch.object(cfm, "maybe_alert_idle_successor")
+        self.idle_alert = self._idle_patch.start()
+        self.addCleanup(self._idle_patch.stop)
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(lambda: [os.environ.pop(k, None) for k in
+                                 ("PANTHEON_STATE_DIR", "PANTHEON_CONTEXT_WINDOW")])
+
+    def _tombstone(self) -> Path:
+        return Path(os.environ["PANTHEON_STATE_DIR"]) / TOMBSTONE_FILENAME_PATTERN.format(agent="recovery")
+
+    def _side_effect(self, jsonl_mtime: int, probe_stdout: str = "1700001000 500\n", probe_rc: int = 0):
+        usage = json.dumps({"type": "assistant", "message": {"usage": {"input_tokens": 770}}})
+
+        def se(cmd, **kwargs):
+            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if "etimes=" in joined:   # pane claude start = 1700000500 by default
+                return MagicMock(returncode=probe_rc, stdout=probe_stdout, stderr="")
+            if "find " in joined and "*.jsonl" in joined:
+                return MagicMock(returncode=0, stdout=f"{jsonl_mtime} /path/prev.jsonl\n", stderr="")
+            if "stat -c %Y" in joined:
+                return MagicMock(returncode=0, stdout=f"{jsonl_mtime}\n", stderr="")
+            if "tac " in joined:
+                return MagicMock(returncode=0, stdout=usage + "\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        return se
+
+    def test_predecessor_transcript_does_not_fire(self) -> None:
+        with patch("tools.context_fill_monitor.subprocess.run") as m, \
+             patch.object(cfm, "_maybe_fire_api_health") as api_health:
+            m.side_effect = self._side_effect(jsonl_mtime=1700000000)  # before start
+            rc = main(["--agent", "recovery"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(self._tombstone().exists(), "must NOT fire off the predecessor's 77%")
+        api_health.assert_not_called()   # jsonl-content detectors skip a stale transcript too
+        # The idle-successor backstop is consulted with the session's start epoch.
+        self.idle_alert.assert_called_once()
+        self.assertEqual(self.idle_alert.call_args[0][2], 1700000500.0)
+
+    def test_live_transcript_fires_normally(self) -> None:
+        # Control: same 77%, but written after the pane's claude started = the live session.
+        with patch("tools.context_fill_monitor.subprocess.run") as m:
+            m.side_effect = self._side_effect(jsonl_mtime=1700000600)
+            rc = main(["--agent", "recovery"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self._tombstone().exists(), "a live transcript at threshold must still fire")
+
+    def test_unresolvable_process_start_fails_open(self) -> None:
+        with patch("tools.context_fill_monitor.subprocess.run") as m:
+            m.side_effect = self._side_effect(jsonl_mtime=1700000000, probe_stdout="", probe_rc=1)
+            rc = main(["--agent", "recovery"])
+        self.assertEqual(rc, 0)
+        self.assertTrue(self._tombstone().exists(), "probe failure must NOT suppress a fire")
+
+
+# ---------------------------------------------------------------------------
 # read_latest_usage
 # ---------------------------------------------------------------------------
 
@@ -807,26 +1174,25 @@ class TestAgentConfig(unittest.TestCase):
     """T-0189 — verify each agent's config is shape-correct."""
 
     def test_orchestrator_present(self) -> None:
-        # T-2953 R31 (reverted T-3098, 2026-08-23): orchestrator is NOT control-
-        # plane-supervised pre-T-2953 cutover -- the interactive session
-        # still lives on the bespoke claude-telegram.service, so AGENT_CONFIG
-        # must carry that RAW unit (no consume-unit derivation, no
-        # "supervisor" key) or context_fill_monitor's own cap-hit auto-
-        # restart derives a target that cannot cycle the session.
+        # T-2953 (2026-10-24): orchestrator cut over to the control plane; mirrors
+        # recovery (T-3026) -- the interactive session moved off the bespoke
+        # claude-telegram.service onto the runtime controller + consume
+        # timer, so AGENT_CONFIG derives the consume unit as restart_service
+        # and carries "supervisor" (same shape as specialist/recovery below).
         self.assertIn("orchestrator", AGENT_CONFIG)
         cfg = AGENT_CONFIG["orchestrator"]
         self.assertEqual(cfg["sudo_user"], "claude")
-        self.assertEqual(cfg["restart_service"], "claude-telegram.service")
+        self.assertEqual(cfg["restart_service"], "pantheon-persona-consume@orchestrator.service")
         self.assertEqual(cfg["restart_target_pane"], "claude-telegram-bot:0")
-        self.assertIsNone(cfg.get("supervisor"))
+        self.assertEqual(cfg["supervisor"], "control-plane")
 
-    def test_context_fill_monitor_orchestrator_restart_uses_bespoke_service_pre_cutover(self) -> None:
+    def test_context_fill_monitor_orchestrator_restart_uses_consume_unit_post_t2953(self) -> None:
         self.assertIn("orchestrator", AGENT_CONFIG)
         cfg = AGENT_CONFIG["orchestrator"]
         self.assertEqual(cfg["sudo_user"], "claude")
-        self.assertEqual(cfg["restart_service"], "claude-telegram.service")
+        self.assertEqual(cfg["restart_service"], "pantheon-persona-consume@orchestrator.service")
         self.assertEqual(cfg["restart_target_pane"], "claude-telegram-bot:0")
-        self.assertIsNone(cfg.get("supervisor"))
+        self.assertEqual(cfg["supervisor"], "control-plane")
 
     def test_specialist_present(self) -> None:
         # T-2658: specialist is control-plane-supervised (T-2633 cutover) — the
@@ -843,22 +1209,23 @@ class TestAgentConfig(unittest.TestCase):
     def test_recovery_present(self) -> None:
         # Recovery is now in AGENT_CONFIG per ORG-020 Phase 1 (T-0309).
         # Recovery uses tombstone-write mode (use_tombstone=True) instead of direct restart.
-        # T-2684 (reverted T-3082, 2026-08-23): recovery is NOT control-plane-
-        # supervised pre-T-3026 — T-2590 covers only the consume plane; the
-        # interactive session still lives on the bespoke claude-telegram-
-        # fallback.service, so AGENT_CONFIG must carry that RAW unit (no
-        # consume-unit derivation, no "supervisor" key) or restart_drain.py's
-        # DRAIN_AGENT_CONFIG mirror derives a restart target that cannot
-        # cycle the session.
+        # T-3026 (2026-09-29): recovery is control-plane-supervised — the
+        # interactive session moved off the bespoke claude-telegram-
+        # fallback.service onto the runtime controller + consume timer, so
+        # AGENT_CONFIG derives the consume unit as restart_service and carries
+        # "supervisor" (same shape as specialist above). Pre-cutover (T-2684
+        # reverted T-3082, 2026-08-23) this asserted the RAW bespoke unit and
+        # no "supervisor" key, because the oneshot consume unit cannot cycle a
+        # bespoke tmux session; post-cutover it is the correct target.
         self.assertIn("recovery", AGENT_CONFIG)
         cfg = AGENT_CONFIG["recovery"]
         self.assertEqual(cfg["sudo_user"], "claude-fallback")
-        self.assertEqual(cfg["restart_service"], "claude-telegram-fallback.service")
-        self.assertIsNone(cfg.get("supervisor"))
+        self.assertEqual(cfg["restart_service"], "pantheon-persona-consume@recovery.service")
+        self.assertEqual(cfg["supervisor"], "control-plane")
         self.assertTrue(cfg.get("use_tombstone"), "Recovery config must have use_tombstone=True")
 
     def test_hook_allowlist_covers_every_configured_agent(self) -> None:
-        # T-1945 structural guard (Atlas, via T-1947 D-17): a persona in
+        # T-1945 structural guard (Artisan, via T-1947 D-17): a persona in
         # AGENT_CONFIG with no HOOK_ALLOWLIST entry gets ZERO hook checking,
         # guarded only by a runtime log line nobody reads. Fail loudly at
         # test-time instead. Born-green 2026-07-22 (both maps carry the same
@@ -870,18 +1237,34 @@ class TestAgentConfig(unittest.TestCase):
             "hook checking, guarded only by a log line",
         )
 
+    def test_worker_guard_allowlisted_on_every_claude_orchestrator_seat(self) -> None:
+        # T-4194: keep the allowlist-first safety gate explicit for all five
+        # non-orchestrator Claude seats.
+        for agent in ("recovery", "specialist", "mason", "artisan", "archivist"):
+            with self.subTest(agent=agent):
+                self.assertIn("worker-guard.py", cfm.HOOK_ALLOWLIST[agent])
+
     def test_per_agent_required_keys_present(self) -> None:
         # T-1945: mirrors _validate_config's contract — observation-only
-        # entries (mnemosyne keeps real restart fields she happens to have;
+        # entries (archivist keeps real restart fields she happens to have;
         # the seats carry none) need only the read-path keys. Restart keys are
         # required exactly for the agents something can fire. Do NOT "fix" a
         # failure here by inventing restart_service values for observation-only
         # entries — a nonexistent service name is the wrong-layer-GREEN trap.
         base = {"jsonl_dir", "sudo_user"}
         restart = {"restart_service", "restart_mode", "restart_target_pane"}
+        # T-3838: bespoke-relaunch seats (mason/artisan once armed) carry the
+        # relaunch identity instead of a restart_service (which they deliberately
+        # lack). Mirrors _validate_config's three-way branch.
+        bespoke = {"restart_bin", "restart_target_pane", "relaunch_session", "relaunch_scope_unit"}
         for agent, cfg in AGENT_CONFIG.items():
             with self.subTest(agent=agent):
-                required = base if cfg.get("observation_only") else base | restart
+                if cfg.get("observation_only"):
+                    required = base
+                elif cfg.get("bespoke_relaunch"):
+                    required = base | bespoke
+                else:
+                    required = base | restart
                 missing = required - set(cfg.keys())
                 self.assertFalse(missing, f"{agent}: missing keys {missing}")
 
@@ -891,10 +1274,10 @@ class TestAgentConfig(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestHookCheckWardFanOut(unittest.TestCase):
+class TestHookCheckRecoveryFanOut(unittest.TestCase):
     """T-1945: recovery's cycle is the execution home for hook_check_via_recovery personas.
 
-    Personas with no @agent timer instance (mnemosyne, metis, atlas) get their
+    Personas with no @agent timer instance (archivist, mason, artisan) get their
     hook-drift security check run from main('recovery'); other agents' cycles do
     not fan out. Without this, an allowlist entry alone is armed-but-unprobed.
     """
@@ -1071,11 +1454,10 @@ class TestMainFlow(unittest.TestCase):
         self.assertFalse(any("handoff_and_restart" in s for s in invocations))
 
     def test_above_threshold_fires_restart_orchestrator(self) -> None:
-        # T-2953 R31 (reverted T-3098, 2026-08-23): orchestrator is NOT control-
-        # plane-supervised pre-T-2953 cutover -- the dispatched unit must
-        # target the bespoke claude-telegram.service directly, never the
-        # oneshot consume unit (it cannot cycle the tmux session), and must
-        # NOT carry --supervisor control-plane.
+        # T-2953 (2026-10-24): orchestrator cut over to the control plane; mirrors
+        # recovery (T-3026) / specialist (T-2658) -- the dispatched unit must fire the
+        # derived consume unit, never the retired bespoke
+        # claude-telegram.service, and must pass --supervisor control-plane.
         find_stdout = "1700000010 /path/sess.jsonl\n"
         usage_stdout = self._usage_line(input_tokens=100, cache_creation=300, cache_read=300) + "\n"
         with patch("tools.context_fill_monitor.subprocess.run") as mock_run:
@@ -1086,9 +1468,11 @@ class TestMainFlow(unittest.TestCase):
         self.assertTrue(_dispatched(mock_run), "threshold restart should have dispatched")
         dispatch = _dispatch_joined(mock_run)
         self.assertIn("handoff_and_restart", dispatch)
-        self.assertIn("claude-telegram.service", dispatch)
-        self.assertNotIn("pantheon-persona-consume@orchestrator.service", dispatch)
-        self.assertNotIn("--supervisor control-plane", dispatch)
+        self.assertIn("pantheon-persona-consume@orchestrator.service", dispatch)
+        self.assertNotIn("claude-telegram.service", dispatch)
+        self.assertIn("--supervisor control-plane", dispatch)
+        # T-4828: a fill restart may hit a mid-turn pane; Escape would interrupt it.
+        self.assertNotIn("--dismiss-modal", dispatch)
         # T-0179 supervised first-fire revealed handoff-file was unset; per-agent
         # path must thread through to handoff_and_restart.sh's --handoff-file flag.
         self.assertIn(
@@ -1307,7 +1691,7 @@ class TestWriteTombstone(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestWardTombstoneFlow(unittest.TestCase):
+class TestRecoveryTombstoneFlow(unittest.TestCase):
     """Verify Recovery's context-fill threshold triggers tombstone-write, not direct fire."""
 
     def setUp(self) -> None:
@@ -2227,6 +2611,348 @@ class TestCheckHookAllowlist(unittest.TestCase):
             self.assertEqual(cfm.check_hook_allowlist("recovery", AGENT_CONFIG["recovery"]), [])
 
 
+class TestCheckPluginDirAllowlist(unittest.TestCase):
+    """T-4577: CLAUDE_CODE_PLUGIN_DIRS in settings.json env loads code at every session
+    start, outside the hooks block. It is held to the same allowlist discipline."""
+
+    MOD = "/home/claude/pantheon-config/tools/mods/fleet-usage"  # orchestrator = claude
+
+    def _run(self, plugin_dirs):
+        settings = {"env": {"CLAUDE_CODE_PLUGIN_DIRS": plugin_dirs},
+                    "hooks": {"SessionStart": [
+                        {"hooks": [{"type": "command", "command": "/h/handoff-auto-read.sh"}]}]}}
+        completed = MagicMock()
+        completed.returncode = 0
+        completed.stdout = json.dumps(settings)
+        completed.stderr = ""
+        with patch.object(cfm.subprocess, "run", return_value=completed):
+            return cfm.check_hook_allowlist("orchestrator", AGENT_CONFIG["orchestrator"])
+
+    def test_allowlisted_in_repo_mod_is_clean(self):
+        self.assertEqual(self._run(self.MOD), [])
+
+    def test_tilde_expands_to_the_seat_home(self):
+        self.assertEqual(self._run("~/pantheon-config/tools/mods/fleet-usage/"), [])
+
+    def test_dir_outside_the_repo_is_flagged(self):
+        out = self._run("/tmp/evil")
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith(cfm.PLUGIN_DEVIATION_PREFIX), out)
+
+    def test_dotdot_escape_is_flagged(self):
+        self.assertEqual(len(self._run(self.MOD + "/../../../../../tmp/evil")), 1)
+
+    def test_unlisted_mod_name_is_flagged(self):
+        self.assertEqual(len(self._run("/home/claude/pantheon-config/tools/mods/other")), 1)
+
+    def test_another_seats_clone_is_flagged(self):
+        self.assertEqual(len(self._run("/home/claude-fallback/pantheon-config/tools/mods/fleet-usage")), 1)
+
+    def test_each_colon_separated_entry_is_judged(self):
+        out = self._run(f"{self.MOD}:/tmp/evil: ")
+        self.assertEqual(len(out), 1)
+        self.assertIn("/tmp/evil", out[0])
+
+    def test_non_string_value_is_flagged(self):
+        self.assertEqual(len(self._run(["/tmp/evil"])), 1)
+
+    def test_origin_reclassify_never_clears_a_plugin_deviation(self):
+        # The T-3204 origin re-read judges HOOK commands; a plugin deviation must not
+        # be cleared by any hook allowlist, however permissive.
+        dev = self._run("/tmp/handoff-auto-read.sh")
+        self.assertEqual(len(dev), 1)  # non-vacuous: there IS a deviation to (not) clear
+        with patch.object(cfm, "_origin_hook_allowlist",
+                          return_value=({"handoff-auto-read.sh"}, "origin/main@x")):
+            still, stale, _ = cfm._reclassify_deviations_against_origin("orchestrator", dev)
+        self.assertEqual((still, stale), (dev, []))
+
+
+class TestCheckMarketplaceModAllowlist(unittest.TestCase):
+    """T-4600: an ENABLED marketplace-installed plugin that ships a mod (hooks.json
+    "modules") can approve calls our user-level PreToolUse guards block, so it is a
+    deviation unless allowlisted."""
+
+    SETTINGS = {"hooks": {"SessionStart": [
+        {"hooks": [{"type": "command", "command": "/h/handoff-auto-read.sh"}]}]}}
+
+    def _run(self, probe_stdout, probe_rc=0):
+        settings = MagicMock(returncode=0, stdout=json.dumps(self.SETTINGS), stderr="")
+        probe = MagicMock(returncode=probe_rc, stdout=probe_stdout, stderr="")
+        with patch.object(cfm.subprocess, "run", side_effect=[settings, probe]):
+            return cfm.check_hook_allowlist("orchestrator", AGENT_CONFIG["orchestrator"])
+
+    @staticmethod
+    def _report(*mods):
+        return json.dumps({"schema": "pantheon-marketplace-mods/1", "mods": list(mods)})
+
+    def test_enabled_plugin_with_a_mod_is_flagged(self):
+        out = self._run(self._report({"key": "x@mkt", "path": "/p", "modules": 1}))
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith(cfm.MARKETPLACE_MOD_DEVIATION_PREFIX), out)
+
+    def test_allowlisted_plugin_is_clean(self):
+        with patch.dict(cfm.MARKETPLACE_MOD_ALLOWLIST, {"orchestrator": {"x@mkt"}}):
+            self.assertEqual(self._run(self._report({"key": "x@mkt", "path": "/p", "modules": 1})), [])
+
+    def test_no_mods_is_clean(self):
+        self.assertEqual(self._run(self._report()), [])
+
+    def test_probe_failure_fails_open(self):
+        self.assertEqual(self._run("", probe_rc=1), [])
+        self.assertEqual(self._run("{not json"), [])
+        self.assertEqual(self._run(json.dumps({"mods": [{"key": "x"}]})), [])  # no schema
+
+    def test_origin_reclassify_never_clears_a_marketplace_deviation(self):
+        dev = self._run(self._report({"key": "handoff-auto-read.sh", "path": "/p", "modules": 1}))
+        self.assertEqual(len(dev), 1)
+        with patch.object(cfm, "_origin_hook_allowlist",
+                          return_value=({"handoff-auto-read.sh"}, "origin/main@x")):
+            still, stale, _ = cfm._reclassify_deviations_against_origin("orchestrator", dev)
+        self.assertEqual((still, stale), (dev, []))
+
+
+class TestPluginContentPin(unittest.TestCase):
+    """T-4651: an installed pinned plugin whose content hash is not pinned is a deviation."""
+
+    KEY = "telegram@claude-plugins-official"
+    SETTINGS = TestCheckMarketplaceModAllowlist.SETTINGS
+
+    def _run(self, content):
+        settings = MagicMock(returncode=0, stdout=json.dumps(self.SETTINGS), stderr="")
+        probe = MagicMock(returncode=0, stderr="", stdout=json.dumps(
+            {"schema": "pantheon-marketplace-mods/1", "mods": [], "content": content}))
+        with patch.object(cfm.subprocess, "run", side_effect=[settings, probe]) as run:
+            out = cfm.check_hook_allowlist("orchestrator", AGENT_CONFIG["orchestrator"])
+        return out, run
+
+    def _content(self, sha):
+        return [{"key": self.KEY, "path": "/p", "version": "0.0.7", "sha256": sha}]
+
+    def test_pinned_hash_is_clean(self):
+        sha = next(iter(cfm.PLUGIN_CONTENT_PINS[self.KEY]["sha256"]))
+        self.assertEqual(self._run(self._content(sha))[0], [])
+
+    def test_drifted_hash_is_flagged(self):
+        out, _ = self._run(self._content("0" * 64))
+        self.assertEqual(len(out), 1)
+        self.assertTrue(out[0].startswith(cfm.PLUGIN_CONTENT_DRIFT_PREFIX), out)
+        self.assertIn("0" * 64, out[0])
+
+    def test_probe_receives_the_pin_request(self):
+        _, run = self._run([])
+        argv = run.call_args_list[1].args[0]
+        req = json.loads(argv[-1])
+        spec = req["pins"][self.KEY]
+        self.assertEqual(spec["files"], ["server.ts", "package.json", "bun.lock", ".mcp.json"])
+        [[new, old]] = spec["normalize"]["server.ts"]
+        self.assertIn("T-2629", new)
+        self.assertNotIn("T-2629", old)
+
+    def test_unreadable_patch_blocks_skip_content_pins(self):
+        """Without the T-2629 blocks a patched server.ts would hash as drift: skip, never page."""
+        with patch.object(cfm, "_t2629_blocks", return_value=None):
+            self.assertEqual(self._run(self._content("0" * 64))[0], [])
+
+    def test_origin_reclassify_never_clears_a_drift(self):
+        dev = self._run(self._content("0" * 64))[0]
+        with patch.object(cfm, "_origin_hook_allowlist", return_value=(set(), "origin/main@x")):
+            still, stale, _ = cfm._reclassify_deviations_against_origin("orchestrator", dev)
+        self.assertEqual((still, stale), (dev, []))
+
+    def test_blocks_match_what_the_patch_script_applies(self):
+        """Run the real patch script on a synthetic pristine file: the probe must hash the
+        patched copy exactly like the pristine one, and an extra edit must change it."""
+        old, new = cfm._t2629_blocks()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            pristine = f"// head\n      {old}\n// tail\n"
+            roots = []
+            for name in ("a", "b", "c"):
+                root = home / name
+                (root / "skills/access").mkdir(parents=True)
+                (root / "server.ts").write_text(pristine)
+                (root / "package.json").write_text("{}")
+                (root / "bun.lock").write_text("lock")
+                (root / "skills/access/SKILL.md").write_text("skill")
+                roots.append(root)
+            subprocess.run(["bash", str(cfm._T2629_SCRIPT)], check=True, capture_output=True,
+                           env={**os.environ, "T2629_TARGETS": f"{roots[1]}/server.ts\n{roots[2]}/server.ts"})
+            self.assertIn("T-2629", (roots[1] / "server.ts").read_text())
+            (roots[2] / "skills/access/SKILL.md").write_text("skill, rugpulled")
+            installed = {f"{r.name}@m": [{"installPath": str(r), "version": "1"}] for r in roots}
+            (home / ".claude/plugins").mkdir(parents=True)
+            (home / ".claude/plugins/installed_plugins.json").write_text(json.dumps({"plugins": installed}))
+            spec = cfm._content_pin_request()["pins"][self.KEY]
+            req = {"pins": {f"{r.name}@m": spec for r in roots}}
+            r = subprocess.run([sys.executable, "-c", cfm._MARKETPLACE_PROBE, str(home), json.dumps(req)],
+                               capture_output=True, text=True,
+                               env={**os.environ, "HOME": str(home),
+                                    "PANTHEON_PROBE_PROC_ROOT": str(home / "noproc"),
+                                    "PANTHEON_PROBE_MANAGED_DIR": str(home / "managed")})
+            got = {c["key"]: c["sha256"] for c in json.loads(r.stdout)["content"]}
+        self.assertEqual(got["a@m"], got["b@m"])
+        self.assertNotEqual(got["a@m"], got["c@m"])
+
+
+class TestPluginContentPinMcpJson(unittest.TestCase):
+    """T-4651 REBOUND-1: .mcp.json (the launch command) is hashed, with only the seats'
+    known launch edits undone."""
+
+    UPSTREAM = {"mcpServers": {"telegram": {"command": "bun", "args": [
+        "run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--shell=bun", "--silent", "start"]}}}
+
+    def _hashes(self, variants):
+        spec = cfm._content_pin_request()["pins"]["telegram@claude-plugins-official"]
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            installed = {}
+            for name, mcp in variants.items():
+                root = home / name
+                (root / "skills").mkdir(parents=True)
+                for f in ("server.ts", "package.json", "bun.lock"):
+                    (root / f).write_text(f)
+                (root / ".mcp.json").write_text(mcp if isinstance(mcp, str) else json.dumps(mcp, indent=2))
+                installed[f"{name}@m"] = [{"installPath": str(root)}]
+            (home / ".claude/plugins").mkdir(parents=True)
+            (home / ".claude/plugins/installed_plugins.json").write_text(json.dumps({"plugins": installed}))
+            req = {"pins": {k: spec for k in installed}}
+            r = subprocess.run([sys.executable, "-c", cfm._MARKETPLACE_PROBE, str(home), json.dumps(req)],
+                               capture_output=True, text=True,
+                               env={**os.environ, "HOME": str(home),
+                                    "PANTHEON_PROBE_PROC_ROOT": str(home / "noproc"),
+                                    "PANTHEON_PROBE_MANAGED_DIR": str(home / "managed")})
+            return {c["key"].split("@")[0]: c["sha256"] for c in json.loads(r.stdout)["content"]}
+
+    def _variant(self, command=None, args=None):
+        v = json.loads(json.dumps(self.UPSTREAM))
+        if command is not None:
+            v["mcpServers"]["telegram"]["command"] = command
+        if args is not None:
+            v["mcpServers"]["telegram"]["args"] = args
+        return v
+
+    def test_known_seat_edits_hash_as_upstream(self):
+        h = self._hashes({
+            "upstream": self.UPSTREAM,
+            "specialist": self._variant(command="/home/claude-research/.bun/bin/bun"),
+            "recovery": self._variant(command="/home/claude-fallback/.bun/bin/bun",
+                                  args=["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--silent", "server.ts"]),
+            "reformatted": json.dumps(self.UPSTREAM),
+        })
+        self.assertEqual(len(set(h.values())), 1, h)
+
+    def test_changed_launch_command_fails_the_pin(self):
+        """RED: a rugpull that swaps the command or script must change the hash."""
+        h = self._hashes({
+            "upstream": self.UPSTREAM,
+            "cmd": self._variant(command="/tmp/evil"),
+            "script": self._variant(args=["run", "--cwd", "${CLAUDE_PLUGIN_ROOT}", "--silent", "evil.ts"]),
+            "extra_server": dict(self.UPSTREAM, mcpServers=dict(
+                self.UPSTREAM["mcpServers"], x={"command": "bun", "args": ["x.ts"]})),
+        })
+        for k in ("cmd", "script", "extra_server"):
+            self.assertNotEqual(h[k], h["upstream"], k)
+
+
+class TestMarketplaceModProbe(unittest.TestCase):
+    """The probe script itself, run for real against a synthetic HOME."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+        (self.home / ".claude/plugins").mkdir(parents=True)
+
+    def _plugin(self, name, *, modules=None, hooks_rel=None):
+        root = self.home / "cache" / name
+        (root / ".claude-plugin").mkdir(parents=True)
+        manifest = {"name": name}
+        if hooks_rel:
+            manifest["hooks"] = hooks_rel
+        (root / ".claude-plugin/plugin.json").write_text(json.dumps(manifest))
+        if modules is not None:
+            hooks_path = root / (hooks_rel or "hooks/hooks.json")
+            hooks_path.parent.mkdir(parents=True, exist_ok=True)
+            hooks_path.write_text(json.dumps({"modules": modules}))
+        return str(root)
+
+    def _env(self, proc_root=None):
+        return {**os.environ, "HOME": str(self.home),
+                "PANTHEON_PROBE_PROC_ROOT": str(proc_root or self.home / "noproc"),
+                "PANTHEON_PROBE_MANAGED_DIR": str(self.home / "managed")}
+
+    def _probe(self, project=None, proc_root=None):
+        r = subprocess.run([sys.executable, "-c", cfm._MARKETPLACE_PROBE, str(project or self.home / "proj")],
+                           capture_output=True, text=True, env=self._env(proc_root))
+        return json.loads(r.stdout)
+
+    def _install(self, *names):
+        installed = {f"{n}@m": [{"installPath": self._plugin(n, modules=["./a.ts"])}] for n in names}
+        (self.home / ".claude/plugins/installed_plugins.json").write_text(
+            json.dumps({"version": 2, "plugins": installed}))
+
+    @staticmethod
+    def _write(path, obj):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(obj))
+
+    def test_scopes_merge_in_precedence_order(self):
+        """REBOUND-1: user < project < local < flag < managed; a higher scope's value wins."""
+        self._install("u", "p", "l", "off", "m")
+        proj = self.home / "proj"
+        self._write(self.home / ".claude/settings.json", {"enabledPlugins": {"u@m": True, "off@m": True}})
+        self._write(proj / ".claude/settings.json", {"enabledPlugins": {"p@m": True}})
+        self._write(proj / ".claude/settings.local.json", {"enabledPlugins": {"l@m": True, "off@m": False}})
+        self._write(self.home / "managed/managed-settings.d/10-x.json", {"enabledPlugins": {"m@m": True, "p@m": False}})
+        report = self._probe(proj)
+        self.assertEqual(sorted(m["key"] for m in report["mods"]), ["l@m", "m@m", "u@m"])
+        self.assertEqual(report["scopes"], ["user", "project", "local", "managed"])
+
+    def test_flag_scope_read_from_live_claude_process(self):
+        """Control-plane seats pass --settings <file>; a plugin enabled only there still counts."""
+        self._install("flagged", "inline", "nodecli", "notclaude")
+        proc = self.home / "fakeproc"
+        cwd = self.home / "seatcwd"
+        self._write(cwd / "rt/main.json", {"enabledPlugins": {"flagged@m": True}})
+        self._write(cwd / "rt/node.json", {"enabledPlugins": {"nodecli@m": True}})
+        self._write(cwd / "rt/other.json", {"enabledPlugins": {"notclaude@m": True}})
+        cli = "/home/x/.npm-global/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+        for pid, argv in (("101", ["claude", "--settings", "rt/main.json"]),
+                          ("102", ["/usr/bin/node", "claude", '--settings={"enabledPlugins": {"inline@m": true}}']),
+                          ("103", ["python3", "--settings", "rt/other.json"]),
+                          # T-4661: a `node .../cli.js` launch is a claude process too
+                          ("104", ["/usr/bin/node", "--no-warnings", cli, "--settings", "rt/node.json"])):
+            (proc / pid).mkdir(parents=True)
+            (proc / pid / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+            os.symlink(cwd, proc / pid / "cwd")
+        report = self._probe(proc_root=proc)
+        self.assertEqual(sorted(m["key"] for m in report["mods"]), ["flagged@m", "inline@m", "nodecli@m"])
+        self.assertIn("flag", report["scopes"])
+
+    def test_reports_only_enabled_plugins_that_declare_modules(self):
+        installed = {
+            "modded@m": [{"installPath": self._plugin("modded", modules=["./a.ts", "./b.ts"])}],
+            "plain@m": [{"installPath": self._plugin("plain")}],
+            "disabled@m": [{"installPath": self._plugin("disabled", modules=["./a.ts"])}],
+            "custom@m": [{"installPath": self._plugin("custom", modules=["./c.ts"], hooks_rel="./etc/h.json")}],
+        }
+        (self.home / ".claude/plugins/installed_plugins.json").write_text(
+            json.dumps({"version": 2, "plugins": installed}))
+        (self.home / ".claude/settings.json").write_text(json.dumps(
+            {"enabledPlugins": {"modded@m": True, "plain@m": True, "disabled@m": False, "custom@m": True}}))
+        r = subprocess.run([sys.executable, "-c", cfm._MARKETPLACE_PROBE],
+                           capture_output=True, text=True, env=self._env())
+        report = json.loads(r.stdout)
+        self.assertEqual(report["schema"], "pantheon-marketplace-mods/1")
+        self.assertEqual(sorted((m["key"], m["modules"]) for m in report["mods"]),
+                         [("custom@m", 1), ("modded@m", 2)])
+
+    def test_missing_registry_reports_nothing(self):
+        r = subprocess.run([sys.executable, "-c", cfm._MARKETPLACE_PROBE],
+                           capture_output=True, text=True, env=self._env())
+        self.assertEqual(json.loads(r.stdout)["mods"], [])
+
+
 class TestMaybeAlertHookDeviation(unittest.TestCase):
     def setUp(self):
         # T-1307: use TemporaryDirectory()+addCleanup (the file's dominant idiom,
@@ -2559,6 +3285,121 @@ class TestSubagentBlockGuard(unittest.TestCase):
         # different main session -> prior reading discarded -> hold again
         self.assertEqual(self._disp("\u25EF x 9m 20s \u2193 390.0k tokens", "b.jsonl"), "hold")
 
+    # --- T-3617: star-spinner glyph parse + format-independent mtime liveness ---
+
+    def _disp_m(self, pane, jsonl_mtime, jsonl="sess.jsonl"):
+        """Like _disp but passes the main-transcript mtime (signal 1)."""
+        with patch.object(cfm, "_capture_pane_text", return_value=pane):
+            return cfm.subagent_block_disposition(
+                "specialist", {}, jsonl, jsonl_mtime=jsonl_mtime)
+
+    def test_star_spinner_line_parses(self):
+        # Root cause: specialist renders a STAR spinner ("\u273B \u2026 \u2193 Nk"), which the circle-only
+        # line regex missed -> _subagent_tokens None -> subagent_block_disposition
+        # 'fire' on a live agent. All three star glyphs must now parse.
+        for glyph in ("\u273B", "\u2736", "\u273D"):  # \u273B \u2736 \u273D
+            line = f"{glyph} impl-x  Arc-intent: \u2026 4m 5s \u00B7 \u2193 17.6k tokens"
+            self.assertEqual(cfm._subagent_tokens(line), 17.6,
+                             f"star spinner {glyph!r} must parse")
+
+    def test_mtime_advance_suppresses_even_with_unparseable_pane(self):
+        # The format-INDEPENDENT signal: the pane has NO parseable subagent line at
+        # all, but the main transcript advanced across polls -> alive -> suppress.
+        # This is the belt (robust to any spinner/glyph drift the regex misses).
+        self.assertEqual(self._disp_m("\u276F can't parse this", 1000.0), "hold")
+        self.assertEqual(self._disp_m("\u276F can't parse this", 1100.0), "suppress")
+
+    def test_mtime_first_reading_holds_then_frozen_fires(self):
+        # No subagent line + a first (real) mtime reading -> HOLD one poll to give the
+        # transcript-advancement signal a chance rather than fire blind. If the
+        # transcript is then FROZEN too -> a genuine plain wedge -> fire.
+        self.assertEqual(self._disp_m("\u276F stuck prompt", 1000.0), "hold")
+        self.assertEqual(self._disp_m("\u276F stuck prompt", 1000.0), "fire")
+
+    def test_no_mtime_probe_no_subagent_still_fires_immediately(self):
+        # mtime probe unavailable (None) -> preserve pre-T-3617 conservative
+        # behaviour: no pane signal -> fire on the first poll (no basis to wait).
+        self.assertEqual(self._disp_m("\u276F stuck prompt", None), "fire")
+
+    def test_frozen_mtime_and_frozen_tokens_still_fires(self):
+        # Belt-and-suspenders must NOT mask a real wedge: subagent line present but
+        # tokens frozen AND the transcript frozen -> fire.
+        self.assertEqual(
+            self._disp_m("\u25EF x 9m 15s \u2193 385.3k tokens", 1000.0), "hold")
+        self.assertEqual(
+            self._disp_m("\u25EF x 9m 25s \u2193 385.3k tokens", 1000.0), "fire")
+
+    # --- T-3726: background-agent-in-manual-mode with no streaming token line ---
+
+    def test_background_agent_glyph_suppresses_with_frozen_mtime(self):
+        # THE T-3726 CASE (verified on specialist 2026-09-15 ~19:38Z): a background-
+        # agent manage state (\u29C9 marker) with NO streamable \u2193 token line and a
+        # FROZEN main transcript (subagent-blocked in manual mode). Both T-3617
+        # guards fail structurally: tokens=None (no \u2193 Nk line \u2014 only a COMPLETED
+        # '\u273B Worked for 14m48s \u00B7 done' line), and the MAIN mtime is frozen
+        # precisely BECAUSE the subagent holds the turn. Used to FIRE on poll 2;
+        # the \u29C9 marker is the discriminator -> must suppress.
+        pane = "\u29C9 impl-x\n\u273B Worked for 14m48s \u00B7 done 14:55\n\u276F "
+        self.assertEqual(self._disp_m(pane, 1000.0), "suppress")  # poll 1
+        self.assertEqual(self._disp_m(pane, 1000.0), "suppress")  # poll 2, frozen mtime
+
+    def test_manage_view_footer_suppresses_with_frozen_mtime(self):
+        # The "\u2193 to manage" footer (inbox_consumer's vetted manage-view-only
+        # sentinel) is the second background-agent signal \u2014 a glyph-drift belt,
+        # the same robustness lesson T-3617 taught for the star spinner.
+        pane = "\u273B Worked for 3m \u00B7 done\n\u276F  \n\u2190 for agents \u00B7 \u2193 to manage"
+        self.assertEqual(self._disp_m(pane, 2000.0), "suppress")
+        self.assertEqual(self._disp_m(pane, 2000.0), "suppress")
+
+    def test_genuinely_frozen_plain_pane_still_fires_without_bg_agent(self):
+        # The requirement's OTHER half: a genuinely-frozen pane with NO
+        # background-agent marker must STILL fire (plain wedge). The fix must not
+        # over-suppress \u2014 "\u2190 for agents" alone (which also shows on the idle
+        # view) is deliberately NOT a suppress signal.
+        pane = "\u276F stuck prompt \u00B7 \u2190 for agents"  # idle-view arrow, no \u29C9, no "\u2193 to manage"
+        self.assertEqual(self._disp_m(pane, 1000.0), "hold")   # poll 1
+        self.assertEqual(self._disp_m(pane, 1000.0), "fire")   # poll 2 frozen -> fire
+
+    def test_frozen_tokens_still_fire_even_with_bg_agent_footer(self):
+        # An INLINE streaming subagent whose tokens are FROZEN is a real wedge and
+        # must fire even if a background-agent footer is also present \u2014 the \u29C9/
+        # manage suppress lives in the tokens-None fall-through, never overriding
+        # the frozen-token fire (Signal 2 wins).
+        line = "\u25EF x 9m 15s \u2193 385.3k tokens\n\u2193 to manage"
+        frozen = "\u25EF x 9m 25s \u2193 385.3k tokens\n\u2193 to manage"
+        self.assertEqual(self._disp_m(line, 1000.0), "hold")
+        self.assertEqual(self._disp_m(frozen, 1000.0), "fire")
+
+
+class TestPaneConfirmedWedgedSustained(unittest.TestCase):
+    """T-3839: the pane-wedged confirmation is RE-SAMPLED to filter a transient
+    non-idle render (the single-snapshot check false-fired on the 2026-09-20 specialist
+    keep-going-injection race). Unit-level, patching the single-read primitive."""
+
+    def test_first_not_wedged_short_circuits(self) -> None:
+        with patch.object(cfm, "_pane_confirmed_wedged", side_effect=[False]) as m:
+            self.assertFalse(cfm._pane_confirmed_wedged_sustained("specialist", samples=3, interval=0))
+        self.assertEqual(m.call_count, 1, "first not-wedged read must short-circuit (no re-sample latency)")
+
+    def test_all_samples_wedged_true(self) -> None:
+        with patch.object(cfm, "_pane_confirmed_wedged", side_effect=[True, True]) as m:
+            self.assertTrue(cfm._pane_confirmed_wedged_sustained("specialist", samples=2, interval=0))
+        self.assertEqual(m.call_count, 2)
+
+    def test_transient_wedged_then_clear_false(self) -> None:
+        with patch.object(cfm, "_pane_confirmed_wedged", side_effect=[True, False]) as m:
+            self.assertFalse(cfm._pane_confirmed_wedged_sustained("specialist", samples=2, interval=0))
+        self.assertEqual(m.call_count, 2, "a transient (wedged then clear) must return False, not fire")
+
+    def test_defaults_read_module_globals_at_call_time(self) -> None:
+        # Guards the import-time-default-capture trap: samples/interval are read
+        # from the module globals at CALL time, so a patch/env change takes effect.
+        with patch.object(cfm, "WEDGE_RESAMPLE_COUNT", 1), \
+             patch.object(cfm, "WEDGE_RESAMPLE_INTERVAL_SECONDS", 0), \
+             patch.object(cfm, "_pane_confirmed_wedged", side_effect=[True]) as m:
+            self.assertTrue(cfm._pane_confirmed_wedged_sustained("specialist"))
+        self.assertEqual(m.call_count, 1, "must read WEDGE_RESAMPLE_COUNT (=1) at call time, not an import-time default")
+
 
 class TestStalenessDetection(unittest.TestCase):
     """T-0857: end-to-end main() wedge detection (the specialist regression)."""
@@ -2582,6 +3423,13 @@ class TestStalenessDetection(unittest.TestCase):
         self._notify_patch = patch.object(cfm, "_notify_wedge_restart")
         self.mock_notify = self._notify_patch.start()
         self.addCleanup(self._notify_patch.stop)
+        # T-3839: the pane-wedged confirmation is now RE-SAMPLED (2 reads). Zero the
+        # inter-sample sleep so these tests stay fast; the re-sample logic (both
+        # reads must be wedged) still runs — a fixed verify_rc side_effect returns
+        # the same verdict for both reads, so existing fixtures behave unchanged.
+        self._resample_patch = patch.object(cfm, "WEDGE_RESAMPLE_INTERVAL_SECONDS", 0)
+        self._resample_patch.start()
+        self.addCleanup(self._resample_patch.stop)
         self.addCleanup(self._tmp.cleanup)
         self.addCleanup(lambda: [os.environ.pop(k, None) for k in
                                  ("PANTHEON_STATE_DIR", "PANTHEON_CONTEXT_WINDOW")])
@@ -2626,6 +3474,95 @@ class TestStalenessDetection(unittest.TestCase):
         # A restart fired despite below-threshold fill (Popen invoked).
         self.assertTrue(_dispatched(mrun), "wedge restart should have fired")
         self.mock_notify.assert_called_once()
+
+    def test_wedge_restart_passes_dismiss_modal(self) -> None:
+        """T-4828: a wedged pane can be parked on a permission dialog (orchestrator
+        10-09 22:57-23:20Z). The wedge restart must ask handoff_and_restart.sh
+        to Escape it first, or the injected Enter approves the command blind."""
+        find = "1700000010 /path/sess.jsonl\n"
+        usage = self._usage_line(164)
+        self._seed_ring("specialist", 164, "sess.jsonl", 3)  # +1 in main = 4 = frozen
+        with patch("tools.context_fill_monitor.subprocess.run") as mrun, \
+             patch("tools.context_fill_monitor.subprocess.Popen") as mpop:
+            mrun.side_effect = self._side_effect(find, usage, verify_rc=7)  # wedged
+            mpop.side_effect = lambda cmd, **kw: MagicMock(
+                stdout=iter(["ok\n"]), wait=MagicMock(return_value=0))
+            self.assertEqual(main(["--agent", "specialist"]), 0)
+        self.assertTrue(_dispatched(mrun), "fixture must actually fire the wedge restart")
+        self.assertIn("--dismiss-modal", _dispatch_joined(mrun))
+
+    def test_wedge_recovery_still_fires_on_a_stale_jsonl(self) -> None:
+        """T-4088: a fresh session wedged AT BOOT writes no jsonl, so the selected one
+        predates its process (stale). The stale-jsonl guard skips jsonl-CONTENT checks
+        and the threshold fire, but pane-confirmed wedge recovery must still run."""
+        find = "1700000010 /path/sess.jsonl\n"
+        usage = self._usage_line(164)
+        self._seed_ring("specialist", 164, "sess.jsonl", 3)  # +1 in main = 4 = frozen
+        base = self._side_effect(find, usage, verify_rc=7)  # wedged
+
+        def se(cmd, **kwargs):
+            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if "etimes=" in joined:   # pane claude started at 1700000500
+                return MagicMock(returncode=0, stdout="1700001000 500\n", stderr="")
+            if "stat -c %Y" in joined:  # jsonl last written before that
+                return MagicMock(returncode=0, stdout="1700000010\n", stderr="")
+            return base(cmd, **kwargs)
+
+        verdicts = []
+        real_guard = cfm.stale_jsonl_session_start
+
+        def spy(*a, **kw):
+            verdicts.append(real_guard(*a, **kw))
+            return verdicts[-1]
+
+        with patch("tools.context_fill_monitor.subprocess.run") as mrun, \
+             patch("tools.context_fill_monitor.subprocess.Popen") as mpop, \
+             patch.object(cfm, "stale_jsonl_session_start", side_effect=spy), \
+             patch.object(cfm, "maybe_alert_idle_successor"):   # fixture epochs are ancient
+            mrun.side_effect = se
+            mpop.side_effect = lambda cmd, **kw: MagicMock(
+                stdout=iter(["ok\n"]), wait=MagicMock(return_value=0))
+            # Poll 1: a first real transcript-mtime reading HOLDS one poll (T-3617).
+            self.assertEqual(main(["--agent", "specialist"]), 0)
+            self.assertFalse(_dispatched(mrun), "first mtime reading holds one poll")
+            # Poll 2: the (stale) transcript did not advance + pane still wedged -> fire.
+            self.assertEqual(main(["--agent", "specialist"]), 0)
+        # Non-vacuous: the guard DID classify the jsonl stale on the firing poll.
+        self.assertEqual(verdicts[-1], 1700000500.0, "fixture must actually reach the stale verdict")
+        self.assertTrue(_dispatched(mrun), "wedge recovery must NOT be blinded by the stale-jsonl guard")
+
+    def test_transient_non_idle_render_does_not_fire(self) -> None:
+        """T-3839: the pane reads wedged on the FIRST sample but idle on the second
+        (a keep-going-injector prompt landing in the bottom region, then clearing).
+        The RE-SAMPLED confirmation must NOT fire — the 2026-09-20 specialist false wedge.
+        (Fails on the old single-snapshot code: it fired on the first rc-7 read.)"""
+        find = "1700000010 /path/sess.jsonl\n"
+        usage = self._usage_line(164)
+        self._seed_ring("specialist", 164, "sess.jsonl", 3)  # +1 in main = 4 = frozen
+        verify_calls = {"n": 0}
+
+        def se(cmd, **kwargs):
+            joined = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+            if "verify_startup" in joined:
+                verify_calls["n"] += 1
+                rc = 7 if verify_calls["n"] == 1 else 0  # transient: wedged then idle
+                return MagicMock(returncode=rc, stdout='{"pane":"x"}', stderr="")
+            if "find " in joined and "*.jsonl" in joined:
+                return MagicMock(returncode=0, stdout=find, stderr="")
+            if "tac " in joined:
+                return MagicMock(returncode=0, stdout=usage, stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+
+        with patch("tools.context_fill_monitor.subprocess.run") as mrun, \
+             patch("tools.context_fill_monitor.subprocess.Popen") as mpop:
+            mrun.side_effect = se
+            mpop.side_effect = lambda cmd, **kw: MagicMock(
+                stdout=iter(["ok\n"]), wait=MagicMock(return_value=0))
+            rc = main(["--agent", "specialist"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(_dispatched(mrun), "a TRANSIENT non-idle render must NOT fire a wedge restart")
+        self.mock_notify.assert_not_called()
+        self.assertGreaterEqual(verify_calls["n"], 2, "the pane-wedged check must be RE-SAMPLED (>=2 reads)")
 
     def test_active_hold_does_not_mask_a_real_wedge(self) -> None:
         """T-2615 state 3 / the load-bearing safety boundary: an active
@@ -2744,6 +3681,18 @@ class TestStalenessDetection(unittest.TestCase):
         "╰─────────╯"
     )
 
+    # T-4024: the /rate-limit-options spend-limit modal (real capture, specialist 2026-09-27).
+    # A wedge-restart send-keys INTO this blocking modal -> handoff never re-written ->
+    # 600s ack timeout -> exit 4, re-fired hourly (35 consecutive failures).
+    _SPEND_LIMIT_PANE = (
+        "  ⎿  You've hit your monthly spend limit · your weekly limit resets Sep 27, 5pm\n"
+        "     (UTC)\n"
+        "   What do you want to do?                        Usage credit balance: $8.08\n"
+        "   ❯ Adjust monthly spend limit:        ← or → to adjust · Del to remove lim…\n"
+        "     Wait for limit to reset                         Resets Sep 27, 5pm (UTC)\n"
+        "   Enter to confirm · Esc to cancel"
+    )
+
     def test_login_modal_pane_suppresses_wedge_fire(self) -> None:
         """T-2965: frozen fill + pane confirmed non-idle (rc 7), BUT the pane shows the
         /login OAuth modal. A restart there send-keys into the login prompt and respawns
@@ -2760,6 +3709,27 @@ class TestStalenessDetection(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertFalse(_dispatched(mrun),
                          "a seat in a /login modal must NOT be auto-restarted")
+        self.mock_notify.assert_not_called()
+
+    def test_spend_limit_modal_pane_suppresses_wedge_fire(self) -> None:
+        """T-4024: frozen fill + pane confirmed non-idle (rc 7), BUT the pane shows the
+        /rate-limit-options spend-limit modal. The wedge-restart send-keys its handoff
+        prompt INTO the blocking modal -> HANDOFF.md is never re-written -> 600s ack
+        timeout -> exit 4, re-fired hourly (specialist/orchestrator/mason/artisan all wedged this way
+        during the 2026-09-27 cap window). A capped seat must WAIT for the usage window
+        to roll (T-2290), never restart -> it must NOT fire."""
+        find = "1700000010 /path/sess.jsonl\n"
+        usage = self._usage_line(164)
+        self._seed_ring("specialist", 164, "sess.jsonl", 3)
+        with patch("tools.context_fill_monitor.subprocess.run") as mrun, \
+             patch("tools.context_fill_monitor.subprocess.Popen"), \
+             patch.object(cfm, "_maybe_fire_spend_limit", return_value=False), \
+             patch.object(cfm, "_capture_pane_text", return_value=self._SPEND_LIMIT_PANE):
+            mrun.side_effect = self._side_effect(find, usage, verify_rc=7)
+            rc = main(["--agent", "specialist"])
+        self.assertEqual(rc, 0)
+        self.assertFalse(_dispatched(mrun),
+                         "a seat on the spend-limit modal must NOT be auto-restarted (T-4024)")
         self.mock_notify.assert_not_called()
 
     def test_explicit_suppress_flag_vetoes_wedge_fire(self) -> None:
@@ -2929,6 +3899,18 @@ class TestWedgeSuppressHelpersT2965(unittest.TestCase):
                           return_value="  Select login method:\n  Paste code here:"):
             self.assertIsNotNone(cfm._pane_in_interactive_modal("specialist", {}))
 
+    def test_modal_sentinel_matches_spend_limit(self) -> None:
+        """T-4024: the /rate-limit-options spend-limit modal must be recognised so the
+        wedge-restart is suppressed — restarting a capped seat re-hits the same usage
+        window (T-2290) and, worse, the restart's send-keys lands in the blocking modal."""
+        with patch.object(cfm, "_capture_pane_text", return_value=(
+            "You've hit your monthly spend limit · your weekly limit resets Sep 27, 5pm\n"
+            "  What do you want to do?\n"
+            "  Adjust monthly spend limit: $63.56\n"
+            "  Wait for limit to reset\n"
+        )):
+            self.assertIsNotNone(cfm._pane_in_interactive_modal("specialist", {}))
+
     def test_modal_sentinel_no_match_on_working_pane(self) -> None:
         with patch.object(cfm, "_capture_pane_text",
                           return_value="Editing foo.py … esc to interrupt"):
@@ -2987,6 +3969,79 @@ class TestSeatMaintenanceT2984(unittest.TestCase):
         os.environ["PANTHEON_MAINTENANCE_REGISTRY"] = "/proc/nonexistent/x.json"
         self.addCleanup(lambda: os.environ.pop("PANTHEON_MAINTENANCE_REGISTRY", None))
         self.assertFalse(cfm._seat_in_maintenance("specialist"))
+
+
+class TestSeatStateT5527(unittest.TestCase):
+    """ORG-106 L4b (T-5527): deep-sleep skips the threshold, api-health and wedge paths;
+    paused-intake is normal; the wedge-restart veto also keys on the seat-state veto."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["PANTHEON_STATE_DIR"] = str(Path(self._tmp.name) / "state")
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(lambda: os.environ.pop("PANTHEON_STATE_DIR", None))
+        for name in ("maybe_alert_hook_deviation", "maybe_alert_allowlist_staleness",
+                     "maybe_alert_undeclared_repos", "reconcile_prior_dispatch"):
+            p = patch.object(cfm, name)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _main(self, seat):
+        enabled = MagicMock(status="enabled")
+        with patch("tools.seat_state.safe_effective_for", return_value=seat), \
+             patch.object(cfm, "active_harness_monitor_gate", return_value=enabled), \
+             patch.object(cfm, "find_latest_jsonl", return_value=None) as find:
+            rc = cfm.main(["--agent", "orchestrator"])
+        return rc, find
+
+    def test_deep_sleep_skips_the_poll_before_any_jsonl_work(self) -> None:
+        from tools.seat_state_testkit import eff
+        for seat in (eff("deep-sleep", asleep=True), eff("deep-sleep", asleep=False)):
+            rc, find = self._main(seat)
+            self.assertEqual(rc, 0)
+            find.assert_not_called()
+
+    def test_deep_sleep_still_runs_the_alert_only_security_checks(self) -> None:
+        from tools.seat_state_testkit import eff
+        self._main(eff("deep-sleep", asleep=True))
+        cfm.maybe_alert_hook_deviation.assert_called()
+
+    def test_paused_intake_active_and_unknown_run_the_normal_poll(self) -> None:
+        from tools.seat_state_testkit import eff
+        for seat in (eff("paused-intake"), eff(), None, eff(oom=True)):
+            _, find = self._main(seat)
+            find.assert_called_once()
+
+    def test_wedge_restart_suppressed_for_deep_sleep_even_without_maintenance(self) -> None:
+        from tools.seat_state_testkit import eff
+        with patch("tools.seat_state.safe_effective_for", return_value=eff("deep-sleep", asleep=True)), \
+             patch.object(cfm, "_capture_pane_text") as cap:
+            reason = cfm._wedge_restart_suppressed("specialist", {})
+        self.assertIn("deep-sleep", reason)
+        cap.assert_not_called()
+
+    def test_live_oom_shape_oom_hold_plus_maintenance_rearm_vetoes_wedge_restart(self) -> None:
+        # the OOM killer re-arms seat maintenance every 10 min (live shape): vetoed via that.
+        from tools.seat_state_testkit import eff
+        with patch("tools.seat_state.safe_effective_for", return_value=eff(oom=True, maintenance=True)), \
+             patch("tools.notify_policy.in_maintenance", return_value=True), \
+             patch.object(cfm, "_capture_pane_text") as cap:
+            self.assertIn("maintenance", cfm._wedge_restart_suppressed("specialist", {}))
+        cap.assert_not_called()
+
+    def test_wedge_restart_not_suppressed_for_paused_or_unknown(self) -> None:
+        from tools.seat_state_testkit import eff
+        for seat in (eff("paused-intake"), None):
+            with patch("tools.seat_state.safe_effective_for", return_value=seat), \
+                 patch.object(cfm, "_capture_pane_text", return_value=None):
+                self.assertIsNone(cfm._wedge_restart_suppressed("specialist", {}))
+
+    def test_maintenance_shim_matches_the_shared_helper(self) -> None:
+        with patch("tools.notify_policy.in_maintenance", return_value=True) as m:
+            self.assertTrue(cfm._seat_in_maintenance("specialist"))
+        m.assert_called_once_with("specialist")
+        with patch("tools.notify_policy.in_maintenance", side_effect=RuntimeError):
+            self.assertFalse(cfm._seat_in_maintenance("specialist"))
 
 
 class TestProjectsDirExists(unittest.TestCase):
@@ -3204,7 +4259,7 @@ class TestValidateConfig(unittest.TestCase):
         # requirements for observation-only entries. A fire-path agent with the same
         # missing account WOULD hard-fail (test_missing_account_fails).
         fixture = self._fixture()
-        fixture["metis"] = {
+        fixture["mason"] = {
             "jsonl_dir": Path("/nonhome/suborch1/projects"),
             "sudo_user": "suborch1",
             "observation_only": True,
@@ -3902,6 +4957,243 @@ class TestUndeclaredRepoAudit(unittest.TestCase):
         send.assert_not_called()
 
     # ------------------------------------------------------------------
+    # T-3314: registry grants count as declared
+    # ------------------------------------------------------------------
+
+    def _role_is(self, role: str | None):
+        return patch.object(cfm, "_resolve_audit_role", return_value=role)
+
+    def test_role_granted_repo_names(self) -> None:
+        self.assertEqual(
+            cfm._role_granted_repo_names(self._REGISTRY, "orchestrator"),
+            {"pantheon-config", "echo-prismatic", "revenue-project"},
+        )
+        self.assertEqual(cfm._role_granted_repo_names(self._REGISTRY, "specialist"), set())
+        self.assertEqual(cfm._role_granted_repo_names({}, "specialist"), set())
+
+    def test_granted_repo_counts_as_declared_no_alert(self) -> None:
+        """A repo whose grants map holds the agent's role → declared, no alert."""
+        with self._role_is("orchestrator"), \
+             self._scan_returns(["pantheon-config", "echo-prismatic", "revenue-project"]), \
+             patch.object(cfm, "send_telegram", return_value=True) as send:
+            maybe_alert_undeclared_repos(self.agent, self.cfg, self.repo_root)
+        send.assert_not_called()
+        self.assertFalse(_repo_audit_marker_path(self.agent).exists())
+
+    def test_ungranted_repo_alerts_with_role_in_text(self) -> None:
+        """A repo not granted to the role (and in no ticket) → alert naming the role."""
+        with self._role_is("specialist"), \
+             self._scan_returns(["pantheon-config", "echo-prismatic"]), \
+             patch.object(cfm, "send_telegram", return_value=True) as send:
+            maybe_alert_undeclared_repos(self.agent, self.cfg, self.repo_root)
+        send.assert_called_once()
+        text = send.call_args[0][0]
+        self.assertIn("echo-prismatic", text)
+        self.assertIn("repos.yaml grant for specialist", text)
+        self.assertIn("ticket repos: field", text)
+        self.assertIn("ignored: list", text)
+        data = json.loads(_repo_audit_marker_path(self.agent).read_text(encoding="utf-8"))
+        self.assertEqual(data["repos"], ["echo-prismatic"])
+
+    def test_grant_for_other_role_does_not_declare(self) -> None:
+        """Only the agent's OWN role's grants count; unrelated repos still alert."""
+        with self._role_is("orchestrator"), \
+             self._scan_returns(["pantheon-config", "echo-prismatic", "stray-clone"]), \
+             patch.object(cfm, "send_telegram", return_value=True) as send:
+            maybe_alert_undeclared_repos(self.agent, self.cfg, self.repo_root)
+        send.assert_called_once()
+        self.assertIn("stray-clone", send.call_args[0][0])
+        self.assertNotIn("echo-prismatic", send.call_args[0][0])
+
+    def test_unresolvable_role_skips_silently(self) -> None:
+        """Role unresolved → fail open: no scan, no alert, no marker."""
+        with self._role_is(None), \
+             patch.object(cfm, "_scan_agent_repos", return_value=["stray"]) as scan, \
+             patch.object(cfm, "send_telegram", return_value=True) as send:
+            maybe_alert_undeclared_repos(self.agent, self.cfg, self.repo_root)
+        scan.assert_not_called()
+        send.assert_not_called()
+        self.assertFalse(_repo_audit_marker_path(self.agent).exists())
+
+    def _assert_resolve_audit_role_contract(self) -> None:
+        """Resolved ONLY when the lookup returns a known role-key (a registry grant
+        key or an instance-manifest role-key); identity fallback, an unknown
+        non-identity value, empty, or a raised error -> None (fail open)."""
+        import tools.agent_role_map as arm
+        reg = self._REGISTRY  # grant keys: {"orchestrator"}
+        # Identity fallback for an unregistered name.
+        with patch.object(arm, "resolve_instance_role", side_effect=lambda a: a):
+            self.assertIsNone(cfm._resolve_audit_role("nobody", reg))
+        # A value that is NOT the input but is no known role-key: still unresolved.
+        with patch.object(arm, "resolve_instance_role", return_value="not-a-role"):
+            self.assertIsNone(cfm._resolve_audit_role("specialist", reg))
+        with patch.object(arm, "resolve_instance_role", return_value=""):
+            self.assertIsNone(cfm._resolve_audit_role("specialist", reg))
+        with patch.object(arm, "resolve_instance_role", side_effect=RuntimeError("x")):
+            self.assertIsNone(cfm._resolve_audit_role("orchestrator", reg))
+        # Known via the instance manifest's role-keys (no registry needed).
+        with patch.object(arm, "resolve_instance_role", return_value="specialist"):
+            self.assertEqual(cfm._resolve_audit_role("specialist"), "specialist")
+        # Known via the registry's grant keys only (absent from the manifest).
+        with patch.object(arm, "resolve_instance_role", return_value="orchestrator"):
+            self.assertEqual(cfm._resolve_audit_role("x", reg), "orchestrator")
+            self.assertIsNone(cfm._resolve_audit_role("x", {"repos": []}))
+        # Even an identity-equal value counts when it IS a grant key.
+        with patch.object(arm, "resolve_instance_role", side_effect=lambda a: a):
+            self.assertEqual(
+                cfm._resolve_audit_role("orchestrator", reg), "orchestrator")
+
+    def test_resolve_audit_role_requires_known_role_key(self) -> None:
+        self._assert_resolve_audit_role_contract()
+
+    def test_resolve_audit_role_patch_target_holds_with_tools_on_sys_path(self) -> None:
+        """r1 regression (T-3314): once another test has put tools/ on sys.path and
+        imported the BARE `agent_role_map`, a patch on `tools.agent_role_map` must
+        still be what _resolve_audit_role calls (package-first import)."""
+        import importlib
+        tools_dir = str(REPO_ROOT / "tools")
+        preloaded = "agent_role_map" in sys.modules
+        with patch.object(sys, "path", [tools_dir, *sys.path]):
+            bare = importlib.import_module("agent_role_map")
+            try:
+                import tools.agent_role_map as pkg
+                self.assertIsNot(bare, pkg)  # both shapes really are loaded
+                self._assert_resolve_audit_role_contract()
+            finally:
+                if not preloaded and sys.modules.get("agent_role_map") is bare:
+                    del sys.modules["agent_role_map"]
+
+    def test_bare_script_import_shape_loads_registry_and_tickets(self) -> None:
+        """The unit runs the monitor as a bare script (tools/ on sys.path[0], no
+        `tools` package): the audit's registry + ticket loaders must still work
+        there (T-3314; the package-only import raised ModuleNotFoundError)."""
+        self._write_ticket("T-0030", repos_field="[echo-prismatic:ro]")
+        tools_dir = str(REPO_ROOT / "tools")
+        code = (
+            "import sys, json\n"
+            f"sys.path.insert(0, {tools_dir!r})\n"
+            "from pathlib import Path\n"
+            "import context_fill_monitor as m\n"
+            "assert 'tools' not in sys.modules\n"
+            f"root = Path({str(self.repo_root)!r})\n"
+            "print(json.dumps({'reg': m._load_repo_registry_for_audit(root) is not None,\n"
+            "  'tickets': sorted(m._active_ticket_repos(root))}))\n"
+        )
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        proc = subprocess.run(
+            [sys.executable, "-c", code], cwd=str(self.tmp), env=env,
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        out = json.loads(proc.stdout.strip().splitlines()[-1])
+        self.assertTrue(out["reg"])
+        self.assertEqual(out["tickets"], ["echo-prismatic"])
+
+    # ------------------------------------------------------------------
+    # T-3314: --repo-audit-dry-run (read-only)
+    # ------------------------------------------------------------------
+
+    def _dry_run(self, *, role: str | None = "orchestrator",
+                 scan: list[str] | None = None, env_flag: str | None = "0"):
+        """Run the dry run with the arm flag OFF; return (rc, parsed JSON, send mock)."""
+        if env_flag is None:
+            os.environ.pop("PANTHEON_REPO_AUDIT_ENABLED", None)
+        else:
+            os.environ["PANTHEON_REPO_AUDIT_ENABLED"] = env_flag
+        out = io.StringIO()
+        with self._role_is(role), \
+             patch.object(cfm, "_scan_agent_repos", return_value=scan), \
+             patch.object(cfm, "send_telegram", return_value=True) as send, \
+             patch.object(cfm, "_read_state_file") as read_state, \
+             contextlib.redirect_stdout(out):
+            rc = cfm.run_repo_audit_dry_run(self.agent, self.cfg, self.repo_root)
+        read_state.assert_not_called()
+        return rc, json.loads(out.getvalue()), send
+
+    def test_dry_run_clean_rc0(self) -> None:
+        rc, data, send = self._dry_run(scan=["pantheon-config", "echo-prismatic", "toys"])
+        self.assertEqual(rc, 0)
+        self.assertEqual(data["undeclared"], [])
+        self.assertEqual(data["present"], ["pantheon-config", "echo-prismatic", "toys"])
+        self.assertIn("echo-prismatic", data["ok"])
+        self.assertEqual(data["role"], "orchestrator")
+        self.assertIsNone(data["error"])
+        send.assert_not_called()
+        self.assertFalse(_repo_audit_marker_path(self.agent).exists())
+
+    def test_dry_run_undeclared_rc1_no_alert_no_marker(self) -> None:
+        rc, data, send = self._dry_run(
+            scan=["pantheon-config", "stray-clone"], env_flag=None)
+        self.assertEqual(rc, 1)
+        self.assertEqual(data["undeclared"], ["stray-clone"])
+        send.assert_not_called()
+        self.assertFalse(_repo_audit_marker_path(self.agent).exists())
+
+    def test_dry_run_leaves_existing_marker_untouched(self) -> None:
+        marker = _repo_audit_marker_path(self.agent)
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text('{"repos": ["old"]}\n', encoding="utf-8")
+        rc, _data, send = self._dry_run(scan=["pantheon-config"])  # clean → would clear
+        self.assertEqual(rc, 0)
+        send.assert_not_called()
+        self.assertEqual(marker.read_text(encoding="utf-8"), '{"repos": ["old"]}\n')
+
+    def test_dry_run_rc3_when_undeterminable(self) -> None:
+        """Can't determine -> rc 3 (2 is argparse's usage-error code)."""
+        self.assertEqual(cfm.REPO_AUDIT_RC_UNDETERMINED, 3)
+        # Role unresolved.
+        rc, data, send = self._dry_run(role=None, scan=["stray"])
+        self.assertEqual(rc, 3)
+        self.assertIn("unresolved", data["error"])
+        send.assert_not_called()
+        # Scan failed.
+        rc, data, send = self._dry_run(scan=None)
+        self.assertEqual(rc, 3)
+        self.assertEqual(data["error"], "repo scan failed")
+        send.assert_not_called()
+        # Registry absent.
+        (self.repo_root / "repos.yaml").unlink()
+        rc, data, send = self._dry_run(scan=["stray"])
+        self.assertEqual(rc, 3)
+        self.assertIn("registry", data["error"])
+        send.assert_not_called()
+        self.assertFalse(_repo_audit_marker_path(self.agent).exists())
+
+    def test_dry_run_logs_go_to_stderr_stdout_is_only_json(self) -> None:
+        """_log output during the dry run lands on stderr; stdout parses as JSON."""
+        def noisy_scan(agent, cfg):
+            cfm._log(agent, "scan: noisy log line")
+            return ["pantheon-config"]
+
+        out, err = io.StringIO(), io.StringIO()
+        with self._role_is("orchestrator"), \
+             patch.object(cfm, "_scan_agent_repos", side_effect=noisy_scan), \
+             patch.object(cfm, "send_telegram", return_value=True) as send, \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = cfm.run_repo_audit_dry_run(self.agent, self.cfg, self.repo_root)
+        self.assertEqual(rc, 0)
+        data = json.loads(out.getvalue())  # whole stdout is one JSON document
+        self.assertEqual(data["present"], ["pantheon-config"])
+        self.assertNotIn("noisy log line", out.getvalue())
+        self.assertIn("scan: noisy log line", err.getvalue())
+        send.assert_not_called()
+
+    def test_main_dry_run_flag_exits_before_poll(self) -> None:
+        """--repo-audit-dry-run dispatches to the dry run and returns its rc without
+        running any poll-cycle check (hook deviation, tripwire)."""
+        with patch.object(cfm, "run_repo_audit_dry_run", return_value=1) as dry, \
+             patch.object(cfm, "maybe_alert_hook_deviation") as hook, \
+             patch.object(cfm, "maybe_alert_undeclared_repos") as trip, \
+             patch.object(cfm, "send_telegram") as send:
+            rc = main(["--agent", "orchestrator", "--repo-audit-dry-run"])
+        self.assertEqual(rc, 1)
+        dry.assert_called_once()
+        self.assertEqual(dry.call_args[0][0], "orchestrator")
+        hook.assert_not_called()
+        trip.assert_not_called()
+        send.assert_not_called()
+
+    # ------------------------------------------------------------------
     # _scan_agent_repos — subprocess integration
     # ------------------------------------------------------------------
 
@@ -4298,14 +5590,14 @@ class ResolveContextWindowTests(unittest.TestCase):
             "orchestrator": DEFAULT_CONTEXT_WINDOW_TOKENS,
             "specialist": DEFAULT_CONTEXT_WINDOW_TOKENS,
             "recovery": DEFAULT_CONTEXT_WINDOW_TOKENS,
-            # Mnemosyne (second head, exocortex account) runs claude-fable-5
+            # Archivist (second head, exocortex account) runs claude-fable-5
             # like the fleet; observation-only entry — no context-fill timer
             # instance exists for her (auto-restart deferred to her call).
-            "mnemosyne": DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "archivist": DEFAULT_CONTEXT_WINDOW_TOKENS,
             # T-1945: ORG-043 seats — observation-only entries (hook-drift
             # coverage via recovery's cycle); fleet model, default window.
-            "metis": DEFAULT_CONTEXT_WINDOW_TOKENS,
-            "atlas": DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "mason": DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "artisan": DEFAULT_CONTEXT_WINDOW_TOKENS,
         }
         for agent, cfg in AGENT_CONFIG.items():
             self.assertEqual(
@@ -4391,17 +5683,35 @@ class TestSpendLimitWedge(unittest.TestCase):
     def tearDown(self):
         self._env.stop()
 
-    def _fire(self, pane_text):
+    def _fire(self, pane_text, agent="orchestrator"):
+        # T-4590: patch the routing chokepoint itself, so no test can reach a live pane.
         with patch.object(cfm, "_capture_pane_text", return_value=pane_text), \
-             patch.object(ic, "_send_telegram_alert") as alert:
-            fired = cfm._maybe_fire_spend_limit("orchestrator", self.cfg)
+             patch.object(ic, "route_failure_alert") as alert, \
+             patch.object(ic, "_send_telegram_alert") as tg:
+            fired = cfm._maybe_fire_spend_limit(agent, self.cfg)
+        tg.assert_not_called()  # never direct-to-operator any more (T-4590)
         return fired, alert
 
-    def test_modal_present_alerts_operator(self):
+    def test_modal_present_routes_via_failure_alert(self):
+        """T-4590 (D1): the spend-limit modal is a per-agent failure that Recovery clears
+        (or orchestrator, for Recovery's own pane), so it takes the standard route_failure_alert
+        path: agent -> Recovery, Recovery -> orchestrator, the operator only as the delivery fallback.
+        It was a direct the operator FYI from before T-2290."""
         fired, alert = self._fire("● You've hit your monthly spend limit · raise it at claude.ai/settings/usage")
         self.assertTrue(fired)
         alert.assert_called_once()
-        self.assertIn("spend-limit", alert.call_args[0][0])
+        agent, msg, vocab = alert.call_args[0]
+        self.assertEqual(agent, "orchestrator")
+        self.assertIn("spend-limit", msg)
+        self.assertEqual(vocab, cfm.SPEND_LIMIT_ALERT_LABEL)
+
+    def test_recoveries_own_modal_routes_with_agent_recovery(self):
+        """Recovery's own modal passes agent="recovery", which route_failure_alert sends to
+        orchestrator's mailbox, never to Recovery's pane (an injected Enter on that modal picks
+        an option)."""
+        fired, alert = self._fire("You've hit your monthly spend limit", agent="recovery")
+        self.assertTrue(fired)
+        self.assertEqual(alert.call_args[0][0], "recovery")
 
     def test_clean_pane_no_alert(self):
         fired, alert = self._fire("❯ \n  ? for shortcuts")
@@ -4422,7 +5732,7 @@ class TestSpendLimitWedge(unittest.TestCase):
     def test_disabled_flag_skips(self):
         with patch.dict(os.environ, {"PANTHEON_SPEND_LIMIT_ENABLED": "0"}), \
              patch.object(cfm, "_capture_pane_text", return_value="monthly spend limit") as cap, \
-             patch.object(ic, "_send_telegram_alert") as alert:
+             patch.object(ic, "route_failure_alert") as alert:
             self.assertFalse(cfm._maybe_fire_spend_limit("orchestrator", self.cfg))
             cap.assert_not_called()  # short-circuits before capturing
             alert.assert_not_called()
@@ -4637,6 +5947,11 @@ class TestBuildRestartArgv(unittest.TestCase):
         self.assertIn("--skip-ack", inner)
         self.assertIn("--lockfile /tmp/custom.lock", inner)
 
+    def test_episode_start_reaches_bespoke_restart_script(self):
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            inner = cfm.build_restart_argv(self.CFG, "orchestrator", episode_start=1234)[-1]
+        self.assertIn("--episode-start 1234", inner)
+
     def test_self_account_has_no_sudo_prefix(self):
         cfg = dict(self.CFG, sudo_user="claude-fallback")
         with patch.object(cfm, "_current_user", return_value="claude-fallback"):
@@ -4658,6 +5973,18 @@ class TestBuildRestartArgv(unittest.TestCase):
         with patch.object(cfm, "_current_user", return_value="claude-fallback"):
             inner = cfm.build_restart_argv(cfg, "specialist")[-1]
         self.assertIn("--supervisor control-plane", inner)
+
+    def test_no_dismiss_modal_flag_by_default(self) -> None:
+        """T-4828: a fill restart may land on a mid-turn pane, where an Escape
+        would interrupt live work, so --dismiss-modal is opt-in only."""
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            inner = cfm.build_restart_argv(self.CFG, "orchestrator")[-1]
+        self.assertNotIn("--dismiss-modal", inner)
+
+    def test_dismiss_modal_flag_when_requested(self) -> None:
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            inner = cfm.build_restart_argv(self.CFG, "orchestrator", dismiss_modal=True)[-1]
+        self.assertIn("--dismiss-modal", inner)
 
     def test_fire_restart_consumes_build_restart_argv(self):
         # Parity pin: the blocking path must build its argv through the SAME
@@ -4800,11 +6127,37 @@ class TestDetachedDispatchReconcile(unittest.TestCase):
         self.assertEqual(unit, "unit-x")
         self.assertEqual(cfm._read_state_file(self._pending_path())["unit"], "unit-x")
 
+    def test_dispatch_threads_dismiss_modal_to_fire(self):
+        # T-4828: the wedge path's dismiss_modal must reach the detached fire.
+        with patch.object(cfm, "fire_restart_detached", return_value=(True, "ok", "unit-x")) as fire:
+            cfm.dispatch_detached_restart(self.CFG, "orchestrator", reason="r", dismiss_modal=True)
+        self.assertTrue(fire.call_args.kwargs.get("dismiss_modal"))
+        with patch.object(cfm, "fire_restart_detached", return_value=(True, "ok", "unit-x")) as fire:
+            cfm.dispatch_detached_restart(self.CFG, "orchestrator", reason="r")
+        self.assertFalse(fire.call_args.kwargs.get("dismiss_modal"))
+
     def test_dispatch_failure_records_no_pending(self):
         with patch.object(cfm, "fire_restart_detached", return_value=(False, "boom", "unit-x")):
             ok, _out, _unit = cfm.dispatch_detached_restart(self.CFG, "orchestrator", reason="r")
         self.assertFalse(ok)
         self.assertIsNone(cfm._read_state_file(self._pending_path()))
+
+    def test_retry_reuses_first_dispatch_as_episode_start(self):
+        # T-4278: an exit-4 retry must accept a handoff written after the first
+        # dispatch, even when it predates the retry's own pre-prompt stat.
+        with patch.object(cfm.time, "time", return_value=100):
+            self._seed_pending()
+        with patch.object(cfm, "_show_transient_unit", return_value={
+                "LoadState": "loaded", "ActiveState": "failed",
+                "Result": "exit-code", "ExecMainStatus": "4"}), \
+             patch.object(cfm.subprocess, "run", return_value=MagicMock(returncode=0)), \
+             patch.object(cfm.time, "time", return_value=200):
+            cfm.reconcile_prior_dispatch("orchestrator")
+        with patch.object(cfm, "fire_restart_detached", return_value=(True, "ok", "unit-y")) as fire, \
+             patch.object(cfm.time, "time", return_value=300):
+            cfm.dispatch_detached_restart(self.CFG, "orchestrator", reason="context_fill_threshold")
+        self.assertEqual(fire.call_args.kwargs["episode_start"], 100)
+        self.assertEqual(cfm._read_state_file(self._pending_path())["episode_start"], 100)
 
     def test_dispatch_uses_out_of_cgroup_sibling_unit_never_blocks(self):
         # No-orphan proof: the restart is registered as a systemd-run --user
@@ -4871,6 +6224,66 @@ class TestDetachedDispatchReconcile(unittest.TestCase):
                         "lingering failed unit was not reset-failed")
         self.assertIsNone(cfm._read_state_file(self._pending_path()))
 
+    def test_exit4_reconcile_shortens_remaining_cooldown(self):
+        self._seed_pending()
+        cooldown = self.state_dir / "context_fill_orchestrator_last_restart.json"
+        cooldown.parent.mkdir(parents=True, exist_ok=True)
+        cooldown.write_text(json.dumps({"ts": 1900, "agent": "orchestrator", "reason": "fill"}))
+        with patch.object(cfm, "_show_transient_unit", return_value={
+                "LoadState": "loaded", "ActiveState": "failed",
+                "Result": "exit-code", "ExecMainStatus": "4"}), \
+             patch.object(cfm.subprocess, "run", return_value=MagicMock(returncode=0)), \
+             patch.object(cfm.time, "time", return_value=2000), \
+             patch.object(cfm, "CONTEXT_FILL_COOLDOWN_SECONDS", 1800), \
+             patch.object(cfm, "ACK_TIMEOUT_RETRY_SECONDS", 300):
+            cfm.reconcile_prior_dispatch("orchestrator")
+        self.assertEqual(json.loads(cooldown.read_text())["ts"], 500)
+
+    def test_non_exit4_reconcile_keeps_full_cooldown(self):
+        self._seed_pending()
+        cooldown = self.state_dir / "context_fill_orchestrator_last_restart.json"
+        cooldown.parent.mkdir(parents=True, exist_ok=True)
+        cooldown.write_text(json.dumps({"ts": 1900, "agent": "orchestrator", "reason": "fill"}))
+        with patch.object(cfm, "_show_transient_unit", return_value={
+                "LoadState": "loaded", "ActiveState": "failed",
+                "Result": "exit-code", "ExecMainStatus": "3"}), \
+             patch.object(cfm, "_unit_journal_contains", return_value=False), \
+             patch.object(cfm.subprocess, "run", return_value=MagicMock(returncode=0)), \
+             patch.object(cfm.time, "time", return_value=2000):
+            cfm.reconcile_prior_dispatch("orchestrator")
+        self.assertEqual(json.loads(cooldown.read_text())["ts"], 1900)
+
+    def _reconcile_exit3(self, journal: str):
+        """Reconcile a failed unit (exit 3) with the default 3-strike threshold."""
+        self._seed_pending()
+        def run_se(cmd, **kw):
+            if isinstance(cmd, list) and cmd[:3] == ["systemctl", "--user", "show"]:
+                return MagicMock(returncode=0, stdout=self._show(
+                    {"LoadState": "loaded", "ActiveState": "failed",
+                     "Result": "exit-code", "ExecMainStatus": "3"}), stderr="")
+            if isinstance(cmd, list) and cmd[:1] == ["journalctl"]:
+                return MagicMock(returncode=0, stdout=journal, stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        with patch.object(cfm.subprocess, "run", side_effect=run_se), \
+             patch.object(cfm, "RESTART_FAILURE_ALERT_THRESHOLD", 3), \
+             patch.object(cfm, "_seat_muted", return_value=False), \
+             patch("tools.inbox_consumer.route_failure_alert") as route:
+            cfm.reconcile_prior_dispatch("orchestrator")
+        return route
+
+    def test_reconcile_dialog_refusal_alerts_on_first_failure(self):
+        # T-4833: a T-4828 refusal means the seat is parked on a dialog Escape did not
+        # clear; waiting 3 cycles (~15 min) for the threshold is the costly case.
+        route = self._reconcile_exit3(
+            "handoff_and_restart: ERROR: refusing to inject: a confirm/permission dialog is focused\n")
+        route.assert_called_once()
+        self.assertIn("dialog", route.call_args.args[1])
+
+    def test_reconcile_other_exit3_keeps_the_threshold(self):
+        # Exit 3 is also the older prompt-send failure; that one keeps the 3-strike net.
+        route = self._reconcile_exit3("handoff_and_restart: ERROR: handoff prompt delivery/submit failed\n")
+        route.assert_not_called()
+
     def test_reconcile_unqueryable_leaves_pending(self):
         # A slow/absent bus (rc!=0, empty stdout → {} props) must fail-open and
         # leave the marker for a later cycle — never a false success/failure.
@@ -4891,23 +6304,24 @@ class TestBuildAgentConfig(unittest.TestCase):
     service), update instance.yaml/_MONITOR_TUNING AND this snapshot together — a diff
     here is the tripwire that the build drifted from the intended live config."""
 
-    # T-2953 R31 (reverted T-3098, 2026-08-23): orchestrator is NOT control-plane-
-    # supervised pre-T-2953 cutover -- T-2953 has not yet moved the
-    # interactive session off the bespoke claude-telegram.service, so
-    # restart_service stays that RAW unit (no consume-unit derivation) and
-    # jsonl_dir stays the plain -home-claude slug (the dir the bespoke
-    # session actually writes to -- matches recovery's post-T-3082 shape below).
-    # T-2953's full cutover re-derives both once it lands.
+    # T-2953 (2026-10-24): orchestrator cut over to the control plane; mirrors recovery
+    # (T-3026) -- restart_service is DERIVED to the consume unit and
+    # "supervisor" is carried, and jsonl_dir is DERIVED to the
+    # -home-<account>-pantheon-config slug (control-plane seats launch
+    # cwd=<account>/pantheon-config, T-2682). Pre-cutover (T-2953 R31
+    # reverted T-3098, 2026-08-23) this entry carried the RAW bespoke
+    # claude-telegram.service and the plain -home-<account> slug.
     REFERENCE_LITERALS = {
         "orchestrator": {
-            "jsonl_dir": Path("/home/claude/.claude/projects/-home-claude"),
+            "jsonl_dir": Path("/home/claude/.claude/projects/-home-claude-pantheon-config"),
             "sudo_user": "claude", "context_window": cfm.DEFAULT_CONTEXT_WINDOW_TOKENS,
-            "restart_service": "claude-telegram.service", "restart_mode": "user",
+            "restart_service": "pantheon-persona-consume@orchestrator.service", "restart_mode": "user",
             "restart_target_pane": "claude-telegram-bot:0",
             "handoff_file": "/home/claude/HANDOFF.md",
             "restart_bin": "/home/claude/pantheon-config/tools/handoff_and_restart.sh",
             "supervise_script": "/home/claude/.local/bin/claude-bot-supervise.sh",
-            "model_pin": "claude-opus-4-7",
+            "model_pin": "claude-opus-5-5",
+            "supervisor": "control-plane",
         },
         # T-2658: specialist is control-plane-supervised (T-2633 cutover) —
         # restart_service is DERIVED to the consume unit and "supervisor" is
@@ -4924,44 +6338,75 @@ class TestBuildAgentConfig(unittest.TestCase):
             "handoff_file": "/home/claude-research/HANDOFF.md",
             "restart_bin": "/home/claude-research/pantheon-config/tools/handoff_and_restart.sh",
             "supervise_script": "/home/claude-research/.local/bin/specialist-bot-supervise.sh",
-            "model_pin": "claude-opus-4-8",
+            "model_pin": "claude-opus-5-5",
             "supervisor": "control-plane",
         },
-        # T-2684 (reverted T-3082, 2026-08-23): recovery is NOT control-plane-
-        # supervised pre-T-3026 — T-2590 moved only the consume plane; the
-        # interactive session still lives on the bespoke claude-telegram-
-        # fallback.service, so restart_service stays that RAW unit (no
-        # consume-unit derivation) and jsonl_dir stays the plain
-        # -home-<account> slug (the dir the bespoke session actually writes
-        # to — matches mnemosyne's shape below). T-3026 (interactive-session
-        # cutover) re-derives both once it lands.
+        # T-3026 (2026-09-29): recovery is control-plane-supervised (interactive-
+        # session cutover onto the runtime controller + consume timer, as specialist
+        # above) — restart_service is DERIVED to the consume unit and
+        # "supervisor" is carried, and jsonl_dir is DERIVED to the
+        # -home-<account>-pantheon-config slug (control-plane seats launch
+        # cwd=<account>/pantheon-config, T-2682). Pre-cutover (T-2684 reverted
+        # T-3082, 2026-08-23) this entry carried the RAW bespoke
+        # claude-telegram-fallback.service and the plain -home-<account> slug.
         "recovery": {
-            "jsonl_dir": Path("/home/claude-fallback/.claude/projects/-home-claude-fallback"),
+            "jsonl_dir": Path("/home/claude-fallback/.claude/projects/-home-claude-fallback-pantheon-config"),
             "sudo_user": "claude-fallback",
-            "restart_service": "claude-telegram-fallback.service", "restart_mode": "user",
+            "restart_service": "pantheon-persona-consume@recovery.service", "restart_mode": "user",
             "restart_target_pane": "claude-telegram-bot-fallback:0",
             "handoff_file": "/home/claude-fallback/HANDOFF.md",
             "restart_bin": "/home/claude-fallback/pantheon-config/tools/handoff_and_restart.sh",
             "supervise_script": "/home/claude-fallback/.local/bin/recovery-bot-supervise.sh",
-            "model_pin": "claude-opus-4-8", "use_tombstone": True,
+            "model_pin": "claude-opus-5-5", "use_tombstone": True,
+            "supervisor": "control-plane",
         },
-        "mnemosyne": {
-            "jsonl_dir": Path("/home/exocortex/.claude/projects/-home-exocortex"),
+        # T-3819 (2026-09-20): archivist ARMED for context-fill auto-restart — observation_only +
+        # remediate removed, so restart_bin derives (has_restart from her binding).
+        # T-5063 (2026-10-18): cut over to the control plane, so (as recovery) restart_service
+        # derives to the consume unit, supervisor is carried, and the jsonl_dir slug is
+        # -pantheon-config (the controller launches cwd=<account>/pantheon-config).
+        # hook_check_via_recovery kept. mason/artisan are armed (see below).
+        "archivist": {
+            "jsonl_dir": Path("/home/exocortex/.claude/projects/-home-exocortex-pantheon-config"),
             "sudo_user": "exocortex", "context_window": cfm.DEFAULT_CONTEXT_WINDOW_TOKENS,
-            "restart_service": "claude-telegram-exocortex.service", "restart_mode": "user",
+            "restart_service": "pantheon-persona-consume@archivist.service", "restart_mode": "user",
             "restart_target_pane": "claude-telegram-bot-exocortex:0",
             "handoff_file": "/home/exocortex/HANDOFF.md",
-            "observation_only": True, "remediate": False, "hook_check_via_recovery": True,
+            "restart_bin": "/home/exocortex/pantheon-config/tools/handoff_and_restart.sh",
+            "hook_check_via_recovery": True,
+            "supervisor": "control-plane",
         },
-        "metis": {
-            "jsonl_dir": Path("/home/suborch1/.claude/projects/-home-suborch1"),
-            "sudo_user": "suborch1",
-            "observation_only": True, "remediate": False, "hook_check_via_recovery": True,
+        # mason + artisan BOTH ARMED (mason T-3838 2026-09-20; artisan T-3846 2026-09-21) —
+        # observation_only removed after each seat's own live-verify landed clean;
+        # bespoke_relaunch derives the relaunch identity + restart_bin (NO restart_service),
+        # and the -pantheon-config jsonl_dir slug (bespoke relaunch runs cwd=pantheon-config).
+        "mason": {
+            # -pantheon-config slug: mason's session runs cwd=pantheon-config
+            # (T-3838), so its live session writes here — not the plain -home-suborch1.
+            "jsonl_dir": Path("/home/suborch1/.claude/projects/-home-suborch1-pantheon-config"),
+            "sudo_user": "suborch1", "context_window": cfm.DEFAULT_CONTEXT_WINDOW_TOKENS,
+            # T-5055: re-armed (T-4818 observe-only interim dropped); the relaunch identity
+            # is derived again, and resolve_restart_cfg routes it through the controller.
+            "handoff_file": "/home/suborch1/HANDOFF.md",
+            "restart_bin": "/home/suborch1/pantheon-config/tools/pantheon-seat-relaunch.sh",
+            "restart_mode": "user", "restart_target_pane": "suborch1-main:0.0",
+            "relaunch_session": "suborch1-main", "relaunch_window": "harness",
+            "relaunch_scope_unit": "pantheon-mason-seat.scope",
+            "consume_timer": "pantheon-persona-consume@mason.timer",
+            "bespoke_relaunch": True, "hook_check_via_recovery": True,
+            # 2026-09-28: fresh path past the lock leaked by the pre-9>&- respawn.
+            "restart_lockfile": "/tmp/pantheon-seat-relaunch_mason.v2.lock",
         },
-        "atlas": {
-            "jsonl_dir": Path("/home/suborch2/.claude/projects/-home-suborch2"),
-            "sudo_user": "suborch2",
-            "observation_only": True, "remediate": False, "hook_check_via_recovery": True,
+        "artisan": {
+            # T-5299: control-plane cutover completed — archivist/specialist shape (no
+            # bespoke_relaunch identity). -pantheon-config slug as before (control-plane seat).
+            "jsonl_dir": Path("/home/suborch2/.claude/projects/-home-suborch2-pantheon-config"),
+            "sudo_user": "suborch2", "context_window": cfm.DEFAULT_CONTEXT_WINDOW_TOKENS,
+            "handoff_file": "/home/suborch2/HANDOFF.md",
+            "restart_bin": "/home/suborch2/pantheon-config/tools/handoff_and_restart.sh",
+            "restart_service": "pantheon-persona-consume@artisan.service",
+            "restart_mode": "user", "restart_target_pane": "suborch2-main:0",
+            "supervisor": "control-plane", "hook_check_via_recovery": True,
         },
     }
 
@@ -4991,6 +6436,177 @@ class TestBuildAgentConfig(unittest.TestCase):
             built = cfm._build_agent_config()
         self.assertEqual(built["orchestrator"]["restart_mode"], "user")
         self.assertEqual(built["orchestrator"]["restart_service"], "x.service")
+
+
+class TestBespokeRelaunchWiring(unittest.TestCase):
+    """T-3838: the bespoke tmux-cycle relaunch path for NOT-cut-over seats
+    (mason/artisan). Every ARMED-shape assertion here runs against SYNTHETIC
+    configs — the LIVE _MONITOR_TUNING keeps mason/artisan observation_only, so
+    this path is inert in production until the orchestrator-reviewed arm removes it
+    (test_live_mason_artisan_are_inert_observation_only guards that)."""
+
+    # A not-cut-over binding: account only, NO restart_service (mirrors the real
+    # mason/artisan instance.yaml bindings).
+    BESPOKE_BINDING = {"account": "suborch1", "expected_policy_skip": "runtime_viability_blocked"}
+
+    def _built_mason(self, tuning_extra: dict) -> dict:
+        tuning = {"mason": dict({"context_window": cfm.DEFAULT_CONTEXT_WINDOW_TOKENS}, **tuning_extra)}
+        with patch.object(cfm, "_MONITOR_TUNING", tuning), \
+             patch.object(cfm, "_instance_binding", return_value=self.BESPOKE_BINDING):
+            return cfm._build_agent_config()["mason"]
+
+    # ---- _build_agent_config ----
+    def test_armed_bespoke_derives_relaunch_bin_and_identity(self) -> None:
+        e = self._built_mason({"bespoke_relaunch": True})
+        self.assertEqual(
+            e["restart_bin"],
+            "/home/suborch1/pantheon-config/tools/pantheon-seat-relaunch.sh",
+        )
+        self.assertEqual(e["restart_target_pane"], "suborch1-main:0.0")
+        self.assertEqual(e["relaunch_session"], "suborch1-main")
+        self.assertEqual(e["relaunch_window"], "harness")
+        self.assertEqual(e["relaunch_scope_unit"], "pantheon-mason-seat.scope")
+        self.assertEqual(e["consume_timer"], "pantheon-persona-consume@mason.timer")
+        self.assertEqual(e["restart_mode"], "user")
+        self.assertEqual(e["handoff_file"], "/home/suborch1/HANDOFF.md")
+        # The whole point: NO restart_service (deriving one would resolve the
+        # persona-consume@ Type=oneshot trap the design exists to dodge).
+        self.assertNotIn("restart_service", e)
+
+    def test_observation_only_keeps_bespoke_inert(self) -> None:
+        # bespoke_relaunch present BUT observation_only still True (the live state
+        # until the arm) -> the branch is gated on `not observation_only`, so NO
+        # restart_bin/relaunch identity is derived. A read-only entry.
+        e = self._built_mason({"bespoke_relaunch": True, "observation_only": True})
+        self.assertNotIn("restart_bin", e)
+        self.assertNotIn("relaunch_scope_unit", e)
+        self.assertNotIn("consume_timer", e)
+        self.assertTrue(e["observation_only"])
+
+    def test_artisan_is_armed_on_the_control_plane_shape(self) -> None:
+        # T-5299: artisan completed its control-plane cutover (supervisor: control-plane in
+        # instance.yaml), so it is armed with the archivist/specialist shape: handoff_and_restart.sh
+        # --supervisor control-plane against the consume unit, NOT the bespoke seat-relaunch
+        # identity. bespoke_relaunch must be gone: with a restart_service present the relaunch
+        # identity is no longer derived, so a leftover flag would KeyError in build_restart_argv
+        # and fail --validate. mason (not cut over) keeps bespoke_relaunch.
+        cfg = cfm.AGENT_CONFIG["artisan"]
+        self.assertFalse(cfg.get("observation_only"))
+        self.assertNotIn("bespoke_relaunch", cfg)
+        self.assertEqual(cfg["supervisor"], "control-plane")
+        self.assertEqual(cfg["restart_service"], "pantheon-persona-consume@artisan.service")
+        self.assertEqual(cfg["restart_target_pane"], "suborch2-main:0")
+        self.assertTrue(cfg["restart_bin"].endswith("/handoff_and_restart.sh"))
+        inner = cfm.build_restart_argv(cfg, "artisan")[-1]
+        self.assertIn("--service pantheon-persona-consume@artisan.service", inner)
+        self.assertIn("--supervisor control-plane", inner)
+        self.assertIn("--target-pane suborch2-main:0", inner)
+        self.assertEqual(cfm.resolve_restart_cfg(cfg, "artisan"), cfg)  # no controller probe, no relaunch fallback
+        self.assertTrue(cfm.AGENT_CONFIG["mason"].get("bespoke_relaunch"))
+
+    def test_mason_rearmed_routes_through_active_controller(self) -> None:
+        # T-5055: the T-4818 observe-only interim is dropped now that T-4789 routes a
+        # bespoke_relaunch seat with an ACTIVE controller through the controller. mason
+        # derives the relaunch identity again, but with the controller up the restart
+        # is handoff_and_restart.sh --supervisor control-plane, never seat-relaunch.
+        cfg = cfm.AGENT_CONFIG["mason"]
+        self.assertFalse(cfg.get("observation_only"))
+        self.assertTrue(cfg.get("bespoke_relaunch"))
+        with patch.object(cfm, "_controller_unit_state", return_value="active"):
+            routed = cfm.resolve_restart_cfg(cfg, "mason")
+        self.assertEqual(routed["supervisor"], "control-plane")
+        self.assertTrue(routed["restart_bin"].endswith("/handoff_and_restart.sh"))
+        self.assertNotIn("bespoke_relaunch", routed)
+        with patch.object(cfm, "_controller_unit_state", return_value="unknown"):
+            self.assertIsNone(cfm.resolve_restart_cfg(cfg, "mason"))
+
+    # ---- build_restart_argv ----
+    ARMED_CFG = {
+        "sudo_user": "suborch1",
+        "bespoke_relaunch": True,
+        "restart_bin": "/home/suborch1/pantheon-config/tools/pantheon-seat-relaunch.sh",
+        "restart_target_pane": "suborch1-main:0.0",
+        "relaunch_session": "suborch1-main",
+        "relaunch_window": "harness",
+        "relaunch_scope_unit": "pantheon-mason-seat.scope",
+        "consume_timer": "pantheon-persona-consume@mason.timer",
+        "handoff_file": "/home/suborch1/HANDOFF.md",
+    }
+
+    def test_argv_uses_relaunch_flags_not_service(self) -> None:
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            argv = cfm.build_restart_argv(self.ARMED_CFG, "mason")
+        self.assertEqual(argv[:5], ["sudo", "-nu", "suborch1", "bash", "-c"])
+        inner = argv[-1]
+        self.assertIn(
+            "XDG_RUNTIME_DIR=/run/user/$(id -u) "
+            "/home/suborch1/pantheon-config/tools/pantheon-seat-relaunch.sh",
+            inner,
+        )
+        self.assertIn("--persona mason", inner)
+        self.assertIn("--session suborch1-main", inner)
+        self.assertIn("--target-pane suborch1-main:0.0", inner)
+        self.assertIn("--scope-unit pantheon-mason-seat.scope", inner)
+        self.assertIn("--window harness", inner)
+        self.assertIn("--consume-timer pantheon-persona-consume@mason.timer", inner)
+        self.assertIn("--handoff-file /home/suborch1/HANDOFF.md", inner)
+        self.assertIn("--lockfile /tmp/pantheon-seat-relaunch_mason.lock", inner)
+        # NEVER a --service flag (the persona-consume@ trap).
+        self.assertNotIn("--service", inner)
+
+    def test_argv_skip_ack_appended(self) -> None:
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            inner = cfm.build_restart_argv(self.ARMED_CFG, "mason", skip_ack=True)[-1]
+        self.assertIn("--skip-ack", inner)
+
+    def test_argv_episode_start_reaches_seat_relaunch(self) -> None:
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            inner = cfm.build_restart_argv(
+                self.ARMED_CFG, "mason", episode_start=1234
+            )[-1]
+        self.assertIn("--episode-start 1234", inner)
+
+    def test_argv_omits_fence_flag_without_consume_timer(self) -> None:
+        cfg = dict(self.ARMED_CFG)
+        cfg.pop("consume_timer")
+        with patch.object(cfm, "_current_user", return_value="claude-fallback"):
+            inner = cfm.build_restart_argv(cfg, "mason")[-1]
+        self.assertNotIn("--consume-timer", inner)
+
+    # ---- _validate_config ----
+    def _validate_fixture(self) -> dict:
+        # A valid ARMED bespoke mason alongside a standard orchestrator. mason's paths
+        # are cross-account from the test's home -> existence checks deferred.
+        return {
+            "orchestrator": {
+                "jsonl_dir": Path("/nonhome/orchestrator/projects"), "sudo_user": "orchestrator",
+                "restart_service": "orchestrator.service", "restart_target_pane": "orchestrator:0",
+                "restart_bin": "/nonhome/orchestrator/handoff_and_restart.sh",
+                "handoff_file": "/nonhome/orchestrator/HANDOFF.md",
+            },
+            "mason": {
+                "jsonl_dir": Path("/home/suborch1/.claude/projects/-home-suborch1"),
+                "sudo_user": "suborch1", "bespoke_relaunch": True,
+                "restart_bin": "/home/suborch1/pantheon-config/tools/pantheon-seat-relaunch.sh",
+                "restart_target_pane": "suborch1-main:0.0",
+                "relaunch_session": "suborch1-main",
+                "relaunch_scope_unit": "pantheon-mason-seat.scope",
+                "handoff_file": "/home/suborch1/HANDOFF.md",
+                "consume_timer": "pantheon-persona-consume@mason.timer",
+            },
+        }
+
+    def test_armed_bespoke_validates_without_restart_service(self) -> None:
+        with patch.object(cfm, "account_exists", return_value=True), \
+             patch.object(cfm, "AGENT_CONFIG", self._validate_fixture()):
+            self.assertEqual(cfm._validate_config(), 0)
+
+    def test_armed_bespoke_missing_scope_unit_fails(self) -> None:
+        fx = self._validate_fixture()
+        del fx["mason"]["relaunch_scope_unit"]
+        with patch.object(cfm, "account_exists", return_value=True), \
+             patch.object(cfm, "AGENT_CONFIG", fx):
+            self.assertEqual(cfm._validate_config(), 1)
 
 
 # ---------------------------------------------------------------------------
@@ -5275,12 +6891,32 @@ class ConsentFallbackDetectorTests(unittest.TestCase):
         del rec["fallbackModel"]
         self.assertEqual(cfm.detect_consent_fallback([rec]), ("claude-fable-5", ""))
 
+    # --- T-4012: prefix match, not exact membership ---
+
+    def test_point_release_fable5_1_fires(self):
+        # A seat re-pinned to the point-release id is the same capped family and
+        # MUST nudge. Regression for the exact-membership bug (would return None).
+        out = cfm.detect_consent_fallback([self._fallback(original="claude-fable-5-1")])
+        self.assertEqual(out, ("claude-fable-5-1", "claude-opus-4-8[1m]"))
+
+    def test_fable5_1m_context_variant_fires(self):
+        out = cfm.detect_consent_fallback([self._fallback(original="claude-fable-5[1m]")])
+        self.assertEqual(out[0], "claude-fable-5[1m]")
+
+    def test_original_model_none_does_not_fire(self):
+        # None originalModel must not crash the startswith predicate (isinstance guard).
+        self.assertIsNone(cfm.detect_consent_fallback([self._fallback(original=None)]))
+
+    def test_unrelated_family_prefix_does_not_over_match(self):
+        # The prefix is the fable-5 family only — an opus id must not match.
+        self.assertIsNone(cfm.detect_consent_fallback([self._fallback(original="claude-opus-5")]))
+
     # --- fire path (alert-only, cooldown, env gate) ---
 
     def test_fire_gated_off_by_env(self):
         with patch.dict(os.environ, {"PANTHEON_CONSENT_FALLBACK_ENABLED": "0"}):
             self.assertFalse(
-                cfm._maybe_fire_consent_fallback("mnemosyne", {"sudo_user": "exocortex"}, Path("/x"))
+                cfm._maybe_fire_consent_fallback("archivist", {"sudo_user": "exocortex"}, Path("/x"))
             )
 
     def test_fire_nudges_recovery_on_detection(self):
@@ -5289,7 +6925,7 @@ class ConsentFallbackDetectorTests(unittest.TestCase):
              patch.dict(os.environ, {"PANTHEON_STATE_DIR": d, "PANTHEON_CONSENT_FALLBACK_ENABLED": "1"}), \
              patch.object(cfm, "read_recent_records", return_value=[self._fallback()]), \
              patch("tools.inbox_consumer._send_alert_via_recovery") as alert:
-            fired = cfm._maybe_fire_consent_fallback("mnemosyne", cfg, Path("/x"))
+            fired = cfm._maybe_fire_consent_fallback("archivist", cfg, Path("/x"))
         self.assertTrue(fired)
         self.assertEqual(alert.call_count, 1)
         self.assertEqual(alert.call_args[0][1], cfm.CONSENT_FALLBACK_ALERT_LABEL)
@@ -5305,7 +6941,7 @@ class ConsentFallbackDetectorTests(unittest.TestCase):
              patch.dict(os.environ, {"PANTHEON_STATE_DIR": d, "PANTHEON_CONSENT_FALLBACK_ENABLED": "1"}), \
              patch.object(cfm, "read_recent_records", return_value=[self._asst(), self._asst()]), \
              patch("tools.inbox_consumer._send_alert_via_recovery") as alert:
-            fired = cfm._maybe_fire_consent_fallback("mnemosyne", cfg, Path("/x"))
+            fired = cfm._maybe_fire_consent_fallback("archivist", cfg, Path("/x"))
         self.assertFalse(fired)
         alert.assert_not_called()
 
@@ -5315,8 +6951,8 @@ class ConsentFallbackDetectorTests(unittest.TestCase):
              patch.dict(os.environ, {"PANTHEON_STATE_DIR": d, "PANTHEON_CONSENT_FALLBACK_ENABLED": "1"}), \
              patch.object(cfm, "read_recent_records", return_value=[self._fallback()]), \
              patch("tools.inbox_consumer._send_alert_via_recovery") as alert:
-            first = cfm._maybe_fire_consent_fallback("mnemosyne", cfg, Path("/x"))
-            second = cfm._maybe_fire_consent_fallback("mnemosyne", cfg, Path("/x"))
+            first = cfm._maybe_fire_consent_fallback("archivist", cfg, Path("/x"))
+            second = cfm._maybe_fire_consent_fallback("archivist", cfg, Path("/x"))
         self.assertTrue(first)
         self.assertFalse(second)  # cooldown state written on first fire
         self.assertEqual(alert.call_count, 1)
@@ -5324,7 +6960,7 @@ class ConsentFallbackDetectorTests(unittest.TestCase):
 
 class CapDetectorSweepTests(unittest.TestCase):
     """T-1980 coverage-void fix: recovery's cycle sweeps the alert-only cap detectors for
-    observation_only agents (mnemosyne + seats) that have no @agent monitor timer."""
+    observation_only agents (archivist + seats) that have no @agent monitor timer."""
 
     def test_sweep_runs_detectors_when_jsonl_present(self):
         cfg = {"sudo_user": "exocortex", "jsonl_dir": Path("/home/exocortex/x")}
@@ -5333,7 +6969,7 @@ class CapDetectorSweepTests(unittest.TestCase):
              patch.object(cfm, "_maybe_fire_capability_cap") as cap, \
              patch.object(cfm, "_maybe_fire_consent_fallback") as consent, \
              patch.object(cfm, "_maybe_fire_spend_limit") as spend:
-            cfm._sweep_cap_detectors_for("mnemosyne", cfg)
+            cfm._sweep_cap_detectors_for("archivist", cfg)
         cap.assert_called_once()
         consent.assert_called_once()
         spend.assert_called_once()
@@ -5347,7 +6983,7 @@ class CapDetectorSweepTests(unittest.TestCase):
              patch.object(cfm, "_maybe_fire_capability_cap") as cap, \
              patch.object(cfm, "_maybe_fire_consent_fallback") as consent, \
              patch.object(cfm, "_maybe_fire_spend_limit") as spend:
-            cfm._sweep_cap_detectors_for("metis", cfg)
+            cfm._sweep_cap_detectors_for("mason", cfg)
         cap.assert_not_called()
         consent.assert_not_called()
         spend.assert_called_once()
@@ -5357,7 +6993,7 @@ class CapDetectorSweepTests(unittest.TestCase):
         cfg = {"sudo_user": "exocortex"}
         with patch.object(cfm, "_projects_dir_for_agent", side_effect=RuntimeError("boom")):
             try:
-                cfm._sweep_cap_detectors_for("mnemosyne", cfg)
+                cfm._sweep_cap_detectors_for("archivist", cfg)
             except Exception as exc:  # noqa: BLE001
                 self.fail(f"_sweep_cap_detectors_for must be fail-soft, raised {exc!r}")
 
@@ -5367,7 +7003,7 @@ class MainLoopAndSubagentHealthAreIndependent(unittest.TestCase):
     hours'. Nothing was down. One of the four states a single snapshot conflates
     is a HEALTHY MAIN LOOP whose dispatched SUBAGENTS are capped — the seat keeps
     producing turns, so every main-loop metric reads healthy, while the work it
-    dispatched dies. atlas found it from inside; nothing outside could see it."""
+    dispatched dies. artisan found it from inside; nothing outside could see it."""
 
     def _err(self, ts, *, sidechain=False, status=400):
         return {"type": "assistant", "isApiErrorMessage": True,
@@ -5738,13 +7374,13 @@ class TestSeatMutedT3165(unittest.TestCase):
     def test_spend_limit_muted_suppresses(self) -> None:
         self._mute("orchestrator")
         with patch.object(cfm, "_capture_pane_text", return_value=cfm.SPEND_LIMIT_SENTINEL), \
-             patch.object(ic, "_send_telegram_alert") as tg:
+             patch.object(ic, "route_failure_alert") as tg:
             self.assertFalse(cfm._maybe_fire_spend_limit("orchestrator", self.cfg))
         tg.assert_not_called()
 
     def test_spend_limit_unmuted_alerts(self) -> None:
         with patch.object(cfm, "_capture_pane_text", return_value=cfm.SPEND_LIMIT_SENTINEL), \
-             patch.object(ic, "_send_telegram_alert") as tg:
+             patch.object(ic, "route_failure_alert") as tg:
             self.assertTrue(cfm._maybe_fire_spend_limit("specialist", self.cfg))
         tg.assert_called_once()
 
@@ -5759,6 +7395,81 @@ class TestSeatMutedT3165(unittest.TestCase):
         with patch.object(cfm, "send_telegram") as tg:
             cfm.maybe_alert_missing_projects_dir("specialist", Path("/nonexistent/proj"))
         tg.assert_called_once()
+
+
+class LiveHarnessGateT5146(unittest.TestCase):
+    """T-5146: a stale runtime.json (harness: claude) must not keep the Claude-only monitor on
+    while the pane actually runs codex; and no kick advice goes into an active turn."""
+    CFG = {"sudo_user": "suborch1", "restart_target_pane": "suborch1-main:harness.0",
+           "handoff_file": "/home/suborch1/HANDOFF.md"}
+
+    def _recorded(self, status="enabled", source="runtime-json", harness="claude"):
+        return cfm.ActiveHarnessMonitorGate(agent="mason", status=status, active_harness=harness,
+                                            source=source, reason="recorded")
+
+    def _gate(self, recorded, live):
+        calls = []
+
+        def probe(pane, user, agent):
+            calls.append(pane)
+            return live
+        with patch.object(cfm, "_recorded_harness_monitor_gate", return_value=recorded):
+            return cfm.active_harness_monitor_gate("mason", self.CFG, pane_harness_fn=probe), calls
+
+    def test_stale_claude_record_with_a_live_codex_pane_disables(self):
+        gate, _ = self._gate(self._recorded(), "codex")
+        self.assertEqual((gate.status, gate.source, gate.active_harness), ("disabled", "live-pane", "codex"))
+
+    def test_pre_controller_with_a_live_codex_pane_disables(self):
+        gate, _ = self._gate(self._recorded(source="pre-controller", harness=""), "codex")
+        self.assertEqual(gate.status, "disabled")
+
+    def test_live_claude_or_unknown_keeps_the_recorded_verdict(self):
+        for live in ("claude", None):
+            with self.subTest(live=live):
+                gate, _ = self._gate(self._recorded(), live)
+                self.assertEqual((gate.status, gate.source), ("enabled", "runtime-json"))
+
+    def test_no_codex_in_manifest_never_probes(self):
+        gate, calls = self._gate(self._recorded(source="manifest-runtime", harness=""), "codex")
+        self.assertEqual(gate.status, "enabled")
+        self.assertEqual(calls, [])
+
+    def test_already_disabled_never_probes(self):
+        gate, calls = self._gate(self._recorded(status="disabled", harness="codex"), "claude")
+        self.assertEqual(gate.status, "disabled")
+        self.assertEqual(calls, [])
+
+    def test_classify_harness_argv(self):
+        cases = {"node /usr/bin/codex --model gpt-5.6-sol": "codex",
+                 "/home/suborch2/.npm-global/bin/claude --model x": "claude",
+                 "/opt/pantheon/claude/claude-fallback/current/claude.exe": "claude",
+                 "env -- PANTHEON_TMUX_PANE=0 /usr/bin/codex": "codex",
+                 "bash": None, "": None, "/usr/bin/vim notes": None}
+        for argv, want in cases.items():
+            with self.subTest(argv=argv):
+                self.assertEqual(cfm.classify_harness_argv(argv), want)
+
+    def test_busy_pane_gets_no_idle_successor_kick_and_is_not_marked(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {"PANTHEON_STATE_DIR": tmp}), \
+                patch.object(cfm, "_seat_muted", return_value=False), \
+                patch.object(cfm, "_pane_reads_busy", return_value=True), \
+                patch("tools.inbox_consumer.route_failure_alert") as route:
+            start = time.time() - cfm.IDLE_SUCCESSOR_ALERT_SECONDS - 60
+            self.assertFalse(cfm.maybe_alert_idle_successor("mason", self.CFG, start))
+            route.assert_not_called()
+            self.assertFalse(cfm._idle_successor_state_path_for_agent("mason").exists())
+
+    def test_pane_reads_busy_needs_positive_evidence(self):
+        with patch.object(cfm, "_capture_pane_text", return_value=None):
+            self.assertFalse(cfm._pane_reads_busy("mason", self.CFG))
+        with patch.object(cfm, "_capture_pane_text", return_value="x"), \
+                patch("tools.inbox_consumer.pane_idle_state", return_value=False):
+            self.assertTrue(cfm._pane_reads_busy("mason", self.CFG))
+        with patch.object(cfm, "_capture_pane_text", return_value="x"), \
+                patch("tools.inbox_consumer.pane_idle_state", return_value=None):
+            self.assertFalse(cfm._pane_reads_busy("mason", self.CFG))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,11 @@
+[Unit]
+Description=Daily pve2 disk health check (T-4997)
+
+[Timer]
+OnCalendar=*-*-* 09:30:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+Unit=pantheon-pve2-disk-health.service
+
+[Install]
+WantedBy=timers.target

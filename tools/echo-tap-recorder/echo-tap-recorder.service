@@ -1,0 +1,54 @@
+# T-5260: standing read-only Echo tap recorder (claude account, systemd --user).
+# Install: see README.md in this directory. Canonical copy lives in
+# pantheon-config tools/echo-tap-recorder/; the installed copies in
+# ~/.config/systemd/user/ and ~/.local/lib/echo-tap-recorder/ are not
+# version-controlled and change only on an explicit re-install.
+[Unit]
+Description=Echo read-only tap recorder to /var/lib/pantheon/echo-evidence/tap (T-5260)
+Documentation=file:%h/pantheon-config/tools/echo-tap-recorder/README.md
+
+[Service]
+Type=simple
+EnvironmentFile=%h/.config/echo-tap-recorder.env
+ExecStart=/usr/bin/python3 %h/.local/lib/echo-tap-recorder/echo_tap_recorder.py
+# The script reconnects to the broker itself (capped exponential backoff,
+# 1 s doubling to 60 s). systemd restarts it after a crash. A bad config
+# (exit 2) or an unsafe tap dir (exit 1) is not restarted: it would only fail
+# again every 10 s. Fix the cause, then systemctl --user restart.
+Restart=always
+RestartSec=10
+RestartPreventExitStatus=1 2
+# On SIGTERM the script sends DISCONNECT, then fsyncs and closes the file. A
+# handshake read notices the stop within 0.25 s; the worst case is a connect
+# to a black-holed broker (5 s timeout).
+TimeoutStopSec=35
+Nice=10
+# Hardening in a --user manager (systemd 255).
+#
+# Effective here: NoNewPrivileges= and the seccomp-based options
+# (RestrictAddressFamilies=, RestrictSUIDSGID=, LockPersonality=).
+#
+# Best-effort and INERT on this host: PrivateTmp=, ProtectSystem=,
+# ProtectHome=, ReadWritePaths=, ProtectKernelTunables=,
+# ProtectControlGroups=. In a --user manager they need an unprivileged user
+# mount namespace, which kernel.apparmor_restrict_unprivileged_userns=1
+# blocks, so systemd skips them. They are kept because they activate if the
+# host policy changes; do not rely on them for isolation today.
+#
+# The tap subdir is created by the script (mode 2750, setgid group
+# inherited from the pantheon-shared parent). RestrictSUIDSGID= refuses a
+# chmod that sets setgid, which is fine: mkdir under a setgid dir already
+# inherits it.
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pantheon/echo-evidence
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+
+[Install]
+WantedBy=default.target

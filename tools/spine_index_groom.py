@@ -170,25 +170,32 @@ from tools._md_table import _UNESCAPED_PIPE, _md_cell, _md_row  # noqa: F401,E40
 
 
 def research_handler(d: Path) -> list[str]:
-    """List dated <date>-<topic>/ subdirs with first-paragraph description."""
-    rows = []
-    for subdir in sorted(d.iterdir()):
-        if not subdir.is_dir():
-            continue
-        # Try README.md, then notes.md, then ANY other .md in the subdir (T-2103).
-        # Without the third leg, a subdir holding only e.g. report.md or
-        # findings.md indexed as a bare "—": present in the index, correctly
-        # listed by FILENAME, and carrying ZERO searchable description. That
-        # defeats the prior-art grep the ORG-012 discipline depends on — it is
-        # how the T-1968 step-1 inventory was nearly rebuilt from scratch, and
-        # it affected 27 of 120 episodic subdirs when this landed. Falling back
-        # to the first other .md fixes every such case with no authoring effort
-        # and no retroactive make-work.
-        desc = _first_paragraph_after_title(subdir / "README.md") or \
-               _first_paragraph_after_title(subdir / "notes.md") or \
-               _first_paragraph_of_any_md(subdir) or "—"
-        rows.append(_md_row(f"[`{subdir.name}/`]({subdir.name}/)", desc))
-    return rows
+    """List dated <date>-<topic>/ subdirs AND loose <date>-<topic>.md notes with
+    first-paragraph description.
+
+    T-3898: loose top-level *.md files were previously skipped (iterdir()+is_dir()
+    filter), so ad-hoc single-file episodic notes never reached the index while
+    the README claimed the Auto-index authoritative. Nine loose notes had
+    accumulated when this fix landed. Emitted alongside subdir rows, sorted
+    together by name so date-prefixed entries interleave naturally.
+    """
+    entries: list[tuple[str, str, str]] = []  # (sort-key, link-cell, desc)
+    for item in d.iterdir():
+        if item.is_dir():
+            # Try README.md, then notes.md, then ANY other .md in the subdir
+            # (T-2103). Without the third leg, a subdir holding only e.g.
+            # report.md or findings.md indexed as a bare "—".
+            desc = _first_paragraph_after_title(item / "README.md") or \
+                   _first_paragraph_after_title(item / "notes.md") or \
+                   _first_paragraph_of_any_md(item) or "—"
+            link = f"[`{item.name}/`]({item.name}/)"
+            entries.append((item.name, link, desc))
+        elif item.is_file() and item.suffix == ".md" and item.name != "README.md":
+            desc = _first_paragraph_after_title(item) or "—"
+            link = f"[`{item.name}`]({item.name})"
+            entries.append((item.name, link, desc))
+    entries.sort(key=lambda e: e[0])
+    return [_md_row(link, desc) for _, link, desc in entries]
 
 
 def _first_paragraph_of_any_md(subdir: Path) -> str:
@@ -225,6 +232,13 @@ def _first_paragraph_after_title(path: Path) -> str:
         return ""
     text = path.read_text()
     lines = text.splitlines()
+    # T-4015: prefer an explicit frontmatter `description:` — it is the file's own
+    # curated one-liner and sidesteps lifting a broken relative link or a stray
+    # subheading out of the body (e.g. the t2107 reframe note carries a
+    # description: but rendered "## The one-line answer" from its first body line).
+    desc = _frontmatter_scalar(lines, "description")
+    if desc:
+        return _sanitize_description(desc)
     past_title = False
     para_lines: list[str] = []
     for line in lines:
@@ -232,13 +246,21 @@ def _first_paragraph_after_title(path: Path) -> str:
             if line.startswith("#"):
                 past_title = True
             continue
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped:
             if para_lines:
                 break
             continue
-        para_lines.append(line.strip())
+        # T-4015: a `##`/`###` SUBHEADING after the title is document structure,
+        # not a description. Skip a leading one and keep scanning for prose; a
+        # heading that follows collected prose ends the paragraph.
+        if stripped.startswith("#"):
+            if para_lines:
+                break
+            continue
+        para_lines.append(stripped)
     if para_lines:
-        return " ".join(para_lines)
+        return _sanitize_description(" ".join(para_lines))
     # No `#` heading anywhere, so the loop above collected nothing. Take the
     # first paragraph from the top instead, skipping any frontmatter block.
     # T-2183: six episodic READMEs are exactly this shape — prose on line 1, no
@@ -246,7 +268,7 @@ def _first_paragraph_after_title(path: Path) -> str:
     # rescues them. Rename the sibling and they silently become em-dashes.
     body = _first_paragraph_from_top(lines)
     if body:
-        return body
+        return _sanitize_description(body)
     return _frontmatter_title(lines)
 
 
@@ -267,16 +289,25 @@ def _first_paragraph_from_top(lines: list[str]) -> str:
             return ""  # unterminated frontmatter — treat the file as opaque
     para: list[str] = []
     for line in lines[start:]:
-        if not line.strip():
+        stripped = line.strip()
+        if not stripped:
             if para:
                 break
             continue
-        para.append(line.strip())
+        # T-4015: never lift a heading line as prose. Harmless in this helper's
+        # original no-`#`-heading use; correct when `_first_paragraph_after_title`
+        # falls back here for a title-plus-subheading doc that has no body prose.
+        if stripped.startswith("#"):
+            if para:
+                break
+            continue
+        para.append(stripped)
     return " ".join(para)
 
 
-def _frontmatter_title(lines: list[str]) -> str:
-    """`title:` value from a leading YAML frontmatter block, else "".
+def _frontmatter_scalar(lines: list[str], key: str) -> str:
+    """Value of a top-level scalar `<key>:` from a leading YAML frontmatter block,
+    else "".
 
     Deliberately a hand parse rather than a YAML dependency: this reads one
     scalar from a block the groomer already treats as opaque, and the module has
@@ -285,12 +316,45 @@ def _frontmatter_title(lines: list[str]) -> str:
     """
     if not lines or lines[0].strip() != "---":
         return ""
+    prefix = key + ":"
     for line in lines[1:]:
         if line.strip() == "---":
             break
-        if line.startswith("title:"):
+        if line.startswith(prefix):
             return line.split(":", 1)[1].strip().strip("\"'")
     return ""
+
+
+def _frontmatter_title(lines: list[str]) -> str:
+    """`title:` value from a leading YAML frontmatter block, else ""."""
+    return _frontmatter_scalar(lines, "title")
+
+
+# T-4015: a description lifted from body prose can carry a RELATIVE markdown link
+# (e.g. `[ORG-026](../../adr/ORG-026.md)`). The index row it lands in lives at a
+# different path depth, so that relative target resolves to nowhere. Rewrite a
+# relative link to just its anchor text; leave absolute links (http(s)://, root-
+# anchored `/…`, in-page `#…`, `mailto:`) intact so real external references stay
+# clickable. (Recovery's daily groom kept reverting the hand-fixes because the groomer
+# re-emitted the raw relative link every run — T-3843 undone by 06ba654b3.)
+_MD_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+
+
+def _sanitize_description(text: str) -> str:
+    """Strip relative markdown links in *text* down to their anchor text.
+
+    Known-narrow by design (the spine corpus is plain inline links): a non-http
+    absolute scheme (`ftp:`, `tel:`) is treated as relative and stripped, an
+    image `![alt](rel)` leaves a stray `!alt`, and a nested-bracket label
+    `[a [b] c](url)` doesn't match and passes through unchanged. None occur in
+    the indexed docs today; hardening is deferred until one does (YAGNI).
+    """
+    def _repl(m: "re.Match[str]") -> str:
+        label, url = m.group(1), m.group(2).strip()
+        if re.match(r"(?:https?:)?//|/|#|mailto:", url):
+            return m.group(0)  # absolute / in-page / mailto — keep as-is
+        return label  # relative — broken at the index row's depth; strip to text
+    return _MD_LINK_RE.sub(_repl, text)
 
 
 def tools_handler(d: Path) -> list[str]:
@@ -483,7 +547,14 @@ def _format_justifies(entry: dict) -> str:
 
 
 def _build_index_row(entry: dict) -> str:
-    eid = entry["id"]
+    # T-3644: tolerate missing `id` — historical convention is `<ts>-<slug>`
+    # but recent HO slim-format appends via cat-heredoc omit the field, and a
+    # bare KeyError here drops the whole ledger handler and rows are silently
+    # missing from INDEX.md. Fall back to ts (an entry's natural addressability
+    # when it has no explicit id), or "?" if ts is also unparseable — a row
+    # that reads "?" is a clear render defect the operator can chase to fix
+    # the source entry, whereas a dropped row is invisible.
+    eid = entry.get("id") or entry_ts(entry) or "?"
     action = entry.get("action", "?")
     agent = entry.get("agent", "?")
     justifies = _format_justifies(entry)
@@ -503,7 +574,8 @@ SPINE_TABLE_HEADER = (
 
 
 def _build_spine_row(entry: dict) -> str:
-    eid = entry["id"]
+    # T-3644: see _build_index_row.
+    eid = entry.get("id") or entry_ts(entry) or "?"
     ts = entry_ts(entry) or "?"
     action = entry.get("action", "?")
     agent = entry.get("agent", "?")
@@ -696,7 +768,10 @@ def ledger_handler(ledger_dir: Path, *, push: bool = False, cwd: Path | None = N
 
     index_text = index_path.read_text()
     indexed_ids = _parse_indexed_ids(index_text)
-    missing = [e for e in entries if e["id"] not in indexed_ids]
+    # T-3644: fall back to ts as the row-identity key when `id` is absent,
+    # matching _build_index_row's rendering fallback. Without this the
+    # missing-detection here raises KeyError and drops the whole handler.
+    missing = [e for e in entries if (e.get("id") or entry_ts(e) or "?") not in indexed_ids]
 
     # Regenerate per-segment SPINE.md files (no-op pre-migration / when
     # subfolders absent). Uses ALL entries for each segment, not just the
@@ -729,7 +804,9 @@ def ledger_handler(ledger_dir: Path, *, push: bool = False, cwd: Path | None = N
     _ledger_commit_and_push(
         new_count=len(missing),
         year=msg_year,
-        sample_ids=[e["id"] for e in missing],
+        # T-3644: commit-message sample list uses the same id-fallback shape
+        # as _build_index_row so id-less entries name themselves by ts.
+        sample_ids=[e.get("id") or entry_ts(e) or "?" for e in missing],
         push=push,
         index_path=index_path,
         cwd=cwd,

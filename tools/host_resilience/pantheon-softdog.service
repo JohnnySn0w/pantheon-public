@@ -1,0 +1,19 @@
+[Unit]
+Description=Pantheon softdog (T-5237): load the software watchdog explicitly at boot so PID 1 can arm it
+Documentation=file:///home/claude/pantheon-config/tools/host_resilience/install.sh
+# Why a unit and not /etc/modules-load.d: Ubuntu blacklists softdog in /lib/modprobe.d and
+# systemd-modules-load honours that ("deny-listed (by kmod)"). An explicit modprobe by name does not.
+# This KVM guest has no hardware watchdog; 10-pantheon-watchdog.conf makes PID 1 feed /dev/watchdog.
+# Early (sysinit) so the device exists soon after boot; after modules-load for a stable order.
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=sysinit.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/sbin/modprobe softdog
+
+[Install]
+WantedBy=sysinit.target

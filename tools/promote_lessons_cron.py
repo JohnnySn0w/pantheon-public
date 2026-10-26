@@ -39,7 +39,7 @@ from tools.watch_digest import read_telegram_token, send_telegram  # noqa: E402
 
 SURFACE_REL = "promotion-candidates"
 DEFAULT_LEDGER = pl.DEFAULT_CANDIDATES_DIR / "ledger.json"
-DEFAULT_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "456474197")  # the operator
+DEFAULT_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "424242424")  # the operator
 
 
 def _default_telegram_env() -> Path:

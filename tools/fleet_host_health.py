@@ -88,6 +88,9 @@ _LABEL = "fleet-host-health"
 OK, UNREACHABLE, CRITICAL, UNKNOWN, DISABLED = (
     "OK", "UNREACHABLE", "CRITICAL", "UNKNOWN", "DISABLED")
 ALERTING = (UNREACHABLE, CRITICAL, UNKNOWN)
+# T-5385: the host did not answer, but THIS host is off the tailnet (every target here is a
+# tailnet address). Not alerting; tailnet_self sends one "swarm off tailnet" alert instead.
+OFF_TAILNET = "OFF_TAILNET"
 
 
 def _log(msg: str) -> None:
@@ -143,6 +146,16 @@ class Ops:
             route_failure_alert(agent, msg, vocab=vocab)
         except Exception as exc:                        # an alert path must never crash the probe
             _log(f"alert delivery FAILED ({exc!r}); verdict still recorded in state")
+
+    def off_tailnet(self) -> str | None:
+        """THIS host's tailscale BackendState when definitely not Running, else None (T-5385)."""
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from tools import tailnet_self
+        return tailnet_self.off_tailnet()
+
+    def report_off_tailnet(self, state: str, detail: str) -> None:
+        from tools import tailnet_self
+        tailnet_self.report_off_tailnet("fleet-host-health", state, detail=detail)
 
     def now(self) -> int:
         return int(time.time())
@@ -234,6 +247,14 @@ def check_host_once(cfg: dict, *, ops: Ops, state_dir: Path, now: int,
     if reachable is True and cfg.get("netdata"):
         critical = ops.netdata_critical_alarms(cfg["netdata"])
     decided = classify_host(cfg, reachable=reachable, critical_alarms=critical)
+    if decided["verdict"] == UNREACHABLE:
+        off = ops.off_tailnet()
+        if off:
+            if not dry_run:
+                ops.report_off_tailnet(off, f"{name} ({cfg['ping']}) unreachable")
+            decided = {"verdict": OFF_TAILNET,
+                       "detail": f"{name} did not answer, but this host's own tailscale reads {off}: "
+                                 f"the fault is here, not on {name} (T-5385)."}
     return _finish(cfg, decided, ops=ops, state_dir=state_dir, now=now,
                    cooldown_secs=cooldown_secs, dry_run=dry_run)
 

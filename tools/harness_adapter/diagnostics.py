@@ -26,6 +26,26 @@ from tools.harness_permission_posture import (
 from tools.mailbox_writable_roots import MailboxWritableRootError, resolve_mailbox_writable_roots
 
 
+def _safe_is_file(path: Path) -> bool:
+    """Path.is_file() that reads an unreadable path as False instead of raising.
+
+    pathlib swallows ENOENT/ENOTDIR but raises PermissionError on EACCES (e.g. a
+    probe under another account's 0700 home on a CI runner), and diagnose must
+    report that as an observation, never crash before printing its report."""
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def _safe_is_dir(path: Path) -> bool:
+    """Path.is_dir() with the same unreadable-is-False contract as _safe_is_file."""
+    try:
+        return path.is_dir()
+    except OSError:
+        return False
+
+
 class HarnessDiagnosticProbe(Protocol):
     def collect(self) -> DiagnosticReport: ...
 
@@ -45,10 +65,15 @@ _METER_QUOTA_PAIRS = {
     ("codex", "subscription", "app-server"),
     ("codex", "api", "provider-api"),
     ("codex", "enterprise", "provider-api"),
+    # T-5011 PR-B (plan §3.2 gap 1): a prepaid API key, read from the provider.
+    ("hermes", "api", "provider-api"),
 }
 _NATIVE_KEYS = {
     "claude": {"permission_mode", "channels", "effort"},
     "codex": {"sandbox", "config_overrides", "permission_posture", "execution_boundary"},
+    # T-5011 PR-B: hermes.HERMES_NATIVE_KEYS (an equality test pins the copy;
+    # importing hermes here would pull its render/yaml chain into diagnostics).
+    "hermes": {"provider", "base_url", "approvals", "terminal_backend", "busy_input_mode", "balance"},
 }
 
 
@@ -124,6 +149,15 @@ def resolve_launch_config(
             )
     if role_block:
         sources.append(f"harness_runtime.roles.{role}.{harness}")
+    # T-5038: a role may run its own binary (recovery runs a root-owned copy so the
+    # Watchman unstick exe-owner gate passes). Same template rules as a profile
+    # executable; a CLI executable_override still wins.
+    role_executable = role_block.get("executable")
+    if role_executable is not None:
+        if not isinstance(role_executable, str) or not role_executable:
+            raise RuntimeProfileError(f"{role}.{harness}.executable must be a non-empty string")
+        executable = _resolve_executable(role_executable, account_home=account_home)
+        sources.append(f"harness_runtime.roles.{role}.{harness}.executable")
     if executable_override is not None:
         if not executable_override.is_absolute():
             raise RuntimeProfileError("executable override must be absolute")
@@ -216,6 +250,9 @@ def resolve_controller_config(
     fallbacks: tuple[str, ...] = ()
     role_tmux: Mapping[str, str] = {}
     post_start: tuple[PostStartCommand, ...] = ()
+    # T-5446: fleet policy, not hand-settable -- ON for every role.
+    mid_session_cap_swap = True
+    fallback_return = True
     if isinstance(runtime, Mapping):
         controller = runtime.get("controller")
         controller = controller if isinstance(controller, Mapping) else {}
@@ -227,6 +264,7 @@ def resolve_controller_config(
         role_raw = roles.get(role) if isinstance(roles, Mapping) else None
         role_tmux = _validate_role_tmux_override(role_raw, role=role)
         post_start = _validate_post_start_commands(role_raw, role=role)
+        _apply_flip_key_policy(role_raw, role=role)
         if isinstance(role_raw, Mapping):
             # T-2635: was `()` (empty TUPLE) on both the default and the
             # None-branch below -- an empty tuple unconditionally fails the
@@ -269,6 +307,8 @@ def resolve_controller_config(
             fallbacks=fallbacks,
         ),
         post_start=post_start,
+        mid_session_cap_swap_enabled=mid_session_cap_swap,
+        fallback_return_enabled=fallback_return,
     )
 
 
@@ -313,7 +353,7 @@ class BasicHarnessDiagnosticProbe:
         executable = self.adapter.executable
         if executable.is_absolute():
             resolved = str(executable)
-            ok = executable.is_file() and os.access(executable, os.X_OK)
+            ok = _safe_is_file(executable) and os.access(executable, os.X_OK)
         else:
             resolved = shutil.which(str(executable)) or ""
             ok = bool(resolved)
@@ -331,7 +371,7 @@ class BasicHarnessDiagnosticProbe:
         )
 
     def _cwd_observation(self, harness: str) -> DiagnosticObservation:
-        usable = self.cwd.is_dir() and os.access(self.cwd, os.R_OK | os.X_OK)
+        usable = _safe_is_dir(self.cwd) and os.access(self.cwd, os.R_OK | os.X_OK)
         return DiagnosticObservation(
             check_id=f"{harness}.cwd",
             status="pass" if usable else "fail",
@@ -342,7 +382,7 @@ class BasicHarnessDiagnosticProbe:
 
     def _config_observation(self, harness: str) -> DiagnosticObservation:
         path = self.adapter.mcp_server_config_path()
-        exists = path.is_file()
+        exists = _safe_is_file(path)
         readable = exists and os.access(path, os.R_OK)
         return DiagnosticObservation(
             check_id=f"{harness}.config",
@@ -376,7 +416,7 @@ class BasicHarnessDiagnosticProbe:
         readable_paths = [
             path
             for path in descriptor.material_paths
-            if path.is_file() and os.access(path, os.R_OK)
+            if _safe_is_file(path) and os.access(path, os.R_OK)
         ]
         return DiagnosticObservation(
             check_id=f"{harness}.auth_material",
@@ -397,7 +437,7 @@ def _find_upward(cwd: Path, filename: str) -> Path | None:
     current = cwd.resolve()
     while True:
         candidate = current / filename
-        if candidate.is_file():
+        if _safe_is_file(candidate):
             return candidate
         if current.parent == current:
             return None
@@ -411,6 +451,11 @@ def _legacy_launch_config(
     executable_override: Path | None,
     model_override: str | None,
 ) -> HarnessLaunchConfig:
+    if harness not in ("claude", "codex"):
+        # T-5011 PR-B: the legacy defaults are claude/codex only. Any other
+        # harness (hermes) needs a manifest runtime profile; it never falls
+        # through to /usr/bin/codex, "interactive-chatgpt" and "app-server".
+        raise RuntimeProfileError(f"{harness} has no legacy launch default; declare a runtime profile")
     if executable_override is not None:
         if not executable_override.is_absolute():
             raise RuntimeProfileError("executable override must be absolute")
@@ -584,6 +629,69 @@ def _validate_role_tmux_override(
                 f"harness_runtime.roles.{role}.tmux.{key} must be a non-empty string"
             )
     return tmux_override
+
+
+_RETIRED_FLIP_KEYS = ("mid_session_cap_swap", "fallback_return")
+
+
+def flip_key_violations(manifest: Mapping[str, Any]) -> list[str]:
+    """Roles whose retired flip keys hold a value the policy forbids (T-5446).
+
+    The ONE strict definition, used by every validator (installer `Manifest.load`,
+    CI over instance.yaml, the controller's per-cycle report). `false` disables a
+    flip that is fleet policy (the operator TG 12274/12283), so it is a violation; a
+    non-bool is a violation; `true` is a tolerated deprecated no-op (Phase A) and is
+    NOT listed here. Pure; never raises.
+    """
+    runtime = manifest.get("harness_runtime") if isinstance(manifest, Mapping) else None
+    roles = runtime.get("roles") if isinstance(runtime, Mapping) else None
+    found: list[str] = []
+    if not isinstance(roles, Mapping):
+        return found
+    for role, role_raw in roles.items():
+        if not isinstance(role_raw, Mapping):
+            continue
+        for key in _RETIRED_FLIP_KEYS:
+            if key in role_raw and role_raw[key] is not True:
+                found.append(
+                    f"harness_runtime.roles.{role}.{key}={role_raw[key]!r}: the flip is fleet policy, "
+                    f"not hand-settable (T-5446, the operator TG 12274/12283); remove the key"
+                )
+    return found
+
+
+def flip_key_deprecations(manifest: Mapping[str, Any]) -> list[str]:
+    """Roles still carrying a retired flip key set to `true`: a tolerated deprecated
+    no-op in Phase A (old-code controllers still honour it); Phase B (T-5460) removes
+    the keys. Pure; never raises."""
+    runtime = manifest.get("harness_runtime") if isinstance(manifest, Mapping) else None
+    roles = runtime.get("roles") if isinstance(runtime, Mapping) else None
+    found: list[str] = []
+    if not isinstance(roles, Mapping):
+        return found
+    for role, role_raw in roles.items():
+        if isinstance(role_raw, Mapping):
+            for key in _RETIRED_FLIP_KEYS:
+                if role_raw.get(key) is True:
+                    found.append(f"harness_runtime.roles.{role}.{key}")
+    return found
+
+
+def _apply_flip_key_policy(role_raw: Mapping[str, Any] | None, *, role: str) -> None:
+    """T-5446 Phase A (the operator TG 12272/12274/12283): the mid-session cap swap (T-4037)
+    and the fallback return (T-4046) are ON for every seat; the per-role keys are
+    retired. The resolver is deliberately SILENT (its stderr is captured by shell
+    callers, e.g. persona_cutover.sh evals it) and never crash-loops on a re-added key
+    (T-5458). By value:
+
+    - `true`: tolerated, a deprecated no-op (listed by `flip_key_deprecations`).
+    - `false` or any non-bool: IGNORED (the flag stays True). The strict rejection is
+      `flip_key_violations`, enforced by Manifest.load and CI; the controller reports
+      it through evidence plus a cooldown-gated alert.
+    """
+    # Nothing to do at runtime: the resolver never reads these keys, so no value can alter
+    # a flip or crash a controller (T-5458). Kept as the single named place for that policy.
+    del role_raw, role
 
 
 _POST_START_SUBSTITUTION_PROBE = {

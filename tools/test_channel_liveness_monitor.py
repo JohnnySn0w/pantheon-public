@@ -8,7 +8,9 @@ mocked at the `_run` boundary; the alert router is mocked at
 
 from __future__ import annotations
 
+import importlib
 import json
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -24,7 +26,8 @@ class ProbeBridgeTest(unittest.TestCase):
         self.cfg = clm.AGENT_CONFIG[AGENT]
 
     def _probe(self, run_results):
-        with mock.patch.object(clm, "_run", side_effect=run_results):
+        with mock.patch.object(clm, "_run", side_effect=run_results), \
+                mock.patch.object(clm, "_codex_poller_serves_bridge", return_value=False):
             return clm.probe_bridge(AGENT, self.cfg)
 
     # Real bridge fixture (ground truth 2026-07-07): argv is just `bun server.ts`;
@@ -165,7 +168,7 @@ class ProbeBridgeTest(unittest.TestCase):
 
 class CheckAgentTest(unittest.TestCase):
     def _check(self, status, *, dry_run=False, cooldown=False, restart_window=False,
-               unit_disabled=None, maintenance=False, muted=False):
+               unit_disabled=None, maintenance=False, muted=False, deaths=0):
         # unit_disabled defaults to None = "could not tell", the fail-open value —
         # so every pre-existing case below still exercises the alerting path and
         # none of them silently starts shelling out to a real `systemctl`.
@@ -177,6 +180,7 @@ class CheckAgentTest(unittest.TestCase):
              mock.patch.object(clm, "_session_unit_is_disabled", return_value=unit_disabled), \
              mock.patch.object(clm, "_in_alert_cooldown", return_value=cooldown), \
              mock.patch.object(clm, "_in_restart_window", return_value=restart_window), \
+             mock.patch.object(clm, "_session_deaths_in_window", return_value=deaths), \
              mock.patch.object(clm, "_record_alert") as rec, \
              mock.patch("tools.inbox_consumer.route_failure_alert") as alert:
             ret = clm.check_agent(AGENT, dry_run=dry_run, now=1000)
@@ -191,6 +195,29 @@ class CheckAgentTest(unittest.TestCase):
         alert.assert_not_called()
         rec.assert_not_called()
         rem.assert_not_called()
+
+    def test_crash_loop_inside_restart_window_alerts_but_does_not_remediate(self):
+        # T-5165: every respawn reopens the grace, so a crash loop would never page.
+        with mock.patch.object(clm, "_maybe_remediate") as rem:
+            ret, alert, rec = self._check("down", restart_window=True, deaths=clm.RESPAWN_LOOP_DEATHS)
+        self.assertEqual(ret, "down")
+        alert.assert_called_once()
+        self.assertIn("CRASH-LOOPING", alert.call_args.args[1])
+        rec.assert_called_once()
+        rem.assert_not_called()
+
+    def test_deaths_below_the_bound_keep_the_grace(self):
+        with mock.patch.object(clm, "_maybe_remediate") as rem:
+            _, alert, _ = self._check("down", restart_window=True, deaths=clm.RESPAWN_LOOP_DEATHS - 1)
+        alert.assert_not_called()
+        rem.assert_not_called()
+
+    def test_crash_loop_alert_respects_cooldown_and_mute(self):
+        for kw in ({"cooldown": True}, {"muted": True}):
+            with mock.patch.object(clm, "_maybe_remediate") as rem:
+                _, alert, _ = self._check("down", restart_window=True, deaths=9, **kw)
+            alert.assert_not_called()
+            rem.assert_not_called()
 
     def test_down_fresh_alerts_and_records(self):
         ret, alert, rec = self._check("down")
@@ -223,24 +250,29 @@ class CheckAgentTest(unittest.TestCase):
         alert.assert_not_called()
         rec.assert_not_called()
 
-    def test_skip_set_short_circuits_before_probe(self):
-        # A seat in CHANNEL_LIVENESS_SKIP (e.g. mid-harness-migration orchestrator) is not
-        # probed/alerted/remediated at all — even when the bridge would read down.
-        with mock.patch.object(clm, "CHANNEL_LIVENESS_SKIP", {AGENT}), \
-             mock.patch.object(clm, "probe_bridge", return_value=("down", "detail")) as probe, \
-             mock.patch.object(clm, "_maybe_remediate") as rem, \
-             mock.patch("tools.inbox_consumer.route_failure_alert") as alert:
-            ret = clm.check_agent(AGENT, now=1000)
-        self.assertEqual(ret, "skipped")
-        probe.assert_not_called()
+    def test_muted_seat_is_still_probed_and_trace_logged(self):
+        # ORG-076 s7.1: a mute never blinds a seat. The probe still runs and the
+        # trace is logged; only the PAGE is withheld.
+        with mock.patch.object(clm, "_log") as log:
+            ret, alert, rec = self._check("down", muted=True)
+        self.assertEqual(ret, "down")  # probed (status returned), not "skipped"
         alert.assert_not_called()
-        rem.assert_not_called()
+        rec.assert_not_called()
+        logged = " ".join(str(c.args[1]) for c in log.call_args_list if len(c.args) > 1)
+        self.assertIn("bridge down", logged)
+        self.assertIn("muted", logged)
 
-    def test_empty_skip_set_is_inert(self):
-        # Default (empty) skip set must NOT suppress: the agent is probed normally
-        # and a fresh down still alerts. Guards against the skip accidentally firing.
-        with mock.patch.object(clm, "CHANNEL_LIVENESS_SKIP", set()):
-            ret, alert, rec = self._check("down")
+    def test_legacy_skip_env_is_removed_and_has_no_effect(self):
+        # The per-monitor CHANNEL_LIVENESS_SKIP env is superseded by the mute
+        # registry (ORG-076 s7.1): no module attribute, and setting it does nothing.
+        self.assertFalse(hasattr(clm, "CHANNEL_LIVENESS_SKIP"))
+        with mock.patch.dict(os.environ, {"CHANNEL_LIVENESS_SKIP": AGENT}):
+            importlib.reload(clm)
+            try:
+                ret, alert, _ = self._check("down")
+            finally:
+                os.environ.pop("CHANNEL_LIVENESS_SKIP", None)
+                importlib.reload(clm)
         self.assertEqual(ret, "down")
         alert.assert_called_once()
 
@@ -259,7 +291,7 @@ class CheckAgentTest(unittest.TestCase):
 
     def test_down_on_a_deliberately_paused_seat_does_not_alert_or_remediate(self):
         # T-2393, the incident this was written from: after the operator-directed
-        # fleet daemon pause, specialist and mnemosyne read down every poll and specialist
+        # fleet daemon pause, specialist and archivist read down every poll and specialist
         # took FOUR graceful-restart remediations, each escalating to Recovery. A
         # disabled session unit means the seat was taken out of service on
         # purpose — the down-read IS the pause.
@@ -345,7 +377,7 @@ class SessionUnitDisabledTest(unittest.TestCase):
     def test_disabled_and_inactive_is_paused(self):
         # `is-enabled` exits NON-ZERO for disabled — the verdict must come from
         # stdout. Reading rc would make every disabled unit look like a failure.
-        # T-2671: genuine pause is disabled AND stopped (specialist/mnemosyne).
+        # T-2671: genuine pause is disabled AND stopped (specialist/archivist).
         verdict, _ = self._probe(1, "disabled", active=(3, "inactive"))
         self.assertIs(verdict, True)
 
@@ -379,7 +411,7 @@ class SessionUnitDisabledTest(unittest.TestCase):
         self.assertIsNone(verdict)
 
     def test_no_restart_service_is_unknown(self):
-        # metis/atlas have no session-owning unit (T-2210) — unknown, not paused.
+        # mason/artisan have no session-owning unit (T-2210) — unknown, not paused.
         verdict, run = self._probe(0, "enabled", cfg={"sudo_user": "suborch1"})
         self.assertIsNone(verdict)
         run.assert_not_called()
@@ -449,6 +481,162 @@ class RestartWindowTest(unittest.TestCase):
                     clm._in_restart_window(AGENT, now=950 + clm.RESTART_GRACE_SECONDS + 1))
 
 
+class ControllerRespawnWindowTest(unittest.TestCase):
+    """T-5156: a runtime-controller respawn opens the grace window too.
+
+    Field case 2026-10-18 (twice: 21:04Z and 22:34Z): oomd killed specialist's pane,
+    the controller respawned it, and the next liveness probe read the OLD
+    bot.pid as dead and dispatched remediation, which killed the fresh session
+    and lock-contended the controller for ~3 min. Fixtures are the captured
+    specialist runtime.json stamps and controller-evidence lines (argv/results
+    trimmed)."""
+
+    RUNTIME = {
+        "persona": "specialist", "harness": "claude",
+        "last_structural_event": "runtime_started",
+        "last_structural_event_at": "2026-10-18T22:38:47.165981Z",
+        "runtime_start_boundary_at": "2026-10-18T22:38:36.008028Z",
+        "runtime_start_observed_at": "2026-10-18T22:38:47.165981Z",
+    }
+    SESSION_END = {"cause": "death", "event": "chronicle_session_end", "persona": "specialist",
+                   "recorded_at": "2026-10-18T22:34:43.026314Z",
+                   "schema": "pantheon-runtime-controller-evidence/v1", "status": "ok",
+                   "transition_id": "b229e31c90f144a085d61bebcb865112"}
+    POST_START = {"background": "false", "event": "post_start_command", "outcome": "ok",
+                  "persona": "specialist", "recorded_at": "2026-10-18T22:34:59.253646Z",
+                  "schema": "pantheon-runtime-controller-evidence/v1",
+                  "transition_id": "b229e31c90f144a085d61bebcb865112"}
+    DEFERRED = {"event": "controller_start_deferred_lock_contended", "persona": "specialist",
+                "recorded_at": "2026-10-18T22:34:50.000000Z",
+                "schema": "pantheon-runtime-controller-evidence/v1"}
+
+    @staticmethod
+    def _epoch(iso):
+        from datetime import datetime
+        return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp())
+
+    def _seat(self, td, runtime=None, evidence=()):
+        import json as _json
+        d = Path(td, "personas", AGENT, "runtime-controller")
+        d.mkdir(parents=True)
+        if runtime is not None:
+            (d / "runtime.json").write_text(runtime if isinstance(runtime, str) else _json.dumps(runtime))
+        if evidence:
+            (d / "controller-evidence.jsonl").write_text(
+                "".join((e if isinstance(e, str) else _json.dumps(e)) + "\n" for e in evidence))
+
+    def _in(self, td, now):
+        # Hermetic even under a controller-launched shell on AGENT's own account
+        # (PANTHEON_PERSONA_STATE_DIR would otherwise point at real state).
+        env = {k: v for k, v in clm.os.environ.items() if k != "PANTHEON_PERSONA_STATE_DIR"}
+        env["PANTHEON_STATE_DIR"] = td
+        with mock.patch.dict(clm.os.environ, env, clear=True), \
+             mock.patch("tools.context_fill_monitor._current_user", return_value="not-" + AGENT):
+            return clm._in_restart_window(AGENT, now=now)
+
+    def test_runtime_start_stamp_opens_window(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as td:
+            self._seat(td, runtime=self.RUNTIME)
+            t = self._epoch(self.RUNTIME["runtime_start_boundary_at"])
+            self.assertTrue(self._in(td, t + 5))
+            # observed_at (the later stamp) bounds the window end
+            t_obs = self._epoch(self.RUNTIME["runtime_start_observed_at"])
+            self.assertTrue(self._in(td, t_obs + clm.RESTART_GRACE_SECONDS - 1))
+            self.assertFalse(self._in(td, t_obs + clm.RESTART_GRACE_SECONDS + 1))
+
+    def test_controller_session_death_opens_window_before_runtime_json_moves(self):
+        # The 22:34Z gap: the session died at 22:34:43, the respawn landed at
+        # 22:34:59, and runtime.json still carried the PREVIOUS start (stale).
+        from tempfile import TemporaryDirectory
+        stale = dict(self.RUNTIME, runtime_start_boundary_at="2026-10-18T17:40:00Z",
+                     runtime_start_observed_at="2026-10-18T17:40:05Z")
+        with TemporaryDirectory() as td:
+            self._seat(td, runtime=stale, evidence=[self.SESSION_END])
+            self.assertTrue(self._in(td, self._epoch(self.SESSION_END["recorded_at"]) + 20))
+
+    def test_post_start_command_opens_window(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as td:
+            self._seat(td, evidence=[self.POST_START])
+            self.assertTrue(self._in(td, self._epoch(self.POST_START["recorded_at"]) + 1))
+
+    def test_unrelated_controller_events_do_not_open_window(self):
+        # Lock-contention events are emitted while OUR remediation holds the
+        # lock; they must not extend suppression on their own.
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as td:
+            self._seat(td, evidence=[self.DEFERRED])
+            self.assertFalse(self._in(td, self._epoch(self.DEFERRED["recorded_at"]) + 1))
+
+    def test_stale_controller_signals_do_not_suppress(self):
+        # A seat that died and was NOT respawned must alert once the grace passes.
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as td:
+            self._seat(td, runtime=self.RUNTIME, evidence=[self.SESSION_END, self.POST_START])
+            latest = self._epoch(self.RUNTIME["runtime_start_observed_at"])
+            self.assertFalse(self._in(td, latest + clm.RESTART_GRACE_SECONDS + 1))
+
+    def _deaths(self, td, now):
+        env = {k: v for k, v in clm.os.environ.items() if k != "PANTHEON_PERSONA_STATE_DIR"}
+        env["PANTHEON_STATE_DIR"] = td
+        with mock.patch.dict(clm.os.environ, env, clear=True), \
+             mock.patch("tools.context_fill_monitor._current_user", return_value="not-" + AGENT):
+            return clm._session_deaths_in_window(AGENT, now=now)
+
+    def test_session_deaths_counts_only_deaths_inside_the_window(self):
+        # T-5165. Graceful ends (replace/start) are not deaths; a death outside the
+        # window does not count; a duplicate record of one transition counts once.
+        from tempfile import TemporaryDirectory
+        base = self._epoch(self.SESSION_END["recorded_at"])
+        def end(offset, cause="death", tid=None):
+            from datetime import datetime, timezone
+            iso = datetime.fromtimestamp(base + offset, timezone.utc).isoformat().replace("+00:00", "Z")
+            return dict(self.SESSION_END, recorded_at=iso, cause=cause,
+                        transition_id=tid or f"t{offset}")
+        ev = [end(-4000), end(-1200), end(-600), end(-600, tid="t-600"), end(-300, cause="replace"),
+              end(0), self.POST_START, self.DEFERRED]
+        with TemporaryDirectory() as td:
+            self._seat(td, evidence=ev)
+            self.assertEqual(self._deaths(td, base + 1), 3)
+
+    def test_malformed_controller_state_fails_open(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as td:
+            self._seat(td, runtime="{not json", evidence=["garbage", '{"event": "chronicle_session_end", "recorded_at": "nope"}'])
+            self.assertFalse(self._in(td, 1792362000))
+
+    def test_no_controller_state_is_not_in_window(self):
+        from tempfile import TemporaryDirectory
+        with TemporaryDirectory() as td:
+            self.assertFalse(self._in(td, 1792362000))
+
+    def test_cross_account_reads_go_through_sudo_as_the_seat(self):
+        # Production (no PANTHEON_STATE_DIR): another account's state dir is
+        # mode 700, so both reads must run as cfg sudo_user, never a local open.
+        cfg_user = clm.AGENT_CONFIG[AGENT]["sudo_user"]
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return mock.Mock(returncode=1, stdout="", stderr="")
+
+        env = {k: v for k, v in clm.os.environ.items() if k != "PANTHEON_STATE_DIR"}
+        # The default state dir is this host's real one; its context-fill stamps can be
+        # newer than the fixed `now` and open the window (T-5165 found this host-only).
+        empty = TemporaryDirectory()
+        self.addCleanup(empty.cleanup)
+        with mock.patch.dict(clm.os.environ, env, clear=True), \
+             mock.patch.object(clm, "_DEFAULT_STATE_DIR", Path(empty.name)), \
+             mock.patch("tools.context_fill_monitor._current_user", return_value="claude-fallback"), \
+             mock.patch.object(clm.subprocess, "run", side_effect=fake_run), \
+             mock.patch("tools.context_fill_monitor.subprocess.run", side_effect=fake_run):
+            self.assertFalse(clm._in_restart_window(AGENT, now=1792362000))
+        joined = [" ".join(a) for a in calls]
+        self.assertTrue(any(cfg_user in j and "runtime.json" in j for j in joined), joined)
+        self.assertTrue(any(cfg_user in j and "controller-evidence.jsonl" in j for j in joined), joined)
+
+
 class CliTest(unittest.TestCase):
     def test_requires_agent_or_all(self):
         with self.assertRaises(SystemExit):
@@ -490,14 +678,34 @@ class RemediateTest(unittest.TestCase):
         wt.assert_not_called()
         fr.assert_not_called()
 
-    def test_per_agent_remediate_false_stays_alert_only(self):
-        # Observation-only agents (mnemosyne, 2026-07-20 profile agreement)
-        # opt out via cfg remediate=False: even with the global flag ON,
-        # bridge-down must never fire a restart for them.
-        ret, wt, fr = self._rem("mnemosyne", enabled=True)
+    def test_remediate_false_flag_is_still_honored_on_any_agent(self):
+        # T-3840: archivist dropped remediate:False from her AGENT_CONFIG post-
+        # T-3832 consolidation + T-3819 arm (the operator "restart on for everyone"
+        # 2026-09-20; policy now uniform across claude-harness personas). The
+        # per-agent remediate=False MECHANISM must still work though — verify
+        # by injecting a synthetic cfg override (any future agent that opts
+        # out again is covered without a code change in channel_liveness_monitor).
+        synthetic_cfg = {**clm.AGENT_CONFIG["archivist"], "remediate": False}
+        with mock.patch.object(clm, "REMEDIATE_ENABLED", True), \
+             mock.patch.object(clm, "write_tombstone") as wt, \
+             mock.patch.object(
+                 clm, "fire_restart_detached",
+                 return_value=(True, "", "pantheon-channel-remediate-x-123"),
+             ) as fr, \
+             mock.patch("tools.inbox_consumer.route_failure_alert"):
+            ret = clm._maybe_remediate("archivist", synthetic_cfg, "detail", now=10000)
         self.assertFalse(ret)
         wt.assert_not_called()
         fr.assert_not_called()
+
+    def test_archivist_now_remediates_by_default(self):
+        # T-3840: verify the arm — archivist with cfg-as-shipped now fires like
+        # any other claude-harness persona when the global flag is ON. If this
+        # test flips, either the arm was reverted (restore remediate=False) or
+        # the config drifted; either way the intent trail is here.
+        ret, wt, fr = self._rem("archivist", enabled=True)
+        self.assertTrue(ret)
+        fr.assert_called_once()
 
     def test_recovery_uses_tombstone(self):
         ret, wt, fr = self._rem("recovery")
@@ -560,7 +768,8 @@ class BlindSentinelMisdirectionT2359(unittest.TestCase):
         self.cfg = clm.AGENT_CONFIG[AGENT]
 
     def _probe(self, run_results):
-        with mock.patch.object(clm, "_run", side_effect=run_results):
+        with mock.patch.object(clm, "_run", side_effect=run_results), \
+                mock.patch.object(clm, "_codex_poller_serves_bridge", return_value=False):
             return clm.probe_bridge(AGENT, self.cfg)
 
     def test_unreadable_pidfile_is_NOT_reported_as_a_dead_bridge(self):
@@ -601,6 +810,196 @@ class BlindSentinelMisdirectionT2359(unittest.TestCase):
         status, detail = self._probe([(0, "12345"), (0, "NOSUCHPROC")])
         self.assertEqual(status, "down")
         self.assertIn("409-death", detail)
+
+
+class CodexPollerAwareT2959(unittest.TestCase):
+    """T-2959: a seat on codex polls its bot with codex-telegram-poller, so the
+    Claude plugin bridge is down by design. Only same-token positive evidence
+    turns that 'down' into 'up'."""
+
+    CFG = clm.AGENT_CONFIG[AGENT]
+
+    def _serves(self, run_result):
+        with mock.patch.object(clm, "_run", return_value=run_result):
+            return clm._codex_poller_serves_bridge(self.CFG)
+
+    def test_verdicts(self):
+        self.assertIs(self._serves((0, "SAME\n")), True)
+        self.assertIs(self._serves((0, "DIFF\n")), False)
+        self.assertIs(self._serves((0, "NOPOLLER\n")), False)
+        self.assertIsNone(self._serves((0, "UNKNOWN\n")))
+        self.assertIsNone(self._serves((0, "")))
+        self.assertIsNone(self._serves((1, "SAME\n")))   # a failed probe is never proof
+
+    def _probe(self, claude, serves):
+        with mock.patch.object(clm, "_probe_claude_bridge", return_value=claude), \
+                mock.patch.object(clm, "_codex_poller_serves_bridge",
+                                  return_value=serves) as sv:
+            return clm.probe_bridge(AGENT, self.CFG), sv
+
+    def test_down_with_same_token_poller_reads_up(self):
+        (status, detail), _ = self._probe(("down", "bot.pid ABSENT"), True)
+        self.assertEqual(status, "up")
+        self.assertIn("codex-telegram-poller", detail)
+
+    def test_down_stays_down_without_positive_evidence(self):
+        for serves in (False, None):
+            (status, detail), _ = self._probe(("down", "bot.pid ABSENT"), serves)
+            self.assertEqual((status, detail), ("down", "bot.pid ABSENT"))
+
+    def test_non_down_never_consults_the_poller(self):
+        for st in ("up", "no_bridge", "inconclusive"):
+            (status, _), sv = self._probe((st, "d"), True)
+            self.assertEqual(status, st)
+            sv.assert_not_called()
+
+
+class CodexPollerProbeScriptT2959(unittest.TestCase):
+    """Runs the embedded probe script for real: a fake `systemctl` on PATH
+    reports a live child process that holds a test token in its environment."""
+
+    def _run_probe(self, *, active=True, live_token="tok-A", plugin_token="tok-A"):
+        import subprocess, sys, time
+        with TemporaryDirectory() as d:
+            child = subprocess.Popen(["sleep", "30"], env={"TELEGRAM_BOT_TOKEN": live_token})
+            try:
+                time.sleep(0.05)
+                fake = Path(d) / "systemctl"
+                state = "active" if active else "inactive"
+                fake.write_text(f"#!/bin/sh\necho ActiveState={state}\necho MainPID={child.pid}\n")
+                fake.chmod(0o755)
+                env_file = Path(d) / ".env"
+                env_file.write_text(f"TELEGRAM_BOT_TOKEN={plugin_token}\n")
+                out = subprocess.run(
+                    [sys.executable, "-I", "-c", clm._CODEX_POLLER_PROBE,
+                     clm.CODEX_POLLER_UNIT, str(env_file)],
+                    capture_output=True, text=True, timeout=30,
+                    env={"PATH": f"{d}:/usr/bin:/bin", "HOME": d}).stdout
+            finally:
+                child.kill()
+                child.wait()
+        return out.strip()
+
+    def test_same_token(self):
+        self.assertEqual(self._run_probe(), "SAME")
+
+    def test_different_bot_is_diff(self):
+        self.assertEqual(self._run_probe(plugin_token="tok-B"), "DIFF")
+
+    def test_inactive_unit_is_nopoller(self):
+        self.assertEqual(self._run_probe(active=False), "NOPOLLER")
+
+    def test_token_never_printed(self):
+        self.assertNotIn("tok-A", self._run_probe())
+
+
+class SeatStateT5527(unittest.TestCase):
+    """ORG-106 L4b (T-5527): a seat declared asleep is not paged; a broken sleep is."""
+
+    def _check(self, status, seat, *, maintenance=False, muted=False, cooldown=False,
+               dry_run=False):
+        from tools.seat_state_testkit import eff
+
+        with mock.patch.object(clm, "probe_bridge", return_value=(status, "detail")), \
+             mock.patch("tools.seat_state.safe_effective_for", return_value=seat), \
+             mock.patch.object(clm, "_seat_in_maintenance", return_value=maintenance), \
+             mock.patch.object(clm, "_seat_muted", return_value=muted), \
+             mock.patch.object(clm, "_session_unit_is_disabled", return_value=None), \
+             mock.patch.object(clm, "_in_alert_cooldown", return_value=cooldown), \
+             mock.patch.object(clm, "_in_restart_window", return_value=False), \
+             mock.patch.object(clm, "_maybe_remediate") as rem, \
+             mock.patch.object(clm, "_record_alert") as rec, \
+             mock.patch("tools.inbox_consumer.route_failure_alert") as alert:
+            ret = clm.check_agent(AGENT, dry_run=dry_run, now=1000)
+        del eff
+        return ret, alert, rec, rem
+
+    def test_asleep_and_bridge_down_is_asleep_no_page_no_remediation(self):
+        from tools.seat_state_testkit import eff
+        ret, alert, rec, rem = self._check("down", eff("deep-sleep", asleep=True))
+        self.assertEqual(ret, "asleep")
+        alert.assert_not_called()
+        rec.assert_not_called()
+        rem.assert_not_called()
+
+    def test_asleep_with_live_bridge_pages_sleep_breach(self):
+        from tools.seat_state_testkit import eff
+        ret, alert, rec, rem = self._check("up", eff("deep-sleep", asleep=True))
+        self.assertEqual(ret, "sleep_breach")
+        alert.assert_called_once()
+        self.assertEqual(alert.call_args.args[0], AGENT)
+        self.assertEqual(alert.call_args.args[2], "sleep_breach")
+        self.assertIn("asleep", alert.call_args.args[1])
+        rec.assert_called_once()
+        rem.assert_not_called()      # a breach is alert-only; this monitor never kills a session
+
+    def test_sleep_breach_skips_local_mute_gate_and_routes_via_the_section7_chokepoint(self):
+        # Only the monitor-local _seat_muted gate is skipped. The page is handed to
+        # route_failure_alert, the ORG-076 section 7 mute chokepoint, which is where a
+        # muted seat's page is suppressed in production.
+        from tools.seat_state_testkit import eff
+        seat = eff("deep-sleep", asleep=True, oom=True, maintenance=True)
+        ret, alert, _, rem = self._check("up", seat, maintenance=True, muted=True)
+        self.assertEqual(ret, "sleep_breach")
+        alert.assert_called_once()
+        self.assertEqual(alert.call_args.args[0], AGENT)
+        self.assertEqual(alert.call_args.args[2], "sleep_breach")
+        rem.assert_not_called()
+
+    def test_sleep_breach_respects_the_alert_cooldown_and_dry_run(self):
+        from tools.seat_state_testkit import eff
+        seat = eff("deep-sleep", asleep=True)
+        ret, alert, rec, _ = self._check("up", seat, cooldown=True)
+        self.assertEqual(ret, "sleep_breach")
+        alert.assert_not_called()
+        ret, alert, rec, _ = self._check("up", seat, dry_run=True)
+        self.assertEqual(ret, "sleep_breach")
+        alert.assert_not_called()
+        rec.assert_not_called()
+
+    def test_oom_hold_with_live_bridge_is_not_a_breach(self):
+        from tools.seat_state_testkit import eff
+        ret, alert, _, _ = self._check("up", eff(oom=True))
+        self.assertEqual(ret, "up")
+        alert.assert_not_called()
+
+    def test_draining_seat_with_bridge_down_is_not_paged_or_remediated(self):
+        from tools.seat_state_testkit import eff
+        ret, alert, rec, rem = self._check("down", eff("deep-sleep", asleep=False))
+        self.assertEqual(ret, "asleep")
+        alert.assert_not_called()
+        rem.assert_not_called()
+
+    def test_paused_intake_seat_is_judged_normally(self):
+        from tools.seat_state_testkit import eff
+        ret, alert, rec, rem = self._check("down", eff("paused-intake"))
+        self.assertEqual(ret, "down")
+        alert.assert_called_once()
+        rem.assert_called_once()
+
+    def test_paused_intake_is_annotated_in_the_log(self):
+        from tools.seat_state_testkit import eff
+        with mock.patch.object(clm, "_log") as log:
+            self._check("up", eff("paused-intake", reason="ship freeze"))
+        self.assertTrue(any("paused-intake" in str(c) and "ship freeze" in str(c)
+                            for c in log.call_args_list))
+
+    def test_live_oom_shape_oom_hold_plus_maintenance_rearm_vetoes_repair(self):
+        # pantheon_oom_killer re-arms seat maintenance every 10 min, so an OOM-held seat
+        # reads maintenance: no page, no remediation (ORG-104), via the maintenance re-arm.
+        from tools.seat_state_testkit import eff
+        ret, alert, _, rem = self._check("down", eff(oom=True, maintenance=True), maintenance=True)
+        self.assertEqual(ret, "maintenance")
+        alert.assert_not_called()
+        rem.assert_not_called()
+
+    def test_maintenance_unchanged_and_unknown_reader_is_normal(self):
+        ret, alert, _, rem = self._check("down", None, maintenance=True)
+        self.assertEqual(ret, "maintenance")
+        alert.assert_not_called()
+        ret, alert, _, _ = self._check("down", None)
+        self.assertEqual(ret, "down")
+        alert.assert_called_once()
 
 
 if __name__ == "__main__":

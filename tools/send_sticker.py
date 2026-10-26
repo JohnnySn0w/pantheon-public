@@ -11,11 +11,11 @@ Contract:
   send_sticker.py <persona> <reaction> <chat_id> [--token-file PATH] [--manifest PATH]
 
 <persona>       one of the manifest's top-level keys (orchestrator/specialist/recovery/codex/
-                mnemosyne/cairn — same slugs the manifest uses)
+                archivist/consultant — same slugs the manifest uses)
 <reaction>      the sticker's `reaction` field (idle/shipped/approved/
                 investigating/thinking/wedged, or persona-specific extras)
 <chat_id>       Telegram chat id — pass the value from the inbound <channel>
-                block, or the operator's 456474197 for the operator DM
+                block, or the operator's 424242424 for the operator DM
 --token-file    the persona's bot .env; default ~/.claude/channels/telegram/.env
                 (works for any persona invoking the helper from their own home)
 --manifest      path to assets/stickers/manifest.json (default: repo-relative)
@@ -40,6 +40,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = REPO_ROOT / "assets" / "stickers" / "manifest.json"
 DEFAULT_TOKEN_FILE = Path.home() / ".claude" / "channels" / "telegram" / ".env"
+# Overridable so tests can point at a local stub instead of Telegram (T-1024).
+API_BASE_ENV = "TELEGRAM_API_BASE"
+DEFAULT_API_BASE = "https://api.telegram.org"
 
 
 def _load_token(token_file: Path) -> str:
@@ -74,17 +77,27 @@ def _resolve_file_id(manifest: dict, persona: str, reaction: str) -> str:
 
 def send_sticker(persona: str, reaction: str, chat_id: str,
                  *, token_file: Path = DEFAULT_TOKEN_FILE,
-                 manifest_path: Path = DEFAULT_MANIFEST) -> dict:
+                 manifest_path: Path = DEFAULT_MANIFEST,
+                 reply_to: int | None = None) -> dict:
     """Resolve manifest → curl sendSticker. Returns the parsed API response.
     Never mutates the manifest. Never logs the token."""
     manifest = json.loads(manifest_path.read_text())
     file_id = _resolve_file_id(manifest, persona, reaction)
     token = _load_token(token_file)
-    api_url = f"https://api.telegram.org/bot{token}/sendSticker"
+    base = os.environ.get(API_BASE_ENV, DEFAULT_API_BASE).rstrip("/")
+    api_url = f"{base}/bot{token}/sendSticker"
     # Token lives in the URL only; not embedded in the args list beyond that,
     # and never printed by this helper on any code path.
     cmd = ["curl", "-sS", api_url, "-d", f"chat_id={chat_id}", "-d", f"sticker={file_id}"]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if reply_to is not None:
+        # Thread under an earlier message (T-1024 MCP tool's reply_to).
+        cmd += ["-d", "reply_parameters=" + json.dumps({"message_id": int(reply_to)})]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # str(TimeoutExpired) includes the argv, and the argv carries the token in the URL:
+        # report a token-free cause instead (T-1024 review).
+        raise RuntimeError(f"sendSticker transport failed: {type(exc).__name__}") from None
     try:
         return json.loads(r.stdout or "{}")
     except json.JSONDecodeError:
@@ -93,9 +106,9 @@ def send_sticker(persona: str, reaction: str, chat_id: str,
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    p.add_argument("persona", help="e.g. orchestrator, specialist, recovery, codex, mnemosyne, cairn")
+    p.add_argument("persona", help="e.g. orchestrator, specialist, recovery, codex, archivist, consultant")
     p.add_argument("reaction", help="e.g. approved, shipped, investigating, thinking, wedged, idle")
-    p.add_argument("chat_id", help="Telegram chat id (from inbound <channel> block, or 456474197 for the operator)")
+    p.add_argument("chat_id", help="Telegram chat id (from inbound <channel> block, or 424242424 for the operator)")
     p.add_argument("--token-file", type=Path, default=DEFAULT_TOKEN_FILE,
                     help=f"path to persona's telegram .env (default {DEFAULT_TOKEN_FILE})")
     p.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST,

@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-BUS Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<!--
+  STAGED TEMPLATE (T-2917, ORG-052 Units 5a/5b). Nothing in this unit
+  installs it; the T-2920 install leg substitutes @SEAT_ACCOUNT@ and
+  @SEAT_UID@ with each registered seat's account and uid from the
+  root-owned seat registry and installs one fragment per seat.
+
+  The per-seat executor runs AS its seat account (ORG-052 section 3), so
+  that account may read its own operations' specifications through the
+  broker-only ExecutionSource interface: exactly one member, member-level.
+  The broker re-checks in code that the caller's uid is the registry uid
+  of the operation's TARGET seat (bus policy is defence in depth, never
+  the perimeter).
+
+  Unit 5b: the seat account may own exactly ONE executor name, its own
+  org.pantheon.HostExecutor1.U<uid> (ruling i5). The broker's Execute /
+  ExecutionGet permission is static, in org.pantheon.HostExecutor1.conf.
+
+  Names PROVISIONAL-PENDING-RATIFICATION (T-2917 ruling i3).
+-->
+<busconfig>
+  <policy user="@SEAT_ACCOUNT@">
+    <allow own="org.pantheon.HostExecutor1.U@SEAT_UID@"/>
+    <allow send_destination="org.pantheon.HostBroker1"
+           send_interface="org.pantheon.HostBroker1.ExecutionSource"
+           send_member="OperationSpec"/>
+  </policy>
+</busconfig>

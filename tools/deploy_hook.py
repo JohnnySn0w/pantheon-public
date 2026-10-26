@@ -47,10 +47,10 @@ T-2261, TWO DEFECTS ONE LAYER BELOW THE ACCOUNT LIST — both silent by construc
 
 2. DEPLOYED IS NOT ACTIVE, AND NOTHING MEASURED ACTIVE. Bytes on disk do not make a hook
    run; Claude Code only invokes it if that account's ~/.claude/settings.json registers it
-   under a SessionStart entry. Metis's words, exact and worth keeping:
+   under a SessionStart entry. Mason's words, exact and worth keeping:
    "A DEPLOY THAT REPORTS VERIFIED AGAINST THE FILE'S MD5 IS MEASURING A PROXY FOR
    'THE HOOK RUNS.'"
-   Measured twice: metis's seat and then atlas's seat both had handoff-auto-read.sh
+   Measured twice: mason's seat and then artisan's seat both had handoff-auto-read.sh
    byte-perfect, mode 755, VERIFIED — and INERT, because settings.json registered only
    ensure-hooks-active.sh. Both had to be wired by hand. This is the same failure shape
    ensure-hooks-active.sh itself polices for git hooks (present but not running) — same
@@ -146,7 +146,7 @@ CANON_DIR = REPO / "tools" / "hooks"
 #
 # WHY THIS LIST IS DANGEROUS TO GET WRONG, and it was wrong from 2026-07-20 to 2026-07-28:
 # it read ("claude", "claude-research", "claude-fallback") — the pre-ORG-042 topology.
-# Mnemosyne (exocortex), Metis (suborch1) and Atlas (suborch2) were simply absent, so a
+# Archivist (exocortex), Mason (suborch1) and Artisan (suborch2) were simply absent, so a
 # deploy of ANY hook reported success while silently covering three of six accounts. The
 # missing entries cannot announce themselves: a skipped account produces no error, no
 # warning, and no row in the plan — its absence is indistinguishable from it being fine.
@@ -159,9 +159,9 @@ DEFAULT_ACCOUNTS = (
     "claude",            # Orchestrator — HO
     "claude-research",   # Specialist — specialist
     "claude-fallback",   # Recovery — recovery
-    "exocortex",         # Mnemosyne — second head (ORG-042)
-    "suborch1",          # Metis — sub-orchestrator seat (ORG-043)
-    "suborch2",          # Atlas — sub-orchestrator seat (ORG-043)
+    "exocortex",         # Archivist — second head (ORG-042)
+    "suborch1",          # Mason — sub-orchestrator seat (ORG-043)
+    "suborch2",          # Artisan — sub-orchestrator seat (ORG-043)
 )
 
 ACTION_PULL = "pull"      # symlinked deployment — cp would write through
@@ -399,7 +399,8 @@ def _session_start_commands(session_start) -> list[str]:
     return cmds
 
 
-def parse_registration(settings_text: str | None, hook: str, account: str) -> tuple[str, str]:
+def parse_registration(settings_text: str | None, hook: str, account: str, *,
+                       home: str | None = None) -> tuple[str, str]:
     """Is `hook` registered under ANY event in this settings.json? PURE. (T-2320)
 
     Returns (STATUS_*, human detail). Split out from the probe so the whole decision table
@@ -415,14 +416,17 @@ def parse_registration(settings_text: str | None, hook: str, account: str) -> tu
                                                measurement, and it is the virgin-seat case.
         no "hooks" key             -> INERT    same reasoning, one level in
         no "SessionStart"          -> INERT    same
-        SessionStart, other hooks  -> INERT    THE MEASURED CASE: metis and atlas both had
+        SessionStart, other hooks  -> INERT    THE MEASURED CASE: mason and artisan both had
                                                only ensure-hooks-active.sh registered while
                                                handoff-auto-read.sh sat on disk, VERIFIED
                                                and never invoked
         this basename, other path  -> ELSEWHERE something runs; not the bytes we verified
         this basename, deployed path -> ACTIVE
+
+    `home` defaults to /home/<account>. verify-hook-integrity.sh (T-4473) passes its own
+    $HOME, so a sandboxed HOME resolves ~ and the deployed path the same way the hook does.
     """
-    home = f"/home/{account}"
+    home = home or f"/home/{account}"
     deployed = f"{home}/.claude/hooks/{hook}"
     if settings_text is None:
         return STATUS_UNKNOWN, "could not read that account's ~/.claude/settings.json"
@@ -501,6 +505,61 @@ def probe_registration(account: str, hook: str, *, run=subprocess.run) -> tuple[
         return STATUS_UNKNOWN, ("could not read that account's settings.json "
                                 "(sudo denied or shell failed)")
     return parse_registration(getattr(r, "stdout", None), hook, account)
+
+
+# T-4473: every settings file a session of this account can load hooks from. The
+# user-level pair, the project-level pair (seats run with cwd = the pantheon-config
+# clone), and the managed file. A deployed copy is dormant only if NONE of them runs it.
+MANAGED_SETTINGS = "/etc/claude-code/managed-settings.json"
+
+
+def _settings_sources(home: str) -> list[str]:
+    return [
+        f"{home}/.claude/settings.json",
+        f"{home}/.claude/settings.local.json",
+        f"{home}/pantheon-config/.claude/settings.json",
+        f"{home}/pantheon-config/.claude/settings.local.json",
+        MANAGED_SETTINGS,
+    ]
+
+
+def _read_settings_text(path: str) -> str:
+    """The file's text, or the ABSENT/UNREADABLE sentinel parse_registration expects.
+    Local read: the caller is the account itself (its own ~ is readable)."""
+    if not os.path.lexists(path):
+        return _SETTINGS_ABSENT
+    try:
+        return Path(path).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return _SETTINGS_UNREADABLE
+
+
+def classify_deployed_copy(hook: str, home: str, account: str, *,
+                           sources: list[str] | None = None) -> tuple[bool, str]:
+    """Is the deployed copy of `hook` under `home` DORMANT, i.e. provably never executed?
+    Returns (dormant, detail). (T-4473)
+
+    verify-hook-integrity.sh raised the full tamper alarm for every deployed copy whose
+    bytes differ from the canonical, including a leftover ~/.claude/hooks copy of a hook
+    that every settings file now registers from the clone. That copy runs nowhere, so its
+    drift is housekeeping rather than a tamper surface.
+
+    DORMANT needs POSITIVE evidence: at least one settings file registers this basename
+    at a DIFFERENT path (ELSEWHERE), and none registers the deployed path (ACTIVE) or is
+    unreadable or unparseable (UNKNOWN). No registration anywhere (all INERT) is NOT
+    dormant, because a helper that another hook imports from ~/.claude/hooks is
+    registered nowhere yet still executes. The alarm stays for that case.
+    """
+    elsewhere = ""
+    for path in sources if sources is not None else _settings_sources(home):
+        status, detail = parse_registration(_read_settings_text(path), hook, account, home=home)
+        if status in (STATUS_ACTIVE, STATUS_UNKNOWN):
+            return False, f"{path}: {status}: {detail}"
+        if status == STATUS_ELSEWHERE and not elsewhere:
+            elsewhere = f"{path}: {detail}"
+    if not elsewhere:
+        return False, "registered nowhere: a copy might still be imported by another hook"
+    return True, elsewhere
 
 
 def plan_step(account: str, deployed: Path, *, is_symlink: bool | None = None,

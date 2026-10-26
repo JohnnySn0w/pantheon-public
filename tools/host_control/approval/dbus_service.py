@@ -31,15 +31,16 @@ Bus policy (staged under ``dist/``) is defence in depth and never the
 perimeter: these refusals hold on a fully permissive bus (gate 10
 posture).
 
-``RequestHuman`` and ``HumanDecision`` are exposed-but-refusing (the
-broker ``Verify`` precedent): they MUST introspect as part of the
-locked inventory (gate 2), the identity gate fires FIRST so an
-unauthorized caller gets the authorization refusal rather than an
-Unsupported error, and the authorized caller gets the bounded
-``Unsupported`` error naming T-2919 — the human-request and
-provider-authenticated decision paths are that unit's (the journal's
-``provider_attestations`` table exists with no writer, and the domain
-``decide`` mints only ``authority_source='agent'``).
+``RequestHuman`` and ``HumanDecision`` are live since T-2919 (ORG-052
+§5 "Human authority ingress"): the identity gate still fires FIRST on
+both, then exactly one domain call. Since T-5518 ``RequestHuman`` replies
+asynchronously (dbus-python ``async_callbacks``) so the outbound
+``Present`` never blocks this loop; see the method docstring. ``RequestHuman`` creates the one
+pending human card record and asks the registered Telegram ingress to
+present it (``HostApprovalTelegram1.Ingress.Present``, through the
+service's presenter seam); ``HumanDecision`` is callable only by the
+registered ingress uid and is the ONLY mint of
+``authority_source='human'``.
 
 DEVIATION RECORD (T-2913 OQ6, PO-acked): the broker-side D-Bus client
 of ``HostApproval1.Consumer`` (the real ``ApprovalStatusSource`` /
@@ -90,16 +91,6 @@ class ApproverSubjectResolver(Protocol):
     """
 
     def subject_for_uid(self, uid: int) -> str | None: ...
-
-
-_UNSUPPORTED_HUMAN_REQUEST = (
-    "human approval requests are unsupported in this revision; "
-    "the RequestHuman path lands with T-2919"
-)
-_UNSUPPORTED_HUMAN_DECISION = (
-    "provider-authenticated human decisions are unsupported in this "
-    "revision; the HumanDecision path lands with T-2919"
-)
 
 
 if DBUS_AVAILABLE:
@@ -251,7 +242,9 @@ if DBUS_AVAILABLE:
                     subject,
                     str(review_handle),
                 )
-                return (record.state, wire.review_summary_json(record))
+                # extras read ONLY after review_get authorized the subject
+                extras = self._service.review_extras(record.review_handle)
+                return (record.state, wire.review_summary_json(record, extras))
 
         @dbus.service.method(
             wire.REVIEWER_INTERFACE,
@@ -290,6 +283,7 @@ if DBUS_AVAILABLE:
             in_signature="sss",
             out_signature="ss",
             sender_keyword="sender",
+            async_callbacks=("reply_cb", "error_cb"),
         )
         def RequestHuman(
             self,
@@ -297,15 +291,51 @@ if DBUS_AVAILABLE:
             expected_digest: str,
             idempotency_key: str,
             sender: str | None = None,
-        ) -> tuple[str, str]:
-            # Exposed but refusing (broker Verify precedent): identity
-            # first, so an unauthorized caller gets the authorization
-            # refusal, never Unsupported.
-            self._approver_subject(sender)
-            raise _named_error(
-                wire.UNSUPPORTED_ERROR,
-                _UNSUPPORTED_HUMAN_REQUEST,
-            )
+            reply_cb=None,
+            error_cb=None,
+        ) -> None:
+            """T-2919: identity first (the Reviewer gate), then exactly one
+            domain call. Slots: request handle, state — never the nonce.
+
+            T-5518: a DEFERRED reply. When the record is still pending and
+            the service delivers asynchronously, the handler returns to
+            the loop at once and replies when the first ``Present``
+            attempt settles (bounded by the presenter timeout): state
+            ``presented`` if delivered, else ``pending`` while the service
+            keeps retrying on its own. The loop is never blocked, so
+            ``HumanDecision`` stays servable while a card is in flight."""
+
+            try:
+                subject = self._approver_subject(sender)
+                with self._mapped_errors():
+                    result = self._service.request_human(
+                        subject,
+                        str(review_handle),
+                        str(expected_digest),
+                        str(idempotency_key),
+                    )
+            except dbus.exceptions.DBusException as exc:
+                error_cb(exc)
+                return
+            if result.state != "pending":
+                reply_cb(result.request_handle, result.state)
+                return
+
+            def settled(outcome, error) -> None:
+                if outcome is None:
+                    error_cb(_wire_error(error or RuntimeError("unavailable")))
+                else:
+                    reply_cb(outcome[0], outcome[1])
+
+            try:
+                deferred = self._service.deliver_human_request(
+                    result.request_handle, settled
+                )
+            except Exception as exc:
+                error_cb(_wire_error(exc))
+                return
+            if not deferred:
+                reply_cb(result.request_handle, result.state)
 
         # ------------------------------------------------------------
         # org.pantheon.HostApproval1.Consumer — broker uid ONLY
@@ -382,9 +412,19 @@ if DBUS_AVAILABLE:
             idempotency_key: str,
             sender: str | None = None,
         ) -> tuple[str, str]:
-            # Exposed but refusing (T-2919): ingress identity first.
-            self._ingress_caller(sender)
-            raise _named_error(
-                wire.UNSUPPORTED_ERROR,
-                _UNSUPPORTED_HUMAN_DECISION,
-            )
+            # T-2919: ingress identity first (transport gate); the domain
+            # rechecks the SAME live uid against the root-owned
+            # registration and derives provider + human subject from it
+            # alone. Slots: review state, attestation handle.
+            uid = self._ingress_caller(sender)
+            with self._mapped_errors():
+                result = self._service.human_decision(
+                    uid,
+                    str(review_handle),
+                    str(expected_digest),
+                    str(decision),
+                    str(source_event_handle),
+                    str(callback_nonce),
+                    str(idempotency_key),
+                )
+                return (result.state, result.attestation_handle)

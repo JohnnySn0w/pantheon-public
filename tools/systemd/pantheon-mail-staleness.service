@@ -12,6 +12,11 @@ OnFailure=pantheon-unit-failure-alert@%n.service
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# T-4667: route_failure_alert honours the ORG-076 §7 mute registry only when it can find
+# it. Without this, notify_policy reads its /opt default (never provisioned), fails open,
+# and a muted seat (mason/artisan, paused under T-4539) paged recovery hourly. Same line as
+# pantheon-channel-liveness.service. An exported var survives the `sg` below (checked).
+Environment=PANTHEON_MUTE_REGISTRY=/var/lib/pantheon/notify-mute/notify_mute.json
 
 # NOT a templated @-unit despite the ticket's shorthand: the monitor scans EVERY
 # inbox on the hub in one pass (discover_inboxes by maildir shape), so there is no

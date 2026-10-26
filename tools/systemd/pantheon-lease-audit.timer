@@ -1,0 +1,15 @@
+[Unit]
+Description=Pantheon detective lease check, every 5 minutes (T-4884 B4b)
+Documentation=file:///home/%u/pantheon-config/notes/2026-10-12-t4884-codex-recovery-seat-design.md
+
+# NOT auto-installed by this build. Template only; install on both recovery
+# seats' accounts once the account is in group systemd-journal.
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Unit=pantheon-lease-audit.service
+
+[Install]
+WantedBy=timers.target

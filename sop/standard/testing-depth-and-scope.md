@@ -60,6 +60,17 @@ Tests at the Integration tier and beyond touch shared resources (real repo paths
 1. **T-0259's `tools/_test_fixtures.py`** for auto-commit / git-touching scripts. The fixture provides tmp repo + bare origin + state dir + `assert_real_repo_untouched` final check. Per the [auto-commit-cron-default-safe-contract.md](auto-commit-cron-default-safe-contract.md) SOP, every auto-commit script gets Layer-3 coverage via this fixture.
 2. **`mkdtemp` + per-test teardown** for non-git temp infra (tmp state dirs, tmp config files, tmp JSONL outputs). Each test gets a fresh tempdir; teardown removes it. Mirrors the existing `tools/test_session_reset_log.py` + `tests/ratifiableFiles.test.ts` patterns.
 3. **Mock at the boundary, not at internals** — when a real subprocess can't be spawned (e.g., live network call to Anthropic API), mock the boundary (the HTTP client), not the internal logic that uses it. Per the implementer-tier persona convention from B5.
+4. **Ambient servers, channels and seat state belong in the `tools/conftest.py` autouse fixtures, not in each test** (T-4564). A test inherits whatever environment and fixed paths the running seat has, so the one structural backstop is an autouse fixture that points each ambient resource at a per-test or per-session private copy. Today these are covered:
+   - **tmux server:** `_isolate_tmux_server` (T-4433).
+   - **Telegram tokens:** `_neutralize_telegram_token` (T-0856).
+   - **Live mute registry:** `_isolate_mute_registry` (T-4668).
+   - **git mutation lockfile:** `_isolate_git_mutation_lockfile` (T-4040).
+   - **Seat state dir, including the manifest pin:** `_isolate_state_dir` per test (T-4697), plus a session-wide `PANTHEON_STATE_DIR` set when conftest is imported, so modules that read it at import time are covered too (T-4703).
+   - **Read-failover switch:** `_disarm_read_failover` (T-1998).
+
+   When a test needs a new ambient resource, such as another server, socket, live state file or channel, add an autouse fixture for it. Don't rely on per-test discipline. A test that legitimately needs the resource sets its own value inside the test; that runs after the autouse fixture, so it wins.
+   - **Known residual:** `sudo -u <other> tmux …` resets the environment, so no fixture reaches it. Such tests must target a private socket explicitly.
+   - **pantheon-pwa** has the equivalent backstop: `tests/helpers/tmpRoot.ts` plus its bunfig preload.
 
 The anti-pattern this avoids: tests that mutate the real `pantheon-config` repo, real ledger, real state dirs, or real `~/.local/state/pantheon/` JSONLs. Such tests pass locally + corrupt the real environment for subsequent cycles. T-0259 surfaced this pattern in `tools/test_session_reset_reconcile.py` (pre-fixture); fixture extraction was the structural fix.
 
@@ -136,7 +147,7 @@ Worked examples (2026-05-29): the acceptance-check cycle's **adversarial** rung 
 
 ## Tests must exercise the real failure condition (Amendment G)
 
-**DRAFTED 2026-06-26 by Orchestrator (HO); awaiting ratification (T-1326).** Origin: the Echo Phase-3 configurator arc surfaced three distinct ways a test passes green while never exercising the bug it ostensibly guards — a *green-but-hollow* test. The matrix above says WHICH tiers a ticket needs and the ladder says HOW DEEP each test goes; this section says the test at any tier must actually *reach the failure condition*. Each discipline below broke a real recurrence live (lessons filed 2026-06-26).
+**Ratified 2026-06-26 by the operator (T-1326).** Drafted 2026-06-26 by Orchestrator (HO). Origin: the Echo Phase-3 configurator arc surfaced three distinct ways a test passes green while never exercising the bug it ostensibly guards — a *green-but-hollow* test. The matrix above says WHICH tiers a ticket needs and the ladder says HOW DEEP each test goes; this section says the test at any tier must actually *reach the failure condition*. Each discipline below broke a real recurrence live (lessons filed 2026-06-26).
 
 The shared root across all three: **a test that LOOKS like it validates but doesn't exercise the real failure condition** — because the timing dodges it, the test was never written, or the assertion checks construction instead of effect. All three are invisible to a green smoke run, which is exactly why the matrix + ladder don't catch them on their own.
 

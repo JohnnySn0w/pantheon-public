@@ -82,7 +82,7 @@ For HO-direct cycles where you don't claim a ticket explicitly, use the cycle-st
 If post-close inspection reveals a metric was wrong (e.g., wall_clock_min off by >2× actual; cycle_shape mis-categorized; outcome_class missed a REBOUND in the count), file a thin correction entry:
 
 ```jsonl
-{"id": "<ts>-NNN", "ts": "<now>", "agent": "orchestrator", "action": "stats_correction_t<NNNN>_<field>_<old>_to_<new>", "rationale": "Per-field correction: <field> was <old>, actually <new> per <evidence>. Original entry remains; this corrects the metrics for aggregation purposes.", "justifies_via": ["P4"], "depends_on": ["T-NNNN"], "supersedes": [], "addresses_principle_drift": [], "lifts_from": [], "metrics_correction": {"target_entry_id": "<original-entry-id>", "field": "<field-name>", "old_value": <old>, "new_value": <new>}}
+{"id": "<ts>-<slug>", "ts": "<now>", "agent": "<your ORG-100 role id>", "executor": "<your seat slot>", "action": "stats_correction_t<NNNN>_<field>_<old>_to_<new>", "rationale": "Per-field correction: <field> was <old>, actually <new> per <evidence>. Original entry remains; this corrects the metrics for aggregation purposes.", "justifies_via": ["P4"], "depends_on": ["T-NNNN"], "supersedes": [], "addresses_principle_drift": [], "lifts_from": [], "metrics_correction": {"target_entry_id": "<original-entry-id>", "field": "<field-name>", "old_value": <old>, "new_value": <new>}}
 ```
 
 The original entry stays untouched (D2 + ledger append-only discipline); the correction entry is the structured override that `tools/cycle_stats.py` (T-0203) honors at aggregation time.

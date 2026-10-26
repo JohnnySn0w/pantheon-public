@@ -30,7 +30,7 @@ bad week" to a property of the layer.
 
 | # | instance | component | how it was found |
 |---|---|---|---|
-| 1 | **T-2152** — mnemosyne phantom-delivered: the `auto_delivered` stamp was written *before* delivery, so a failed deliver looked like a completed one | `inbox_consumer` | her own install check, incidentally |
+| 1 | **T-2152** — archivist phantom-delivered: the `auto_delivered` stamp was written *before* delivery, so a failed deliver looked like a completed one | `inbox_consumer` | her own install check, incidentally |
 | 2 | **T-2142/T-2144** — codex never wired into `inbox_consumer` at all; zero occurrences. Its inbox was not stale, it was never connected | `inbox_consumer` provisioning | the operator asked a question about something else |
 | 3 | **T-2190** — `tools/mailbox.py` has no `__main__`, so `python3 tools/mailbox.py send …` exits **0**, prints nothing, delivers nothing | `mailbox.py` itself | Specialist lost a real message and caught it by listing the recipient's `new/` |
 

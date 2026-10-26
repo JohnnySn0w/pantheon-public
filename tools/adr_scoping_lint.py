@@ -47,11 +47,10 @@ _REPO_ROOT = _HERE.parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 from tools.adr_reeval_walk import _load_yaml, _split_frontmatter  # noqa: E402
+from tools.hermes_diff_scan import iter_added_lines  # noqa: E402
 
 _EXEMPT_DISPOSITIONS = frozenset({"no-build-needed", "built"})
 
-# Matches the `+++ b/<path>` diff header line.
-_PLUS_PLUS_PLUS_RE = re.compile(r"^\+\+\+ (?:b/)?(.+)$")
 # A newly-added ADR file path, e.g. "architecture/adr/ORG-069-foo.md" /
 # "architecture/adr/ADR-500-x.md" (path per ORG-094 architecture umbrella; the
 # repo-root adr/ tree was moved to architecture/adr/ on 2026-09-06, T-3472).
@@ -83,59 +82,75 @@ def check_adr_frontmatter(path_display: str, text: str) -> str | None:
     )
 
 
-def scan_diff_for_new_adrs(diff_text: str) -> list[str]:
+def scan_diff_for_new_adrs(diff_text: "str | bytes") -> list[str]:
     """Parse unified-diff text; return violation messages for every newly
     ADDED `architecture/adr/(ADR|ORG)-NNN...md` file whose reconstructed content fails
     `check_adr_frontmatter`.
 
     Only genuinely NEW files are considered — a `new file mode` line must
-    appear between this file's `diff --git` header and its `+++` header.
+    appear in this file's header block (after its `diff --git` line).
     Modified existing ADRs are deliberately out of scope for this
     prevent-AT-CREATION lint (see module docstring); a wholly-new file's
     diff hunk is 100% added (`+`) lines, so the reconstructed content is
     exact.
+
+    Framing is the shared structural parser (T-4202,
+    `hermes_diff_scan.iter_added_lines`): hunk-count tracked, split on the
+    newline byte only, so a body line starting `++ ` (rendered `+++ `) is
+    content, not a header, and a form feed / U+2028 inside a line does not
+    split it. Input is a two-endpoint `git diff` (adr-scoping-lint.yml); no
+    combined (`@@@`) diffs are read. `str` input is UTF-8 encoded first.
     """
+    if isinstance(diff_text, str):
+        diff_text = diff_text.encode("utf-8", "surrogateescape")
+    # path -> added content lines, in first-seen order. A path seen twice
+    # (not produced by a single git diff) accumulates, never resets.
+    files: dict[str, list[bytes]] = {}
+    for ev in iter_added_lines(diff_text):
+        if ev.is_new_file and ev.path is not None and _NEW_ADR_PATH_RE.match(ev.path):
+            text = ev.text
+            # A CRLF file's line ending is not frontmatter content: drop the
+            # one trailing CR so `_split_frontmatter`'s "---\n" test still
+            # sees a CRLF ADR's frontmatter (the old splitlines() did the
+            # same). A CR elsewhere in the line stays.
+            if text.endswith(b"\r"):
+                text = text[:-1]
+            files.setdefault(ev.path, []).append(text)
+
     violations: list[str] = []
-    is_new_file = False
-    current_path: str | None = None
-    content_lines: list[str] = []
+    for path, content_lines in files.items():
+        content = b"\n".join(content_lines).decode("utf-8", "replace")
+        msg = check_adr_frontmatter(path, content)
+        if msg:
+            violations.append(msg)
+    return violations
 
-    def _flush() -> None:
-        if (
-            current_path is not None
-            and is_new_file
-            and _NEW_ADR_PATH_RE.match(current_path)
-        ):
-            content = "\n".join(content_lines)
-            msg = check_adr_frontmatter(current_path, content)
-            if msg:
-                violations.append(msg)
 
-    for raw_line in diff_text.splitlines():
-        if raw_line.startswith("diff --git "):
-            _flush()
-            is_new_file = False
-            current_path = None
-            content_lines = []
-            continue
-        if raw_line.startswith("new file mode"):
-            is_new_file = True
-            continue
-        m = _PLUS_PLUS_PLUS_RE.match(raw_line)
-        if m:
-            current_path = m.group(1)
-            content_lines = []
-            continue
-        if raw_line.startswith("@@"):
-            continue
-        if raw_line.startswith("+++"):
-            continue
-        if raw_line.startswith("+"):
-            content_lines.append(raw_line[1:])
-        # '-'-prefixed / context lines can't legitimately appear in a
-        # brand-new file's hunk; ignore defensively rather than crash.
+# T-4692: dirs whose frontmatter must parse. A state check, not a diff check:
+# an edit to an EXISTING ADR (the #748 status flip with an unquoted ': ') never
+# reaches the creation-only scan above, and docs-only PRs skip ci.yml, so this
+# was the only lint that ran on it.
+_FRONTMATTER_DIRS = ("architecture/adr", "architecture/rfc")
 
-    _flush()
+
+def scan_tree_frontmatter(root: Path) -> list[str]:
+    """Return a violation per ADR/RFC under `root` whose frontmatter is not
+    valid YAML. No frontmatter at all is legitimate; unparseable is not."""
+    import yaml
+
+    violations: list[str] = []
+    for rel_dir in _FRONTMATTER_DIRS:
+        for path in sorted((root / rel_dir).glob("*.md")):
+            fm_block, _body = _split_frontmatter(path.read_text(encoding="utf-8"))
+            if not fm_block.strip():
+                continue
+            try:
+                yaml.safe_load(fm_block)
+            except Exception as exc:  # noqa: BLE001 — any YAML error is a finding
+                violations.append(
+                    f"{rel_dir}/{path.name}: frontmatter is not valid YAML "
+                    f"({type(exc).__name__}); quote any value containing ': '"
+                )
     return violations
 
 
@@ -145,14 +160,26 @@ def main() -> int:
     Usage:
         git diff <base> HEAD | python3 tools/adr_scoping_lint.py
         python3 tools/adr_scoping_lint.py <diff-file>
+        python3 tools/adr_scoping_lint.py --tree [<repo-root>]
 
-    Exits 0 if no violations (including "no new ADR files in the diff"), 1
-    if any newly-added ADR fails the scoping-ticket check.
+    Diff mode exits 0 if no violations (including "no new ADR files in the
+    diff"), 1 if any newly-added ADR fails the scoping-ticket check. Tree mode
+    (T-4692) exits 1 if any ADR/RFC frontmatter in the tree fails to parse.
     """
+    if len(sys.argv) > 1 and sys.argv[1] == "--tree":
+        root = Path(sys.argv[2]) if len(sys.argv) > 2 else _REPO_ROOT
+        broken = scan_tree_frontmatter(root)
+        for msg in broken:
+            print(f"  {msg}", file=sys.stderr)
+        return 1 if broken else 0
+
+    # Bytes in (T-4202): the framing splits on the newline byte only, so text
+    # decoding / universal newlines must not touch the diff first.
     if len(sys.argv) > 1:
-        diff_text = Path(sys.argv[1]).read_text(encoding="utf-8", errors="replace")
+        diff_text = Path(sys.argv[1]).read_bytes()
     else:
-        diff_text = sys.stdin.read()
+        stdin_buffer = getattr(sys.stdin, "buffer", None)
+        diff_text = stdin_buffer.read() if stdin_buffer is not None else sys.stdin.read()
 
     violations = scan_diff_for_new_adrs(diff_text)
     if not violations:

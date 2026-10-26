@@ -470,7 +470,10 @@ class TestCmdClaimRepoProvisioning(unittest.TestCase):
         self._tickets_patch = patch.object(ticket, "TICKETS_ROOT", self.root)
         self._tickets_patch.start()
         self._prev_cap = os.environ.get("PANTHEON_MAX_ACTIVE_TICKETS")
-        os.environ["PANTHEON_MAX_ACTIVE_TICKETS"] = "100000"
+        from datetime import datetime, timedelta, timezone
+        # T-4881: override must carry a (run-time computed) expiry.
+        _exp = (datetime.now(timezone.utc) + timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        os.environ["PANTHEON_MAX_ACTIVE_TICKETS"] = f"100000@{_exp}"
 
         # Write a ticket with repos: field
         _write_ticket(

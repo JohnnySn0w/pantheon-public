@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon S3* per-seat evidence — daily 08:15 UTC, before the 08:30 audit due-check (T-4928)
+
+[Timer]
+OnCalendar=*-*-* 08:15:00 UTC
+Persistent=true
+RandomizedDelaySec=2min
+Unit=pantheon-s3star-seat-evidence.service
+
+[Install]
+WantedBy=timers.target

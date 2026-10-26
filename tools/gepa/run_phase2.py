@@ -30,7 +30,10 @@ explicit post-optimize `evaluate()` calls below.
 from __future__ import annotations
 
 import argparse
+import atexit
 import hashlib
+import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -43,7 +46,9 @@ from tools.gepa.adapter import ExecutorCall, ReviewerGEPAAdapter
 from tools.gepa.scorer import ScoredRollout
 from tools.ticket import REPO_ROOT
 
-DEFAULT_SEED_CANDIDATE_PATH = Path("/home/claude/claude-config/agents/reviewer.md")
+# T-4763 (ORG-091): the reviewer persona lives in this repo's harness/claude/ now;
+# ~/claude-config is frozen.
+DEFAULT_SEED_CANDIDATE_PATH = REPO_ROOT / "harness" / "claude" / "agents" / "reviewer.md"
 DEFAULT_RUN_DIR = Path("/tmp/gepa_phase2_run")
 DEFAULT_OUT_DIR = Path("/tmp/gepa_phase2_report")
 
@@ -152,12 +157,19 @@ def build_fixed_skills_context() -> str:
     return "\n\n".join(parts)
 
 
-def make_claude_rollout_executor(*, model: str, keep_sessions: bool, timeout: float = 300.0):
+def make_claude_rollout_executor(
+    *, model: str, keep_sessions: bool, cwd: str | None = None, timeout: float = 300.0,
+):
     """Build the RolloutExecutorFn: (persona_text, task_prompt) -> ExecutorCall.
 
     Injects the candidate persona via `--agents`/`--agent` (live-verified
     2026-08-12 to survive the isolation flags; see
     tools/test_gepa_claude_executor.py::TestLiveAgentsPersonaMechanism).
+
+    `cwd`: subprocess working directory. Load-bearing when the invoked persona
+    has a main-path cwd guard (the reviewer persona refuses to run from a
+    canonical project root, since T-3289/T-3290 2026-08-26). Caller must
+    pre-stage a /tmp worktree and pass its path here. Absent, inherits parent.
     """
 
     def _executor(persona_text: str, task_prompt: str) -> ExecutorCall:
@@ -170,7 +182,7 @@ def make_claude_rollout_executor(*, model: str, keep_sessions: bool, timeout: fl
             keep_sessions=keep_sessions,
         )
         check_isolation_flags_present(argv)
-        raw_response = claude_executor.run_argv(argv, timeout=timeout)
+        raw_response = claude_executor.run_argv(argv, timeout=timeout, cwd=cwd)
         return ExecutorCall(argv=tuple(argv), raw_response=raw_response)
 
     return _executor
@@ -233,10 +245,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     check_isolation_flags_present(claude_executor.build_claude_argv(model=args.executor_model))
     print("[run_phase2] isolation-flags self-check: OK")
 
+    # Pre-stage a /tmp worktree so the reviewer persona's TWO hard guards
+    # (main-path cwd + branch-discipline, both added post-2026-08-26 by
+    # T-3289/T-3290) don't refuse every rollout. Matches the pinned
+    # reviewer-cwd-tmp-worktree-dispatch pattern used across the fleet; T-2809
+    # diagnostic surface. The branch name `agent/T-2809-gepa-eval` satisfies
+    # the branch-discipline guard (starts with `agent/`). Cleaned up via atexit.
+    worktree_path = Path(f"/tmp/gepa-eval-{os.getpid()}")
+    eval_branch = "agent/T-2809-gepa-eval"
+    subprocess.run(
+        ["git", "worktree", "add", "-b", eval_branch, str(worktree_path), "HEAD"],
+        check=True, capture_output=True,
+    )
+    print(f"[run_phase2] pre-staged reviewer-eval worktree: {worktree_path} on {eval_branch}")
+
+    def _cleanup_worktree() -> None:
+        try:
+            subprocess.run(
+                ["git", "worktree", "remove", "--force", str(worktree_path)],
+                check=False, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "branch", "-D", eval_branch],
+                check=False, capture_output=True,
+            )
+        except Exception:
+            pass  # best-effort; leftover worktree/branch is harmless
+    atexit.register(_cleanup_worktree)
+
     fixed_skills_context = build_fixed_skills_context()
     judge_model = args.judge_model or args.executor_model
 
-    rollout_executor = make_claude_rollout_executor(model=args.executor_model, keep_sessions=args.keep_sessions)
+    rollout_executor = make_claude_rollout_executor(
+        model=args.executor_model, keep_sessions=args.keep_sessions, cwd=str(worktree_path),
+    )
     reflection_lm = make_claude_plain_lm(model=args.reflector_model, keep_sessions=args.keep_sessions)
     judge_fn = make_claude_plain_lm(model=judge_model, keep_sessions=args.keep_sessions)
 

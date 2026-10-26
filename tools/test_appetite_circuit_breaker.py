@@ -29,6 +29,7 @@ import shutil
 from unittest.mock import MagicMock
 
 from tools import _git_utils, ticket, ticket_lint
+from tools._test_fixtures import contained_path
 from tools import ticket_grooming as tg
 from tools import ticket_purpose as tp
 
@@ -43,7 +44,7 @@ def _ticket_text(
     appetite: int | None = None,
     labels: list[str] | None = None,
     serves: str | None = None,
-    target: str = "metis",
+    target: str = "mason",
     created: str = "2026-09-06T01:00:00Z",
     transition_lines: list[str] | None = None,
     title: str = "Example bet",
@@ -144,8 +145,8 @@ class _VerbFixture(_TicketsRootFixture):
 
     def _fake_run(self, argv, **kwargs):
         if argv[:2] == ["git", "mv"] and len(argv) >= 4:
-            src = self.root / argv[2]
-            dst = self.root / argv[3]
+            src = contained_path(self.root, argv[2])
+            dst = contained_path(self.root, argv[3])
             dst.parent.mkdir(parents=True, exist_ok=True)
             if src.exists():
                 shutil.move(str(src), str(dst))
@@ -175,8 +176,11 @@ class _VerbFixture(_TicketsRootFixture):
                             staged.add(p)
                 elif pa[:2] == ["git", "commit"]:
                     staged.clear()
+            # T-4885: the file verb also asks `--name-status` (ADD assertion).
             return MagicMock(returncode=0,
-                             stdout="\n".join(sorted(staged)) + ("\n" if staged else ""),
+                             stdout="\n".join(
+                                 (f"A\t{x}" if "--name-status" in argv else x)
+                                 for x in sorted(staged)) + ("\n" if staged else ""),
                              stderr="")
         return MagicMock(returncode=0, stdout="", stderr="")
 
@@ -215,7 +219,9 @@ class TestIsShipped(_TicketsRootFixture):
 # ---------------------------------------------------------------------------
 # FALSIFIER 2 — multi-dependency completion predicate.
 # A depends_on [T-X, T-Y]; drop T-X (substate:dropped); resolve T-Y (shipped).
-# ORG-013 must NOT unblock A because T-X is not _is_shipped().
+# ORG-013 must NOT unblock A because T-X is not _is_shipped(). (T-3933: the
+# cascade's partial-strip leg DOES prune T-Y as a stale-shipped ref — that's
+# not an unblock, and A stays gated on T-X exactly as this falsifier requires.)
 # ---------------------------------------------------------------------------
 
 
@@ -240,17 +246,28 @@ class TestDroppedDepDoesNotUnblock(_TicketsRootFixture):
         )
 
     def test_cascade_does_not_unblock_A(self) -> None:
+        """T-3933: partial-strip now fires unconditionally for the just-shipped
+        dep (T-0101 is genuinely SHIPPED, not dropped — decision (i) generalizes
+        past "malformed sibling" to any not-currently-shipped sibling, dropped
+        included). A DOES get touched (T-0101 pruned), but the load-bearing
+        invariant this falsifier defends — A is NOT UNBLOCKED, because the
+        dropped sibling T-0100 is not `_is_shipped()` — still holds: A keeps
+        exactly one live gate (T-0100), which will never ship (terminal).
+        """
         affected = ticket._cascade_unblock_dependants("T-0101")
-        self.assertEqual(affected, [])
-        # A's depends_on is untouched — T-X still gates it.
+        self.assertEqual(affected, [self.a_path])
         a = ticket.parse_ticket(self.a_path)
-        self.assertIn("T-0100", a.fields["depends_on"])
+        # T-0100 (dropped) still gates; T-0101 (shipped) is pruned as a stale ref.
+        self.assertEqual(a.fields["depends_on"], ["T-0100"])
+        # Not unblocked: partial-strip only, no auto-unblock transition fired.
+        self.assertNotIn("auto-unblock", a.body)
+        self.assertIn("[cascade]", a.body)
 
     def test_inbox_classifies_A_as_dependency_blocked(self) -> None:
         from tools import inbox_consumer
         with patch.object(inbox_consumer, "TICKETS_ROOT", self.tickets):
             with self.assertRaises(inbox_consumer.SkipCycle) as ctx:
-                inbox_consumer.list_eligible_tickets("metis")
+                inbox_consumer.list_eligible_tickets("mason")
         self.assertEqual(str(ctx.exception), "dependency_blocked")
 
     def test_lint_emits_dropped_dep_finding_not_stale(self) -> None:
@@ -274,7 +291,7 @@ def _spend_body(events: list[tuple[str, str]]) -> str:
     """Build a body with a ## Transition log of (iso_ts, verb) bullets."""
     lines = ["", "# t", "", "## Transition log", ""]
     for ts, verb in events:
-        lines.append(f"- {ts} [metis] {verb}")
+        lines.append(f"- {ts} [mason] {verb}")
     lines.append("")
     return "\n".join(lines)
 
@@ -328,10 +345,10 @@ class TestActiveSpendStateMachine(unittest.TestCase):
         T0, T1, T2, T3 = ("2026-09-06T00:00:00Z", "2026-09-06T01:00:00Z",
                           "2026-09-06T05:00:00Z", "2026-09-06T06:00:00Z")
         lines = ["", "# t", "", "## Transition log", "",
-                 f"- {T0} [metis] claimed",
-                 f"- {T1} [metis] blocked",
+                 f"- {T0} [mason] claimed",
+                 f"- {T1} [mason] blocked",
                  f"- {T2} [auto-unblock] dep resolved",  # cascade resume
-                 f"- {T3} [metis] resolved", ""]
+                 f"- {T3} [mason] resolved", ""]
         body = "\n".join(lines)
         spend = tg.active_spend_from_transition_log(body, now=self._t(T3))
         # (block-claim) + (resolve-autounblock) = 3600 + 3600
@@ -447,7 +464,7 @@ class TestResolveRefusesOverrun(_VerbFixture):
 # ---------------------------------------------------------------------------
 # T-3451: appetite outcome-log shard write folded into the resolve/drop/reopen
 # commit (previously landed UNCOMMITTED as a disconnected post-transition
-# write — metis hit it on T-3440 resolve, HO hit it on T-3439 resolve).
+# write — mason hit it on T-3440 resolve, HO hit it on T-3439 resolve).
 # ---------------------------------------------------------------------------
 
 
@@ -557,7 +574,7 @@ class TestAppetiteOutcomeLogFoldIntoCommit(_VerbFixture):
 class TestFileAppetiteApplicability(_VerbFixture):
     def _file_ns(self, **kw) -> argparse.Namespace:
         base = dict(
-            title="a bet", requester="orchestrator", target="metis",
+            title="a bet", requester="orchestrator", target="role:engineering_orchestrator",
             labels=None, depends_on=None, implements=None, verifies=None,
             supersedes=None, informs=None, parent_ticket=None, orphan=None,
             project_id=None, nearest_intent_ref=None, serves=None,
@@ -616,7 +633,7 @@ class TestFileAppetiteApplicability(_VerbFixture):
 class TestAutomatedFilerFileSafety(_VerbFixture):
     def _file_ns(self, **kw) -> argparse.Namespace:
         base = dict(
-            title="automated finding", requester="orchestrator", target="metis",
+            title="automated finding", requester="orchestrator", target="role:engineering_orchestrator",
             labels=None, depends_on=None, implements=None, verifies=None,
             supersedes=None, informs=None, parent_ticket=None, orphan=None,
             project_id="null", nearest_intent_ref="maintenance:ticket-board",
@@ -733,6 +750,61 @@ class TestAppetiteCompletenessCheck(unittest.TestCase):
         findings = tg._appetite_completeness_check([self.adr_dir], self.tickets, self.now)
         self.assertEqual(findings, [])
 
+    def test_adopted_only_adr_is_checked(self) -> None:
+        # T-4741(6a): an ADR whose status says Adopted (HO-adopted, no "Ratified"
+        # token) is in force and must not slip past the completeness check.
+        self._write_adr("ORG-104-x.md", _adr_text(
+            adr_id="ORG-104", status="Adopted 2026-09-27 by Orchestrator (HO) under D3.",
+            appetite=None, appetite_body="TODO", riskiest_body="TODO"))
+        reasons = {f.reason for f in tg._appetite_completeness_check(
+            [self.adr_dir], self.tickets, self.now)}
+        self.assertEqual(reasons, {"appetite-field", "appetite-section", "riskiest-section"})
+
+    def test_adopted_complete_adr_not_flagged(self) -> None:
+        self._write_adr("ORG-105-x.md", _adr_text(
+            adr_id="ORG-105", status="**Adopted 2026-09-27 by Orchestrator (HO).**",
+            appetite="5",
+            appetite_body="A substantive appetite paragraph about the bet size here.",
+            riskiest_body="A substantive riskiest-assumption paragraph with a cheap test."))
+        self.assertEqual(tg._appetite_completeness_check(
+            [self.adr_dir], self.tickets, self.now), [])
+
+    def test_superseded_adopted_adr_not_checked(self) -> None:
+        self._write_adr("ORG-106-x.md", _adr_text(
+            adr_id="ORG-106", status="Adopted 2026-09-27; Superseded by ORG-110.",
+            appetite=None, appetite_body="TODO", riskiest_body="TODO"))
+        self.assertEqual(tg._appetite_completeness_check(
+            [self.adr_dir], self.tickets, self.now), [])
+
+    def test_frontmatter_only_riskiest_assumption_accepted(self) -> None:
+        # T-4741(6b): riskiest_assumption declared in frontmatter (no body
+        # section) satisfies the requirement.
+        text = _adr_text(
+            adr_id="ORG-107", status="**Ratified 2026-09-08 by the operator**",
+            appetite="5",
+            appetite_body="A substantive appetite paragraph about the bet size here.",
+            riskiest_body="x")
+        text = text.replace("appetite: 5\n", (
+            "appetite: 5\nriskiest_assumption: \"That the taxonomy is the right cut; "
+            "cheap test is one real gap case.\"\n"))
+        text = text.split("## Riskiest assumption")[0]  # drop the body section
+        self._write_adr("ORG-107-x.md", text)
+        self.assertEqual(tg._appetite_completeness_check(
+            [self.adr_dir], self.tickets, self.now), [])
+
+    def test_boilerplate_frontmatter_riskiest_still_flagged(self) -> None:
+        text = _adr_text(
+            adr_id="ORG-108", status="**Ratified 2026-09-08 by the operator**",
+            appetite="5",
+            appetite_body="A substantive appetite paragraph about the bet size here.",
+            riskiest_body="x")
+        text = text.replace("appetite: 5\n", "appetite: 5\nriskiest_assumption: TBD\n")
+        text = text.split("## Riskiest assumption")[0]
+        self._write_adr("ORG-108-x.md", text)
+        reasons = {f.reason for f in tg._appetite_completeness_check(
+            [self.adr_dir], self.tickets, self.now)}
+        self.assertEqual(reasons, {"riskiest-section"})
+
     def test_org089_itself_is_not_grandfathered_dogfood(self) -> None:
         # DECISION-10 dogfood: ORG-089 (ratified 2026-09-06, the landing date) is
         # NOT grandfathered — the completeness check evaluates it. (The grandfathering
@@ -774,7 +846,7 @@ class TestAppetiteOverrunCheck(_TicketsRootFixture):
     def _overrun_ticket(self) -> None:
         # claimed 10h ago, still active, appetite 5 (budget 3600s) → overrun.
         self._write("active", tid="T-0400", appetite=5, transition_lines=[
-            "- 2026-09-05T15:00:00Z [metis] claimed",
+            "- 2026-09-05T15:00:00Z [mason] claimed",
         ])
 
     def test_silent_when_policy_absent(self) -> None:
@@ -804,13 +876,13 @@ class TestAppetiteOverrunCheck(_TicketsRootFixture):
         f, _ = ticket.parse_front_matter(
             (self.tickets / "active" / "T-0400.md").read_text(encoding="utf-8"))
         self.assertEqual(f["substate"], "appetite-overrun")
-        # advisory sent to claimant (metis) + orchestrator
+        # advisory sent to claimant (mason) + orchestrator
         self.assertTrue(sent)
 
     def test_missing_appetite_never_fires(self) -> None:
         self._active()
         self._write("active", tid="T-0401", transition_lines=[
-            "- 2026-09-05T15:00:00Z [metis] claimed"])  # no appetite
+            "- 2026-09-05T15:00:00Z [mason] claimed"])  # no appetite
         found = tg._appetite_overrun_check(self.policy_path, self.tickets, self.now,
                                            apply=True, send_fn=lambda *a, **k: None)
         self.assertEqual(found, [])  # fail-safe: missing appetite → no fire
@@ -818,7 +890,7 @@ class TestAppetiteOverrunCheck(_TicketsRootFixture):
     def test_under_budget_not_flagged(self) -> None:
         self._active()
         self._write("active", tid="T-0402", appetite=5, transition_lines=[
-            f"- {tg._now_iso(self.now)} [metis] claimed"])  # just claimed → 0s
+            f"- {tg._now_iso(self.now)} [mason] claimed"])  # just claimed → 0s
         found = tg._appetite_overrun_check(self.policy_path, self.tickets, self.now,
                                            apply=True, send_fn=lambda *a, **k: None)
         self.assertEqual(found, [])
@@ -855,7 +927,7 @@ class TestInboxOverrunSkip(_TicketsRootFixture):
         self._write("inbox", tid="T-0500", appetite=5, substate="appetite-overrun")
         with patch.object(inbox_consumer, "TICKETS_ROOT", self.tickets):
             with self.assertRaises(inbox_consumer.SkipCycle) as ctx:
-                inbox_consumer.list_eligible_tickets("metis")
+                inbox_consumer.list_eligible_tickets("mason")
         self.assertEqual(str(ctx.exception), "appetite_overrun_blocked")
 
     def test_overrun_skip_is_never_alert(self) -> None:
@@ -867,7 +939,7 @@ class TestInboxOverrunSkip(_TicketsRootFixture):
         from tools import inbox_consumer
         self._write("inbox", tid="T-0501", appetite=5)
         with patch.object(inbox_consumer, "TICKETS_ROOT", self.tickets):
-            eligible = inbox_consumer.list_eligible_tickets("metis")
+            eligible = inbox_consumer.list_eligible_tickets("mason")
         self.assertEqual([t.id for t in eligible], ["T-0501"])
 
 
@@ -878,7 +950,7 @@ class TestDigestWiring(unittest.TestCase):
             appetite_completeness_findings=[
                 tg.AppetiteCompletenessFinding("ORG-089", "appetite-field")],
             appetite_overrun_findings=[
-                tg.AppetiteOverrunFinding("T-9", 5, 99999, 3600, "metis")],
+                tg.AppetiteOverrunFinding("T-9", 5, 99999, 3600, "mason")],
             dropped_this_week=[
                 tg.DroppedTicket("T-8", "a bet", "not worth it",
                                  datetime(2026, 9, 6, tzinfo=timezone.utc))],

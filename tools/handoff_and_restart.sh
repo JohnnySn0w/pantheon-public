@@ -4,6 +4,9 @@
 # Part of T-0008 deliverable 2: chain prompt -> wait -> restart -> verify
 # behind a single command, eliminating the multi-step manual broker dance.
 #
+# Exit 75 (EX_TEMPFAIL, ORG-106 L3a): the seat is in deep-sleep per `seat_state.py launch-check`;
+# refused before any step, nothing touched. Distinct from every step code below.
+#
 # Steps (each is also the script's exit code on failure):
 #   1. Acquire flock on /tmp/handoff_and_restart.lock (non-blocking).
 #   2. Read pre-prompt mtime of the HANDOFF.md file.
@@ -17,7 +20,7 @@
 # T-2658 — control-plane-supervised seats (--supervisor control-plane, e.g.
 # specialist post-T-2633-cutover): steps 5/6 branch.
 #   5. tmux kill-session on the target pane's session FIRST (abort if it
-#      survives), THEN systemctl restart — $SERVICE is the caller-resolved
+#      survives), THEN systemctl start (twice, T-4309) — $SERVICE is the caller-resolved
 #      pantheon-persona-consume@<persona>.service, not a bespoke unit; a live
 #      matching pane would otherwise make runtime_controller.ensure_runtime()
 #      just REUSE the old process instead of restarting it.
@@ -69,9 +72,13 @@ source "$SCRIPT_DIR/t2590_cutover_verify_lib.sh"
 SERVICE=""
 MODE=""                                  # user | system
 TARGET_PANE=""
-HANDOFF_FILE="/home/claude/HANDOFF.md"
+HANDOFF_FILE=""                          # T-5300: no default; derived + owner-checked after parsing
+EPISODE_START=0                        # T-4278: first dispatch epoch for retry ACKs
 PROMPT_TEXT=""                           # default below if unset
 ACK_TIMEOUT=600                          # 10 min — HO writing a handoff
+QUEUED_ACK_TIMEOUT=1200                  # T-4117: ack window when the prompt QUEUED on a busy pane (fits the 1800s watchdog)
+REPRESS_INTERVAL="${HANDOFF_REPRESS_INTERVAL_SECS:-20}"  # T-4141: seconds between stuck-composer checks in the ack wait
+REPRESS_MAX=2                            # T-4141: at most this many extra Enters per run (never a re-paste)
 STEADY_TIMEOUT=60                        # 1 min — fresh session warming up
 POLL_INTERVAL=2                          # seconds between mtime/pane polls
 SUPERVISOR="bespoke"                     # T-2658: bespoke | control-plane — branches steps 5/6
@@ -94,7 +101,12 @@ PROC_ROOT="${HANDOFF_RESTART_PROC_ROOT:-/proc}"  # T-2658 test seam only
 # are C.UTF-8: `LC_ALL=C` reproduces the CI failure here exactly (15/18, same list).
 VERIFY_PATTERN='(╭(─)+╮|(─){20,})'      # Claude Code prompt-frame top edge (corner-framed or bare horizontal run)
 IDLE_SENTINEL='❯'                        # positive idle-prompt cursor; T-0528: empirical 90-frame Recovery-restart capture showed `❯` rendered in every frame from t+1s, while `? for shortcuts` rendered in only 1/90 — so `❯` is the reliable boot-window match. Stale OR-alternates (? for shortcuts, ctrl+t to hide tasks) removed.
-DIALOG_EXCLUDE='Enter to confirm|Esc to cancel'  # negative: any of these in the pane DISQUALIFIES the steady-state match. T-0528: `❯` alone false-passes the dev-channels confirm dialog (option cursor is also `❯`), defeating T-0172's dialog guard. The dialog's footer markers are highly specific to Claude Code's confirm/cancel UI and are not present in normal idle/prose output.
+DIALOG_EXCLUDE='Enter to confirm|Esc to cancel|Yes, set auto mode as my default permission mode'  # negative: any of these in the pane DISQUALIFIES the steady-state match. T-0528: `❯` alone false-passes the dev-channels confirm dialog (option cursor is also `❯`), defeating T-0172's dialog guard. The dialog's footer markers are highly specific to Claude Code's confirm/cancel UI and are not present in normal idle/prose output.
+# T-4646: the third alternate is the first option of Claude Code 2.1.289's "Make auto
+# mode your default permission mode?" startup nudge. That prompt has no confirm footer
+# and its option cursor is `❯`, so the first two alternates and the positives pass on it.
+# On 2026-10-05 this step false-passed on specialist's restart and the kick's Enter picked
+# "Yes". Same marker as submit_verify.AUTO_MODE_NUDGE_MARKER; it is not dismissed here.
 # T-0721: the dev-channels development-channels startup confirm a freshly-restarted
 # session boots into. Dismissing it (option 1) is SAFE and leaves the session idle.
 # Dismissed INLINE at step-7 so the restart completes now instead of leaving the
@@ -104,7 +116,7 @@ DIALOG_EXCLUDE='Enter to confirm|Esc to cancel'  # negative: any of these in the
 BOOT_DIALOG_SENTINEL='I am using this for local development'
 # T-2210: a SECOND boot modal exists (Claude Code v2.1.220) — 'Try the new
 # fullscreen renderer?' with options '1. Yes, try it' / '2. Not now'. It wedged
-# exocortex/mnemosyne after the operator's droplet restart on 2026-07-28.
+# exocortex/archivist after the operator's droplet restart on 2026-07-28.
 #
 # ⚠️ IT IS DISMISSED WITH 2, NOT 1, AND THAT IS THE WHOLE REASON IT IS A SEPARATE
 # CONSTANT. For the dev-channels dialog option 1 is the benign acknowledgement.
@@ -149,9 +161,15 @@ Required:
   --target-pane <pane>        tmux target pane (e.g. main:0.0)
 
 Optional:
-  --handoff-file <path>       default: /home/claude/HANDOFF.md
+  --handoff-file <path>       default: $HOME/HANDOFF.md of the running account; must be owned by
+                              that account, else exit 64 (T-5300)
+  --episode-start <epoch>     first dispatch of this restart episode (default: 0)
   --prompt <text>             prompt to send to HO; default is canned
   --ack-timeout <sec>         default: 600
+  --queued-ack-timeout <sec>  default: 1200. T-4117: when the prompt is delivered to a BUSY pane
+                              (submit verified still pending: Claude Code queues it mid-turn), wait
+                              this long for the ack instead of exiting 3. Kept under the 1800s
+                              wall-clock watchdog so steps 5-8 still fit.
   --steady-timeout <sec>      default: 60
   --poll-interval <sec>       default: 2
   --verify-pattern <regex>    grep -E pattern; default: '(╭─+╮|─{20,})' (corner-framed or bare horizontal run >=20)
@@ -170,7 +188,7 @@ Optional:
                               prong (not recommended outside tests).
   --lockfile <path>           default: /tmp/handoff_and_restart.lock
   --kick-prompt <text>        post-step-7 directive injected into the fresh pane to trigger first-turn
-                              action (Read HANDOFF.md + post status). default: canned text referencing chat_id 456474197.
+                              action (Read HANDOFF.md + post status). default: canned text referencing chat_id 424242424.
   --no-kick                   skip the post-step-7 kick (T-0172). useful for tests / one-off invocations.
   --skip-ack                  force-restart mode (T-0510): skip steps 2-4 (handoff prompt + ack-wait) and
                               go straight to restart. For agents that cannot write a handoff (e.g. a
@@ -205,7 +223,7 @@ Optional:
                               over to the harness-manager control plane, e.g. specialist post-
                               T-2633) are NOT restarted via a plain `systemctl restart` of
                               $SERVICE — step 5 first tmux-kills the target pane's session
-                              (aborting if it survives), then restarts $SERVICE (the caller-
+                              (aborting if it survives), then starts $SERVICE twice (the caller-
                               resolved pantheon-persona-consume@<persona> unit); step 6 polls
                               runtime-scope + session liveness instead of `systemctl is-
                               active` (a Type=oneshot consume unit is never is-active after
@@ -214,9 +232,9 @@ Optional:
 
 Exit codes:
   0 success; 1 lock; 2 pre-mtime; 3 prompt-send; 4 ack-timeout;
-  5 restart (bespoke: systemctl restart failed; control-plane: also covers a
-    kill-session that didn't take); 6 is-active / runtime-not-live; 7 steady-state;
-  8 kick-send; 64 usage error.
+  5 restart (bespoke: systemctl restart failed; control-plane: systemctl start
+    failed, or a kill-session that didn't take); 6 is-active / runtime-not-live; 7 steady-state;
+  8 kick-send; 64 usage error; 75 the seat is in deep-sleep (ORG-106), nothing touched.
 EOF
 }
 
@@ -226,8 +244,10 @@ while [[ $# -gt 0 ]]; do
     --mode)            MODE="$2"; shift 2 ;;
     --target-pane)     TARGET_PANE="$2"; shift 2 ;;
     --handoff-file)    HANDOFF_FILE="$2"; shift 2 ;;
+    --episode-start)   EPISODE_START="$2"; shift 2 ;;
     --prompt)          PROMPT_TEXT="$2"; shift 2 ;;
     --ack-timeout)     ACK_TIMEOUT="$2"; shift 2 ;;
+    --queued-ack-timeout) QUEUED_ACK_TIMEOUT="$2"; shift 2 ;;
     --steady-timeout)  STEADY_TIMEOUT="$2"; shift 2 ;;
     --poll-interval)   POLL_INTERVAL="$2"; shift 2 ;;
     --verify-pattern)  VERIFY_PATTERN="$2"; shift 2 ;;
@@ -252,10 +272,37 @@ if [[ -z "$SERVICE" || -z "$MODE" || -z "$TARGET_PANE" ]]; then
   usage
   exit 64
 fi
+# T-5300: the handoff file belongs to the account this runs as (every caller runs
+# it as the target seat through sudo -u). On 2026-10-19 a hand-run recovery for
+# specialist omitted --handoff-file and the old default /home/claude/HANDOFF.md
+# (orchestrator's) went into specialist's prompt and ack wait. Default to this account's
+# $HOME/HANDOFF.md, and refuse a file (or, when absent, its directory) that this
+# account does not own, before any prompt is sent.
+if [[ -z "$HANDOFF_FILE" ]]; then
+  if [[ -z "${HOME:-}" ]]; then
+    echo "refusing: no --handoff-file and HOME is unset, so the seat's own handoff file is unknown [T-5300]" >&2
+    exit 64
+  fi
+  HANDOFF_FILE="$HOME/HANDOFF.md"
+fi
+handoff_owner_path="$HANDOFF_FILE"
+[[ -e "$handoff_owner_path" ]] || handoff_owner_path="$(dirname "$HANDOFF_FILE")"
+# -L: judge the file a symlink points at, not the link (a seat-owned link to
+# another seat's handoff must not pass).
+handoff_owner_uid="$(stat -L -c %u "$handoff_owner_path" 2>/dev/null || true)"
+if [[ "$handoff_owner_uid" != "$(id -u)" ]]; then
+  echo "refusing: handoff file $HANDOFF_FILE is not owned by the running account $(id -un) (owner uid ${handoff_owner_uid:-unknown}); run as that seat's account or pass its own --handoff-file [T-5300]" >&2
+  exit 64
+fi
 case "$MODE" in
   user|system) ;;
   *) echo "--mode must be 'user' or 'system'" >&2; exit 64 ;;
 esac
+# T-4117: the queued path compares these arithmetically; a non-integer (e.g. '4s')
+# would silently skip raising the ack window, so refuse it up front.
+if [[ ! "$ACK_TIMEOUT" =~ ^[0-9]+$ || ! "$QUEUED_ACK_TIMEOUT" =~ ^[0-9]+$ || ! "$REPRESS_INTERVAL" =~ ^[0-9]+$ || ! "$EPISODE_START" =~ ^[0-9]+$ ]]; then
+  echo "--ack-timeout, --queued-ack-timeout, --episode-start and HANDOFF_REPRESS_INTERVAL_SECS must be whole seconds" >&2; exit 64
+fi
 case "$SUPERVISOR" in
   bespoke|control-plane) ;;
   *) echo "--supervisor must be 'bespoke' or 'control-plane'" >&2; exit 64 ;;
@@ -273,14 +320,15 @@ fi
 # In pause mode the agent is asked to finish + write its handoff + STOP (it will
 # not be restarted by this wrapper); the machine reboot cycles it. Use a
 # pause-specific default prompt unless the caller overrode --prompt.
-DEFAULT_PROMPT="Recovery here — please write a fresh ${HANDOFF_FILE} capturing current state, in-flight work, and immediate next actions for the next session. When done, say \"handoff written\" and stop. I will then restart the service."
-DEFAULT_PAUSE_PROMPT="Recovery here — a coordinated machine reboot is imminent. Please finish your current step, then write a fresh ${HANDOFF_FILE} capturing current state, in-flight work, and immediate next actions. When done, say \"handoff written\" and stop — do NOT start new work; the reboot will cycle the session and the next session resumes from your handoff."
+DEFAULT_PROMPT="Recovery here — please write a fresh ${HANDOFF_FILE} capturing current state, in-flight work, and immediate next actions for the next session. When done, say \"handoff written\" and stop. I will then restart the service. Rewrite the file even if nothing changed since your last handoff: the restart waits for the file's modification time, not for your reply."
+DEFAULT_PAUSE_PROMPT="Recovery here — a coordinated machine reboot is imminent. Please finish your current step, then write a fresh ${HANDOFF_FILE} capturing current state, in-flight work, and immediate next actions. When done, say \"handoff written\" and stop — do NOT start new work; the reboot will cycle the session and the next session resumes from your handoff. Rewrite the file even if nothing changed since your last handoff: the restart waits for the file's modification time, not for your reply."
 # T-1500 (A): the kick must CONTINUE the handoff's queued work, not stop at the
 # snapshot — a fresh session that completes the literal ask and parks caused the
 # 2026-07-02 6.5h idle gap. Keep the phrase "post a one-paragraph status
-# snapshot" intact (the smoke suite's kick_busy_token keys on it) and keep in
-# sync with inbox_consumer.RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT.
-DEFAULT_KICK_PROMPT="Read ${HANDOFF_FILE}, then post a one-paragraph status snapshot to the operator via your Telegram tool (chat_id 456474197). Then continue working immediately: pick up the handoff's queued next work (or your next ticket per standing priority) and execute — do not park after the snapshot. Begin."
+# snapshot" intact (the smoke suite's kick_busy_token keys on it). This copy is
+# canonical: its former inbox_consumer twin (RECOVERY_AUTO_RESOLVE_KICKOFF_PROMPT) was
+# retired in T-4203.
+DEFAULT_KICK_PROMPT="Read ${HANDOFF_FILE}, then post a one-paragraph status snapshot to the operator via your Telegram tool (chat_id 424242424). Then continue working immediately: pick up the handoff's queued next work (or your next ticket per standing priority) and execute — do not park after the snapshot. Begin."
 
 if [[ -z "$PROMPT_TEXT" ]]; then
   if [[ "$NO_RESTART" == "1" ]]; then
@@ -302,6 +350,24 @@ err() { echo "[handoff-and-restart] ERROR: $*" >&2; }
 # See that file for the full submit-verify logic + constant documentation.
 # T-0533: DRY refactor — removed inline copy, single source of truth is now
 # tools/send_keys_submit.sh.
+
+# ---------------------------------------------------------------------------
+# ORG-106 L3a (T-5526): a deep-sleeping seat is never restarted/relaunched. Covers every
+# caller (restart_drain, context_fill_monitor, channel_liveness, self_restart,
+# restart_request). Persona from the control-plane consume unit, else this account's.
+# Fail-open on a fault: the controller's launch_breach tripwire is the backstop.
+# ---------------------------------------------------------------------------
+_lc_args=(--account "$(id -un)")
+_lc_re='^pantheon-persona-consume@([a-z][a-z0-9_-]*)\.service$'
+if [[ "$SERVICE" =~ $_lc_re ]]; then
+  _lc_args=("${BASH_REMATCH[1]}")
+fi
+_lc_rc=0
+/usr/bin/python3 "$SCRIPT_DIR/seat_state.py" launch-check "${_lc_args[@]}" || _lc_rc=$?
+if [[ $_lc_rc -eq 3 ]]; then
+  err "seat is in deep-sleep; refusing to restart it (wake it first: harness <seat> wake)"
+  exit 75   # EX_TEMPFAIL: ORG-106 deep-sleep, nothing touched. 3 is prompt-send, taken.
+fi
 
 # ---------------------------------------------------------------------------
 # Dry run: print plan, no side effects.
@@ -537,13 +603,47 @@ if [[ "$DISMISS_MODAL" == "1" ]]; then
   sleep "$POLL_INTERVAL"
 fi
 
-# Deliver via send_keys_submit: literal text, then a delayed Enter so the TUI
-# paste-mode debounce settles and the prompt actually submits (T-0519).
-if ! send_keys_submit "$TARGET_PANE" "$PROMPT_TEXT"; then
-  err "handoff prompt delivery/submit failed"
+# T-4828: NEVER type into a confirm/permission dialog. Its option cursor sits on
+# "1. Yes", so send_keys_submit's Enter APPROVES whatever the agent was asking to do
+# (2026-10-09 23:20Z: a context-fill wedge restart without --dismiss-modal approved
+# orchestrator's pending Bash command blind, and the handoff text was swallowed). Read the
+# bottom of the pane (after any --dismiss-modal Escape) and refuse with exit 3 if a
+# dialog footer is still there. A false refusal is the safe direction: nothing is
+# sent, the caller's OnFailure path pages recovery, and a human or --dismiss-modal clears it.
+pane_bottom=$(tmux capture-pane -p -t "$TARGET_PANE" 2>/dev/null | grep -v '^[[:space:]]*$' | tail -n 12) || pane_bottom=""
+if [[ -n "$pane_bottom" ]] && printf '%s' "$pane_bottom" | grep -Eq "$DIALOG_EXCLUDE"; then
+  err "refusing to inject: a confirm/permission dialog is focused on $TARGET_PANE (matched '$DIALOG_EXCLUDE' in the bottom 12 lines); typing + Enter would answer it. Re-run with --dismiss-modal (Escape denies it) or clear it by hand [T-4828]"
   exit 3
 fi
-log "prompt delivered to $TARGET_PANE"
+# T-4832: the same bottom region through submit_verify's --enter-check, which also
+# knows the plan-approval dialog ("No, keep planning"). It is not added to
+# DIALOG_EXCLUDE because step 7 matches that against the WHOLE pane, where the words
+# can be transcript prose. send_keys_submit repeats this check before every Enter.
+if [[ -n "$pane_bottom" ]] && [[ "$(printf '%s\n' "$pane_bottom" \
+     | python3 "$SUBMIT_VERIFY_PY" --harness "$HARNESS" --enter-check 2>/dev/null || echo ok)" == refuse:* ]]; then
+  err "refusing to inject: a dialog (submit_verify --enter-check) is focused on $TARGET_PANE; typing + Enter would answer it. Clear it by hand [T-4832]"
+  exit 3
+fi
+
+# Deliver via send_keys_submit: literal text, then a delayed Enter so the TUI
+# paste-mode debounce settles and the prompt actually submits (T-0519).
+#
+# T-4117: rc 2 = delivered but verified still PENDING. On a busy pane Claude Code
+# queues the input and runs it when the current turn ends; that is not a failure.
+# Exiting 3 there (the 2026-09-28 orchestrator fire) left the agent to write a handoff
+# nobody restarted on, then wait ~35 min for the next dispatch. So wait for the
+# ack on a longer window instead. The prompt is never re-sent (no double delivery).
+submit_rc=0
+send_keys_submit "$TARGET_PANE" "$PROMPT_TEXT" || submit_rc=$?
+if [[ "$submit_rc" == "2" ]]; then
+  if (( QUEUED_ACK_TIMEOUT > ACK_TIMEOUT )); then ACK_TIMEOUT="$QUEUED_ACK_TIMEOUT"; fi
+  log "prompt queued on $TARGET_PANE (submit unproven or still pending: busy pane or blank capture, T-5412) — waiting up to ${ACK_TIMEOUT}s for the ack [T-4117]"
+elif [[ "$submit_rc" != "0" ]]; then
+  err "handoff prompt delivery/submit failed"
+  exit 3
+else
+  log "prompt delivered to $TARGET_PANE"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 4: poll mtime for HO's ack (handoff write).
@@ -551,12 +651,25 @@ log "prompt delivered to $TARGET_PANE"
 
 ack_deadline=$(( $(date +%s) + ACK_TIMEOUT ))
 ack_ok=0
+# T-4141: while waiting, if the prompt is still sitting in the composer of a pane that
+# is no longer busy (a queued or eaten submit), press Enter once more. Bounded, and never
+# a re-paste. repress_if_stuck (send_keys_submit.sh) holds on generating, background-
+# agent and modal panes.
+repress_left=$REPRESS_MAX
+next_repress=$(( $(date +%s) + REPRESS_INTERVAL ))
 while (( $(date +%s) < ack_deadline )); do
   cur=$(stat -c %Y "$HANDOFF_FILE" 2>/dev/null || echo 0)
-  if [[ "$cur" != "$PRE_MTIME" && "$cur" -gt 0 ]]; then
+  if [[ "$cur" -gt 0 ]] && { [[ "$cur" != "$PRE_MTIME" ]] || (( EPISODE_START > 0 && cur > EPISODE_START )); }; then
     ack_ok=1
-    log "handoff ack: mtime $PRE_MTIME -> $cur"
+    log "handoff ack: mtime $PRE_MTIME -> $cur (episode-start=$EPISODE_START)"
     break
+  fi
+  if (( repress_left > 0 && $(date +%s) >= next_repress )); then
+    next_repress=$(( $(date +%s) + REPRESS_INTERVAL ))
+    if repress_if_stuck "$TARGET_PANE" "$PROMPT_TEXT"; then
+      repress_left=$(( repress_left - 1 ))
+      log "re-pressed Enter on $TARGET_PANE: pane not busy, handoff prompt still in the composer [T-4141]"
+    fi
   fi
   sleep "$POLL_INTERVAL"
 done
@@ -604,13 +717,28 @@ python3 "$(dirname "$0")/handoff_conservation.py" check \
       --handoff-file "$HANDOFF_FILE" \
       2>&1 | sed 's/^/  [handoff-conservation] /'
 
-if ! python3 "$(dirname "$0")/chronicle.py" archive \
-      --handoff-file "$HANDOFF_FILE" \
-      --reason "graceful_restart" \
-      --ts "$CHRONICLE_TS" \
-      --uuid "$CHRONICLE_UUID" \
-      2>&1 | sed 's/^/  [chronicle] /'; then
-  log "chronicle archive failed (non-fatal); see [chronicle] lines above"
+# T-5349: ACE phase-1 advisory carry-forward (T-2819 C1/C3). Runs here for the same
+# reason as the conservation check: the Chronicle's latest snapshot is still the PRIOR
+# cycle's handoff. ace_carry.py itself checks the per-seat opt-in (instance.yaml
+# `ace_carry_forward: true`, artisan only) and is a silent no-op on every other seat. It
+# only writes Chronicle companions (carry-forward.md / expired-carry.md / carry-state.json),
+# never HANDOFF.md, and always exits 0; `timeout 30` bounds it and no exit code is
+# branched on, so it can never block the restart.
+timeout -k 5 30 python3 "$(dirname "$0")/ace_carry.py" run \
+      --handoff-file "$HANDOFF_FILE" --ts "$CHRONICLE_TS" --uuid "$CHRONICLE_UUID" \
+      2>&1 | sed 's/^/  [ace-carry] /'
+
+# T-5016: the Chronicle record is no longer written here. The session-end duty
+# (tools/session_chronicle.py, shared with the runtime controller) writes ONE record
+# per session end after the restart below, so a controller-supervised seat is not
+# archived twice. Pause mode is the exception: the session is NOT ending now, so
+# the record is written here and its pane log is attached by the next start.
+SC_HANDOFF_FRESH=1
+if [[ "$NO_RESTART" == "1" ]]; then
+  _sc_out="$(timeout 90 python3 "$(dirname "$0")/session_chronicle.py" session-end \
+        --handoff-file "$HANDOFF_FILE" --cause fleet-reboot --defer-pane-log \
+        --handoff-fresh 1 --uuid "$CHRONICLE_UUID" --entrypoint handoff_and_restart:pause --certain 2>&1)" || true
+  [[ -n "$_sc_out" ]] && printf '%s\n' "$_sc_out" | sed 's/^/  [session-chronicle] /'
 fi
 
 fi  # T-2829: end ack-outcome branch (archive only on a successful ack)
@@ -648,6 +776,28 @@ for _panelog in "${PANE_LOG_DIR:-$HOME/.local/log/pantheon}"/pane-timed-*.log; d
   fi
 done
 
+# T-5016 review B1: pin the ENDING session's identity NOW, before the restart.
+# On the control plane the restart runs the controller's own session-end hook
+# (which may archive these staged logs first) and then rewrites runtime.json for
+# the successor. The post-restart call below must name THIS session (its staged
+# logs + its runtime.json started_at), never whatever is live by then.
+_sc_sources=()
+_sc_stamps=()
+for _staged in "${PANE_LOG_DIR:-$HOME/.local/log/pantheon}"/pane-timed-*.log.dying; do
+  [[ -e "$_staged" ]] || continue
+  _sc_sources+=(--source "$_staged")
+  # T-5019: also pin each staged log's first stamp now, with no python, so a
+  # failed identity capture below can still recognise the session H1 archived
+  # (and consumed the file) during the restart.
+  _st="$(head -n 50 -- "$_staged" 2>/dev/null \
+        | grep -m1 -oE '^\[[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}\] ' \
+        | sed -E 's/^\[(.*)\] $/\1/')" || _st=""
+  [[ -n "$_st" ]] && _sc_stamps+=(--pane-stamp "$_st")
+done
+SC_RT_STARTED="$(timeout 30 python3 "$(dirname "$0")/session_chronicle.py" identity \
+      --handoff-file "$HANDOFF_FILE" "${_sc_sources[@]}" 2>/dev/null || echo -)"
+[[ -n "$SC_RT_STARTED" ]] || SC_RT_STARTED=-
+
 # ---------------------------------------------------------------------------
 # Step 5: systemctl restart.
 # ---------------------------------------------------------------------------
@@ -677,7 +827,21 @@ if [[ "$SUPERVISOR" == "control-plane" ]]; then
   log "control-plane: killed session $TARGET_SESSION pre-restart"
 fi
 
-if ! systemctl "$SYSTEMCTL_FLAG" restart "$SERVICE"; then
+if [[ "$SUPERVISOR" == "control-plane" ]]; then
+  # T-4309: `start` twice, never `restart`. The kill-session above wakes the
+  # user manager, which fires the consume timer early if it is inside its
+  # accuracy window. A `restart` then TERMs that run (or one already in flight),
+  # and OnFailure pages Recovery for a routine restart (specialist, 5 of 5 pages
+  # 09-24..09-29). `start` on an activating oneshot JOINS the run instead of
+  # killing it. The second `start` is a run that began after the kill, so
+  # ensure_runtime sees the session gone and starts it (T-2658).
+  for _pass in 1 2; do
+    if ! systemctl "$SYSTEMCTL_FLAG" start "$SERVICE"; then
+      err "systemctl $SYSTEMCTL_FLAG start $SERVICE failed (pass $_pass of 2)"
+      exit 5
+    fi
+  done
+elif ! systemctl "$SYSTEMCTL_FLAG" restart "$SERVICE"; then
   err "systemctl $SYSTEMCTL_FLAG restart $SERVICE failed"
   exit 5
 fi
@@ -702,19 +866,26 @@ fi
 # (review fix: `if ! cmd | sed` tested sed's rc, making the error branch dead).
 # Best-effort: a failed archive leaves the .dying file for the NEXT restart's
 # stage-2 sweep (the *.log glob in stage 1 can't re-blend it).
-for _staged in "${PANE_LOG_DIR:-$HOME/.local/log/pantheon}"/pane-timed-*.log.dying; do
-  [[ -e "$_staged" ]] || continue
-  _companion_out="$(python3 "$(dirname "$0")/chronicle.py" companion \
-        --source "$_staged" \
-        --handoff-file "$HANDOFF_FILE" \
-        --ts "${CHRONICLE_TS:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}" \
-        --uuid "${CHRONICLE_UUID:-unknown-forced}" \
-        2>&1)"; _companion_rc=$?
-  [[ -n "$_companion_out" ]] && printf '%s\n' "$_companion_out" | sed 's/^/  [chronicle] /'
-  if [[ "$_companion_rc" -ne 0 ]]; then
-    log "pane-log companion not archived for ${_staged##*/} (non-fatal; retried next restart)"
-  fi
-done
+#
+# T-5016: each staged log now goes through the session-end duty, which writes the
+# WHOLE record (index line + HANDOFF snapshot + .pane.log.gz + .session.json) under
+# a per-session claim, so the controller's own hook (which may fire for the same
+# session end) finds it archived and writes nothing. --skip-ack and the ack-timeout
+# hard restart get a record too (cause forced-restart, handoff_fresh false), where
+# they used to leave only an index-less "unknown-forced" companion. Bounded (timeout
+# 90) and non-fatal; the duty alerts Recovery itself on a failed archive.
+if [[ "${SC_HANDOFF_FRESH:-0}" == "1" ]]; then _sc_cause=graceful-restart; else _sc_cause=forced-restart; fi
+_sc_args=(session-end --handoff-file "$HANDOFF_FILE" --cause "$_sc_cause"
+          --handoff-fresh "${SC_HANDOFF_FRESH:-0}" --entrypoint handoff_and_restart --certain
+          --rt-started-at "${SC_RT_STARTED:--}")
+[[ -n "${CHRONICLE_UUID:-}" ]] && _sc_args+=(--uuid "$CHRONICLE_UUID")
+# Only the logs staged above for THIS session (review B1); if the controller's
+# hook already archived them, the duty finds them gone and the claim done: no-op.
+_sc_out="$(timeout 90 python3 "$(dirname "$0")/session_chronicle.py" "${_sc_args[@]}" "${_sc_sources[@]}" "${_sc_stamps[@]}" 2>&1)" || true
+[[ -n "$_sc_out" ]] && printf '%s\n' "$_sc_out" | sed 's/^/  [session-chronicle] /'
+if ! grep -q '"status": "ok"' <<<"$_sc_out"; then
+  log "session-end chronicle record not confirmed (non-fatal; the duty alerts on failure)"
+fi
 
 # ---------------------------------------------------------------------------
 # Step 6: readiness fast-fail — systemctl is-active (bespoke) or runtime
@@ -725,8 +896,8 @@ if [[ "$SUPERVISOR" == "control-plane" ]]; then
   # T-2658: $SERVICE is a Type=oneshot pantheon-persona-consume@<persona>
   # unit with no RemainAfterExit — it is NEVER is-active after ExecStart
   # exits, so `systemctl is-active` is the wrong witness here (ExecStart
-  # already ran to completion by the time the BLOCKING `systemctl restart`
-  # above returned — Type=oneshot's restart job waits for ExecStart to exit,
+  # already ran to completion by the time the BLOCKING `systemctl start`
+  # above returned — Type=oneshot's start job waits for ExecStart to exit,
   # so persona_bringup.py consume -> wake_persistent_runtime ->
   # ensure_runtime's own internal pane/scope verification already ran; this
   # poll is a safety net, not the primary wait). The real witness is the
@@ -826,7 +997,9 @@ while (( $(date +%s) < steady_deadline )); do
     if (( ! boot_dialog_dismissed )) && [[ -n "$boot_opt" ]] \
        && ! printf '%s' "$pane" | grep -Eq "$BOOT_DISMISS_DENYLIST"; then
       log "step-7: known startup dialog detected — dismissing inline (option $boot_opt) [T-0721/T-2210]"
-      send_keys_submit "$TARGET_PANE" "$boot_opt" \
+      # T-4832: this Enter MUST land in the (sentinel-matched, not-denylisted) boot
+      # dialog, so the one-call bypass of send_keys_submit's pre-Enter dialog check.
+      SEND_KEYS_ALLOW_DIALOG_ENTER=1 send_keys_submit "$TARGET_PANE" "$boot_opt" \
         || log "step-7: boot-dialog dismiss send failed; will fall through to exit 7 if it persists"
       boot_dialog_dismissed=1
       sleep "$POLL_INTERVAL"
@@ -894,12 +1067,24 @@ if [[ "$KICK_ENABLED" == "1" ]]; then
   KICK_POLL_SECS="${HANDOFF_RESTART_KICK_POLL_SECS:-12}"
   KICK_POLL_INTERVAL="${HANDOFF_RESTART_KICK_POLL_INTERVAL:-2}"
   KICK_MAX_ATTEMPTS="${HANDOFF_RESTART_KICK_MAX_ATTEMPTS:-3}"
+  # T-4456: render-gate each inject. The kick lands on a freshly booted TUI (T-4362):
+  # ungated, the Enter can beat the paste render and read as submitted while the
+  # text sits unsent (T-4455). 8s = runtime_controller's fresh-runtime bound.
+  KICK_RENDER_WAIT="${HANDOFF_RESTART_KICK_RENDER_WAIT:-8}"
   if /usr/bin/python3 "$SCRIPT_DIR/kick_verify.py" \
         --pane "$TARGET_PANE" --prompt "$KICK_PROMPT" \
         --settle "$KICK_READINESS_SETTLE_SECS" \
         --poll-secs "$KICK_POLL_SECS" \
         --poll-interval "$KICK_POLL_INTERVAL" \
-        --max-attempts "$KICK_MAX_ATTEMPTS"; then
+        --max-attempts "$KICK_MAX_ATTEMPTS" \
+        --render-wait "$KICK_RENDER_WAIT" \
+        --accept-running-turn; then
+    # T-4193: --accept-running-turn. The fresh session is often ALREADY mid-turn
+    # (the SessionStart handoff auto-read): the kick then queues, submit-verify reads
+    # it as pending, and re-firing only stacks duplicate kicks behind a WORKING
+    # successor and reports a false exit 8 (specialist 2026-09-28 21:20Z, which fed a false
+    # "auto-restart wedged" alert). The step's goal is "the successor is not idle";
+    # a running turn meets it. An idle pane still re-fires and still exits 8.
     log "post-restart kick delivered + dispatch-verified to $TARGET_PANE"
   else
     err "post-restart kick failed verification (no turn dispatched after bounded re-fires)"

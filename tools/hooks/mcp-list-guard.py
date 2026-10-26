@@ -10,8 +10,11 @@ live bot; diagnose via `ps` + `curl getMe`." This hook ENFORCES that structurall
 Scope: checks the CURRENT account's own bridge (`~/.claude/channels/telegram/
 bot.pid` → a live `bun ... server.ts`). `claude mcp list` in this account would
 load this account's plugin and poll this account's bot, so the relevant poller is
-the local one — no cross-account/sudo needed. Self-contained + FAIL-OPEN: any
-error or ambiguity → allow (a guard must never brick a session's tooling).
+the local one — no cross-account/sudo needed. The poller probe itself stays
+fail-open (an unreadable poller state → allow). T-4392 phase 2a: the HOOK is
+FAIL-CLOSED — an exception, an ambiguous payload, its own 15s deadline or the
+262,144-character command cap DENIES (exit 2), via tools/hooks/_failclosed.py (which also
+holds the break-glass); see main().
 
 Wire as a PreToolUse hook with matcher "Bash" in each agent's settings.json
 (deferred careful per-agent deploy — see T-0996). Modeled on act-vs-ask-gate.py.
@@ -231,11 +234,11 @@ _WRAPPER_ARG = r"(?:-\S*|-?\d+(?:\.\d+)?[smhd]?|[A-Z][A-Z0-9_]*)"
 # neither had alone (same shape as the T-2896 lesson). Excluding `=` closes
 # it: an env-assignment's `name=value` boundary can never be crossed by a
 # path-prefix, in the wrapper name or in the final claude match below.
-_WRAPPER = (
-    r"(?:[^\s=]*/)?"
-    r"(?:command|exec|nohup|setsid|timeout|time|nice|env|stdbuf|ionice|chrt)"
-    r"(?:\s+" + _WRAPPER_ARG + r")*"
+_WRAPPER_NAMES = frozenset(
+    ("command", "exec", "nohup", "setsid", "timeout", "time", "nice", "env",
+     "stdbuf", "ionice", "chrt")
 )
+_WRAPPER_NAME_MAX = max(len(w) for w in _WRAPPER_NAMES)
 
 # env assignments. T-2251: the VALUE must not be able to cross a shell
 # separator. It was `\S*`, which happily swallowed `$(cd ` (and, after the
@@ -248,16 +251,174 @@ _ENV_ASSIGN = r"[A-Za-z_][A-Za-z0-9_]*=[^\s;&|`\n()]*"
 # `claude` (bare or path-invoked) in COMMAND position: start-of-string or after
 # a shell separator/substitution opener, optionally via any number/combination
 # of process wrappers and env assignments, in ANY ORDER (T-3192 — was: at most
-# one `command`/`exec` wrapper, then env assignments, fixed order). Captures
-# the rest of that command segment for the safe-flag test.
-_CLAUDE_CMD_RE = re.compile(
-    r"(?:^|[;&|`\n(])\s*"                              # command position
-    r"(?:(?:" + _WRAPPER + r"|" + _ENV_ASSIGN + r")\s+)*"  # wrappers + env assigns, any order
-    r"(?:[^\s=]*/)?claude(?=\s|[;&|`)\n]|$)"            # bare or path-invoked; full token only
-                                                         # (claude-bot-supervise.sh must NOT match;
-                                                         # `=`-excluded path-prefix per T-3192 above)
-    r"([^;&|`\n]*)"                                     # args until the next separator
-)
+# one `command`/`exec` wrapper, then env assignments, fixed order). The rest of
+# that command segment is captured for the safe-flag test.
+#
+# T-4392 phase 2b: this grammar USED to be one backtracking regex,
+#
+#   (?:^|[;&|`\n(])\s*                                 command position
+#   (?:(?:WRAPPER|ENV_ASSIGN)\s+)*                     wrappers + env assigns, any order
+#   (?:[^\s=]*/)?claude(?=\s|[;&|`)\n]|$)              bare or path-invoked, full token
+#   ([^;&|`\n]*)                                       args until the next separator
+#
+#   WRAPPER = (?:[^\s=]*/)?(?:command|exec|...|chrt)(?:\s+WRAPPER_ARG)*
+#
+# run under re.finditer. On a hook that gates EVERY Bash call it was
+# super-linear: QUADRATIC because `\s` includes `\n`, so every newline was a
+# fresh command position whose `\s*` rescanned the whole whitespace run, and
+# every failed start re-walked the same wrapper/assign chain (`"\n"*4096` =
+# 3.3s CPU; orchestrator measured 18.6s at 5 KB); and EXPONENTIAL on a wrapper
+# followed by `-1`-shaped tokens, which match two WRAPPER_ARG alternatives
+# each (`"timeout " + "-1 "*22`, 74 bytes = 6.4s, doubling per 4 tokens).
+#
+# `_claude_invocation_args` below computes EXACTLY what that regex's finditer
+# yielded (the same group(1) sequence, in order, for every input; the old
+# regex is kept verbatim in tools/test_mcp_list_guard.py as the differential
+# oracle), in O(n log n). It works because every choice inside the chain is a
+# WHOLE whitespace-delimited token (each item and each wrapper arg must be
+# followed by `\s+`, so a partial-token match can never continue), which makes
+# each regex decision a per-token predicate, and a failed chain walk
+# memoizable by position:
+#   * Loop(x): the `(...)*` loop state at position x. The regex's result from
+#     it depends only on x, so it is computed once per token (right to left)
+#     and reused by every command position that lands there.
+#   * the wrapper-arg repetition is greedy: it tries the LONGEST run of arg
+#     tokens first, so the first success is the HIGHEST-index successful Loop
+#     in the run's range -- one bisect, not a walk.
+#   * the `claude` exit's greedy `[^\s=]*/` prefix picks the RIGHTMOST
+#     `/claude<lookahead>` before the first `=` (or the token's end), else a
+#     bare `claude<lookahead>` at x.
+_ASSIGN_RE = re.compile(_ENV_ASSIGN)
+_WRAPPER_ARG_RE = re.compile(_WRAPPER_ARG)
+_TOKEN_RE = re.compile(r"\S+")
+_EQ_RE = re.compile(r"=")
+_SLASH_RE = re.compile(r"/")
+# every `/claude` whose next char satisfies the old lookahead (zero-width, so
+# overlapping candidates are all found)
+_SLASH_CLAUDE_RE = re.compile(r"(?=/claude(?:\s|[;&|`)\n]|$))")
+_CMD_POS_RE = re.compile(r"[;&|`\n(]")  # command-position openers
+_ARGS_END_RE = re.compile(r"[;&|`\n]")  # where a match's args stop
+_CLAUDE_LOOKAHEAD = frozenset(";&|`)\n")
+
+
+def _claude_invocation_args(s: str):
+    """Yield the args of each `claude` invocation in command position, in
+    order -- exactly the group(1) sequence the pre-T-4392 `_CLAUDE_CMD_RE`
+    finditer produced (see the comment above), in O(n log n).
+
+    Tokenizing on `\\S+` and testing `str.isspace()` matches the regex's `\\s`
+    EXACTLY: for str patterns the two agree on every code point 0..0x10FFFF
+    (checked in the T-4392 review), and the equivalence argument depends on it."""
+    if "claude" not in s:
+        return  # every match contains the literal `claude`
+    n = len(s)
+    starts, ends = [], []
+    for m in _TOKEN_RE.finditer(s):
+        starts.append(m.start())
+        ends.append(m.end())
+    ntok = len(starts)
+    eqs = [m.start() for m in _EQ_RE.finditer(s)]
+    slashes = [m.start() for m in _SLASH_RE.finditer(s)]
+    good = [m.start() for m in _SLASH_CLAUDE_RE.finditer(s)]
+
+    def first_eq(x):
+        i = bisect.bisect_left(eqs, x)
+        return eqs[i] if i < len(eqs) else n
+
+    def is_wrapper(x, e):
+        # `(?:[^\s=]*/)?NAME` then whitespace: NAME is everything after the
+        # token's last `/`, and the prefix may not contain `=`.
+        i = bisect.bisect_left(slashes, e) - 1
+        if i >= 0 and slashes[i] >= x:
+            last = slashes[i]
+            if first_eq(x) < last:
+                return False
+            return e - last - 1 <= _WRAPPER_NAME_MAX and s[last + 1:e] in _WRAPPER_NAMES
+        return e - x <= _WRAPPER_NAME_MAX and s[x:e] in _WRAPPER_NAMES
+
+    def is_assign(x, e):
+        # The match stops at the first separator, so total work over every
+        # start inside one token stays linear.
+        m = _ASSIGN_RE.match(s, x)
+        return m is not None and m.end() == e
+
+    def claude_end(x, e):
+        bound = min(first_eq(x), e)
+        i = bisect.bisect_left(good, bound) - 1
+        if i >= 0 and good[i] >= x:
+            return good[i] + 7  # rightmost `/claude` (greedy prefix)
+        if s.startswith("claude", x) and (
+            x + 6 == n or s[x + 6].isspace() or s[x + 6] in _CLAUDE_LOOKAHEAD
+        ):
+            return x + 6
+        return None
+
+    # run_end[t]: first token index >= t that is NOT a whole-token wrapper arg.
+    run_end = [ntok] * (ntok + 1)
+    for t in range(ntok - 1, -1, -1):
+        is_arg = _WRAPPER_ARG_RE.fullmatch(s, starts[t], ends[t]) is not None
+        run_end[t] = run_end[t + 1] if is_arg else t
+
+    res = [None] * ntok  # Loop(starts[t]) -> claude end offset, or None
+    succ_neg = []  # -t for every t with res[t] set; ascending by construction
+
+    def best_in(lo, hi):
+        """res of the HIGHEST successful token index in [lo, hi] (greedy args)."""
+        if lo > hi:
+            return None
+        k = bisect.bisect_left(succ_neg, -hi)
+        if k < len(succ_neg) and -succ_neg[k] >= lo:
+            return res[-succ_neg[k]]
+        return None
+
+    def loop_at(x, e, t_next):
+        # Loop(x): first try one item then recurse (greedy `*`), else exit.
+        if e < n:  # an item must be followed by whitespace
+            if is_wrapper(x, e):
+                if t_next < ntok:
+                    r = best_in(t_next, min(run_end[t_next], ntok - 1))
+                    if r is not None:
+                        return r
+            elif is_assign(x, e) and t_next < ntok:
+                r = res[t_next]
+                if r is not None:
+                    return r
+        return claude_end(x, e)
+
+    for t in range(ntok - 1, -1, -1):
+        res[t] = loop_at(starts[t], ends[t], t + 1)
+        if res[t] is not None:
+            succ_neg.append(-t)
+
+    def loop_pos(x):
+        if x >= n or s[x].isspace():
+            return None
+        t = bisect.bisect_right(starts, x) - 1
+        if starts[t] == x:
+            return res[t]
+        return loop_at(x, ends[t], t + 1)  # command position mid-token (`a;claude`)
+
+    def landing(y):  # `\s*`: first non-whitespace offset >= y
+        if y < n and not s[y].isspace():
+            return y
+        i = bisect.bisect_left(starts, y)
+        return starts[i] if i < ntok else n
+
+    cmd_pos = [m.start() for m in _CMD_POS_RE.finditer(s)]
+    pos = 0
+    while True:
+        c = loop_pos(landing(0)) if pos == 0 else None  # the `^` alternative
+        if c is None:
+            for k in range(bisect.bisect_left(cmd_pos, pos), len(cmd_pos)):
+                c = loop_pos(landing(cmd_pos[k] + 1))
+                if c is not None:
+                    break
+        if c is None:
+            return
+        m = _ARGS_END_RE.search(s, c)
+        end = m.start() if m else n
+        yield s[c:end]
+        pos = end
 
 # Safe invocation shapes (tested against the matched segment's args):
 _SAFE_ARGS_RE = re.compile(r"--version\b|--help\b|(?:^|\s)-h\b")
@@ -275,8 +436,7 @@ def command_targets_mcp_list(command: str) -> bool:
     if not command:
         return False
     stripped = _SUBST_RE.sub(";", _QUOTED_RE.sub(" ", _strip_heredoc_bodies(command)))
-    for m in _CLAUDE_CMD_RE.finditer(stripped):
-        args = m.group(1) or ""
+    for args in _claude_invocation_args(stripped):
         if _SAFE_ARGS_RE.search(args):
             continue  # --version/--help: no session, no plugin
         if _PRINT_RE.search(args) and _SAFE_MODE_RE.search(args):
@@ -333,19 +493,44 @@ def decide(data: dict, poller_live: bool) -> dict | None:
     }
 
 
+# T-4392 phase 2a: the most this guard will read. The scanner is linear (~0.23s CPU at 64 KiB),
+# so 262,144 characters (~1s) sits well inside the 15s fail-closed budget while leaving room for main-thread
+# orchestrator heredocs; tools/test_mcp_list_guard_failclosed.py pins the worst-shape timing.
+MAX_COMMAND_CHARS = 262_144
+
+
+def _entry_decide(data: dict) -> dict | None:
+    return decide(data, own_poller_live())
+
+
 def main() -> None:
+    """Run the guard FAIL-CLOSED (T-4392 phase 2a) through tools/hooks/_failclosed.py.
+
+    The verdict logic above is unchanged, including own_poller_live()'s internal fail-open
+    (an unreadable poller state still allows). What changed is the HOOK-level failure mode: an
+    exception, an ambiguous payload, the 15s deadline from process start, or a command over
+    MAX_COMMAND_CHARS now DENIES (exit 2, stderr names the cause) instead of exiting 0. The
+    helper is imported from THIS file's real directory, first on sys.path (a decoy on
+    PYTHONPATH cannot win); if that import fails, the guard denies too, since an ImportError
+    would exit 1, which fails open."""
     try:
-        raw = sys.stdin.read()
-        data = json.loads(raw) if raw.strip() else {}
-    except Exception:
-        sys.exit(0)  # fail-open
-    try:
-        payload = decide(data, own_poller_live())
-    except Exception:
-        sys.exit(0)  # fail-open
-    if payload is not None:
-        print(json.dumps(payload))
-    sys.exit(0)
+        sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+        import _failclosed
+    except BaseException as exc:  # noqa: BLE001 - an import failure must DENY
+        missing = isinstance(exc, FileNotFoundError) or (
+            isinstance(exc, ModuleNotFoundError) and exc.name == "_failclosed")
+        if missing:
+            hint = ("The hook's directory lacks _failclosed.py: run the hook from the "
+                    "pantheon-config clone, or unwire it via the Edit tool.")
+        else:
+            hint = (f"the hook's _failclosed.py failed to import ({type(exc).__name__}): "
+                    "fix it, or unwire the hook via the Edit tool.")
+        sys.stderr.write(
+            "BLOCKED (mcp-list-guard, fail-closed, T-4392): cannot import _failclosed "
+            f"({exc!r}). {hint}\n"
+        )
+        sys.exit(2)
+    _failclosed.run("mcp-list-guard", _entry_decide, max_command_chars=MAX_COMMAND_CHARS)
 
 
 if __name__ == "__main__":

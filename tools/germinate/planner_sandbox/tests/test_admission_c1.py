@@ -15,9 +15,13 @@ kuid switch, empirically distinguished from the cosmetic bare
 
 from __future__ import annotations
 
+import contextlib
 import os
+import queue
 import signal
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 
@@ -49,15 +53,26 @@ def main() -> int:
     instance, component, verb, scope = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
     uid = int(sys.argv[6])
     marker = Path(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else None
-    hold_seconds = float(sys.argv[8]) if len(sys.argv) > 8 else 0.0
+    hold = sys.argv[8] if len(sys.argv) > 8 else "0"
+    start_gate = len(sys.argv) > 9 and sys.argv[9] == "wait-go"
+
+    if start_gate:
+        # Start barrier: report readiness (imports done), then attempt
+        # only once the test writes "go" -- lets N callers contend at once.
+        print("READY", flush=True)
+        sys.stdin.readline()
 
     try:
         with gate.acquire(system_dir, instance, component, verb, scope=scope, uid=uid) as run_id:
-            print(f"ADMITTED {run_id}", flush=True)
             if marker is not None:
                 marker.write_text(run_id, encoding="utf-8")
-            if hold_seconds > 0:
-                time.sleep(hold_seconds)
+            print(f"ADMITTED {run_id}", flush=True)
+            if hold == "until-stdin":
+                # Handshake hold: keep the claim until the test writes a
+                # line (or closes stdin). No timing dependence.
+                sys.stdin.readline()
+            elif float(hold) > 0:
+                time.sleep(float(hold))
     except AdmissionRefused as exc:
         print(f"REFUSED {exc.reason}", flush=True)
     except PrimitiveUnavailable as exc:
@@ -100,9 +115,10 @@ def _run_native(
     scope: str,
     uid: int,
     marker: Path | None = None,
-    hold_seconds: float = 0.0,
+    hold_seconds: float | str = 0.0,
     *,
     strace_log: Path | None = None,
+    wait_go: bool = False,
 ) -> subprocess.Popen[str]:
     args = [
         "python3",
@@ -116,11 +132,98 @@ def _run_native(
         str(uid),
         str(marker) if marker is not None else "",
         str(hold_seconds),
+        "wait-go" if wait_go else "",
     ]
     if strace_log is not None:
         args = ["strace", "-f", "-e", "trace=openat", "-o", str(strace_log), *args]
     env = {**os.environ, "PYTHONPATH": str(_REPO_ROOT)}
-    return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    return subprocess.Popen(
+        args,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+
+
+#: Upper bound on how long a caller may take to report its admission
+#: outcome. A failure bound only -- never a synchronisation mechanism --
+#: so it is generous enough for a heavily loaded serial CI runner.
+_OUTCOME_LINE_TIMEOUT = 120.0
+
+#: Cleanup bound for reaping a released (or killed) caller. Deliberately
+#: independent of any test deadline: cleanup must still get time to run
+#: after that deadline has already been blown.
+_REAP_GRACE = 30.0
+
+
+def _deadline_in(seconds: float) -> float:
+    return time.monotonic() + seconds
+
+
+def _remaining(deadline: float) -> float:
+    return max(0.0, deadline - time.monotonic())
+
+
+def _await_outcome_line(proc: subprocess.Popen[str], deadline: float | None = None) -> str:
+    """Block until ``proc`` prints its first outcome line
+    (READY/ADMITTED/REFUSED/UNAVAILABLE) and return it stripped.
+
+    This is the handshake that replaces sleep-based ordering (T-4331):
+    once this returns ``ADMITTED ...``, the caller provably holds the
+    claim on disk, and with ``hold_seconds="until-stdin"`` it keeps
+    holding until the test releases it via stdin.
+
+    ``deadline`` is an absolute ``time.monotonic()`` value shared across
+    every wait of one test, so the bounds do not stack; ``None`` means a
+    fresh ``_OUTCOME_LINE_TIMEOUT``. On timeout the caller is killed and
+    reaped (``wait()``, NOT ``communicate()``, so a later
+    ``_release_and_reap`` stays valid) and ``AssertionError`` is raised.
+    """
+
+    if deadline is None:
+        deadline = _deadline_in(_OUTCOME_LINE_TIMEOUT)
+    lines: queue.Queue[str] = queue.Queue(maxsize=1)
+    stdout = proc.stdout
+    assert stdout is not None
+    reader = threading.Thread(target=lambda: lines.put(stdout.readline()), daemon=True)
+    reader.start()
+    try:
+        return lines.get(timeout=_remaining(deadline)).strip()
+    except queue.Empty:
+        proc.kill()
+        proc.wait(timeout=_REAP_GRACE)
+        raise AssertionError(
+            f"caller pid={proc.pid} printed no outcome line before its deadline"
+        ) from None
+
+
+def _release_and_reap(proc: subprocess.Popen[str]) -> None:
+    """Release a holding caller via stdin and reap it. Never raises, so
+    it cannot mask the assertion that led to cleanup, and a loop over
+    several callers always reaches every one of them.
+
+    Callers write almost nothing after release, so ``wait()`` without
+    draining stdout/stderr cannot deadlock on a full pipe.
+    """
+
+    try:
+        if proc.poll() is None and proc.stdin is not None and not proc.stdin.closed:
+            try:
+                proc.stdin.write("release\n")
+                proc.stdin.close()
+            except (OSError, ValueError):
+                pass  # caller exited between poll() and write: nothing to release
+        proc.wait(timeout=_REAP_GRACE)
+    except Exception:
+        proc.kill()
+        proc.wait()
+    finally:
+        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError, ValueError):
+                    pipe.close()
 
 
 def _run_privileged_switch(
@@ -152,16 +255,21 @@ def _run_privileged_switch(
     if strace_log is not None:
         inner_args = ["strace", "-f", "-e", "trace=openat", "-o", str(strace_log), *inner_args]
     return run_as_privileged_switch_uid(
-        inner_args, env={"PYTHONPATH": str(_REPO_ROOT)}, timeout=20.0
+        inner_args, env={"PYTHONPATH": str(_REPO_ROOT)}, timeout=_OUTCOME_LINE_TIMEOUT
     )
 
 
 def test_c1_1_cross_uid_concurrent_claim(require_privileged_uid_switch: None) -> None:
-    """Two processes under distinct REAL uids attempt admission on the
-    same (instance, component); exactly one succeeds, the other refuses
-    at the admission tier before any mutation-tier code runs. Instrument:
-    strace both callers, prove the loser's log never opens the mutation
-    marker path."""
+    """Cross-uid refusal while a claim is provably held. The native
+    caller claims first and holds (handshake: its ADMITTED line); only
+    then does a caller under a distinct REAL uid attempt the same
+    (instance, component), and it must refuse at the admission tier
+    before any mutation-tier code runs. Instrument: strace both callers,
+    prove the loser's log never opens the mutation marker path.
+
+    The name is kept for traceability; this test orders the two claims
+    deterministically (T-4331). Simultaneous contention is exercised by
+    ``test_c1_5_simultaneous_multiprocess_claim_single_winner``."""
 
     with temp_gate_tree() as tree, temp_scratch_dir() as scratch:
         support = _stage_support_dir(scratch)
@@ -181,26 +289,38 @@ def test_c1_1_cross_uid_concurrent_claim(require_privileged_uid_switch: None) ->
             "system",
             1000,
             marker=marker,
-            hold_seconds=1.0,
+            hold_seconds="until-stdin",
             strace_log=native_log,
         )
-        time.sleep(0.3)  # let native win the race deterministically for this pairing
-        nobody_result = _run_privileged_switch(
-            script_path,
-            tree.system_dir,
-            "c1-1-instance",
-            "c1-1-component",
-            "plan",
-            "seat-nobody",
-            PRIVILEGED_SWITCH_UID,
-            marker=marker,
-            hold_seconds=0.0,
-            strace_log=nobody_log,
-        )
-        native_stdout, native_stderr = native_proc.communicate(timeout=10)
+        # Handshake, not a sleep (T-4331): block until native provably
+        # holds the claim. Under load a sleep-based head start let the two
+        # callers run without overlapping -- both then admitted
+        # sequentially and legitimately, and the test flaked with "both".
+        native_outcome = _await_outcome_line(native_proc)
+        try:
+            assert native_outcome.startswith("ADMITTED"), (
+                f"native caller must win the uncontended first claim, got: {native_outcome!r}"
+            )
+            # nobody attempts (and completes) strictly while native holds.
+            nobody_result = _run_privileged_switch(
+                script_path,
+                tree.system_dir,
+                "c1-1-instance",
+                "c1-1-component",
+                "plan",
+                "seat-nobody",
+                PRIVILEGED_SWITCH_UID,
+                marker=marker,
+                hold_seconds=0.0,
+                strace_log=nobody_log,
+            )
+        finally:
+            # Release native's hold (second half of the handshake); also
+            # runs on failure so no caller is left blocked on stdin.
+            _release_and_reap(native_proc)
 
         outcomes = {
-            "native": native_stdout.strip(),
+            "native": native_outcome,
             "nobody": nobody_result.stdout.strip(),
         }
         admitted = {k: v for k, v in outcomes.items() if v.startswith("ADMITTED")}
@@ -225,7 +345,7 @@ def test_c1_1_cross_uid_concurrent_claim(require_privileged_uid_switch: None) ->
 
 
 def test_c1_2_caller_exit_persistence_survives_sigkill(require_privileged_uid_switch: None) -> None:
-    """Cairn v9 BLOCK-1 witness. Caller A claims admission, execs a plan
+    """Consultant v9 BLOCK-1 witness. Caller A claims admission, execs a plan
     phase, then is SIGKILLed from outside -- no chance to clean up.
     Caller B under a distinct real uid attempts admission afterward and
     MUST still refuse, because the claim (a durable file) is the
@@ -244,13 +364,19 @@ def test_c1_2_caller_exit_persistence_survives_sigkill(require_privileged_uid_sw
             "plan",
             "system",
             1000,
-            hold_seconds=30.0,  # long enough that only SIGKILL ends it
+            hold_seconds="until-stdin",  # holds until SIGKILL; stdin is never written
         )
-        time.sleep(0.5)
+        # Handshake, not a sleep (T-4331): SIGKILL only once caller A
+        # provably holds the claim. A fixed sleep could fire the kill
+        # before a loaded caller A had claimed, letting caller B admit.
+        native_outcome = _await_outcome_line(native_proc)
+        assert native_outcome.startswith("ADMITTED"), (
+            f"caller A must hold the claim before the kill, got: {native_outcome!r}"
+        )
         assert native_proc.poll() is None, "caller A should still be alive/holding"
 
         os.kill(native_proc.pid, signal.SIGKILL)
-        native_proc.wait(timeout=5)
+        native_proc.communicate(timeout=_OUTCOME_LINE_TIMEOUT)
         assert native_proc.returncode is not None and native_proc.returncode < 0, (
             "caller A must have died by signal, not by a graceful path"
         )
@@ -355,3 +481,108 @@ def test_c1_4_n_scope_enumeration() -> None:
                         )
                 except AdmissionRefused as exc:
                     assert exc.scope == scope
+
+
+def test_c1_5_simultaneous_multiprocess_claim_single_winner() -> None:
+    """N real processes released through a start barrier attempt
+    admission on the same (instance, component) at once; exactly one is
+    ADMITTED. Timing-independent by construction (T-4331): the winner
+    holds its claim until the test has collected EVERY contender's
+    outcome, so each attempt provably overlaps a live hold -- the only
+    way to see two ADMITTED lines is a genuine non-atomic claim. No
+    cross-uid dependency, so this runs where C1-1 typed-skips."""
+
+    contenders = 6
+    # ONE overall bound for the whole round, shared by every wait (so the
+    # per-call bounds do not stack across 2*N serial waits).
+    deadline = _deadline_in(_OUTCOME_LINE_TIMEOUT)
+    with temp_gate_tree() as tree, temp_scratch_dir() as scratch:
+        script_path = _write_caller_script(scratch)
+        bootstrap_component(tree.system_dir, "c1-5-instance", "c1-5-component")
+
+        procs = [
+            _run_native(
+                script_path,
+                tree.system_dir,
+                "c1-5-instance",
+                "c1-5-component",
+                "plan",
+                f"seat-{9999910 + i}",
+                9999910 + i,
+                hold_seconds="until-stdin",
+                wait_go=True,
+            )
+            for i in range(contenders)
+        ]
+        outcomes = _run_contention_round(procs, deadline)
+
+        admitted = [o for o in outcomes if o.startswith("ADMITTED")]
+        refused = [o for o in outcomes if o.startswith("REFUSED")]
+        assert len(admitted) == 1, f"expected exactly one ADMITTED, got: {outcomes}"
+        assert len(refused) == contenders - 1, f"expected the rest REFUSED, got: {outcomes}"
+
+
+def _run_contention_round(procs: list[subprocess.Popen[str]], deadline: float) -> list[str]:
+    """Drive a start-barrier round: await every READY, send "go" to all,
+    collect every outcome line, THEN release and reap every contender
+    (the winner holds until all outcomes are in). Every wait draws on the
+    one shared ``deadline``. Cleanup releases each contender
+    independently, so a failure (e.g. one contender timing out) surfaces
+    as the original AssertionError and every child is still reaped."""
+
+    try:
+        for proc in procs:
+            ready = _await_outcome_line(proc, deadline)
+            assert ready == "READY", f"contender failed before the start barrier: {ready!r}"
+        for proc in procs:
+            assert proc.stdin is not None
+            proc.stdin.write("go\n")
+            proc.stdin.flush()
+        return [_await_outcome_line(proc, deadline) for proc in procs]
+    finally:
+        for proc in procs:
+            _release_and_reap(proc)
+
+
+def test_c1_6_contention_round_timeout_surfaces_and_reaps_all() -> None:
+    """Harness self-test for the C1-5 cleanup path: one contender that
+    never prints must surface as the timeout AssertionError (not a
+    cleanup-time error masking it), and every contender -- including
+    those still blocked on stdin -- must be reaped."""
+
+    import pytest
+
+    with temp_gate_tree() as tree, temp_scratch_dir() as scratch:
+        script_path = _write_caller_script(scratch)
+        bootstrap_component(tree.system_dir, "c1-6-instance", "c1-6-component")
+
+        def contender(i: int) -> subprocess.Popen[str]:
+            return _run_native(
+                script_path,
+                tree.system_dir,
+                "c1-6-instance",
+                "c1-6-component",
+                "plan",
+                f"seat-{9999920 + i}",
+                9999920 + i,
+                hold_seconds="until-stdin",
+                wait_go=True,
+            )
+
+        silent = subprocess.Popen(
+            [sys.executable, "-c", "import sys; sys.stdin.read()"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        procs = [contender(0), silent, contender(1)]
+
+        # Short deadline: the silent contender can never meet it,
+        # whatever the load, so the timeout path is always taken.
+        with pytest.raises(AssertionError, match="printed no outcome line"):
+            _run_contention_round(procs, _deadline_in(2.0))
+
+        assert all(proc.returncode is not None for proc in procs), (
+            f"every contender must be reaped: {[proc.returncode for proc in procs]}"
+        )

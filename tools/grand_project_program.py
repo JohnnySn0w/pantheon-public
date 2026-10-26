@@ -16,7 +16,7 @@ import re
 import unicodedata
 from collections import Counter
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterator, Mapping, Sequence
 
 from tools import ticket
 
@@ -165,6 +165,37 @@ def _ticket_paths(tickets_root: Path, ticket_id: str | None = None) -> list[Path
 
 def _ticket_fields(path: Path) -> Mapping[str, Any]:
     return ticket.parse_ticket(path).fields
+
+
+_OPEN_STATES = frozenset({"inbox", "active"})
+
+
+def _open_ticket_fields(tickets_root: Path) -> Iterator[tuple[str, Mapping[str, Any]]]:
+    """(ticket id, front-matter fields) for each OPEN ticket, tolerant of concurrent moves.
+
+    T-4165: the tree is live. The inbox-consumer, any agent's ticket.py, or a parallel
+    CI worker can move a ticket between the glob in _ticket_paths and the parse here,
+    which crashed the scan with FileNotFoundError (main run 36457036198). A ticket
+    that vanished is re-resolved by id once: parsed where it now lives if that is still
+    inbox/active, skipped if it moved to done/blocked (it is no longer open) or is gone.
+    Each id is yielded at most once, since a move between the per-state globs can list
+    one ticket under both states."""
+    seen: set[str] = set()
+    for path in _ticket_paths(tickets_root):
+        if path.parent.name not in _OPEN_STATES or path.stem in seen:
+            continue
+        try:
+            fields = _ticket_fields(path)
+        except FileNotFoundError:
+            now = [p for p in _ticket_paths(tickets_root, path.stem) if p.parent.name in _OPEN_STATES]
+            if not now:
+                continue
+            try:
+                fields = _ticket_fields(now[0])
+            except FileNotFoundError:
+                continue
+        seen.add(path.stem)
+        yield path.stem, fields
 
 
 def _ticket_record(tickets_root: Path, ticket_id: str | None) -> ticket.Ticket | None:
@@ -561,15 +592,12 @@ def lint_obligation_completeness(
             findings.append(_finding("obligation-source-digest-drift", record_id, "source digest changed"))
     for obligation in sorted(owned, key=lambda item: item.obligation_id):
         matching = []
-        for path in _ticket_paths(tickets_root):
-            if path.parent.name not in {"inbox", "active"}:
-                continue
-            fields = _ticket_fields(path)
+        for ticket_id, fields in _open_ticket_fields(tickets_root):
             labels = fields.get("labels", [])
             if isinstance(labels, list) and {
                 "adr-reeval", f"reeval:{obligation.obligation_id}"
             }.issubset(set(labels)):
-                matching.append(path.stem)
+                matching.append(ticket_id)
         if obligation.state == "open":
             if len(matching) != 1:
                 findings.append(
@@ -888,12 +916,10 @@ def due_obligations(
 def existing_review_ticket(obligation_id: str, tickets_root: Path) -> str | None:
     wanted = {"adr-reeval", f"reeval:{obligation_id}"}
     matches: list[str] = []
-    for path in _ticket_paths(tickets_root):
-        if path.parent.name not in {"inbox", "active"}:
-            continue
-        labels = _ticket_fields(path).get("labels", [])
+    for ticket_id, fields in _open_ticket_fields(tickets_root):
+        labels = fields.get("labels", [])
         if isinstance(labels, list) and wanted.issubset(set(labels)):
-            matches.append(path.stem)
+            matches.append(ticket_id)
     return matches[0] if len(matches) == 1 else None
 
 
@@ -954,10 +980,8 @@ def evaluate_indexes(
             continue
         matching_count = 0
         wanted = {"adr-reeval", f"reeval:{obligation.obligation_id}"}
-        for path in _ticket_paths(tickets_root):
-            if path.parent.name not in {"inbox", "active"}:
-                continue
-            labels = _ticket_fields(path).get("labels", [])
+        for _ticket_id, fields in _open_ticket_fields(tickets_root):
+            labels = fields.get("labels", [])
             if isinstance(labels, list) and wanted.issubset(set(labels)):
                 matching_count += 1
         if matching_count > 1:

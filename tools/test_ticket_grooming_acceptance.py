@@ -429,7 +429,9 @@ class TestExtractArtifacts(unittest.TestCase):
         # T-1489 shape (false-reopened T-1443): a claude-config deliverable whose
         # top dir (`pinned-rules/`) COLLIDES with pantheon-config's own same-named
         # dir — so the top-level-dir guard is fooled (the dir exists here, but the
-        # file `orchestrator.md` lives in claude-config). The line names the sibling repo
+        # file `orchestrator.md` lived in claude-config when that ticket resolved; T-4759
+        # has since moved it into pantheon-config/pinned-rules/, and the fixture
+        # line still names claude-config, as historical lines do). The line names the sibling repo
         # `claude-config`, which is the reliable "resolve against the other repo"
         # signal. Pre-fix (claude-config absent from _OTHER_REPO_MARKERS) this
         # false-reopened a correctly-resolved ticket.
@@ -440,6 +442,29 @@ class TestExtractArtifacts(unittest.TestCase):
         arts = ticket_grooming.extract_artifacts(
             "resolved; correction committed to claude-config "
             "pinned-rules/orchestrator.md, symlinked as the auto-loaded CLAUDE.md"
+        )
+        self.assertEqual([a for a, k in arts if k == "path"], [])
+
+    def test_path_on_sseed_presence_line_skipped(self) -> None:
+        # T-3983 shape (false-reopened T-3972 + T-3926): a sseed-presence
+        # deliverable whose top dir (`notes/`) collides with pantheon-config's
+        # own same-named dir — so the top-level-dir guard is fooled (the dir
+        # exists here, but the file lives in sseed-presence). Naming the
+        # sibling repo `sseed-presence` on the line is the reliable
+        # "resolve against the other repo" signal.
+        arts = ticket_grooming.extract_artifacts(
+            "resolved; deliverable committed in sseed-presence "
+            "notes/2026-09-23-zrun-ota-endpoint-re.md (commit 16460e5)"
+        )
+        self.assertEqual([a for a, k in arts if k == "path"], [])
+
+    def test_path_on_supernote_pipeline_line_skipped(self) -> None:
+        # T-3983 shape sibling: supernote-pipeline deliverables get referenced
+        # by bare paths that collide with pantheon-config's top dirs. Same
+        # class of fix as sseed-presence — line-marker guard closes it.
+        arts = ticket_grooming.extract_artifacts(
+            "resolved; enrichment landed in supernote-pipeline "
+            "tools/apply_enrichment.py + notes/pipeline-e2e.md"
         )
         self.assertEqual([a for a, k in arts if k == "path"], [])
 

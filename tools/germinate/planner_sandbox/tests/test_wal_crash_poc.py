@@ -7,8 +7,11 @@ import signal
 import subprocess
 import sys
 import textwrap
+import time
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 
 RUN_KEY = "run-a"
@@ -131,10 +134,74 @@ def _child_script() -> str:
     )
 
 
+# T-4412: this was a fixed 10 s and raised TimeoutExpired on a loaded CI leg (dispatch
+# run 36685685124, py3.11). The child imports the WAL and does several fsync'd writes
+# before it SIGKILLs itself; interpreter startup + imports + fsyncs on a disk-bound,
+# xdist-loaded runner is legitimately slow, not hung. The deadline only has to separate
+# "slow" from "hung", so it is generous; a real hang still fails, just not at 10 s.
+_CHILD_DEADLINE_S = 120.0
+
+
 def _run_killed_child(run_dir: Path, boundary: str):
     proc = subprocess.Popen([sys.executable, "-c", _child_script(), str(run_dir), boundary])
-    proc.wait(timeout=10)
-    assert proc.returncode == -signal.SIGKILL
+    try:
+        proc.wait(timeout=_CHILD_DEADLINE_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()  # never leak a hung child into the rest of the run
+        proc.wait()
+        raise AssertionError(
+            f"crash child (boundary={boundary!r}) still running after {_CHILD_DEADLINE_S}s: "
+            "a hang, not load"
+        ) from None
+    assert proc.returncode == -signal.SIGKILL, (
+        f"crash child (boundary={boundary!r}) exited {proc.returncode}, expected SIGKILL "
+        f"({-signal.SIGKILL})"
+    )
+
+
+# T-4412: the crash child's runtime is dominated by fsync'd WAL writes plus interpreter
+# startup and imports, which a loaded or disk-bound CI runner stretches well past any
+# tight fixed budget. These pin the load-robust deadline and that its semantics survive.
+def test_crash_child_deadline_is_generous_not_a_tight_fixed_budget():
+    assert _CHILD_DEADLINE_S >= 60.0
+
+
+def test_a_hung_child_fails_the_test_cleanly_and_is_reaped(monkeypatch, tmp_path: Path):
+    spawned: list[subprocess.Popen] = []
+    real_popen = subprocess.Popen
+
+    def spy_popen(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        spawned.append(proc)
+        return proc
+
+    this = sys.modules[__name__]
+    monkeypatch.setattr(subprocess, "Popen", spy_popen)
+    monkeypatch.setattr(this, "_child_script", lambda: "import time; time.sleep(600)")
+    monkeypatch.setattr(this, "_CHILD_DEADLINE_S", 0.5)
+    started = time.monotonic()
+    with pytest.raises(AssertionError, match="hang"):
+        _run_killed_child(tmp_path, "after-intent")
+    assert time.monotonic() - started < 5.0  # the named deadline is what bounds the wait
+    assert spawned and spawned[0].poll() is not None  # killed and reaped, not leaked
+
+
+def test_a_slow_child_within_the_deadline_still_passes(monkeypatch, tmp_path: Path):
+    this = sys.modules[__name__]
+    monkeypatch.setattr(
+        this,
+        "_child_script",
+        lambda: "import os, signal, time; time.sleep(1.0); os.kill(os.getpid(), signal.SIGKILL)",
+    )
+    monkeypatch.setattr(this, "_CHILD_DEADLINE_S", 30.0)
+    _run_killed_child(tmp_path, "after-intent")  # slow but SIGKILLed: crash semantics hold
+
+
+def test_a_child_that_exits_without_being_killed_still_fails(monkeypatch, tmp_path: Path):
+    this = sys.modules[__name__]
+    monkeypatch.setattr(this, "_child_script", lambda: "import sys; sys.exit(0)")
+    with pytest.raises(AssertionError, match="SIGKILL"):
+        _run_killed_child(tmp_path, "after-intent")
 
 
 def test_kill_after_intent_before_mutation_classifies_intent_only(tmp_path: Path):

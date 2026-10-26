@@ -16,7 +16,7 @@ from __future__ import annotations
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -356,6 +356,88 @@ class TestAppendRefusesDuplicateIds(unittest.TestCase):
             all(k.startswith("2026-05-1") or k.startswith("2026-05-2") for k in dupes),
             f"a duplicate outside the frozen 2026-05 window: {dupes}",
         )
+
+
+class TestValidateEntryOrg001(unittest.TestCase):
+    """T-4734: ORG-001's rules for NEW entries (the operator TG 11474)."""
+
+    NOW = datetime(2026, 10, 8, 15, 0, 0, tzinfo=timezone.utc)
+
+    def entry(self, **over):
+        base = {
+            "id": "2026-10-08T15:00:00Z-t4734-check",
+            "ts": "2026-10-08T15:00:00Z",
+            "agent": "head_engineering_orchestrator",
+            "action": "check_rules",
+            "rationale": "why",
+            "justifies_via": ["P4"],
+        }
+        base.update(over)
+        return {k: v for k, v in base.items() if v is not None}
+
+    def test_conforming_entry_has_no_problems(self):
+        self.assertEqual(ls.validate_entry(self.entry(), self.NOW), [])
+
+    def test_human_operator_is_allowed(self):
+        self.assertEqual(ls.validate_entry(self.entry(agent="human:operator"), self.NOW), [])
+
+    def test_missing_required_fields_are_named(self):
+        problems = ls.validate_entry(self.entry(rationale=None, justifies_via=[]), self.NOW)
+        self.assertIn("missing required field 'rationale'", problems)
+        self.assertIn("missing required field 'justifies_via'", problems)
+
+    def test_ts_far_from_the_writer_clock_is_flagged(self):
+        e = self.entry(ts="2026-10-08T14:00:00Z", id="2026-10-08T14:00:00Z-late")
+        self.assertTrue(any("write time" in p for p in ls.validate_entry(e, self.NOW)))
+        near = self.entry(ts="2026-10-08T14:56:00Z", id="2026-10-08T14:56:00Z-near")
+        self.assertEqual(ls.validate_entry(near, self.NOW), [])
+
+    def test_ts_not_utc_format_is_flagged(self):
+        e = self.entry(ts="2026-10-08 15:00:00", id="2026-10-08 15:00:00-x")
+        self.assertTrue(any("UTC" in p for p in ls.validate_entry(e, self.NOW)))
+
+    def test_id_must_be_ts_then_kebab_slug(self):
+        for bad in (
+            "2026-10-08T15:00:00Z-001_x",
+            "2026-10-08T15:00:00Z-Upper",
+            "2026-10-08T14:59:59Z-other-ts",
+            "2026-10-08T15:00:00Z-",
+        ):
+            with self.subTest(bad=bad):
+                problems = ls.validate_entry(self.entry(id=bad), self.NOW)
+                self.assertTrue(any("'<ts>-<slug>'" in p for p in problems), problems)
+        ok = self.entry(id="2026-10-08T15:00:00Z-t4734-slug-2")
+        self.assertEqual(ls.validate_entry(ok, self.NOW), [])
+
+    def test_persona_and_legacy_agents_are_history_only(self):
+        for legacy in ("artisan", "orchestrator", "orchestrator", "worker:implementer"):
+            with self.subTest(agent=legacy):
+                problems = ls.validate_entry(self.entry(agent=legacy), self.NOW)
+                self.assertTrue(any("history-only" in p for p in problems), problems)
+
+    def test_shared_role_needs_an_executor_slot(self):
+        e = self.entry(agent="engineering_orchestrator")
+        self.assertTrue(any("executor" in p for p in ls.validate_entry(e, self.NOW)))
+        e["executor"] = "engineering-orchestrator-2"
+        self.assertEqual(ls.validate_entry(e, self.NOW), [])
+
+    def test_warn_mode_writes_and_enforce_mode_refuses(self):
+        bad = self.entry(agent="artisan")
+        bad["ts"] = datetime.now(timezone.utc).strftime(ls.TS_FORMAT)
+        bad["id"] = f"{bad['ts']}-warn-mode"
+        with tempfile.TemporaryDirectory() as d:
+            ledger = Path(d)
+            target = ls.append_entry(ledger, bad)
+            self.assertIn("warn-mode", target.read_text())
+            old = ls.ENFORCE
+            ls.ENFORCE = True
+            try:
+                again = dict(bad, id=f"{bad['ts']}-enforce-mode")
+                with self.assertRaises(ValueError):
+                    ls.append_entry(ledger, again)
+                self.assertNotIn("enforce-mode", target.read_text())
+            finally:
+                ls.ENFORCE = old
 
 
 if __name__ == "__main__":

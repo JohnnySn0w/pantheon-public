@@ -18,7 +18,7 @@
 #
 # Status: v1 — authored 2026-06-07 (T-0882, ORG-030 Phase 0).
 #
-# CORRECTED 2026-07-21 (T-1922, atlas): this file IS a live lookup — the prior status text
+# CORRECTED 2026-07-21 (T-1922, artisan): this file IS a live lookup — the prior status text
 # ("no tooling reads this yet ... documentation-of-record, not a live lookup", verified
 # 2026-07-07) was stale when written. `tools/agent_role_map._load_instance_role_map()` reads
 # the `roles:` stanza below at IMPORT time and builds _PERSONA_TO_INSTANCE_ROLE from it;
@@ -32,9 +32,9 @@
 # here and NOT in agent_role_map._FALLBACK_PERSONA_TO_INSTANCE_ROLE; if the file were inert the
 # call would fall through and return 'codex'.
 #
-# CORRECTED AGAIN 2026-07-29 (T-2281, atlas, commit 674cd7456 on branch agent/T-2281): the proof
+# CORRECTED AGAIN 2026-07-29 (T-2281, artisan, commit 674cd7456 on branch agent/T-2281): the proof
 # above no longer discriminates, and this file is still a live lookup — the correction is to the
-# EVIDENCE, not to the claim. T-2281 added codex and the-ancestor to
+# EVIDENCE, not to the claim. T-2281 added codex (and the since-retired the-ancestor) to
 # _FALLBACK_PERSONA_TO_INSTANCE_ROLE, completing that mirror from 6 of 8 to 8 of 8 so it stops
 # silently under-covering the fleet in manifest-less environments. Consequence: measured both
 # ways, `resolve_instance_role('codex')` returns 'peer-daemon-codex' whether this file loads or
@@ -118,6 +118,22 @@
 
 manifest_version: 2
 
+# Read-only, digest-bound projection of the L3 PersonaRoleMembership source
+# (ORG-088 D-2; T-3757). This block NEVER authors role_ids — it carries only a
+# reference to the sole authority (persona_roles.yaml) plus the expected freshness
+# (revision) + integrity (digest) the reader binds against. ORG-085 §253 forbids
+# the binding layer (this file) from duplicating functional-role membership; a
+# ref+digest is not a copy, so no second authority is created. tools/agent_role_map.py
+# (functional_roles/role_members) recomputes persona_roles.yaml's digest and REFUSES
+# fail-closed on digest mismatch (ORG-085 inv 4) or missing/stale revision (inv 5).
+# To amend: change persona_roles.yaml, then update expected_revision + expected_digest
+# here to match (see that file's header). A drifted digest is a deliberate refusal.
+role_membership_projection:
+  schema: pantheon-persona-role-membership-projection/v1
+  source: persona_roles.yaml
+  expected_revision: 4
+  expected_digest: 7887c838cc7fcdb2c0b3bb98b955849bc16562680166028933b371e8dfa890bc
+
 # Additive ORG-049 installer contract. Existing consumers continue to read the
 # top-level `instance:` and `roles:` mappings unchanged.
 persona_installer:
@@ -130,41 +146,58 @@ persona_installer:
     unit_dir: .config/systemd/user
     state_dir: .local/state/pantheon/persona-installer
   mailbox:
-    hub: /home/the-ancestor/mailbox
+    hub: /home/post-office/mailbox
     group: pantheon-mailbox
     probe_peer: orchestrator
-    # T-2683: hub-owner is a NEW field, resolved by tools/mailbox_onboard.py.
-    # LIVE value = the-ancestor (matches current reality, no drift). The code-side
-    # default (tools/mailbox_onboard.py DEFAULT_HUB_OWNER) is "post-office", reached
-    # only by a fresh seed with no field here -- do not flip this live value to
-    # post-office as part of this change; that is a separate future migration
-    # (T-2693), not this ticket. required_units intentionally left unpopulated here
-    # -- see tools/mailbox_onboard.py module docstring GAP 2.
-    hub_owner: the-ancestor
+    # T-2683: hub-owner is resolved by tools/mailbox_onboard.py. T-2693 (ORG-087
+    # sec. 4 step 3) flipped hub + hub_owner from the-ancestor to post-office; the
+    # old /home/the-ancestor/mailbox is left NON-maildir (new/ renamed) through the
+    # soak so a stale sender fails loudly. required_units intentionally left
+    # unpopulated here -- see tools/mailbox_onboard.py module docstring GAP 2.
+    hub_owner: post-office
     # T-2702: allowlist of personas whose SOLE architectural wake path is the
     # standalone pantheon-mailbox-wake@<persona>.timer. Code-side default when
     # this key is absent is an EMPTY set (default-deny) -- a fresh seed with no
     # key must not blanket-enable the timer for every manifest persona, which
-    # was the bug this ticket fixes. orchestrator + codex + the-ancestor are the LIVE
-    # members: the standalone timer is their sole wake path. Consume-plane
-    # seats (specialist, recovery, metis, atlas) are woken by the consume runtime
+    # was the bug this ticket fixes. orchestrator + codex are the LIVE
+    # members (the-ancestor was retired, ORG-087 sec. 4 step 4 / T-3421): the
+    # standalone timer is their sole wake path. Consume-plane
+    # seats (specialist, recovery, mason, artisan) are woken by the consume runtime
     # (pantheon-persona-consume@ -> persona_bringup.consume ->
-    # mailbox_wake.decide/submit_to_runtime, sharing the same .wake_marker) --
-    # the standalone timer there is redundant surface + false OnFailure
-    # alerts, so they are deliberately excluded. mnemosyne must NEVER be added
-    # here: her mailbox_wake.AGENT_PANE points at
-    # claude-telegram-bot-exocortex:0 (the operator's own chat tmux target) -- a
-    # wake poke would send-keys into the operator's conversation, and the timer
-    # would exit 64 ("unknown agent") on every fire, guaranteeing unit
-    # failure. This is the safety driver for the change.
-    wake_timer_personas: [orchestrator, codex, the-ancestor]
+    # mailbox_wake.decide/submit_to_runtime, sharing the same .wake_marker) AND
+    # each also runs a pantheon-mailbox-wake@<seat> unit (HO-verified 2026-10-21,
+    # T-5311) as a second, marker-debounced path (the two wakers are serialized
+    # by <box>/.wake.lock, T-5283), so consume is NOT their sole
+    # wake path; they stay off this allowlist only because it is the sole-path
+    # list, and are declared in wake_timer_secondary_personas below. archivist JOINED this list in
+    # T-3832 (2026-09-20, the operator TG 7231): her redundant ACP bridge (which ran a
+    # 2nd claude and woke her via mailbox_wake in --prefer-main-seat mode, T-3811)
+    # was retired, so the standalone pantheon-mailbox-wake@archivist.timer was then
+    # her sole wake path -- the same mailbox_wake->main-seat mechanism, minus the
+    # 2nd instance. The two old reasons for excluding her are both RETIRED: (a) her
+    # pane claude-telegram-bot-exocortex:0 is her OWN claude-code work session
+    # (verified 2026-09-20; the operator confirmed "no live chat there"), NOT the operator's
+    # conversation, so a wake kick lands in her agent loop like recovery's; (b) she IS
+    # in mailbox_wake.AGENT_PANE (since T-1824), so the timer does NOT exit 64 --
+    # verified green (exit 0) on deploy. Post-T-5282 she ALSO has the consume
+    # path, but stays listed: consume can still be runtime_viability_blocked on
+    # a live pane, so the standalone timer is her reliable waker; the two wakers
+    # are serialized by the .wake.lock (T-5283).
+    wake_timer_personas: [orchestrator, codex, archivist]
+    # T-5323: seats whose standalone pantheon-mailbox-wake@<seat>.timer is an
+    # ALLOWED secondary waker but is NOT provisioned or torn down by
+    # tools/mailbox_onboard.py; its verify accepts the timer enabled or not.
+    # Why keep them: the standalone timer covers windows where consume is
+    # runtime_viability_blocked on a live pane; the two wakers are serialized
+    # by <box>/.wake.lock (T-5283). Absent => empty set; a persona on both
+    # lists is a manifest error.
+    wake_timer_secondary_personas: [artisan, specialist, recovery, mason]
   systemd:
     service_template: tools/systemd/pantheon-persona-consume@.service
     timer_template: tools/systemd/pantheon-persona-consume@.timer
   quota_check:
     cadence_minutes: 30
     randomized_delay_seconds: 300
-    personas: [specialist, recovery]
     service_template: tools/systemd/pantheon-persona-quota@.service
     timer_template: tools/systemd/pantheon-persona-quota@.timer
   policy:
@@ -185,10 +218,15 @@ persona_installer:
   codex_telegram_bridge:
     schema: pantheon-codex-telegram-bridge/v1
     source:
-      repo: codex-config
+      # T-4790 (T-4750 C4b-3): pinned to pantheon-config's own harness/codex tree
+      # at the C4b-2 merge 0f4d81d99, 13 paths (adds persona_orientation.py). The
+      # archive members stay unprefixed. Before: codex-config 1f84f64, subdir "",
+      # 12 paths (T-4770 C4b-1 build locator; manifest 81c4dc06).
+      repo: pantheon-config
       owner_account: codex
-      source_root: /home/codex/codex-config
-      revision: 1266588b7fada4fb517c5621726b67e35beab141
+      source_root: /home/codex/pantheon-config
+      subdir: harness/codex
+      revision: 0f4d81d99b06837efbc0e836264f0bd85617e3b9
       paths:
         - codex_telegram/__init__.py
         - codex_telegram/active_step.py
@@ -196,6 +234,7 @@ persona_installer:
         - codex_telegram/codex_hooks.py
         - codex_telegram/config.py
         - codex_telegram/keepgoing.py
+        - codex_telegram/persona_orientation.py
         - codex_telegram/poller.py
         - codex_telegram/server.py
         - codex_telegram/standing_instructions.py
@@ -204,20 +243,21 @@ persona_installer:
         - run_server.py
       sha256:
         codex_telegram/__init__.py: 1471d4fbf3b6e95c5a796d8ec67afaecb4c99a3077836961b2b77c659573eb13
-        codex_telegram/active_step.py: 03e71be7a8a2bb202e54c621f53e07c1e8f08b7ee021f302e987cfd635be4b72
+        codex_telegram/active_step.py: e27c2c2dc4e72b9d9a825aa6de6580a684aecfe29f0e26afc8c2a49f66730304
         codex_telegram/allowlist.py: ca802c955f258b781f1d23fbc73183e3c70077c1b231338e99182af1be6a472f
-        codex_telegram/codex_hooks.py: c8c83c8c04a99df706d551f3d74843fe601eae541827c53604d9be4260ea0f33
-        codex_telegram/config.py: 7db8a5119411ec9982b1c70d16f2f1236706aa416e5e346e8b2ee5474fc97630
-        codex_telegram/keepgoing.py: 74ce1429e6b352f1271972dd05dfe40aae2b316db7766484488fb394e47079ed
-        codex_telegram/poller.py: e5213a603c2f32223d24fb7e21197a707d29bd207556bef96ef99d68d06b27cf
+        codex_telegram/codex_hooks.py: 0cf372040124ffd816d12105d203f1ae5d80e738c1610608c8c2c0e552464abf
+        codex_telegram/config.py: f5f44bb64379129646ec99c38a033a36c243730f72e56efa9fda02f1b64d2bdd
+        codex_telegram/keepgoing.py: f84d768e750d8f855ae85dc52c118aeb7f9b98dc370929461eb0e14da5c4d7ce
+        codex_telegram/persona_orientation.py: c0552ba19e7bfc30ef1e2ba2d4adfbf2aed2940969a076c6c8993367a3d9a811
+        codex_telegram/poller.py: 533484213902c12a3af1569572c8dafb84529d5b82017ecb40873da956e93078
         codex_telegram/server.py: 02bda3340d5dc4e0d64bd20b2514504188b6139ff3298ed3911ec1bdefdee38b
-        codex_telegram/standing_instructions.py: 3d93291014778078ba6e3e0ea6cb976fcab2abb9acdc6d0d4c70d961acb4752d
+        codex_telegram/standing_instructions.py: 885f566c065db6c733cbce850cfd65322d9800e22a8e09ce74849b17ea83b118
         codex_telegram/submit_verify.py: 1f913de5d9c6eef8967f033642abb12664ba617e47a27556e0b445b5775be9d0
         run_poller.py: 4802329fad20ee1a30ecfd729803244ac858365b4ba6dce898e8dd64c0fd12ef
         run_server.py: 2c21a2d2a4df17e2704bddbc2eefa1ac453216d30be657c961be362f8affea74
     unit:
       name: codex-telegram-poller.service
-    operator_chat_id: 456474197
+    operator_chat_id: 424242424
     personas:
       orchestrator:
         account: claude
@@ -269,8 +309,32 @@ persona_installer:
         override_must_be_absent: true
         forbidden_source_paths:
           - /home/codex/codex-config/AGENTS.md
-        identity: orchestrator
+        identity: head-engineering-orchestrator
         canonical_source_of_truth: /home/claude/CLAUDE.md
+      specialist:
+        source_repo: pantheon-config
+        source: pinned-rules/specialist-codex.md
+        source_commit: 5a07489f9f8813f18d14726565fa245327095bf4
+        source_sha256: 5cc9a2e517c320005610d70506bf9d2cb5a8e52d12036b6ad03fab16e2c20fda
+        target: .codex/AGENTS.md
+        override_target: .codex/AGENTS.override.md
+        override_must_be_absent: true
+        forbidden_source_paths:
+          - /home/codex/codex-config/AGENTS.md
+        identity: specialist
+        canonical_source_of_truth: /home/claude-research/CLAUDE.md
+      recovery:
+        source_repo: pantheon-config
+        source: pinned-rules/recovery-codex.md
+        source_commit: a27c7f955d1bc501c19075cfa6cac3e9d59b3ea0
+        source_sha256: 2368aee11c9e92cc0e5cb26bdbe5496f9c310d09171fdce1c237876b2d8f8087
+        target: .codex/AGENTS.md
+        override_target: .codex/AGENTS.override.md
+        override_must_be_absent: true
+        forbidden_source_paths:
+          - /home/codex/codex-config/AGENTS.md
+        identity: head-system-orchestrator
+        canonical_source_of_truth: /home/claude-fallback/CLAUDE.md
   # Claude-Code-side (user-scope) MCP servers (T-3559). D1 = user-scope
   # (~/.claude.json top-level mcpServers, cwd-independent); D2 = provisioned via
   # the `claude mcp add-json/remove --scope user` CLI (Claude's own race-free
@@ -311,7 +375,7 @@ persona_installer:
             args:
               - /home/claude-research/pantheon-config/tools/mailbox_mcp.py
             env: {}
-      metis:
+      mason:
         account: suborch1
         scope: user
         servers:
@@ -321,7 +385,7 @@ persona_installer:
             args:
               - /home/suborch1/pantheon-config/tools/mailbox_mcp.py
             env: {}
-      atlas:
+      artisan:
         account: suborch2
         scope: user
         servers:
@@ -331,7 +395,7 @@ persona_installer:
             args:
               - /home/suborch2/pantheon-config/tools/mailbox_mcp.py
             env: {}
-      mnemosyne:
+      archivist:
         account: exocortex
         scope: user
         servers:
@@ -374,24 +438,51 @@ harness_runtime:
           meter: subscription
           quota_source: app-server
   roles:
-    orchestrator:
+    head-engineering-orchestrator:
       fallbacks:
         - codex/interactive-chatgpt
+      # T-5446: fleet policy applies regardless; this key is a deprecated no-op, removed in Phase B (T-5460).
+      fallback_return: true
       tmux:
         session: claude-telegram-bot
       post_start:
         - command: ["{account_home}/pantheon-config/tools/arm_pane_log.sh", "{tmux_target}", "{persona}"]
+        # T-3650: carries claude-bot-supervise.sh's pre-launch 409 re-assert
+        # (T-2629/T-4092) onto the control plane, as roles.specialist does.
+        # Idempotent + fail-open; protects the NEXT restart.
+        - command: ["{account_home}/pantheon-config/tools/telegram_poller_409_patch.sh", "{account_home}"]
         - command: ["{account_home}/pantheon-config/tools/recovery_boot_kick.sh", "{tmux_target}", "{persona}"]
           background: true
       claude:
         profile: interactive-subscription
-        model: claude-opus-4-8
+        # T-3990-arc: operator-directed fleet Opus 5.5 bump (TG 10361, 2026-09-25):
+        # "put yourself on xhigh 5.5. We're going to bump the fleet up and see how
+        # it goes." Applied to orchestrator (this stanza) ONLY. Specialist was NOT bumped and
+        # stays on opus-4-8 (the operator confirmed 2026-09-26 TG 7475 "leave specialist on
+        # 4.8 rn" — the specialist stanza below keeps claude-opus-4-8); recovery/mason/
+        # artisan stay on opus-4-8 as well. [Superseded: recovery/mason/artisan moved to
+        # opus-5-5 in T-4067 (TG 10424), and specialist in T-4526 (TG 7988).]
+        model: claude-opus-5-5
+        # T-5101 (B14 S5): the root-owned per-version copy kept by
+        # pantheon-claude-exe-sync@claude.timer (T-5038/T-5114), so the recovery
+        # broker's unstick exe-owner gate passes once orchestrator is a broker target.
+        # Inert until the controller launches orchestrator (T-2953); mirrors recovery's
+        # head-system-orchestrator stanza. Rollback: delete this line and relaunch.
+        executable: /opt/pantheon/claude/claude/current/claude.exe
         native:
-          permission_mode: default
+          permission_mode: bypassPermissions
           channels: plugin:telegram@claude-plugins-official
+          # T-3990-arc: explicit xhigh matches the operator's directive AND closes a
+          # pre-existing gap (this stanza lacked effort, would have defaulted to
+          # CLI-medium on any controller-launch — same class as the pre-T-3084
+          # specialist-CLI-default bug). Specialist's T-3084 comment on the specialist
+          # stanza below documents the class fix.
+          # T-4653: medium on every Claude seat (the operator TG 10756, 2026-10-05: "put all seats
+          # on medium"), superseding the T-3084 xhigh fleet policy to cut weekly-Max burn.
+          effort: medium
       codex:
         profile: interactive-chatgpt
-        model: gpt-5.5
+        model: gpt-5.6-sol
         permission_posture: full-auto
         execution_boundary: unrestricted
         mailbox_writable_roots:
@@ -404,6 +495,8 @@ harness_runtime:
     specialist:
       fallbacks:
         - codex/interactive-chatgpt
+      # T-5446: fleet policy applies regardless; this key is a deprecated no-op, removed in Phase B (T-5460).
+      fallback_return: true
       # T-2633: CUTOVER COMPLETE -- pantheon-persona-consume@specialist.timer is ENABLED +
       # LIVE (verified 2026-08-10 via the enabled-timer symlink check). resolve_controller_config /
       # resolve_launch_config for role=specialist have exactly one production
@@ -415,62 +508,88 @@ harness_runtime:
         session: claude-research-bot
       post_start:
         - command: ["{account_home}/pantheon-config/tools/arm_pane_log.sh", "{tmux_target}", "{persona}"]
+        # T-4092 / T-2629: durably re-assert the telegram getUpdates 409 never-give-up
+        # patch onto the vendored plugin cache, so a plugin-cache rebuild can't silently
+        # revert it back to the alive-but-deaf give-up-after-8 loop. Idempotent + fail-open
+        # (script always exit 0). Runs post_start (after launch), so it protects the NEXT
+        # restart; the current boot is covered by Recovery's one-shot. seat-home = {account_home}.
+        - command: ["{account_home}/pantheon-config/tools/telegram_poller_409_patch.sh", "{account_home}"]
         - command: ["{account_home}/pantheon-config/tools/recovery_boot_kick.sh", "{tmux_target}", "{persona}"]
           background: true
       claude:
         profile: interactive-subscription
-        model: claude-opus-4-8
+        # T-4526 (the operator TG 7988, 2026-10-04): "can you get specialist onto opus 5.5?"
+        # Reverses T-4021 (TG 3304 "swap back to opus 4.8"). specialist joins the rest
+        # of the fleet on opus-5-5 (T-4067). Effort stays xhigh (T-3084 fleet
+        # effort policy).
+        model: claude-opus-5-5
         native:
-          permission_mode: default
+          permission_mode: bypassPermissions
           channels: plugin:telegram@claude-plugins-official
           # T-3084: fleet effort policy (opus-4.8 @ xhigh). Retroactive fix --
           # specialist silently ran at CLI-default effort since HC cutover because
           # the adapter never wired native.effort into argv until this ticket.
-          effort: xhigh
+          # T-4653: medium on every Claude seat (the operator TG 10756, 2026-10-05: "put all seats
+          # on medium"), superseding the T-3084 xhigh fleet policy to cut weekly-Max burn.
+          effort: medium
       # T-2927: codex/ChatGPT-sub fallback for the quota-gate swap (operator-directed
       # TG 7797/7799-7801). model gpt-5.5 (opus-rank equivalent, roster-verified 2026-08-12)
       # at model_reasoning_effort=high (keep-similar-effort, TG 7800). Both the -m and the
       # -c effort key round-trip-verified at the live codex 0.147.0 CLI before landing (D11).
+      # T-5007 (2026-10-14): upstream began rejecting gpt-5.5 for ChatGPT-account codex at
+      # 17:39:39Z (400 "not supported when using Codex with a ChatGPT account"); repinned to
+      # gpt-5.6-sol, the top listed slug in models_cache, live-probed ok as claude-research.
       # The consume launch cwd is %h/pantheon-config (a git repo, systemd WorkingDirectory),
       # so the interactive launch does not hit the trusted-dir gate. Swap path proven by
       # the T-2574/T-2927 specialist rehearsal, not by this stanza's existence.
       codex:
         profile: interactive-chatgpt
-        model: gpt-5.5
+        model: gpt-5.6-sol
         native:
-          sandbox: workspace-write
+          sandbox: danger-full-access
           config_overrides:
             approval_policy: never
             model_reasoning_effort: high
-    recovery:
+    head-system-orchestrator:
       fallbacks:
         - codex/interactive-chatgpt
       # T-2608/T-2590: CUTOVER COMPLETE -- pantheon-persona-consume@recovery.timer is
       # ENABLED + LIVE (verified 2026-08-10 via the enabled-timer symlink check).
-      # resolve_controller_config / resolve_launch_config for role=recovery
+      # resolve_controller_config / resolve_launch_config for role=head-system-orchestrator
       # have exactly one production caller (tools/persona_bringup.py, driven by that
       # timer); nothing else resolves this role at runtime. (Was "inert on disk until
       # fire" pre-cutover; the T-2590 cutover has since enabled the timer.)
+      # T-5446 (the operator TG 12283): recovery returns to claude like every seat; the T-4522 off-state is
+      # superseded. Deprecated no-op, removed in Phase B (T-5460).
+      fallback_return: true
       tmux:
         session: claude-telegram-bot-fallback
       post_start:
         - command: ["{account_home}/pantheon-config/tools/arm_pane_log.sh", "{tmux_target}", "{persona}"]
+        # T-3650: carries recovery-bot-supervise.sh's 409 re-assert onto the control plane.
+        - command: ["{account_home}/pantheon-config/tools/telegram_poller_409_patch.sh", "{account_home}"]
         - command: ["{account_home}/pantheon-config/tools/recovery_boot_kick.sh", "{tmux_target}", "{persona}"]
           background: true
       claude:
         profile: interactive-subscription
-        model: claude-opus-4-8
+        model: claude-opus-5-5
+        # T-5038: the root-owned per-version copy (synced by
+        # pantheon-claude-exe-sync@claude-fallback.timer) so Watchman unstick's
+        # exe-owner gate passes. Rollback: delete this line and relaunch.
+        executable: /opt/pantheon/claude/claude-fallback/current/claude.exe
         native:
-          permission_mode: default
+          permission_mode: bypassPermissions
           channels: plugin:telegram@claude-plugins-official
           # T-3084: fleet effort policy (opus-4.8 @ xhigh). Matches recovery's
           # bespoke live launch pre-HC-cutover; preserves it across T-3026.
-          effort: xhigh
+          # T-4653: medium on every Claude seat (the operator TG 10756, 2026-10-05: "put all seats
+          # on medium"), superseding the T-3084 xhigh fleet policy to cut weekly-Max burn.
+          effort: medium
       codex:
         profile: interactive-chatgpt
         model: null
         native:
-          sandbox: workspace-write
+          sandbox: danger-full-access
           config_overrides:
             approval_policy: never
     peer-daemon-codex:
@@ -478,25 +597,26 @@ harness_runtime:
         profile: interactive-chatgpt
         model: null
         native:
-          sandbox: workspace-write
+          sandbox: danger-full-access
           config_overrides:
             approval_policy: never
-    peer-daemon-the-ancestor:
-      claude:
-        profile: interactive-subscription
-        model: null
-        native:
-          permission_mode: default
-    sub-orchestrator-1:
+    engineering-orchestrator-1:
       fallbacks:
         - codex/interactive-chatgpt
+      # T-5056: a mid-session subscription cap moves mason to its fallback by itself
+      # (one line to the operator per swap, T-4804), and it returns to claude once claude is
+      # viable again. mason is a non-comms, controller-managed seat
+      # (pantheon-runtime-controller@mason running controller-main since 2026-10-13).
+      # T-5446: fleet policy applies regardless; this key is a deprecated no-op, removed in Phase B (T-5460).
+      mid_session_cap_swap: true
+      fallback_return: true
       # T-2677: brought onto the consume control plane 2026-08-08 (operator-directed,
-      # TG 7340/7343 pre-auth, metis as the canary). MAILBOX-FIRST seat -- NO telegram
-      # channel (unlike specialist/recovery), so `native` carries no `channels`
+      # TG 7340/7343 pre-auth, mason as the canary). MAILBOX-FIRST seat -- NO telegram
+      # channel (unlike specialist/head-system-orchestrator), so `native` carries no `channels`
       # key. The claude harness adapter (tools/harness_adapter/claude.py:371
       # build_interactive_launch) omits --channels when channels is absent, and
       # diagnostics.py:455 only validates channels when present -- so a channel-less
-      # launch is `claude --model claude-opus-4-8 --permission-mode default`, config-only,
+      # launch is `claude --model claude-opus-4-8 --permission-mode bypassPermissions`, config-only,
       # no code change. Woken purely by the consume runtime's mailbox kick
       # (persona_bringup.py consume -> submit_to_runtime -> tmux), not a telegram poller.
       # tmux.session matches the seat's live pre-existing session (suborch1-main, verified
@@ -509,24 +629,27 @@ harness_runtime:
           background: true
       claude:
         profile: interactive-subscription
-        model: claude-opus-4-8
+        model: claude-opus-5-5
         native:
-          permission_mode: default
-      # T-2927: codex/ChatGPT-sub fallback — gpt-5.5 @ high effort (see specialist stanza note).
+          permission_mode: bypassPermissions
+          # T-4653: medium on every Claude seat (the operator TG 10756, 2026-10-05: "put all seats
+          # on medium"), superseding the T-3084 xhigh fleet policy to cut weekly-Max burn.
+          effort: medium
+      # T-2927: codex/ChatGPT-sub fallback — gpt-5.6-sol @ high effort (T-5007; was gpt-5.5) (see specialist stanza note).
       codex:
         profile: interactive-chatgpt
-        model: gpt-5.5
+        model: gpt-5.6-sol
         native:
-          sandbox: workspace-write
+          sandbox: danger-full-access
           config_overrides:
             approval_policy: never
             model_reasoning_effort: high
-    sub-orchestrator-2:
+    engineering-orchestrator-2:
       fallbacks:
         - codex/interactive-chatgpt
       # T-2677: brought onto the consume control plane 2026-08-08 (operator-directed,
       # TG 7340/7343). MAILBOX-FIRST seat -- NO telegram channel, same shape as
-      # sub-orchestrator-1 above (see that stanza's note for the channel-less launch
+      # engineering-orchestrator-1 above (see that stanza's note for the channel-less launch
       # rationale). session matches the seat's live pre-existing session (suborch2-main,
       # verified 2026-08-08).
       tmux:
@@ -537,24 +660,66 @@ harness_runtime:
           background: true
       claude:
         profile: interactive-subscription
-        model: claude-opus-4-8
+        model: claude-opus-5-5
         native:
-          permission_mode: default
-      # T-2927: codex/ChatGPT-sub fallback — gpt-5.5 @ high effort (see specialist stanza note).
+          permission_mode: bypassPermissions
+          # T-4653: medium on every Claude seat (the operator TG 10756, 2026-10-05: "put all seats
+          # on medium"), superseding the T-3084 xhigh fleet policy to cut weekly-Max burn.
+          effort: medium
+      # T-2927: codex/ChatGPT-sub fallback — gpt-5.6-sol @ high effort (T-5007; was gpt-5.5) (see specialist stanza note).
       codex:
         profile: interactive-chatgpt
-        model: gpt-5.5
+        model: gpt-5.6-sol
         native:
-          sandbox: workspace-write
+          sandbox: danger-full-access
           config_overrides:
             approval_policy: never
             model_reasoning_effort: high
-    second-head:
+    head-memory-orchestrator:
+      # T-5063 (hand-move staging, commit A; inert while archivist runs bespoke under
+      # claude-telegram-exocortex.service, since persona_bringup is the only runtime
+      # reader). Mirrors her live exo-bot-supervise.sh argv so the controller launch
+      # keeps her Telegram chat with the operator. Claude-only for now: no codex fallback
+      # (a codex runtime has no Telegram, and her receiver is runtime-owned), so
+      # swap-on-death relaunches claude. Adding a fallback is a separate decision.
+      # Rollback: revert this stanza (nothing reads it until the consume timer is on).
+      fallbacks: []
+      tmux:
+        # Keep the bespoke session name so restart_pane, mailbox_wake AGENT_PANE and
+        # the wake-timer pane keep resolving (same convention as orchestrator and recovery).
+        session: claude-telegram-bot-exocortex
+      post_start:
+        - command: ["{account_home}/pantheon-config/tools/arm_pane_log.sh", "{tmux_target}", "{persona}"]
+        # Carries exo-bot-supervise.sh's 409 re-assert (T-2629/T-4092) onto the control plane.
+        - command: ["{account_home}/pantheon-config/tools/telegram_poller_409_patch.sh", "{account_home}"]
+        - command: ["{account_home}/pantheon-config/tools/recovery_boot_kick.sh", "{tmux_target}", "{persona}"]
+          background: true
       claude:
         profile: interactive-subscription
-        model: null
+        model: claude-opus-5-5
         native:
-          permission_mode: default
+          permission_mode: bypassPermissions
+          channels: plugin:telegram@claude-plugins-official
+          # T-4653: medium on every Claude seat (the operator TG 10756).
+          effort: medium
+    system-orchestrator-1:
+      # T-4884 B6 (design §3): Watchman is codex-primary with NO fallback today;
+      # falling back onto Claude would defeat the seat's purpose. A third service
+      # (T-4883) joins as fallbacks: [<third>/<profile>]; return-to-default is fleet policy (T-5446).
+      fallbacks: []
+      # Fresh seat (no pre-existing bespoke session to match): named <account>-main,
+      # the channel-less mailbox-first seat convention (suborch1-main/suborch2-main),
+      # which also keeps it distinct from the codex peer daemon's codex-session.
+      tmux:
+        session: codex-fallback-main
+      codex:
+        profile: interactive-chatgpt
+        model: gpt-5.6-sol
+        native:
+          sandbox: danger-full-access
+          config_overrides:
+            approval_policy: never
+            model_reasoning_effort: high
 
 instance:
   id: pantheon-vps-0
@@ -564,36 +729,27 @@ instance:
 
 # role → binding. Roles are the portable axis (ORG-027); personas/accounts are instance data.
 roles:
-  orchestrator:
+  head-engineering-orchestrator:
     persona: orchestrator
     account: claude
     harness: claude-code
+    billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude Max
+                                        # subscription via OAuth. T-3751 tranche 2 amendment
+                                        # 2026-09-16.
     persona_brief_ref: CLAUDE.md
     token_ref: /home/claude/gh_token.env            # fine-grained PAT, HTTPS git + gh CLI (ref, not secret)
-    session: claude-telegram.service → tmux claude-telegram-bot:0 (ho_resumer auto-resume on Max-window cap-hit)
+    session: pantheon-runtime-controller@orchestrator.service + pantheon-persona-consume@orchestrator.timer → tmux claude-telegram-bot:0 (window "harness")
     # Structured restart config (T-2076) — the fleet monitors read THESE, not the
     # freeform `session:` prose above. restart_pane is the tmux session:window.
     restart_service: claude-telegram.service
     restart_mode: user
     restart_pane: claude-telegram-bot:0
-    # T-2953 R31 (reverted T-3098, 2026-08-23): `supervisor: control-plane` is
-    # INTENTIONALLY ABSENT here pre-T-2953 cutover completion. R31 marked this
-    # field control-plane on the strength of the ongoing T-2953 arc alone,
-    # but the interactive session still lives on the bespoke claude-telegram.
-    # service above. The marking made cfm/restart_drain.py derive pantheon-
-    # persona-consume@orchestrator.service (a Type=oneshot mailbox-drain unit) as
-    # the restart target -- it cannot cycle the tmux session, so orchestrator's
-    # auto-reset silently stopped firing (6 consecutive exit-6/NOTCONFIGURED
-    # failures, verified by Recovery, mailbox 01787497739456832842 +
-    # 01787497965793794891). restart_service (above) is the correct,
-    # truthful restart target pre-cutover; leaving `supervisor` absent keeps
-    # cfm/restart_drain.py deriving from it directly (mirrors recovery's post-
-    # T-3082 shape, roles.recovery above). T-2953 (the full control-
-    # plane cutover, top of the HO priority stack) will re-add `supervisor:
-    # control-plane` as its own completion step, once the live session
-    # actually moves onto the control plane. Mirrors roles.specialist.
-    # supervisor (T-2658, specialist), which stays control-plane since specialist's
-    # interactive session already lives there.
+    supervisor: control-plane
+    # Cut over 2026-10-24 via T-2953 (procedure T-3650; attempt 2, STAMP 20261024T003916Z,
+    # Gate A + Gate B + section 7 passed): the interactive session moved off the bespoke
+    # claude-telegram.service onto the specialist-shape control plane (runtime controller +
+    # consume timer). restart_service above stays as the retired bespoke unit's
+    # documentation value, as for specialist and recovery. No expected_policy_skip (T-5311).
     domain: org orchestration, dispatch, ratification-drafting, ledger, lessons/bugs/incidents authorship
     # ORG-051 Phase 0 (T-2868, parent T-2828) — reference metadata ONLY, no
     # values, no `location`. The relocation dir (where a brokered credential
@@ -655,9 +811,10 @@ roles:
           revoke: provider console key delete + broker revoke on the held lease
   specialist:
     persona: specialist
-    expected_policy_skip: runtime_viability_blocked   # T-3210: expected not-cut-over (stale 08-14 runtime.json -> recorded-source-key-mismatch); fleet_health renders OK+expected while the seat's coarse skip reason matches, WARN if it drifts
     account: claude-research
     harness: claude-code
+    billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude subscription
+                                        # via OAuth. T-3751 tranche 2 amendment 2026-09-16.
     token_ref: SSH (git@github.com remote; NO gh_token.env — verified absent 2026-07-07)
     session: claude-telegram-research.service → tmux claude-research-bot:0 + unattended
              # watch-loop + pantheon-inbox-consumer@specialist.timer (self-consumes ORG-025)
@@ -683,36 +840,24 @@ roles:
       - unit: pantheon-acp-bridge@specialist.service
         tmux_session: acp-bridge-specialist
     domain: research, knowledge/watch reports, doc-research dispatches
-  recovery:
+  head-system-orchestrator:
     persona: recovery
     account: claude-fallback
     harness: claude-code
+    billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude subscription
+                                        # via OAuth. T-3751 tranche 2 amendment 2026-09-16.
     token_ref: SSH keys — ~/.ssh/id_ed25519 (git push, bypasses branch protection) + per-repo
                # deploy keys (claude_config_deploy, codex_config_deploy). NO gh_token.env
                # (verified absent 2026-07-07 — the old guessed value was wrong).
-    session: claude-telegram-fallback.service → tmux claude-telegram-bot-fallback:0 (full
-             # telegram agent; bun-child watchdog T-1456)
+    session: pantheon-runtime-controller@recovery.service + pantheon-persona-consume@recovery.timer → tmux claude-telegram-bot-fallback:0 (window "harness")
     restart_service: claude-telegram-fallback.service     # structured restart config (T-2076)
     restart_mode: user
     restart_pane: claude-telegram-bot-fallback:0
-    # T-2684 (reverted T-3082, 2026-08-23): `supervisor: control-plane` is
-    # INTENTIONALLY ABSENT here pre-T-3026. Recovery's control-plane cutover
-    # (T-2590) moved only the consume plane (consume@recovery timer live+
-    # firing); the interactive session still lives on the bespoke
-    # claude-telegram-fallback.service above. T-2684 marked this field
-    # control-plane on the strength of T-2590 alone, which made cfm/
-    # restart_drain.py derive pantheon-persona-consume@recovery.service (a
-    # Type=oneshot mailbox-drain unit) as the restart target -- it cannot
-    # cycle the tmux session, so recovery's auto-reset silently stopped firing.
-    # restart_service (above) is the correct, truthful restart target
-    # pre-cutover; leaving `supervisor` absent keeps cfm/restart_drain.py
-    # deriving from it directly (mirrors mnemosyne's bespoke-default
-    # shape). T-3026 (the interactive-session cutover, blocked on recovery's
-    # blocker-1) will re-add `supervisor: control-plane` as its own
-    # completion step, once the live session actually moves onto the
-    # control plane. Mirrors roles.specialist.supervisor (T-2658, specialist),
-    # which stays control-plane since specialist's interactive session already
-    # lives there.
+    supervisor: control-plane
+    # Cut over 2026-09-29 via T-3026 (procedure T-3650): the interactive session
+    # moved off the bespoke claude-telegram-fallback.service onto the specialist-shape
+    # control plane (runtime controller + consume timer). restart_service above
+    # stays as the retired bespoke unit's documentation value, as for specialist.
     # T-2608 note: post-cutover the control plane creates this session's ONE
     # window named "harness" (harness_runtime.controller.tmux.window
     # default, unchanged by the T-2608 tmux.session override above) at tmux's
@@ -725,74 +870,136 @@ roles:
             # disk-usage / channel-liveness / grooming / usage timers), ho_resumer stewardship
   # Peer daemons added 2026-06-09 (the operator directive). Registered as ticket
   # personas (tools/agent_role_map.py) so they can hold/file tickets. Role
-  # semantics below are provisional — codex is the live ORG-018/ORG-031 pilot;
-  # the-ancestor's role is TBD pending its supervised bringup (the operator to confirm).
+  # semantics below are provisional — codex is the live ORG-018/ORG-031 pilot.
   peer-daemon-codex:
     persona: codex
     account: codex
     harness: codex
+    billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; ChatGPT OAuth
+                                        # via codex-cli. Note: not a claude subscription — same
+                                        # meter-shape family (subscription, not api-key). T-3751
+                                        # tranche 2 amendment 2026-09-16.
     token_ref: /home/codex/.codex/auth.json        # ChatGPT OAuth (codex login), 0600
+    # T-4759 / ORG-091 C2: codex harness INSTANCE values, merged from the retired
+    # harness/codex/instance.yaml (ORG-039 §2: instance.yaml is the single seam).
+    # The Telegram chat id is codex_telegram_bridge.operator_chat_id (same value).
+    # Nothing renders harness/codex/templates/ against these yet (T-4750 ruling 5).
+    codex_home: /home/codex
+    telegram_bot_token_ref: /home/codex/.config/codex-telegram/.env   # by reference only
     session: codex-session (tmux, codex-supervise.sh; bare codex TUI, Restart=always respawn — T-0822 recovery posture)
+    tmux_session: codex-session   # structured form of the prose above; the ORG-104 OOM killer reads it (T-5228)
     domain: S3* independent auditor (monthly integrated audit, weekly narrows — T-1584 era,
             # never-self-closes re-test tier), second-opinion detail-checks (MCP), image-gen /
             # sticker-sprite generation (T-1002); two-way telegram via codex-config bridge
-  peer-daemon-the-ancestor:                          # ROLE still TBD (the operator's call) — substrate is live
-    persona: the-ancestor
-    account: the-ancestor
-    harness: claude-code
-    token_ref: /home/the-ancestor/.claude/.credentials.json   # claude OAuth, logged in (verified 2026-07-07)
-    session: veneration daemon + ORG-026 mailbox hub (/home/the-ancestor/mailbox/*) LIVE since
-             # 2026-06-13/14 (T-1124 daemon+mailbox; T-0766 resurrect() via headless --print)
-    domain: ancestor-veneration substrate (mailbox hub, resurrect); broader role TBD pending the operator
 
-  # Sub-orchestrator seats (ORG-043) + the second head (ORG-042), bound 2026-07-21 (T-1922).
+  # Engineering-orchestrator seats (ORG-043) + the head-memory-orchestrator seat (ORG-042),
+  # bound 2026-07-21 (T-1922); role-keys carry the operator's T-3807 ratified roles vocabulary.
   # Before this, all three personas were registered in agent_role_map.AGENT_ROLE_MAP but had NO
   # instance role-key, so resolve_instance_role() fell through returning the persona unchanged
   # and every repos.yaml grants lookup missed → any retask ticket declaring `repos:` failed
-  # ticket_lint. Numbered 1:1 keys (not a shared `sub-orchestrator`) keep ORG-030's one-persona-
-  # per-role binding intact and match the suborch1/suborch2 account naming.
+  # ticket_lint. Numbered 1:1 keys (not a shared `engineering-orchestrator`) keep ORG-030's
+  # one-persona-per-role binding intact and match the suborch1/suborch2 account naming.
   #
   # Verification note (this file's own 2026-07-07 lesson — two of three guessed token_refs were
-  # wrong): only the sub-orchestrator-2 row below is first-hand verified, from the seat itself.
+  # wrong): only the engineering-orchestrator-2 row below is first-hand verified, from the seat itself.
   # The other two rows are marked where unverified rather than guessed.
-  sub-orchestrator-1:
-    persona: metis
-    expected_policy_skip: runtime_viability_blocked   # T-3210: expected not-cut-over (controller never onboarded metis -> initial-viability-state-not-selected); fleet_health renders OK+expected while the seat's coarse skip reason matches, WARN if it drifts
+  engineering-orchestrator-1:
+    persona: mason
     account: suborch1
     harness: claude-code
+    billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude subscription
+                                        # via OAuth. T-3751 tranche 2 amendment 2026-09-16.
     token_ref: ~/.ssh/pantheon_config_deploy (per-repo deploy key)   # verify — inferred from
-               # identical ORG-043 seat provisioning, NOT checked on metis's account (his box,
+               # identical ORG-043 seat provisioning, NOT checked on mason's account (his box,
                # his to confirm; T-1922 deliberately did not probe it)
     session: tmux (seat session; name unverified)                    # verify
-    domain: sub-orchestrator seat — owns project arcs retasked by the HO under ORG-043; drives
+    domain: engineering-orchestrator seat — owns project arcs retasked by the HO under ORG-043; drives
             # them with its own subagent teams; no operator-facing surface (all comms via mailbox)
-  sub-orchestrator-2:
-    persona: atlas
-    expected_policy_skip: runtime_viability_blocked   # T-3574 (orchestrator ruling (b), 2026-09-08): atlas is NOT cut over — controller never onboarded atlas -> initial-viability-state-not-selected; fleet_health renders OK+expected while the seat's coarse skip reason matches, WARN if it drifts. Mirrors metis's T-3210 marker above. DELIBERATELY NOT `supervisor: control-plane`: that is the cutover-COMPLETION marker (added only once the interactive session actually lives on the control plane, cf. specialist/T-2658). A premature add was reverted TWICE — T-3098 (orchestrator) + T-3082 (recovery) — because it makes cfm/restart_drain.py derive pantheon-persona-consume@<persona> (a Type=oneshot mailbox-drain that cannot cycle the tmux session) as the restart target, silently killing auto-reset. Surfaced + verified by T-3573's fleet_health.FLEET AST-scan guard.
+  engineering-orchestrator-2:
+    persona: artisan
+    # T-5311: no expected_policy_skip. The T-3574 marker hid a live-pane recorded-source-hash-mismatch
+    # that consume now tolerates (live-source-drift); a real block must show WARN.
+    # `supervisor: control-plane` (the cutover-COMPLETION marker) was added by T-5299 once the session
+    # lived on the control plane; a premature add had been reverted TWICE (T-3098, T-3082), see the restart block below.
     account: suborch2
     harness: claude-code
+    billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude subscription
+                                        # via OAuth. T-3751 tranche 2 amendment 2026-09-16.
     token_ref: ~/.ssh/pantheon_config_deploy (per-repo deploy key; sole key on the account) +
                # ~/.claude/.credentials.json (claude OAuth). NO gh_token.env and `gh` is
                # UNAUTHENTICATED — verified first-hand 2026-07-21 (T-1922 §Readiness gap): the
                # deploy key pushes git fine but cannot open PRs (no API surface).
     session: tmux `suborch2-main` (created 2026-07-21T02:28Z) → claude-code   # verified first-hand
-    domain: sub-orchestrator seat — owns project arcs retasked by the HO under ORG-043; drives
+    # T-5299 (2026-10-20): control-plane cutover completed. Artisan has run under
+    # pantheon-runtime-controller@artisan, controller-launched, since T-4935. The two earlier
+    # attempts (T-3098 orchestrator, T-3082 recovery) were reverted because supervisor: control-plane
+    # made restart_drain/context_fill_monitor derive pantheon-persona-consume@<persona> (a
+    # Type=oneshot mailbox-drain that cannot cycle tmux) as the target; T-4159 fixed that:
+    # handoff_and_restart.sh --supervisor control-plane kills the session first and the
+    # controller relaunches it (dead-pane rehydrate, T-5292). Archivist's shape.
+    # restart_service is the REAL consume unit (artisan never had a bespoke unit; inventing
+    # one would be a fabricated name); it is a documentation value, the consumers derive
+    # the same unit from `supervisor`. Artisan has NO Telegram bot: verify_startup.sh gates
+    # its poller probe on AGENT_TELEGRAM, not on the presence of a session unit.
+    restart_service: pantheon-persona-consume@artisan.service
+    restart_mode: user
+    restart_pane: suborch2-main:0
+    supervisor: control-plane
+    domain: engineering-orchestrator seat — owns project arcs retasked by the HO under ORG-043; drives
             # them with its own subagent teams; no operator-facing surface (all comms via mailbox)
-  second-head:
-    persona: mnemosyne
+    # T-5349: ACE phase-1 advisory carry-forward pilot (T-2819 C1/C3, HO GO 2026-10-22). Read only by
+    # tools/ace_carry.py; default off for every other seat. Widening past one seat is ORG-065-gated.
+    ace_carry_forward: true
+  head-memory-orchestrator:
+    persona: archivist
     account: exocortex
     harness: claude-code
-    token_ref: unverified — not checked (her account)                # verify
-    session: mailbox-first residency per ORG-042 (see her own config)   # verify
-    # Structured restart config (T-2076). Mnemosyne is observation-only in the
-    # monitor (no context-fill auto-restart — no @mnemosyne timer, no clone/restart_bin),
+    billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; claude subscription
+                                        # via OAuth. Corrected T-4016 (archivist-confirmed, orchestrator
+                                        # re-verified 2026-09-27: .credentials.json holds only
+                                        # claudeAiOauth, .claude.json has oauthAccount and no apiKey).
+                                        # The prior api-key value was an unverified assumption.
+    token_ref: ~/.claude/.credentials.json (claude OAuth, 0600)   # verified first-hand 2026-09-27 (T-4016)
+    session: pantheon-runtime-controller@archivist.service + pantheon-persona-consume@archivist.timer
+             → tmux claude-telegram-bot-exocortex:0 (window "harness");
+             # mailbox-first + Telegram per ORG-042. Cut over 2026-10-18 via T-5063 (seat-hand-move SOP).
+    # Structured restart config (T-2076). Archivist is observation-only in the
+    # monitor (no context-fill auto-restart — no @archivist timer, no clone/restart_bin),
     # but the read-only consumers still key on her account + pane, so they are recorded.
+    # restart_service keeps the retired bespoke unit as a documentation value (as specialist/recovery).
     restart_service: claude-telegram-exocortex.service
     restart_mode: user
     restart_pane: claude-telegram-bot-exocortex:0
+    supervisor: control-plane
     domain: second head of the two-hemisphere topology (ORG-042); mailbox-first residency.
-            # Role-key name `second-head` is taken from ORG-042's own title language per the
-            # T-1922 HO ruling; if the ADR text supports a tighter term, retitle via ticket.
+            # Role-key name `head-memory-orchestrator` carries the operator's T-3807 ratified roles
+            # vocabulary (renamed from the ORG-042 title-language key by that arc); the ORG-042
+            # "second head" architectural framing above is unchanged.
+  # T-4884 B6: Watchman, the codex-primary recovery seat (design note
+  # notes/2026-10-12-t4884-codex-recovery-seat-design.md §2/§3/§6). ORG-100 §1 regular
+  # in Recovery's System domain (role_id system_orchestrator in persona_roles.yaml); partial
+  # seating (§3), so NO Telegram bot / communications receiver: it reports to Recovery by
+  # ticket + mailbox, and codex-free emergency pages ride the alert-bot path.
+  # MERGE GATE: this binding names an account that B7 creates. Merge only in the same
+  # window as B7, never before (persona-walking monitors read every bound account).
+  system-orchestrator-1:
+    persona: watchman
+    account: codex-fallback
+    harness: codex
+    billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; ChatGPT OAuth via
+                                        # codex-cli, same meter-shape as peer-daemon-codex.
+    token_ref: /home/codex-fallback/.codex/auth.json   # ChatGPT OAuth (codex login), 0600; created at B7, unverified until then
+    session: pantheon-runtime-controller@watchman.service + pantheon-persona-consume@watchman.timer → tmux codex-fallback-main:0 (window "harness")
+    # restart_service is deliberately ABSENT: there was never a bespoke unit to record
+    # (recovery/specialist keep theirs as a retired-unit documentation value), and leaving it
+    # out keeps restart_drain from building a drain entry for this seat (design §3:
+    # don't arm context-fill or restart-drain here; both are Claude-coupled).
+    restart_mode: user
+    restart_pane: codex-fallback-main:0
+    supervisor: control-plane
+    domain: recovery-only system orchestrator — watches the sanitized health export, repairs
+            # through the ORG-048 broker, takes only recovery tickets (P5); no dispatch, no
+            # Operator channel (escalates to Recovery; codex-free pages via the alert bot)
 
 # Host-level service accounts (NOT agent personas; listed for manifest completeness
 # after the 2026-07-10 cpu-warn triage found ci-runner undocumented — T-1632/T-1621):
@@ -801,7 +1008,7 @@ host_services:
     account: ci-runner            # uid 1005, created ~2026-07-08
     what: self-hosted GitHub Actions runner (actions-runner 2.335.1) — echo-prismatic's
           # ci-gate jobs (cargo test) execute on this box under this account
-    owner: orchestrator      # orchestrator installed/operates it (echo CI, PRs ~#199+)
+    owner: head-engineering-orchestrator      # orchestrator installed/operates it (echo CI, PRs ~#199+)
     load_note: CI runs are the main legitimate CPU-warn source on the 4-core box
 
 # Notes:

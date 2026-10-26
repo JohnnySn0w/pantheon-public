@@ -270,7 +270,7 @@ def _scenario_self_owner(caller_uid: int) -> dict:
 def _scenario_self_trust_domain(caller_uid: int) -> dict:
     """Caller resolves to approver 'specialist'; the plan owner 'alpha' is a
     DISTINCT subject mapped to the SAME uid — gate 11 arm (ii):
-    approver_shares_trust_domain. 'metis' is a legitimate approver on a
+    approver_shares_trust_domain. 'mason' is a legitimate approver on a
     third uid whose driver-side review-open lets the bus caller attempt
     the DECIDE arm too."""
 
@@ -279,33 +279,33 @@ def _scenario_self_trust_domain(caller_uid: int) -> dict:
             subjects={
                 "specialist": caller_uid,
                 "alpha": caller_uid,
-                "metis": caller_uid + 3000,
+                "mason": caller_uid + 3000,
             },
             approvers={
                 "specialist": approver_entry(),
-                "metis": approver_entry(),
+                "mason": approver_entry(),
             },
         ),
         "plan_owner": "alpha",
         "consumer_offset": 2000,
         "ingress_offset": 3000,
-        "open_review_as": "metis",
+        "open_review_as": "mason",
     }
 
 
 def _scenario_consumer(caller_uid: int) -> dict:
     """Caller IS the configured consumer (broker) uid; a granted grant
-    is seeded driver-side by approver 'metis' (distinct uid)."""
+    is seeded driver-side by approver 'mason' (distinct uid)."""
 
     return {
         "policy": approver_policy_raw(
-            subjects={"alpha": caller_uid + 1000, "metis": caller_uid + 3000},
-            approvers={"metis": approver_entry()},
+            subjects={"alpha": caller_uid + 1000, "mason": caller_uid + 3000},
+            approvers={"mason": approver_entry()},
         ),
         "plan_owner": "alpha",
         "consumer_offset": 0,
         "ingress_offset": 3000,
-        "seed_grant_as": "metis",
+        "seed_grant_as": "mason",
     }
 
 
@@ -347,7 +347,58 @@ def _scenario_cross_service(caller_uid: int) -> dict:
     }
 
 
+def _scenario_cross_service_requester(caller_uid: int) -> dict:
+    """T-2916 (gate 5, requester-only seat end to end): the same two real
+    services as ``cross_service``, but the caller's uid resolves only to
+    the plan-owning subject 'alpha'; the approver roster ('specialist') lives
+    on a different uid. Every Reviewer call from the caller - through the
+    approver MCP adapter or directly over D-Bus - must be refused."""
+
+    return {
+        "policy": approver_policy_raw(
+            subjects={
+                "specialist": caller_uid + 2000,
+                "alpha": caller_uid,
+                "bravo": 60001,
+            },
+            approvers={"specialist": approver_entry()},
+        ),
+        "plan_owner": None,
+        "consumer_offset": 2000,
+        "ingress_offset": 3000,
+        "metadata_from_broker": True,
+    }
+
+
+def _scenario_cross_service_revoked(caller_uid: int) -> dict:
+    """T-2916 (ORG-052 §7 revocation): ``cross_service`` after a policy
+    revision that removes 'specialist' (the caller's uid) from the approver
+    roster. 'specialist' stays a known subject; 'mason' is the remaining
+    approver on another uid. Run against the SAME journal root as a prior
+    ``cross_service`` run, it models a policy install + service restart
+    while the approver seat's harness config is stale."""
+
+    return {
+        "policy": approver_policy_raw(
+            subjects={
+                "specialist": caller_uid,
+                "alpha": caller_uid,
+                "bravo": 60001,
+                "mason": caller_uid + 3000,
+            },
+            approvers={"mason": approver_entry()},
+            revision="approver-policy-r2",
+        ),
+        "plan_owner": None,
+        "consumer_offset": 2000,
+        "ingress_offset": 3000,
+        "metadata_from_broker": True,
+    }
+
+
 SCENARIOS: dict[str, Callable[[int], dict]] = {
+    "cross_service_requester": _scenario_cross_service_requester,
+    "cross_service_revoked": _scenario_cross_service_revoked,
     "reviewer": _scenario_reviewer,
     "requester_only": _scenario_requester_only,
     "self_owner": _scenario_self_owner,

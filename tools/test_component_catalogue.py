@@ -80,6 +80,36 @@ def _provision(
     }
 
 
+def _subject_visibility(**overrides: object) -> dict[str, object]:
+    data: dict[str, object] = {
+        "subject_refs": ["subject:alpha"],
+        "role_refs": [],
+        "instance_refs": [],
+        "trust_zones": ["test-zone"],
+        "policy_refs": ["policy:alpha-visibility"],
+        "evidence_refs": ["evidence:alpha-visibility"],
+    }
+    data.update(overrides)
+    return data
+
+
+def _navigator_selection(
+    role: str = "primary",
+    *,
+    primary_provider_component_id: str | None = None,
+    fallback_rank: int | None = None,
+    provider_organ_id: str = "organ:alpha-provider",
+    health_dependency_id: str = "dependency:alpha-provider-health",
+) -> dict[str, object]:
+    return {
+        "role": role,
+        "primary_provider_component_id": primary_provider_component_id,
+        "fallback_rank": fallback_rank,
+        "provider_organ_id": provider_organ_id,
+        "health_dependency_id": health_dependency_id,
+    }
+
+
 def _requirement(
     capability: str = "alpha-capability",
     *,
@@ -401,6 +431,413 @@ class ComponentCatalogueTests(unittest.TestCase):
                 )
                 with self.subTest(name=name):
                     self.assertEqual({issue.code for issue in issues}, {"unknown-provider"})
+
+    def test_capability_provision_classes_parse_and_preserve_distinct_opaque_tokens(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            provision = _provision()
+            provision["equivalence_class"] = "vendor/Foo Equivalent v2"
+            provision["trust_class"] = "tier:gold+human reviewed"
+            data = _record(provides=[provision])
+            data["deployment"]["trust_zone"] = "deployment-zone"  # type: ignore[index]
+            _write_component(root, data)
+
+            record = cc.load_component_records(root)["alpha-component"]
+            parsed = record.provides[0]
+            self.assertEqual(parsed.equivalence_class, "vendor/Foo Equivalent v2")
+            self.assertEqual(parsed.trust_class, "tier:gold+human reviewed")
+            self.assertNotEqual(parsed.equivalence_class, parsed.trust_class)
+            self.assertNotEqual(parsed.equivalence_class, record.deployment.trust_zone)
+            self.assertNotEqual(parsed.trust_class, record.deployment.trust_zone)
+
+    def test_legacy_capability_provision_without_classes_remains_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = Path(td)
+            _write_project(repo)
+            _write_component(repo / "components" / "records", _record())
+
+            records = cc.load_component_records(repo / "components" / "records")
+            provision = records["alpha-component"].provides[0]
+            self.assertIsNone(provision.equivalence_class)
+            self.assertIsNone(provision.trust_class)
+
+            _write_generated(repo)
+            self.assertEqual(cc.check_component_catalogue(repo), ())
+
+    def test_component_record_accepts_legacy_omission_and_parses_subject_visibility_when_present(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write_component(root / "legacy", _record())
+            legacy = cc.load_component_records(root / "legacy")["alpha-component"]
+            self.assertIsNone(legacy.provides[0].subject_visibility)
+
+            provision = _provision()
+            provision["subject_visibility"] = _subject_visibility(
+                subject_refs=["subject:alpha", "subject:all"],
+                role_refs=["role:worker"],
+                instance_refs=["instance:test"],
+                trust_zones=["test-zone"],
+            )
+            _write_component(root / "present", _record(provides=[provision]))
+
+            parsed = cc.load_component_records(root / "present")["alpha-component"]
+            policy = parsed.provides[0].subject_visibility
+            self.assertEqual(
+                policy,
+                cc.SubjectVisibilityPolicy(
+                    subject_refs=("subject:alpha", "subject:all"),
+                    role_refs=("role:worker",),
+                    instance_refs=("instance:test",),
+                    trust_zones=("test-zone",),
+                    policy_refs=("policy:alpha-visibility",),
+                    evidence_refs=("evidence:alpha-visibility",),
+                ),
+            )
+
+    def test_component_record_rejects_subject_visibility_extra_missing_duplicates_bad_digest_refs(
+        self,
+    ) -> None:
+        cases: list[tuple[str, dict[str, object]]] = []
+        extra = _subject_visibility()
+        extra["extra"] = "nope"
+        cases.append(("extra", extra))
+        missing = _subject_visibility()
+        missing.pop("evidence_refs")
+        cases.append(("missing", missing))
+        cases.append(
+            (
+                "duplicate",
+                _subject_visibility(subject_refs=["subject:alpha", "subject:alpha"]),
+            )
+        )
+        cases.append(("empty-policy-ref", _subject_visibility(policy_refs=[""])))
+        cases.append(("non-string-evidence-ref", _subject_visibility(evidence_refs=[7])))
+        cases.append(("whitespace-role-ref", _subject_visibility(role_refs=[" role:worker "])))
+        for token in sorted(cc.FORBIDDEN_SUBJECT_VISIBILITY_TOKENS):
+            cases.append(
+                (
+                    f"forbidden-{token}",
+                    _subject_visibility(subject_refs=[token]),
+                )
+            )
+        cases.append(("empty-policy-refs", _subject_visibility(policy_refs=[])))
+        cases.append(("empty-evidence-refs", _subject_visibility(evidence_refs=[])))
+        cases.append(
+            (
+                "no-subject-dimension",
+                _subject_visibility(
+                    subject_refs=[],
+                    role_refs=[],
+                    instance_refs=[],
+                    trust_zones=[],
+                ),
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for index, (name, policy) in enumerate(cases):
+                provision = _provision()
+                provision["subject_visibility"] = policy
+                case_root = root / f"{index}-{name.replace('*', 'star')}"
+                _write_component(case_root, _record(provides=[provision]))
+                with self.subTest(name=name), self.assertRaises(
+                    cc.ComponentCatalogueError
+                ):
+                    cc.load_component_records(case_root)
+
+    def test_capability_provision_accepts_legacy_omission_null_and_parses_navigator_selection_when_present(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            _write_component(root / "omitted", _record())
+            omitted = cc.load_component_records(root / "omitted")["alpha-component"]
+            self.assertIsNone(omitted.provides[0].navigator_provider_selection)
+
+            explicit_null = _provision()
+            explicit_null["navigator_provider_selection"] = None
+            _write_component(root / "null", _record(provides=[explicit_null]))
+            nullable = cc.load_component_records(root / "null")["alpha-component"]
+            self.assertIsNone(nullable.provides[0].navigator_provider_selection)
+
+            primary = _provision()
+            primary["navigator_provider_selection"] = _navigator_selection()
+            _write_component(root / "primary", _record(provides=[primary]))
+            parsed_primary = (
+                cc.load_component_records(root / "primary")["alpha-component"]
+                .provides[0]
+                .navigator_provider_selection
+            )
+            self.assertEqual(
+                parsed_primary,
+                cc.NavigatorProviderSelection(
+                    role=cc.NavigatorProviderRole.PRIMARY,
+                    primary_provider_component_id=None,
+                    fallback_rank=None,
+                    provider_organ_id="organ:alpha-provider",
+                    health_dependency_id="dependency:alpha-provider-health",
+                ),
+            )
+
+            fallback = _provision()
+            fallback["navigator_provider_selection"] = _navigator_selection(
+                "fallback",
+                primary_provider_component_id="primary-component",
+                fallback_rank=1,
+                provider_organ_id="organ:fallback-provider",
+                health_dependency_id="dependency:fallback-health",
+            )
+            _write_component(root / "fallback", _record(provides=[fallback]))
+            parsed_fallback = (
+                cc.load_component_records(root / "fallback")["alpha-component"]
+                .provides[0]
+                .navigator_provider_selection
+            )
+            self.assertEqual(parsed_fallback.role, cc.NavigatorProviderRole.FALLBACK)  # type: ignore[union-attr]
+            self.assertEqual(parsed_fallback.primary_provider_component_id, "primary-component")  # type: ignore[union-attr]
+            self.assertEqual(parsed_fallback.fallback_rank, 1)  # type: ignore[union-attr]
+            self.assertEqual(parsed_fallback.provider_organ_id, "organ:fallback-provider")  # type: ignore[union-attr]
+            self.assertEqual(parsed_fallback.health_dependency_id, "dependency:fallback-health")  # type: ignore[union-attr]
+
+    def test_capability_provision_rejects_navigator_selection_extra_missing_role_field_mismatch_and_bad_refs(
+        self,
+    ) -> None:
+        cases: list[tuple[str, dict[str, object]]] = []
+        extra = _navigator_selection()
+        extra["extra"] = "nope"
+        cases.append(("extra", extra))
+        missing = _navigator_selection()
+        missing.pop("role")
+        cases.append(("missing", missing))
+        cases.append(("bad-role", _navigator_selection("standby")))
+        cases.append(
+            (
+                "primary-target",
+                _navigator_selection(primary_provider_component_id="primary-component"),
+            )
+        )
+        cases.append(("primary-rank", _navigator_selection(fallback_rank=1)))
+        cases.append(("fallback-null-target", _navigator_selection("fallback", fallback_rank=1)))
+        cases.append(
+            (
+                "fallback-rank-zero",
+                _navigator_selection(
+                    "fallback",
+                    primary_provider_component_id="primary-component",
+                    fallback_rank=0,
+                ),
+            )
+        )
+        bad_bool_rank = _navigator_selection(
+            "fallback",
+            primary_provider_component_id="primary-component",
+            fallback_rank=1,
+        )
+        bad_bool_rank["fallback_rank"] = True
+        cases.append(("fallback-bool-rank", bad_bool_rank))
+        cases.append(
+            (
+                "bad-component",
+                _navigator_selection(
+                    "fallback",
+                    primary_provider_component_id="Primary_Component",
+                    fallback_rank=1,
+                ),
+            )
+        )
+        cases.append(("bad-organ", _navigator_selection(provider_organ_id="alpha-provider")))
+        cases.append(
+            (
+                "organ-slash",
+                _navigator_selection(provider_organ_id="organ:alpha/provider"),
+            )
+        )
+        cases.append(
+            (
+                "organ-space",
+                _navigator_selection(provider_organ_id="organ:alpha provider"),
+            )
+        )
+        cases.append(
+            (
+                "organ-double-colon",
+                _navigator_selection(provider_organ_id="organ:alpha:provider"),
+            )
+        )
+        cases.append(
+            (
+                "organ-case",
+                _navigator_selection(provider_organ_id="organ:Alpha-provider"),
+            )
+        )
+        cases.append(
+            (
+                "bad-dependency",
+                _navigator_selection(health_dependency_id="health:alpha-provider"),
+            )
+        )
+        cases.append(
+            (
+                "dependency-slash",
+                _navigator_selection(
+                    health_dependency_id="dependency:alpha/provider"
+                ),
+            )
+        )
+        cases.append(
+            (
+                "dependency-space",
+                _navigator_selection(
+                    health_dependency_id="dependency:alpha provider"
+                ),
+            )
+        )
+        cases.append(
+            (
+                "dependency-double-colon",
+                _navigator_selection(
+                    health_dependency_id="dependency:alpha:provider"
+                ),
+            )
+        )
+        cases.append(
+            (
+                "dependency-case",
+                _navigator_selection(
+                    health_dependency_id="dependency:Alpha-provider"
+                ),
+            )
+        )
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            for name, selection in cases:
+                provision = _provision()
+                provision["navigator_provider_selection"] = selection
+                case_root = root / name
+                _write_component(case_root, _record(provides=[provision]))
+                with self.subTest(name=name), self.assertRaises(
+                    cc.ComponentCatalogueError
+                ):
+                    cc.load_component_records(case_root)
+
+    def test_capability_provision_class_fields_accept_null_and_refuse_non_strings(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            accepted = _provision()
+            accepted["equivalence_class"] = None
+            accepted["trust_class"] = None
+            _write_component(root / "null", _record(provides=[accepted]))
+            parsed = cc.load_component_records(root / "null")["alpha-component"].provides[0]
+            self.assertIsNone(parsed.equivalence_class)
+            self.assertIsNone(parsed.trust_class)
+
+            unexpected = _provision()
+            unexpected["unexpected_class_authority"] = "class:alpha"
+            _write_component(root / "unknown", _record(provides=[unexpected]))
+            with self.assertRaisesRegex(cc.ComponentCatalogueError, "unknown"):
+                cc.load_component_records(root / "unknown")
+
+            invalid_values: tuple[object, ...] = (
+                "",
+                " whitespace ",
+                True,
+                7,
+                ["class:alpha"],
+                {"class": "alpha"},
+            )
+            for field in ("equivalence_class", "trust_class"):
+                for value in invalid_values:
+                    provision = _provision()
+                    provision[field] = value
+                    case = root / f"{field}-{type(value).__name__}-{len(str(value))}"
+                    _write_component(case, _record(provides=[provision]))
+                    with self.subTest(field=field, value=value), self.assertRaises(
+                        cc.ComponentCatalogueError
+                    ):
+                        cc.load_component_records(case)
+
+    def test_generated_component_schema_keeps_class_fields_optional_nullable_and_closed(
+        self,
+    ) -> None:
+        schema = json.loads(cc.generate_component_record_schema())
+        provision = schema["properties"]["provides"]["items"]
+        nullable_text = {
+            "anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]
+        }
+
+        self.assertEqual(
+            provision["properties"]["equivalence_class"], nullable_text
+        )
+        self.assertEqual(provision["properties"]["trust_class"], nullable_text)
+        self.assertNotIn("equivalence_class", provision["required"])
+        self.assertNotIn("trust_class", provision["required"])
+        self.assertIs(provision["additionalProperties"], False)
+        self.assertEqual(schema["properties"]["schema_version"]["const"], cc.SCHEMA_VERSION)
+        self.assertEqual(cc.SCHEMA_VERSION, 1)
+        self.assertEqual(
+            (REPO_ROOT / "schemas" / "component-record.schema.json").read_bytes(),
+            cc.generate_component_record_schema(),
+        )
+
+    def test_generated_component_schema_keeps_navigator_selection_optional_nullable_closed_and_v1(
+        self,
+    ) -> None:
+        schema = json.loads(cc.generate_component_record_schema())
+        provision = schema["properties"]["provides"]["items"]
+        selection = provision["properties"]["navigator_provider_selection"]
+        selection_object = selection["anyOf"][1]
+
+        self.assertNotIn("navigator_provider_selection", provision["required"])
+        self.assertEqual(selection["anyOf"][0], {"type": "null"})
+        self.assertIs(selection_object["additionalProperties"], False)
+        self.assertEqual(
+            tuple(selection_object["required"]),
+            cc.NAVIGATOR_PROVIDER_SELECTION_KEYS,
+        )
+        self.assertEqual(
+            selection_object["properties"]["role"]["enum"],
+            ["primary", "fallback"],
+        )
+        self.assertEqual(
+            selection_object["properties"]["provider_organ_id"]["pattern"],
+            cc.ORGAN_REF_PATTERN,
+        )
+        self.assertEqual(
+            selection_object["properties"]["health_dependency_id"]["pattern"],
+            cc.DEPENDENCY_REF_PATTERN,
+        )
+        primary_conditional = selection_object["allOf"][0]
+        fallback_conditional = selection_object["allOf"][1]
+        self.assertEqual(
+            primary_conditional["then"]["properties"]["primary_provider_component_id"],
+            {"type": "null"},
+        )
+        self.assertEqual(
+            primary_conditional["then"]["properties"]["fallback_rank"],
+            {"type": "null"},
+        )
+        self.assertEqual(
+            fallback_conditional["then"]["properties"]["primary_provider_component_id"],
+            {"type": "string", "pattern": cc.STABLE_ID_PATTERN},
+        )
+        self.assertEqual(
+            fallback_conditional["then"]["properties"]["fallback_rank"],
+            {"type": "integer", "minimum": 1},
+        )
+        self.assertEqual(schema["properties"]["schema_version"]["const"], cc.SCHEMA_VERSION)
+        self.assertEqual(cc.SCHEMA_VERSION, 1)
+        self.assertEqual(
+            (REPO_ROOT / "schemas" / "component-record.schema.json").read_bytes(),
+            cc.generate_component_record_schema(),
+        )
 
     def test_optional_disabled_declares_degradation_and_creates_no_edge(self) -> None:
         with tempfile.TemporaryDirectory() as td:
@@ -793,8 +1230,9 @@ class ComponentCatalogueTests(unittest.TestCase):
         workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
             encoding="utf-8"
         )
-        push, pull_request = workflow.split("  pull_request:", 1)
-        for section in (push, pull_request):
+        # T-5001: ci.yml has no push trigger (the nightly covers main); only the PR list.
+        _, pull_request = workflow.split("  pull_request:", 1)
+        for section in (pull_request,):
             self.assertIn("'components/**'", section)
             self.assertIn("'schemas/component-record.schema.json'", section)
             self.assertIn(

@@ -76,12 +76,9 @@ The pattern applies at every dispatcher↔dispatchee boundary. **Layer 1's `Sche
 
 The mailbox MCP (ORG-026) is a reliable cross-**persona** channel (orchestrator/specialist/recovery). It does **not** replace Layer 1: (i) it is **poll-based** — `consume` drains, nothing pushes/wakes — so it still needs a poll to fire; (ii) it is **persona-scoped**, so it does not address intra-team subagent (orchestrator↔implementer) signaling. Conclusion: the mailbox improves data-delivery reliability for cross-persona dispatches once a poll fires, but the irreducible primitive remains the dispatcher-side poll (Layer 1). For the subagent case the reliable primitive is the harness **task-notification-to-spawner**, not the mailbox.
 
-## Implementation arc (sub-tickets under T-1315)
+## Implementation arc
 
-- **A — SOP (`sop/standard/`):** codify Layer-1 arming (dispatch-and-wait → arm self-wakeup; re-arm until await resolves; bounded ≥1200s fallback cadence) + Layer-2 bilateral self-checks + the poke→verify-liveness→decide lesson. HO-authored. Lands on ratification. `depends_on: [T-1315 ratification]`.
-- **B — probe (OQ-1):** verify whether project-orchestrator subagents can arm a self-wakeup; resolve the per-tier mechanism. Verification dispatch; no production change.
-- **C — [operator-gated] Layer-3 narrow Recovery backstop:** the active-team + no-activity + no-pending-wakeup predicate. Reopens the P1.c surface; gated on the operator's ruling. `interactive-required`.
-- **D — evaluate sub-tier completion-signal restructuring:** reliable task-notification-to-spawner vs member→member SendMessage as the sub-tier root fix (the (b) sub-case above).
+The T-1315 sub-ticket breakdown (SOP, OQ-1 probe, operator-gated Layer-3 backstop, sub-tier completion-signal evaluation) is in `notes/2026-10-08-org-037-implementation-arc-relocated.md`.
 
 ## DECISIONS
 

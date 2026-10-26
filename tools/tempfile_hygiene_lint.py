@@ -54,7 +54,9 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _TOOLS = _REPO_ROOT / "tools"
 
 _TEMP_FACTORIES = {"mkdtemp", "TemporaryDirectory"}
-_CLEANUP_SIGNAL_RE = re.compile(r"rmtree|\.cleanup\b")
+# T-5312: unittest's self.enterContext(cm) / cls.enterClassContext(cm) (py3.11+) enter
+# the context manager and register its __exit__ as a cleanup, with neither token above.
+_CLEANUP_SIGNAL_RE = re.compile(r"rmtree|\.cleanup\b|\benter(?:Class)?Context\(")
 
 # Documented exceptions: scope key "filename::ScopeName" -> structural rationale.
 # Re-stated here so a suppression carries its own justification (anti-rot). Empty

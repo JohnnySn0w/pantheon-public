@@ -13,7 +13,10 @@ import contextlib
 import io
 import json
 import tempfile
+import time
 import unittest
+from unittest.mock import patch
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -42,6 +45,14 @@ def _run_capture_stderr(argv, *, root, ledger_dir, kill_return_value=False):
     return code, out_buf.getvalue(), err_buf.getvalue()
 
 
+def _without_org001_warnings(stderr: str) -> str:
+    """`stderr` minus the T-4734 ORG-001 WARN lines from ledger_shard."""
+    return "".join(
+        line for line in stderr.splitlines(keepends=True)
+        if not line.startswith("ledger: WARN ORG-001 ")
+    )
+
+
 def _read_ledger_entries(ledger_dir: Path) -> list[dict]:
     entries: list[dict] = []
     for path in sorted(ledger_dir.rglob("*.jsonl")):
@@ -59,6 +70,16 @@ class HarnessCliTestCase(unittest.TestCase):
         self.ledger_dir = base / "ledger"
         self.root.mkdir()
         self.ledger_dir.mkdir()
+        # Hermetic status: never read the host's real /var/lib/pantheon/oom/holds.json.
+        patcher = mock.patch.object(harness, "_OOM_HOLDS_PATH", base / "no-oom-holds.json")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # ORG-106 L3a: never touch the real /var/lib/pantheon/oom-hold flag dir.
+        self.hold_dir = base / "oom-hold"
+        self.hold_dir.mkdir()
+        flag_patcher = mock.patch.object(harness, "_OOM_HOLD_DIR", self.hold_dir)
+        flag_patcher.start()
+        self.addCleanup(flag_patcher.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
@@ -251,12 +272,18 @@ class TestLedgerEntryShape(HarnessCliTestCase):
         entries = _read_ledger_entries(self.ledger_dir)
         self.assertEqual(len(entries), 1)
         entry = entries[0]
-        self.assertEqual(set(entry), {"id", "ts", "agent", "action", "summary", "links"})
-        self.assertEqual(entry["agent"], "operator:operator")
+        # T-4737: ORG-001 fields; a human operator writes human:operator.
+        self.assertEqual(
+            set(entry),
+            {"id", "ts", "agent", "action", "rationale", "justifies_via", "summary", "links"},
+        )
+        self.assertEqual(entry["agent"], "human:operator")
+        self.assertIn("operator: operator", entry["rationale"])
+        self.assertEqual(entry["justifies_via"], ["P4"])
         self.assertEqual(entry["action"], "harness_override")
         self.assertIn("known broken", entry["summary"])
-        self.assertIn("persona:orchestrator", entry["links"])
-        self.assertIn("runtime:codex/interactive-chatgpt", entry["links"])
+        self.assertIn({"type": "persona", "ref": "orchestrator"}, entry["links"])
+        self.assertIn({"type": "runtime", "ref": "codex/interactive-chatgpt"}, entry["links"])
         self.assertTrue(entry["id"].startswith(entry["ts"]))
         self.assertIn("harness-orchestrator-override-hold", entry["id"])
 
@@ -305,7 +332,7 @@ class TestLedgerEntryShape(HarnessCliTestCase):
         self.assertEqual(code, 0)
         entries = _read_ledger_entries(self.ledger_dir)
         self.assertEqual(len(entries), 1)
-        self.assertNotIn("runtime:", str(entries[0]["links"]))
+        self.assertNotIn("runtime", [link["type"] for link in entries[0]["links"]])
         self.assertIsNone(hs.load_last_attempt("orchestrator", "claude/anthropic-code", root=self.root)["cooldown_until"])
         self.assertIsNone(hs.load_last_attempt("orchestrator", "codex/interactive-chatgpt", root=self.root)["cooldown_until"])
 
@@ -327,7 +354,7 @@ class TestLedgerEntryShape(HarnessCliTestCase):
         )
         entries = _read_ledger_entries(self.ledger_dir)
         self.assertEqual(len(entries), 1)
-        self.assertNotIn("runtime:", str(entries[0]["links"]))
+        self.assertNotIn("runtime", [link["type"] for link in entries[0]["links"]])
 
     def test_restart_with_runtime_and_clear_cooldown(self):
         hs.write_last_attempt(
@@ -342,7 +369,7 @@ class TestLedgerEntryShape(HarnessCliTestCase):
         self.assertEqual(code, 0)
         self.assertIsNone(hs.load_last_attempt("orchestrator", "claude/anthropic-code", root=self.root)["cooldown_until"])
         entries = _read_ledger_entries(self.ledger_dir)
-        self.assertIn("runtime:claude/anthropic-code", entries[0]["links"])
+        self.assertIn({"type": "runtime", "ref": "claude/anthropic-code"}, entries[0]["links"])
         self.assertIn("does not force selection", entries[0]["summary"] + out)
 
     def test_restart_with_runtime_no_clear_cooldown_leaves_cooldown(self):
@@ -368,7 +395,10 @@ class TestOperatorResolution(HarnessCliTestCase):
 
         _run(["orchestrator", "hold", "codex/interactive-chatgpt", "--reason", "x"], root=self.root, ledger_dir=self.ledger_dir)
         entries = _read_ledger_entries(self.ledger_dir)
-        self.assertEqual(entries[0]["agent"], f"operator:{getpass.getuser()}")
+        agent, executor = harness.ledger_identity_for_operator(getpass.getuser())
+        self.assertEqual(entries[0]["agent"], agent)
+        self.assertEqual(entries[0].get("executor"), executor)
+        self.assertIn(f"operator: {getpass.getuser()}", entries[0]["rationale"])
 
     def test_operator_flag_overrides(self):
         _run(
@@ -376,7 +406,21 @@ class TestOperatorResolution(HarnessCliTestCase):
             root=self.root, ledger_dir=self.ledger_dir,
         )
         entries = _read_ledger_entries(self.ledger_dir)
-        self.assertEqual(entries[0]["agent"], "operator:recovery")
+        # T-4737: a fleet seat writes its ORG-100 role id and seat slot.
+        self.assertEqual(entries[0]["agent"], "head_system_orchestrator")
+        self.assertEqual(entries[0]["executor"], "head-system-orchestrator")
+
+
+class TestSharedRoleOperatorRefused(HarnessCliTestCase):
+    def test_shared_role_id_as_operator_is_refused_before_anything_runs(self):
+        # T-4737 (review F2): engineering_orchestrator is artisan AND mason.
+        code, _out, err = _run_capture_stderr(
+            ["--operator", "engineering_orchestrator", "orchestrator", "hold", "codex/interactive-chatgpt", "--reason", "x"],
+            root=self.root, ledger_dir=self.ledger_dir,
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("shared by several seats", err)
+        self.assertEqual(_read_ledger_entries(self.ledger_dir), [])
 
 
 class TestTmuxKillWiring(HarnessCliTestCase):
@@ -399,6 +443,71 @@ class TestTmuxKillWiring(HarnessCliTestCase):
             code = harness.main(["orchestrator", "restart", "--reason", "x"], root=self.root, ledger_dir=self.ledger_dir)
         self.assertEqual(code, 0)
         killed.assert_not_called()
+
+
+class TestRestartHandoffFirst(HarnessCliTestCase):
+    """T-5069: restart of a live session asks for a fresh HANDOFF first."""
+
+    def _seed_active(self):
+        active_path = hs.active_runtime_path("orchestrator", root=self.root)
+        active_path.parent.mkdir(parents=True)
+        active_path.write_text(
+            json.dumps({"schema": hs.SCHEMA_ACTIVE_RUNTIME, "runtime": "claude/anthropic-code", "tmux_session": "s1"}),
+            encoding="utf-8",
+        )
+
+    def _run(self, extra, *, live=True, confirmed=True):
+        from tools import handoff_first
+
+        outcome = handoff_first.HandoffOutcome(confirmed, "no ack" if not confirmed else "ok", Path("/x/HANDOFF.md"))
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            contextlib.redirect_stdout(out), contextlib.redirect_stderr(err),
+            mock.patch("tools.harness._tmux_session_live", return_value=live),
+            mock.patch("tools.harness._request_handoff_first", return_value=outcome) as ask,
+            mock.patch("tools.harness._kill_tmux_session", return_value=True) as kill,
+        ):
+            code = harness.main(
+                ["orchestrator", "restart", "--reason", "x", *extra], root=self.root, ledger_dir=self.ledger_dir
+            )
+        return code, out.getvalue(), err.getvalue(), ask, kill
+
+    def test_confirmed_handoff_then_kill(self):
+        self._seed_active()
+        code, out, _err, ask, kill = self._run([])
+        self.assertEqual(code, 0)
+        ask.assert_called_once_with("orchestrator")
+        kill.assert_called_once()
+        self.assertIn("fresh handoff confirmed", out)
+
+    def test_unconfirmed_handoff_refuses_and_does_not_kill(self):
+        self._seed_active()
+        code, _out, err, ask, kill = self._run([], confirmed=False)
+        self.assertEqual(code, 2)
+        self.assertIn("--skip-handoff", err)
+        kill.assert_not_called()
+        self.assertEqual(_read_ledger_entries(self.ledger_dir), [])
+
+    def test_skip_handoff_kills_without_asking(self):
+        self._seed_active()
+        code, out, _err, ask, kill = self._run(["--skip-handoff"], confirmed=False)
+        self.assertEqual(code, 0)
+        ask.assert_not_called()
+        kill.assert_called_once()
+        self.assertIn("handoff skipped", out)
+
+    def test_no_live_session_no_handoff_request(self):
+        self._seed_active()
+        code, _out, _err, ask, kill = self._run([], live=False)
+        self.assertEqual(code, 0)
+        ask.assert_not_called()
+
+    def test_dry_run_does_not_ask(self):
+        self._seed_active()
+        code, out, _err, ask, kill = self._run(["--dry-run"], confirmed=False)
+        self.assertEqual(code, 0)
+        ask.assert_not_called()
+        self.assertIn("would ask the live session", out)
 
 
 class TestLedgerIdCollisionRefusal(HarnessCliTestCase):
@@ -486,7 +595,9 @@ class TestLedgerIdCollisionRefusal(HarnessCliTestCase):
             )
         self.assertEqual(code1, 0)
         self.assertEqual(code2, 0)
-        self.assertEqual(err2, "")
+        # T-4734: ORG-001 WARN lines (the harness writer conforms in T-4737)
+        # are not a collision refusal; nothing else may reach stderr.
+        self.assertEqual(_without_org001_warnings(err2), "")
         self.assertEqual(len(_read_ledger_entries(self.ledger_dir)), 2)
 
     def test_dry_run_never_triggers_collision_check(self):
@@ -533,6 +644,879 @@ class TestLedgerAppendFailureHandling(HarnessCliTestCase):
         # And critically: the handler must not have run either, since the
         # precheck failure happens before dispatch.
         self.assertEqual(hs.load_holds("orchestrator", root=self.root)["holds"], {})
+
+
+def _git(*args, cwd):
+    import subprocess
+
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True).stdout
+
+
+class TestOverrideLandsOnOriginNotSeatClone(unittest.TestCase):
+    """T-5021: with no ledger_dir (production), an override's ledger entry lands on
+    origin/main from a throwaway worktree and NEVER dirties the clone harness.py
+    runs from (the seat's). Real git against a tmp bare origin + tmp seat clone."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        gitconfig = base / "gitconfig"
+        gitconfig.write_text("", encoding="utf-8")
+        env = mock.patch.dict(
+            "os.environ",
+            {
+                "GIT_CONFIG_GLOBAL": str(gitconfig),
+                "GIT_CONFIG_NOSYSTEM": "1",
+                "GIT_AUTHOR_NAME": "seat",
+                "GIT_AUTHOR_EMAIL": "seat@example.invalid",
+                "GIT_COMMITTER_NAME": "seat",
+                "GIT_COMMITTER_EMAIL": "seat@example.invalid",
+            },
+        )
+        env.start()
+        self.addCleanup(env.stop)
+        self.origin = base / "origin.git"
+        self.seat = base / "seat-clone"
+        self.state = base / "state"
+        self.land_tmp = base / "landing-tmp"
+        self.land_tmp.mkdir()
+        _git("init", "-q", "--bare", "-b", "main", str(self.origin), cwd=base)
+        _git("clone", "-q", str(self.origin), str(self.seat), cwd=base)
+        (self.seat / "ledger").mkdir()
+        (self.seat / "ledger" / ".keep").write_text("", encoding="utf-8")
+        _git("add", "ledger/.keep", cwd=self.seat)
+        _git("commit", "-q", "-m", "seed", cwd=self.seat)
+        _git("push", "-q", "origin", "HEAD:main", cwd=self.seat)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _main(self, argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err), mock.patch(
+            "tools.harness._kill_tmux_session", return_value=False
+        ):
+            code = harness.main(
+                argv, root=self.state, repo_root=self.seat, landing_tmp_root=self.land_tmp
+            )
+        return code, out.getvalue(), err.getvalue()
+
+    def _origin_entries(self) -> list[dict]:
+        listing = _git("ls-tree", "-r", "--name-only", "main", cwd=self.origin).split()
+        entries = []
+        for name in listing:
+            if name.endswith(".jsonl"):
+                text = _git("show", f"main:{name}", cwd=self.origin)
+                entries += [json.loads(line) for line in text.splitlines() if line.strip()]
+        return entries
+
+    def _assert_seat_clone_untouched(self):
+        self.assertEqual(_git("status", "--porcelain", "--untracked-files=all", cwd=self.seat), "")
+        self.assertEqual([p.name for p in (self.seat / "ledger").iterdir()], [".keep"])
+        worktrees = [line for line in _git("worktree", "list", "--porcelain", cwd=self.seat).splitlines()
+                     if line.startswith("worktree ")]
+        self.assertEqual(len(worktrees), 1)
+        self.assertEqual(list(self.land_tmp.iterdir()), [])
+
+    def test_hold_lands_on_origin_and_leaves_the_seat_clone_clean(self):
+        code, out, err = self._main(
+            ["--operator", "orchestrator", "specialist", "hold", "claude/interactive-subscription", "--reason", "T-5021"]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn("hold on specialist", out)
+        entries = self._origin_entries()
+        self.assertEqual([e["action"] for e in entries], ["harness_override"])
+        self.assertEqual(entries[0]["agent"], harness.ledger_identity_for_operator("orchestrator")[0])
+        self._assert_seat_clone_untouched()
+        self.assertFalse(harness.spool_path(self.state).exists())
+        self.assertIn("claude/interactive-subscription", hs.load_holds("specialist", root=self.state)["holds"])
+
+    def test_unreachable_origin_spools_0600_then_next_run_drains_idempotently(self):
+        good_url = _git("remote", "get-url", "origin", cwd=self.seat).strip()
+        _git("remote", "set-url", "origin", str(self.seat.parent / "missing.git"), cwd=self.seat)
+        code, out, err = self._main(["specialist", "hold", "claude/interactive-subscription", "--reason", "down"])
+        self.assertEqual(code, 2)
+        self.assertIn("hold on specialist", out)
+        self.assertIn("did not reach origin/main", err)
+        spool = harness.spool_path(self.state)
+        self.assertEqual(spool.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(len(harness._read_spool(self.state)), 1)
+        self._assert_seat_clone_untouched()
+        # The override itself took effect.
+        self.assertIn("claude/interactive-subscription", hs.load_holds("specialist", root=self.state)["holds"])
+
+        _git("remote", "set-url", "origin", good_url, cwd=self.seat)
+        with mock.patch("tools.harness._utc_now_ts", return_value="2026-10-15T03:00:00Z"):
+            code, _out, err = self._main(["specialist", "clear-hold", "claude/interactive-subscription", "--reason", "up"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(
+            sorted(e["id"].split("-override-", 1)[1] for e in self._origin_entries()), ["clear-hold", "hold"]
+        )
+        self.assertFalse(spool.exists())
+        self._assert_seat_clone_untouched()
+
+    def test_spooled_entry_already_on_origin_is_dropped_not_duplicated(self):
+        code, _out, err = self._main(["specialist", "hold", "codex/interactive-chatgpt", "--reason", "a"])
+        self.assertEqual(code, 0, err)
+        landed = self._origin_entries()[0]
+        harness._append_spool(self.state, landed)  # a crash after the landing, before the drain
+        with mock.patch("tools.harness._utc_now_ts", return_value="2026-10-15T03:00:00Z"):
+            code, _out, err = self._main(["specialist", "clear-hold", "codex/interactive-chatgpt", "--reason", "b"])
+        self.assertEqual(code, 0, err)
+        ids = [e["id"] for e in self._origin_entries()]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(len(ids), 2)
+        self.assertFalse(harness.spool_path(self.state).exists())
+
+    def test_network_steps_are_bounded_by_a_timeout(self):
+        import subprocess
+
+        real_run = subprocess.run
+        seen: list[tuple] = []
+
+        def run(cmd, *args, **kwargs):
+            if cmd[:2] == ["git", "fetch"]:
+                seen.append(tuple(cmd))
+                raise subprocess.TimeoutExpired(cmd, kwargs["timeout"])
+            return real_run(cmd, *args, **kwargs)
+
+        with mock.patch("tools.harness.subprocess.run", side_effect=run):
+            code, _out, err = self._main(["specialist", "hold", "codex/interactive-chatgpt", "--reason", "slow"])
+        self.assertEqual(code, 2)
+        self.assertIn(f"timed out after {harness.GIT_FETCH_TIMEOUT_SECONDS}s", err)
+        self.assertTrue(seen)
+        self.assertEqual(len(harness._read_spool(self.state)), 1)
+        self._assert_seat_clone_untouched()
+
+    def test_dry_run_writes_nothing_anywhere(self):
+        code, _out, _err = self._main(["--dry-run", "specialist", "hold", "codex/interactive-chatgpt", "--reason", "d"])
+        self.assertEqual(code, 0)
+        self.assertEqual(self._origin_entries(), [])
+        self.assertFalse(harness.spool_path(self.state).exists())
+        self._assert_seat_clone_untouched()
+
+    def test_status_reports_unlanded_entries_on_a_separate_line_only_when_present(self):
+        probe = lambda bindings: None  # noqa: E731
+        args = harness.build_parser().parse_args(["specialist", "status"])
+        before = io.StringIO()
+        with contextlib.redirect_stdout(before):
+            harness._do_status(args, root=self.state, pane_probe=probe)
+        self.assertNotIn("unlanded", before.getvalue())
+        harness._append_spool(self.state, {"id": "x", "summary": "s"})
+        after = io.StringIO()
+        with contextlib.redirect_stdout(after):
+            harness._do_status(args, root=self.state, pane_probe=probe)
+        self.assertEqual(after.getvalue().splitlines()[:-1], before.getvalue().splitlines())
+        self.assertEqual(
+            after.getvalue().splitlines()[-1],
+            f"unlanded ledger entries: 1 (spooled at {harness.spool_path(self.state)})",
+        )
+
+    def test_a_permanently_bad_spooled_entry_is_quarantined_and_does_not_block(self):
+        bad = {"id": "bad-entry", "ts": "not-a-timestamp", "agent": "x", "action": "harness_override"}
+        harness._append_spool(self.state, bad)
+        code, _out, err = self._main(["specialist", "hold", "codex/interactive-chatgpt", "--reason", "q"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual([e["action"] for e in self._origin_entries()], ["harness_override"])
+        self.assertNotIn("bad-entry", [e["id"] for e in self._origin_entries()])
+        self.assertFalse(harness.spool_path(self.state).exists())
+        rows = harness._read_quarantine(self.state)
+        self.assertEqual([r["entry"]["id"] for r in rows], ["bad-entry"])
+        self.assertIn("ledger writer refused", rows[0]["reason"])
+        self.assertEqual(harness.quarantine_path(self.state).stat().st_mode & 0o777, 0o600)
+        # A later override is not blocked by it either.
+        with mock.patch("tools.harness._utc_now_ts", return_value="2026-10-15T03:00:00Z"):
+            code, _out, err = self._main(["specialist", "clear-hold", "codex/interactive-chatgpt", "--reason", "q2"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(harness._read_quarantine(self.state)), 1)
+        self._assert_seat_clone_untouched()
+
+    def test_a_conflicting_spooled_entry_is_quarantined_and_the_new_one_lands(self):
+        code, _out, err = self._main(["specialist", "hold", "codex/interactive-chatgpt", "--reason", "a"])
+        self.assertEqual(code, 0, err)
+        on_main = self._origin_entries()[0]
+        harness._append_spool(self.state, {**on_main, "summary": "a different body"})
+        with mock.patch("tools.harness._utc_now_ts", return_value="2026-10-15T03:00:00Z"):
+            code, _out, err = self._main(["specialist", "clear-hold", "codex/interactive-chatgpt", "--reason", "b"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(self._origin_entries()), 2)
+        rows = harness._read_quarantine(self.state)
+        self.assertEqual([r["entry"]["id"] for r in rows], [on_main["id"]])
+        self.assertIn("different content", rows[0]["reason"])
+        self.assertFalse(harness.spool_path(self.state).exists())
+
+    def test_status_reports_quarantined_entries_on_a_separate_line(self):
+        probe = lambda bindings: None  # noqa: E731
+        args = harness.build_parser().parse_args(["specialist", "status"])
+        harness._append_quarantine(self.state, {"id": "x"}, "why")
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            harness._do_status(args, root=self.state, pane_probe=probe)
+        self.assertEqual(
+            out.getvalue().splitlines()[-1],
+            f"quarantined ledger entries: 1 (at {harness.quarantine_path(self.state)})",
+        )
+
+    def test_crash_leftovers_are_swept_and_pruned(self):
+        import os
+        import shutil
+        import time
+
+        crashed = self.land_tmp / "harness-ledger-crashed"
+        _git("worktree", "add", "-q", "--detach", str(crashed / "wt"), "HEAD", cwd=self.seat)
+        old = time.time() - harness.STALE_LANDING_DIR_SECONDS - 60
+        os.utime(crashed, (old, old))
+        fresh = self.land_tmp / "harness-ledger-in-flight"
+        fresh.mkdir()
+        unrelated = self.land_tmp / "someone-else-old"
+        unrelated.mkdir()
+        os.utime(unrelated, (old, old))
+        # The crashed run's checkout dir is gone but its .git/worktrees record stays.
+        shutil.rmtree(crashed / "wt")
+        os.utime(crashed, (old, old))
+        code, _out, err = self._main(["specialist", "hold", "codex/interactive-chatgpt", "--reason", "s"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(sorted(p.name for p in self.land_tmp.iterdir()), ["harness-ledger-in-flight", "someone-else-old"])
+        worktrees = [line for line in _git("worktree", "list", "--porcelain", cwd=self.seat).splitlines()
+                     if line.startswith("worktree ")]
+        self.assertEqual(len(worktrees), 1)
+
+    def test_the_spool_lock_is_not_held_across_the_network(self):
+        import fcntl
+        import os
+
+        observed = []
+
+        def land(entries, **kwargs):
+            lock = harness.spool_path(self.state).with_suffix(".lock")
+            fd = os.open(lock, os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises if the caller holds it
+                observed.append("free")
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+            return harness.LandingResult(True, "stub", landed=tuple(e["id"] for e in entries))
+
+        with mock.patch("tools.harness.land_ledger_entries", side_effect=land):
+            code, _out, err = self._main(["specialist", "hold", "codex/interactive-chatgpt", "--reason", "l"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(observed, ["free"])
+
+    def test_ledger_dir_callers_keep_the_direct_append_and_exit_codes(self):
+        ledger_dir = Path(self._tmp.name) / "ledger-direct"
+        ledger_dir.mkdir()
+        with mock.patch("tools.harness.land_ledger_entries") as lander:
+            code, _out = _run(["specialist", "hold", "codex/interactive-chatgpt", "--reason", "t"],
+                              root=self.state, ledger_dir=ledger_dir)
+            with mock.patch("tools.harness.append_entry", side_effect=RuntimeError("disk full")):
+                code2, _o, err2 = _run_capture_stderr(
+                    ["specialist", "clear-hold", "codex/interactive-chatgpt", "--reason", "t"],
+                    root=self.state, ledger_dir=ledger_dir,
+                )
+        self.assertEqual(code, 0)
+        self.assertEqual(len(_read_ledger_entries(ledger_dir)), 1)
+        lander.assert_not_called()
+        self.assertEqual(code2, 2)
+        self.assertIn("failed to append ledger entry", err2)
+        self.assertFalse(harness.spool_path(self.state).exists())
+
+
+class TestOperatorRestartMarker(HarnessCliTestCase):
+    """T-5483: restart drops a durable marker BEFORE the kill; fail-open; dry-run writes none."""
+
+    def _seed_active(self):
+        path = hs.active_runtime_path("orchestrator", root=self.root)
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({"schema": hs.SCHEMA_ACTIVE_RUNTIME, "runtime": "claude/anthropic-code",
+                        "tmux_session": "s1", "pid": 4242}),
+            encoding="utf-8",
+        )
+
+    def _restart(self, extra=(), *, live=True, kill=None, write_patch=None):
+        seen = {}
+
+        def fake_kill(session, dry_run):
+            seen["marker_at_kill"] = hs.load_operator_restart_marker("orchestrator", root=self.root)
+            return True
+
+        out, err = io.StringIO(), io.StringIO()
+        with (
+            contextlib.redirect_stdout(out), contextlib.redirect_stderr(err),
+            mock.patch("tools.harness._tmux_session_live", return_value=live),
+            mock.patch("tools.harness._request_handoff_first",
+                       return_value=__import__("tools.handoff_first", fromlist=["x"]).HandoffOutcome(True, "ok", Path("/x"))),
+            mock.patch("tools.harness._kill_tmux_session", side_effect=kill or fake_kill),
+        ):
+            if write_patch is not None:
+                with mock.patch.object(hs, "write_operator_restart_marker", side_effect=write_patch):
+                    code = harness.main(["orchestrator", "restart", "--reason", "x", *extra],
+                                        root=self.root, ledger_dir=self.ledger_dir)
+            else:
+                code = harness.main(["orchestrator", "restart", "--reason", "x", *extra],
+                                    root=self.root, ledger_dir=self.ledger_dir)
+        return code, seen, err.getvalue()
+
+    def test_marker_written_before_kill_with_fields(self):
+        self._seed_active()
+        code, seen, _err = self._restart()
+        self.assertEqual(code, 0)
+        marker = seen["marker_at_kill"]
+        self.assertEqual(marker["runtime"], "claude/anthropic-code")
+        self.assertEqual(marker["pid"], 4242)
+        self.assertEqual(marker["tmux_session"], "s1")
+        self.assertTrue(marker["correlation_id"])
+        self.assertTrue(marker["ts"])
+
+    def test_dry_run_writes_no_marker(self):
+        self._seed_active()
+        code, seen, _err = self._restart(["--dry-run"])
+        self.assertEqual(code, 0)
+        self.assertIsNone(seen["marker_at_kill"])
+        self.assertFalse(hs.operator_restart_path("orchestrator", root=self.root).exists())
+
+    def test_no_active_runtime_cache_no_marker(self):
+        code, _seen, _err = self._restart()
+        self.assertEqual(code, 0)
+        self.assertFalse(hs.operator_restart_path("orchestrator", root=self.root).exists())
+
+    def test_marker_removed_when_session_was_not_live(self):
+        self._seed_active()
+        _code, _seen, _err = self._restart(kill=lambda session, dry_run: False)
+        self.assertFalse(hs.operator_restart_path("orchestrator", root=self.root).exists())
+
+    def test_marker_write_failure_is_fail_open(self):
+        self._seed_active()
+        code, seen, err = self._restart(write_patch=OSError("disk full"))
+        self.assertEqual(code, 0)  # the restart still happened
+        self.assertIsNone(seen["marker_at_kill"])
+        self.assertIn("marker not written", err)
+
+
+class TestOperatorRestartMarkerOrdering(HarnessCliTestCase):
+    """T-5483: marker is written AFTER the handoff and immediately BEFORE the kill, on every path."""
+
+    def _seed(self, with_hold=False):
+        path = hs.active_runtime_path("orchestrator", root=self.root)
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps({"schema": hs.SCHEMA_ACTIVE_RUNTIME, "runtime": "claude/anthropic-code",
+                        "tmux_session": "s1", "pid": 4242}),
+            encoding="utf-8",
+        )
+        if with_hold:
+            hs.write_holds(
+                "orchestrator",
+                {"schema": hs.SCHEMA_HOLDS, "holds": {"claude/anthropic-code": {"set_ts": "t", "set_by": "operator:x", "reason": "r"}}},
+                root=self.root,
+            )
+
+    def _go(self, extra):
+        from tools import handoff_first
+
+        order = []
+        clock = iter(f"2026-10-25T22:{m:02d}:00Z" for m in range(10, 59))
+
+        def tick():
+            return next(clock)
+
+        def handoff(persona):
+            order.append(("handoff", tick()))  # a long wait: the clock moves on
+            return handoff_first.HandoffOutcome(True, "ok", Path("/x"))
+
+        real_write = hs.write_operator_restart_marker
+
+        def write(*a, **k):
+            order.append(("marker", k["ts"]))
+            return real_write(*a, **k)
+
+        def kill(session, dry_run):
+            order.append(("kill", tick()))
+            return True
+
+        with (
+            contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()),
+            mock.patch("tools.harness._tmux_session_live", return_value=True),
+            mock.patch("tools.harness._utc_now_ts", side_effect=tick),
+            mock.patch("tools.harness._request_handoff_first", side_effect=handoff),
+            mock.patch("tools.harness._kill_tmux_session", side_effect=kill),
+            mock.patch.object(hs, "write_operator_restart_marker", side_effect=write),
+        ):
+            code = harness.main(["orchestrator", "restart", "--reason", "x", *extra], root=self.root, ledger_dir=self.ledger_dir)
+        return code, order
+
+    def test_marker_ts_is_after_handoff_and_before_kill(self):
+        self._seed()
+        code, order = self._go([])
+        self.assertEqual(code, 0)
+        self.assertEqual([n for n, _ in order], ["handoff", "marker", "kill"])
+        ts = {n: t for n, t in order}
+        self.assertLess(ts["handoff"], ts["marker"])
+        self.assertLess(ts["marker"], ts["kill"])
+
+    def test_skip_handoff_path_writes_marker_before_kill(self):
+        self._seed()
+        code, order = self._go(["--skip-handoff"])
+        self.assertEqual(code, 0)
+        self.assertEqual([n for n, _ in order], ["marker", "kill"])
+
+    def test_override_hold_path_writes_marker_before_kill(self):
+        self._seed(with_hold=True)
+        code, order = self._go(["--runtime", "claude/anthropic-code", "--override-hold"])
+        self.assertEqual(code, 0)
+        self.assertEqual([n for n, _ in order], ["handoff", "marker", "kill"])
+        self.assertNotIn("claude/anthropic-code", hs.load_holds("orchestrator", root=self.root)["holds"])
+
+
+class TestSeatAccountGuard(HarnessCliTestCase):
+    """T-5483: harness state lives in the seat account's home."""
+
+    def _main(self, argv, *, euid, expected):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = harness.main(
+                argv, root=self.root, ledger_dir=self.ledger_dir,
+                euid_fn=lambda: euid, account_fn=lambda persona: expected,
+            )
+        return code, err.getvalue()
+
+    def test_mutating_as_wrong_account_is_refused_before_anything_runs(self):
+        import os, pwd
+
+        me = pwd.getpwuid(os.geteuid()).pw_name
+        code, err = self._main(["orchestrator", "hold", "codex/interactive-chatgpt", "--reason", "x"],
+                               euid=os.geteuid(), expected=me + "-other")
+        self.assertEqual(code, 2)
+        self.assertIn("refusing", err)
+        self.assertIn("pantheon-sudo -u", err)
+        self.assertEqual(hs.load_holds("orchestrator", root=self.root)["holds"], {})
+        self.assertEqual(_read_ledger_entries(self.ledger_dir), [])
+
+    def test_status_and_dry_run_only_warn(self):
+        import os, pwd
+
+        me = pwd.getpwuid(os.geteuid()).pw_name
+        for argv in (["orchestrator", "status"], ["orchestrator", "hold", "codex/interactive-chatgpt", "--dry-run", "--reason", "x"]):
+            code, err = self._main(argv, euid=os.geteuid(), expected=me + "-other")
+            self.assertEqual(code, 0, argv)
+            self.assertIn("WARN", err)
+
+    def test_mutating_as_root_refused_even_when_account_unresolved(self):
+        code, err = self._main(["orchestrator", "hold", "codex/interactive-chatgpt", "--reason", "x"], euid=0, expected=None)
+        self.assertEqual(code, 2)
+        self.assertIn("root", err)
+        code, err = self._main(["orchestrator", "status"], euid=0, expected=None)
+        self.assertEqual(code, 0)
+        self.assertIn("WARN", err)
+
+    def test_matching_account_is_silent(self):
+        import os, pwd
+
+        me = pwd.getpwuid(os.geteuid()).pw_name
+        code, err = self._main(["orchestrator", "status"], euid=os.geteuid(), expected=me)
+        self.assertEqual(code, 0)
+        self.assertNotIn("WARN", err)
+
+
+class TestSeatPauseWake(HarnessCliTestCase):
+    """ORG-106 L1 (T-5524): pause / wake verbs and seat state in status."""
+
+    def setUp(self):
+        super().setUp()
+
+    def _pause(self, *extra, persona="specialist"):
+        return _run_capture_stderr(
+            ["--operator", "operator", persona, "pause", *extra],
+            root=self.root, ledger_dir=self.ledger_dir)
+
+    def _wake(self, *extra, persona="specialist"):
+        return _run_capture_stderr(
+            ["--operator", "operator", persona, "wake", *extra],
+            root=self.root, ledger_dir=self.ledger_dir)
+
+    def _record(self, persona="specialist"):
+        return hs.load_seat_state(persona, root=self.root)
+
+    def _tombstones(self, persona="specialist"):
+        path = hs.seat_state_tombstones_path(persona, root=self.root)
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines()]
+
+    def _plant(self, **over):
+        doc = {
+            "schema": hs.SCHEMA_SEAT_STATE, "persona": "specialist", "state": "paused-intake",
+            "phase": "set", "phase_ts": "2026-01-01T00:00:00Z", "set_ts": "2026-01-01T00:00:00Z",
+            "set_by": "operator:x", "owner": "operator", "reason": "old", "ticket": None,
+            "expires": "2026-01-01T04:00:00Z", "indefinite": False,
+            "telegram_dark_ack": False, "pre_expiry_notified": False, "ledger_entry": "e",
+        }
+        doc.update(over)
+        path = hs.seat_state_path("specialist", root=self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc))
+
+    def test_pause_without_reason_refused(self):
+        code, _out, err = self._pause()
+        self.assertEqual(code, 2)
+        self.assertIn("reason", err)
+        self.assertIsNone(self._record())
+
+    def test_wake_without_reason_refused(self):
+        code, _out, err = self._wake()
+        self.assertEqual(code, 2)
+        self.assertIn("reason", err)
+
+    def test_pause_default_ttl_is_four_hours_and_record_shape(self):
+        code, _out, err = self._pause("--reason", "quota crunch")
+        self.assertEqual(code, 0, err)
+        rec = self._record()
+        from tools import seat_state
+        self.assertEqual(seat_state.validate_record(rec), [])
+        self.assertEqual(rec["state"], "paused-intake")
+        self.assertEqual(rec["phase"], "set")
+        self.assertFalse(rec["indefinite"])
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        delta = datetime.strptime(rec["expires"], fmt) - datetime.strptime(rec["set_ts"], fmt)
+        self.assertEqual(delta, timedelta(hours=4))
+        self.assertEqual(rec["set_by"], "operator:operator")
+        self.assertEqual(rec["owner"], "operator")
+        self.assertIsNone(rec["ticket"])
+        self.assertFalse(rec["telegram_dark_ack"])
+        self.assertFalse(rec["pre_expiry_notified"])
+        self.assertEqual(rec["persona"], "specialist")
+        self.assertEqual(rec["phase_ts"], rec["set_ts"])
+        self.assertEqual(hs.seat_state_path("specialist", root=self.root).stat().st_mode & 0o777, 0o600)
+
+    def test_pause_ledger_entry_id_matches_record_and_summary(self):
+        code, _out, _err = self._pause("--reason", "quota crunch", "--ticket", "T-5524")
+        self.assertEqual(code, 0)
+        entries = _read_ledger_entries(self.ledger_dir)
+        self.assertEqual(len(entries), 1)
+        entry = entries[0]
+        self.assertEqual(entry["id"], self._record()["ledger_entry"])
+        self.assertIn("harness-specialist-override-pause", entry["id"])
+        self.assertEqual(entry["action"], "harness_override")
+        self.assertIn("quota crunch", entry["summary"])
+        self.assertIn("pause on specialist", entry["summary"])
+        self.assertIn({"type": "persona", "ref": "specialist"}, entry["links"])
+        self.assertEqual(self._record()["ticket"], "T-5524")
+
+    def test_pause_for_parsing(self):
+        fmt = "%Y-%m-%dT%H:%M:%SZ"
+        for text, want in (("30m", timedelta(minutes=30)), ("2d", timedelta(days=2)),
+                           ("1d12h", timedelta(days=1, hours=12))):
+            code, _out, err = self._pause("--for", text, "--reason", "x")
+            self.assertEqual(code, 0, err)
+            rec = self._record()
+            got = datetime.strptime(rec["expires"], fmt) - datetime.strptime(rec["set_ts"], fmt)
+            self.assertEqual(got, want, text)
+            time.sleep(1.1)  # distinct ledger-id second
+
+    def test_pause_for_bad_values_refused(self):
+        for bad in ("abc", "0m", "4", "-1h", "1w", ""):
+            code, _out, err = self._pause("--for", bad, "--reason", "x")
+            self.assertEqual(code, 2, bad)
+            self.assertIn("--for", err)
+        self.assertIsNone(self._record())
+
+    def test_huge_or_unicode_for_refused_cleanly(self):
+        for bad in ("99999999999d", "9999999d", "\u0663h", "\u0664\u0660m"):
+            code, _out, err = self._pause("--for", bad, "--reason", "x")
+            self.assertEqual(code, 2, bad)
+            self.assertIn("--for", err)
+            self.assertNotIn("Traceback", err)
+        self.assertIsNone(self._record())
+
+    def test_pause_above_max_refused_without_indefinite(self):
+        code, _out, err = self._pause("--for", "8d", "--reason", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("--indefinite", err)
+        self.assertIsNone(self._record())
+        code, _out, err = self._pause("--for", "7d", "--reason", "x")
+        self.assertEqual(code, 0, err)
+
+    def test_pause_indefinite(self):
+        code, _out, err = self._pause("--indefinite", "--reason", "x")
+        self.assertEqual(code, 0, err)
+        rec = self._record()
+        self.assertIsNone(rec["expires"])
+        self.assertTrue(rec["indefinite"])
+
+    def test_for_and_indefinite_mutually_exclusive(self):
+        code, _out, err = self._pause("--for", "1h", "--indefinite", "--reason", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("--indefinite", err)
+
+    def test_owner_and_ticket_validation(self):
+        code, _out, _err = self._pause("--owner", "has space", "--reason", "x")
+        self.assertEqual(code, 2)
+        code, _out, _err = self._pause("--owner", "x" * 81, "--reason", "x")
+        self.assertEqual(code, 2)
+        code, _out, _err = self._pause("--ticket", "5524", "--reason", "x")
+        self.assertEqual(code, 2)
+        code, _out, err = self._pause("--owner", "role:head_engineering_orchestrator", "--reason", "x")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self._record()["owner"], "role:head_engineering_orchestrator")
+
+    def test_default_owner_for_seat_operator_is_role(self):
+        code, _out, err = _run_capture_stderr(
+            ["--operator", "orchestrator", "specialist", "pause", "--reason", "x"],
+            root=self.root, ledger_dir=self.ledger_dir)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(self._record()["owner"], "role:head_engineering_orchestrator")
+        self.assertEqual(self._record()["set_by"], "operator:orchestrator")
+
+    def test_pause_refresh_replaces_record(self):
+        self._plant(owner="old", reason="old", expires="2099-01-01T00:00:00Z")
+        code, out, err = self._pause("--owner", "newowner", "--reason", "new", "--for", "1h")
+        self.assertEqual(code, 0, err)
+        rec = self._record()
+        self.assertEqual((rec["owner"], rec["reason"]), ("newowner", "new"))
+        self.assertNotEqual(rec["set_ts"], "2026-01-01T00:00:00Z")
+        self.assertIn("refreshed", out)
+
+    def test_pause_and_wake_fail_cleanly_when_seat_state_lock_busy(self):
+        """ORG-106 L5 (T-5529): pause/wake wait on the janitor's lock, then fail, changing nothing."""
+        self._plant(owner="old", reason="old", expires="2099-01-01T00:00:00Z")
+        with patch("tools.harness.SEAT_STATE_LOCK_TIMEOUT_S", 0.2), \
+             hs.seat_state_lock("specialist", root=self.root):
+            pcode, _o, perr = self._pause("--reason", "new")
+            wcode, _o, werr = self._wake("--reason", "bye")
+        self.assertNotEqual(pcode, 0)
+        self.assertNotEqual(wcode, 0)
+        self.assertIn("seat-state busy, retry", perr)
+        self.assertIn("seat-state busy, retry", werr)
+        self.assertEqual(self._record()["reason"], "old")
+        self.assertEqual(self._tombstones(), [])
+
+    def test_pause_refresh_tombstones_the_replaced_record(self):
+        self._plant(owner="old", reason="old", expires="2099-01-01T00:00:00Z")
+        code, _out, err = self._pause("--reason", "new")
+        self.assertEqual(code, 0, err)
+        rows = self._tombstones()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ended_by"], "replaced:operator:operator")
+        self.assertEqual(rows[0]["reason"], "old")
+        self.assertEqual(rows[0]["ended_ts"], self._record()["set_ts"])
+
+    def test_pause_over_invalid_parseable_record_tombstones_it(self):
+        self._plant(reason="")
+        code, _out, err = self._pause("--reason", "new")
+        self.assertEqual(code, 0, err)
+        rows = self._tombstones()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ended_by"], "replaced:operator:operator")
+        self.assertEqual(self._record()["reason"], "new")
+
+    def test_first_pause_and_dry_run_leave_no_tombstone(self):
+        self._pause("--reason", "first")
+        self.assertEqual(self._tombstones(), [])
+        self._plant(expires="2099-01-01T00:00:00Z")
+        self._pause("--dry-run", "--reason", "x")
+        self.assertEqual(self._tombstones(), [])
+
+    def _plant_persona(self, persona, **over):
+        doc = {
+            "schema": hs.SCHEMA_SEAT_STATE, "persona": persona, "state": "deep-sleep",
+            "phase": "asleep", "phase_ts": "2026-01-01T00:00:00Z", "set_ts": "2026-01-01T00:00:00Z",
+            "set_by": "operator:x", "owner": "operator", "reason": "old", "ticket": None,
+            "expires": "2099-01-01T00:00:00Z", "indefinite": False,
+            "telegram_dark_ack": False, "pre_expiry_notified": False, "ledger_entry": "e",
+        }
+        doc.update(over)
+        path = hs.seat_state_path(persona, root=self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(doc))
+
+    def test_pause_over_deep_sleep_downgrades_to_paused_intake(self):
+        # ORG-106 L3a, risk 8: tombstone replaced:operator:<op>, then a paused-intake record.
+        self._plant(state="deep-sleep", phase="asleep", expires="2099-01-01T00:00:00Z")
+        code, out, err = self._pause("--reason", "back to intake-only")
+        self.assertEqual(code, 0, err)
+        rec = self._record()
+        self.assertEqual((rec["state"], rec["phase"]), ("paused-intake", "set"))
+        rows = self._tombstones()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ended_by"], "replaced:operator:operator")
+        self.assertEqual(rows[0]["state"], "deep-sleep")
+        from tools import seat_sleep
+        self.assertFalse(seat_sleep.launch_block("specialist", root=self.root).sleeping)
+        self.assertIn("downgraded", out)
+
+    def test_downgrade_clears_the_sysorch_flag_before_tombstoning(self):
+        self._plant_persona("recovery")
+        flag = self.hold_dir / "recovery"
+        flag.write_text("seat-sleep\n")
+        code, _out, err = _run_capture_stderr(
+            ["--operator", "operator", "recovery", "pause", "--reason", "x"],
+            root=self.root, ledger_dir=self.ledger_dir)
+        self.assertEqual(code, 0, err)
+        self.assertFalse(flag.exists())
+        self.assertEqual(hs.load_seat_state("recovery", root=self.root)["state"], "paused-intake")
+
+    def test_downgrade_flag_failure_refuses_and_leaves_the_record(self):
+        self._plant_persona("recovery")
+        before = hs.seat_state_path("recovery", root=self.root).read_text()
+        with mock.patch("tools.seat_sleep.clear_sysorch_flag", side_effect=PermissionError("no")):
+            code, _out, err = _run_capture_stderr(
+                ["--operator", "operator", "recovery", "pause", "--reason", "x"],
+                root=self.root, ledger_dir=self.ledger_dir)
+        self.assertEqual(code, 2)
+        self.assertIn("oom-hold flag", err)
+        self.assertEqual(hs.seat_state_path("recovery", root=self.root).read_text(), before)
+        self.assertEqual(hs.seat_state_tombstones_path("recovery", root=self.root).exists(), False)
+
+    def test_wake_of_deep_sleep_clears_the_sysorch_flag_only_for_sysorch(self):
+        self._plant_persona("recovery")
+        (self.hold_dir / "recovery").write_text("x")
+        (self.hold_dir / "specialist").write_text("operator manual hold, not ours")
+        self._plant_persona("specialist")
+        for persona in ("recovery", "specialist"):
+            code, _out, err = _run_capture_stderr(
+                ["--operator", "operator", persona, "wake", "--reason", "x"],
+                root=self.root, ledger_dir=self.ledger_dir)
+            self.assertEqual(code, 0, err)
+        self.assertFalse((self.hold_dir / "recovery").exists())
+        self.assertTrue((self.hold_dir / "specialist").exists(), "non-sysorch flags are never touched")
+
+    def test_wake_flag_failure_refuses_and_keeps_the_record(self):
+        self._plant_persona("recovery")
+        with mock.patch("tools.seat_sleep.clear_sysorch_flag", side_effect=PermissionError("no")):
+            code, _out, err = _run_capture_stderr(
+                ["--operator", "operator", "recovery", "wake", "--reason", "x"],
+                root=self.root, ledger_dir=self.ledger_dir)
+        self.assertEqual(code, 2)
+        self.assertIsNotNone(hs.load_seat_state("recovery", root=self.root))
+
+    def test_wake_does_not_touch_a_paused_intake_sysorch_flag(self):
+        self._plant_persona("recovery", state="paused-intake", phase="set")
+        (self.hold_dir / "recovery").write_text("manual")
+        code, _out, err = _run_capture_stderr(
+            ["--operator", "operator", "recovery", "wake", "--reason", "x"],
+            root=self.root, ledger_dir=self.ledger_dir)
+        self.assertEqual(code, 0, err)
+        self.assertTrue((self.hold_dir / "recovery").exists())
+
+    def test_wake_does_not_clear_cap_cooldowns(self):
+        self._plant(state="deep-sleep", phase="asleep", expires="2099-01-01T00:00:00Z")
+        doc = {"schema": hs.SCHEMA_LAST_ATTEMPT, "outcome": "failed", "failure_class": "subscription_cap",
+               "cooldown_until": "2099-01-01T00:00:00Z"}
+        hs.write_last_attempt("specialist", "claude/primary", doc, root=self.root)
+        code, _out, err = self._wake("--reason", "x")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(hs.load_last_attempt("specialist", "claude/primary", root=self.root)["cooldown_until"],
+                         "2099-01-01T00:00:00Z")
+
+    def test_restart_refused_on_deep_sleep(self):
+        self._plant(state="deep-sleep", phase="asleep", expires="2099-01-01T00:00:00Z")
+        code, _out, err = _run_capture_stderr(
+            ["--operator", "operator", "specialist", "restart", "--reason", "x"],
+            root=self.root, ledger_dir=self.ledger_dir)
+        self.assertEqual(code, 2)
+        self.assertIn("wake", err)
+        self.assertEqual(_read_ledger_entries(self.ledger_dir), [])
+
+    def test_status_shows_the_deep_sleep_phase(self):
+        self._plant(state="deep-sleep", phase="draining", expires="2099-01-01T00:00:00Z")
+        code, out = _run(["specialist", "status"], root=self.root, ledger_dir=self.ledger_dir)
+        self.assertEqual(code, 0)
+        self.assertIn("phase: draining", out)
+
+    def test_pause_dry_run_writes_nothing(self):
+        code, out, err = self._pause("--dry-run", "--reason", "x")
+        self.assertEqual(code, 0, err)
+        self.assertIn("dry-run", out)
+        self.assertIsNone(self._record())
+        self.assertEqual(_read_ledger_entries(self.ledger_dir), [])
+
+    def test_wake_dry_run_writes_nothing(self):
+        self._plant(expires="2099-01-01T00:00:00Z")
+        code, _out, _err = self._wake("--dry-run", "--reason", "x")
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(self._record())
+        self.assertEqual(self._tombstones(), [])
+        self.assertEqual(_read_ledger_entries(self.ledger_dir), [])
+
+    def test_wake_noop_without_record(self):
+        code, out, err = self._wake("--reason", "x")
+        self.assertEqual(code, 0, err)
+        self.assertIn("nothing to wake", out)
+        self.assertEqual(self._tombstones(), [])
+
+    def test_wake_tombstones_and_removes(self):
+        self._plant(expires="2099-01-01T00:00:00Z")
+        code, _out, err = self._wake("--reason", "done")
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(self._record())
+        rows = self._tombstones()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["ended_by"], "operator:operator")
+        self.assertEqual(rows[0]["reason"], "old")
+        self.assertRegex(rows[0]["ended_ts"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+        entry = _read_ledger_entries(self.ledger_dir)[0]
+        self.assertIn("harness-specialist-override-wake", entry["id"])
+        self.assertIn("done", entry["summary"])
+
+    def test_wake_expired_record_tombstoned_as_expiry(self):
+        self._plant()  # expired in 2026-01
+        code, out, err = self._wake("--reason", "x")
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(self._record())
+        self.assertEqual(self._tombstones()[0]["ended_by"], "expiry")
+        self.assertIn("expired", out)
+
+    def test_wake_clears_invalid_but_parseable_record(self):
+        self._plant(reason="")
+        code, _out, err = self._wake("--reason", "x")
+        self.assertEqual(code, 0, err)
+        self.assertIsNone(self._record())
+        self.assertEqual(len(self._tombstones()), 1)
+
+    def test_wake_refuses_unparseable_file_and_names_path(self):
+        path = hs.seat_state_path("specialist", root=self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json")
+        code, _out, err = self._wake("--reason", "x")
+        self.assertEqual(code, 2)
+        self.assertIn(str(path), err)
+        self.assertTrue(path.exists())
+        self.assertEqual(_read_ledger_entries(self.ledger_dir), [])
+
+    def test_status_shows_seat_state(self):
+        out = _run(["specialist", "status"], root=self.root, ledger_dir=self.ledger_dir)[1]
+        self.assertIn("seat state: active", out)
+        self._pause("--owner", "operator", "--reason", "quota crunch")
+        out = _run(["specialist", "status"], root=self.root, ledger_dir=self.ledger_dir)[1]
+        self.assertIn("seat state: paused-intake", out)
+        self.assertIn("owner: operator", out)
+        self.assertIn("quota crunch", out)
+        self.assertIn("left", out)
+        self.assertIn("holds: none", out)
+
+    def test_status_shows_fault_on_corrupt_record(self):
+        path = hs.seat_state_path("specialist", root=self.root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{not json")
+        out = _run(["specialist", "status"], root=self.root, ledger_dir=self.ledger_dir)[1]
+        self.assertIn("fault:", out)
+
+    def test_seat_account_guard_applies(self):
+        import os
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            code = harness.main(
+                ["specialist", "pause", "--reason", "x"], root=self.root, ledger_dir=self.ledger_dir,
+                euid_fn=lambda: os.geteuid(), account_fn=lambda persona: "someone-else-entirely")
+        self.assertEqual(code, 2)
+        self.assertIn("refusing", err.getvalue())
+        self.assertIsNone(self._record())
+
+    def test_no_sleep_verb(self):
+        code, _out, _err = _run_capture_stderr(
+            ["specialist", "sleep", "--reason", "x"], root=self.root, ledger_dir=self.ledger_dir)
+        self.assertEqual(code, 2)
 
 
 if __name__ == "__main__":

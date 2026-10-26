@@ -2,7 +2,7 @@
 """Tests for the mailbox SYSTEM — the composition, not the library (T-2245).
 
 WHY THIS FILE EXISTS, in one measurement: 4266 unit tests were green for the whole
-of mnemosyne's 90-minute delivery outage on 2026-07-28, and the monitor built that
+of archivist's 90-minute delivery outage on 2026-07-28, and the monitor built that
 afternoon to catch exactly that ran 23 times and alerted ZERO times. Both halves are
 covered at the unit level. `tools/test_mail_staleness_monitor.py` is thorough — 47
 tests — and asserts alert COUNTS on hand-built `InboxObservation` objects. What has
@@ -354,7 +354,7 @@ class AlertSinkCompositionTest(unittest.TestCase):
     def test_SELF_RECOVERY_does_not_erase_the_surfaced_gap(self):
         """THE HARDEST CONSTRAINT OF THE ARC, stated as an assertion.
 
-        mnemosyne's bridge died at ~19:20Z and came back by itself at 20:50:14Z.
+        archivist's bridge died at ~19:20Z and came back by itself at 20:50:14Z.
         Because it self-recovered, every after-the-fact observation of the system
         was healthy, and a suite asserting eventual recovery would have passed
         straight through the ninety minutes. It was surfaced only because the operator
@@ -765,9 +765,9 @@ class KnownGapsTest(unittest.TestCase):
         `OnFailure=pantheon-unit-failure-alert@%n.service`. The night's two
         failures, side by side:
 
-          pantheon-mailbox-wake@metis.service   HAS OnFailure -> failed 21:47:04Z,
+          pantheon-mailbox-wake@mason.service   HAS OnFailure -> failed 21:47:04Z,
             routed to recovery, surfaced within minutes by an uninvolved third party.
-          pantheon-acp-bridge@mnemosyne.service NO OnFailure  -> died ~19:20Z,
+          pantheon-acp-bridge@archivist.service NO OnFailure  -> died ~19:20Z,
             restarted 20:50:14Z, ninety minutes invisible.
 
         Same box, same evening, same delivery path; the outcomes tracked that one

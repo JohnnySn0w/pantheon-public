@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import io
@@ -13,8 +14,10 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tarfile
 import tempfile
+import time
 import unittest
 import urllib.error
 from pathlib import Path
@@ -49,6 +52,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 R10_ORCHESTRATOR_CODEX_SHA256 = "36f0d5eb9ff0bcd6396bd82e658fa68fd49d46b1d7415186943a357a865cc688"
 
 
+def _is_seat_core_periodic_timer(unit: str) -> bool:
+    """T-5447: the allowlisted seat-core periodic timers (everything but consume)."""
+    from tools import persona_installer as _pim
+
+    try:
+        _pim._seat_timer_template_unit(unit)
+    except _pim.OperationFailed:
+        return False
+    return True
+
+
 class LocalHostCommandSheetStageBackend(LocalHostBackend):
     def __init__(self, expected_env: dict[str, str]) -> None:
         super().__init__(command_timeout=1, timed_fire_timeout=1)
@@ -61,8 +75,19 @@ class LocalHostCommandSheetStageBackend(LocalHostBackend):
         self.commands.append(command)
         if command[:4] == ("systemctl", "--user", "show", "codex-telegram-poller.service"):
             return subprocess.CompletedProcess(command, 0, "ActiveState=inactive\nMainPID=0\n", "")
-        if command[:3] == ("systemctl", "--user", "show") and command[3].startswith("pantheon-persona-consume@") and command[3].endswith(".timer"):
+        if command[:3] == ("systemctl", "--user", "show") and (command[3].startswith("pantheon-persona-consume@") or _is_seat_core_periodic_timer(command[3])) and command[3].endswith(".timer"):
             return subprocess.CompletedProcess(command, 0, "LoadState=loaded\nUnitFileState=disabled\nActiveState=inactive\nSubState=dead\n", "")
+        if command[:3] == ("systemctl", "--user", "show") and command[3].startswith("pantheon-persona-consume@") and command[3].endswith(".service"):
+            # T-5471: the stale-reset preflight now reads the consume unit. A clean fresh
+            # seat reports not-found / inactive / dead (STALE_RESET); SERVICE_OBSERVE
+            # (read only for a loaded service) answers the same shape.
+            wanted = [command[i + 1] for i, arg in enumerate(command) if arg == "-p"]
+            clean = {
+                "LoadState": "not-found", "ActiveState": "inactive", "SubState": "dead",
+                "Result": "success", "ExecMainStatus": "0", "InvocationID": "", "Job": "",
+                "SuccessExitStatus": "",
+            }
+            return subprocess.CompletedProcess(command, 0, "".join(f"{k}={clean[k]}\n" for k in wanted), "")
         if command[:3] == ("systemctl", "--user", "show-environment"):
             for key, value in self.expected_env.items():
                 if os.environ.get(key) != value:
@@ -91,6 +116,15 @@ class LocalHostCommandSheetStageBackend(LocalHostBackend):
 
     def _current_account_only(self, account: str) -> PreflightResult:
         return PreflightResult(True, "current-account", f"test account {account}")
+
+    def _unit_fire_bootstrap_blocker(self, operation):  # type: ignore[override]
+        """T-5471: a ready host; the real gates are tested in test_persona_installer_converge."""
+        return None
+
+    def _bootstrap_fire_pending(self, timer):  # type: ignore[override]
+        """T-5473: a ready host has no runtime state to quarantine and no user manager to ask;
+        the quarantine is tested for real in test_persona_installer_phase_q."""
+        return False
 
     def _identity_ready(self, operation) -> PreflightResult:  # type: ignore[override]
         return PreflightResult(True, "identity", f"test identity {operation.owner}")
@@ -178,13 +212,14 @@ def _manifest() -> dict:
             "codex_telegram_bridge": {
                 "schema": "pantheon-codex-telegram-bridge/v1",
                 "source": {
-                    "repo": "codex-config",
+                    "repo": "pantheon-config",
                     "revision": bridge.CODEX_TELEGRAM_SOURCE_REVISION,
+                    "subdir": bridge.CODEX_TELEGRAM_SOURCE_SUBDIR,
                     "paths": list(bridge.CODEX_TELEGRAM_SOURCE_PATHS),
                     "sha256": source_hashes,
                 },
                 "unit": {"name": "codex-telegram-poller.service"},
-                "operator_chat_id": 456474197,
+                "operator_chat_id": 424242424,
                 "personas": {
                     "specialist": {
                         "account": "claude-research",
@@ -224,36 +259,43 @@ def _manifest() -> dict:
     }
 
 
-_CODEX_HOME_GIT = Path("/home/codex/codex-config/.git")
+def _pinned_codex_config_source(relative: str) -> bytes:
+    """The bridge deploy path ``relative`` at the bridge pin, read from THIS repo's history.
+
+    T-4790 (T-4750 C4b-3): the pin is pantheon-config's own harness/codex tree, so
+    the object path carries ``CODEX_TELEGRAM_SOURCE_SUBDIR``. The history below
+    describes the earlier codex-config root-level pin (1f84f64).
+
+    T-4763 (ORG-091 / T-4750): C1 imported codex-config into harness/codex/ with its
+    history, so the pin (``CODEX_TELEGRAM_SOURCE_REVISION``) is an ancestor here and
+    its original root-level tree answers ``git show <pin>:<path>``. These tests used to
+    read ``/home/codex/codex-config``, which only UID codex can, so the whole BridgeCase
+    sat behind a skipUnless (T-3547 slice 4) on every other account and in CI. Needs
+    full history (CI checks out with fetch-depth 0); a shallow clone fails loudly.
+    Live /home/codex paths that are runtime CONFIG (the planned source_root, the
+    source-check command line) are still asserted as such."""
+    return subprocess.run(
+        (
+            "git",
+            "-C",
+            str(REPO_ROOT),
+            "show",
+            f"{bridge.CODEX_TELEGRAM_SOURCE_REVISION}:{bridge.CODEX_TELEGRAM_SOURCE_SUBDIR}/{relative}",
+        ),
+        check=True,
+        capture_output=True,
+    ).stdout
 
 
-def _codex_home_reachable() -> bool:
-    """Reachability probe for the class-level ``skipUnless``. Many
-    BridgeCase methods reach ``/home/codex/codex-config`` through
-    subprocess ``git -C /home/codex/codex-config …`` calls that the
-    module under test itself makes. That path is readable only under
-    UID ``codex``; every other UID (including ``claude`` fleet-side
-    and the GitHub Actions runner) hits ``Permission denied`` on the
-    outer ``cd``/``chdir`` before the inner test assertion runs. This
-    surfaces as one of the CI-red baseline classes T-3547 tracks. The
-    guard here skips the whole ``BridgeCase`` on any UID that cannot
-    read the codex clone — the test-body regression signal still holds
-    when a codex-UID run does execute (e.g. running under
-    ``sudo -u codex``). Coverage is unchanged in that seat."""
-    try:
-        return _CODEX_HOME_GIT.is_dir() and os.access(_CODEX_HOME_GIT, os.R_OK | os.X_OK)
-    except OSError:
-        return False
+def _seed_claude_mcp_servers(home: Path, document: Mapping) -> None:
+    """Seed ``home``/.claude.json with orchestrator's manifest MCP servers. The fixtures' fake
+    claude CLI registers nothing, so without this the installer's MCP registration
+    step (added after these tests went behind the T-3547 skip guard) fails its
+    after-check; seeded, it is a matching no-op. T-4763."""
+    servers = document["persona_installer"]["claude_mcp_servers"]["personas"]["orchestrator"]["servers"]
+    (home / ".claude.json").write_text(json.dumps({"mcpServers": servers}), encoding="utf-8")
 
 
-@unittest.skipUnless(
-    _codex_home_reachable(),
-    "skips when /home/codex/codex-config/.git is unreachable to the runtime UID — "
-    "the bridge tests drive real `git -C /home/codex/codex-config` subprocess "
-    "calls that only succeed under UID=codex; every other UID (claude, recovery, "
-    "GitHub Actions runner) hits Permission denied on the outer cd/chdir. "
-    "Regression-signal intent still holds under a codex-UID run (T-3547 slice 4).",
-)
 class BridgeCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
@@ -512,10 +554,16 @@ class BridgeCase(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         sudo_bin = fake_bin or (self.root / "fake-bin")
         self._write_fake_sudo(sudo_bin)
+        fixture_home = str((cwd.parent if cwd.name == "pantheon-config" else cwd))
         env = {
             "PATH": f"{sudo_bin}:/usr/local/bin:/usr/bin:/bin",
+            # T-4763: pin the operator shell's HOME to the fixture home too. Without it
+            # bash falls back to the PASSWD home, so `~` and the `-l` login profile read
+            # the real account's files: green on a seat that has ~/pantheon-config, red
+            # on the CI runner (/home/runner-pc) that does not.
+            "HOME": fixture_home,
             "EXPECT_SUDO_ACCOUNT": account,
-            "EXPECT_SUDO_HOME": str((cwd.parent if cwd.name == "pantheon-config" else cwd)),
+            "EXPECT_SUDO_HOME": fixture_home,
             **(dict(extra_env or {})),
         }
         return subprocess.run(
@@ -539,10 +587,16 @@ class BridgeCase(unittest.TestCase):
     ) -> subprocess.CompletedProcess[str]:
         sudo_bin = self.root / "fake-bin-live"
         self._write_fake_sudo(sudo_bin)
+        fixture_home = str((cwd.parent if cwd.name == "pantheon-config" else cwd))
         env = {
             "PATH": f"{sudo_bin}:/usr/local/bin:/usr/bin:/bin",
+            # T-4763: pin the operator shell's HOME to the fixture home too. Without it
+            # bash falls back to the PASSWD home, so `~` and the `-l` login profile read
+            # the real account's files: green on a seat that has ~/pantheon-config, red
+            # on the CI runner (/home/runner-pc) that does not.
+            "HOME": fixture_home,
             "EXPECT_SUDO_ACCOUNT": account,
-            "EXPECT_SUDO_HOME": str((cwd.parent if cwd.name == "pantheon-config" else cwd)),
+            "EXPECT_SUDO_HOME": fixture_home,
             **(dict(extra_env or {})),
         }
         return subprocess.run(
@@ -591,17 +645,26 @@ class BridgeCase(unittest.TestCase):
         fake_claude.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         fake_claude.chmod(0o755)
         self._write_bridge_shim(repo)
+        # T-5454: the seat clone's shell-box wrapper (operator prerequisite), committed with
+        # the clone so the checkout stays clean and the local backend can exec it
+        shell_box = repo / "tools" / "oom" / "pantheon-shell-box.sh"
+        shell_box.parent.mkdir(parents=True, exist_ok=True)
+        shell_box.write_text("#!/bin/sh\n", encoding="utf-8")
+        shell_box.chmod(0o755)
         subprocess.run(("git", "init", "--initial-branch=main", str(repo)), check=True, capture_output=True, text=True)
         self._git(repo, "config", "user.email", "test@example.invalid")
         self._git(repo, "config", "user.name", "Test")
-        self._git(repo, "add", "pinned-rules/orchestrator-codex.md", "tools/codex_telegram_bridge.py")
+        self._git(repo, "add", "pinned-rules/orchestrator-codex.md", "tools/codex_telegram_bridge.py",
+                  "tools/oom/pantheon-shell-box.sh")
         self._git(repo, "commit", "-m", "source")
         source_commit = self._git_text(repo, "rev-parse", "HEAD")
         source_sha = hashlib.sha256(source_text.encode("utf-8")).hexdigest()
 
         document = yaml.safe_load((REPO_ROOT / "instance.yaml").read_text(encoding="utf-8"))
-        document["roles"]["orchestrator"]["account"] = account
+        document["roles"]["head-engineering-orchestrator"]["account"] = account
         document["persona_installer"]["codex_telegram_bridge"]["personas"]["orchestrator"]["account"] = account
+        document["persona_installer"]["claude_mcp_servers"]["personas"]["orchestrator"]["account"] = account
+        _seed_claude_mcp_servers(home, document)
         ref = document["persona_installer"]["codex_standing_instructions"]["personas"]["orchestrator"]
         ref["source_commit"] = source_commit
         ref["source_sha256"] = source_sha
@@ -858,21 +921,25 @@ class BridgeCase(unittest.TestCase):
     def _stage_orchestrator_target_via_installer(self, *, root: Path, home: Path, repo: Path, account: str):
         for mailbox_persona in ("orchestrator", "codex"):
             for subdir in ("tmp", "new", "cur"):
-                (root / "home" / "the-ancestor" / "mailbox" / mailbox_persona / subdir).mkdir(parents=True, exist_ok=True)
+                (root / "home" / "post-office" / "mailbox" / mailbox_persona / subdir).mkdir(parents=True, exist_ok=True)
         manifest = Manifest.load(repo / "instance.yaml")
         installer = PersonaInstaller(REPO_ROOT)
         plan = installer.plan(manifest, "orchestrator", harness_override="claude", root=root)
         archive = self._operation(plan, "codex-telegram.source-archive")
         source = bridge.CodexTelegramSource(
-            "codex-config",
+            bridge.CODEX_TELEGRAM_SOURCE_REPO,
             archive.desired["revision"],
             tuple(json.loads(archive.desired["paths"])),
             dict(json.loads(archive.desired["sha256"])),
             owner_account=archive.desired.get("source_account") or None,
             source_root=Path(archive.desired["source_root"]),
+            subdir=archive.desired.get("source_subdir", ""),
         )
+        # The plan's source_root is the codex-owned pantheon-config clone (T-4770);
+        # the archive is built from the same pinned objects in this repo (T-4763).
+        self.assertEqual(archive.desired["source_root"], "/home/codex/pantheon-config")
         bridge.create_verified_source_archive(
-            Path(archive.desired["source_root"]),
+            REPO_ROOT,
             Path(archive.desired["archive_path"]),
             source,
         )
@@ -890,6 +957,7 @@ class BridgeCase(unittest.TestCase):
                     instance=plan.instance,
                     capabilities=_all_plan_capabilities(plan),
                 ),
+                manifest=manifest,
             )
         self.assertIn(report.status, {"applied", "noop"}, report.errors)
         activation_ids = {
@@ -998,7 +1066,9 @@ class BridgeCase(unittest.TestCase):
         self.assertEqual(binding.tmux_pane, "0.0")
         self.assertEqual(binding.codex_receiver_unit, "codex-telegram-poller.service")
         self.assertEqual(binding.source.owner_account, "codex")
-        self.assertEqual(binding.source.source_root, Path("/home/codex/codex-config"))
+        self.assertEqual(binding.source.source_root, Path("/home/codex/pantheon-config"))
+        self.assertEqual(binding.source.repo, "pantheon-config")
+        self.assertEqual(binding.source.subdir, "harness/codex")
 
     def test_render_unit_orchestrator_uses_manifest_pane_env(self) -> None:
         live = Manifest.load(Path(__file__).resolve().parent.parent / "instance.yaml")
@@ -1052,20 +1122,8 @@ class BridgeCase(unittest.TestCase):
         self.assertEqual(post.operations, ("probe-claude-present", "complete-receiver-topology-snapshot"))
 
     def test_rendered_allowlist_matches_pinned_codex_config_loader_contract(self) -> None:
-        result = subprocess.run(
-            (
-                "git",
-                "-C",
-                "/home/codex/codex-config",
-                "show",
-                f"{bridge.CODEX_TELEGRAM_SOURCE_REVISION}:codex_telegram/config.py",
-            ),
-            check=True,
-            capture_output=True,
-            text=True,
-        )
         config_path = self.root / "pinned_config.py"
-        config_path.write_text(result.stdout, encoding="utf-8")
+        config_path.write_bytes(_pinned_codex_config_source("codex_telegram/config.py"))
         spec = importlib.util.spec_from_file_location("pinned_codex_telegram_config", config_path)
         self.assertIsNotNone(spec)
         self.assertIsNotNone(spec.loader)
@@ -1077,7 +1135,7 @@ class BridgeCase(unittest.TestCase):
         (state / "allowlist.json").write_text(bridge.render_allowlist(), encoding="utf-8")
         with mock.patch.dict(os.environ, {"CODEX_TG_STATE_DIR": str(state)}):
             allow = module.load_allowlist()
-        self.assertIn(456474197, allow)
+        self.assertIn(424242424, allow)
         self.assertNotIn(123, allow)
 
     def test_credential_wrapper_exports_only_telegram_bot_token(self) -> None:
@@ -1278,7 +1336,7 @@ class BridgeCase(unittest.TestCase):
                 self.assertIn("--destination codex/interactive-chatgpt", joined)
                 self.assertIn("--destination claude/interactive-subscription", joined)
                 self.assertEqual(sheet["commands_authoritative"], False)
-                generate = next(index for index, item in enumerate(commands) if "--source-repo /home/codex/codex-config" in item)
+                generate = next(index for index, item in enumerate(commands) if "--source-repo /home/codex/pantheon-config" in item)
                 install = next(index for index, item in enumerate(commands) if " && sudo install " in item)
                 stage = next(index for index, item in enumerate(commands) if " bridge-stage " in item)
                 swap = next(index for index, item in enumerate(commands) if "--destination codex/interactive-chatgpt" in item)
@@ -1289,12 +1347,73 @@ class BridgeCase(unittest.TestCase):
                 self.assertLess(swap, restore)
                 for command in commands:
                     argv = shlex.split(command)
-                    self.assertIn(argv[0], {"sudo", "python3"})
+                    self.assertIn(argv[0], {"sudo", "python3", "CODEX_TG_SRC_DIR=$(mktemp"})
                     for index, token in enumerate(argv):
                         if token.endswith(".py") and "pantheon-config/tools" in token:
                             self.assertTrue((Path(__file__).resolve().parent / Path(token).name).is_file())
                 with mock.patch("builtins.print"):
                     self.assertEqual(bridge.main(["command-sheet", "--persona", persona, "--expected-pantheon-revision", expected_revision]), 0)
+
+    def test_t5066_archives_staged_in_private_mktemp_dirs_not_fixed_tmp_paths(self) -> None:
+        for persona in ("specialist", "recovery"):
+            with self.subTest(persona=persona):
+                sheet = bridge.command_sheet(persona, expected_pantheon_revision="a" * 40)
+                remediation = sheet["amendment_i_remediation"]
+                # (a) no fixed predictable path anywhere in the emitted sheet
+                self.assertNotIn("/tmp/codex-telegram-", str(sheet))
+                self.assertNotIn("/tmp/codex-telegram-", str(remediation))
+                for steps, create_id, stage_id in (
+                    (sheet["steps"], "04-source-archive", "06-bridge-stage"),
+                    (remediation["steps"], "ai-01-source-archive", "ai-07-bridge-stage-disabled"),
+                ):
+                    by_id = {step["step_id"]: step["command"] for step in steps if step["type"] == "command"}
+                    create = by_id[create_id]
+                    # (b) unpredictable dirs: source dir owned by the writer, target dir owned by the seat account
+                    self.assertIn("CODEX_TG_SRC_DIR=$(mktemp -d)", create)
+                    self.assertRegex(create, r"CODEX_TG_DST_DIR=\$\(sudo -u \S+ mktemp -d\)")
+                    self.assertIn('--archive "$CODEX_TG_SRC_DIR/', create)
+                    self.assertLess(create.index("mktemp -d"), create.index("source-check"))
+                    install = next(c for c in by_id.values() if " && sudo install " in c)
+                    self.assertIn('"$CODEX_TG_SRC_DIR/', install)
+                    self.assertIn('"$CODEX_TG_DST_DIR/', install)
+                    stage = by_id[stage_id]
+                    # the seat account gets the dir as a positional arg across the sudo hop
+                    self.assertIn(' _ "$CODEX_TG_DST_DIR/', stage)
+                    self.assertIn('--archive "$1" --json', stage)
+                    # (c) cleanup emitted, only after the stage succeeds, guarded against empty vars
+                    self.assertIn('rm -rf -- "${CODEX_TG_SRC_DIR:?}"', stage)
+                    self.assertIn('sudo rm -rf -- "${CODEX_TG_DST_DIR:?}"', stage)
+                    self.assertLess(stage.index("bridge-stage"), stage.index("rm -rf"))
+                    self.assertTrue(stage.rstrip().endswith("unset CODEX_TG_SRC_DIR CODEX_TG_DST_DIR"))
+
+    def test_t5068_orchestrator_sheet_stages_archives_in_private_mktemp_dirs(self) -> None:
+        sheet = bridge.command_sheet("orchestrator", expected_pantheon_revision="4" * 40)
+        self.assertNotIn("/tmp/codex-telegram-", str(sheet))
+        by_id = {step["step_id"]: step["command"] for step in sheet["steps"] if step["type"] == "command"}
+        create = by_id["05-source-archive"]
+        # source dir owned by the source account that writes it; target dir by the seat account
+        self.assertRegex(create, r"^CODEX_TG_SRC_DIR=\$\(sudo -u codex mktemp -d\) && ")
+        self.assertRegex(create, r"CODEX_TG_DST_DIR=\$\(sudo -u claude mktemp -d\) && ")
+        self.assertLess(create.index("mktemp -d"), create.index("source-check"))
+        stem = f"codex-telegram-orchestrator-{bridge.CODEX_TELEGRAM_SOURCE_REVISION}"
+        self.assertTrue(create.rstrip().endswith(f' _ "$CODEX_TG_SRC_DIR/{stem}.codex.tar"'))
+        outer = shlex.split(create.split(" && ", 2)[2])
+        self.assertIn('--archive "$1"', outer[outer.index("-lc") + 1].replace("'", ""))
+        install = by_id["06-install-archive"]
+        self.assertIn('"$CODEX_TG_SRC_DIR/', install)
+        self.assertIn('"$CODEX_TG_DST_DIR/', install)
+        stage = by_id["08-stage-disabled-instructions-and-bridge"]
+        self.assertTrue(stage.rstrip().endswith(' _ "$CODEX_TG_DST_DIR"'))
+        _assignments, compound = _assert_target_env_shape(self, stage)
+        self.assertIn('--codex-telegram-archive-dir "$1"', compound)
+        # activation preflight at step 14 still reads the archive: cleanup rides there, not earlier
+        for early in ("05-source-archive", "06-install-archive", "07-stage1-cutover-dry-run", "08-stage-disabled-instructions-and-bridge"):
+            self.assertNotIn("rm -rf", by_id[early])
+        execute = by_id["14-stage1-cutover-execute"]
+        self.assertIn('rm -rf -- "${CODEX_TG_SRC_DIR:?}"', execute)
+        self.assertIn('sudo rm -rf -- "${CODEX_TG_DST_DIR:?}"', execute)
+        self.assertLess(execute.index("persona_cutover.sh"), execute.index("rm -rf"))
+        self.assertTrue(execute.rstrip().endswith("unset CODEX_TG_SRC_DIR CODEX_TG_DST_DIR"))
 
     def test_command_sheet_uses_ordered_steps_and_legacy_commands_are_non_authoritative(self) -> None:
         sheet = bridge.command_sheet("specialist", expected_pantheon_revision="a" * 40)
@@ -1306,7 +1425,8 @@ class BridgeCase(unittest.TestCase):
             if step["type"] == "command":
                 argv = shlex.split(step["command"])
                 self.assertTrue(argv)
-                self.assertIn(argv[0], {"sudo", "python3"})
+                # T-5066: the first archive step opens with the private staging-dir assignment.
+                self.assertIn(argv[0], {"sudo", "python3", "CODEX_TG_SRC_DIR=$(mktemp"})
                 if "bash" in argv:
                     inner = argv[argv.index("-lc") + 1]
                     shlex.split(inner)
@@ -1935,8 +2055,20 @@ class BridgeCase(unittest.TestCase):
         )
         fake_git.chmod(0o755)
         old = self._run_operator_live_copy_literal(old_shape, account=account, cwd=repo)
-        self.assertNotEqual(old.returncode, 0)
-        self.assertRegex(old.stderr + old.stdout, r"Not a valid object name|\\{print \\}|awk")
+        # The deliberate negative: the OLD shape nests shlex quoting ('"'"') two layers
+        # deep, and an operator pasting it into `bash -lc "..."` ends that wrapper's
+        # double quotes at the first embedded `"`. The command is re-split at the wrong
+        # layer: the innermost `bash -c` gets only a fragment with a dangling `"` (its $0
+        # becomes `-euo`, hence "-euo: -c: ... unexpected EOF"), and the rest runs one
+        # layer out, where `git cat-file` receives the object name with literal quote
+        # characters glued on. Both are pure quoting effects; with HOME pinned (see
+        # _run_operator_live_copy_literal) `cd ~/pantheon-config` lands in the fixture
+        # repo, so neither depends on the runner's home (T-4763).
+        failure = old.stderr + old.stdout
+        self.assertEqual(old.returncode, 128, failure)  # git's fatal exit, not cd's 1
+        self.assertIn("-euo: -c: line 1: unexpected EOF while looking for matching", failure)
+        self.assertRegex(failure, r"fatal: Not a valid object name \S*'\S*\^\{commit\}")
+        self.assertNotIn("No such file or directory", failure)
 
     def test_orchestrator_postinstall_instruction_target_executes_literal_command_through_operator_shell_without_losing_hash_field(self) -> None:
         root, home, repo, expected, source_sha, account = self._rooted_orchestrator_repo()
@@ -2039,6 +2171,19 @@ class BridgeCase(unittest.TestCase):
             "orchestrator:amendment:ai-12-prove-startup-pane",
             "orchestrator:amendment:ai-13-prove-no-sustained-409",
         }
+        # T-5066: the archive-staging steps expand operator-shell staging-dir variables on purpose.
+        for expanding_persona in ("specialist", "recovery"):
+            allowed.update(f"{expanding_persona}:{step_id}" for step_id in ("04-source-archive", "05-install-archive", "06-bridge-stage"))
+        # T-5068: so does the orchestrator sheet (create, install, stage-disabled, and cleanup-on-cutover steps).
+        allowed.update(
+            f"orchestrator:{step_id}"
+            for step_id in ("05-source-archive", "06-install-archive", "08-stage-disabled-instructions-and-bridge", "14-stage1-cutover-execute")
+        )
+        for expanding_persona in ("specialist", "recovery", "orchestrator"):
+            allowed.update(
+                f"{expanding_persona}:amendment:{step_id}"
+                for step_id in ("ai-01-source-archive", "ai-02-install-archive", "ai-07-bridge-stage-disabled")
+            )
         offenders = []
         for label, command in surfaces:
             has_expansion = "$" in command or "`" in command or "~" in command
@@ -2142,10 +2287,11 @@ class BridgeCase(unittest.TestCase):
         (home / "CLAUDE.md").write_text("Orchestrator brief fixture\n", encoding="utf-8")
         for mailbox_persona in ("orchestrator", "codex"):
             for subdir in ("tmp", "new", "cur"):
-                (root / "home" / "the-ancestor" / "mailbox" / mailbox_persona / subdir).mkdir(parents=True, exist_ok=True)
+                (root / "home" / "post-office" / "mailbox" / mailbox_persona / subdir).mkdir(parents=True, exist_ok=True)
         fake_claude = home / ".npm-global" / "bin" / "claude"
         fake_claude.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         fake_claude.chmod(0o755)
+        _seed_claude_mcp_servers(home, yaml.safe_load((REPO_ROOT / "instance.yaml").read_text(encoding="utf-8")))
         repo.symlink_to(REPO_ROOT, target_is_directory=True)
 
         manifest = Manifest.load(REPO_ROOT / "instance.yaml")
@@ -2160,15 +2306,19 @@ class BridgeCase(unittest.TestCase):
         plan = installer.plan(manifest, "orchestrator", harness_override="claude", root=root)
         archive = self._operation(plan, "codex-telegram.source-archive")
         source = bridge.CodexTelegramSource(
-            "codex-config",
+            bridge.CODEX_TELEGRAM_SOURCE_REPO,
             archive.desired["revision"],
             tuple(json.loads(archive.desired["paths"])),
             dict(json.loads(archive.desired["sha256"])),
             owner_account=archive.desired.get("source_account") or None,
             source_root=Path(archive.desired["source_root"]),
+            subdir=archive.desired.get("source_subdir", ""),
         )
+        # The plan's source_root is the codex-owned pantheon-config clone (T-4770);
+        # the archive is built from the same pinned objects in this repo (T-4763).
+        self.assertEqual(archive.desired["source_root"], "/home/codex/pantheon-config")
         bridge.create_verified_source_archive(
-            Path(archive.desired["source_root"]),
+            REPO_ROOT,
             Path(archive.desired["archive_path"]),
             source,
         )
@@ -2185,6 +2335,7 @@ class BridgeCase(unittest.TestCase):
                     instance=plan.instance,
                     capabilities=_all_plan_capabilities(plan),
                 ),
+                manifest=manifest,
             )
         self.assertIn(report.status, {"applied", "noop"}, report.errors)
         target = home / ".codex" / "AGENTS.md"
@@ -2218,10 +2369,11 @@ class BridgeCase(unittest.TestCase):
         (home / "CLAUDE.md").write_text("Orchestrator brief fixture\n", encoding="utf-8")
         for mailbox_persona in ("orchestrator", "codex"):
             for subdir in ("tmp", "new", "cur"):
-                (root / "home" / "the-ancestor" / "mailbox" / mailbox_persona / subdir).mkdir(parents=True, exist_ok=True)
+                (root / "home" / "post-office" / "mailbox" / mailbox_persona / subdir).mkdir(parents=True, exist_ok=True)
         fake_claude = home / ".npm-global" / "bin" / "claude"
         fake_claude.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         fake_claude.chmod(0o755)
+        _seed_claude_mcp_servers(home, yaml.safe_load((REPO_ROOT / "instance.yaml").read_text(encoding="utf-8")))
         repo.symlink_to(REPO_ROOT, target_is_directory=True)
 
         manifest = Manifest.load(REPO_ROOT / "instance.yaml")
@@ -2261,15 +2413,19 @@ class BridgeCase(unittest.TestCase):
         plan = installer.plan(Manifest.load(manifest_arg), persona_arg, harness_override=harness_arg, root=root)
         archive = self._operation(plan, "codex-telegram.source-archive")
         source = bridge.CodexTelegramSource(
-            "codex-config",
+            bridge.CODEX_TELEGRAM_SOURCE_REPO,
             archive.desired["revision"],
             tuple(json.loads(archive.desired["paths"])),
             dict(json.loads(archive.desired["sha256"])),
             owner_account=archive.desired.get("source_account") or None,
             source_root=Path(archive.desired["source_root"]),
+            subdir=archive.desired.get("source_subdir", ""),
         )
+        # The plan's source_root is the codex-owned pantheon-config clone (T-4770);
+        # the archive is built from the same pinned objects in this repo (T-4763).
+        self.assertEqual(archive.desired["source_root"], "/home/codex/pantheon-config")
         bridge.create_verified_source_archive(
-            Path(archive.desired["source_root"]),
+            REPO_ROOT,
             Path(archive.desired["archive_path"]),
             source,
         )
@@ -2605,7 +2761,7 @@ class BridgeCase(unittest.TestCase):
         self.assertLess(ids.index("ai-08-daemon-reload"), ids.index("ai-09-start-codex"))
         self.assertLess(ids.index("ai-09-start-codex"), ids.index("ai-12-prove-startup-pane"))
         commands = "\n".join(remediation["commands"])
-        self.assertIn("source-check --persona specialist --source-repo /home/codex/codex-config", commands)
+        self.assertIn("source-check --persona specialist --source-repo /home/codex/pantheon-config", commands)
         self.assertIn("source-currency", commands)
         self.assertIn(expected, commands)
         self.assertIn('unit=codex-telegram-poller.service', commands)
@@ -2826,7 +2982,7 @@ approval_mode = "approve"
         self.assertNotIn("[mcp_servers.telegram.tools.", bridge.expected_mcp_snippet(specialist))
         self.assertNotIn("[mcp_servers.telegram.tools.", bridge.expected_mcp_snippet(recovery))
 
-    def test_specialist_no_permission_policy_ref_preserves_workspace_write_never_and_emitted_bytes(self) -> None:
+    def test_specialist_no_permission_policy_ref_preserves_danger_full_access_never_and_emitted_bytes(self) -> None:
         live = Manifest.load(REPO_ROOT / "instance.yaml")
         specialist = live.codex_telegram_binding("specialist")
         recovery = live.codex_telegram_binding("recovery")
@@ -2848,7 +3004,9 @@ approval_mode = "approve"
             "specialist",
             harness_override="codex",
         ).launch
-        self.assertEqual(specialist_launch.native["sandbox"], "workspace-write")
+        # T-4025 (the operator TG 7477, 2026-09-26): specialist (an HC codex fallback) now runs
+        # danger-full-access after the T-2654 UID-cordon tightening; was workspace-write.
+        self.assertEqual(specialist_launch.native["sandbox"], "danger-full-access")
         self.assertEqual(specialist_launch.native["config_overrides"]["approval_policy"], "never")
         self.assertNotIn("permission_posture", specialist_launch.native)
 
@@ -2924,6 +3082,60 @@ approval_mode = "approve"
         self.assertEqual(evidence["claude_receiver_process_count"], "1")
         self.assertEqual(evidence["plugin_launcher_descendant_count"], "1")
         self.assertEqual(evidence["plugin_server_descendant_count"], "1")
+
+    def test_live_recovery_binding_carries_its_configured_claude_executable(self) -> None:
+        # T-5038: recovery launches the root-owned /opt copy; every other role keeps npm.
+        live = Manifest.load(Path(__file__).resolve().parent.parent / "instance.yaml")
+        recovery = live.codex_telegram_binding("recovery")
+        self.assertEqual(recovery.claude_executable, Path("/opt/pantheon/claude/claude-fallback/current/claude.exe"))
+        self.assertEqual(recovery.claude_pane_commands, frozenset({"claude", "claude.exe"}))
+        self.assertIsNone(live.codex_telegram_binding("specialist").claude_executable)
+
+    def test_runtime_owned_present_accepts_the_configured_executable(self) -> None:
+        exe = Path("/opt/pantheon/claude/claude-fallback/current/claude.exe")
+        binding = dataclasses.replace(self.manifest.codex_telegram_binding("specialist"), claude_executable=exe)
+        processes = (
+            bridge.ProcessSnapshot(1400118, 1, f"{exe} --channels plugin:telegram@claude-plugins-official --model claude-opus-5-5"),
+        ) + self._runtime_owned_processes(binding)[1:]
+        evidence = bridge._evaluate_runtime_owned_claude_state(
+            binding,
+            expected="present",
+            unit_probe=bridge.UnitProbe(binding.claude_receiver_unit, "inactive", "dead", "0"),
+            unit_enabled="disabled",
+            tmux=bridge.TmuxPaneSnapshot(True, False, 1400118, "claude.exe"),
+            processes=processes,
+        )
+        self.assertEqual(evidence["claude_receiver_process_count"], "1")
+        # The same /opt receiver is still present, so an absent proof must refuse.
+        with self.assertRaises(bridge.BridgeError):
+            bridge._evaluate_runtime_owned_claude_state(
+                binding,
+                expected="absent",
+                unit_probe=bridge.UnitProbe(binding.claude_receiver_unit, "inactive", "dead", "0"),
+                unit_enabled="disabled",
+                tmux=bridge.TmuxPaneSnapshot(True, False, 1400118, "claude.exe"),
+                processes=processes,
+            )
+        # A role WITHOUT a configured executable does not accept the /opt argv.
+        npm_only = dataclasses.replace(binding, claude_executable=None)
+        with self.assertRaises(bridge.BridgeError):
+            bridge._evaluate_runtime_owned_claude_state(
+                npm_only,
+                expected="present",
+                unit_probe=bridge.UnitProbe(binding.claude_receiver_unit, "inactive", "dead", "0"),
+                unit_enabled="disabled",
+                tmux=bridge.TmuxPaneSnapshot(True, False, 1400118, "claude.exe"),
+                processes=processes,
+            )
+
+    def test_manifest_claude_executable_must_be_an_absolute_literal(self) -> None:
+        for bad in ("claude.exe", "{account_home}/.npm-global/bin/claude", 7):
+            with self.subTest(bad=bad):
+                manifest = dataclasses.make_dataclass("M", [("harness_runtime", dict)])(
+                    {"roles": {"r": {"claude": {"executable": bad}}}}
+                )
+                with self.assertRaises(bridge.BridgeError):
+                    bridge._manifest_role_claude_executable(manifest, role="r")
 
     def test_runtime_owned_present_rejects_substring_wrappers_or_duplicate_receivers(self) -> None:
         binding = self.manifest.codex_telegram_binding("specialist")
@@ -3412,13 +3624,35 @@ approval_mode = "approve"
             instance=plan.instance,
             capabilities=installer_module._all_plan_capabilities(plan),
         )
-        report = installer.apply(plan, plan.digest, SimulatedHostBackend(), actor)
+        report = installer.apply(plan, plan.digest, SimulatedHostBackend(), actor, manifest=self.manifest)
         self.assertEqual(report.status, "applied")
         receipt_evidence = next(item.evidence for item in report.receipt.evidence if item.operation_id == "codex-telegram.source-archive")
         self.assertEqual(receipt_evidence["claude_receiver_topology"], "runtime-owned")
         self.assertEqual(receipt_evidence["predecessor_claude_receiver_topology"], "runtime-owned")
         self.assertEqual(receipt_evidence["tmux_pane"], "0.0")
         self.assertEqual(receipt_evidence["effective_pane"], "claude-telegram-bot-fallback:0.0")
+
+    def test_stage_extracts_the_verified_bytes_not_a_swapped_archive(self) -> None:
+        # T-4860: another account swaps the (predictable /tmp) archive between
+        # verification and extraction. Staging must promote what was verified.
+        binding = self.manifest.codex_telegram_binding("specialist", root=self.root)
+        archive = self._canonical_archive()
+        evil = self._archive({path: b"evil" for path in bridge.CODEX_TELEGRAM_SOURCE_PATHS})
+        real_verify = bridge.verify_archive
+
+        def verify_then_swap(source_archive, source):
+            receipt = real_verify(source_archive, source)
+            os.replace(evil, archive)  # the swap lands after verification
+            return receipt
+
+        with mock.patch.object(bridge, "verify_archive", side_effect=verify_then_swap):
+            bridge.stage_archive_release(archive, binding)
+        release_dir = binding.release_root / "releases" / binding.source.revision
+        self.assertTrue(bridge._release_tree_matches(release_dir, binding.source))
+        with self.assertRaises(bridge.BridgeError):  # the swap really happened on disk
+            real_verify(archive, binding.source)
+        for path in bridge.CODEX_TELEGRAM_SOURCE_PATHS:
+            self.assertNotEqual((release_dir / path).read_bytes(), b"evil")
 
     def test_bridge_stage_failure_restores_owned_allowlist_unit_current_mcp_and_skips_receipt(self) -> None:
         binding = self.manifest.codex_telegram_binding("specialist", root=self.root)
@@ -3620,11 +3854,11 @@ approval_mode = "approve"
         self.assertEqual(
             pairs,
             [
-                "/home/the-ancestor/mailbox/orchestrator",
-                "/home/the-ancestor/mailbox/codex",
+                "/home/post-office/mailbox/orchestrator",
+                "/home/post-office/mailbox/codex",
             ],
         )
-        self.assertNotIn("/home/the-ancestor/mailbox", pairs)
+        self.assertNotIn("/home/post-office/mailbox", pairs)
         self.assertFalse(any(item.startswith("--config") and "writable" in item for item in spec.argv))
 
     def test_codex_launch_repeats_add_dir_for_typed_writable_roots(self) -> None:
@@ -4475,8 +4709,9 @@ approval_mode = "approve"
         return None, last
 
     def _write_source_tree(self, root: Path) -> None:
+        # compute_source_hashes reads under the pinned subdir (T-4790).
         for path in bridge.CODEX_TELEGRAM_SOURCE_PATHS:
-            file_path = root / path
+            file_path = root / bridge.CODEX_TELEGRAM_SOURCE_SUBDIR / path
             file_path.parent.mkdir(parents=True, exist_ok=True)
             file_path.write_text("x", encoding="utf-8")
 
@@ -4492,12 +4727,7 @@ approval_mode = "approve"
     def _canonical_archive(self) -> Path:
         members = {}
         for path in bridge.CODEX_TELEGRAM_SOURCE_PATHS:
-            result = subprocess.run(
-                ("git", "-C", "/home/codex/codex-config", "show", f"{bridge.CODEX_TELEGRAM_SOURCE_REVISION}:{path}"),
-                check=True,
-                capture_output=True,
-            )
-            members[path] = result.stdout
+            members[path] = _pinned_codex_config_source(path)
         return self._archive(members)
 
     def _runtime_owned_processes(self, binding) -> tuple:
@@ -4505,7 +4735,7 @@ approval_mode = "approve"
             bridge.ProcessSnapshot(
                 1400118,
                 1,
-                f"{binding.account_home}/.npm-global/bin/claude --channels plugin:telegram@claude-plugins-official --model claude-opus-4-8 --permission-mode default",
+                f"{binding.account_home}/.npm-global/bin/claude --channels plugin:telegram@claude-plugins-official --model claude-opus-4-8 --permission-mode bypassPermissions",
             ),
             bridge.ProcessSnapshot(
                 1400120,
@@ -4518,6 +4748,710 @@ approval_mode = "approve"
                 "bun server.ts",
             ),
         )
+
+
+class TopologySnapshotPendingTests(unittest.TestCase):
+    """T-4178: the read-only pending-snapshot predicate the runtime controller
+    gates its codex-to-claude post phase on. Not gated on the codex UID: the
+    snapshot lives in a temp state_dir and unit probes are scripted."""
+
+    class _Backend(bridge.LocalReceiverBackend):
+        def _require_current_account(self, binding):  # type: ignore[override]
+            del binding
+
+        def _snapshot_unit(self, unit):  # type: ignore[override]
+            del unit
+            return {"active_state": "active", "sub_state": "waiting", "main_pid": "0", "enabled": "enabled"}
+
+    def _binding(self, root: Path, persona: str = "recovery"):
+        return SimpleNamespace(
+            persona=persona,
+            account="claude-fallback",
+            claude_receiver_topology="runtime-owned",
+            state_dir=root,
+            watchdog_units=("recovery-telegram-child-watchdog.timer", "recovery-telegram-child-watchdog.service"),
+        )
+
+    def test_missing_snapshot_is_not_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertFalse(self._Backend().receiver_topology_snapshot_pending(self._binding(Path(tmp))))
+
+    def test_pre_phase_snapshot_is_pending_until_completed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binding = self._binding(Path(tmp))
+            backend = self._Backend()
+            backend.execute("snapshot-watchdog-units", binding)
+            self.assertTrue(backend.receiver_topology_snapshot_pending(binding))
+            backend.execute("complete-receiver-topology-snapshot", binding)
+            self.assertFalse(backend.receiver_topology_snapshot_pending(binding))
+
+    def test_foreign_identity_snapshot_raises_instead_of_guessing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._Backend().execute("snapshot-watchdog-units", self._binding(root, persona="specialist"))
+            with self.assertRaises(bridge.BridgeError):
+                self._Backend().receiver_topology_snapshot_pending(self._binding(root))
+
+    def test_cli_reports_pending_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binding = self._binding(Path(tmp))
+            self._Backend().execute("snapshot-watchdog-units", binding)
+            out = io.StringIO()
+            with mock.patch.object(bridge, "binding_for_current_account", return_value=binding), \
+                    mock.patch.object(bridge.LocalReceiverBackend, "_require_current_account", return_value=None), \
+                    contextlib.redirect_stdout(out):
+                code = bridge.main(["topology-snapshot-state", "--persona", "recovery", "--json"])
+            self.assertEqual(code, 0)
+            payload = json.loads(out.getvalue())
+            self.assertIs(payload["ok"], True)
+            self.assertIs(payload["pending"], True)
+
+    def test_cli_error_is_ok_false_exit_1(self) -> None:
+        out = io.StringIO()
+        with mock.patch.object(bridge, "binding_for_current_account", side_effect=bridge.BridgeError("no binding")), \
+                contextlib.redirect_stdout(out):
+            code = bridge.main(["topology-snapshot-state", "--persona", "recovery", "--json"])
+        self.assertEqual(code, 1)
+        payload = json.loads(out.getvalue())
+        self.assertIs(payload["ok"], False)
+        self.assertIn("no binding", payload["error"])
+
+
+class UnprovenPriorRuntimeHandoffTests(unittest.TestCase):
+    """T-4184: the controller's claude-to-codex quiesce (``--prior-runtime
+    unproven``) composes with T-4178's codex-to-claude POST through the
+    receiver topology snapshot. Not gated on the codex UID: systemctl is a
+    stateful fake and the snapshot lives in a temp state_dir."""
+
+    TIMER = "recovery-telegram-child-watchdog.timer"
+    SERVICE = "recovery-telegram-child-watchdog.service"
+    CLAUDE_UNIT = "claude-telegram-fallback.service"
+
+    class _FakeSystemd(bridge.LocalReceiverBackend):
+        def __init__(self, units):
+            super().__init__(timeout_seconds=0)
+            self.units = units  # unit -> {"enabled": bool, "active": bool}
+            self.claude_present_results: list[bool] = []
+
+        def _require_current_account(self, binding):  # type: ignore[override]
+            del binding
+
+        def _require_present(self, binding, *, kind, topology_phase="managed"):  # type: ignore[override]
+            del binding, topology_phase
+            if kind == "claude" and not self.claude_present_results.pop(0):
+                raise bridge.BridgeError("runtime-owned Claude receiver process is not present")
+            return {"kind": kind, "expected": "present"}
+
+        def _run(self, argv, *args, **kwargs):  # type: ignore[override]
+            argv = tuple(argv)
+            assert argv[:2] == ("systemctl", "--user"), argv
+            verb, rest = argv[2], argv[3:]
+            if verb == "show":
+                state = self.units[rest[0]]
+                active = "active" if state["active"] else "inactive"
+                return subprocess.CompletedProcess(argv, 0, f"ActiveState={active}\nSubState=x\nMainPID=0\n", "")
+            if verb == "is-enabled":
+                enabled = self.units[rest[0]]["enabled"]
+                return subprocess.CompletedProcess(argv, 0 if enabled else 1, "enabled\n" if enabled else "disabled\n", "")
+            now = rest[0] == "--now"
+            unit = rest[-1]
+            if verb == "disable":
+                self.units[unit]["enabled"] = False
+                if now:
+                    self.units[unit]["active"] = False
+            elif verb == "enable":
+                self.units[unit]["enabled"] = True
+            elif verb == "start":
+                self.units[unit]["active"] = True
+            elif verb == "stop":
+                self.units[unit]["active"] = False
+            else:
+                raise AssertionError(argv)
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+    def _binding(self, root: Path):
+        return SimpleNamespace(
+            persona="recovery",
+            account="claude-fallback",
+            claude_receiver_topology="runtime-owned",
+            claude_receiver_unit=self.CLAUDE_UNIT,
+            state_dir=root,
+            watchdog_units=(self.TIMER, self.SERVICE),
+        )
+
+    def _run(self, backend, binding, direction, phase, *, prior_runtime="live"):
+        for action in bridge.handoff_actions(binding, direction, phase, prior_runtime=prior_runtime):
+            backend.execute(action, binding)
+
+    def test_repeated_swaps_with_a_middle_post_failure_restore_the_original_enabled_state(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binding = self._binding(Path(tmp))
+            units = {
+                self.TIMER: {"enabled": True, "active": True},
+                self.SERVICE: {"enabled": False, "active": False},
+                self.CLAUDE_UNIT: {"enabled": False, "active": False},
+            }
+            backend = self._FakeSystemd(units)
+            backend.claude_present_results = [False, True]
+
+            self._run(backend, binding, "claude-to-codex", "pre", prior_runtime="unproven")
+            self.assertEqual(units[self.TIMER], {"enabled": False, "active": False})
+            self.assertTrue(backend.receiver_topology_snapshot_pending(binding))
+
+            with self.assertRaises(bridge.BridgeError):  # the codex-to-claude POST fails
+                self._run(backend, binding, "codex-to-claude", "post")
+            self.assertEqual(units[self.TIMER], {"enabled": False, "active": False})
+            self.assertTrue(backend.receiver_topology_snapshot_pending(binding))
+
+            # codex again (claude capped): the quiesce re-runs over the pending snapshot
+            self._run(backend, binding, "claude-to-codex", "pre", prior_runtime="unproven")
+            snapshot = backend._read_topology_snapshot(binding)
+            self.assertEqual(snapshot["units"][self.TIMER]["enabled"], "enabled")  # first-wins
+
+            self._run(backend, binding, "codex-to-claude", "post")
+            self.assertEqual(units[self.TIMER], {"enabled": True, "active": True})
+            self.assertEqual(units[self.SERVICE], {"enabled": False, "active": False})
+            self.assertFalse(backend.receiver_topology_snapshot_pending(binding))
+
+    def test_handoff_cli_threads_prior_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            binding = self._binding(Path(tmp))
+            for extra, expect_probe in (((), True), (("--prior-runtime", "unproven"), False)):
+                with self.subTest(extra=extra):
+                    executed: list[str] = []
+                    out = io.StringIO()
+                    with mock.patch.object(bridge, "binding_for_current_account", return_value=binding), \
+                            mock.patch.object(
+                                bridge.LocalReceiverBackend, "execute",
+                                side_effect=lambda action, b: executed.append(action) or {"ok": "true"},
+                            ), contextlib.redirect_stdout(out):
+                        code = bridge.main([
+                            "handoff", "--persona", "recovery", "--direction", "claude-to-codex",
+                            "--phase", "pre", "--reason", "r", *extra, "--json",
+                        ])
+                    self.assertEqual(code, 0)
+                    payload = json.loads(out.getvalue())
+                    self.assertEqual(payload["operations"], executed)
+                    self.assertEqual("probe-claude-present" in executed, expect_probe)
+                    self.assertIn("stop-watchdog-service", executed)
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                bridge.main([
+                    "handoff", "--persona", "recovery", "--direction", "claude-to-codex", "--phase", "pre",
+                    "--reason", "r", "--prior-runtime", "dead", "--json",
+                ])
+
+
+class CodexPollerConflictHealthTests(unittest.TestCase):
+    """T-4184: `health-codex-no-409` counts only the poller's getUpdates 409
+    Conflict lines logged since its CURRENT activation, from message bodies.
+    Not gated on the codex UID: systemctl and journalctl are scripted."""
+
+    UNIT = "codex-telegram-poller.service"
+    CONFLICT = "2026-09-28 12:00:01,512 ERROR codex_telegram.poller: 409 Conflict — another getUpdates poller holds the token; backing off 2s"
+    OK_LINE = "2026-09-28 12:00:00,409 INFO codex_telegram.poller: codex telegram poller starting — pane=x"
+
+    class _Scripted(bridge.LocalReceiverBackend):
+        def __init__(self, *, start_epoch: float, entries):
+            super().__init__(timeout_seconds=0)
+            self.start_epoch = start_epoch
+            self.entries = entries  # (epoch, pid, message)
+            self.journal_argv: tuple[str, ...] = ()
+
+        def _require_current_account(self, binding):  # type: ignore[override]
+            del binding
+
+        def _run(self, argv, *args, **kwargs):  # type: ignore[override]
+            argv = tuple(argv)
+            if argv[0] == "journalctl":
+                self.journal_argv = argv
+                since = float(argv[argv.index("--since") + 1].lstrip("@")) if "--since" in argv else 0.0
+                cat = "-o" in argv and argv[argv.index("-o") + 1] == "cat"
+                lines = [
+                    message if cat else f"Sep 28 12:00:00 host python3[{pid}]: {message}"
+                    for epoch, pid, message in self.entries
+                    if epoch >= since
+                ]
+                return subprocess.CompletedProcess(argv, 0, "".join(f"{line}\n" for line in lines), "")
+            if "ActiveEnterTimestampMonotonic" in argv:
+                mono = int((time.monotonic() - (time.time() - self.start_epoch)) * 1_000_000)
+                return subprocess.CompletedProcess(argv, 0, f"{mono}\n", "")
+            if argv[2] == "show":  # _unit_probe for the presence proof
+                return subprocess.CompletedProcess(argv, 0, "ActiveState=active\nSubState=running\nMainPID=140923\n", "")
+            raise AssertionError(argv)
+
+    def _binding(self):
+        return SimpleNamespace(persona="recovery", account="claude-fallback", codex_receiver_unit=self.UNIT)
+
+    def _health(self, backend):
+        backend.execute("health-codex-no-409", self._binding())
+
+    def test_stale_conflicts_before_the_current_start_do_not_fail(self) -> None:
+        start = time.time() - 30
+        backend = self._Scripted(
+            start_epoch=start,
+            entries=[(start - 100, 111, self.CONFLICT), (start - 99, 111, self.CONFLICT), (start + 5, 140923, self.OK_LINE)],
+        )
+        self._health(backend)  # no raise
+        self.assertIn("--since", backend.journal_argv)
+
+    def test_pid_or_timestamp_containing_409_does_not_match(self) -> None:
+        start = time.time() - 30
+        backend = self._Scripted(
+            start_epoch=start, entries=[(start + i, 140923, self.OK_LINE) for i in range(5)]
+        )
+        self._health(backend)  # the old bare-"409" count would have failed here
+        self.assertEqual(backend.journal_argv[backend.journal_argv.index("-o") + 1], "cat")
+
+    def test_one_conflict_since_start_is_below_the_threshold(self) -> None:
+        start = time.time() - 30
+        self._health(self._Scripted(start_epoch=start, entries=[(start + 2, 140923, self.CONFLICT)]))
+
+    def test_two_conflicts_since_start_fail_with_the_shared_prefix(self) -> None:
+        start = time.time() - 30
+        backend = self._Scripted(
+            start_epoch=start, entries=[(start + 2, 140923, self.CONFLICT), (start + 4, 140923, self.CONFLICT)]
+        )
+        with self.assertRaises(bridge.BridgeError) as ctx:
+            self._health(backend)
+        self.assertTrue(str(ctx.exception).startswith(bridge.HEALTH_409_ERROR_PREFIX))
+
+    def test_no_activation_timestamp_fails_closed(self) -> None:
+        backend = self._Scripted(start_epoch=time.time(), entries=[])
+        real_run = backend._run
+        backend._run = lambda argv, *a, **k: (  # type: ignore[method-assign]
+            subprocess.CompletedProcess(tuple(argv), 0, "0\n", "")
+            if "ActiveEnterTimestampMonotonic" in argv else real_run(argv, *a, **k)
+        )
+        with self.assertRaisesRegex(bridge.BridgeError, "no current activation"):
+            self._health(backend)
+
+
+class StopCodexPollerNotFoundTests(unittest.TestCase):
+    """T-4158: `stop-codex-poller` treats a unit that does not exist on the
+    account (LoadState=not-found; `systemctl stop` exits 5) as already stopped
+    and lets `probe-codex-absent` decide; any other stop failure still raises.
+    Not gated on the codex UID: every systemctl/ps call is scripted."""
+
+    UNIT = "codex-telegram-poller.service"
+
+    class _Scripted(bridge.LocalReceiverBackend):
+        def __init__(self, responses, *, processes=""):
+            super().__init__(timeout_seconds=0)
+            self.responses = responses
+            self.processes = processes
+            self.calls: list[tuple[str, ...]] = []
+
+        def _run(self, argv, *args, **kwargs):  # type: ignore[override]
+            argv = tuple(argv)
+            self.calls.append(argv)
+            if argv[0] == "ps":
+                return subprocess.CompletedProcess(argv, 0, self.processes, "")
+            code, out, err = self.responses[argv[2:]]
+            return subprocess.CompletedProcess(argv, code, out, err)
+
+    def _binding(self):
+        return SimpleNamespace(
+            persona="recovery",
+            account="claude-fallback",
+            codex_receiver_unit=self.UNIT,
+            current_release=Path("/nonexistent/release"),
+        )
+
+    def _run_actions(self, backend, *actions):
+        binding = self._binding()
+        with mock.patch.object(bridge.LocalReceiverBackend, "_require_current_account", return_value=None):
+            for action in actions:
+                backend.execute(action, binding)
+
+    def _responses(self, *, stop, load_state):
+        return {
+            ("stop", self.UNIT): stop,
+            ("show", self.UNIT, "-p", "LoadState", "--value"): (0, f"{load_state}\n", ""),
+            ("show", self.UNIT, "-p", "ActiveState", "-p", "SubState", "-p", "MainPID"): (
+                0, "ActiveState=inactive\nSubState=dead\nMainPID=0\n", ""
+            ),
+        }
+
+    def test_not_loaded_unit_stop_is_tolerated_and_probe_proves_absent(self) -> None:
+        backend = self._Scripted(
+            self._responses(stop=(5, "", f"Failed to stop {self.UNIT}: Unit {self.UNIT} not loaded."), load_state="not-found")
+        )
+        self._run_actions(backend, "stop-codex-poller", "probe-codex-absent")
+        self.assertIn(("ps", "-u", "claude-fallback", "-o", "pid=,args="), backend.calls)
+
+    def test_not_loaded_unit_with_stray_poller_process_still_fails_the_probe(self) -> None:
+        backend = self._Scripted(
+            self._responses(stop=(5, "", "Unit not loaded."), load_state="not-found"),
+            processes="4242 /usr/bin/python3 /x/codex_telegram_bridge.py exec --mode poller\n",
+        )
+        self._run_actions(backend, "stop-codex-poller")  # tolerated
+        with self.assertRaisesRegex(bridge.BridgeError, "codex receiver still present"):
+            self._run_actions(backend, "probe-codex-absent")
+
+    def test_real_stop_failure_on_a_loaded_unit_still_raises(self) -> None:
+        backend = self._Scripted(
+            self._responses(stop=(1, "", "Job for unit canceled."), load_state="loaded")
+        )
+        with self.assertRaisesRegex(bridge.BridgeError, "systemctl stop codex-telegram-poller.service failed"):
+            self._run_actions(backend, "stop-codex-poller")
+
+    def test_successful_stop_does_not_query_load_state(self) -> None:
+        backend = self._Scripted(self._responses(stop=(0, "", ""), load_state="loaded"))
+        self._run_actions(backend, "stop-codex-poller")
+        self.assertEqual(backend.calls, [("systemctl", "--user", "stop", self.UNIT)])
+
+
+class PluginGroupShapeTests(unittest.TestCase):
+    """T-4461: the Claude receiver "present" proof must accept both Telegram plugin shapes.
+
+    Upstream's `.mcp.json` runs `bun run --cwd <plugin> --shell=bun --silent start`, which forks a
+    `bun server.ts` child (two processes). Recovery's (T-2624, absolute bun) runs
+    `<abs bun> run --cwd <plugin> --silent server.ts`: that one process IS the server. Before
+    T-4461 the proof demanded the child, so every recovery receiver-state retried "plugin group is not
+    present" until its 90s deadline. Pure evaluator calls, so no BridgeCase codex-UID skip.
+    """
+
+    CLAUDE_PID = 1400118
+    LAUNCHER_PID = 1400120
+
+    def setUp(self) -> None:
+        self.binding = Manifest.load(REPO_ROOT / "instance.yaml").codex_telegram_binding("recovery")
+        home = self.binding.account_home
+        plugin = f"{home}/.claude/plugins/cache/claude-plugins-official/telegram/0.0.7"
+        self.claude = bridge.ProcessSnapshot(
+            self.CLAUDE_PID,
+            1,
+            f"{home}/.npm-global/bin/claude --channels plugin:telegram@claude-plugins-official --model claude-opus-5-5",
+        )
+        self.direct = bridge.ProcessSnapshot(self.LAUNCHER_PID, self.CLAUDE_PID, f"{home}/.bun/bin/bun run --cwd {plugin} --silent server.ts")
+        self.wrapper = bridge.ProcessSnapshot(self.LAUNCHER_PID, self.CLAUDE_PID, f"{home}/.bun/bin/bun run --cwd {plugin} --shell=bun --silent start")
+        self.server_child = bridge.ProcessSnapshot(1400121, self.LAUNCHER_PID, "bun server.ts")
+
+    def _runtime_owned(self, *plugin: bridge.ProcessSnapshot) -> Mapping[str, str]:
+        return bridge._evaluate_runtime_owned_claude_state(
+            self.binding,
+            expected="present",
+            unit_probe=bridge.UnitProbe(self.binding.claude_receiver_unit, "inactive", "dead", "0"),
+            unit_enabled="disabled",
+            tmux=bridge.TmuxPaneSnapshot(True, False, self.CLAUDE_PID, "claude"),
+            processes=(self.claude,) + plugin,
+        )
+
+    def _systemd_user(self, *plugin: bridge.ProcessSnapshot) -> Mapping[str, str]:
+        unit = self.binding.claude_receiver_unit
+        cgroup = f"0::/user.slice/user-1000.slice/user@1000.service/app.slice/{unit}\n"
+        tmux_server = bridge.ProcessSnapshot(1400110, 1, "tmux new-session -s claude-telegram-bot-fallback")
+        claude = dataclasses.replace(self.claude, ppid=tmux_server.pid)
+        return bridge._evaluate_systemd_user_claude_state(
+            self.binding,
+            expected="present",
+            unit_probe=bridge.UnitProbe(unit, "active", "running", "1400100"),
+            tmux=bridge.TmuxPaneSnapshot(True, False, self.CLAUDE_PID, "claude", tmux_server.pid),
+            processes=(bridge.ProcessSnapshot(1400100, 1, "unit main"), tmux_server, claude) + plugin,
+            unit_main_cgroup=cgroup,
+            tmux_server_cgroup=cgroup,
+        )
+
+    def test_direct_spawn_launcher_without_server_child_is_a_complete_group(self) -> None:
+        for evaluate in (self._runtime_owned, self._systemd_user):
+            with self.subTest(evaluate=evaluate.__name__):
+                evidence = evaluate(self.direct)
+                self.assertEqual(evidence["plugin_launcher_descendant_count"], "1")
+                self.assertEqual(evidence["plugin_server_descendant_count"], "0")
+                self.assertEqual(evidence["plugin_group_shape"], "direct-spawn")
+
+    def test_wrapper_launcher_still_needs_its_server_child(self) -> None:
+        for evaluate in (self._runtime_owned, self._systemd_user):
+            with self.subTest(evaluate=evaluate.__name__):
+                self.assertEqual(evaluate(self.wrapper, self.server_child)["plugin_group_shape"], "wrapper")
+                with self.assertRaisesRegex(bridge.BridgeError, "plugin group is not present"):
+                    evaluate(self.wrapper)
+
+    def test_mixed_or_duplicate_shapes_are_refused(self) -> None:
+        second_direct = dataclasses.replace(self.direct, pid=1400122)
+        for evaluate in (self._runtime_owned, self._systemd_user):
+            with self.subTest(evaluate=evaluate.__name__):
+                # A server child under a direct-spawn launcher is a second server.
+                with self.assertRaisesRegex(bridge.BridgeError, "plugin group is duplicate"):
+                    evaluate(self.direct, self.server_child)
+                with self.assertRaisesRegex(bridge.BridgeError, "plugin group is duplicate"):
+                    evaluate(self.direct, second_direct)
+
+    def test_shell_box_wrapper_is_not_a_second_launcher(self) -> None:
+        # T-5481: recovery 2026-10-25, claude -> bash pantheon-shell-box.sh <bun ...> -> bun
+        box = f"/bin/bash {self.binding.account_home}/pantheon-config/tools/oom/pantheon-shell-box.sh"
+        for name, launcher, children in (
+            ("direct-spawn", self.direct, ()),
+            ("wrapper", self.wrapper, (self.server_child,)),
+        ):
+            wrapper_proc = bridge.ProcessSnapshot(1400119, self.CLAUDE_PID, f"{box} {launcher.args}")
+            boxed = dataclasses.replace(launcher, ppid=wrapper_proc.pid)
+            for evaluate in (self._runtime_owned, self._systemd_user):
+                with self.subTest(shape=name, evaluate=evaluate.__name__):
+                    evidence = evaluate(wrapper_proc, boxed, *children)
+                    self.assertEqual(evidence["plugin_group_shape"], name)
+                    self.assertEqual(evidence["plugin_launcher_descendant_count"], "1")
+        # a genuinely duplicated boxed launcher is still refused
+        wrapper_proc = bridge.ProcessSnapshot(1400119, self.CLAUDE_PID, f"{box} {self.direct.args}")
+        boxed = dataclasses.replace(self.direct, ppid=wrapper_proc.pid)
+        with self.assertRaisesRegex(bridge.BridgeError, "plugin group is duplicate"):
+            self._runtime_owned(wrapper_proc, boxed, dataclasses.replace(self.direct, pid=1400122))
+
+    def test_server_ts_must_be_a_whole_argv_token(self) -> None:
+        lookalike = dataclasses.replace(self.direct, args=self.direct.args + ".bak")
+        with self.assertRaisesRegex(bridge.BridgeError, "plugin group is not present"):
+            self._runtime_owned(lookalike)
+
+
+#: T-4790 (T-4750 C4b-3, T-2950 Q2): the approved 13-path bridge manifest at the
+#: pantheon-config harness/codex pin 0f4d81d99 (adds persona_orientation.py).
+#: manifest_sha256 = sha256 of the canonical JSON of the 13 per-file sha256s.
+APPROVED_BRIDGE_MANIFEST_SHA256 = "e21ea6f9ca3e49d0d71a01c93eef3c0b79ecae86b1272a391fb09fe8d422e06a"
+#: T-4224's go-live record of the previous 12-path bridge manifest (codex-config
+#: pin 1f84f64, subdir ""). Kept so the rollback pin stays provably reproducible.
+HISTORICAL_BRIDGE_MANIFEST_SHA256 = "81c4dc06be31cf2840f14138c12550d8de3142a5923b0bf081cd5b51288a7b51"
+HISTORICAL_BRIDGE_REVISION = "1f84f64382f75f86bd4064d62e7dffd48794a687"
+HISTORICAL_BRIDGE_SHA256 = {
+    "codex_telegram/__init__.py": "1471d4fbf3b6e95c5a796d8ec67afaecb4c99a3077836961b2b77c659573eb13",
+    "codex_telegram/active_step.py": "e27c2c2dc4e72b9d9a825aa6de6580a684aecfe29f0e26afc8c2a49f66730304",
+    "codex_telegram/allowlist.py": "ca802c955f258b781f1d23fbc73183e3c70077c1b231338e99182af1be6a472f",
+    "codex_telegram/codex_hooks.py": "7f03f96e49bcc2245c7d99eb756dab252ad07088fb419fe977b09405b71389ba",
+    "codex_telegram/config.py": "f5f44bb64379129646ec99c38a033a36c243730f72e56efa9fda02f1b64d2bdd",
+    "codex_telegram/keepgoing.py": "239e3dad1cd001a3a2465db894ad46a976bec2694647ee7f162f6681155c870e",
+    "codex_telegram/poller.py": "533484213902c12a3af1569572c8dafb84529d5b82017ecb40873da956e93078",
+    "codex_telegram/server.py": "02bda3340d5dc4e0d64bd20b2514504188b6139ff3298ed3911ec1bdefdee38b",
+    "codex_telegram/standing_instructions.py": "de1ce09fa39cd795c295ddc3168c8876885453f4e7cbe1b1aaaf76c6a29ec2f6",
+    "codex_telegram/submit_verify.py": "1f913de5d9c6eef8967f033642abb12664ba617e47a27556e0b445b5775be9d0",
+    "run_poller.py": "4802329fad20ee1a30ecfd729803244ac858365b4ba6dce898e8dd64c0fd12ef",
+    "run_server.py": "2c21a2d2a4df17e2704bddbc2eefa1ac453216d30be657c961be362f8affea74",
+}
+#: The modules the poller and server pull in at import time (T-4790 Q2 condition b).
+BRIDGE_IMPORT_SMOKE_MODULES = (
+    "codex_telegram.poller",
+    "codex_telegram.server",
+    "codex_telegram.codex_hooks",
+    "codex_telegram.keepgoing",
+    "codex_telegram.persona_orientation",
+    "codex_telegram.standing_instructions",
+)
+
+
+class PantheonConfigSourceRegressionTests(unittest.TestCase):
+    """T-4790 (T-4750 C4b-3): the bridge archive is pinned to pantheon-config's own
+    harness/codex tree (subdir harness/codex) at 0f4d81d99, 13 paths. T-4770 (C4b-1)
+    first moved the build locator onto the pantheon-config clone at the old pin.
+
+    Deliberately NOT under BridgeCase's /home/codex reachability guard: it reads
+    only THIS repo's history (codex-config's commits arrived with the T-4755
+    import), so it runs on every seat and in CI (ci.yml checks out with
+    fetch-depth 0). A shallow clone fails loudly rather than skipping."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+
+    def _instance_source_block(self) -> Mapping:
+        document = yaml.safe_load((REPO_ROOT / "instance.yaml").read_text(encoding="utf-8"))
+        return document["persona_installer"]["codex_telegram_bridge"]["source"]
+
+    def test_archive_from_this_repo_at_pin_reproduces_approved_manifest(self) -> None:
+        raw = self._instance_source_block()
+        self.assertEqual(raw["repo"], "pantheon-config")
+        self.assertEqual(raw["source_root"], "/home/codex/pantheon-config")
+        self.assertEqual(raw["subdir"], "harness/codex")
+        self.assertEqual(raw["revision"], "0f4d81d99b06837efbc0e836264f0bd85617e3b9")
+        self.assertEqual(len(raw["paths"]), 13)
+        self.assertIn("codex_telegram/persona_orientation.py", raw["paths"])
+
+        source = Manifest.load(REPO_ROOT / "instance.yaml").codex_telegram_source()
+        self.assertEqual(source.repo, "pantheon-config")
+        self.assertEqual(source.subdir, "harness/codex")
+        archive_path = self.root / "bridge.tar"
+        receipt = bridge.create_verified_source_archive(REPO_ROOT, archive_path, source)
+
+        self.assertEqual(receipt.revision, "0f4d81d99b06837efbc0e836264f0bd85617e3b9")
+        self.assertEqual(receipt.manifest_sha256, APPROVED_BRIDGE_MANIFEST_SHA256)
+        self.assertEqual(dict(receipt.file_sha256), dict(raw["sha256"]))
+        with tarfile.open(archive_path, "r") as archive:
+            members = [member for member in archive.getmembers() if member.isfile()]
+            actual = {
+                member.name: hashlib.sha256(archive.extractfile(member).read()).hexdigest()
+                for member in members
+            }
+        # Members are the unprefixed deploy paths, never harness/codex/...
+        self.assertEqual(sorted(actual), sorted(raw["paths"]))
+        for relative, digest in raw["sha256"].items():
+            self.assertEqual(actual[relative], digest, relative)
+        # The source-check receipt (no archive) agrees with the archive build.
+        check = bridge.source_check_receipt(source, source_repo=REPO_ROOT)
+        self.assertEqual(check["manifest_sha256"], APPROVED_BRIDGE_MANIFEST_SHA256)
+
+    def test_unchanged_paths_are_byte_identical_to_the_historical_pin(self) -> None:
+        """T-2950 Q2 condition (a): only codex_hooks, keepgoing and
+        standing_instructions changed vs 1f84f64; persona_orientation is new."""
+        changed = {
+            "codex_telegram/codex_hooks.py",
+            "codex_telegram/keepgoing.py",
+            "codex_telegram/standing_instructions.py",
+        }
+        for relative, digest in bridge.CODEX_TELEGRAM_SOURCE_SHA256.items():
+            with self.subTest(relative=relative):
+                if relative == "codex_telegram/persona_orientation.py":
+                    self.assertNotIn(relative, HISTORICAL_BRIDGE_SHA256)
+                elif relative in changed:
+                    self.assertNotEqual(digest, HISTORICAL_BRIDGE_SHA256[relative])
+                else:
+                    self.assertEqual(digest, HISTORICAL_BRIDGE_SHA256[relative])
+
+    def test_historical_pin_still_reproduces_its_manifest(self) -> None:
+        """Rollback reproducibility: 1f84f64, subdir "", 12 paths still builds 81c4dc06."""
+        historical = bridge.CodexTelegramSource(
+            "pantheon-config",
+            HISTORICAL_BRIDGE_REVISION,
+            tuple(HISTORICAL_BRIDGE_SHA256),
+            dict(HISTORICAL_BRIDGE_SHA256),
+            subdir="",
+        )
+        receipt = bridge.create_verified_source_archive(REPO_ROOT, self.root / "historical.tar", historical)
+        self.assertEqual(receipt.manifest_sha256, HISTORICAL_BRIDGE_MANIFEST_SHA256)
+        self.assertEqual(dict(receipt.file_sha256), HISTORICAL_BRIDGE_SHA256)
+
+    def test_extracted_archive_imports_the_bridge_modules(self) -> None:
+        """T-2950 Q2 condition (b): the 13-path archive is import-complete. Built
+        from this repo, extracted into an empty dir, imported under ``python3 -I``
+        with only that dir prepended to sys.path (no network, no /home/codex)."""
+        source = Manifest.load(REPO_ROOT / "instance.yaml").codex_telegram_source()
+        archive_path = self.root / "bridge.tar"
+        bridge.create_verified_source_archive(REPO_ROOT, archive_path, source)
+        extracted = self.root / "extracted"
+        extracted.mkdir()
+        with tarfile.open(archive_path, "r") as archive:
+            archive.extractall(extracted, filter="data")
+        self.assertEqual(
+            sorted(str(path.relative_to(extracted)) for path in extracted.rglob("*") if path.is_file()),
+            sorted(bridge.CODEX_TELEGRAM_SOURCE_PATHS),
+        )
+        script = (
+            "import importlib, sys\n"
+            "sys.path.insert(0, sys.argv[1])\n"
+            "for name in sys.argv[2:]:\n"
+            "    module = importlib.import_module(name)\n"
+            "    assert module.__file__.startswith(sys.argv[1]), (name, module.__file__)\n"
+            "print('ok')\n"
+        )
+        result = subprocess.run(
+            (sys.executable, "-I", "-c", script, str(extracted), *BRIDGE_IMPORT_SMOKE_MODULES),
+            cwd=self.root,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "ok")
+
+    def test_parse_bridge_block_requires_pantheon_config_repo(self) -> None:
+        raw = _manifest()["persona_installer"]["codex_telegram_bridge"]
+        source, _ = bridge.parse_bridge_block(raw)
+        self.assertEqual(source.repo, "pantheon-config")
+        self.assertEqual(source.subdir, "harness/codex")
+        stale = json.loads(json.dumps(raw))
+        stale["source"]["repo"] = "codex-config"
+        with self.assertRaisesRegex(bridge.BridgeError, "must be pantheon-config"):
+            bridge.parse_bridge_block(stale)
+        for subdir in ("", None, "harness"):
+            unpinned = json.loads(json.dumps(raw))
+            if subdir is None:
+                del unpinned["source"]["subdir"]
+            else:
+                unpinned["source"]["subdir"] = subdir
+            with self.subTest(subdir=subdir), self.assertRaisesRegex(bridge.BridgeError, "subdir does not match"):
+                bridge.parse_bridge_block(unpinned)
+
+    def test_parse_source_subdir_rejects_unclean_paths(self) -> None:
+        self.assertEqual(bridge.parse_source_subdir(None), "")
+        self.assertEqual(bridge.parse_source_subdir(""), "")
+        self.assertEqual(bridge.parse_source_subdir("harness/codex"), "harness/codex")
+        for bad in ("/harness/codex", "harness/codex/", "harness//codex", "../codex", "harness/./codex", 3):
+            with self.subTest(bad=bad), self.assertRaises(bridge.BridgeError):
+                bridge.parse_source_subdir(bad)
+
+    def test_source_repo_root_derives_from_binding(self) -> None:
+        base = bridge.CodexTelegramSource(
+            "pantheon-config",
+            bridge.CODEX_TELEGRAM_SOURCE_REVISION,
+            bridge.CODEX_TELEGRAM_SOURCE_PATHS,
+            dict(bridge.CODEX_TELEGRAM_SOURCE_SHA256),
+        )
+        self.assertEqual(bridge.source_repo_root(base), Path("/home/codex/pantheon-config"))
+        owned = dataclasses.replace(base, owner_account="consultant")
+        self.assertEqual(bridge.source_repo_root(owned), Path("/home/consultant/pantheon-config"))
+        rooted = dataclasses.replace(owned, source_root=Path("/srv/elsewhere"))
+        self.assertEqual(bridge.source_repo_root(rooted), Path("/srv/elsewhere"))
+
+    def test_subdir_reads_paths_under_prefix_with_unprefixed_members(self) -> None:
+        """C4b-3 shape (subdir harness/codex), on a synthetic repo. The root-level
+        decoys differ from the prefixed content, so reading the wrong tree fails."""
+        repo = self.root / "repo"
+        repo.mkdir()
+        env = {
+            **os.environ,
+            "GIT_AUTHOR_NAME": "t",
+            "GIT_AUTHOR_EMAIL": "t@example.invalid",
+            "GIT_COMMITTER_NAME": "t",
+            "GIT_COMMITTER_EMAIL": "t@example.invalid",
+        }
+
+        def git(*args: str) -> str:
+            return subprocess.run(
+                ("git", "-C", str(repo), *args), check=True, capture_output=True, text=True, env=env
+            ).stdout
+
+        git("init", "-q")
+        paths = ("codex_telegram/__init__.py", "run_poller.py")
+        hashes = {}
+        for relative in paths:
+            prefixed = repo / "harness" / "codex" / relative
+            prefixed.parent.mkdir(parents=True, exist_ok=True)
+            content = f"prefixed {relative}\n".encode("utf-8")
+            prefixed.write_bytes(content)
+            hashes[relative] = hashlib.sha256(content).hexdigest()
+            decoy = repo / relative
+            decoy.parent.mkdir(parents=True, exist_ok=True)
+            decoy.write_bytes(b"root decoy\n")
+        git("add", "-A")
+        git("-c", "commit.gpgsign=false", "commit", "-q", "--no-verify", "-m", "synthetic")
+        revision = git("rev-parse", "HEAD").strip()
+
+        source = bridge.CodexTelegramSource("pantheon-config", revision, paths, hashes, subdir="harness/codex")
+        self.assertEqual(source.object_path("run_poller.py"), "harness/codex/run_poller.py")
+        archive_path = self.root / "prefixed.tar"
+        receipt = bridge.create_verified_source_archive(repo, archive_path, source)
+        self.assertEqual(dict(receipt.file_sha256), hashes)
+        with tarfile.open(archive_path, "r") as archive:
+            self.assertEqual(sorted(member.name for member in archive.getmembers()), sorted(paths))
+        check = bridge.source_check_receipt(source, source_repo=repo)
+        self.assertEqual(check["manifest_sha256"], receipt.manifest_sha256)
+        self.assertEqual(dict(bridge.compute_source_hashes(repo, source).file_sha256), hashes)
+
+        # The same pin read at the commit root sees the decoys and fails closed.
+        unprefixed = dataclasses.replace(source, subdir="")
+        with self.assertRaisesRegex(bridge.BridgeError, "hash mismatch"):
+            bridge.create_verified_source_archive(repo, self.root / "root.tar", unprefixed)
+
+
+# --- T-4963: a '//'-prefixed path is refused as a typed BridgeError ---
+
+
+def test_t4963_rooted_path_refuses_double_slash(tmp_path):
+    import pytest
+
+    # Before T-4963 a non-'/' root raised a bare ValueError from relative_to("/").
+    with pytest.raises(bridge.BridgeError):
+        bridge._rooted_path(tmp_path, Path("//x"))
+    with pytest.raises(bridge.BridgeError):
+        bridge._rooted_path(Path("/"), Path("/" + str(tmp_path)))
+    assert bridge._rooted_path(tmp_path, Path("/x")) == tmp_path / "x"
 
 
 if __name__ == "__main__":

@@ -1,0 +1,58 @@
+# host-substrate manifest: the server-resolved value registry (T-5084, tranche GE).
+#
+# CURRENT (co-author recovery; D15 approved at 71fd484cc). On a real host this registry is
+# root-owned and never seat-writable (ORG-052 §8); this in-repo copy is the
+# simulated-tier input only (nothing here actuates: the host port is dark).
+#
+# Fleet seat accounts, groups and mailbox dirs are manifest data resolved from
+# the instance manifest (ORG-080 D-S); they are not enumerated here yet.
+#
+# T-3401 (host OOM config) is absorbed only where an existing ORG-082 family
+# fits: the shield service + timer and the user.slice / user-.slice oomd drop-ins are
+# unit.system.install / enable. Three pieces do not fit any family and stay in
+# legacy_coverage (bespoke root runbooks): the shield executable in
+# /usr/local/sbin, oomd.conf.d (a daemon config, not a unit) and the
+# systemd-oomd package. verify checks their presence, read-only.
+schema: pantheon-host-substrate-manifest/v0
+status: CURRENT
+co_author: recovery
+signoff: approved
+groups: {}
+accounts: {}
+installer_roots: []
+paths: {}
+mailbox_dirs: {}
+units:
+  pantheon-oom-shield.service:
+    path: /etc/systemd/system/pantheon-oom-shield.service
+    source: tools/systemd/system/pantheon-oom-shield.service
+    sha256: cb3858ff901b6d3df8c62a140cec421ab13facf1bdf48e96db19dde8f9854f46
+    enable: false
+  pantheon-oom-shield.timer:
+    path: /etc/systemd/system/pantheon-oom-shield.timer
+    source: tools/systemd/system/pantheon-oom-shield.timer
+    sha256: 94336407574efc5499d454f2ee47b8205be32c7e8b81cdec992c8f5fe8c414f7
+    enable: true
+  user-slice-oomd-dropin:
+    path: /etc/systemd/system/user.slice.d/50-pantheon-oomd.conf
+    source: tools/systemd/system/user.slice.d/50-pantheon-oomd.conf
+    sha256: 771b9b21d89be6e98bda51f9de9966adc80e84f8c2aa7616cae3887c470aa8fe
+    enable: false
+  user-account-slice-oomd-dropin:
+    path: /etc/systemd/system/user-.slice.d/50-pantheon-oomd.conf
+    source: tools/systemd/system/user-.slice.d/50-pantheon-oomd.conf
+    sha256: 4dee7cad27403ea99c0dc4bb758200f8134ef286f090f4aedf934931c053ec10
+    enable: false
+dbus_policies: {}
+sudoers_templates: {}
+legacy_requirements:
+  - path: /usr/local/sbin/pantheon_oom_shield.sh
+    note: T-1927 shield executable (no executable-install family; legacy runbook)
+  - path: /etc/systemd/oomd.conf.d/50-pantheon.conf
+    note: T-2241 oomd config (a daemon config, not a unit; legacy tools/deploy_systemd_oomd.sh)
+  - path: /usr/lib/systemd/systemd-oomd
+    note: T-2241 systemd-oomd package (package management is outside the ORG-052 §8 envelope)
+  - path: /etc/default/earlyoom
+    note: T-5157 earlyoom swap backstop config (a daemon config, not a unit; legacy tools/deploy_systemd_oomd.sh)
+  - path: /usr/bin/earlyoom
+    note: T-5157 earlyoom package (package management is outside the ORG-052 §8 envelope)

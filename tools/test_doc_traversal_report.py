@@ -8,12 +8,14 @@ Run: python3 -m unittest tools.test_doc_traversal_report -v
 from __future__ import annotations
 
 import contextlib
+import getpass
 import io
 import json
 import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tools.doc_traversal_report import (
     analyze_session,
@@ -24,6 +26,8 @@ from tools.doc_traversal_report import (
     is_governance_path,
     is_index_path,
     list_local_sessions,
+    list_remote_sessions,
+    load_session_lines,
     main,
     normalize_gov_key,
     parse_transcript_lines,
@@ -67,6 +71,12 @@ class ParseTests(unittest.TestCase):
             [read_line("/a.md", sidechain=True), read_line("/b.md")]
         )
         self.assertEqual([e["input"]["file_path"] for e in events], ["/b.md"])
+
+    def test_include_sidechain_keeps_subagent_records(self):
+        lines = [read_line("/a.md", sidechain=True), read_line("/b.md", sidechain=True)]
+        self.assertEqual(parse_transcript_lines(lines), [])
+        events = parse_transcript_lines(lines, include_sidechain=True)
+        self.assertEqual([e["input"]["file_path"] for e in events], ["/a.md", "/b.md"])
 
     def test_malformed_and_irrelevant_lines_skipped_silently(self):
         lines = [
@@ -340,6 +350,42 @@ class SessionSelectionTests(unittest.TestCase):
             os.utime(agent, (3000, 3000))
             got = list_local_sessions(tmp, 5)
             self.assertEqual([Path(p).name for p in got], ["new.jsonl", "old.jsonl"])
+
+
+class SeatArgvRoutingTests(unittest.TestCase):
+    """Own account reads DIRECTLY: sudo-to-self is rejected and its empty stdout reads as
+    an empty session list (a false absence; T-4058). Other accounts cross via sudo -n -u."""
+
+    def _run(self, stdout=""):
+        return mock.patch("tools.doc_traversal_report.subprocess.run",
+                          return_value=mock.MagicMock(returncode=0, stdout=stdout, stderr=""))
+
+    def test_list_remote_sessions_own_account_no_sudo(self):
+        with self._run() as run:
+            list_remote_sessions(getpass.getuser(), "/d", 5)
+        self.assertNotIn("sudo", run.call_args.args[0])
+
+    def test_list_remote_sessions_other_account_uses_sudo(self):
+        with self._run("/d/a.jsonl\n") as run:
+            got = list_remote_sessions("definitely-not-me-account", "/d", 5)
+        self.assertEqual(run.call_args.args[0][:4],
+                         ["sudo", "-n", "-u", "definitely-not-me-account"])
+        self.assertEqual(got, ["/d/a.jsonl"])
+
+    def test_load_session_lines_own_account_reads_file_directly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "s.jsonl"
+            p.write_text("line\n")
+            with self._run() as run:
+                got = load_session_lines(str(p), user=getpass.getuser())
+        run.assert_not_called()
+        self.assertEqual(got, ["line\n"])
+
+    def test_load_session_lines_other_account_uses_sudo_cat(self):
+        with self._run("line\n") as run:
+            load_session_lines("/d/s.jsonl", user="definitely-not-me-account")
+        self.assertEqual(run.call_args.args[0],
+                         ["sudo", "-n", "-u", "definitely-not-me-account", "cat", "/d/s.jsonl"])
 
 
 class CliTests(unittest.TestCase):

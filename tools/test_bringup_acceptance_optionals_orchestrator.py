@@ -28,8 +28,8 @@ from unittest.mock import patch
 from tools.bringup_acceptance.optionals.orchestrator import (
     RESUMER_MODULE_ID,
     STOP_FAILURE_MODULE_ID,
-    ThothHoResumerModule,
-    ThothStopFailureHookModule,
+    OrchestratorHoResumerModule,
+    OrchestratorStopFailureHookModule,
     _ACCOUNT_HOME_ENV,
     _REPO_ROOT_ENV,
     _basename_of,
@@ -239,29 +239,29 @@ class GetCallKeyExtractionTest(unittest.TestCase):
 class DeclareTest(unittest.TestCase):
     def test_orchestrator_persona_applies_for_both_modules(self) -> None:
         target = TargetInventory(persona="orchestrator", entries=())
-        for module in (ThothHoResumerModule(), ThothStopFailureHookModule()):
+        for module in (OrchestratorHoResumerModule(), OrchestratorStopFailureHookModule()):
             declaration = module.declare(target)
             self.assertTrue(declaration.applies)
             self.assertEqual(declaration.tier, "optional")
 
     def test_non_orchestrator_persona_is_declared_absent_for_both_modules(self) -> None:
         target = TargetInventory(persona="recovery", entries=())
-        for module in (ThothHoResumerModule(), ThothStopFailureHookModule()):
+        for module in (OrchestratorHoResumerModule(), OrchestratorStopFailureHookModule()):
             declaration = module.declare(target)
             self.assertFalse(declaration.applies)
 
 
 # ---------------------------------------------------------------------------
-# ThothHoResumerModule.prove() -- happy path against THIS checkout's real files
+# OrchestratorHoResumerModule.prove() -- happy path against THIS checkout's real files
 # ---------------------------------------------------------------------------
 
 
-class ThothHoResumerModuleHappyPathTest(_OverrideMixin):
+class OrchestratorHoResumerModuleHappyPathTest(_OverrideMixin):
     def test_prove_against_real_repo_files(self) -> None:
         self._set_repo_root(_REPO_ROOT)
         with tempfile.TemporaryDirectory() as evidence_root:
             ctx = _run_context(Path(evidence_root))
-            module = ThothHoResumerModule()
+            module = OrchestratorHoResumerModule()
             evidence = module.prove(ctx)
             self.assertEqual(evidence.status, "proven")
             self.assertEqual(evidence.detail["state_file_name"], "ho_limit_hit.json")
@@ -274,7 +274,7 @@ class ThothHoResumerModuleHappyPathTest(_OverrideMixin):
             self.assertTrue(restore_evidence.restored)
 
 
-class ThothHoResumerModuleNegativePathTest(_OverrideMixin):
+class OrchestratorHoResumerModuleNegativePathTest(_OverrideMixin):
     def _stage(self, tmp: Path, *, resumer: str | None, timer: str | None, service: str | None) -> None:
         tools_dir = tmp / "tools"
         systemd_dir = tools_dir / "systemd"
@@ -302,7 +302,7 @@ class ThothHoResumerModuleNegativePathTest(_OverrideMixin):
             self._set_repo_root(Path(tmp))
             with tempfile.TemporaryDirectory() as evidence_root:
                 with self.assertRaises(HardStop):
-                    ThothHoResumerModule().prove(_run_context(Path(evidence_root)))
+                    OrchestratorHoResumerModule().prove(_run_context(Path(evidence_root)))
 
     def test_missing_main_function_is_a_hard_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -311,7 +311,7 @@ class ThothHoResumerModuleNegativePathTest(_OverrideMixin):
             self._set_repo_root(Path(tmp))
             with tempfile.TemporaryDirectory() as evidence_root:
                 with self.assertRaises(HardStop):
-                    ThothHoResumerModule().prove(_run_context(Path(evidence_root)))
+                    OrchestratorHoResumerModule().prove(_run_context(Path(evidence_root)))
 
     def test_wrong_state_file_name_is_a_hard_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -323,7 +323,7 @@ class ThothHoResumerModuleNegativePathTest(_OverrideMixin):
             self._set_repo_root(Path(tmp))
             with tempfile.TemporaryDirectory() as evidence_root:
                 with self.assertRaises(HardStop):
-                    ThothHoResumerModule().prove(_run_context(Path(evidence_root)))
+                    OrchestratorHoResumerModule().prove(_run_context(Path(evidence_root)))
 
     def test_timer_missing_oncalendar_is_a_hard_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -332,7 +332,7 @@ class ThothHoResumerModuleNegativePathTest(_OverrideMixin):
             self._set_repo_root(Path(tmp))
             with tempfile.TemporaryDirectory() as evidence_root:
                 with self.assertRaises(HardStop):
-                    ThothHoResumerModule().prove(_run_context(Path(evidence_root)))
+                    OrchestratorHoResumerModule().prove(_run_context(Path(evidence_root)))
 
     def test_service_missing_oneshot_is_a_hard_stop(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -341,11 +341,11 @@ class ThothHoResumerModuleNegativePathTest(_OverrideMixin):
             self._set_repo_root(Path(tmp))
             with tempfile.TemporaryDirectory() as evidence_root:
                 with self.assertRaises(HardStop):
-                    ThothHoResumerModule().prove(_run_context(Path(evidence_root)))
+                    OrchestratorHoResumerModule().prove(_run_context(Path(evidence_root)))
 
 
 # ---------------------------------------------------------------------------
-# ThothStopFailureHookModule.prove()
+# OrchestratorStopFailureHookModule.prove()
 # ---------------------------------------------------------------------------
 
 
@@ -353,7 +353,7 @@ def _settings_json_text(command: str) -> str:
     return json.dumps({"hooks": {"StopFailure": [{"hooks": [{"type": "command", "command": command}]}]}})
 
 
-class ThothStopFailureHookModuleHappyPathTest(_OverrideMixin):
+class OrchestratorStopFailureHookModuleHappyPathTest(_OverrideMixin):
     def test_prove_against_real_repo_files_extracts_exact_known_schema(self) -> None:
         self._set_repo_root(_REPO_ROOT)
         with tempfile.TemporaryDirectory() as account_home:
@@ -366,7 +366,7 @@ class ThothStopFailureHookModuleHappyPathTest(_OverrideMixin):
             self._set_account_home(Path(account_home))
             with tempfile.TemporaryDirectory() as evidence_root:
                 ctx = _run_context(Path(evidence_root))
-                module = ThothStopFailureHookModule()
+                module = OrchestratorStopFailureHookModule()
                 evidence = module.prove(ctx)
                 self.assertEqual(evidence.status, "proven")
                 self.assertEqual(set(evidence.detail["producer_keys"]), _REAL_PRODUCER_KEYS)
@@ -378,7 +378,7 @@ class ThothStopFailureHookModuleHappyPathTest(_OverrideMixin):
                 self.assertTrue(restore_evidence.restored)
 
 
-class ThothStopFailureHookModuleNegativePathTest(_OverrideMixin):
+class OrchestratorStopFailureHookModuleNegativePathTest(_OverrideMixin):
     def test_hook_not_wired_to_stopfailure_is_a_hard_stop(self) -> None:
         self._set_repo_root(_REPO_ROOT)
         with tempfile.TemporaryDirectory() as account_home:
@@ -388,7 +388,7 @@ class ThothStopFailureHookModuleNegativePathTest(_OverrideMixin):
             self._set_account_home(Path(account_home))
             with tempfile.TemporaryDirectory() as evidence_root:
                 with self.assertRaises(HardStop):
-                    ThothStopFailureHookModule().prove(_run_context(Path(evidence_root)))
+                    OrchestratorStopFailureHookModule().prove(_run_context(Path(evidence_root)))
 
     def test_stopfailure_wired_to_a_different_script_is_a_hard_stop(self) -> None:
         self._set_repo_root(_REPO_ROOT)
@@ -402,7 +402,7 @@ class ThothStopFailureHookModuleNegativePathTest(_OverrideMixin):
             self._set_account_home(Path(account_home))
             with tempfile.TemporaryDirectory() as evidence_root:
                 with self.assertRaises(HardStop):
-                    ThothStopFailureHookModule().prove(_run_context(Path(evidence_root)))
+                    OrchestratorStopFailureHookModule().prove(_run_context(Path(evidence_root)))
 
     def test_consumer_reading_a_key_the_producer_does_not_write_is_a_hard_stop(self) -> None:
         # Real ho_resumer.py (consumer) stays untouched; a SYNTHETIC producer
@@ -432,7 +432,7 @@ class ThothStopFailureHookModuleNegativePathTest(_OverrideMixin):
                 self._set_account_home(Path(account_home))
                 with tempfile.TemporaryDirectory() as evidence_root:
                     with self.assertRaises(HardStop) as caught:
-                        ThothStopFailureHookModule().prove(_run_context(Path(evidence_root)))
+                        OrchestratorStopFailureHookModule().prove(_run_context(Path(evidence_root)))
                     self.assertIn("resets_at", str(caught.exception))
 
 

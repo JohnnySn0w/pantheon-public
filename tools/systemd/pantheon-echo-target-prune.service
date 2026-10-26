@@ -1,0 +1,21 @@
+[Unit]
+Description=Pantheon echo-target prune — unit-granular, lock-safe (T-4852; superseded units T-5249)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Exit 1 (repaired), 2 (refused), 3 (errors) are all non-success and alert Recovery.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+UMask=0002
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# --superseded-hours 6 (T-5249): echo crates rebuild under a new hash per commit, so the
+# 7-day age floor alone could not keep up (35G target, all used within a day, 2026-10-20).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/echo_target_prune.py --superseded-hours 6
+SuccessExitStatus=0
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=idle

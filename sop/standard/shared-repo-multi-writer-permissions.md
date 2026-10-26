@@ -2,6 +2,8 @@
 
 **Status:** Adopted 2026-06-16 by Orchestrator (HO) — autonomous per msg-3733 (operational discipline, below goal-level). Codifies the recurring multi-uid shared-group permission bug-class surfaced by the 2026-06-15 ORG-012 sweep (T-1200). The operator override-available.
 
+> **Note — kino is no longer a shared writer (2026-09-28, Orchestrator, T-4106).** The PWA now writes its own clone at `/var/lib/kino/pantheon-config`, kept fresh by a kino-owned one-minute `ff-pull` timer (`kino-pantheon-config-pull.timer`), and `kino` is in neither `pantheon-shared` nor `claude`. It keeps only a traverse ACL on `/home/claude` for read access to the repos the PWA displays. So the shared-writer set for `/home/claude/pantheon-config` is the agent seats only, and the kino-specific shared-group and UMask retrofit (T-0281) is superseded. Where the text below names kino as a writer, read it as the historical topology; the bug-class and the discipline still apply to the remaining seat writers.
+
 When more than one unix uid writes the same repo or path through a shared group (Pantheon's `pantheon-shared` topology: `claude`, `kino`, and other agents all writing `/home/claude/pantheon-config`), **neither a writer's credentials (its supplementary-group set) nor the file modes it produces (its umask) propagate automatically** when the writer set changes. The shared-writer invariant — every writer can read+write every other writer's objects via the group — silently breaks, and the next cross-uid git op fails with `Permission denied`. This SOP is the onboarding + group-change checklist that keeps the invariant intact. It is the structural fix; the three bugs below are the evidence it earns its keep.
 
 ## The bug-class (one root, three faces)

@@ -1,0 +1,12 @@
+[Unit]
+Description=Pantheon ORG-102 weekly quant digest timer (T-4780)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=Mon *-*-* 13:30:00
+Persistent=true
+RandomizedDelaySec=300
+Unit=pantheon-quant-weekly-digest.service
+
+[Install]
+WantedBy=timers.target

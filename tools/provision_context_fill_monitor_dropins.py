@@ -9,7 +9,8 @@ Recovery re-provision would silently LOSE every enable (detection goes dark with
 signal — the exact silent-disarm hazard T-1214 names).
 
 This tool makes the enablement REPRODUCIBLE. The canonical drop-in set is the
-`DROPINS` × `AGENTS` spec below (this module IS the provisioning manifest):
+`DROPINS` spec below, each leg over its own agent subset (default `AGENTS`; this
+module IS the provisioning manifest):
   --provision : recreate the full drop-in set idempotently + `systemctl --user
                 daemon-reload`. A re-provision can re-run this to re-arm every leg.
   --verify    : confirm every expected leg is armed; exit non-zero on ANY missing.
@@ -28,6 +29,7 @@ import argparse
 import subprocess
 import sys
 from pathlib import Path
+from typing import Iterator, NamedTuple
 
 UNIT = "pantheon-context-fill-monitor"
 
@@ -35,26 +37,52 @@ UNIT = "pantheon-context-fill-monitor"
 # ~/.config). Keep in sync with the per-agent @<agent> instances actually run.
 AGENTS = ("orchestrator", "specialist", "recovery")
 
-# Each enablement leg: drop-in filename -> (env var, canonical one-line note). The
-# legs are uniform across agents (same env var per detector); the rollout history
-# lives in the ticket/ledger, not in per-agent comment divergence.
-DROPINS: dict[str, tuple[str, str]] = {
-    "enable.conf": (
+
+class Leg(NamedTuple):
+    """One enablement leg: its env var, canonical one-line note, and the agents it
+    is armed for. The default is the full `AGENTS` set; a leg mid-rollout (T-3314
+    repo-audit, HO-first) names a narrower subset."""
+
+    envvar: str
+    note: str
+    agents: tuple[str, ...] = AGENTS
+
+
+# Each enablement leg: drop-in filename -> Leg. Content is uniform across the
+# agents a leg covers (same env var per detector); the rollout history lives in
+# the ticket/ledger, not in per-agent comment divergence.
+DROPINS: dict[str, Leg] = {
+    "enable.conf": Leg(
         "PANTHEON_API_HEALTH_ENABLED",
         "alive-but-erroring api-health watchdog (sustained api-error -> restart); "
         "fleet-wide after the T-1126 gap-2 peer-coordinated first-fire (2026-06-16).",
     ),
-    "staleness.conf": (
+    "staleness.conf": Leg(
         "PANTHEON_STALENESS_ENABLED",
         "wedge/staleness detection (a confirmed-wedged pane -> restart); per-agent "
         "cutover T-0857 (Recovery first-fire 2026-06-06, then Specialist/Orchestrator).",
     ),
-    "model-outage.conf": (
+    "model-outage.conf": Leg(
         "PANTHEON_MODEL_OUTAGE_ENABLED",
         "model-outage detector (sustained 404 model_not_found -> ALERT to Recovery, never "
         "a force-restart); fleet-wide after the T-1126 Recovery-first cutover (2026-06-16).",
     ),
+    "repo-audit.conf": Leg(
+        "PANTHEON_REPO_AUDIT_ENABLED",
+        "T-0761 component 5 present-but-undeclared repo audit (alert-once, never a "
+        "restart); HO-first single-seat validation per T-3314, widen to specialist/recovery "
+        "after a week clean.",
+        agents=("orchestrator",),
+    ),
 }
+
+
+def expected_legs() -> Iterator[tuple[str, str, Leg]]:
+    """Yield every expected (agent, drop-in name, leg), honouring each leg's subset."""
+    for agent in AGENTS:
+        for name, leg in DROPINS.items():
+            if agent in leg.agents:
+                yield agent, name, leg
 
 DEFAULT_CONFIG_ROOT = Path.home() / ".config" / "systemd" / "user"
 
@@ -82,14 +110,13 @@ def expected_token(envvar: str) -> str:
 def provision(config_root: Path = DEFAULT_CONFIG_ROOT, *, daemon_reload: bool = True) -> list[str]:
     """(Re)create every drop-in idempotently. Returns the paths actually written."""
     written: list[str] = []
-    for agent in AGENTS:
-        for name, (envvar, note) in DROPINS.items():
-            path = dropin_path(config_root, agent, name)
-            body = dropin_body(envvar, note)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists() or path.read_text() != body:
-                path.write_text(body)
-                written.append(str(path))
+    for agent, name, leg in expected_legs():
+        path = dropin_path(config_root, agent, name)
+        body = dropin_body(leg.envvar, leg.note)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists() or path.read_text() != body:
+            path.write_text(body)
+            written.append(str(path))
     if daemon_reload and written:
         subprocess.run(["systemctl", "--user", "daemon-reload"], check=False)
     return written
@@ -102,11 +129,10 @@ def verify(config_root: Path = DEFAULT_CONFIG_ROOT) -> list[str]:
     contains the `Environment=<X>=1` token, regardless of surrounding comments.
     """
     missing: list[str] = []
-    for agent in AGENTS:
-        for name, (envvar, _note) in DROPINS.items():
-            path = dropin_path(config_root, agent, name)
-            if not path.exists() or expected_token(envvar) not in path.read_text():
-                missing.append(f"{agent}/{name} ({envvar})")
+    for agent, name, leg in expected_legs():
+        path = dropin_path(config_root, agent, name)
+        if not path.exists() or expected_token(leg.envvar) not in path.read_text():
+            missing.append(f"{agent}/{name} ({leg.envvar})")
     return missing
 
 
@@ -131,7 +157,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    total = len(AGENTS) * len(DROPINS)
+    total = sum(1 for _ in expected_legs())
 
     if not (args.provision or args.verify):
         print(

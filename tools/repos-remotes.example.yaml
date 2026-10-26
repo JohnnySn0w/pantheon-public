@@ -1,0 +1,63 @@
+# ============================================================================
+# REFERENCE EXAMPLE — replace every value below for your own instance.
+# ============================================================================
+# This is a worked example of the ORG-046 "manifest-resolved git remotes"
+# schema (architecture/adr/ORG-046-manifest-resolved-git-remotes.md, §1),
+# consumed by tools/remote_resolve.py. It is NOT wired into this fleet's own
+# repos.yaml today (that per-agent-access-grants file predates this schema;
+# folding the two together is a separate, not-yet-landed decision) — this
+# file exists purely as a copy-paste-and-edit starting point for downstream
+# operators (T-1999, closing the T-0915 external-collaborator gap: once a
+# clone resolves its remote through a manifest like this instead of a
+# hardcoded URL, a future host rename or provider swap becomes a one-line
+# edit here instead of a broken clone).
+#
+# Every URL/host/path below is a PLACEHOLDER — none of it resolves or is
+# meant to. Replace:
+#   - `your-repo`                                  -> your own logical repo name
+#   - `github.com` / `YOUR-ORG` / `YOUR-REPO`       -> your actual GitHub remote
+#   - `git.your-self-hosted-git.example`            -> your self-hosted git
+#                                                       server's real domain
+#     (the `.example` TLD is IANA-reserved for documentation, per RFC 2606 —
+#     it deliberately cannot resolve, so a copy-paste-without-editing mistake
+#     fails loudly at DNS rather than silently pointing somewhere real)
+#   - the `key:` / `token:` paths under auth_refs    -> paths to your own
+#                                                       credential files
+#
+# Schema notes (ORG-046 §1):
+#   - `remotes:` is ORDERED — preference is list order. Exactly one `primary`,
+#     zero or more `mirror`. The resolver tries `primary` first, falls back
+#     to `mirror`s in order on a reachability failure (read-only failover;
+#     writes/sync are a separate, deferred concern — ORG-046 §2).
+#   - Every remote's `auth` names an entry in `auth_refs`, never an inline
+#     credential (ORG-039: secrets-by-reference).
+#   - Every `auth_refs` entry carries `allowed_hosts` — the resolver REFUSES
+#     to use a url/auth pair whose host falls outside this list (ORG-046 §4,
+#     finding 6). This is host-level defense-in-depth against a tampered
+#     manifest repointing a real credential at an attacker host; it is not
+#     itself a repo-scoping gate (that rides on the credential's own
+#     forge-side scope — a per-repo deploy key or fine-grained token).
+#   - A `mirror` remote may carry `writable: true` (ORG-101 §2; default false, invalid on a
+#     `primary`). When set, the push tooling also pushes accepted writes to it, and
+#     falls back to it only when the primary is down (never when the primary merely
+#     refuses a push). Leave it off for a read-only pull-mirror.
+
+schema_version: 1
+
+repos:
+  - name: your-repo                    # logical name — stable; never the break surface
+    remotes:
+      - role: primary                  # exactly one primary; preference = list order
+        url: git@github.com:YOUR-ORG/YOUR-REPO.git
+        auth: deploy-key:your-repo
+      - role: mirror                   # zero or more mirrors
+        url: https://git.your-self-hosted-git.example/YOUR-ORG/YOUR-REPO.git
+        auth: token:your-repo-mirror
+
+auth_refs:
+  deploy-key:your-repo:
+    key: <path-to-your-deploy-key>              # e.g. ~/.ssh/your-repo_deploy_key
+    allowed_hosts: [github.com]
+  token:your-repo-mirror:
+    token: <path-to-your-forgejo-or-gitea-token-file>
+    allowed_hosts: [git.your-self-hosted-git.example]

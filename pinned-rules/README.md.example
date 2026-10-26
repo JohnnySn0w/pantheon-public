@@ -1,0 +1,30 @@
+# pinned-rules: each seat's auto-loaded rules (template)
+
+<!--
+Generic template (ORG-039 §1: the pinned-rules STRUCTURE is framework; your
+filled README and briefs are instance content). Copy it to
+pinned-rules/README.md and fill in the table for your own seats.
+-->
+
+This directory version-controls each agent seat's **pinned rules**: the short, always-loaded instructions the harness reads at every session start (for Claude Code, the seat's `CLAUDE.md`).
+
+## Convention
+
+- **One file per persona:** `pinned-rules/<persona>.md`, where `<persona>` is the persona id bound in `instance.yaml`.
+- **The live path is a symlink into this directory**, e.g. `~<account>/CLAUDE.md -> <checkout>/pinned-rules/<persona>.md`. The tracked file is therefore the source of truth: history, diff and backup come from git, and the harness reads the symlink target transparently.
+- **Start a new seat from `persona.md.example`**, then trim it to what that seat actually needs. Pinned rules load on every session, so keep them short.
+
+## Seats
+
+| persona | role | live path | tracked file |
+|---------|------|-----------|--------------|
+| `<persona>` | `<role-id>` | `~<account>/CLAUDE.md` | `<persona>.md` |
+
+## Editing
+
+- Edit the tracked file through your repository's normal change flow (branch + review if main is protected), and record material rule changes the way your instance records decisions.
+- Never edit the live path in a way that replaces the symlink with a regular file, or the tracked file stops being the source of truth.
+
+## If rules go missing at session start
+
+Check that the live path is still a symlink and that it resolves (`readlink -f ~<account>/CLAUDE.md`). Re-link it to the tracked file, then start a fresh session.

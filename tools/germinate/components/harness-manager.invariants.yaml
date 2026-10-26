@@ -1,0 +1,305 @@
+# harness-manager invariant list (ORG-080 Amendment A-6; T-5090, germination tranche GF1).
+#
+# STATUS: CURRENT. Recovery co-authors this list (ORG-080 Build plan (d), D15); her
+# review is APPROVED. Derived from the ADR text: ORG-079 "Verification
+# contract" V1-V19, ORG-099 §3.1 HARD parity axes (whose machine form is
+# sop/standard/seat-parity/axes.yaml), and the two explicit ORG-080 §6 monitor
+# invariants. It is the ONE list both `verify` and the PersonaController1 emitter
+# report against (ORG-080 §2 invariant_list_id / invariant_list_digest; §6
+# touch-point 2). Neither surface keeps a parallel verifier (A-6).
+#
+# The two ORG-080 monitor entries are contract shape only in GF1. T-5135 owns
+# engine verify/evaluator wiring and T-5137 owns live PersonaController1 emitter
+# wiring; until those seams land, machine_check is ambiguous and this list makes
+# no live-coverage claim.
+#
+# The digest pinned in harness-manager.yaml is
+#   sha256:<hex of canonical_json_bytes(yaml.safe_load(this file))>
+# computed by harness_manager_verify.list_digest. Comments are not part of it.
+# Nothing in the engine or the ORG-081 validator recomputes it yet (seam gap S4);
+# test_list_digest_is_pinned_in_the_contract is the stopgap.
+#
+# Classes (evaluated by harness_manager_verify.evaluate over observation data):
+#   presence-mode   path present + owner + mode (+ no-symlink where named)
+#   schema          document is a mapping and carries the required keys
+#   set-compare     actual set == expected (manifest-declared) set
+#   receipt-bound   evidence hash equals the hash bound in the receipt
+#   live-compare    live grants are a subset of the declared envelope
+#   trace           a binding chain resolves to its pinned target
+#   recorded-probe  a parity check verdict (parity_render vocabulary:
+#                   PASS | FAIL | UNMEASURABLE); anything else is an alarm
+#   hook-allowlist-parity  supplied hook-symlink and allowlist parity booleans
+#   owner-manager-match   supplied configured owner and observed manager identity
+# "Could not ask" (no observation, malformed observation, UNMEASURABLE) is an
+# ALARM, never a pass (ORG-099 §8).
+#
+# Overlaps are cross-referenced, not merged (merging is Recovery's call):
+#   ORG-079/V8 ~ axes.yaml#mailbox-inbox-exists, axes.yaml#mailbox-can-send-to-peers
+#   ORG-079/V1, V4 ~ axes.yaml#harness-cli-installed-authed (config file present)
+#   ORG-079/V16 ~ axes.yaml#inbox-consumer-timer-present (one enabled unit)
+#
+# Ambiguous machine-checks, to send to Recovery (D15) -- verbatim from the T-5090 plan:
+# - V3 and V4: the "JSON-wiring schema" is undefined, and V4's path `~/.claude/hooks/settings.json` (ORG-079:155) is probably a typo for `~/.claude/settings.json`.
+# - V7: the hook-binding trace.
+# - V9 and V10: no operator-receipt or convergence-marker schema or path exists in the manifest.
+# - V11: no `uid_cordon` schema or evaluator (it waits on the ORG-063 build).
+# - V12: no per-role `autoMemoryDirectory` in the manifest.
+# - V13: depends on V9.
+# - V14: reload results are never recorded today.
+# - V16: no `enabled_units` in the manifest.
+# - V18: there is no disabled-first-fire evidence store.
+# - V19: the "fully-typed schema" is undefined.
+# - HARD `chat-surface-first-live-turn-verified`: verify can only read recorded evidence; a live turn isn't side-effect-free.
+# - HARD `delivery-mode-substrate-match` and `permissions-allow-covers-mcp-tools`: their `check_ref` shell semantics need a typed probe.
+# - ORG-080 monitor invariants: observation producers are unwired (T-5135 verify;
+#   T-5137 emitter), so these entries evaluate supplied facts but do not claim a
+#   live machine check.
+invariant_list:
+  id: org.pantheon.persona-stack/v1
+  status: CURRENT
+  co_author: recovery
+  co_author_review: approved
+  sources: [ORG-079, ORG-099, ORG-080]
+  invariants:
+    - id: ORG-079/V1
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V1
+      text: Adapter-config-root exists and is a mapping; an mcpServers-equivalent key exists (may be {})
+      class: schema
+      applies_to: {adapters: [claude]}
+      on_fail: degraded
+      machine_check: defined
+    - id: ORG-079/V2
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V2
+      text: Adapter skills directory exists (empty legal); ownership + mode match manifest
+      class: presence-mode
+      applies_to: {adapters: [claude]}
+      on_fail: degraded
+      machine_check: defined
+    - id: ORG-079/V3
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V3
+      text: Adapter plugin config skeleton present + exact paths + JSON-wiring schema conformance
+      class: schema
+      applies_to: {adapters: [claude]}
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-079/V4
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V4
+      text: Adapter hooks directory + settings.json present + exact paths + JSON-wiring schema
+      class: schema
+      applies_to: {adapters: [claude]}
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-079/V5
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V5
+      text: personas/<persona>.json exists, writable by the seat uid, legacy session-id schema, ownership + mode (install-time evidence only, not continuity validation)
+      class: presence-mode
+      applies_to: all
+      on_fail: degraded
+      machine_check: defined
+    - id: ORG-079/V6
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V6
+      text: chronicle/ and agent-state-history/ dirs exist, writable, ownership
+      class: presence-mode
+      applies_to: all
+      on_fail: degraded
+      machine_check: defined
+    - id: ORG-079/V7
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V7
+      text: chronicle.py importable + handoff_and_restart.sh executable + the restart hook reaches the pinned executable
+      class: trace
+      applies_to: all
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-079/V8
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V8
+      text: Mailbox path present; canonical mailbox verifier succeeds with the exact manifest-derived ACL
+      class: set-compare
+      applies_to: all
+      on_fail: degraded
+      machine_check: defined
+      overlaps: [axes.yaml#mailbox-inbox-exists, axes.yaml#mailbox-can-send-to-peers]
+    - id: ORG-079/V9
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V9
+      text: Per-install source snapshot archived; revision + path hashes bound to an operator receipt
+      class: receipt-bound
+      applies_to: all
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-079/V10
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V10
+      text: Apply receipt at persona_installer.convergence_marker.path; immutable, hash-bound, created only after post-apply verify
+      class: receipt-bound
+      applies_to: all
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-079/V11
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V11
+      text: UID-cordon audit CURRENT PASS for the declared blast radius; live uid grants compared at verify time
+      class: live-compare
+      applies_to: all
+      on_fail: unhealthy
+      security_drift: true
+      machine_check: ambiguous
+    - id: ORG-079/V12
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V12
+      text: autoMemoryDirectory present + writable; native harness config binding present AND target path resolves
+      class: trace
+      applies_to: all
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-079/V13
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V13
+      text: Owned systemd unit bytes + owner + mode match the install-time source snapshot (V9)
+      class: receipt-bound
+      applies_to: {systemd_runtime: true}
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-079/V14
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V14
+      text: daemon-reload ran after unit materialization; last reload result recorded
+      class: recorded-probe
+      applies_to: {systemd_runtime: true}
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-079/V15
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V15
+      text: HANDOFF.md create-if-absent + ownership
+      class: presence-mode
+      applies_to: all
+      on_fail: degraded
+      machine_check: defined
+    - id: ORG-079/V16
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V16
+      text: Enabled systemd unit set matches roles.<role-key>.enabled_units (per role, not blanket)
+      class: set-compare
+      applies_to: {systemd_runtime: true}
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-079/V17
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V17
+      text: persona-installer root ownership + mode + no-symlink
+      class: presence-mode
+      applies_to: all
+      on_fail: degraded
+      no_symlink: true
+      machine_check: defined
+    - id: ORG-079/V18
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V18
+      text: Disabled-first-fire evidence bound to the apply receipt for each enabled unit
+      class: receipt-bound
+      applies_to: {systemd_runtime: true}
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-079/V19
+      source: architecture/adr/ORG-079-l1-install-completeness-contract.md#V19
+      text: Adapter-config schema conformance against the fully typed manifest-derived schema
+      class: schema
+      applies_to: {adapters: [claude, codex]}
+      on_fail: degraded
+      machine_check: ambiguous
+    - id: ORG-099/unix-account-linger-enabled
+      source: sop/standard/seat-parity/axes.yaml#unix-account-linger-enabled
+      text: "HARD: substrate baseline (account, linger, identity, sudoers scope)"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: defined
+    - id: ORG-099/harness-cli-installed-authed
+      source: sop/standard/seat-parity/axes.yaml#harness-cli-installed-authed
+      text: "HARD: harness CLI installed, on PATH, auth completed, config present"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: defined
+      overlaps: [ORG-079/V1, ORG-079/V4]
+    - id: ORG-099/permissions-allow-populated
+      source: sop/standard/seat-parity/axes.yaml#permissions-allow-populated
+      text: "HARD: permissions.allow populated"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: defined
+    - id: ORG-099/permissions-allow-covers-mcp-tools
+      source: sop/standard/seat-parity/axes.yaml#permissions-allow-covers-mcp-tools
+      text: "HARD: permissions.allow covers the MCP tools"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: ambiguous
+    - id: ORG-099/mailbox-inbox-exists
+      source: sop/standard/seat-parity/axes.yaml#mailbox-inbox-exists
+      text: "HARD: own inbox at the hub (receive)"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: defined
+      overlaps: [ORG-079/V8]
+    - id: ORG-099/mailbox-can-send-to-peers
+      source: sop/standard/seat-parity/axes.yaml#mailbox-can-send-to-peers
+      text: "HARD: can send to every peer inbox (two-directional)"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: defined
+      overlaps: [ORG-079/V8]
+    - id: ORG-099/mcp-python-package-pinned
+      source: sop/standard/seat-parity/axes.yaml#mcp-python-package-pinned
+      text: "HARD: mcp<2 pinned per account"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: defined
+    - id: ORG-099/ticket-persona-registered
+      source: sop/standard/seat-parity/axes.yaml#ticket-persona-registered
+      text: "HARD: persona registered in AGENT_ROLE_MAP / instance.yaml"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: defined
+    - id: ORG-099/chat-surface-first-live-turn-verified
+      source: sop/standard/seat-parity/axes.yaml#chat-surface-first-live-turn-verified
+      text: "HARD: chat surface exercised end-to-end (read from recorded evidence only)"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: ambiguous
+    - id: ORG-099/inbox-consumer-timer-present
+      source: sop/standard/seat-parity/axes.yaml#inbox-consumer-timer-present
+      text: "HARD: inbox consumer present on the seat's own user manager, timer enabled"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: defined
+      overlaps: [ORG-079/V16]
+    - id: ORG-099/delivery-mode-substrate-match
+      source: sop/standard/seat-parity/axes.yaml#delivery-mode-substrate-match
+      text: "HARD: delivery-mode declaration matches substrate reality"
+      class: recorded-probe
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: ambiguous
+    - id: ORG-099/codex-worker-guard-hook-trusted
+      source: sop/standard/seat-parity/axes.yaml#codex-worker-guard-hook-trusted
+      text: "HARD: codex worker-guard hook trusted"
+      class: recorded-probe
+      applies_to: {roles: [peer-daemon-codex, head-engineering-orchestrator, specialist, head-system-orchestrator, engineering-orchestrator-1, engineering-orchestrator-2]}
+      on_fail: unhealthy
+      machine_check: defined
+    - id: ORG-080/hook-symlink-allowlist-parity
+      source: architecture/adr/ORG-080-germination-engine.md#6-health-plane-seam
+      text: Hook symlink and allowlist parity hold on both verify and emitter surfaces
+      class: hook-allowlist-parity
+      applies_to: all
+      on_fail: degraded
+      machine_check: ambiguous
+      surfaces: [verify, emitter]
+      unwired_seams: [T-5135, T-5137]
+    - id: ORG-080/configured-owner-observed-manager
+      source: architecture/adr/ORG-080-germination-engine.md#6-health-plane-seam
+      text: Configured owner matches the observed manager; mismatch is reported distinctly
+      class: owner-manager-match
+      applies_to: all
+      on_fail: unhealthy
+      machine_check: ambiguous
+      surfaces: [verify, emitter]
+      unwired_seams: [T-5135, T-5137]

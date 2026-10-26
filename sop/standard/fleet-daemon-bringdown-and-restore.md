@@ -63,8 +63,8 @@ boot or `daemon-reload` and the pause silently ends.
 **3.5 — `reset-failed` afterwards, per seat.** Even done gracefully, expect some residue.
 
 > **WHY 3.1–3.3 EXIST.** Doing it in one undifferentiated `disable --now` sweep — timers and services
-> together — produced, measured: `pantheon-acp-bridge-backlog@mnemosyne`, `pantheon-acp-bridge@specialist`,
-> `pantheon-acp-bridge-backlog@specialist`, `pantheon-mailbox-wake@{specialist,metis,atlas}` all in `failed`,
+> together — produced, measured: `pantheon-acp-bridge-backlog@archivist`, `pantheon-acp-bridge@specialist`,
+> `pantheon-acp-bridge-backlog@specialist`, `pantheon-mailbox-wake@{specialist,mason,artisan}` all in `failed`,
 > **plus a `pantheon-unit-failure-alert@…` instance for each** — 10 failed units and 5 spurious alerts
 > across four seats. Nothing was broken, but the fleet's own health surface then reported a fault that
 > the operator caused. **A bringdown that leaves the health surface lying is not a graceful bringdown.**
@@ -103,7 +103,7 @@ systemctl --user -M <acct>@ enable --now <unit>     # for each line in the manif
 ```
 
 Then re-verify with §4. Restoring the *app* without the wake path (or vice versa) is a legitimate
-partial — the originating incident restored `exocortex.service` alone while mnemosyne stayed paused.
+partial — the originating incident restored `exocortex.service` alone while archivist stayed paused.
 
 ## 6. Variations
 
@@ -125,3 +125,9 @@ Ledger the pause with the manifest path, the exact unit count, what you delibera
 and any judgement calls (seat apps, live processes). An operator-directed fleet change is an
 audit-chain event: the instruction came from outside the repo, so the ledger entry is the only place
 the *why* survives.
+
+**Post-arc: move the manifest out of the home dir.** The home dir is only where 3.0 writes the
+manifest during the pause (a fixed, obvious path while things are down). Once the fleet is restored,
+copy it to `knowledge/episodic/<date>-fleet-daemon-pause/`, commit, and point the ledger entry at the
+committed copy. A home-dir file is not a shared record (`sop/standard/mailbox-is-not-the-shared-record.md`),
+and the next pause would strand it. Precedent: the 2026-08-01 pause (`knowledge/episodic/2026-08-01-fleet-daemon-pause/`, T-3842).

@@ -1,5 +1,5 @@
 [Unit]
-Description=Pantheon fleet clone-currency check — read-only per-seat drift detector, mailbox-alerts orchestrator on drift (T-2798/T-2794 option-b)
+Description=Pantheon fleet clone-currency check — read-only per-seat drift + off-main detector, mailbox-alerts orchestrator, recovery and the owning persona (T-2798/T-2794 option-b, T-4143)
 Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
 
 # Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.

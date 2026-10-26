@@ -59,6 +59,12 @@ EXCLUDED = {
         "freshness, not unit status: any failure (unit, hang, push, auth, box-down) "
         "shows as a missing daily commit in the backup repo. The staleness check that "
         "alerts on that is T-2886 (T-2178 follow-up).",
+    "pantheon-metrics-push.service":
+        "self-healing high-cadence pusher (~90s fire). A single missed push recovers "
+        "on the next fire, and specialist's >2min stale-fallback covers the gap by design "
+        "(T-3626 / ORG-098 BT2). Routing transient ssh/network blips to the mailbox "
+        "would spam. Failures still land in the journal (StandardError=journal) for "
+        "inspection. The unit file itself carries the equivalent comment.",
 }
 
 
@@ -104,7 +110,7 @@ class EveryUnitAlertsOrSaysWhyNot(unittest.TestCase):
 
     def test_seat_units_bound_a_crash_loop(self):
         """OnFailure fires PER FAILURE, so under Restart=always a crash-loop alerts
-        every cycle (metis, measured). A StartLimit is what converts that into ONE
+        every cycle (mason, measured). A StartLimit is what converts that into ONE
         terminal failure — the bound is what makes wiring these safe, so assert it
         rather than trusting it was kept."""
         for name in ("claude-telegram.service", "claude-telegram-research.service"):

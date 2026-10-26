@@ -1,6 +1,6 @@
 """test_delivery_reachability.py — can each seat actually receive a ticket? (T-2232)
 
-The property under test is the one T-2144's classification guard could not see: atlas was
+The property under test is the one T-2144's classification guard could not see: artisan was
 DECLARED deliverable and had no unit at all, and the guard stayed green for that seat's whole
 existence. These tests pin the distinction between a declaration and a capability, and — the
 load-bearing one — between a unit somebody switched OFF and a unit that was never installed.
@@ -14,8 +14,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import delivery_reachability as dr  # noqa: E402
 
 SUB = {
-    "atlas": {"account": "suborch2", "pane": "suborch2-main:0"},
-    "metis": {"account": "suborch1", "pane": "suborch1-main:0"},
+    "artisan": {"account": "suborch2", "pane": "suborch2-main:0"},
+    "mason": {"account": "suborch1", "pane": "suborch1-main:0"},
     "specialist": {"account": "claude-research", "pane": "claude-research-bot:0"},
 }
 
@@ -42,7 +42,7 @@ class FakeOps(dr.Ops):
 
 
 def agent_of(pane):
-    return {"suborch2-main:0": "atlas", "suborch1-main:0": "metis",
+    return {"suborch2-main:0": "artisan", "suborch1-main:0": "mason",
             "claude-research-bot:0": "specialist"}.get(pane, "?")
 
 
@@ -52,12 +52,12 @@ class StateTest(unittest.TestCase):
 
     # ⭐ the split that a pause manifest cannot express -----------------------
     def test_never_installed_is_MISSING_not_disabled(self):
-        r = self._probe("atlas", units={"atlas": "missing"})
+        r = self._probe("artisan", units={"artisan": "missing"})
         self.assertEqual(r["state"], dr.MISSING)
         self.assertIn("never installed", r["detail"])
 
     def test_switched_off_is_DISABLED_and_does_not_alert(self):
-        r = self._probe("metis", units={"metis": "disabled"})
+        r = self._probe("mason", units={"mason": "disabled"})
         self.assertEqual(r["state"], dr.DISABLED)
         self.assertNotIn(r["state"], dr.ALERTING,
                          "somebody ran `disable`; a deliberate act is an authorised no")
@@ -68,25 +68,25 @@ class StateTest(unittest.TestCase):
 
     # -- enabled but pointed at nothing --------------------------------------
     def test_enabled_with_no_tmux_session_is_BROKEN(self):
-        r = self._probe("atlas", units={"atlas": "enabled"}, sessions={"atlas": False})
+        r = self._probe("artisan", units={"artisan": "enabled"}, sessions={"artisan": False})
         self.assertEqual(r["state"], dr.BROKEN)
 
     def test_enabled_with_a_live_session_is_READY(self):
-        r = self._probe("atlas", units={"atlas": "enabled"}, sessions={"atlas": True})
+        r = self._probe("artisan", units={"artisan": "enabled"}, sessions={"artisan": True})
         self.assertEqual(r["state"], dr.READY)
 
     # -- unaskable is never green -------------------------------------------
     def test_unqueryable_manager_is_UNKNOWN(self):
         ops = FakeOps()
         ops.unit_state = lambda account, agent: None
-        r = dr.probe_agent("atlas", "send-keys", SUB["atlas"], ops)
+        r = dr.probe_agent("artisan", "send-keys", SUB["artisan"], ops)
         self.assertEqual(r["state"], dr.UNKNOWN)
         self.assertIn(dr.UNKNOWN, dr.ALERTING)
 
     def test_unqueryable_tmux_is_UNKNOWN_not_broken(self):
-        ops = FakeOps(units={"atlas": "enabled"})
+        ops = FakeOps(units={"artisan": "enabled"})
         ops.tmux_session_exists = lambda account, pane: None
-        r = dr.probe_agent("atlas", "send-keys", SUB["atlas"], ops)
+        r = dr.probe_agent("artisan", "send-keys", SUB["artisan"], ops)
         self.assertEqual(r["state"], dr.UNKNOWN,
                          "'could not ask' must not be reported as 'provably gone'")
 
@@ -120,15 +120,15 @@ class ProbeSeamTest(unittest.TestCase):
         return ops
 
     def test_failed_probe_is_UNASKABLE_not_absent(self):
-        self.assertIsNone(self._ops_with(1, "").unit_state("suborch2", "atlas"),
+        self.assertIsNone(self._ops_with(1, "").unit_state("suborch2", "artisan"),
                           "a denied/failed command yields empty stdout too — it is not evidence "
                           "that the unit is absent")
 
     def test_timeout_is_UNASKABLE(self):
-        self.assertIsNone(self._ops_with(255, "").unit_state("suborch2", "atlas"))
+        self.assertIsNone(self._ops_with(255, "").unit_state("suborch2", "artisan"))
 
     def test_successful_empty_query_IS_absent(self):
-        self.assertEqual(self._ops_with(0, "").unit_state("suborch2", "atlas"), "missing",
+        self.assertEqual(self._ops_with(0, "").unit_state("suborch2", "artisan"), "missing",
                          "rc==0 with no rows is the one case that really means absent")
 
     def test_own_account_is_probed_WITHOUT_sudo(self):
@@ -144,8 +144,11 @@ class ProbeSeamTest(unittest.TestCase):
         seen = {}
         ops = dr.Ops()
         with unittest.mock.patch.object(dr.subprocess, "run", subprocess_run_capture(seen)):
-            ops._sudo_user("suborch2", "true")
-        self.assertEqual(seen["argv"][:3], ["sudo", "-n", "-u"])
+            # T-4758: an account guaranteed NOT to be ours. A fleet name like "suborch2" is
+            # the current user on that seat, where _sudo_user rightly skips sudo.
+            other = "not-" + dr._me()
+            ops._sudo_user(other, "true")
+        self.assertEqual(seen["argv"][:4], ["sudo", "-n", "-u", other])
 
 
 def subprocess_run_capture(seen):
@@ -168,12 +171,12 @@ class InventoryTest(unittest.TestCase):
         self.assertIn("not the same as empty", out[0]["detail"])
 
     def test_every_declared_agent_gets_a_verdict(self):
-        modes = {"atlas": "send-keys", "metis": "send-keys", "specialist": "mailbox"}
+        modes = {"artisan": "send-keys", "mason": "send-keys", "specialist": "mailbox"}
         out = dr.probe_all(FakeOps(), substrate=SUB, modes=modes)
-        self.assertEqual(sorted(r["agent"] for r in out), ["specialist", "atlas", "metis"])
+        self.assertEqual(sorted(r["agent"] for r in out), ["specialist", "artisan", "mason"])
 
     def test_never_consults_consumer_outcomes(self):
-        """The whole reason this module exists: metis's consumer passed for weeks on
+        """The whole reason this module exists: mason's consumer passed for weeks on
         `skip:empty_inbox`, never reaching the inject step. A run that does not exercise
         the path cannot testify about it — so no verdict here may depend on one."""
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -184,6 +187,103 @@ class InventoryTest(unittest.TestCase):
             self.assertNotIn(forbidden, body,
                              f"a verdict must never be derived from {forbidden!r} — that is the "
                              f"vacuous-pass this module was built to break")
+
+
+class MaintenanceHoldTest(unittest.TestCase):
+    """T-5254: a seat in an ACTIVE seat-maintenance window is HELD, not alerting."""
+    MODES = {"mason": "send-keys", "artisan": "send-keys"}
+
+    def _ops(self):
+        return FakeOps(units={"mason": "missing", "artisan": "missing"})
+
+    def _held(self, *held):
+        return unittest.mock.patch("tools.notify_policy.in_maintenance",
+                                   side_effect=lambda a, *x, **k: a in held)
+
+    def test_held_seat_is_held_not_alerting_and_never_probed(self):
+        ops = self._ops()
+        ops.unit_state = unittest.mock.Mock(side_effect=ops.unit_state)
+        with self._held("mason"):
+            out = {r["agent"]: r for r in dr.probe_all(ops, substrate=SUB, modes=self.MODES)}
+        self.assertEqual(out["mason"]["state"], dr.HELD)
+        self.assertNotIn(dr.HELD, dr.ALERTING)
+        self.assertEqual(out["artisan"]["state"], dr.MISSING)
+        probed = [c.args[1] for c in ops.unit_state.call_args_list]
+        self.assertNotIn("mason", probed)
+
+    def test_main_does_not_page_for_held_seat(self):
+        ops = self._ops()
+        with self._held("mason", "artisan"), \
+                unittest.mock.patch.object(dr, "Ops", return_value=ops), \
+                unittest.mock.patch.object(dr, "_substrate", return_value=SUB), \
+                unittest.mock.patch.object(dr, "_delivery_modes", return_value=self.MODES):
+            dr.main([])
+        self.assertEqual(ops.alerts, [])
+
+    def test_not_held_still_alerts_as_today(self):
+        ops = self._ops()
+        with self._held(), \
+                unittest.mock.patch.object(dr, "Ops", return_value=ops), \
+                unittest.mock.patch.object(dr, "_substrate", return_value=SUB), \
+                unittest.mock.patch.object(dr, "_delivery_modes", return_value=self.MODES):
+            dr.main([])
+        self.assertEqual(len(ops.alerts), 1)
+        self.assertIn("MISSING mason", ops.alerts[0][0])
+
+    def test_held_seat_does_not_mask_other_seat_alert(self):
+        ops = self._ops()
+        with self._held("mason"), \
+                unittest.mock.patch.object(dr, "Ops", return_value=ops), \
+                unittest.mock.patch.object(dr, "_substrate", return_value=SUB), \
+                unittest.mock.patch.object(dr, "_delivery_modes", return_value=self.MODES):
+            dr.main([])
+        self.assertEqual(len(ops.alerts), 1)
+        self.assertIn("MISSING artisan", ops.alerts[0][0])
+        self.assertNotIn("mason", ops.alerts[0][0])
+
+    def _seat(self, **kw):
+        from tools.seat_state_testkit import eff
+        return unittest.mock.patch("tools.seat_state.safe_effective_for", return_value=eff(**kw))
+
+    def test_deep_sleep_seat_is_held_and_never_probed_T5527(self):
+        for asleep in (True, False):
+            ops = self._ops()
+            ops.unit_state = unittest.mock.Mock(side_effect=ops.unit_state)
+            with self._held(), self._seat(state="deep-sleep", asleep=asleep):
+                out = {r["agent"]: r for r in dr.probe_all(ops, substrate=SUB, modes=self.MODES)}
+            self.assertEqual(out["mason"]["state"], dr.HELD)
+            self.assertIn("deep-sleep", out["mason"]["detail"])
+            self.assertNotIn("mason", [c.args[1] for c in ops.unit_state.call_args_list])
+
+    def test_paused_intake_and_oom_only_seats_are_probed_normally_T5527(self):
+        for seat in (self._seat(state="paused-intake"), self._seat(oom=True)):
+            ops = self._ops()
+            with self._held(), seat:
+                out = {r["agent"]: r for r in dr.probe_all(ops, substrate=SUB, modes=self.MODES)}
+            self.assertEqual(out["mason"]["state"], dr.MISSING)
+
+    def test_live_oom_shape_oom_hold_plus_maintenance_rearm_is_held_T5527(self):
+        ops = self._ops()
+        with self._held("mason"), self._seat(oom=True, maintenance=True):
+            out = {r["agent"]: r for r in dr.probe_all(ops, substrate=SUB, modes=self.MODES)}
+        self.assertEqual(out["mason"]["state"], dr.HELD)
+        self.assertIn("seat-maintenance ACTIVE", out["mason"]["detail"])   # text unchanged
+
+    def test_main_does_not_page_for_a_sleeping_seat_T5527(self):
+        ops = self._ops()
+        with self._held(), self._seat(state="deep-sleep", asleep=True), \
+                unittest.mock.patch.object(dr, "Ops", return_value=ops), \
+                unittest.mock.patch.object(dr, "_substrate", return_value=SUB), \
+                unittest.mock.patch.object(dr, "_delivery_modes", return_value=self.MODES):
+            dr.main([])
+        self.assertEqual(ops.alerts, [])
+
+    def test_policy_fault_fails_open(self):
+        ops = self._ops()
+        with unittest.mock.patch("tools.notify_policy.in_maintenance", side_effect=OSError("boom")):
+            out = {r["agent"]: r for r in dr.probe_all(ops, substrate=SUB, modes=self.MODES)}
+        self.assertEqual(out["mason"]["state"], dr.MISSING)
+        self.assertFalse(dr._seat_in_maintenance("mason"))
 
 
 if __name__ == "__main__":

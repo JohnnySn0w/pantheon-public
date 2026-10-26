@@ -11,7 +11,6 @@ OnFailure=pantheon-unit-failure-alert@%n.service
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
 ExecStart=/usr/bin/python3 %h/pantheon-config/tools/ticket_grooming.py --commit-prod
 StandardOutput=journal
 StandardError=journal

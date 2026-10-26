@@ -77,7 +77,7 @@ actually succeeded*:
   the `sg veneration` wrapper runs as **root**, so `-u <account>` correctly omits it). "Exactly
   one bridge process" is the wrong invariant. Measured trap: a bare
   `pgrep -fc 'acp_bridge.py --agent specialist'` returned **5** when the truthful answer was 2, and an
-  unscoped pattern showed 3 procs for specialist *and* 3 for mnemosyne on the same host. `| grep -v
+  unscoped pattern showed 3 procs for specialist *and* 3 for archivist on the same host. `| grep -v
   pgrep` is not a dependable self-exclusion — it works only when the checking shell's argv happens
   to contain the string `pgrep`.
 - **Do NOT use `pstree -p <MainPID>`.** MainPID is `acp-bridge-supervise.sh`; the bridge tree does
@@ -126,7 +126,7 @@ activity. (Same pane-visible/jsonl-silent shape as the idle spend-cap wedge.)
   resetting (it should always be).
 - **Credit:** Recovery diagnosed `_resolve_session` (the state-file resume) 2026-07-26; Orchestrator executed
   + verified under the operator-escalated multi-system incident. Full narrative: ledger `2026-W30`
-  (`mnemosyne-bridge-incident-resolved`). The operational procedure (systemctl-not-tmux +
+  (`archivist-bridge-incident-resolved`). The operational procedure (systemctl-not-tmux +
   state-file-delete) also belongs in Recovery's bridge runbook.
 - Sibling "restart resumes the wrong state" shape:
   `supervisor-launch-flag-outranks-settings-json-on-model-pin.md`.

@@ -1,0 +1,66 @@
+# STAGED ARTIFACT (T-2919, ORG-052 Unit 7) - nothing in this unit
+# installs it. Account creation, executable materialization, credential
+# provisioning, root allowlist install and enablement are HO enable-leg
+# asks (T-2920 install leg / T-2924 live proof).
+#
+# The separately supervised Telegram human-approval ingress (ORG-052
+# section 5 "Human authority ingress"). Its OWN dedicated account; its
+# bot credential arrives only through an ORG-051 host-file lease read at
+# startup (never argv, never the environment, never this file).
+#
+# PROVISIONAL values pending T-2920 ratification:
+#   - the account name  pantheon-hostapproval-ingress (minted in the
+#     staged org.pantheon.HostApproval1.conf, T-2913)
+#   - ExecStart path    /usr/local/libexec/pantheon-host-approval-telegram-ingress
+#   - config path       /etc/pantheon/host-approval-telegram/ingress.json
+#
+# NETWORK (HO decision, T-2919 HO ask #6): this is the ONLY host-control
+# service that needs outbound IP (HTTPS to the Telegram Bot API).
+# RestrictAddressFamilies therefore allows AF_INET/AF_INET6; systemd's
+# IPAddressAllow cannot express a DNS name, so egress narrowing to
+# api.telegram.org needs a separate host-level decision.
+
+[Unit]
+Description=Pantheon host approval Telegram ingress (org.pantheon.HostApprovalTelegram1)
+Documentation=file:adr/ORG-052-harness-neutral-host-capability-broker.md
+Requires=dbus.service
+After=dbus.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=dbus
+BusName=org.pantheon.HostApprovalTelegram1
+ExecStart=/usr/local/libexec/pantheon-host-approval-telegram-ingress --config /etc/pantheon/host-approval-telegram/ingress.json
+User=pantheon-hostapproval-ingress
+Group=pantheon-hostapproval-ingress
+Restart=on-failure
+RestartSec=10
+
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
+StateDirectory=pantheon-host-approval-telegram
+StateDirectoryMode=0700
+
+[Install]
+WantedBy=multi-user.target

@@ -65,6 +65,16 @@ an instance is not listed until instantiated on ITS OWN manager. Every probe her
 ask" (rc!=0) is kept strictly distinct from "asked, found nothing" (rc==0, empty) — merging
 them is precisely how delivery_reachability once fabricated a MISSING for a live timer.
 
+UNIT LIST (T-4220). The same signal watches any plain oneshot service + timer registered in
+`WATCHED_UNITS` (the ORG-013 cascade sweep on the `claude` seat is the first). A unit carries its
+own max-silence threshold, and its account is its OWNER persona's, read through the same
+`sudo -u <account> systemctl --user` path as the inbox-consumers — no new cross-account surface.
+Units share the verdicts, the per-verdict cooldown, the UNKNOWN streak-gate and the mute files
+(`consumer-liveness.<unit-key>.disabled`); NO_TIMER / DISABLED stay report-only, so a silently
+deleted or disabled unit timer is NOT paged (usually a deliberate ORG-068 lifecycle act, but this
+monitor cannot tell that from an accident, so the report hedges it and names the consequence).
+`--unit KEY` checks one unit; an explicit `--agent` checks no unit.
+
 AUTHORISED NO. A planned pause (the TG-6694 pause-manifest class) is a legitimate quiet:
 `<state>/consumer-liveness.disabled` mutes all agents, `consumer-liveness.<agent>.disabled`
 mutes one. Both are JSON {reason, until}; past `until`, or unparseable, the mute lapses and
@@ -79,6 +89,7 @@ import os
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -114,6 +125,60 @@ _LABEL = "consumer-liveness"
 
 LIVE, STALLED, DISABLED, NO_TIMER, UNKNOWN = "LIVE", "STALLED", "DISABLED", "NO_TIMER", "UNKNOWN"
 ALERTING = (STALLED, UNKNOWN)
+
+
+@dataclass(frozen=True)
+class WatchedUnit:
+    """A plain (non-templated) oneshot service + its timer, watched for going quiet (T-4220).
+
+    key               state / mute-file / result name. Must not equal a persona name: it shares
+                      `consumer-liveness.json` and `consumer-liveness.<key>.disabled` with them.
+    service, timer    the unit file names, as `systemctl --user` on the owner's account sees them.
+    owner             the persona whose seat runs the unit. Its account comes from `_substrate()`
+                      (one seat map), and a page routes as this persona via route_failure_alert.
+    max_silence_secs  STALLED once `now - ExecMainExitTimestamp` exceeds this (strictly).
+    label             the words an alert uses for the unit.
+    consequence       what a dead unit costs, as a clause in the NO_TIMER / DISABLED report's
+                      "If this wasn't a deliberate <act> (ORG-068), <consequence>; <fix>" sentence
+                      (empty: the clause is omitted).
+    """
+    key: str
+    service: str
+    timer: str
+    owner: str
+    max_silence_secs: int
+    label: str
+    consequence: str = ""
+
+
+# UNIT LIST (T-4220). Each entry is a oneshot whose timer can fire for a long time and then stop,
+# which OnFailure (no run started, so none failed) and verify_startup C8 (boot-time, never-armed
+# only) cannot see. Keep max_silence_secs in lockstep with the timer's cadence: the
+# test_consumer_liveness_units registry guard parses the real .timer and fails if they disagree.
+#
+# cascade-sweep: fires at *:04,19,34,49 (15 min). Normal staleness peaks near 16-17 min (cadence +
+# RandomizedDelaySec=60 + a ~1s run). 3600s = 4 cadences: it still reads LIVE across TWO missed
+# fires (a user-manager reload, a seat session reset) and pages on the third, ~60-65 min after
+# the last completed run given the 5-min poll. A dead sweep only degrades to resolve-time cascade
+# (stale depends_on never blocks dispatch), so the extra latency is cheap and a false page is not.
+#
+# RESIDUAL (accepted, T-4220): a unit whose timer is DISABLED or whose files are REMOVED reads
+# DISABLED / NO_TIMER, which is report-only here, so a silently deleted timer is not paged.
+# Those are usually deliberate lifecycle acts (ORG-068 disable/remove) and a page-until-muted
+# would be noise, but nothing here can tell a deliberate one from an accident: the report says
+# only that intent is possible, and names the consequence and the fix. Who owns paging a deleted
+# timer is an open ownership gap (a follow-up ticket), deliberately not built in this module.
+WATCHED_UNITS: tuple[WatchedUnit, ...] = (
+    WatchedUnit(
+        key="cascade-sweep",
+        service="pantheon-cascade-sweep.service",
+        timer="pantheon-cascade-sweep.timer",
+        owner="orchestrator",
+        max_silence_secs=3600,
+        label="ORG-013 cascade sweep",
+        consequence="the sweep has degraded to resolve-time-only cascade",
+    ),
+)
 
 
 def _log(msg: str) -> None:
@@ -205,20 +270,20 @@ class Ops:
             return 255, ""
         return r.returncode, r.stdout
 
-    def timer_enablement(self, account: str, agent: str) -> str | None:
+    def _enablement(self, account: str, listed: str, timer: str) -> str | None:
         """'enabled' / 'disabled' / 'missing' on THAT account's manager, or None if unaskable.
 
-        Checks the TEMPLATE's presence separately from the INSTANCE's enablement — that split
-        IS the NO_TIMER-vs-DISABLED line: an instance of a template nobody installed is not
-        'disabled', it does not exist."""
+        Checks that `listed` (the template for an instance, the unit file itself for a plain
+        unit) is INSTALLED separately from `timer`'s enablement — that split IS the
+        NO_TIMER-vs-DISABLED line: a unit nobody installed is not 'disabled', it does not
+        exist."""
         rc, out = self._sudo_user(
-            account, f"systemctl --user list-unit-files '{CONSUMER_TEMPLATE}' --no-legend")
+            account, f"systemctl --user list-unit-files '{listed}' --no-legend")
         if rc != 0:
             return None  # could not ASK (denied sudo / dead manager / timeout) — never "absent"
         if not out.strip():
             return "missing"
-        rc2, out2 = self._sudo_user(
-            account, f"systemctl --user is-enabled {CONSUMER_TIMER.format(agent=agent)} 2>&1")
+        rc2, out2 = self._sudo_user(account, f"systemctl --user is-enabled {timer} 2>&1")
         text = (out2 or "").strip().splitlines()
         state = text[-1].strip() if text else ""
         if state in ("enabled", "enabled-runtime", "static", "alias", "indirect"):
@@ -230,15 +295,15 @@ class Ops:
         # not a guess — UNKNOWN alerts (streak-gated), a wrong guess does not.
         return None
 
-    def service_last_exit(self, account: str, agent: str) -> dict | None:
-        """{'exit_epoch': int|None, 'result': str, 'active_state': str} for the consumer
-        service, or None if the manager could not be queried at all.
+    def _last_exit(self, account: str, service: str) -> dict | None:
+        """{'exit_epoch': int|None, 'result': str, 'active_state': str} for `service`, or None
+        if the manager could not be queried at all.
 
-        exit_epoch is when the oneshot last EXITED — i.e. a cycle ran to completion. None here
+        exit_epoch is when the oneshot last EXITED — i.e. a run went to completion. None here
         means it has no completed run yet (never fired / just enabled)."""
         rc, out = self._sudo_user(
             account,
-            f"systemctl --user show --timestamp=unix {CONSUMER_SERVICE.format(agent=agent)} "
+            f"systemctl --user show --timestamp=unix {service} "
             f"-p ExecMainExitTimestamp -p Result -p ActiveState")
         if rc != 0:
             return None
@@ -257,6 +322,22 @@ class Ops:
             "result": fields.get("Result", ""),
             "active_state": fields.get("ActiveState", ""),
         }
+
+    def timer_enablement(self, account: str, agent: str) -> str | None:
+        """The inbox-consumer instance for `agent`: see `_enablement` (template vs instance)."""
+        return self._enablement(account, CONSUMER_TEMPLATE, CONSUMER_TIMER.format(agent=agent))
+
+    def service_last_exit(self, account: str, agent: str) -> dict | None:
+        """The inbox-consumer service for `agent`: see `_last_exit`."""
+        return self._last_exit(account, CONSUMER_SERVICE.format(agent=agent))
+
+    def unit_enablement(self, account: str, timer: str) -> str | None:
+        """A plain (non-templated) timer, installed AND enabled on `account`'s manager."""
+        return self._enablement(account, timer, timer)
+
+    def unit_last_exit(self, account: str, service: str) -> dict | None:
+        """A plain oneshot service's last completed run on `account`'s manager."""
+        return self._last_exit(account, service)
 
     def alert(self, msg: str, vocab: str, agent: str) -> None:
         try:
@@ -300,13 +381,36 @@ def disabled_reason(state_dir: Path, now: int, name: str) -> str | None:
     return f"{reason} (until {until})"
 
 
+def _if_unintended(unit: WatchedUnit, act: str, fix: str) -> str:
+    """The hedge for a unit whose timer is gone or off. NO_TIMER / DISABLED are report-only (an
+    ORG-068 lifecycle act can be deliberate) but nothing here can tell that from an accident, so
+    the report states the fact and only the POSSIBILITY of intent, then the consequence and fix."""
+    consequence = f"{unit.consequence}; " if unit.consequence else ""
+    return (f"If this wasn't a deliberate {act} (ORG-068), {consequence}"
+            f"{fix} per tools/systemd/README.md.")
+
+
 def classify_agent(agent: str, *, account: str | None, enablement: str | None,
                    service: dict | None, now: int,
-                   cadence: int = CADENCE_SECS, stall_multiple: int = STALL_MULTIPLE) -> dict:
+                   cadence: int = CADENCE_SECS, stall_multiple: int = STALL_MULTIPLE,
+                   unit: WatchedUnit | None = None) -> dict:
     """Pure decision for one agent. Returns {agent, verdict, detail}. No I/O.
 
     Reads `now` and `service['exit_epoch']` fresh each call and derives the verdict from their
-    DIFFERENCE — there is no stored liveness answer to go stale (the freshness point)."""
+    DIFFERENCE — there is no stored liveness answer to go stale (the freshness point).
+
+    `unit` (T-4220): when set, `agent` is the unit's key and the subject is that plain oneshot
+    unit instead of an inbox-consumer instance — same verdict logic (one T-3099 mid-run rule,
+    one strict `>` boundary), but the threshold is `unit.max_silence_secs` and the wording
+    names the unit. With `unit=None` every string below is byte-identical to before T-4220
+    (pinned by test_consumer_liveness_units.AgentPathPinned)."""
+    if unit is None:
+        noun, who, run_word = "inbox-consumer", "consumer", "cycle"
+        threshold = cadence * stall_multiple
+    else:
+        noun = who = unit.label
+        run_word = "run"
+        threshold = unit.max_silence_secs
     if not account:
         return {"agent": agent, "verdict": UNKNOWN,
                 "detail": f"{agent}: no account known (absent from the substrate map) — unmeasurable."}
@@ -315,13 +419,23 @@ def classify_agent(agent: str, *, account: str | None, enablement: str | None,
                 "detail": f"{agent}: could not query {account}'s user manager (denied sudo / dead "
                           f"manager / timeout). Liveness is unmeasurable — NOT a green result."}
     if enablement == "missing":
-        return {"agent": agent, "verdict": NO_TIMER,
-                "detail": f"{agent}: no inbox-consumer unit on {account}. delivery_reachability "
-                          f"(MISSING) owns this alarm — not re-paged here."}
+        if unit is None:
+            detail = (f"{agent}: no inbox-consumer unit on {account}. delivery_reachability "
+                      f"(MISSING) owns this alarm — not re-paged here.")
+        else:
+            detail = (f"{agent}: {unit.label} timer ({unit.timer}) is not installed on {account}. "
+                      + _if_unintended(unit, "removal", "reinstall")
+                      + " Reported, not paged.")
+        return {"agent": agent, "verdict": NO_TIMER, "detail": detail}
     if enablement == "disabled":
-        return {"agent": agent, "verdict": DISABLED,
-                "detail": f"{agent}: inbox-consumer timer on {account} is switched OFF — an "
-                          f"authorised no, not a stall."}
+        if unit is None:
+            detail = (f"{agent}: {noun} timer on {account} is switched OFF — an "
+                      f"authorised no, not a stall.")
+        else:
+            detail = (f"{agent}: {unit.label} timer ({unit.timer}) on {account} is switched OFF "
+                      f"(disabled or masked). " + _if_unintended(unit, "disable", "re-enable")
+                      + " Reported, not paged.")
+        return {"agent": agent, "verdict": DISABLED, "detail": detail}
 
     # enabled from here.
     if service is None:
@@ -341,32 +455,36 @@ def classify_agent(agent: str, *, account: str | None, enablement: str | None,
         active_state = (service.get("active_state") or "").strip()
         if active_state in ("activating", "active", "reloading"):
             return {"agent": agent, "verdict": LIVE,
-                    "detail": f"{agent}: consumer is mid-cycle (ActiveState={active_state}); "
+                    "detail": f"{agent}: {who} is mid-{run_word} (ActiveState={active_state}); "
                               f"exit-timestamp transiently cleared during activation — alive, "
                               f"not never-fired (T-3099)."}
         return {"agent": agent, "verdict": UNKNOWN,
-                "detail": f"{agent}: timer enabled but the consumer has no completed-run "
+                "detail": f"{agent}: timer enabled but the {who} has no completed-run "
                           f"timestamp yet (never fired / just enabled). verify_startup C8 owns "
                           f"the never-fired case — held UNKNOWN here, not silently green."}
 
-    threshold = cadence * stall_multiple
     staleness = now - exit_epoch
     if staleness > threshold:
-        mins, cad_m, thr_m = staleness // 60, cadence // 60, threshold // 60
+        mins, thr_m = staleness // 60, threshold // 60
         extra = ""
         result, active = service.get("result", ""), service.get("active_state", "")
         if result and result != "success":
             extra = f" Last run Result={result}"
         if active:
             extra += f" (ActiveState={active})"
-        return {"agent": agent, "verdict": STALLED,
-                "detail": (f"{agent}: inbox-consumer on {account} last COMPLETED a cycle {mins} min "
-                           f"ago (cadence {cad_m} min, threshold {thr_m} min). The timer is enabled "
-                           f"but has stopped delivering cycles — a stall the empty-queue detectors "
-                           f"cannot see, and OnFailure does not catch because no run started to "
-                           f"fail.{extra}")}
+        if unit is None:
+            detail = (f"{agent}: inbox-consumer on {account} last COMPLETED a cycle {mins} min "
+                      f"ago (cadence {cadence // 60} min, threshold {thr_m} min). The timer is "
+                      f"enabled but has stopped delivering cycles — a stall the empty-queue "
+                      f"detectors cannot see, and OnFailure does not catch because no run "
+                      f"started to fail.{extra}")
+        else:
+            detail = (f"{agent}: {noun} on {account} last COMPLETED a run {mins} min ago "
+                      f"(threshold {thr_m} min). The timer is enabled but has stopped firing — "
+                      f"OnFailure does not catch it because no run started to fail.{extra}")
+        return {"agent": agent, "verdict": STALLED, "detail": detail}
     return {"agent": agent, "verdict": LIVE,
-            "detail": f"{agent}: inbox-consumer completed a cycle {staleness // 60} min ago "
+            "detail": f"{agent}: {noun} completed a {run_word} {staleness // 60} min ago "
                       f"(<= {threshold // 60} min threshold)."}
 
 
@@ -388,6 +506,27 @@ def check_agent_once(agent: str, *, ops: Ops, substrate: dict, state_dir: Path, 
         service = ops.service_last_exit(account, agent)
     decided = classify_agent(agent, account=account, enablement=enablement,
                              service=service, now=now)
+    return _finish(decided, ops=ops, state_dir=state_dir, now=now,
+                   cooldown_secs=cooldown_secs, dry_run=dry_run)
+
+
+def check_unit_once(unit: WatchedUnit, *, ops: Ops, substrate: dict, state_dir: Path, now: int,
+                    cooldown_secs: int, dry_run: bool) -> dict:
+    """Probe one registered unit and record/alert. Returns {agent (= unit.key), verdict,
+    detail, alerted}. The account is the OWNER persona's (one seat map, `_substrate`), and an
+    alert routes as that persona — `route_failure_alert` sends non-recovery personas via Recovery."""
+    account = substrate.get(unit.owner)
+    muted = (disabled_reason(state_dir, now, _DISABLE_NAME)
+             or disabled_reason(state_dir, now, f"consumer-liveness.{unit.key}.disabled"))
+    if muted:
+        decided = {"agent": unit.key, "verdict": DISABLED,
+                   "detail": f"{unit.key}: authorised quiet: {muted}"}
+    else:
+        enablement = ops.unit_enablement(account, unit.timer) if account else None
+        service = ops.unit_last_exit(account, unit.service) if enablement == "enabled" else None
+        decided = classify_agent(unit.key, account=account, enablement=enablement,
+                                 service=service, now=now, unit=unit)
+    decided["route_as"] = unit.owner
     return _finish(decided, ops=ops, state_dir=state_dir, now=now,
                    cooldown_secs=cooldown_secs, dry_run=dry_run)
 
@@ -424,8 +563,10 @@ def _finish(decided: dict, *, ops: Ops, state_dir: Path, now: int,
                or last_verdict != verdict
                or now - last_alert >= cooldown_secs)
         if due:
+            # `route_as` (units only): the persona the page is about. `agent` is then the unit
+            # key, which is a state/mute namespace, not a persona route_failure_alert knows.
             ops.alert(f"[{_LABEL}] {result['detail']}",
-                      vocab=f"{_LABEL} ({verdict})", agent=agent)
+                      vocab=f"{_LABEL} ({verdict})", agent=decided.get("route_as", agent))
             result["alerted"] = True
             astate["last_alert_epoch"] = now
             astate["last_alert_verdict"] = verdict
@@ -439,24 +580,42 @@ def _finish(decided: dict, *, ops: Ops, state_dir: Path, now: int,
 
 def check_all(*, ops: Ops | None = None, state_dir: Path | None = None,
               agents: list[str] | None = None, substrate: dict | None = None,
-              cooldown_secs: int = DEFAULT_COOLDOWN_SECS, dry_run: bool = False) -> list[dict]:
+              cooldown_secs: int = DEFAULT_COOLDOWN_SECS, dry_run: bool = False,
+              units: list[WatchedUnit] | None = None) -> list[dict]:
+    """Seats first, then units. `agents=None` means the whole fleet: every seat plus every
+    `WATCHED_UNITS` entry. An explicit `agents=[...]` checks exactly those agents and no units;
+    an explicit `units=[...]` overrides the registry (`agents=[]` + `units=[u]` is a units-only
+    run, which is what `--unit` does)."""
     ops = ops or Ops()
     state_dir = Path(state_dir) if state_dir else _DEFAULT_STATE_DIR
     sub = substrate if substrate is not None else _substrate()
     seats = agents if agents is not None else _seat_inventory()
+    explicit_units = units is not None
+    if units is None:
+        units = list(WATCHED_UNITS) if agents is None else []
     now = ops.now()
-    if not seats:
-        return [{"agent": "*", "verdict": UNKNOWN, "alerted": False,
-                 "detail": "seat inventory could not be read (DELIVERY_MODE unreadable) — the "
-                           "roster is unknown, which is not the same as empty."}]
-    return [check_agent_once(a, ops=ops, substrate=sub, state_dir=state_dir, now=now,
-                             cooldown_secs=cooldown_secs, dry_run=dry_run)
-            for a in seats]
+    results: list[dict] = []
+    if not seats and not (explicit_units and units):
+        results.append({"agent": "*", "verdict": UNKNOWN, "alerted": False,
+                        "detail": "seat inventory could not be read (DELIVERY_MODE unreadable) — the "
+                                  "roster is unknown, which is not the same as empty."})
+    results += [check_agent_once(a, ops=ops, substrate=sub, state_dir=state_dir, now=now,
+                                 cooldown_secs=cooldown_secs, dry_run=dry_run)
+                for a in seats]
+    # An unreadable seat roster must not blind the unit checks: they do not depend on it.
+    results += [check_unit_once(u, ops=ops, substrate=sub, state_dir=state_dir, now=now,
+                                cooldown_secs=cooldown_secs, dry_run=dry_run)
+                for u in units]
+    return results
 
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
-    ap.add_argument("--agent", default=None, help="check only this agent (default: all seats)")
+    scope = ap.add_mutually_exclusive_group()
+    scope.add_argument("--agent", default=None,
+                       help="check only this agent (default: all seats plus every registered unit)")
+    scope.add_argument("--unit", default=None, choices=[u.key for u in WATCHED_UNITS],
+                       help="check only this registered unit, e.g. `--unit cascade-sweep --dry-run`")
     ap.add_argument("--cooldown-secs", type=int, default=DEFAULT_COOLDOWN_SECS)
     ap.add_argument("--state-dir", default=None)
     ap.add_argument("--dry-run", action="store_true", help="decide and print; never alert")
@@ -464,11 +623,16 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     agents = None
+    units = None
     if args.agent:
         agents = [args.agent]
+    elif args.unit:
+        agents = []
+        units = [u for u in WATCHED_UNITS if u.key == args.unit]
 
     results = check_all(state_dir=Path(args.state_dir) if args.state_dir else None,
-                        agents=agents, cooldown_secs=args.cooldown_secs, dry_run=args.dry_run)
+                        agents=agents, units=units, cooldown_secs=args.cooldown_secs,
+                        dry_run=args.dry_run)
     if args.json:
         print(json.dumps(results))
     else:

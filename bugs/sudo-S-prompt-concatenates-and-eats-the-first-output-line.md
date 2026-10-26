@@ -73,7 +73,7 @@ Once `-p ''` has removed the prompt, `2>/dev/null` is hiding nothing that is sti
 work except discarding diagnostics. In a sweep, a failing item belongs in the enumeration beside the
 ones that succeeded.
 
-*(Correction credit: mnemosyne, T-2331 — this entry originally prescribed `2>/dev/null` and I had
+*(Correction credit: archivist, T-2331 — this entry originally prescribed `2>/dev/null` and I had
 broadcast that to five seats before the second half was measured.)*
 
 ## Why it is worse than it looks
@@ -89,7 +89,7 @@ checked separately out of habit, not because the method was sound.
 
 ## The general form
 
-`sudo -S` is one instance, not the class. Stated wider (mnemosyne, T-2331):
+`sudo -S` is one instance, not the class. Stated wider (archivist, T-2331):
 
 > **A filter written to suppress a prompt will eat any data the prompt fused with, and
 > prompt-fusion happens whenever a writer omits the trailing newline.**

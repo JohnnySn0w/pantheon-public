@@ -139,7 +139,7 @@ class TestCheck(_WatchdogBase):
         self.assertEqual(mroute.call_count, 2)
 
 
-class TestRouteWard(unittest.TestCase):
+class TestRouteRecovery(unittest.TestCase):
     def test_route_recovery_sends_urgent_mailbox_message(self) -> None:
         with mock.patch("tools.mailbox.send") as msend:
             watchdog._route_recovery("priority-list persistently broken: yaml-parse-fail")

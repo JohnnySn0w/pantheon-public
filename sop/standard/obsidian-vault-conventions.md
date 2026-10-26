@@ -28,7 +28,7 @@ pantheon-config doubles as an **Obsidian vault**: open the repo folder (or its p
 
 ## The enforcement gate
 
-`python3 tools/vault_link_check.py` — classifies every wikilink outside code fences and **fails on dead links in curated dirs** (adr/, rulebook/, sop/, notes/, lessons/, live tickets); historical record dirs (tickets/done/, watch reports, incidents/, ledger/) warn only, because history is never rewritten. Run it after adding cross-referenced docs; suite: `python3 -m unittest tools.test_vault_link_check`.
+`python3 tools/vault_link_check.py` — classifies every wikilink outside code fences and **fails on dead links in curated dirs** (architecture/, rulebook/, sop/, notes/, lessons/, live tickets); historical record dirs (tickets/done/, watch reports, incidents/, ledger/) warn only, because history is never rewritten. Run it after adding cross-referenced docs; suite: `python3 -m unittest tools.test_vault_link_check`.
 
 ## Ready-to-paste Dataview views
 

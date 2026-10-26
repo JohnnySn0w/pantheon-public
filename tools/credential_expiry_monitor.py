@@ -51,46 +51,48 @@ try:  # ORG-076 §7 / T-2978: the unified per-persona mute registry.
 except ImportError:  # bare run with cwd=tools/
     from notify_policy import is_muted as _persona_is_muted  # type: ignore
 
+try:  # T-4096: the mailbox hub path comes from instance.yaml, never a literal.
+    from tools.agent_role_map import mailbox_hub
+except ImportError:  # bare run with cwd=tools/
+    from agent_role_map import mailbox_hub  # type: ignore
+
 # Accounts that authenticate with a Claude OAuth credential file (agent -> unix
 # user). Deliberately INDEPENDENT of context_fill_monitor.AGENT_CONFIG: that set
-# carries restart/session semantics and omits the-ancestor, but the-ancestor runs
-# `claude` headless with its own ~/.claude/.credentials.json and can 401-expire
-# exactly like the others (its access token had already expired by the time of the
-# Jun-2026 outage; it survived only because its refresh token was intact). It is
-# channel-less / on-demand with different restart semantics, so it belongs HERE for
-# credential health but NOT in AGENT_CONFIG. codex is intentionally EXCLUDED — it
+# carries restart/session semantics, this one only credential health. the-ancestor
+# was listed here until T-3421 (2026-10-24, the operator TG 8778): it is retired and runs
+# no agent, so its leftover credential file only produced NEAR_CLIFF pages once its
+# mute was cleared. codex is intentionally EXCLUDED — it
 # authenticates via a separate (OpenAI) system, not a Claude OAuth credential file.
 CREDENTIALED_ACCOUNTS = {
     "orchestrator": "claude",
     "specialist": "claude-research",
     "recovery": "claude-fallback",
-    "the-ancestor": "the-ancestor",
-    # Mnemosyne (second head, ORG-042) — Claude OAuth like the fleet; added
+    # Archivist (second head, ORG-042) — Claude OAuth like the fleet; added
     # 2026-07-20 with the recovery→exocortex sudo grant (observation-only profile).
-    "mnemosyne": "exocortex",
-    # Metis + Atlas (sub-orchestrator seats, ORG-043) — independent Claude OAuth
+    "archivist": "exocortex",
+    # Mason + Artisan (sub-orchestrator seats, ORG-043) — independent Claude OAuth
     # lineages from the 2026-07-21 batch (~mid-Aug refresh cliffs); added with
     # the recovery→suborch* sudo grants (/etc/sudoers.d/61-fallback-suborch, T-1904/
     # T-1905). Credential health only — their restart/wake semantics are orchestrator's
-    # bringup surface, so like the-ancestor they belong HERE, not in AGENT_CONFIG.
-    "metis": "suborch1",
-    "atlas": "suborch2",
+    # bringup surface, so they belong HERE, not in AGENT_CONFIG.
+    "mason": "suborch1",
+    "artisan": "suborch2",
 }
 
 # Tunable (env-overridable): re-alert cadence per (agent, problem class).
 ALERT_COOLDOWN_SECONDS = int(os.environ.get("PANTHEON_CRED_ALERT_COOLDOWN_SECONDS", str(6 * 3600)))
 # Agents whose credential ALERTS are suppressed — intentionally offline/retired seats
-# (T-2973: mnemosyne offline, the-ancestor retiring). Their credentials will trip
+# (T-2973: archivist offline; the-ancestor was here too until T-3421 removed it). Their credentials will trip
 # NEAR_CLIFF/MALFORMED forever with no one to relogin, so alerting the operator about them
 # is pure noise (a D1 violation). The class is still CLASSIFIED + LOGGED (trace kept,
 # so a resurrected seat is not silently blind — check the log), only the the operator page
 # + Recovery wake are suppressed, and the agent is not counted a problem. Comma-separated
-# env, mirrors channel_liveness's CHANNEL_LIVENESS_SKIP. REVERSIBLE: drop from the env
+# env (the channel-liveness analogue was removed under ORG-076 s7.1). REVERSIBLE: drop from the env
 # when a seat comes back online.
 CREDENTIAL_ALERT_SKIP = {a.strip() for a in os.environ.get("PANTHEON_CRED_ALERT_SKIP", "").split(",") if a.strip()}
 # T-2973: the refresh token is NON-rotating and expires ~30d from login; when it
 # lapses the next access-token renew hard-fails and Claude Code ZEROES the credential
-# (the 2026-08-18 cascade — atlas/orchestrator/recovery/metis within hours, undetected because
+# (the 2026-08-18 cascade — artisan/orchestrator/recovery/mason within hours, undetected because
 # this monitor only watched the short-lived ACCESS token). Warn this many seconds
 # before the refreshTokenExpiresAt cliff so the SOP's pre-emptive relogin arc fires in
 # time. Default 3 days — enough runway to batch-relogin the whole cohort.
@@ -144,6 +146,47 @@ def _read_credential(agent: str, cfg: dict) -> tuple[str, dict | None]:
         # than lumping it with unreadable files.
         return "no accessToken field", oauth
     return "ok", oauth
+
+
+def _read_account_json(user: str, path: str) -> dict | None:
+    """Parse a JSON file owned by `user` (Recovery direct, siblings via `sudo -n`).
+    None on ANY failure: callers treat None as "unknown", never as a signal."""
+    try:
+        if user == getpass.getuser():
+            raw = Path(path).read_text()
+        else:
+            res = subprocess.run(["sudo", "-n", "-u", user, "cat", path],
+                                 capture_output=True, text=True, timeout=15)
+            if res.returncode != 0:
+                return None
+            raw = res.stdout
+        data = json.loads(raw)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _claude_hold(agent: str, cfg: dict) -> str | None:
+    """T-4791: why this persona's Claude credential is unused, or None.
+
+    Non-None only when BOTH hold: the operator HELD claude/* off the persona
+    (runtime-controller overrides/holds.json, an explicit operator act) AND its
+    recorded live runtime is another harness (active-runtime.json). Then the
+    credential's cliff pages the operator every cooldown for a login nothing uses; when
+    the operator returns the seat to claude the hold is removed and alerts resume,
+    which is exactly when the /login is needed. Muting the persona instead would
+    silence ALL its alerts. Any unreadable/unknown state returns None (alert as
+    before): this can only ever skip a page on positive evidence."""
+    root = f"/home/{cfg['sudo_user']}/.local/state/pantheon/personas/{agent}"
+    holds = (_read_account_json(cfg["sudo_user"], f"{root}/overrides/holds.json") or {}).get("holds")
+    held = sorted(k for k in holds if k.startswith("claude/")) if isinstance(holds, dict) else []
+    if not held:
+        return None
+    runtime = (_read_account_json(cfg["sudo_user"], f"{root}/active-runtime.json") or {}).get("runtime")
+    if not isinstance(runtime, str) or not runtime or runtime.startswith("claude/"):
+        return None
+    reason = str((holds.get(held[0]) or {}).get("reason", ""))[:120]
+    return f"{', '.join(held)} held ({reason}); live runtime {runtime}"
 
 
 def classify(agent: str, cfg: dict, now: float | None = None) -> tuple[str, str]:
@@ -247,7 +290,7 @@ def _alert(text: str) -> None:
     _send_telegram_alert(text)
 
 
-RECOVERY_INBOX = os.environ.get("PANTHEON_RECOVERY_INBOX", "/home/the-ancestor/mailbox/recovery")
+RECOVERY_INBOX = os.environ.get("PANTHEON_RECOVERY_INBOX") or f"{mailbox_hub()}/recovery"
 
 # T-1874: fleet login/rotation event log — every credential-fingerprint change is
 # recorded so the NEXT auth-death can be correlated against fleet login activity
@@ -356,6 +399,10 @@ def check(agents: list[str], *, dry_run: bool, now: float | None = None) -> int:
         # is_muted fail-opens, so an absent/broken registry is a no-op (never silences).
         if agent in CREDENTIAL_ALERT_SKIP or _persona_is_muted(agent):
             _log(agent, f"alert suppressed (persona muted / skip-list: intentionally offline/retired) — {cls}")
+            continue
+        hold = _claude_hold(agent, cfg)
+        if hold:
+            _log(agent, f"alert suppressed (claude runtime held by operator: {hold}) — {cls}")
             continue
         problems += 1
         if dry_run:

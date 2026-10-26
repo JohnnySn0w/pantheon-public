@@ -4,7 +4,7 @@ WHY THIS EXISTS. `settings.json` is edited by fleet rollouts, and a seat can hav
 two executors (T-2274) that both act on the same mailed instruction. Two
 read-modify-write cycles interleaving on one JSON file is a SILENT LOST UPDATE:
 no error, no traceback, and no diff to notice — the loser's hook simply is not
-there. Measured on the mnemosyne seat during the T-2313 rollout, where the two
+there. Measured on the archivist seat during the T-2313 rollout, where the two
 executors raced and only an idempotence check (not the design) prevented it.
 
 The existing idiom (e.g. `ci_audit_liveness._write_json`) does tmp-file +

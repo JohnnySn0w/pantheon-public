@@ -32,9 +32,33 @@
 #    it's already resumable (see AUTO-RESUME below): it reuses the open PR and
 #    relocates the CI run rather than re-pushing.
 #
+# STAGED MODE (T-2877): the one-shot flow (push + pre-push-smoke + CI-poll +
+# merge) reliably OUTLASTS the harness background-task duration cap and gets
+# KILLED mid-flight (T-1666: killed during the pre-push smoke, before push
+# landed). Auto-resume (T-1631) only helps AFTER remote state exists; a kill in
+# the pre-push-smoke phase leaves nothing to resume. Split the flow so each
+# invocation fits the cap and persists resumable state at its boundary:
+#   1. tools/echo-merge.sh <id> --stage-push [--no-verify-push] --title .. --body-file ..
+#        push + PR-create + locate the CI run, PRINT `run-id=<id>` and EXIT.
+#        (no CI poll, no merge — the short half that establishes remote state.)
+#   2. tools/echo-merge.sh <id> --merge-when-green [<run-id>] --execute
+#        skip push; reuse the open PR; ONE bounded CI poll; --admin merge; clean
+#        up. Re-invokable across turns: on poll TIMEOUT (exit 3) just re-run the
+#        SAME command — it resumes the poll (the run-id is optional; omitted, it
+#        relocates the run by branch). Dry-run without --execute, same as before.
+# The default (neither flag) is the unchanged one-shot flow — keep it for short
+# doc-only merges whose CI fits inside the cap.
+#
 # Usage:
 #   tools/echo-merge.sh <ticket-id> [options]
 #     <ticket-id>            e.g. T-1481  (branch agent/<id>, worktree /tmp/echo-<id>)
+#   --stage-push            STAGE 1: push + PR + locate run-id, print it, EXIT
+#                           (no poll/merge/cleanup). Mutually exclusive with
+#                           --merge-when-green and --execute.
+#   --merge-when-green [id]  STAGE 2: skip push; poll the CI run (id optional —
+#                           relocated by branch if omitted) to green, then merge
+#                           (with --execute) + clean up. Re-invokable on exit 3.
+#                           Mutually exclusive with --stage-push.
 #   --execute               perform the merge (default: dry-run, stop before merge)
 #   --title <s>             PR title      (required only if no PR exists yet)
 #   --body-file <path>      PR body file  (required only if no PR exists yet)
@@ -79,6 +103,9 @@ METHOD="squash"
 EXECUTE=0
 DO_PUSH=1
 DO_NO_VERIFY_PUSH=0
+STAGE_PUSH=0            # T-2877 stage 1: push + PR + locate run-id, print, exit
+MERGE_WHEN_GREEN=0      # T-2877 stage 2: poll + merge + cleanup (no push)
+MERGE_RUN_ID=""         # optional explicit run-id for --merge-when-green
 POLL_TIMEOUT=4500
 POLL_INTERVAL=30
 TICKET=""
@@ -93,6 +120,14 @@ log() { echo "echo-merge: $*" >&2; }
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --execute) EXECUTE=1; shift ;;
+    --stage-push) STAGE_PUSH=1; shift ;;
+    --merge-when-green)
+      MERGE_WHEN_GREEN=1
+      # Optional run-id: consume the next token ONLY if it's all-digits (a run
+      # id). Otherwise leave it for the parser (a flag) or the positional ticket
+      # — merge-when-green then relocates the run by branch.
+      if [[ "${2:-}" =~ ^[0-9]+$ ]]; then MERGE_RUN_ID="$2"; shift 2; else shift; fi
+      ;;
     --no-push) DO_PUSH=0; shift ;;
     --no-verify-push) DO_NO_VERIFY_PUSH=1; shift ;;
     --title) PR_TITLE="${2:-}"; shift 2 ;;
@@ -113,6 +148,16 @@ done
 [[ "$METHOD" =~ ^(squash|merge|rebase)$ ]] || die "--method must be squash|merge|rebase"
 BRANCH="agent/${TICKET}"
 [[ -n "$WORKTREE" ]] || WORKTREE="/tmp/echo-${TICKET}"
+
+# ---- staged-mode validation (T-2877) -----------------------------------------
+if [[ "$STAGE_PUSH" == "1" && "$MERGE_WHEN_GREEN" == "1" ]]; then
+  die "--stage-push and --merge-when-green are mutually exclusive (they are the two halves of the staged flow — run them in separate invocations)"
+fi
+if [[ "$STAGE_PUSH" == "1" && "$EXECUTE" == "1" ]]; then
+  die "--stage-push never merges; drop --execute (merge happens in the --merge-when-green stage)"
+fi
+# The merge stage never pushes — it resumes from remote state the push stage left.
+if [[ "$MERGE_WHEN_GREEN" == "1" ]]; then DO_PUSH=0; fi
 
 # ---- token (exported for gh, never printed) ----------------------------------
 [[ -f "$TOKEN_ENV" ]] || die "token file not found: $TOKEN_ENV"
@@ -160,6 +205,10 @@ PR_NUM="$(gh pr list --repo "$REPO" --head "$BRANCH" --state open --json number 
 if [[ -n "$PR_NUM" ]]; then
   log "[2/5] reusing open PR #$PR_NUM for $BRANCH."
 else
+  # The merge stage resumes an already-opened PR — it must not create one (that
+  # is the push stage's job). A missing PR here means stage 1 never ran (or the
+  # PR closed), so fail loudly rather than silently opening a fresh PR.
+  [[ "$MERGE_WHEN_GREEN" != "1" ]] || die "no open PR for $BRANCH — run --stage-push first (--merge-when-green resumes an existing PR, it does not create one)"
   [[ -n "$PR_TITLE" && -n "$PR_BODY_FILE" ]] || die "no open PR for $BRANCH; provide --title and --body-file to create one"
   [[ -f "$PR_BODY_FILE" ]] || die "body file not found: $PR_BODY_FILE"
   log "[2/5] creating PR ..."
@@ -168,15 +217,33 @@ else
   log "[2/5] created PR #$PR_NUM ($PR_URL)."
 fi
 
-# ---- phase 3: poll CI to terminal --------------------------------------------
-log "[3/5] locating CI run for $BRANCH ..."
-RUN_ID=""
-for _ in $(seq 1 10); do
-  RUN_ID="$(gh run list --repo "$REPO" --branch "$BRANCH" --json databaseId,status --limit 1 --jq '.[0].databaseId // empty' 2>/dev/null || true)"
-  [[ -n "$RUN_ID" ]] && break
-  sleep 6
-done
-[[ -n "$RUN_ID" ]] || die "no CI run found for $BRANCH after PR open"
+# ---- phase 3: locate CI run --------------------------------------------------
+if [[ -n "$MERGE_RUN_ID" ]]; then
+  # --merge-when-green <id>: trust the id stage 1 printed; skip the locate loop.
+  RUN_ID="$MERGE_RUN_ID"
+  log "[3/5] using provided run id=$RUN_ID for $BRANCH."
+else
+  log "[3/5] locating CI run for $BRANCH ..."
+  RUN_ID=""
+  for _ in $(seq 1 10); do
+    RUN_ID="$(gh run list --repo "$REPO" --branch "$BRANCH" --json databaseId,status --limit 1 --jq '.[0].databaseId // empty' 2>/dev/null || true)"
+    [[ -n "$RUN_ID" ]] && break
+    sleep 6
+  done
+  [[ -n "$RUN_ID" ]] || die "no CI run found for $BRANCH after PR open"
+fi
+
+# STAGE 1 boundary (T-2877): push + PR + run-id located = the short half is done
+# and remote state now exists (resumable). Print the run-id machine-greppably and
+# hand off to the merge stage. Do NOT poll — that is what outlasts the cap.
+if [[ "$STAGE_PUSH" == "1" ]]; then
+  log "[3/5] STAGE-PUSH COMPLETE: PR #$PR_NUM open, CI run located."
+  log "Resume when convenient (re-invokable across turns):"
+  log "  tools/echo-merge.sh $TICKET --merge-when-green $RUN_ID --execute"
+  echo "run-id=$RUN_ID pr=$PR_NUM"   # stdout, machine-greppable for the next turn
+  exit 0
+fi
+
 log "[3/5] run id=$RUN_ID; polling (timeout ${POLL_TIMEOUT}s, NOT gh run watch) ..."
 
 elapsed=0

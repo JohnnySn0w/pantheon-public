@@ -22,15 +22,9 @@
 #
 # format: <token> <path>
 
-1058350bd tickets/active/T-2124.md
-98d06b63 tickets/done/T-0670.md
-43434375 tickets/done/T-1056.md
+cd13d1013 tickets/active/T-4537.md
 6b153c4e8 tickets/done/T-1056.md
-5772461b tickets/done/T-1084.md
-7d559d0f tickets/done/T-1099.md
 7d93e73a3 tickets/done/T-1099.md
-0a95a37a tickets/done/T-1491.md
-21a6264e tickets/done/T-1926.md
 09e83bd9c tickets/done/T-1987.md
 0904d1abc tickets/done/T-2128.md
 7a80f8840 tickets/done/T-2128.md
@@ -58,46 +52,14 @@ f789baaaa tickets/done/T-2347.md
 8dc49fb1d tickets/done/T-2357.md
 4374c1273 tickets/done/T-2360.md
 21c2b4c8d tickets/done/T-2362.md
-
-# T-2382 (orchestrator 2026-08-06, flagged by recovery via mailbox, disposition orchestrator):
-# two pruned agent/T-2382-land intermediates cited in the ticket's own
-# append-only notes. 4aa5c58ba = the bugs#1-2 base (squashed to e175325, which
-# IS on origin/main via PR#189); 5ba964502 = codex's permission-pin bundle head.
-# The -land branch was pruned after the squash-merge, so both went unreachable.
-# Done ticket => append-only; T-2347 precedent refuses to rewrite the log to go
-# green. Baselined-with-audit-note (not silenced); the real landed sha is e175325.
 4aa5c58ba tickets/done/T-2382.md
 5ba964502 tickets/done/T-2382.md
-
-# 2026-08-21 (recovery — weekly cited-hash-lint sweep failure disposition; unit red since 2026-08-16):
-# 28 UNREACHABLE citations, ALL in append-only done/ transition-logs / resolve notes (verified:
-# fresh-sweep dir-tally = 28/28 in tickets/done, 0 in active/inbox). Each is a worker-branch /
-# draft / pre-merge / pre-push-rebase commit that was rewritten or pruned after squash-merge, so
-# it is not an ancestor of origin/main. None are fixable in place; T-2347 refuses rewriting a
-# done-ticket log to green a lint. Baselined-with-audit (still printed in full every run; removed
-# from the EXIT CODE only). Where the note itself records the landed sha it stays verifiable there
-# — e.g. T-0383: "72ef62f -> merged as e0ebde7 (PR #1)".
-72ef62f tickets/done/T-0383.md
-11a200e5a tickets/done/T-1924.md
-522c95432 tickets/done/T-2245.md
-81b07d7bb tickets/done/T-2246.md
-2e876bb5f tickets/done/T-2261.md
-2e876bb5f tickets/done/T-2272.md
-092dbe51d tickets/done/T-2388.md
-c0021121c tickets/done/T-2388.md
-17b99c7ed tickets/done/T-2388.md
-9a1962887 tickets/done/T-2388.md
-2331acb00 tickets/done/T-2388.md
-3b3daf5c3 tickets/done/T-2388.md
-4e7d5ce16 tickets/done/T-2388.md
-89937e76a tickets/done/T-2388.md
-ca16cc58c tickets/done/T-2388.md
-96ba3ea16 tickets/done/T-2388.md
-b151e7853 tickets/done/T-2438.md
-537d593095 tickets/done/T-2438.md
-39f380d32760c421fe5cef8114fe422e452313aa tickets/done/T-2438.md
+be65fa837364ee30b580300bd42a1616f099d1b3 tickets/done/T-2447.md
+ff1e3e985 tickets/done/T-2447.md
+ff1e3e985fa68fde0a7ddc221c926bbcbf6d20a4 tickets/done/T-2447.md
+952784b54 tickets/done/T-2664.md
 2324c10348 tickets/done/T-2665.md
-3ba4d96a9d tickets/done/T-2730.md
+952784b54e tickets/done/T-2800.md
 3637f4c04f tickets/done/T-2829.md
 cade9ff254 tickets/done/T-2831.md
 ee7453d391 tickets/done/T-2831.md
@@ -105,28 +67,35 @@ ee7453d391 tickets/done/T-2831.md
 cade9ff254 tickets/done/T-2832.md
 ee7453d391 tickets/done/T-2832.md
 ab4b089b81 tickets/done/T-2833.md
-
-# 2026-08-30 (T-3345): 16 UNREACHABLE citations in resolved/append-only surfaces — all verified
-# orphaned (not an ancestor of origin/main AND on no ref: deleted branch tips / pre-push-rewritten /
-# deliberately-preserved-then-dropped). Unverifiable + unfixable in place without rewriting a resolved
-# ticket's record (T-2347 no-rewrite; same class as the 28 above). 14 sit in transition logs; 2 are in
-# done-ticket BODY but are historical references, not typos (T-2935 hash IS the subject = an unlanded
-# preserved commit; T-3107 = "follow-up to T-3106 branch commit"). Root cause: branch-commit hashes
-# cited in prose orphan when the branch squash-merges + is deleted; the T-2360 stamper covers only
-# stamped fields, not prose, so this class recurs and is accepted per T-2347. See T-3345 resolve note.
-e6a787fcf tickets/done/T-3243.md
-5e3b1fa74 tickets/done/T-3243.md
-0c1a4282a4 tickets/done/T-3246.md
-fd300bc0b tickets/inbox/T-2950.md
-866a289e2 tickets/inbox/T-3006.md
-b5593bef5 tickets/inbox/T-3006.md
-952784b54 tickets/done/T-2664.md
-952784b54e tickets/done/T-2800.md
 952784b54e tickets/done/T-2935.md
-6cf245f893 tickets/done/T-3020.md
-0e05f87d01 tickets/done/T-3020.md
-581614a5f3 tickets/done/T-3020.md
-3405bd903e tickets/done/T-3020.md
-b7ab67275b tickets/done/T-3107.md
-b2bc33b12 tickets/done/T-3241.md
-b2bc33b12 tickets/done/T-3242.md
+4e190b2be278813a1cbb26dd671abfd2065541de tickets/done/T-3028.md
+5553ad1ed1a7141a6ae1b961e47b5fc91ab35ffb tickets/done/T-3028.md
+a1e710e3adcae9ef1a594f484d9c60116766e698 tickets/done/T-3028.md
+0032a21603 tickets/done/T-3263.md
+7177c2d21c tickets/done/T-3263.md
+8cf75ae86e tickets/done/T-3263.md
+a7e1b0bdb2 tickets/done/T-3263.md
+c10ba6c1e7 tickets/done/T-3263.md
+7177c2d21c tickets/done/T-3302.md
+1058350bd tickets/done/T-3835.md
+c8ff6d465 tickets/done/T-3844.md
+0c9bf0407 tickets/done/T-4061.md
+2c1e87645 tickets/done/T-4061.md
+7dd6e4569 tickets/done/T-4284.md
+7dd6e4569 tickets/done/T-4292.md
+cd13d1013 tickets/done/T-4292.md
+ce5db11c2 tickets/done/T-4292.md
+5af6b010b tickets/done/T-4321.md
+ff32bc708 tickets/done/T-4328.md
+00c2eedd4 tickets/done/T-4360.md
+dd7f8c3db tickets/done/T-4362.md
+52d400328 tickets/done/T-4369.md
+d4d69f12e tickets/done/T-4369.md
+795f94196 tickets/done/T-4416.md
+e658442ba tickets/done/T-4425.md
+e7edf925e tickets/done/T-4425.md
+52d400328 tickets/done/T-4456.md
+58b5f5aff tickets/done/T-4457.md
+1058350bd tickets/inbox/T-2124.md
+fd300bc0b tickets/inbox/T-2950.md
+4f5d5d3ca tickets/inbox/T-4347.md

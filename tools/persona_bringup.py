@@ -25,6 +25,7 @@ import inspect
 import json
 import os
 import pwd
+import stat
 import sys
 import tempfile
 import time
@@ -63,11 +64,14 @@ from tools.harness_adapter.quota import (
     decide_failover,
     decide_fallback_recovery,
 )
+from tools import quota_probe_detector
 from tools import codex_telegram_bridge
 from tools import mailbox as pantheon_mailbox
 from tools import mailbox_wake
 from tools.persona_brief import PersonaBriefError, resolve_persona_brief_path
 from tools import runtime_controller
+from tools import subscription_usability
+from tools import agent_role_map
 from tools.claude_quota_probe import (
     ClaudeQuotaProbeError,
     PROMPT as CLAUDE_QUOTA_PROBE_PROMPT,
@@ -82,8 +86,7 @@ from tools.claude_quota_probe import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = REPO_ROOT / "instance.yaml"
-DEFAULT_MAILBOX_HUB = Path("/home/the-ancestor/mailbox")
-DEFAULT_QUOTA_CHECK_PERSONAS = frozenset({"specialist", "recovery"})
+DEFAULT_MAILBOX_HUB = Path(agent_role_map.mailbox_hub())  # T-4096: instance.yaml mailbox.hub
 QUOTA_CHECK_LOCK_TIMEOUT_SECONDS = 0.0
 BACKOFF_DELAYS_SECONDS = (120, 300, 900, 3600, 14400, 21600)
 
@@ -154,6 +157,9 @@ class QuotaCheckResult:
         "planned-transition-started",
         "transition-active-noop",
         "fallback-active-noop",
+        "no-viable-target",
+        "receiver-not-ready",
+        "seat-sleep",
     ]
     acted: bool
     reason: str
@@ -210,11 +216,25 @@ def _standing_instruction_reference(
 ) -> Mapping[str, str] | None:
     del role, selected_harness
     installer = data.get("persona_installer")
-    raw = installer.get("codex_standing_instructions") if isinstance(installer, Mapping) else None
-    personas = raw.get("personas") if isinstance(raw, Mapping) else None
-    item = personas.get(persona) if isinstance(personas, Mapping) else None
-    if not isinstance(item, Mapping):
+    if not isinstance(installer, Mapping):
         return None
+    # T-5011 PR-D: the generalized reader (legacy codex key or
+    # harness_standing_instructions); this reference stays codex-only.
+    from tools.persona_installer import LEGACY_CODEX_STANDING_SCHEMA, ManifestError, standing_instruction_entries
+
+    try:
+        items = standing_instruction_entries(installer, persona).get("codex")
+    except ManifestError as exc:  # this module's callers handle ValueError
+        raise ValueError(str(exc)) from exc
+    if not items:
+        return None
+    if len(items) != 1:
+        raise ValueError("codex standing instructions take exactly one entry")
+    item = items[0]
+    raw = installer.get("codex_standing_instructions")
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("personas"), Mapping) or persona not in raw["personas"]:
+        raw = installer.get("harness_standing_instructions")
+    raw = raw if isinstance(raw, Mapping) else {"schema": LEGACY_CODEX_STANDING_SCHEMA}
     target = item.get("target")
     override = item.get("override_target")
     source = item.get("source")
@@ -241,7 +261,7 @@ def load_binding(
     profile_override: str | None = None,
     mailbox_hub: Path = DEFAULT_MAILBOX_HUB,
 ) -> PersonaBinding:
-    data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+    data = agent_role_map.load_instance_document(manifest_path)  # T-4279: cached parse
     roles = data.get("roles") if isinstance(data, dict) else None
     if not isinstance(roles, dict):
         raise ValueError(f"{manifest_path}: roles mapping missing")
@@ -310,28 +330,12 @@ def load_binding(
     raise ValueError(f"{manifest_path}: persona {persona!r} is not bound")
 
 
-def quota_check_personas(manifest_path: Path) -> frozenset[str]:
-    data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
-    installer = data.get("persona_installer") if isinstance(data, dict) else None
-    quota = installer.get("quota_check") if isinstance(installer, dict) else None
-    personas = quota.get("personas") if isinstance(quota, dict) else None
-    if personas is None:
-        return DEFAULT_QUOTA_CHECK_PERSONAS
-    if not (
-        isinstance(personas, list)
-        and all(isinstance(item, str) and item for item in personas)
-    ):
-        raise ValueError("persona_installer.quota_check.personas must be a list of persona strings")
-    return frozenset(personas)
-
-
 def quota_check_supported(
     binding: PersonaBinding,
     *,
     manifest_path: Path = DEFAULT_MANIFEST,
 ) -> tuple[bool, str]:
-    if binding.persona not in quota_check_personas(manifest_path):
-        return False, "persona-not-allowlisted"
+    # T-5446 / TG 12274: no persona allowlist -- every seat with a manifest fallback flips.
     if not binding.controller.policy.fallbacks:
         return False, "no-manifest-fallback"
     return True, "supported"
@@ -429,6 +433,135 @@ def resolve_configured_runtime_target(
     return current, target
 
 
+class OperatorSwapHeldError(RuntimeError):
+    """T-5028 (a): an operator swap onto a held runtime without --override-hold,
+    or an override whose hold-clear did not take effect."""
+
+
+def _clear_hold_via_harness(persona: str, destination: str, *, state_root: Path, reason: str) -> tuple[int, str]:
+    """Clear the hold with the harness CLI itself, so the clear lands on
+    origin/main through the T-5021 landing path (or is spooled, exit 2) exactly
+    like `harness <persona> clear-hold`. Returns (exit code, combined output)."""
+    import contextlib
+    import io
+
+    from tools import harness
+    from tools import harness_state
+
+    root = harness_state.root_for_personas_dir(state_root)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        code = harness.main([persona, "clear-hold", destination, "--reason", reason], root=root)
+    return code, (out.getvalue() + err.getvalue()).strip()
+
+
+def _gate_operator_swap_onto_held(
+    persona: str,
+    destination: str,
+    *,
+    correlation_id: str,
+    state_root: Path,
+    override_hold: bool,
+    override_reason: str | None,
+    clear_hold_fn: Any | None,
+) -> dict[str, Any] | None:
+    """Refuse, or clear the hold for --override-hold. Returns the override record
+    (for the post-swap outcome row and alert) or None when no override happened."""
+    if destination not in runtime_controller.load_holds(persona, state_root=state_root):
+        if override_hold:
+            # REBOUND 1 MINOR 3: a no-op override leaves a small trace and nothing else.
+            try:
+                runtime_controller._append_controller_evidence(
+                    persona,
+                    "operator_swap_override_hold_noop",
+                    {"destination": destination, "correlation_id": correlation_id,
+                     "detail": "override-hold-noop: destination not held"},
+                    state_root=state_root,
+                )
+            except Exception:  # noqa: BLE001 -- a trace, never a gate
+                pass
+        return None
+    if not override_hold:
+        raise OperatorSwapHeldError(
+            f"{destination} is operator-held for {persona}; refusing the swap "
+            "(pass --override-hold --reason <text> to clear the hold and swap)"
+        )
+    if not override_reason:
+        raise OperatorSwapHeldError("--override-hold requires --reason")
+    reason = f"operator swap --override-hold ({correlation_id}): {override_reason}"
+    clear = clear_hold_fn or _clear_hold_via_harness
+    try:
+        code, detail = clear(persona, destination, state_root=state_root, reason=reason)
+    except Exception as exc:  # noqa: BLE001 -- an unclearable hold refuses the swap
+        code, detail = -1, f"{type(exc).__name__}: {exc}"
+    if destination in runtime_controller.load_holds(persona, state_root=state_root):
+        raise OperatorSwapHeldError(
+            f"--override-hold could not clear the hold on {destination} (exit {code}): {detail}"[:1000]
+        )
+    ledger = "landed" if code == 0 else "spooled-or-unlanded"
+    payload = {
+        "destination": destination,
+        "correlation_id": correlation_id,
+        "reason": override_reason,
+        "clear_hold_exit": code,
+        "ledger": ledger,
+        # REBOUND 1 MINOR 2: the harness CLI's own words -- why landing failed, or
+        # the spool path it kept the entry under.
+        "clear_hold_detail": str(detail)[:1000],
+    }
+    try:
+        runtime_controller._append_controller_evidence(
+            persona, "operator_swap_hold_overridden", payload, state_root=state_root
+        )
+    except Exception:  # noqa: BLE001 -- the hold is already cleared; the swap proceeds
+        pass
+    return payload
+
+
+def _record_operator_override_outcome(
+    persona: str,
+    override: Mapping[str, Any],
+    *,
+    state_root: Path,
+    ok: bool,
+    status: str = "",
+    error: str = "",
+) -> None:
+    """REBOUND 1 MINOR 2: after the swap ran, one outcome row and one Recovery alert
+    that carry it, so a swap failing after a successful override is loud. Never raises."""
+    destination = str(override.get("destination", ""))
+    try:
+        hold_cleared = destination not in runtime_controller.load_holds(persona, state_root=state_root)
+    except Exception:  # noqa: BLE001
+        hold_cleared = False
+    outcome = {
+        "destination": destination,
+        "correlation_id": override.get("correlation_id"),
+        "ok": ok,
+        "status": status,
+        "error": error[:1000],
+        "hold_still_cleared": hold_cleared,
+        "ledger": override.get("ledger"),
+    }
+    try:
+        runtime_controller._append_controller_evidence(
+            persona, "operator_swap_hold_override_outcome", outcome, state_root=state_root
+        )
+    except Exception:  # noqa: BLE001 -- the alert below still carries the outcome
+        pass
+    verdict = f"swap {status or 'ok'}" if ok else f"SWAP FAILED ({error})"
+    try:
+        runtime_controller._route_failure_alert(
+            persona,
+            f"operator swap on {persona}: hold on {destination} cleared with --override-hold "
+            f"({override.get('correlation_id')}; ledger {override.get('ledger')}); {verdict}; "
+            f"hold {'stays cleared' if hold_cleared else 'is set again'} -- reason: {override.get('reason')}"[:1500],
+            f"operator-hold-override ({persona}) {destination} {override.get('correlation_id')}",
+        )
+    except Exception:  # noqa: BLE001 -- alerting is best-effort
+        pass
+
+
 def operator_target_swap(
     *,
     manifest_path: Path,
@@ -440,7 +573,16 @@ def operator_target_swap(
     mailbox_hub: Path = DEFAULT_MAILBOX_HUB,
     context: runtime_controller.TmuxRuntimeContext | None = None,
     backend: Any | None = None,
+    override_hold: bool = False,
+    override_reason: str | None = None,
+    clear_hold_fn: Any | None = None,
 ) -> runtime_controller.OperatorSwapReceipt:
+    """Operator target swap. T-5028 (a): a FRESH initiation onto an operator-held
+    destination is refused unless ``override_hold``, which clears the hold through
+    the harness CLI (its T-5021 origin/main ledger landing path, so the clear has
+    one audit trail), writes an evidence row and alerts Recovery, then swaps. A retry
+    of the same transition, the already-active case and the recovery entry points
+    are untouched. ``clear_hold_fn`` is the test seam (default: harness CLI)."""
     current, target = resolve_configured_runtime_target(
         manifest_path,
         persona=persona,
@@ -496,6 +638,54 @@ def operator_target_swap(
             incoming_profile=current.launch.profile,
             receiver_transferred=False,
         )
+    override = None
+    if not matching_existing and existing.get("phase") not in {"preparing", "awaiting-successor-read"}:
+        override = _gate_operator_swap_onto_held(
+            persona,
+            destination,
+            correlation_id=correlation_id,
+            state_root=state_root,
+            override_hold=override_hold,
+            override_reason=override_reason,
+            clear_hold_fn=clear_hold_fn,
+        )
+    if override is None:
+        return _operator_target_swap_run(
+            current, target, persona=persona, destination=destination, trigger=trigger,
+            correlation_id=correlation_id, state_root=state_root, context=context,
+            backend=backend, matching_existing=matching_existing,
+        )
+    try:
+        receipt = _operator_target_swap_run(
+            current, target, persona=persona, destination=destination, trigger=trigger,
+            correlation_id=correlation_id, state_root=state_root, context=context,
+            backend=backend, matching_existing=matching_existing,
+        )
+    except Exception as exc:
+        _record_operator_override_outcome(
+            persona, override, state_root=state_root, ok=False, error=f"{type(exc).__name__}: {exc}"
+        )
+        raise
+    _record_operator_override_outcome(
+        persona, override, state_root=state_root, ok=True, status=str(getattr(receipt, "status", ""))
+    )
+    return receipt
+
+
+def _operator_target_swap_run(
+    current: Any,
+    target: Any,
+    *,
+    persona: str,
+    destination: str,
+    trigger: Literal["operator"],
+    correlation_id: str,
+    state_root: Path,
+    context: runtime_controller.TmuxRuntimeContext | None,
+    backend: Any | None,
+    matching_existing: bool,
+) -> runtime_controller.OperatorSwapReceipt:
+    """The pre-T-5028 tail of operator_target_swap, unchanged."""
     handle = None if matching_existing else runtime_controller.recorded_runtime_handle(current, state_root=state_root)
     try:
         return runtime_controller._operator_target_swap_resolved(
@@ -703,167 +893,199 @@ def select_recorded_runtime_binding(
     return load_runtime_reference(manifest_path, binding, reference)
 
 
+def _claude_probe_valid(
+    probe_result: ClaudeQuotaProbeResult, primary: PersonaBinding, probe_run_id: str
+) -> bool:
+    return not (
+        probe_result.status != "observed"
+        or probe_result.account != primary.account
+        or probe_result.persona != primary.persona
+        or probe_result.tmux_target != claude_probe_tmux_target(primary.persona, probe_run_id)
+        or probe_result.session_id
+        != claude_probe_session_id(primary.account, primary.persona, probe_run_id)
+        or probe_result.prompt_sha256
+        != hashlib.sha256(CLAUDE_QUOTA_PROBE_PROMPT.encode("utf-8")).hexdigest()
+        or probe_result.pong_observed is not True
+        or probe_result.cap_sentinel is not None
+    )
+
+
+def _claude_bucket_probe(
+    primary: PersonaBinding,
+    *,
+    state_dir: Path,
+    observed_now: datetime,
+    claude_probe_runner,
+) -> tuple[ClaudeQuotaProbeResult | None, str]:
+    """One PONG attempt per half-hour bucket (bounds subscription turns while
+    allowing a failed/reset-delayed provider to be rechecked later). Returns
+    (validated result | None, kind); kind is "ok", "probe-capped",
+    "cached-failure", "probe-error" or "probe-invalid"."""
+    bucket = observed_now.replace(
+        minute=(observed_now.minute // 30) * 30, second=0, microsecond=0
+    )
+    probe_run_id = bucket.strftime("%Y%m%dT%H%M%SZ")
+    result_path = claude_probe_result_path(state_dir, primary.persona, probe_run_id)
+    failure_path = result_path.with_name("failure.json")
+    probe_result = read_claude_probe_result(result_path)
+    if probe_result is None and failure_path.exists():
+        return None, "cached-failure"
+    if probe_result is None:
+        try:
+            probe_result = claude_probe_runner(
+                account=primary.account,
+                persona=primary.persona,
+                executable=primary.launch.executable,
+                repo_root=REPO_ROOT,
+                state_root=state_dir,
+                run_id=probe_run_id,
+            )
+        except ClaudeQuotaProbeError as exc:
+            _atomic_write_json(
+                failure_path,
+                {
+                    "schema": "pantheon-claude-quota-probe-failure/v1",
+                    "run_id": probe_run_id,
+                    "account": primary.account,
+                    "persona": primary.persona,
+                    "attempted_at": observed_now.isoformat().replace("+00:00", "Z"),
+                    "error": str(exc)[:1000],
+                },
+            )
+            return None, "probe-error"
+    if not _claude_probe_valid(probe_result, primary, probe_run_id):
+        if probe_result.status == "capped" or probe_result.cap_sentinel is not None:
+            return None, "probe-capped"
+        return None, "probe-invalid"
+    return probe_result, "ok"
+
+
 def primary_recovery_evidence(
     primary: PersonaBinding,
     *,
     state_dir: Path,
     now: datetime | None = None,
     claude_probe_runner=run_claude_quota_probe,
+    probe_deps: subscription_usability.ProbeDeps | None = None,
 ) -> dict[str, str] | None:
-    """Return fresh reset+health proof before a fallback may return to primary."""
+    """Return live health proof before a fallback may return to primary (T-4862).
+
+    The persisted ``primary_resets_at`` is only a HINT for when to look again
+    (``subscription_usability`` schedules the re-probe, ceiling-bounded); it no
+    longer gates the return, so an early provider-side reset is visible. A
+    return needs the probe verdict ``usable`` -- for Claude additionally PONG +
+    a fresh status line + ``decide_failover == "stay"`` and the existing
+    account/session/sha cross-checks; for Codex an app-server rate-limit read.
+    """
 
     state = runtime_controller.transition_state(primary.persona, state_root=state_dir)
     if not (
         state.get("phase") == "completed"
         and state.get("fallback_active") is True
-        # T-2584: forced-cap now records a schedule-computed
-        # primary_resets_at at swap time (runtime_controller.forced_swap),
-        # so it can return through the same reset+health gate as a planned
-        # failover once that instant passes -- everything downstream of
-        # this check already only reads reset+health, not the trigger.
+        # T-2584: forced-cap records a schedule-computed primary_resets_at at
+        # swap time (runtime_controller.forced_swap); everything downstream of
+        # this check reads live health, not the trigger.
         and state.get("trigger") in ("planned-quota", "forced-cap")
     ):
         return None
     raw_reset = state.get("primary_resets_at")
-    if not isinstance(raw_reset, str):
-        return None
-    try:
-        reset = datetime.fromisoformat(raw_reset.replace("Z", "+00:00"))
-    except ValueError:
-        return None
-    if reset.tzinfo is None:
-        return None
+    reset_hint: datetime | None = None
+    if isinstance(raw_reset, str):
+        try:
+            parsed = datetime.fromisoformat(raw_reset.replace("Z", "+00:00"))
+            reset_hint = parsed if parsed.tzinfo is not None else None
+        except ValueError:
+            reset_hint = None
     observed_now = now or datetime.now(timezone.utc)
     if observed_now.tzinfo is None:
         observed_now = observed_now.replace(tzinfo=timezone.utc)
     observed_now = observed_now.astimezone(timezone.utc)
-    if observed_now < reset.astimezone(timezone.utc):
+
+    deps = probe_deps or subscription_usability.ProbeDeps()
+    holder: dict[str, Any] = {}
+    if primary.selected_harness == "claude":
+        # Return requires PONG: the free tiers (pane, old status line) are not enough.
+        def _pong(binding, moment):
+            result, kind = _claude_bucket_probe(
+                binding, state_dir=state_dir, observed_now=moment,
+                claude_probe_runner=claude_probe_runner,
+            )
+            holder["result"] = result
+            if result is None:
+                return None, kind
+            adapter = build_adapter(binding, harness_home=binding.account_home)
+            return adapter.quota_observer(state_dir / binding.persona).read(), kind
+
+        deps = dataclasses.replace(
+            deps,
+            claude_pong=deps.claude_pong or _pong,
+            claude_statusline=deps.claude_statusline or (lambda _b: None),
+            claude_pane_cap=deps.claude_pane_cap or (lambda _b: None),
+        )
+    probe = subscription_usability.probe_usability(
+        primary, state_root=state_dir, now=observed_now, allow_spend=True, deps=deps, hint=reset_hint,
+    )
+    if probe.verdict != "usable":
         return None
 
     probe_result: ClaudeQuotaProbeResult | None = None
+    fresh: QuotaSnapshot | None = None
     if primary.selected_harness == "claude":
-        # One attempt per half-hour bucket bounds subscription turns while
-        # allowing a failed/reset-delayed provider to be rechecked later.
-        bucket = observed_now.replace(
-            minute=(observed_now.minute // 30) * 30,
-            second=0,
-            microsecond=0,
-        )
-        probe_run_id = bucket.strftime("%Y%m%dT%H%M%SZ")
-        result_path = claude_probe_result_path(
-            state_dir, primary.persona, probe_run_id
-        )
-        failure_path = result_path.with_name("failure.json")
-        probe_result = read_claude_probe_result(result_path)
-        if probe_result is None and failure_path.exists():
-            return None
+        probe_result = holder.get("result")
         if probe_result is None:
-            try:
-                probe_result = claude_probe_runner(
-                    account=primary.account,
-                    persona=primary.persona,
-                    executable=primary.launch.executable,
-                    repo_root=REPO_ROOT,
-                    state_root=state_dir,
-                    run_id=probe_run_id,
-                )
-            except ClaudeQuotaProbeError as exc:
-                _atomic_write_json(
-                    failure_path,
-                    {
-                        "schema": "pantheon-claude-quota-probe-failure/v1",
-                        "run_id": probe_run_id,
-                        "account": primary.account,
-                        "persona": primary.persona,
-                        "attempted_at": observed_now.isoformat().replace("+00:00", "Z"),
-                        "error": str(exc)[:1000],
-                    },
-                )
+            # Verdict came from the cached bucket result: re-validate it.
+            bucket = observed_now.replace(minute=(observed_now.minute // 30) * 30, second=0, microsecond=0)
+            run_id = bucket.strftime("%Y%m%dT%H%M%SZ")
+            probe_result = read_claude_probe_result(claude_probe_result_path(state_dir, primary.persona, run_id))
+            if probe_result is None or not _claude_probe_valid(probe_result, primary, run_id):
                 return None
+        adapter = build_adapter(primary, harness_home=primary.account_home)
+        fresh = adapter.quota_observer(state_dir / primary.persona).read()
         if (
-            probe_result.status != "observed"
-            or probe_result.account != primary.account
-            or probe_result.persona != primary.persona
-            or probe_result.tmux_target
-            != claude_probe_tmux_target(primary.persona, probe_run_id)
-            or probe_result.session_id
-            != claude_probe_session_id(
-                primary.account, primary.persona, probe_run_id
-            )
-            or probe_result.prompt_sha256
-            != hashlib.sha256(CLAUDE_QUOTA_PROBE_PROMPT.encode("utf-8")).hexdigest()
-            or probe_result.pong_observed is not True
-            or probe_result.cap_sentinel is not None
-        ):
-            return None
-    adapter = build_adapter(primary, harness_home=primary.account_home)
-    fresh = adapter.quota_observer(state_dir / primary.persona).read()
-    if probe_result is not None:
-        observed_session = fresh.evidence.get("session_id")
-        if (
-            fresh.evidence.get("path") != probe_result.statusline_path
+            fresh.freshness != "fresh"
+            or fresh.evidence.get("path") != probe_result.statusline_path
             or fresh.evidence.get("sha256") != probe_result.statusline_sha256
-            or observed_session != probe_result.session_id
+            or fresh.evidence.get("session_id") != probe_result.session_id
         ):
             return None
-    policy = FailoverPolicy(
-        weekly_remaining_percent=primary.controller.policy.weekly_remaining_percent,
-        fallbacks=primary.controller.policy.fallbacks,
-    )
-    healthy = (
-        decide_failover(fresh, policy) == "stay"
-        and str(fresh.evidence.get("authoritative_limit", "false")).lower()
-        != "true"
-    )
-    probe = PrimaryHealthProbe(
-        healthy=healthy,
-        observed_at=fresh.observed_at,
-        freshness=fresh.freshness,
-        evidence=dict(fresh.evidence),
-    )
-    recorded_reset = QuotaSnapshot(
-        profile=runtime_reference(primary),
-        windows=(
-            QuotaWindow(
-                name="weekly",
-                used_percent=0.0,
-                remaining_percent=0.0,
-                resets_at=reset,
-            ),
-        ),
-        observed_at=reset,
-        freshness="fresh",
-        evidence={"source": "persisted-transition-reset"},
-    )
-    if (
-        decide_fallback_recovery(recorded_reset, probe, now=observed_now)
-        != "return-to-primary"
-    ):
-        return None
-    weekly_remaining = _weekly_remaining_percent(fresh)
+        policy = FailoverPolicy(
+            weekly_remaining_percent=primary.controller.policy.weekly_remaining_percent,
+            fallbacks=primary.controller.policy.fallbacks,
+        )
+        if (
+            decide_failover(fresh, policy) != "stay"
+            or str(fresh.evidence.get("authoritative_limit", "false")).lower() == "true"
+        ):
+            return None
+    observed_at = fresh.observed_at if fresh is not None else (probe.observed_at or observed_now)
+    weekly_remaining = _weekly_remaining_percent(fresh) if fresh is not None else None
+    if weekly_remaining is None and "remaining_percent" in probe.evidence:
+        try:
+            weekly_remaining = float(probe.evidence["remaining_percent"])
+        except ValueError:
+            weekly_remaining = None
+    evidence_items = fresh.evidence if fresh is not None else probe.evidence
     return {
         "primary_profile": runtime_reference(primary),
-        "reset_passed_at": raw_reset,
-        "probe_observed_at": fresh.observed_at.isoformat().replace("+00:00", "Z"),
-        "probe_freshness": fresh.freshness,
+        "reset_passed_at": raw_reset if isinstance(raw_reset, str) else "",
+        "usability_verdict": probe.verdict,
+        "usability_source": probe.source,
+        "probe_observed_at": observed_at.isoformat().replace("+00:00", "Z"),
+        "probe_freshness": fresh.freshness if fresh is not None else "fresh",
         **(
             {"probe_weekly_remaining_percent": str(weekly_remaining)}
             if weekly_remaining is not None
             else {}
         ),
-        **{f"probe_{key}": str(value) for key, value in fresh.evidence.items()},
+        **{f"probe_{key}": str(value) for key, value in evidence_items.items()},
         **(
             {
                 "probe_run_id": probe_result.run_id,
                 "probe_result_path": str(
-                    claude_probe_result_path(
-                        state_dir, primary.persona, probe_result.run_id
-                    )
+                    claude_probe_result_path(state_dir, primary.persona, probe_result.run_id)
                 ),
                 "probe_result_sha256": hashlib.sha256(
-                    claude_probe_result_path(
-                        state_dir, primary.persona, probe_result.run_id
-                    ).read_bytes()
+                    claude_probe_result_path(state_dir, primary.persona, probe_result.run_id).read_bytes()
                 ).hexdigest(),
                 "probe_pong_observed": str(probe_result.pong_observed).lower(),
             }
@@ -913,11 +1135,34 @@ def refresh_primary_quota(
     claude_probe_runner=run_claude_quota_probe,
     adapter=None,
 ) -> QuotaSnapshot | None:
+    return refresh_primary_quota_detailed(
+        binding,
+        state_dir=state_dir,
+        now=now,
+        claude_probe_runner=claude_probe_runner,
+        adapter=adapter,
+    )[0]
+
+
+def refresh_primary_quota_detailed(
+    binding: PersonaBinding,
+    *,
+    state_dir: Path,
+    now: datetime | None = None,
+    claude_probe_runner=run_claude_quota_probe,
+    adapter=None,
+) -> tuple[QuotaSnapshot | None, quota_probe_detector.ProbeOutcome | None]:
+    """``refresh_primary_quota`` plus WHICH outcome produced a ``None`` (ORG-076 BT2).
+
+    The snapshot half is exactly the historical return value. The outcome half is None when no
+    probe applies (non-claude primary), so the detector takes no sample.
+    """
     observed_now = now or datetime.now(timezone.utc)
     if observed_now.tzinfo is None:
         observed_now = observed_now.replace(tzinfo=timezone.utc)
     observed_now = observed_now.astimezone(timezone.utc)
     probe_result: ClaudeQuotaProbeResult | None = None
+    outcome: quota_probe_detector.ProbeOutcome | None = None
     if binding.selected_harness == "claude":
         bucket = observed_now.replace(
             minute=(observed_now.minute // 30) * 30,
@@ -929,7 +1174,9 @@ def refresh_primary_quota(
         failure_path = result_path.with_name("failure.json")
         probe_result = read_claude_probe_result(result_path)
         if probe_result is None and failure_path.exists():
-            return None
+            return None, quota_probe_detector.ProbeOutcome(
+                quota_probe_detector.CACHED_FAILURE, probe_run_id, "cached failure.json for this bucket"
+            )
         if probe_result is None:
             try:
                 probe_result = claude_probe_runner(
@@ -952,7 +1199,9 @@ def refresh_primary_quota(
                         "error": str(exc)[:1000],
                     },
                 )
-                return None
+                return None, quota_probe_detector.ProbeOutcome(
+                    quota_probe_detector.PROBE_ERROR, probe_run_id, str(exc)[:1000]
+                )
         if (
             probe_result.status != "observed"
             or probe_result.account != binding.account
@@ -966,7 +1215,42 @@ def refresh_primary_quota(
             or probe_result.pong_observed is not True
             or probe_result.cap_sentinel is not None
         ):
-            return None
+            if probe_result.status == "capped" or probe_result.cap_sentinel is not None:
+                kind, detail = quota_probe_detector.CAPPED, "probe observed a usage cap"
+            else:
+                kind = quota_probe_detector.PROBE_INVALID
+                failed = [
+                    name
+                    for name, bad in (
+                        ("status", probe_result.status != "observed"),
+                        ("account", probe_result.account != binding.account),
+                        ("persona", probe_result.persona != binding.persona),
+                        (
+                            "tmux_target",
+                            probe_result.tmux_target
+                            != claude_probe_tmux_target(binding.persona, probe_run_id),
+                        ),
+                        (
+                            "session_id",
+                            probe_result.session_id
+                            != claude_probe_session_id(
+                                binding.account, binding.persona, probe_run_id
+                            ),
+                        ),
+                        (
+                            "prompt_sha256",
+                            probe_result.prompt_sha256
+                            != hashlib.sha256(
+                                CLAUDE_QUOTA_PROBE_PROMPT.encode("utf-8")
+                            ).hexdigest(),
+                        ),
+                        ("pong_observed", probe_result.pong_observed is not True),
+                    )
+                    if bad
+                ]
+                detail = "probe result failed checks: " + ",".join(failed)
+            return None, quota_probe_detector.ProbeOutcome(kind, probe_run_id, detail)
+        outcome = quota_probe_detector.ProbeOutcome(quota_probe_detector.READ, probe_run_id)
     quota_adapter = adapter or build_adapter(binding, harness_home=binding.account_home)
     fresh = quota_adapter.quota_observer(state_dir / binding.persona).read()
     if probe_result is not None:
@@ -976,8 +1260,12 @@ def refresh_primary_quota(
             or fresh.evidence.get("sha256") != probe_result.statusline_sha256
             or observed_session != probe_result.session_id
         ):
-            return None
-    return fresh
+            return None, quota_probe_detector.ProbeOutcome(
+                quota_probe_detector.EVIDENCE_MISMATCH,
+                outcome.run_id if outcome else None,
+                "statusline path/sha256/session_id does not match the probe result",
+            )
+    return fresh, outcome
 
 
 def evaluate_planned_quota_swap(
@@ -1001,18 +1289,93 @@ def evaluate_planned_quota_swap(
     return decision, weekly_remaining, _weekly_reset_at(quota_snapshot)
 
 
+def _report_planned_swap_receiver_not_ready(
+    persona: str,
+    why: str,
+    *,
+    state_dir: Path,
+    now: datetime,
+) -> None:
+    """T-5456: a planned (95%) transition was refused because the codex Telegram
+    receiver is not ready. Cooldown-gated alert; the evidence event is written only
+    when the alert routed (one per cooldown window -- the quota timer fires ~30 min).
+    Never raises: a reporting failure must not turn into a transition."""
+    try:
+        msg = (
+            f"quota-check {persona}: the planned quota transition to codex was REFUSED -- the codex "
+            f"Telegram receiver is not ready ({why}). Swapping onto it would drop comms. Fix the "
+            f"install (persona_installer apply + verify-seat); the swap fires on its own once the "
+            f"receiver is ready."
+        )
+        result = runtime_controller._route_cooldown_gated_alert(
+            persona, msg, f"controller-planned-swap-receiver-not-ready ({persona})",
+            stamp_name="planned-swap-receiver-not-ready-alert.json", state_root=state_dir, now=now,
+        )
+        if result.get("alert_routed"):
+            runtime_controller._append_controller_evidence(
+                persona, "planned_swap_receiver_not_ready", {"reason": why[:500]}, state_root=state_dir,
+            )
+    except Exception:  # noqa: BLE001 -- reporting is best-effort
+        pass
+
+
+def _planned_swap_gate_applies(binding: PersonaBinding, targets: Sequence[PersonaBinding]) -> bool:
+    return bool(targets) and runtime_controller.receiver_handoff_required(binding) and all(
+        t.launch.harness == "codex" for t in targets
+    )
+
+
+def _planned_swap_receiver_refusal(
+    binding: PersonaBinding,
+    targets: Sequence[PersonaBinding],
+    *,
+    manifest_path: Path,
+    state_dir: Path,
+    now: datetime,
+) -> str | None:
+    """T-5456: the planned-transition twin of the T-5451 mid-session gate.
+
+    Returns None when the transition may proceed; otherwise the not-ready reason
+    (already reported). Gates only a comms persona (`receiver_handoff_required`)
+    whose every candidate target is codex -- a claude->claude profile swap runs no
+    codex receiver handoff. Uses the one shared predicate, which fails closed; a
+    predicate that raises is likewise "not ready"."""
+    if not _planned_swap_gate_applies(binding, targets):
+        return None
+    try:
+        ready, why = runtime_controller._comms_receiver_ready(binding, manifest_path=manifest_path)
+    except Exception as exc:  # noqa: BLE001 -- fail closed
+        ready, why = False, f"readiness check raised: {type(exc).__name__}: {exc}"[:500]
+    if ready:
+        return None
+    why = why or "not ready"
+    _report_planned_swap_receiver_not_ready(binding.persona, why, state_dir=state_dir, now=now)
+    return why
+
+
 def quota_check(
     binding: PersonaBinding,
     *,
     adapter,
-    fallback_binding: PersonaBinding | None,
+    fallback_binding: PersonaBinding | None = None,
     primary_binding: PersonaBinding,
     state_dir: Path,
     cwd: Path,
     now: datetime | None = None,
     claude_probe_runner=run_claude_quota_probe,
     manifest_path: Path = DEFAULT_MANIFEST,
+    outcome_sink=None,
+    fallback_bindings: Sequence[PersonaBinding] | None = None,
+    probe_deps: subscription_usability.ProbeDeps | None = None,
 ) -> QuotaCheckResult:
+    """``outcome_sink`` (ORG-076 BT2): optional callable given the probe outcome whenever the
+    probe actually ran. It must be a trivial collector -- it runs under the operation lock.
+
+    ``fallback_bindings`` (T-4862): the full fallback list in manifest order. When given, the
+    target is chosen only among fallbacks whose subscription is live-probed usable now
+    (``subscription_usability``); every fallback capped/unknown -> decision ``no-viable-target``
+    with the primary left untouched. The legacy single ``fallback_binding`` keeps the
+    ungated behaviour (no probe)."""
     del cwd
     supported, support_reason = quota_check_supported(binding, manifest_path=manifest_path)
     if not supported:
@@ -1035,6 +1398,16 @@ def quota_check(
                 state_root=state_dir,
             )
             phase = transition.get("phase")
+            if phase == "awaiting-successor-read":
+                # T-5028 (h): the quota fire observes too (specialist/recovery run it).
+                runtime_controller.observe_successor_read(
+                    binding.persona,
+                    binding=_incoming_binding(transition, (binding, primary_binding, fallback_binding,
+                                                           *(fallback_bindings or ()))),
+                    state_root=state_dir,
+                )
+                transition = runtime_controller.transition_state(binding.persona, state_root=state_dir)
+                phase = transition.get("phase")
             if phase in {"preparing", "awaiting-successor-read"}:
                 return QuotaCheckResult(
                     persona=binding.persona,
@@ -1062,13 +1435,15 @@ def quota_check(
                     reason="selected-runtime-is-fallback",
                     transition_phase=str(phase) if phase else None,
                 )
-            fresh = refresh_primary_quota(
+            fresh, probe_outcome = refresh_primary_quota_detailed(
                 primary_binding,
                 state_dir=state_dir,
                 now=now,
                 claude_probe_runner=claude_probe_runner,
                 adapter=adapter,
             )
+            if outcome_sink is not None and probe_outcome is not None:
+                outcome_sink(probe_outcome)
             if fresh is None:
                 return QuotaCheckResult(
                     persona=binding.persona,
@@ -1077,6 +1452,9 @@ def quota_check(
                     acted=False,
                     reason="probe-unavailable",
                 )
+            gated = fallback_bindings is not None
+            if gated:
+                fallback_binding = fallback_bindings[0] if fallback_bindings else None
             decision, weekly_remaining, weekly_reset = evaluate_planned_quota_swap(
                 binding,
                 fresh,
@@ -1116,6 +1494,69 @@ def quota_check(
                     weekly_remaining_percent=weekly_remaining,
                     evidence=dict(fresh.evidence),
                 )
+            moment = now or datetime.now(timezone.utc)
+
+            def _refused(why: str) -> QuotaCheckResult:
+                return QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=True,
+                    decision="receiver-not-ready",
+                    acted=False,
+                    reason="comms-receiver-not-ready",
+                    quota_freshness=fresh.freshness,
+                    weekly_remaining_percent=weekly_remaining,
+                    evidence={**dict(fresh.evidence), "receiver_not_ready": why},
+                )
+
+            precleared = False
+            if gated:
+                # T-5456: every candidate is codex -> the answer is already known; refuse
+                # before the allow_spend probe rather than spend one each tick.
+                why = _planned_swap_receiver_refusal(
+                    binding, fallback_bindings, manifest_path=manifest_path, state_dir=state_dir, now=moment,
+                )
+                if why is not None:
+                    return _refused(why)
+                precleared = _planned_swap_gate_applies(binding, fallback_bindings)
+                chosen, usability = subscription_usability.select_usable_fallback(
+                    binding.persona,
+                    fallback_bindings,
+                    state_root=state_dir,
+                    now=moment,
+                    primary_confirmed_capped=False,
+                    allow_spend=True,
+                    deps=probe_deps,
+                )
+                if chosen.chosen is None:
+                    subscription_usability.report_no_viable_target(
+                        binding.persona,
+                        "planned_quota_no_viable_target",
+                        chosen,
+                        stamp_name=subscription_usability.NO_VIABLE_ALERT_STAMP,
+                        state_root=state_dir,
+                        now=moment,
+                    )
+                    return QuotaCheckResult(
+                        persona=binding.persona,
+                        supported=True,
+                        decision="no-viable-target",
+                        acted=False,
+                        reason="no-usable-fallback",
+                        quota_freshness=fresh.freshness,
+                        weekly_remaining_percent=weekly_remaining,
+                        evidence={
+                            **dict(fresh.evidence),
+                            **{f"usability_{k}": v for k, v in chosen.per_candidate.items()},
+                        },
+                    )
+                fallback_binding = chosen.chosen
+            # T-5456: gate on the chosen target (also the legacy ungated single fallback).
+            if not precleared:
+                why = _planned_swap_receiver_refusal(
+                    binding, (fallback_binding,), manifest_path=manifest_path, state_dir=state_dir, now=moment,
+                )
+                if why is not None:
+                    return _refused(why)
             message_id, _ = _oldest_pending_identity(binding.mailbox)
             barrier = runtime_controller.begin_planned_transition(
                 binding.persona,
@@ -1514,6 +1955,89 @@ def load_policy_skip(state_dir: Path, persona: str) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+MAINTENANCE_BYPASS_MAX_TTL_S = 15 * 60
+
+
+def maintenance_bypass_path(state_dir: Path, persona: str) -> Path:
+    return state_dir / f"{persona}.maintenance-bypass.json"
+
+
+def consume_maintenance_bypass(state_dir: Path, persona: str) -> bool:
+    """T-2953: a one-shot pass for the seat hand-move's single bootstrap consume fire.
+
+    The hand-move SOP requires the seat to be in maintenance (T-4377) and also needs one
+    consume fire to launch the runtime (phase 4), which the T-5282 guard skips. The seat
+    script writes {"persona", "expires"} here right before that fire. A valid token is
+    unlinked when read (single use), so the timer's later fires stay held. It is refused
+    if it names another persona, is expired, expires more than 15 min out (a bootstrap
+    aid, never a standing release), or is malformed. Any token that is read gets
+    removed, valid or not. Consume calls this on EVERY fire, armed or not, so a token
+    left by a run whose maintenance lapsed is still cleared (the seat script fails if
+    the token survives its fire)."""
+    path = maintenance_bypass_path(state_dir, persona)
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return False
+    try:
+        path.unlink()
+    except OSError:
+        pass
+    raw = data.decode("utf-8", errors="replace")
+    try:
+        token = json.loads(raw)
+        expires = datetime.strptime(str(token["expires"]), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+        remaining = (expires - datetime.now(timezone.utc)).total_seconds()
+        ok = token.get("persona") == persona and 0 < remaining <= MAINTENANCE_BYPASS_MAX_TTL_S
+    except (ValueError, KeyError, TypeError, AttributeError):
+        ok = False
+    print(f"[persona_bringup] maintenance bypass token {'USED' if ok else 'REFUSED'} for {persona}: {raw.strip()[:200]}",
+          file=sys.stderr)
+    return ok
+
+
+def _seat_deep_sleeping(persona: str) -> bool:
+    """ORG-106 L3a: is `persona` in an unexpired deep-sleep (draining or asleep)? The shared
+    launch predicate (tools/seat_sleep.launch_block). Fail-open, as _seat_in_maintenance."""
+    try:
+        from tools import seat_sleep
+
+        return bool(seat_sleep.launch_block(persona).sleeping)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[persona_bringup] seat-sleep check failed open: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
+
+
+def _seat_in_maintenance(persona: str) -> bool:
+    """T-5282: is `persona` in an active seat-maintenance window (notify_policy)?
+    Fail-open, as inbox_consumer.check_seat_maintenance (T-4362): an import error or
+    any raise reads as False (logged), so a broken registry can never stop consume.
+    in_maintenance itself already reads a missing/malformed/expired entry as False."""
+    try:
+        from tools.notify_policy import in_maintenance
+
+        return bool(in_maintenance(persona))
+    except Exception as exc:  # noqa: BLE001 -- fail-open by design
+        print(f"[persona_bringup] seat-maintenance check failed open: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return False
+
+
+def all_runtimes_held(persona: str, candidates, state_dir: Path) -> bool:
+    """T-5285: True iff *candidates* is non-empty and EVERY one is held in the
+    persona's holds.json (a deliberate operator hold, not a dead seat).
+
+    A malformed holds file loads as `_FailClosedHolds`, which reads every runtime
+    as held; that is fail-closed for LAUNCHES but must never quiet a dead seat, so
+    it (and any load fault) reads False here and exhaustion keeps raising."""
+    try:
+        holds = runtime_controller.load_holds(persona, state_root=state_dir)
+        if isinstance(holds, runtime_controller._FailClosedHolds) or not candidates:
+            return False
+        return all(runtime_reference(item) in holds for item in candidates)
+    except Exception:  # noqa: BLE001 -- unknown means not-held: keep paging
+        return False
+
+
 def bump_policy_skip(state_dir: Path, persona: str, reason: str) -> dict[str, Any]:
     """Increment and persist *persona*'s consecutive policy-skip streak,
     keyed by *reason*; return the new state ({"reason", "count", "since"}).
@@ -1759,6 +2283,107 @@ def consume_persona_mailbox(
     return stats, outcomes
 
 
+# T-4137: a control-plane restart (handoff_and_restart.sh --supervisor
+# control-plane: context-fill auto-restart, restart_drain tombstones) kills the
+# seat's session and then runs THIS unit via a blocking `systemctl restart`,
+# while pantheon-runtime-controller@<persona> (Restart=always) respawns into the
+# same gap. The initial-viability probe can lose that race: on specialist
+# 2026-09-28T13:34Z the claude candidate was torn down 13s after launch and the
+# codex fallback hit the 409 left by the respawning claude poller, so
+# ensure_viable_runtime raised RuntimeViabilityExhausted, the unit exited 1 and
+# OnFailure paged. The controller recovered the seat four seconds later.
+# Exhaustion WHILE a restart holds its flock is the restart's transient, not a
+# dead seat: consume soft-defers (exit 5, policy skip) and the restart script's
+# own step-6 liveness poll stays the witness that the seat came back.
+# Exhaustion with no restart in flight still raises (exit 1, pages).
+#
+# The restart holds `flock` for its whole life on the per-persona path that
+# context_fill_monitor and restart_drain pass via --lockfile. The script's
+# per-UID default (a manual run without --lockfile) is deliberately NOT honored:
+# it names no persona, so on a multi-persona account it would mute a genuinely
+# dead sibling seat. A manual restart is operator-attended, so a page there is
+# honest. Detection reads /proc/locks and never takes the lock: a probe that
+# took it for even an instant could make a starting restart's `flock -n` bail
+# with "held by another instance".
+RELAUNCH_LOCK_MAX_AGE_SECONDS = 1800  # handoff_and_restart.sh WALL_CLOCK_TIMEOUT_SECS default
+_PROC_LOCKS = Path("/proc/locks")
+
+
+def relaunch_lock_paths(persona: str) -> tuple[Path, ...]:
+    return (Path(f"/tmp/handoff_and_restart_{persona}.lock"),)
+
+
+def _held_flock_keys(proc_locks: Path) -> set[tuple[int, int, int]]:
+    """(major, minor, inode) of every GRANTED flock in /proc/locks.
+
+    Lines look like `4: FLOCK  ADVISORY  WRITE 2344563 fd:01:5299728 0 EOF`;
+    waiters carry a `->` marker and are skipped (they hold nothing). The pid
+    column is the `flock(1)` child that took the lock, usually long exited, so
+    only the inode is load-bearing."""
+    keys: set[tuple[int, int, int]] = set()
+    try:
+        text = proc_locks.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return keys
+    for line in text.splitlines():
+        fields = line.split()
+        if len(fields) < 6 or "->" in fields or fields[1] != "FLOCK":
+            continue
+        try:
+            major, minor, inode = fields[5].split(":")
+            keys.add((int(major, 16), int(minor, 16), int(inode)))
+        except ValueError:
+            continue
+    return keys
+
+
+def relaunch_in_progress(
+    persona: str,
+    *,
+    uid: int | None = None,
+    now: float | None = None,
+    proc_locks: Path = _PROC_LOCKS,
+    lock_paths: Sequence[Path] | None = None,
+) -> dict[str, str] | None:
+    """Evidence that a handoff_and_restart.sh run for *persona* holds its lock.
+
+    Returns None (so exhaustion stays loud) unless the persona's lockfile is a
+    regular file OWNED BY THIS ACCOUNT (a foreign file pre-planted in the
+    world-writable /tmp must not mute this seat's pages), is flock-held right
+    now, and was opened within RELAUNCH_LOCK_MAX_AGE_SECONDS. The script's
+    `exec 9>"$LOCKFILE"` truncates, so the mtime is its open time; a holder
+    older than the script's own wall-clock cap is a leak, not a restart."""
+    uid = os.getuid() if uid is None else uid
+    now = time.time() if now is None else now
+    held = _held_flock_keys(proc_locks)
+    if not held:
+        return None
+    for path in lock_paths if lock_paths is not None else relaunch_lock_paths(persona):
+        try:
+            st = os.stat(path, follow_symlinks=False)
+        except OSError:
+            continue
+        if not stat.S_ISREG(st.st_mode) or st.st_uid != uid:
+            continue
+        if (os.major(st.st_dev), os.minor(st.st_dev), st.st_ino) not in held:
+            continue
+        age = now - st.st_mtime
+        if age < 0 or age > RELAUNCH_LOCK_MAX_AGE_SECONDS:
+            continue
+        return {"lock_path": str(path), "lock_age_seconds": str(int(age))}
+    return None
+
+
+def _incoming_binding(
+    transition: Mapping[str, Any], bindings: Sequence[PersonaBinding | None]
+) -> PersonaBinding | None:
+    """T-5028 (h): the binding of the transition's incoming runtime (for its
+    account_home and launch cwd), else any binding of the persona (same account)."""
+    present = [item for item in bindings if item is not None]
+    wanted = f"{transition.get('incoming_harness')}/{transition.get('incoming_profile')}"
+    return next((item for item in present if runtime_reference(item) == wanted), present[0] if present else None)
+
+
 def wake_persistent_runtime(
     binding: PersonaBinding,
     *,
@@ -1771,6 +2396,8 @@ def wake_persistent_runtime(
     state_dir: Path,
     cwd: Path,
     now: float | None = None,
+    gate_on_usability: bool = False,
+    probe_deps: subscription_usability.ProbeDeps | None = None,
 ) -> dict[str, Any]:
     with runtime_controller.persona_operation_lock(
         binding.persona,
@@ -1788,6 +2415,8 @@ def wake_persistent_runtime(
             state_dir=state_dir,
             cwd=cwd,
             now=now,
+            gate_on_usability=gate_on_usability,
+            probe_deps=probe_deps,
         )
 
 
@@ -1803,8 +2432,13 @@ def _wake_persistent_runtime_locked(
     state_dir: Path,
     cwd: Path,
     now: float | None = None,
+    gate_on_usability: bool = False,
+    probe_deps: subscription_usability.ProbeDeps | None = None,
 ) -> dict[str, Any]:
     """Ensure the interactive TUI and nudge it without claiming mailbox work.
+
+    ``gate_on_usability`` (T-4862): re-probe the swap target immediately before
+    the runtime is replaced; an unusable target abandons the transition.
 
     The persona running inside the TUI remains the only mailbox consumer.  A
     successful tmux submission is therefore reported as transport acceptance,
@@ -1812,10 +2446,40 @@ def _wake_persistent_runtime_locked(
     """
 
     drain_id = runtime_controller.new_drain_id()
+
+    def _usability_gate(swap_trigger: str):
+        if not gate_on_usability:
+            return None
+
+        def gate(target: PersonaBinding):
+            moment = datetime.now(timezone.utc)
+            decision, probes = subscription_usability.select_usable_fallback(
+                target.persona, [target], state_root=state_dir, now=moment,
+                primary_confirmed_capped=False, allow_spend=True, deps=probe_deps, force=True,
+            )
+            probe = probes.get(subscription_usability.runtime_ref(target))
+            ok = decision.chosen is not None
+            if swap_trigger == "quota-reset":  # returning to primary needs a clean bill
+                ok = ok and probe is not None and probe.verdict == "usable"
+            return ok, dict(decision.per_candidate)
+
+        return gate
+
     transition = runtime_controller.transition_state(
         binding.persona,
         state_root=state_dir,
     )
+    if transition.get("phase") == "awaiting-successor-read":
+        # T-5028 (h): the structural ack-read, once per fire, ahead of the
+        # viability gate so a viability-blocked seat still observes.
+        runtime_controller.observe_successor_read(
+            binding.persona,
+            binding=_incoming_binding(
+                transition, (binding, fallback_binding, primary_binding, *(runtime_candidates or ()))
+            ),
+            state_root=state_dir,
+        )
+        transition = runtime_controller.transition_state(binding.persona, state_root=state_dir)
     if transition.get("phase") == "preparing":
         trigger = transition.get("trigger")
         if trigger not in {"planned-quota", "quota-reset"}:
@@ -1827,11 +2491,10 @@ def _wake_persistent_runtime_locked(
             raise runtime_controller.RuntimeTransitionPending(
                 "cooperative transition has no manifest-authorized target"
             )
-        handle = runtime_controller.ensure_runtime(
-            binding,
-            adapter,
-            state_root=state_dir,
-        )
+        ensure_kwargs: dict[str, Any] = {"state_root": state_dir}
+        if receiver_backend is not None:  # T-4179 seam; call shape unchanged otherwise
+            ensure_kwargs["receiver_backend"] = receiver_backend
+        handle = runtime_controller.ensure_runtime(binding, adapter, **ensure_kwargs)
         message_id, _ = _oldest_pending_identity(binding.mailbox)
         runtime_controller.planned_swap(
             handle,
@@ -1840,6 +2503,7 @@ def _wake_persistent_runtime_locked(
             drain_id=drain_id,
             trigger=trigger,
             state_root=state_dir,
+            **({"pre_replace_gate": _usability_gate(trigger)} if gate_on_usability else {}),
         )
 
     candidates = tuple(runtime_candidates or (binding, *(item for item in (fallback_binding,) if item is not None)))
@@ -1865,7 +2529,20 @@ def _wake_persistent_runtime_locked(
         drain_id,
         state_root=state_dir,
     )
-    if primary_binding is not None and recovery_evidence is not None:
+    primary_held = primary_binding is not None and recovery_evidence is not None and (
+        runtime_reference(primary_binding)
+        in runtime_controller.load_holds(primary_binding.persona, state_root=state_dir)
+    )
+    if primary_held:
+        # T-5021: an operator hold on the primary blocks the quota-reset return;
+        # skip it here instead of beginning and abandoning a transition each fire.
+        runtime_controller._append_held_evidence_once(
+            primary_binding.persona,
+            "quota_reset_return_skipped_held",
+            {"runtime": runtime_reference(primary_binding)},
+            state_root=state_dir,
+        )
+    if primary_binding is not None and recovery_evidence is not None and not primary_held:
         message_id, _ = _oldest_pending_identity(binding.mailbox)
         runtime_controller.planned_swap(
             handle,
@@ -1875,6 +2552,7 @@ def _wake_persistent_runtime_locked(
             quota_evidence=recovery_evidence,
             trigger="quota-reset",
             state_root=state_dir,
+            **({"pre_replace_gate": _usability_gate("quota-reset")} if gate_on_usability else {}),
         )
     quota_decision = decide_failover(
         quota_snapshot,
@@ -1884,6 +2562,47 @@ def _wake_persistent_runtime_locked(
         ),
     )
     target = runtime_controller.runtime_target_text(handle.tmux)
+    box = binding.mailbox
+    base: dict[str, Any] = {
+        "tmux_target": target,
+        "profile": binding.launch.profile,
+        "harness": binding.launch.harness,
+        "runtime_viability": selection.receipt,
+        "mailbox_claimed": False,
+        "acked": False,
+        "quota_decision": quota_decision,
+        "quota_freshness": quota_snapshot.freshness,
+    }
+    # T-5283: the standalone pantheon-mailbox-wake@ unit kicks this same pane. Both
+    # wakers hold <box>/.wake.lock from decide through the marker write; a busy lock
+    # means the other waker is kicking right now, so skip like a debounce (no submit,
+    # no raise). An unopenable lock fails open inside wake_lock.
+    with mailbox_wake.wake_lock(box) as lock_state:
+        if lock_state == "busy":
+            return {
+                "action": "debounced",
+                "reason": (f"{mailbox_wake.WAKE_LOCK_BUSY_REASON}: another waker holds "
+                           f"{box / mailbox_wake._WAKE_LOCK_NAME} (T-5283)"),
+                "unread": 0,
+                **base,
+            }
+        return _kick_persistent_runtime(
+            binding, handle=handle, target=target, base=base,
+            state_dir=state_dir, cwd=cwd, now=now,
+        )
+
+
+def _kick_persistent_runtime(
+    binding: PersonaBinding,
+    *,
+    handle,
+    target: str,
+    base: dict[str, Any],
+    state_dir: Path,
+    cwd: Path,
+    now: float | None,
+) -> dict[str, Any]:
+    """Decide and kick under the T-5283 wake lock (the caller holds it)."""
     box = binding.mailbox
     new_dir = box / "new"
     marker = box / ".wake_marker"
@@ -1901,14 +2620,7 @@ def _wake_persistent_runtime_locked(
         "action": action,
         "reason": reason,
         "unread": len(names),
-        "tmux_target": target,
-        "profile": binding.launch.profile,
-        "harness": binding.launch.harness,
-        "runtime_viability": selection.receipt,
-        "mailbox_claimed": False,
-        "acked": False,
-        "quota_decision": quota_decision,
-        "quota_freshness": quota_snapshot.freshness,
+        **base,
     }
     if action != "wake":
         return result
@@ -1921,12 +2633,20 @@ def _wake_persistent_runtime_locked(
     # path computed pane_idle above but never acted on it. Mirror the guard: DEFER
     # without injecting and WITHOUT advancing the marker, so the next consume fire
     # retries once the pane goes idle (a newer message / condition-5 idle-rekick
-    # re-evaluates to "wake"). Only a CONFIRMED-busy pane (False) defers; None
-    # (unknown / foreign substrate / unreadable) and True (idle) fall through and inject
-    # as before — identical to the waker's None-never-blocks contract.
+    # re-evaluates to "wake").
     if pane_idle is False:
         result["action"] = "deferred"
         result["reason"] = "pane busy (mid-turn); deferring to next consume fire (T-2681)"
+        return result
+    # T-4292: UNKNOWN is not permission. This is the same guard as mailbox_wake.run(),
+    # through the same helper, so the two wake paths cannot drift: a permission dialog
+    # must never receive the paste plus Enter. A claude pane needs a True verdict; a
+    # codex pane needs codex's own ready-composer evidence.
+    if pane_idle is None and not mailbox_wake.unknown_pane_deliverable(
+            target, binding.launch.harness):
+        result["action"] = "deferred"
+        result["reason"] = ("pane state unknown (modal, unrecognised screen, or a turn "
+                            "without its sentinel); deferring to next consume fire (T-4292)")
         return result
 
     prompt = mailbox_wake.build_persona_kick(
@@ -2011,7 +2731,7 @@ def _common_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--persona", required=True)
     parser.add_argument(
         "--harness",
-        choices=("claude", "claude-code", "codex"),
+        choices=("claude", "claude-code", "codex", "hermes"),  # hermes: T-5011 PR-B
         default=os.environ.get("PANTHEON_HARNESS_OVERRIDE"),
     )
     parser.add_argument(
@@ -2138,8 +2858,27 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(str(exc))
 
     if args.command == "quota-check":
+        if _seat_deep_sleeping(primary_binding.persona):
+            # ORG-106 L3a: quota-check starts an ephemeral Claude TUI (the probe) under the
+            # seat's account and can begin a planned transition (a launch). Neither may happen
+            # to a deep-sleeping seat. No probe, no transition, and no feeder record: a sleeping
+            # seat's silence is expected, not "not measured".
+            _print_json(
+                QuotaCheckResult(
+                    persona=binding.persona,
+                    supported=False,
+                    decision="seat-sleep",
+                    acted=False,
+                    reason="seat is in deep-sleep; quota probe and planned transition skipped",
+                )
+            )
+            return 0
         supported, reason = quota_check_supported(binding, manifest_path=args.manifest)
         if not supported:
+            if quota_probe_detector.enabled():  # BT3b: "ran, not measured" (freshness only); advisory
+                quota_probe_detector.feed_safely(
+                    primary_binding,
+                    quota_probe_detector.ProbeOutcome(quota_probe_detector.NOT_MEASURED, None, f"unsupported: {reason}"))
             _print_json(
                 QuotaCheckResult(
                     persona=binding.persona,
@@ -2152,16 +2891,36 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         adapter = build_adapter(binding, harness_home=args.harness_home)
         fallback = first_fallback_binding(args.manifest, binding)
+        fallbacks = tuple(
+            item
+            for item in configured_runtime_bindings(args.manifest, primary_binding)
+            if runtime_reference(item) != runtime_reference(binding)
+        )
+        # ORG-076 BT2 dark switch: read at call time; off => the detector does not exist here.
+        detector_on = quota_probe_detector.enabled()
+        probe_outcomes: list = []
         result = quota_check(
             binding,
             adapter=adapter,
             fallback_binding=fallback,
+            fallback_bindings=fallbacks,
             primary_binding=primary_binding,
             state_dir=args.state_dir,
             cwd=args.cwd,
             manifest_path=args.manifest,
+            outcome_sink=probe_outcomes.append if detector_on else None,
         )
         _print_json(result)
+        if detector_on:
+            # AFTER quota_check returned: the persona operation lock is released and is never
+            # held across the store drive. Advisory: failures are logged, never change rc.
+            if probe_outcomes:
+                quota_probe_detector.feed_safely(primary_binding, probe_outcomes[-1])
+            else:  # BT3b: the unit ran but took no measurement -> a "not-measured" record (freshness only)
+                quota_probe_detector.feed_safely(
+                    primary_binding,
+                    quota_probe_detector.ProbeOutcome(quota_probe_detector.NOT_MEASURED, None,
+                                                      f"{result.decision}: {result.reason}"))
         return 0
 
     report = diagnose_persona(
@@ -2186,6 +2945,42 @@ def main(argv: list[str] | None = None) -> int:
         # regardless of what the attempt stage below does next (backoff-skip,
         # policy-skip, transport failure, or success) -- clear its streak now.
         clear_diag_streak(args.state_dir, binding.persona)
+        # T-2953: read (and so clear) any bypass token first, whether or not the seat is armed.
+        bypass = consume_maintenance_bypass(args.state_dir, primary_binding.persona)
+        if _seat_deep_sleeping(primary_binding.persona):
+            # ORG-106 L3a: DEEP-SLEEP skips the whole cycle, before any viability, rehydrate,
+            # launch or wake step and before any claim. The bypass token (read, and so
+            # cleared, above) is deliberately NOT consulted: it never bypasses deep-sleep.
+            policy_skip = bump_policy_skip(args.state_dir, binding.persona, "seat_sleep")
+            _print_json(
+                {
+                    "binding": binding,
+                    "diagnostics": report,
+                    "consume": {
+                        "skipped": "seat_sleep",
+                        "policy_skip_streak": policy_skip,
+                    },
+                    "outcomes": [],
+                }
+            )
+            return 0
+        if _seat_in_maintenance(primary_binding.persona) and not bypass:
+            # T-5282: maintenance is the operator hold for a seat with no holds.json.
+            # Skip the WHOLE cycle before any viability/rehydrate/launch/wake step and
+            # before any claim, so mail stays queued for after the hold.
+            policy_skip = bump_policy_skip(args.state_dir, binding.persona, "seat_maintenance")
+            _print_json(
+                {
+                    "binding": binding,
+                    "diagnostics": report,
+                    "consume": {
+                        "skipped": "seat_maintenance",
+                        "policy_skip_streak": policy_skip,
+                    },
+                    "outcomes": [],
+                }
+            )
+            return 0
         adapter = build_adapter(binding, harness_home=args.harness_home)
         fallback = first_fallback_binding(args.manifest, binding)
         recovery = (
@@ -2222,6 +3017,7 @@ def main(argv: list[str] | None = None) -> int:
                     recovery_evidence=recovery,
                     state_dir=args.state_dir,
                     cwd=args.cwd,
+                    gate_on_usability=True,
                 )
                 stats: dict[str, Any] = {
                     "mode": "interactive-wake",
@@ -2270,8 +3066,54 @@ def main(argv: list[str] | None = None) -> int:
             )
             return 0
         except runtime_controller.RuntimeViabilityBlocked as exc:
+            # T-4179: the exception carries its coarse token (default
+            # runtime_viability_blocked; a prior-receiver refusal is
+            # prior_receiver_blocked, so fleet_health never masks it as expected).
+            skip_reason = getattr(exc, "policy_skip_reason", "runtime_viability_blocked")
+            policy_skip = bump_policy_skip(args.state_dir, binding.persona, skip_reason)
+            _print_json(
+                {
+                    "binding": binding,
+                    "diagnostics": report,
+                    "consume": {
+                        "mode": "interactive-wake",
+                        "skipped": skip_reason,
+                        "reason": exc.reason,
+                        "block": exc.evidence,
+                        "policy_skip_streak": policy_skip,
+                    },
+                    "outcomes": [],
+                }
+            )
+            return 5
+        except runtime_controller.RuntimeViabilityExhausted as exc:
+            # T-5285: exhaustion with EVERY candidate operator-held is a deliberate
+            # hold, not a dead seat: same soft shape/exit as T-4137 below.
+            if all_runtimes_held(binding.persona, runtime_candidates, args.state_dir):
+                policy_skip = bump_policy_skip(
+                    args.state_dir, binding.persona, "all_runtimes_held"
+                )
+                _print_json(
+                    {
+                        "binding": binding,
+                        "diagnostics": report,
+                        "consume": {
+                            "mode": "interactive-wake",
+                            "skipped": "all_runtimes_held",
+                            "reason": str(exc),
+                            "policy_skip_streak": policy_skip,
+                        },
+                        "outcomes": [],
+                    }
+                )
+                return 5
+            # T-4137: soft ONLY inside a live restart window; otherwise a
+            # genuinely dead seat keeps its traceback + exit 1 + page.
+            relaunch = relaunch_in_progress(binding.persona)
+            if relaunch is None:
+                raise
             policy_skip = bump_policy_skip(
-                args.state_dir, binding.persona, "runtime_viability_blocked"
+                args.state_dir, binding.persona, "relaunch_window_exhausted"
             )
             _print_json(
                 {
@@ -2279,9 +3121,9 @@ def main(argv: list[str] | None = None) -> int:
                     "diagnostics": report,
                     "consume": {
                         "mode": "interactive-wake",
-                        "skipped": "runtime_viability_blocked",
-                        "reason": exc.reason,
-                        "block": exc.evidence,
+                        "skipped": "relaunch_window_exhausted",
+                        "reason": str(exc),
+                        "relaunch": relaunch,
                         "policy_skip_streak": policy_skip,
                     },
                     "outcomes": [],
@@ -2370,11 +3212,21 @@ def main(argv: list[str] | None = None) -> int:
             parser.error(
                 "--ephemeral requires an explicitly selected batch runtime profile"
             )
-        handle = runtime_controller.ensure_runtime(
-            binding,
-            adapter,
-            state_root=args.state_dir,
-        )
+        try:
+            handle = runtime_controller.ensure_runtime(
+                binding,
+                adapter,
+                state_root=args.state_dir,
+            )
+        except runtime_controller.RuntimeViabilityBlocked as exc:
+            if exc.reason not in ("runtime-held", runtime_controller.SEAT_SLEEP_CAUSE):
+                raise
+            # T-5021: an operator hold is a policy skip, not a crash; same soft code as consume.
+            # ORG-106 L3a: so is a deep-sleeping seat (no traceback).
+            what = "seat is in deep-sleep" if exc.reason == runtime_controller.SEAT_SLEEP_CAUSE else (
+                f"runtime {runtime_reference(binding)} held by operator")
+            print(what, file=sys.stderr)
+            return 5
         receipt = runtime_controller.submit_to_runtime(handle, request)
         _print_json(
             {

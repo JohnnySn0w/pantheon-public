@@ -1,0 +1,6 @@
+  ⎿  You've hit your monthly spend limit · your weekly limit resets Sep 27, 5pm
+     (UTC)
+   What do you want to do?                        Usage credit balance: $8.08
+   ❯ Adjust monthly spend limit:        ← or → to adjust · Del to remove lim…
+     Wait for limit to reset                         Resets Sep 27, 5pm (UTC)
+   Enter to confirm · Esc to cancel

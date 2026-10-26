@@ -1,0 +1,10 @@
+[Unit]
+Description=pve2 heat check every 10 minutes (T-5309)
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=10min
+Unit=pantheon-pve2-heat.service
+
+[Install]
+WantedBy=timers.target

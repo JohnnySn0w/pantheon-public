@@ -186,7 +186,7 @@ class ChronicleTest(unittest.TestCase):
     # ---------------------------------------------------------- cred scrub (T-1683)
     def test_scrub_redacts_credential_forms(self):
         cases = [
-            ("sshpass -p 'SentHome0290' ssh h", "SentHome0290"),
+            ("sshpass -p 'Synthetic-Pw-0000' ssh h", "Synthetic-Pw-0000"),  # synthetic; never a real credential
             ("sshpass -p hunter2 ssh x", "hunter2"),
             ("export PASSWORD=abc123 && go", "abc123"),
             ('Authorization: Bearer eyJ.abc.def', "eyJ.abc.def"),
@@ -293,7 +293,8 @@ class CliTest(unittest.TestCase):
         self.assertEqual(cy.agent_from_handoff_path("/home/claude/HANDOFF.md"), "orchestrator")
         self.assertEqual(cy.agent_from_handoff_path("/home/claude-research/HANDOFF.md"), "specialist")
         self.assertEqual(cy.agent_from_handoff_path("/home/claude-fallback/HANDOFF.md"), "recovery")
-        self.assertEqual(cy.agent_from_handoff_path("/home/the-ancestor/HANDOFF.md"), "ancestor")
+        # retired persona (T-3421): no longer resolvable
+        self.assertIsNone(cy.agent_from_handoff_path("/home/the-ancestor/HANDOFF.md"))
         self.assertIsNone(cy.agent_from_handoff_path("/tmp/whatever.md"))
 
     def test_cli_archive_from_file(self):

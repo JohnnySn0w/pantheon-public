@@ -1,6 +1,6 @@
 #!/bin/bash
 # SessionStart hook. Runs for EVERY Pantheon persona — six as of ORG-042 + ORG-043:
-# orchestrator / specialist / recovery / mnemosyne / metis / atlas. The old "orchestrator / specialist / recovery" here was
+# orchestrator / specialist / recovery / archivist / mason / artisan. The old "orchestrator / specialist / recovery" here was
 # pre-ORG-042 drift and disagreed with the topology this same file inlines below (T-2261).
 #
 # Injects (as additionalContext on stdout) two orientation pointers:
@@ -53,7 +53,7 @@ out=""
 # Motivating failure, same evening: this hook fired, printed the Read instruction, and
 # the HO read HANDOFF.md but not the README. It then operated from stale memory pins for
 # a full session — missing the reviewer SOP and the dispatch-liveness SOP it had itself
-# adopted, and holding a WRONG model of the sub-orchestrator seats (pin said Metis/Atlas
+# adopted, and holding a WRONG model of the sub-orchestrator seats (pin said Mason/Artisan
 # had no unix accounts; README line 25 says six personas, and suborch1/suborch2 exist).
 # The information was one Read away the whole time. An instruction in context still needs
 # an action; content in context does not.

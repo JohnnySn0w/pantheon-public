@@ -12,6 +12,7 @@ from typing import Callable, Mapping
 from tools.host_control.approval.policy import parse_approver_policy
 from tools.host_control.approval_source import BrokerApprovalSource
 from tools.host_control.contracts import PlanEnvelope, compute_effect_digest, sha256_json
+from tools.persona_installer_contracts import FRAMEWORK_CODE_ARTIFACTS
 from tools.host_control.dbus_service import UnavailableApprovalStatus
 from tools.host_control.health import (
     APPROVAL_ROSTER,
@@ -63,6 +64,13 @@ def _default_probe_state() -> dict:
                 "status": "not_configured",
                 "reason": "executor reachability is not configured until T-2917",
                 "revision": "T-2917",
+            },
+            # T-2917 5d.4: the closed roster gained operation_driver (HO
+            # ruling); a healthy driver by default
+            "operation_driver": {
+                "status": "ready",
+                "reason": "",
+                "revision": "T-2917-5d",
             },
         },
         "approval": {
@@ -178,13 +186,16 @@ def _seed_broker_plan(
             InstallOperation(
                 operation_id="framework.source",
                 layer=0,
-                kind="record",
+                # admitted kinds: T-2917 5b refuses a non-admitted kind
+                # inside a broker plan at prepare as well as at plan time
+                kind="source-check",
                 target="pantheon-framework",
                 precondition={},
                 desired={
                     "artifacts": ",".join(
                         (
-                            "tools/persona_installer.py",
+                            # T-5516: the installer code files (Q3 binding)
+                            *FRAMEWORK_CODE_ARTIFACTS,
                             *manifest.template_ids,
                         )
                     ),
@@ -197,7 +208,7 @@ def _seed_broker_plan(
             InstallOperation(
                 operation_id="health-seed-op",
                 layer=10,
-                kind="file",
+                kind="mkdir",
                 target="/projection/health-seed",
                 precondition={"exists": "false"},
                 desired={"exists": "true"},
@@ -291,7 +302,7 @@ def _seed_domain_sentinels(
         plan_handle,
         plan_digest,
         "seed-health-journal-apply",
-        "seed-health-journal-approval",
+        "5c" * 32,
     )
     seed_operations.authorize(record.operation_handle)
     seed_operations.dispatch(record.operation_handle, _SeedExecutor())
@@ -304,7 +315,7 @@ def _seed_domain_sentinels(
     )
 
     approval_fixture.metadata.plans[plan_handle] = (
-        plan_metadata_fixture(owner="metis", plan_digest=plan_digest)
+        plan_metadata_fixture(owner="mason", plan_digest=plan_digest)
     )
     opened = approval_fixture.service.review(
         "specialist",
@@ -463,7 +474,7 @@ def serve(config_path: str) -> int:
     policy_raw = approver_policy_raw(
         subjects={
             "specialist": int(config["subject_uid"]),
-            "metis": int(config["subject_uid"]) + 1,
+            "mason": int(config["subject_uid"]) + 1,
         },
         approvers={"specialist": approver_entry()},
     )
@@ -544,7 +555,15 @@ def serve(config_path: str) -> int:
         "approval": approval_provider.snapshot(),
     }
     state_path = root / "state.json"
-    state_path.write_text(
+    # T-4118: write state.json ATOMICALLY (temp file + rename). A concurrent
+    # reader is the test harness's `_spawn_driver` poll loop, which json.loads
+    # this file. A plain `write_text` truncates-then-writes, exposing a window
+    # where the reader sees an empty/truncated file and JSONDecodeError-crashes
+    # -- a window that `pytest -n auto` contention widens enough to false-fail
+    # the harness setup. `Path.replace` is an atomic rename on the same
+    # filesystem, so the reader only ever sees the complete document.
+    state_tmp = state_path.with_suffix(".json.tmp")
+    state_tmp.write_text(
         json.dumps(
             {
                 "broker_health_path": broker_health_path(),
@@ -563,6 +582,7 @@ def serve(config_path: str) -> int:
         ),
         encoding="utf-8",
     )
+    state_tmp.replace(state_path)
 
     seen_emit = {"value": ""}
 

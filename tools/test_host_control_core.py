@@ -119,7 +119,7 @@ def _envelope_replace(
 
 class HostControlCase(unittest.TestCase):
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
         self.root.chmod(0o700)
         self.manifest_path = self.root / "instance.yaml"
@@ -200,9 +200,9 @@ class HostControlCase(unittest.TestCase):
             "schema": "pantheon-host-seat-registry/v1",
             "seats": [
                 {
-                    "seat_id": "cairn",
+                    "seat_id": "consultant",
                     "uid": 1003,
-                    "persona": "cairn",
+                    "persona": "consultant",
                     "role": "worker",
                     "instance": "test-instance",
                     "account": "codex",
@@ -249,7 +249,7 @@ class HostControlCase(unittest.TestCase):
 
     def policy_dict(self) -> dict:
         grants = []
-        for subject in ("cairn", "peer"):
+        for subject in ("consultant", "peer"):
             grants.append(
                 {
                     "subject_seat_id": subject,
@@ -288,7 +288,7 @@ class HostControlCase(unittest.TestCase):
         subject = self.registry.subject_for_uid(1003)
         self.assertEqual(
             subject,
-            SubjectContext(1003, "cairn", "cairn", "worker", "test-instance"),
+            SubjectContext(1003, "consultant", "consultant", "worker", "test-instance"),
         )
         claimed_environment = {
             "PANTHEON_PERSONA": "recovery",
@@ -750,7 +750,7 @@ from tools.host_control.contracts import SubjectContext
 from tools.host_control.journal import BrokerJournal
 j = BrokerJournal.open(Path(__import__('sys').argv[1]))
 p = j.get_plan(
-    subject=SubjectContext(1003, 'cairn', 'cairn', 'worker', 'test-instance'),
+    subject=SubjectContext(1003, 'consultant', 'consultant', 'worker', 'test-instance'),
     plan_handle=__import__('sys').argv[2],
     expected_digest=__import__('sys').argv[3],
 )

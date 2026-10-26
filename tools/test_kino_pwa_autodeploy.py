@@ -438,6 +438,14 @@ class TestStepShapes(_Base):
         self.assertNotIn("--delete", inner)
         self.assertIn(f"{ad.SOURCE_DIR}/ {ad.DEPLOY_DIR}/", inner)
 
+    def test_rsync_strips_group_write_from_deployed_files(self) -> None:
+        # T-4027: the deployed tree is what kino executes and serves; it must not
+        # inherit the source checkout's pantheon-shared group-write.
+        calls, fake = self._capture_run()
+        with patch("tools.kino_pwa_autodeploy._run", side_effect=fake):
+            ad.rsync_to_deploy()
+        self.assertIn("--chmod=g-w", calls[0][-1])
+
     def test_restart_uses_bare_kino_token(self) -> None:
         calls, fake = self._capture_run()
         with patch("tools.kino_pwa_autodeploy._run", side_effect=fake):

@@ -1,0 +1,18 @@
+{
+  "claude_json": {
+    "mcpServers": {
+      "pantheon-host": {
+        "type": "stdio",
+        "command": "/usr/local/libexec/pantheon-host-mcp-adapter",
+        "args": []
+      }
+    }
+  },
+  "settings_json": {
+    "permissions": {
+      "allow": [
+        "mcp__pantheon-host"
+      ]
+    }
+  }
+}

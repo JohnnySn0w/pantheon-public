@@ -38,6 +38,11 @@ import re
 import sys
 from pathlib import Path
 
+try:
+    from tools._tree_walk import walk_paths
+except ImportError:  # bare run with cwd=tools/ (tools/ on sys.path, repo root not)
+    from _tree_walk import walk_paths  # type: ignore[no-redef]
+
 WIKILINK_RE = re.compile(r"\[\[([^\]\[|#]+)(?:#[^\]\[|]*)?(?:\|[^\]\[]*)?\]\]")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 INLINE_CODE_RE = re.compile(r"`[^`]*`")
@@ -56,8 +61,8 @@ CROSS_REPO_RE = re.compile(r"^(ADR-\d+$|adr/ADR-|Supplementary Material/)")
 # Files that seed another agent's private vault — wikilinks inside them point
 # INTO that agent's namespace (their memory + their vault sections), which live
 # outside this repo. Treated as cross-agent-vault references, not dead. Example:
-# pinned-rules/mnemosyne.md is Orchestrator's seed for mnemosyne (ORG-042); its
-# [[feedback-*]], [[project-*]], [[rulebook-*]] links target mnemosyne's own
+# pinned-rules/archivist.md is Orchestrator's seed for archivist (ORG-042); its
+# [[feedback-*]], [[project-*]], [[rulebook-*]] links target archivist's own
 # vault under /home/exocortex/, unreachable from this repo.
 AGENT_VAULT_SEED_PREFIXES = ("pinned-rules/",)
 
@@ -76,7 +81,8 @@ SKIP_DIRS = {".git", ".obsidian", "node_modules", "__pycache__"}
 
 
 def iter_md_files(root: Path):
-    for p in sorted(root.rglob("*.md")):
+    # walk_paths, not rglob: tolerate entries vanishing mid-walk (T-4450).
+    for p in walk_paths(root, "*.md"):
         if any(part in SKIP_DIRS for part in p.parts):
             continue
         yield p

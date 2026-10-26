@@ -371,10 +371,157 @@ class ProjectCatalogueTests(unittest.TestCase):
 
     def test_ci_paths_cover_project_records_and_schema(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        push, pull_request = workflow.split("  pull_request:", 1)
-        for section in (push, pull_request):
+        # T-5001: ci.yml has no push trigger (the nightly covers main); only the PR list.
+        _, pull_request = workflow.split("  pull_request:", 1)
+        for section in (pull_request,):
             self.assertIn("'projects/**'", section)
             self.assertIn("'schemas/project-record.schema.json'", section)
+
+    def test_new_project_bootstrap_orders_formation_before_git_init(self) -> None:
+        """T-2414 plan's named T-3166 acceptance test: sop/standard/new-project-bootstrap.md
+        Procedure must open with a mandatory formation precondition that
+        precedes the first `git init` step, AND the repository safeguards
+        (`.gitignore first`, source-only tracking) must remain present after
+        `git init` — a regression that deleted safeguards to accommodate the
+        formation-first insertion would break bootstrap integrity, so both
+        halves are checked in-place."""
+        sop = (REPO_ROOT / "sop" / "standard" / "new-project-bootstrap.md").read_text(
+            encoding="utf-8"
+        )
+        procedure = sop.split("## Procedure", 1)[1].split("## Boundary", 1)[0]
+
+        # The Procedure section MUST split cleanly at the first `git init` step so
+        # we can independently assert what comes BEFORE it (formation precondition)
+        # vs what comes AFTER it (surviving repository safeguards).
+        first_git_init = "1. **`git init`**"
+        self.assertIn(
+            first_git_init, procedure,
+            "new-project-bootstrap.md Procedure lost its numbered `1. git init` "
+            "step (T-3166 T-2414-plan-named contract requires the git-init step "
+            "to be identifiable as the first *repository* action)",
+        )
+        before_git_init, after_git_init = procedure.split(first_git_init, 1)
+
+        # BEFORE git init: formation precondition + project-lifecycle SOP pointer.
+        self.assertIn(
+            "project-formation section of the",
+            before_git_init,
+            "new-project-bootstrap.md Procedure lost its mandatory formation "
+            "precondition pointing at project-lifecycle.md — T-3166 T-2414-plan-"
+            "named contract requires formation to precede git init",
+        )
+        self.assertIn(
+            "project-lifecycle",
+            before_git_init,
+            "new-project-bootstrap.md Procedure's formation precondition lost "
+            "its pointer to project-lifecycle.md (SOP-of-record for §Formation)",
+        )
+        self.assertIn(
+            "project record",
+            before_git_init,
+            "new-project-bootstrap.md Procedure's formation precondition lost "
+            "the canonical-project-record requirement",
+        )
+
+        # AFTER git init: repository safeguards (`.gitignore first`, source-only
+        # tracking) must survive the T-3166 amendment — deleting them to
+        # accommodate the formation-first insertion would be the exact
+        # regression this test guards against.
+        self.assertIn(
+            "`.gitignore` first",
+            after_git_init,
+            "new-project-bootstrap.md Procedure lost its `.gitignore first` "
+            "safeguard — the T-3166 formation-precedes-bootstrap amendment must "
+            "NOT delete the pre-existing repository safeguards",
+        )
+        self.assertIn(
+            "Source only is tracked",
+            after_git_init,
+            "new-project-bootstrap.md Procedure lost its source-only-tracked "
+            "safeguard note — same reason as above (T-3166 amendment must not "
+            "delete existing safeguards)",
+        )
+
+    def test_brief_and_reviewer_contract_require_mechanical_chain_check(self) -> None:
+        """T-2414 plan's named T-3166 acceptance test: BOTH D2 surfaces
+        (team-orchestrator brief-construction + pre-implementation reviewer
+        discipline) must name the mechanically-resolvable project/purpose chain
+        fields — `project_id`, `nearest_intent_ref`, chain terminus (including
+        the rootless-project case), and current developmental mode. Each
+        surface is checked in its own section so a regression in one file
+        cannot hide behind a whole-file substring match on the other."""
+        brief = (
+            REPO_ROOT / "sop" / "standard" / "team-orchestrator-brief-construction.md"
+        ).read_text(encoding="utf-8")
+        reviewer = (
+            REPO_ROOT / "sop" / "standard" / "pre-implementation-reviewer-discipline.md"
+        ).read_text(encoding="utf-8")
+
+        for label, surface in (("brief-construction", brief), ("reviewer-discipline", reviewer)):
+            self.assertIn(
+                "project_id",
+                surface,
+                f"D2 surface {label} lost its `project_id` field naming (T-3166 "
+                f"T-2414-plan-named contract requires both surfaces name the "
+                f"mechanically-resolvable project/purpose chain fields)",
+            )
+            self.assertIn(
+                "nearest_intent_ref",
+                surface,
+                f"D2 surface {label} lost its `nearest_intent_ref` field naming",
+            )
+            self.assertIn(
+                "developmental mode",
+                surface,
+                f"D2 surface {label} lost its `developmental mode` naming — the "
+                f"mode-in-chain requirement is part of the ORG-054 mechanical "
+                f"resolve gate",
+            )
+
+        # Rootless-terminus semantic: appears in the brief's canonical-structure
+        # section verbatim; in the reviewer's chain-check as the "invented/default
+        # root" negation (a chain that terminates WITHOUT an invented root is the
+        # rootless case). Checking each surface's own phrasing so we don't crypto-
+        # equivalence-collapse them (they're deliberately different-worded).
+        self.assertIn(
+            "Rootless projects terminate at their own telos",
+            brief,
+            "brief-construction lost its rootless-terminus rule (the sentence "
+            "naming that rootless projects terminate at their own telos)",
+        )
+        self.assertIn(
+            "without an invented/default root",
+            reviewer,
+            "reviewer-discipline lost its 'without an invented/default root' "
+            "chain-terminus check (the negation form of the rootless-terminus "
+            "rule brief-construction names positively)",
+        )
+
+    def test_split_merge_and_retire_require_obligation_disposition(self) -> None:
+        """T-2414 plan's named T-3169 acceptance test: sop/standard/project-lifecycle.md
+        must mandate a non-empty obligation_dispositions transition receipt for
+        replace/split/merge/retire alike (ORG-054 closure continuity), each
+        checked in its own section so a regression in one section cannot hide
+        behind a whole-file substring match."""
+        sop = (REPO_ROOT / "sop" / "standard" / "project-lifecycle.md").read_text(
+            encoding="utf-8"
+        )
+        replacement = sop.split("## 4. Replacement", 1)[1].split("## 5. Split", 1)[0]
+        split = sop.split("## 5. Split", 1)[1].split("## 6. Merge", 1)[0]
+        merge = sop.split("## 6. Merge", 1)[1].split("## 7. Retirement", 1)[0]
+        retirement = sop.split("## 7. Retirement", 1)[1].split("## 8.", 1)[0]
+        self.assertIn(
+            "cannot complete with an empty `obligation_dispositions` list", replacement
+        )
+        self.assertIn(
+            "`obligation_dispositions` non-empty unless a reviewer verifies", split
+        )
+        self.assertIn(
+            "`obligation_dispositions` covering every merged project's obligations", merge
+        )
+        self.assertIn(
+            "`obligation_dispositions` non-empty unless a reviewer verifies", retirement
+        )
 
 
 if __name__ == "__main__":

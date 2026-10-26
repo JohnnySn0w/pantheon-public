@@ -14,7 +14,7 @@ Two-phase flow (post-2026-06-13 billing change; headless `claude -p` is API-bill
 
   Phase 1 — cron (--file-request, the default):
     Write the full generation prompt to `reports/.pending/<YYYY>-W<NN>-prompt.md`
-    and file a generation-request ticket (target=orchestrator). No headless dispatch.
+    and file a generation-request ticket (target=role:head_engineering_orchestrator). No headless dispatch.
 
   Phase 2 — in-session fulfillment (--finalize <week>):
     Assert the report file exists (written in-session by Orchestrator), run
@@ -249,6 +249,18 @@ def build_input_bundle(tickets: Iterable[TicketRecord], monday: dt.date, sunday:
     return body + "\n" + _adr_reeval_watch(body, sunday)
 
 
+def _import_run_walk():
+    """Import adr_reeval_walk.run_walk under script-mode invocation. The unit
+    runs `python3 tools/weekly_ticket_summary.py`, so `tools` is not importable
+    until the repo root is on sys.path; without this the walk failed with "No
+    module named 'tools'" on every weekly fire. Same bootstrap as the other lazy
+    tools imports below (T-1936)."""
+    if __package__ in (None, ""):
+        sys.path.insert(0, str(REPO_ROOT))
+    from tools.adr_reeval_walk import run_walk
+    return run_walk
+
+
 def _adr_reeval_watch(week_activity: str, sunday: dt.date) -> str:
     """Surface-only 'ADR re-eval watch' section for the report bundle (T-2527).
 
@@ -257,7 +269,7 @@ def _adr_reeval_watch(week_activity: str, sunday: dt.date) -> str:
     weekly report, so it degrades to a comment.
     """
     try:
-        from tools.adr_reeval_walk import run_walk
+        run_walk = _import_run_walk()
         return run_walk(now=sunday, week_activity=week_activity,
                         dry_run=True, push=False).watch_section
     except Exception as exc:  # pragma: no cover - defensive
@@ -404,9 +416,9 @@ def file_request(
         str(ticket_bin),
         "file",
         "--requester", "orchestrator",
-        "--target", "orchestrator",
+        "--target", "role:head_engineering_orchestrator",
         # NB: no --intent — it is a target=operator-specific surface (ticket.py
-        # rejects it for target=orchestrator, T-0465/T-0852). An orchestrator-targeted action
+        # rejects it for target=role:head_engineering_orchestrator, T-0465/T-0852). A role-targeted action
         # ticket carries no intent field. (Passing it failed the 09:00Z service
         # run every week: prompt staged but the request ticket never filed.)
         "--title", f"Generate weekly ticket summary {label}",
@@ -654,7 +666,7 @@ def run(args: argparse.Namespace) -> int:
     # warns but never blocks the weekly report request.
     if not args.dry_run:
         try:
-            from tools.adr_reeval_walk import run_walk
+            run_walk = _import_run_walk()
             wr = run_walk(now=dt.date.today(), dry_run=False, push=True)
             if wr.filed:
                 print(f"[weekly_ticket_summary] ADR re-eval: filed {len(wr.filed)} "

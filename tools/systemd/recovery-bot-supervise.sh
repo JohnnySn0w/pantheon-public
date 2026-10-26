@@ -1,4 +1,13 @@
 #!/usr/bin/env bash
+# ---------------------------------------------------------------------------
+# REFERENCE SNAPSHOT of recovery's LIVE supervise script, synced 2026-09-28T06:25Z (T-4068).
+# The LIVE copy at /home/claude-fallback/.local/bin/recovery-bot-supervise.sh is AUTHORITATIVE.
+# This tracked copy is for review, audit and diff only. Edits land live first, and
+# model/effort changes land live-only (see project_model_policy_opus_standard).
+# Re-sync when a live change is load-bearing (e.g. a boot-time re-assert such as
+# T-2629/T-4092). No drift lint by design: these scripts retire with the
+# harness-controller cutover (T-2953/T-3650).
+# ---------------------------------------------------------------------------
 # recovery-bot-supervise.sh — systemd-supervised wrapper for Recovery's Telegram bot.
 #
 # Why this exists (RCA 2026-05-21, T-0495-adjacent outage):
@@ -35,6 +44,8 @@ CLAUDE_BIN="/home/claude-fallback/.npm-global/bin/claude"
 # --permission-mode default pins the pre-v2.1.200 launch default (CC v2.1.200 flipped
 # unset to Manual; unattended relaunches stall at the first tool prompt). Fleet ruling
 # 2026-07-06 (orchestrator, T-1541/T-1544).
+# SUPERSEDED 2026-10-13 (T-4935, the operator TG 11753): the launch is now --permission-mode
+# bypassPermissions (unix account = boundary); tools/bypass_consent.py pre-accepts the dialog.
 #
 # --model: THE LAUNCH FLAG IS THE AUTHORITATIVE PIN and outranks settings.json — see
 # bugs/supervisor-launch-flag-outranks-settings-json-on-model-pin.md (settings.json already
@@ -43,13 +54,25 @@ CLAUDE_BIN="/home/claude-fallback/.npm-global/bin/claude"
 # round-trip on a plugin-free seat before being pinned here. orchestrator stays on 4-7 for now — it
 # was mid-work and the operator reported it "seems great on 4.7".
 #
-# NOTE: the cap-autoswitch mechanism these notes used to guard against
-# (model_stepper.py) was removed (T-2737, 2026-08-10 — stepping policy retired
-# fleet-wide in favor of the opus-4-8 standard). context_fill_monitor's
-# model_pin is still `claude-fable-5` regardless — see the warning above
-# _MONITOR_TUNING in context_fill_monitor.py (T-2134/T-2136 history) before
-# "tidying" that pin.
-CLAUDE_ARGS="--channels plugin:telegram@claude-plugins-official --model claude-opus-4-8 --permission-mode default"
+# NOTE this does NOT re-arm cap-autoswitch: model_stepper's expect_from reads
+# context_fill_monitor's model_pin, still `claude-fable-5`, so the T-2134 mismatch — the thing
+# that makes a cap event fail loud — is preserved. Do not "tidy" that pin.
+#
+# ⚠️ ONE NEW WRINKLE worth knowing before anyone reopens T-2136: claude-opus-4-8 IS
+# model_stepper.OPUS_MODEL, i.e. the model a cap event would rewrite everything TO. So recovery now
+# sits AT the step-down target. Still inert (dark + mismatched), but if the pin were ever
+# "fixed", a cap event would be a no-op for recovery while stepping the other seats down — the
+# ladder is no longer uniform across the fleet.
+# 2026-09-28 the operator TG 10424: every seat except specialist to opus-5.5 (T-4067, orchestrator).
+# T-4653 (the operator TG 10756, 2026-10-05): every seat on --effort medium to cut weekly-Max burn.
+CLAUDE_ARGS="--channels plugin:telegram@claude-plugins-official --model claude-opus-5-5 --effort medium --permission-mode bypassPermissions"
+
+# T-4935 (the operator TG 11753 via T-4939; ORG-063 s1): launch is --permission-mode bypassPermissions
+# (full unlock; supersedes the `default` pin in the comments above). The bypass warning dialog
+# ("No, exit" preselected) is skipped only when skipDangerousModePermissionPrompt is in USER
+# settings (--settings/flagSettings does not count, verified in the 2.1.296 binary), so the
+# consent is merged into settings.json here: idempotent, fail-open (tools/bypass_consent.py).
+python3 -c 'import json,os,sys;d=os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude");p=os.path.join(d,"settings.json");s=json.load(open(p)) if os.path.exists(p) else {};sys.exit(0) if s.get("skipDangerousModePermissionPrompt") is True else None;os.makedirs(d,exist_ok=True);s["skipDangerousModePermissionPrompt"]=True;t=p+".tmp";json.dump(s,open(t,"w"),indent=2);os.replace(t,p)' >/dev/null 2>&1 || true
 
 # Prewarm the telegram plugin's node_modules OFF the MCP critical path, AND pin
 # an ABSOLUTE bun path in `.mcp.json` (T-2624/T-2625).
@@ -99,12 +122,23 @@ EOF
   # .mcp.json pin above — a plugin-cache rebuild restores the pristine upstream
   # server.ts (which gives up after 8 consecutive 409s and goes alive-but-deaf).
   # Marker-guarded, exact-literal, fail-open (|| true never bricks a boot).
+  # T-4092 (2026-09-28): restored — lost from this live copy in an edit that
+  # started from an older base; the tracked copy kept it.
   ~/pantheon-config/tools/telegram_poller_409_patch.sh >/dev/null 2>&1 || true
   ( cd "$TG_PLUGIN_DIR" && bun install --no-summary >/dev/null 2>&1 ) || true
 fi
 
 # (Re)create the session only if it isn't already up — makes the script
 # idempotent across systemd restarts and tolerant of a manual tmux spawn.
+# ORG-106 L3a (T-5526): never launch a deep-sleeping seat. WAIT rather than exit (Restart=always
+# would churn the unit); fail-open on a reader fault. Tracked copy of the live script: re-sync it.
+while :; do
+  _lc_rc=0
+  python3 "$HOME/pantheon-config/tools/seat_state.py" launch-check recovery || _lc_rc=$?
+  [[ $_lc_rc -eq 3 ]] || break
+  sleep 60
+done
+
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
   tmux new-session -d -s "$SESSION" "$CLAUDE_BIN $CLAUDE_ARGS"
   ~/pantheon-config/tools/arm_pane_log.sh "$SESSION:0" recovery || true  # T-1636 pane time-log tap

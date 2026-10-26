@@ -118,7 +118,7 @@ def _default_telegram_env() -> Path:
 TELEGRAM_ENV = Path(
     os.environ.get("PANTHEON_TELEGRAM_ENV", str(_default_telegram_env()))
 )
-TELEGRAM_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "456474197")  # the operator
+TELEGRAM_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "424242424")  # the operator
 
 
 # ---------------------------------------------------------------------------

@@ -17,7 +17,7 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # storm. Alerts the operator DIRECTLY via the Telegram bot token (independent of
 # Claude OAuth) ONLY when a restart fails to clear the wedge within 2x the
 # cooldown (a single successful restart is routine and is not alerted).
-# SHIP-DARK (matches ancestor_liveness_monitor / channel_liveness_monitor):
+# SHIP-DARK (matches channel_liveness_monitor):
 # detection runs live unconditionally; the live restart itself stays inert
 # until PANTHEON_AGENT_MONITOR_REMEDIATE_ENABLED is armed (deliberately no
 # Environment= line for it here — this unit installs UNARMED; arming is a

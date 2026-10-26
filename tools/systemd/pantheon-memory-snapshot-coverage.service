@@ -1,5 +1,5 @@
 [Unit]
-Description=Pantheon memory-snapshot coverage monitor — detect a per-seat snapshot timer that has silently STOPPED (T-2838; the T-1871 mnemosyne rot: snapshots quietly ceased ~07-29 and nobody noticed for ~12 days)
+Description=Pantheon memory-snapshot coverage monitor — detect a per-seat snapshot timer that has silently STOPPED (T-2838; the T-1871 archivist rot: snapshots quietly ceased ~07-29 and nobody noticed for ~12 days)
 Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
 
 # Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
@@ -9,8 +9,8 @@ OnFailure=pantheon-unit-failure-alert@%n.service
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-# Per covered memory-bearing seat (recovery/orchestrator/specialist/atlas/metis via
-# pantheon-agent-state-snapshot.timer; mnemosyne via mnemosyne-state-snapshot.timer),
+# Per covered memory-bearing seat (recovery/orchestrator/specialist/artisan/mason via
+# pantheon-agent-state-snapshot.timer; archivist via archivist-state-snapshot.timer),
 # check that the seat's snapshot TIMER is active+enabled with a near-future fire —
 # the idle-seat-proof signal (a healthy timer on a quiet seat legitimately produces
 # no new commit, so commit-age would false-alarm; timer health does not). Cross-account

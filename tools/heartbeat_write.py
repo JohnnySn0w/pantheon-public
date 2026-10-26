@@ -77,7 +77,7 @@ def build_heartbeat(persona: str, *, source: str, now: datetime, pid: int) -> di
     }
 
 
-def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
+def _atomic_write_json(path: Path, payload: dict[str, object], *, mode: int | None = None) -> None:
     """Write *payload* to *path* atomically: temp file in the same dir, then
     ``os.replace``. Never leaves a partial target file."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -88,6 +88,8 @@ def _atomic_write_json(path: Path, payload: dict[str, object]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if mode is not None:  # explicit mode (e.g. 0644 for a cross-account readable heartbeat)
+            os.chmod(tmp_name, mode)
         os.replace(tmp_name, path)
     finally:
         try:

@@ -68,11 +68,15 @@ from a2a.utils.constants import AGENT_CARD_WELL_KNOWN_PATH
 # runs as a script (systemd ExecStart invokes it directly — __package__ is
 # "" ) or as a package submodule (`python -m tools.a2a.specialist_seat_server`,
 # or imported by the test suite — __package__ is already "tools.a2a", repo
-# root already on sys.path). Same convention as tools/activity_digest.py.
+# root already on sys.path). Same convention as tools/cascade_sweep.py.
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
 from tools import mailbox  # noqa: E402
+# T-4096: stdlib-only leaf beside tools.mailbox, so it imports wherever mailbox
+# does (incl. the ~/.venv-a2a interpreter). That venv has no PyYAML, so there
+# mailbox_hub() returns agent_role_map's own _FALLBACK_MAILBOX hub.
+from tools import agent_role_map  # noqa: E402
 
 
 logger = logging.getLogger(__name__)
@@ -260,8 +264,8 @@ DEFAULT_DEPTH = "standard"
 # (not env-var) overridable — same convention as tools/mailbox_wake.py's
 # `run(..., inbox=...)` — so tests can point at a temp maildir without
 # touching the live boxes.
-DEFAULT_REQUEST_INBOX = "/home/the-ancestor/mailbox/specialist"
-DEFAULT_RESULT_INBOX = "/home/the-ancestor/mailbox/specialist-a2a"
+DEFAULT_REQUEST_INBOX = f"{agent_role_map.mailbox_hub()}/specialist"
+DEFAULT_RESULT_INBOX = f"{agent_role_map.mailbox_hub()}/specialist-a2a"
 
 # Design notes §7.1: "minimum viable events: staged→WORKING and
 # result→COMPLETED/FAILED... latency fits the card's published contract

@@ -7,12 +7,10 @@ persona files have lost the bail logic — regenerate or restore from T-0357.
 Run from repo root:
     python3 -m unittest tools.test_worker_isolation_canary -v
 
-Design note: tests read the persona files from the claude-config submodule
-path inside echo-prismatic. We locate claude-config via:
-  1. /home/claude/claude-config (canonical VPS path — preferred)
-  2. /home/claude/echo-prismatic/claude-config (submodule fallback)
-If neither exists, tests skip with an informative message (CI without the
-repo checked out).
+Design note: tests read the persona files from this repo's in-repo harness
+(harness/claude/agents/, ORG-091 / T-4750), so they always run. Until T-4763
+they looked for a ~/claude-config clone and skipped when none was readable
+(T-1294's CI skip).
 """
 
 from __future__ import annotations
@@ -38,35 +36,16 @@ FIRST_ACTION_PHRASE = "git rev-parse --show-toplevel"
 PREFLIGHT_SECTION = "Pre-flight: cwd discipline"
 
 
-def _find_claude_config() -> Path | None:
-    """Return the first existing claude-config agents directory, or None."""
-    candidates = [
-        Path("/home/claude/claude-config/agents"),
-        Path("/home/claude/echo-prismatic/claude-config/agents"),
-    ]
-    for candidate in candidates:
-        # T-0891: is_dir() raises PermissionError (not False) when the path is
-        # inside another agent's 700-mode home — e.g. Recovery (claude-fallback)
-        # statting /home/claude/... while running the full-discover pre-commit
-        # gate. Treat any access error as "not found" so the class cleanly SKIPS
-        # on accounts that can't reach it, rather than crashing collection.
-        try:
-            if candidate.is_dir():
-                return candidate
-        except OSError:
-            continue
-    return None
+AGENTS_DIR = Path(__file__).resolve().parent.parent / "harness" / "claude" / "agents"
 
 
-@unittest.skipUnless(_find_claude_config() is not None, "claude-config not found; skip")
 class TestPersonaCwdGuard(unittest.TestCase):
     """Structural checks: persona files contain required cwd-guard text."""
 
     @classmethod
     def setUpClass(cls) -> None:
-        agents_dir = _find_claude_config()
-        cls.implementer = (agents_dir / "implementer.md").read_text()
-        cls.reviewer = (agents_dir / "reviewer.md").read_text()
+        cls.implementer = (AGENTS_DIR / "implementer.md").read_text()
+        cls.reviewer = (AGENTS_DIR / "reviewer.md").read_text()
 
     # --- implementer.md checks ---
 

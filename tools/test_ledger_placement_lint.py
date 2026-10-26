@@ -44,7 +44,7 @@ TS_W30 = "2026-07-26T12:00:00Z"
 TS_W31 = "2026-07-27T12:00:00Z"
 
 
-def _entry(ts: str, eid: str | None = None, agent: str = "metis") -> dict:
+def _entry(ts: str, eid: str | None = None, agent: str = "mason") -> dict:
     return {"id": eid or f"{ts}-{agent}-x", "ts": ts, "agent": agent}
 
 
@@ -76,7 +76,7 @@ class TestCheckEntry(unittest.TestCase):
 
     def test_ts_derived_from_id_when_field_absent(self) -> None:
         # entry_ts falls back to the id's leading ts prefix (T-1879)
-        entry = {"id": f"{TS_W31}-metis-x", "agent": "metis"}  # no "ts"
+        entry = {"id": f"{TS_W31}-mason-x", "agent": "mason"}  # no "ts"
         m = lpl.check_entry("2026-W30", json.dumps(entry))
         self.assertIsNotNone(m)
         self.assertEqual(m["want"], "2026-W31")
@@ -350,6 +350,341 @@ class TestLintStagedValidity(unittest.TestCase):
             lpl.lint_staged_validity(repo_root="/nonexistent/not/a/repo"), [])
 
 
+class TestSharedFraming(unittest.TestCase):
+    """T-4202: added lines are framed by the shared structural parser
+    (hermes_diff_scan.iter_added_lines) over a bytes diff. Each case below
+    failed on the old text=True + splitlines() + `+++`-skip parser."""
+
+    SEG = "2026-W30"
+    REL = "ledger/2026-W30/2026-W30.jsonl"
+
+    def _git(self, repo: Path, *args: str) -> None:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@e.com",
+               "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@e.com"}
+        subprocess.run(["git", "-C", str(repo), *args],
+                       capture_output=True, check=True, env=env)
+
+    def _repo(self, t: str, base_lines: "list[bytes]") -> "tuple[Path, Path]":
+        repo = Path(t) / "r"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        shard = repo / self.REL
+        shard.parent.mkdir(parents=True)
+        shard.write_bytes(b"".join(l + b"\n" for l in base_lines))
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-q", "-m", "base")
+        return repo, shard
+
+    def _append(self, shard: Path, lines: "list[bytes]") -> None:
+        shard.write_bytes(shard.read_bytes() + b"".join(l + b"\n" for l in lines))
+
+    @staticmethod
+    def _raw(entry: dict, note: str = "") -> bytes:
+        e = dict(entry)
+        if note:
+            e["note"] = note
+        return json.dumps(e, ensure_ascii=False).encode("utf-8")
+
+    def test_staged_valid_line_with_raw_u2028_is_not_a_false_block(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t, [self._raw(_entry(TS_W30, eid="a"))])
+            self._append(shard, [self._raw(_entry(TS_W30, eid="b"), "x y\u0085z\x1cw")])
+            self._git(repo, "add", "-A")
+            self.assertEqual(lpl.lint_staged_validity(repo_root=repo), [])
+
+    def test_staged_invalid_plus_plus_line_is_caught(self) -> None:
+        # Content `++{...}` renders `+++{...}`; the old parser skipped it.
+        bad = b"++" + self._raw(_entry(TS_W30, eid="bad"))
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t, [self._raw(_entry(TS_W30, eid="a"))])
+            self._append(shard, [bad])
+            self._git(repo, "add", "-A")
+            out = lpl.lint_staged_validity(repo_root=repo)
+        self.assertEqual(len(out), 1, out)
+        self.assertIn("invalid JSON", out[0]["error"])
+        self.assertEqual(out[0]["line"], bad.decode())
+        self.assertEqual(out[0]["path"], self.REL)
+
+    def test_non_utf8_line_is_flagged_not_skipped(self) -> None:
+        # Broken JSON AND a non-UTF-8 byte: must surface, never vanish.
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t, [self._raw(_entry(TS_W30, eid="a"))])
+            self._append(shard, [b'{"a": "\xff"'])
+            self._git(repo, "add", "-A")
+            out = lpl.lint_staged_validity(repo_root=repo)  # must not raise
+        self.assertEqual(len(out), 1, out)
+        self.assertEqual(out[0]["error"], "not valid UTF-8")
+        self.assertEqual(out[0]["path"], self.REL)
+        self.assertEqual(out[0]["line"], '{"a": "�"')
+        self.assertEqual(len(lpl.format_validity_lines(out)), 1)
+
+    def test_non_utf8_line_does_not_hide_other_lines(self) -> None:
+        bad = b"++" + self._raw(_entry(TS_W30, eid="bad"))
+        ok = self._raw(_entry(TS_W30, eid="ok"))
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t, [self._raw(_entry(TS_W30, eid="a"))])
+            self._append(shard, [b'{"id": "\xff\xfe"}', ok, bad])
+            self._git(repo, "add", "-A")
+            out = lpl.lint_staged_validity(repo_root=repo)
+        self.assertEqual([v["error"] for v in out], ["not valid UTF-8", out[1]["error"]])
+        self.assertIn("invalid JSON", out[1]["error"])
+        self.assertEqual(out[1]["line"], bad.decode())
+
+    def test_range_non_utf8_misplaced_entry_is_still_judged(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t, [self._raw(_entry(TS_W30, eid="ok"))])
+            base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            line = json.dumps({"id": "bad", "ts": TS_W31, "agent": "mason", "n": "X"}).encode()
+            self._append(shard, [line.replace(b'"X"', b'"\xff"')])
+            self._git(repo, "add", "-A")
+            self._git(repo, "commit", "-q", "-m", "tip")
+            out = lpl.lint_range(base, "HEAD", repo_root=repo)
+        self.assertEqual([m["id"] for m in out], ["bad"])
+
+    def test_range_misplaced_entry_with_raw_u2028_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo, shard = self._repo(t, [self._raw(_entry(TS_W30, eid="ok"))])
+            base = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                                  capture_output=True, text=True, check=True).stdout.strip()
+            self._append(shard, [self._raw(_entry(TS_W31, eid="bad"), "p q")])
+            self._git(repo, "add", "-A")
+            self._git(repo, "commit", "-q", "-m", "tip")
+            out = lpl.lint_range(base, "HEAD", repo_root=repo)
+        self.assertEqual([m["id"] for m in out], ["bad"])
+
+    def test_all_scan_misplaced_entry_with_raw_u2028_is_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            shard = Path(t) / "ledger" / self.SEG / f"{self.SEG}.jsonl"
+            shard.parent.mkdir(parents=True)
+            shard.write_bytes(self._raw(_entry(TS_W31, eid="bad"), "p q") + b"\n")
+            out = lpl.lint_all(Path(t) / "ledger")
+        self.assertEqual([m["id"] for m in out], ["bad"])
+
+
+class TestStagedRenames(unittest.TestCase):
+    """T-4451: a staged `git mv` of a ledger shard is status R. The validity check
+    used to drop R (`--diff-filter=ACM`), so a renamed-and-edited shard was never
+    validated; naively adding R would instead read a PURE rename as all-added
+    lines and false-block the ledger groomer on any pre-existing bad line. Git's
+    own rename pairing (`-M`) over the `ledger` pathspec gives the right scope:
+    only genuinely added lines are judged, attributed to the destination path."""
+
+    OLD = "ledger/2026-W30/2026-W30.jsonl"
+    NEW = "ledger/2026-W30/2026-W30-regrouped.jsonl"
+
+    def _git(self, repo: Path, *args: str) -> None:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@e.com",
+               "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@e.com"}
+        subprocess.run(["git", "-C", str(repo), *args],
+                       capture_output=True, check=True, env=env)
+
+    @staticmethod
+    def _good(n: int) -> bytes:
+        return json.dumps(_entry(TS_W30, eid=f"ok-{n}")).encode()
+
+    @staticmethod
+    def _bad(tag: str) -> bytes:
+        return json.dumps(_entry(TS_W30, eid=tag)).encode()[:-1]  # missing "}"
+
+    def _repo(self, t: str, base_lines: "list[bytes]", rel: str = None) -> Path:
+        repo = Path(t) / "r"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        self._put(repo, rel or self.OLD, base_lines)
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-q", "-m", "base")
+        return repo
+
+    @staticmethod
+    def _put(repo: Path, rel: str, lines: "list[bytes]") -> None:
+        path = repo / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"".join(l + b"\n" for l in lines))
+
+    def _move(self, repo: Path, old: str, new: str, lines: "list[bytes] | None" = None) -> None:
+        (repo / new).parent.mkdir(parents=True, exist_ok=True)
+        self._git(repo, "mv", old, new)
+        if lines is not None:
+            self._put(repo, new, lines)
+        self._git(repo, "add", "-A")
+
+    def _base(self) -> "list[bytes]":
+        return [self._good(i) for i in range(6)]
+
+    def test_pure_rename_of_a_shard_with_a_pre_existing_bad_line_is_not_flagged(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo = self._repo(t, self._base() + [self._bad("old-bad")])
+            self._move(repo, self.OLD, self.NEW)
+            self.assertEqual(lpl.lint_staged_validity(repo_root=repo), [])
+
+    def test_rename_plus_a_valid_added_line_is_clean_despite_a_pre_existing_bad_line(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            base = self._base() + [self._bad("old-bad")]
+            repo = self._repo(t, base)
+            self._move(repo, self.OLD, self.NEW, base + [self._good(99)])
+            self.assertEqual(lpl.lint_staged_validity(repo_root=repo), [])
+
+    def test_rename_plus_an_invalid_added_line_is_flagged_at_the_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            base = self._base() + [self._bad("old-bad")]
+            repo = self._repo(t, base)
+            new_bad = self._bad("new-bad")
+            self._move(repo, self.OLD, self.NEW, base + [new_bad])
+            out = lpl.lint_staged_validity(repo_root=repo)
+        self.assertEqual(len(out), 1, out)
+        self.assertIn("invalid JSON", out[0]["error"])
+        self.assertEqual(out[0]["path"], self.NEW)
+        self.assertEqual(out[0]["line"], new_bad.decode())
+
+    def test_a_file_moved_into_ledger_from_outside_is_validated_in_full(self) -> None:
+        """No source inside the `ledger` pathspec, so git sees a new file: every
+        line counts as added (the bad one is judged, nothing is credited)."""
+        with tempfile.TemporaryDirectory() as t:
+            repo = self._repo(t, self._base() + [self._bad("staged-bad")], rel="scratch/pile.jsonl")
+            self._move(repo, "scratch/pile.jsonl", self.NEW)
+            out = lpl.lint_staged_validity(repo_root=repo)
+        self.assertEqual(len(out), 1, out)
+        self.assertEqual(out[0]["path"], self.NEW)
+
+    def test_a_rename_out_of_the_ledger_tree_is_never_judged(self) -> None:
+        with tempfile.TemporaryDirectory() as t:
+            repo = self._repo(t, self._base() + [self._bad("old-bad")])
+            self._move(repo, self.OLD, "scratch/pile.jsonl")
+            self.assertEqual(lpl.lint_staged_validity(repo_root=repo), [])
+
+    # -- diff-prefix config must not blind the guard ---------------------------
+    # Added lines are attributed by the diff's `+++ <prefix><path>` header. A seat
+    # that sets diff.mnemonicPrefix (`+++ i/<path>`), diff.noprefix (`+++ <path>`) or
+    # diff.dstPrefix would hand the attribution a path that is not `ledger/...`, and
+    # the line would be silently SKIPPED -- the guard turned off, not failed. The
+    # argv pins `--src-prefix=a/ --dst-prefix=b/`, which overrides all three.
+
+    # (config key, value, header the config must produce, key exists in every git?)
+    # diff.dstPrefix only exists in newer git (it is absent from 2.43): there the
+    # precondition cannot hold, so that row skips instead of passing vacuously.
+    PREFIX_CONFIGS = (
+        ("diff.mnemonicPrefix", "true", "+++ i/", True),
+        ("diff.noprefix", "true", "+++ ledger/", True),
+        ("diff.dstPrefix", "zz/", "+++ zz/", False),
+    )
+
+    def _raw_staged_diff(self, repo: Path) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), "diff", "--cached", "-M", "--unified=0", "--", "ledger"],
+            capture_output=True, text=True, check=True).stdout
+
+    def _require_header(self, repo: Path, header: str, always: bool) -> None:
+        raw = self._raw_staged_diff(repo)
+        if header in raw:
+            return
+        if not always:
+            self.skipTest("this git does not honour that diff config key")
+        self.fail(f"precondition: the config must actually change the diff header; got {raw!r}")
+
+    def test_a_rename_plus_an_invalid_line_is_flagged_under_any_diff_prefix_config(self) -> None:
+        for key, value, header, always in self.PREFIX_CONFIGS:
+            with self.subTest(config=f"{key}={value}"), tempfile.TemporaryDirectory() as t:
+                base = self._base() + [self._bad("old-bad")]
+                repo = self._repo(t, base)
+                self._git(repo, "config", key, value)
+                new_bad = self._bad("new-bad")
+                self._move(repo, self.OLD, self.NEW, base + [new_bad])
+                self._require_header(repo, header, always)
+                out = lpl.lint_staged_validity(repo_root=repo)
+                self.assertEqual(len(out), 1, out)
+                self.assertEqual(out[0]["path"], self.NEW)
+                self.assertEqual(out[0]["line"], new_bad.decode())
+
+    def test_a_new_shard_with_an_invalid_line_is_flagged_under_any_diff_prefix_config(self) -> None:
+        for key, value, header, always in self.PREFIX_CONFIGS:
+            with self.subTest(config=f"{key}={value}"), tempfile.TemporaryDirectory() as t:
+                repo = self._repo(t, self._base())
+                self._git(repo, "config", key, value)
+                self._put(repo, self.NEW, self._base() + [self._bad("new-bad")])
+                self._git(repo, "add", "-A")
+                self._require_header(repo, header, always)
+                out = lpl.lint_staged_validity(repo_root=repo)
+                self.assertEqual([v["path"] for v in out], [self.NEW], out)
+
+
+class TestDiffToolConfigDoesNotBlindTheLint(unittest.TestCase):
+    """T-4487: both lint diffs parse the patch BODY, so a seat-level `diff.external`
+    (replaces the body with whatever the tool prints) or a `.gitattributes` textconv
+    driver (diffs converted text, not the file's bytes) would hand the parser a body
+    with no added lines -- the invalid line is silently never judged, the guard off
+    rather than failed. The argv pins `--no-ext-diff --no-textconv` on both paths:
+    the staged validity diff (pre-commit) and `_added_lines` (pre-push `--range`, whose
+    judgement is placement: an added line is "invalid" there when it is misplaced).
+
+    Each case first proves the config really blinds a plain `git diff` (the existing
+    `_require_header` pattern), so the test cannot pass vacuously."""
+
+    REL = "ledger/2026-W30/2026-W30.jsonl"
+    MARK = "T4487-HIDDEN"
+    CONFIGS = ("diff.external", "diff.<driver>.textconv")
+
+    def _git(self, repo: Path, *args: str) -> str:
+        env = {**os.environ, "GIT_AUTHOR_NAME": "T", "GIT_AUTHOR_EMAIL": "t@e.com",
+               "GIT_COMMITTER_NAME": "T", "GIT_COMMITTER_EMAIL": "t@e.com"}
+        return subprocess.run(["git", "-C", str(repo), *args], capture_output=True,
+                              text=True, check=True, env=env).stdout.strip()
+
+    @staticmethod
+    def _tool(t: str, body: str) -> str:
+        path = Path(t) / "difftool.sh"
+        path.write_text("#!/bin/sh\n" + body)
+        path.chmod(0o755)
+        return str(path)
+
+    def _repo(self, t: str, config: str) -> "tuple[Path, Path]":
+        """A repo whose seat config blinds `git diff`, with one good line committed."""
+        repo = Path(t) / "r"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        if config == "diff.external":
+            self._git(repo, "config", "diff.external", self._tool(t, "exit 0\n"))
+        else:
+            (repo / ".gitattributes").write_text("*.jsonl diff=blind\n")
+            self._git(repo, "config", "diff.blind.textconv", self._tool(t, "echo converted\n"))
+        shard = repo / self.REL
+        shard.parent.mkdir(parents=True)
+        shard.write_text(json.dumps(_entry(TS_W30, eid="ok")) + "\n")
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-q", "-m", "base")
+        return repo, shard
+
+    def _assert_blinded(self, repo: Path, *diff_args: str) -> None:
+        raw = self._git(repo, "diff", "--unified=0", *diff_args, "--", "ledger")
+        self.assertNotIn(self.MARK, raw,
+                         "precondition: the seat config must hide the added line from a plain diff")
+
+    def test_an_unparseable_staged_line_is_flagged_under_a_hostile_diff_config(self) -> None:
+        for config in self.CONFIGS:
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as t:
+                repo, shard = self._repo(t, config)
+                bad = json.dumps(_entry(TS_W30, eid=self.MARK))[:-1]  # missing "}"
+                shard.write_text(shard.read_text() + bad + "\n")
+                self._git(repo, "add", "-A")
+                self._assert_blinded(repo, "--cached")
+                out = lpl.lint_staged_validity(repo_root=repo)
+                self.assertEqual([v["path"] for v in out], [self.REL], out)
+                self.assertEqual(out[0]["line"], bad)
+
+    def test_a_misplaced_added_line_is_flagged_by_the_range_scan_under_a_hostile_diff_config(self) -> None:
+        for config in self.CONFIGS:
+            with self.subTest(config=config), tempfile.TemporaryDirectory() as t:
+                repo, shard = self._repo(t, config)
+                base = self._git(repo, "rev-parse", "HEAD")
+                shard.write_text(shard.read_text()
+                                 + json.dumps(_entry(TS_W31, eid=self.MARK)) + "\n")  # W31 line in the W30 shard
+                self._git(repo, "add", "-A")
+                self._git(repo, "commit", "-q", "-m", "tip")
+                self._assert_blinded(repo, f"{base}..HEAD")
+                out = lpl.lint_range(base, "HEAD", repo_root=repo)
+                self.assertEqual([m["id"] for m in out], [self.MARK], out)
+
+
 class TestAppendEntry(unittest.TestCase):
     def test_places_by_entry_ts_not_now(self) -> None:
         with tempfile.TemporaryDirectory() as t:
@@ -369,7 +704,7 @@ class TestAppendEntry(unittest.TestCase):
             ledger = Path(t) / "ledger"
             ledger.mkdir()
             with self.assertRaises(ValueError):
-                ledger_shard.append_entry(ledger, {"id": "no-ts", "agent": "metis"})
+                ledger_shard.append_entry(ledger, {"id": "no-ts", "agent": "mason"})
 
     def test_honors_legacy_file_transition(self) -> None:
         with tempfile.TemporaryDirectory() as t:
@@ -414,7 +749,7 @@ class TestMainDispatch(unittest.TestCase):
 
     def test_bare_invocation_nonzero_exit_on_misplacement(self) -> None:
         fake = {"shard": "2026-W30", "want": "2026-W31", "ts": TS_W31,
-                "id": "x", "agent": "metis"}
+                "id": "x", "agent": "mason"}
         with mock.patch.object(lpl, "lint_default", return_value=[fake]):
             rc = lpl.main([])
         self.assertEqual(rc, 1)

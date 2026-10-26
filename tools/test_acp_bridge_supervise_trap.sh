@@ -86,34 +86,56 @@ PASS=0; FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS+1)); }
 fail() { echo "  FAIL: $1"; FAIL=$((FAIL+1)); }
 
+# Wall-clock bounds (T-4348). Both are $SECONDS deadlines, not iteration counts,
+# so a bound means the same thing on an idle box and on the saturated CI runner.
+#
+# STARTUP waits on a POSITIVE readiness signal (the stub's new-session marker), so
+# the 60s bound only caps a broken start and never paces a healthy one. The old 5s
+# bound lost to load: before its first new-session the script resolves the mailbox
+# hub with a python3 import of agent_role_map, which measured 4-5s by itself on the
+# loaded runner. ACP_BRIDGE_INBOX is the script's own override for that lookup.
+# This file tests the SIGTERM trap, not hub resolution, so it sets the override and
+# drops the slow step. test_acp_bridge_supervise_batch.sh keeps the default
+# (hub-lookup) launch path covered.
+#
+# EXIT is timed from the SIGTERM. A synchronous `sleep 5` in the supervise poll loop
+# defers the trap until that sleep returns, so a healthy exit takes up to one poll
+# interval plus a stub-tmux exec. The bound is 30s: six poll intervals of load
+# margin, still far under systemd's default TimeoutStopSec=90s.
+STARTUP_BOUND=60
+EXIT_BOUND=30
+
 echo "T1: supervise script tears down its tmux session on SIGTERM"
 
 PATH="$STUBDIR:$PATH" HOME="$SANDBOX" ACP_BRIDGE_AGENT="$AGENT" \
+  ACP_BRIDGE_INBOX="$SANDBOX/inbox" \
   "$SUPERVISE" &
 SCRIPT_PID=$!
 
-# Wait for the session to come up (bounded poll, not a fixed sleep).
+# Wait for the session to come up (bounded poll on the readiness marker, not a
+# fixed sleep).
 up=0
-for _ in $(seq 1 50); do
+deadline=$((SECONDS + STARTUP_BOUND))
+while (( SECONDS < deadline )); do
   if [[ -e "$STUB_TMUX_MARK" ]]; then up=1; break; fi
+  # A supervisor that died before new-session never will: fail now, not at 60s.
+  kill -0 "$SCRIPT_PID" 2>/dev/null || break
   sleep 0.1
 done
 if [[ "$up" -eq 1 ]]; then pass "session came up before signaling"
-else fail "session never came up (new-session not observed)"; fi
+else fail "session never came up within ${STARTUP_BOUND}s (new-session not observed)"; fi
 
 kill -TERM "$SCRIPT_PID" 2>/dev/null
 
-# Wait for the script to actually exit. Worst case delay is bounded by the
-# loop's poll interval (5s in acp-bridge-supervise.sh as of this writing) —
-# 15s of headroom here is generous, still far under systemd's default
-# TimeoutStopSec=90s.
+# Wait for the script to actually exit (bounded; see EXIT_BOUND above).
 exited=0
-for _ in $(seq 1 150); do
+deadline=$((SECONDS + EXIT_BOUND))
+while (( SECONDS < deadline )); do
   if ! kill -0 "$SCRIPT_PID" 2>/dev/null; then exited=1; break; fi
   sleep 0.1
 done
 if [[ "$exited" -eq 1 ]]; then pass "script exited after SIGTERM"
-else fail "script did not exit within 15s of SIGTERM"; fi
+else fail "script did not exit within ${EXIT_BOUND}s of SIGTERM"; fi
 
 # T-2264 follow-up: assert the STATUS, not merely that it terminated.
 # This test previously checked only that the process went away, so it passed
@@ -122,12 +144,24 @@ else fail "script did not exit within 15s of SIGTERM"; fi
 # status, OnFailure= fires on it, and "it exited" is not the property that
 # matters. A test that stops one question short of the one the consumer asks
 # is how this stayed invisible.
-wait "$SCRIPT_PID" 2>/dev/null; SCRIPT_RC=$?
-# 0 = clean end; 143 = 128+SIGTERM, also a clean systemd stop.
-if [[ "$SCRIPT_RC" -eq 0 || "$SCRIPT_RC" -eq 143 ]]; then
-  pass "script exited with a NON-FAILURE status ($SCRIPT_RC)"
+#
+# `wait` ONLY when the bounded poll above saw the process go (T-4348). Waiting on
+# a still-running script is an unbounded wait, so a supervisor that ignores
+# SIGTERM would HANG this test instead of failing it. The session-death suite
+# carries the same guard.
+if [[ "$exited" -eq 1 ]]; then
+  wait "$SCRIPT_PID" 2>/dev/null; SCRIPT_RC=$?
+  SCRIPT_PID=""
+  # 0 = clean end; 143 = 128+SIGTERM, also a clean systemd stop.
+  if [[ "$SCRIPT_RC" -eq 0 || "$SCRIPT_RC" -eq 143 ]]; then
+    pass "script exited with a NON-FAILURE status ($SCRIPT_RC)"
+  else
+    fail "script exited $SCRIPT_RC — a clean shutdown must not report failure (systemd fires OnFailure= on this)"
+  fi
 else
-  fail "script exited $SCRIPT_RC — a clean shutdown must not report failure (systemd fires OnFailure= on this)"
+  kill -KILL "$SCRIPT_PID" 2>/dev/null
+  SCRIPT_PID=""
+  fail "exit status unavailable — the script never exited after SIGTERM (see above)"
 fi
 
 if grep -qF "kill-session -t $SESSION" "$STUB_TMUX_LOG"; then

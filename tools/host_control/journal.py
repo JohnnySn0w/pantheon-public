@@ -11,16 +11,20 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tools.host_control.contracts import (
+    COMPENSATION_APPROVAL_SENTINEL,
+    COMPENSATION_KEY_PREFIX,
     OPERATION_TRANSITIONS,
     TERMINAL_OPERATION_STATES,
     HostControlError,
     IdempotencyConflict,
     InvalidTransition,
+    JournalBusy,
     ManifestRecord,
     MigrationRequired,
     OperationReceipt,
     OperationRecord,
     PlanEnvelope,
+    RecoveryRefused,
     RollbackIntent,
     SeatRecord,
     SubjectContext,
@@ -30,6 +34,10 @@ from tools.host_control.contracts import (
     compute_effect_digest,
 )
 
+
+# Default write-lock wait. Injectable through BrokerJournal.open so a test
+# can force lock contention without depending on host load.
+BUSY_TIMEOUT_MS = 5000
 
 APPLICATION_ID = 1346913090
 USER_VERSION_V1 = 1
@@ -301,11 +309,89 @@ def _sidecars_present(path: Path) -> bool:
     return wal.exists() or shm.exists()
 
 
+# sqlite primary result codes for lock contention (sqlite3.h).
+_SQLITE_BUSY = 5
+_SQLITE_LOCKED = 6
+_LOCK_CONTENTION_MESSAGES = frozenset(
+    ("database is locked", "database table is locked")
+)
+
+
+def _is_lock_contention(exc: sqlite3.OperationalError) -> bool:
+    """True when sqlite reports lock contention (SQLITE_BUSY / LOCKED).
+
+    The primary result code (low byte of ``sqlite_errorcode``, present on
+    Python 3.11+; extended codes such as BUSY_RECOVERY reduce to it)
+    decides. Only when the interpreter attached no code does the exact
+    message text stand in. Every other OperationalError is not contention.
+    Duplicated in the sibling journal on purpose (L3: no import edge across
+    the authority boundary); a parity test drives both copies.
+    """
+
+    code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(code, int):
+        return (code & 0xFF) in (_SQLITE_BUSY, _SQLITE_LOCKED)
+    return str(exc) in _LOCK_CONTENTION_MESSAGES
+
+
+# T-2917 5d (ruling T-2917:D14): the events written BEFORE an Execute call.
+PRE_EXECUTE_MARKERS = ("dispatch_intent", "spec_rearmed", "execute_retry", "redispatch_intent")
+# T-2917 5d.2 fixup (ruling T-2917:D27): every Execute ISSUED for a mutating
+# operation is preceded by exactly one of these journaled events (the first
+# dispatch, an identical/definitive-refusal retry, a reconciler re-dispatch).
+# Their lifetime count is the number of Executes ever issued.
+EXECUTE_ISSUANCE_MARKERS = ("dispatch_intent", "execute_retry", "redispatch_intent")
+# T-2917 5d.2 follow-up (ruling T-2917:D29): an Execute the executor answered
+# with a DEFINITIVE ``Busy`` created no execution for that (handle, digest),
+# so the broker journals ``execute_voided`` against that issuance's marker
+# and the lifetime count excludes it. Closed refusal set: ``Denied`` is NOT
+# here (it fires while a same-handle execution runs, so it proves nothing).
+EXECUTE_VOIDED_EVENT = "execute_voided"
+VOIDING_REFUSALS = frozenset(("Busy",))
+# T-2917 5d.2 (ruling T-2917:D17): journaled spec re-arms per operation, and
+# the closed set of reasons a re-arm may carry. Event kinds are free text in
+# the v2 DDL, so neither adds a schema change (SCHEMA_DIGEST is pinned).
+MAX_SPEC_REARMS = 2
+REARM_REASONS = frozenset(("reconcile-probe-clean", "rollback-redispatch"))
+
+
 class BrokerJournal:
-    def __init__(self, path: Path, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        path: Path,
+        connection: sqlite3.Connection,
+        busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+    ) -> None:
         self.path = path
         self._connection = connection
+        self._busy_timeout_ms = busy_timeout_ms
         self._closed = False
+
+    def _begin_immediate(
+        self,
+        connection: sqlite3.Connection,
+        operation: str,
+    ) -> None:
+        """Take the write lock up front; map lock contention here.
+
+        Every runtime write transaction opens through this one seam. A
+        lock still held by another connection past the busy timeout
+        refuses with ``JournalBusy`` (a HostControlError) naming the
+        operation that lost, instead of leaking the raw sqlite error; the
+        transaction never began, so nothing was written. Any other
+        OperationalError surfaces unchanged.
+        """
+
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            if not _is_lock_contention(exc):
+                raise
+            raise JournalBusy(
+                f"{operation}: journal write lock busy after "
+                f"{self._busy_timeout_ms} ms (lock contention); "
+                "nothing was written; retry later"
+            ) from exc
 
     @staticmethod
     def _check_compiled_digests() -> None:
@@ -315,8 +401,19 @@ class BrokerJournal:
             raise HostControlError("compiled journal schema digest mismatch")
 
     @classmethod
-    def open(cls, path: Path) -> "BrokerJournal":
+    def open(
+        cls,
+        path: Path,
+        *,
+        busy_timeout_ms: int = BUSY_TIMEOUT_MS,
+    ) -> "BrokerJournal":
         cls._check_compiled_digests()
+        if (
+            not isinstance(busy_timeout_ms, int)
+            or isinstance(busy_timeout_ms, bool)
+            or busy_timeout_ms < 0
+        ):
+            raise HostControlError("invalid journal busy timeout")
         if not path.is_absolute():
             path = path.resolve()
         parent = path.parent
@@ -325,10 +422,10 @@ class BrokerJournal:
         try:
             connection = sqlite3.connect(
                 path,
-                timeout=5.0,
+                timeout=busy_timeout_ms / 1000,
                 isolation_level=None,
             )
-            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
             connection.execute("PRAGMA foreign_keys=ON")
             objects = _schema_objects(connection)
             application_id = connection.execute(
@@ -357,7 +454,7 @@ class BrokerJournal:
             connection.execute("PRAGMA synchronous=FULL")
             if created:
                 _fsync_dir(parent)
-            return cls(path, connection)
+            return cls(path, connection, busy_timeout_ms)
         except (OSError, sqlite3.Error) as exc:
             try:
                 connection.close()
@@ -643,7 +740,7 @@ class BrokerJournal:
             raise HostControlError("journal plan identity mismatch")
         plan_json = canonical_json(plan.to_dict())
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(connection, "put_plan_or_replay")
             row = connection.execute(
                 f"{_SELECT_PLAN} WHERE subject_uid=? AND subject_seat_id=? "
                 "AND action='plan' AND target_seat_id=? AND idempotency_key=?",
@@ -803,9 +900,8 @@ class BrokerJournal:
             raise HostControlError("invalid operation record digest")
         if record.state != "prepared":
             raise HostControlError("new operations must be prepared")
-        operation_json = canonical_json(record.to_dict())
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(connection, "put_operation_or_replay")
             row = connection.execute(
                 f"{_SELECT_OPERATION} WHERE subject_uid=? AND "
                 "subject_seat_id=? AND operation_kind=? AND "
@@ -826,38 +922,7 @@ class BrokerJournal:
                 stored = self._decode_operation_row(row)
                 connection.execute("COMMIT")
                 return stored, True
-            connection.execute(
-                "INSERT INTO operations VALUES "
-                "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    record.operation_handle,
-                    record.kind,
-                    record.state,
-                    record.owner.uid,
-                    record.owner.seat_id,
-                    record.target_seat_id,
-                    record.plan_handle,
-                    record.plan_digest,
-                    record.receipt_handle,
-                    record.receipt_digest,
-                    record.approval_handle,
-                    record.authority_record_id,
-                    record.idempotency_key,
-                    record.request_digest,
-                    operation_json,
-                    record.created_at,
-                    record.updated_at,
-                ),
-            )
-            self._insert_event(
-                connection,
-                operation_handle=record.operation_handle,
-                from_state="none",
-                to_state="prepared",
-                event_kind="prepared",
-                payload={"request_digest": record.request_digest},
-                created_at=record.created_at,
-            )
+            self._insert_operation(connection, record)
             connection.execute("COMMIT")
             return record, False
         except IdempotencyConflict:
@@ -900,6 +965,30 @@ class BrokerJournal:
             raise HostControlError("operation digest does not match expectation")
         return record
 
+    def subject_references_approval(
+        self,
+        *,
+        subject: SubjectContext,
+        approval_handle: str,
+    ) -> bool:
+        """True iff one of ``subject``'s own operations carries
+        ``approval_handle`` (T-2917 5a: ApprovalGet subject binding).
+
+        Read-only, single SELECT, no DDL and no schema-digest change. The
+        operations table has no approval_handle index; the scan is bounded
+        by the subject's own operation count on a lifecycle-only surface,
+        and the predicate is exact equality so no other subject's row can
+        ever satisfy it.
+        """
+
+        connection = self._require_open()
+        row = connection.execute(
+            "SELECT 1 FROM operations WHERE subject_uid=? AND "
+            "subject_seat_id=? AND approval_handle=? LIMIT 1",
+            (subject.uid, subject.seat_id, approval_handle),
+        ).fetchone()
+        return row is not None
+
     def load_operation_unbound(self, operation_handle: str) -> OperationRecord:
         """Broker-internal recovery read; never expose on a public surface."""
 
@@ -923,7 +1012,10 @@ class BrokerJournal:
         connection = self._require_open()
         self._check_transition_pair(current, new)
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(
+                connection,
+                f"transition_operation[{event_kind}]",
+            )
             self._insert_event(
                 connection,
                 operation_handle=current.operation_handle,
@@ -954,7 +1046,10 @@ class BrokerJournal:
 
         connection = self._require_open()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(
+                connection,
+                f"append_event[{event_kind}]",
+            )
             row = connection.execute(
                 "SELECT state FROM operations WHERE operation_handle=?",
                 (current.operation_handle,),
@@ -1011,7 +1106,7 @@ class BrokerJournal:
             ):
                 raise HostControlError("rollback intent sequence mismatch")
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(connection, "record_dispatch_intent")
             connection.execute(
                 "INSERT INTO operation_receipts VALUES (?,?,?,?,?,?)",
                 (
@@ -1073,11 +1168,19 @@ class BrokerJournal:
         new: OperationRecord,
         receipt: OperationReceipt,
         payload: dict[str, object],
+        compensation: OperationRecord | None = None,
     ) -> None:
+        """Append the terminal receipt and state. T-4964: a ``compensation``
+        (the broker-created rollback of a FAILED apply's restorable
+        mutations) is inserted in the SAME transaction, so no failed receipt
+        exists, even across a crash, without the compensation it licenses."""
+
         connection = self._require_open()
         self._check_transition_pair(current, new)
         if new.state not in ("completed", "failed"):
             raise InvalidTransition("record_terminal targets completed/failed")
+        if compensation is not None:
+            self._check_compensation(current, new, receipt, compensation)
         expected_phase = "complete" if new.state == "completed" else "failed"
         if receipt.phase != expected_phase:
             raise HostControlError("terminal receipt phase mismatch")
@@ -1086,7 +1189,7 @@ class BrokerJournal:
         if not receipt.validate_digest():
             raise HostControlError("invalid terminal receipt digest")
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(connection, "record_terminal")
             connection.execute(
                 "INSERT INTO operation_receipts VALUES (?,?,?,?,?,?)",
                 (
@@ -1113,6 +1216,8 @@ class BrokerJournal:
                 created_at=new.updated_at,
             )
             self._guarded_update(connection, current=current, new=new)
+            if compensation is not None:
+                self._insert_operation(connection, compensation)
             connection.execute("COMMIT")
         except sqlite3.IntegrityError as exc:
             try:
@@ -1146,7 +1251,7 @@ class BrokerJournal:
         connection = self._require_open()
         bounded_note = note[:512]
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            self._begin_immediate(connection, "mark_manual_recovery")
             row = connection.execute(
                 "SELECT state FROM operations WHERE operation_handle=?",
                 (operation_handle,),
@@ -1248,6 +1353,336 @@ class BrokerJournal:
             intents.append(intent)
         return tuple(intents)
 
+    def claim_spec_serve(self, *, current: OperationRecord, created_at: str) -> bool:
+        """Atomically record an ``ExecutionSource.OperationSpec`` serve of a
+        MUTATING operation (T-2917 5b review S4). A spec is served iff
+        ``count(spec_served) <= count(spec_rearmed)`` (T-2917 5d.2): exactly
+        once, plus once more per journaled re-arm, so a broker-uid process
+        cannot re-trigger an apply parked for the reconciler. Returns False
+        when the serve is refused."""
+
+        connection = self._require_open()
+        try:
+            self._begin_immediate(connection, "claim_spec_serve")
+            row = connection.execute(
+                "SELECT state FROM operations WHERE operation_handle=?",
+                (current.operation_handle,),
+            ).fetchone()
+            if row is None:
+                raise UnknownHandle("unknown operation handle")
+            # the driver may record DISPATCHED between the executor's call
+            # and this serve; both dispatchable states are fine
+            state = row[0]
+            if state not in ("dispatch_intent", "dispatched"):
+                raise HostControlError("operation is not dispatchable for spec serve")
+            served = self._event_count(connection, current.operation_handle, "spec_served")
+            rearmed = self._event_count(connection, current.operation_handle, "spec_rearmed")
+            if served > rearmed:
+                connection.execute("COMMIT")
+                return False
+            self._insert_event(
+                connection,
+                operation_handle=current.operation_handle,
+                from_state=state,
+                to_state=state,
+                event_kind="spec_served",
+                payload={"served": True},
+                created_at=created_at,
+            )
+            connection.execute("COMMIT")
+            return True
+        except BaseException:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    @staticmethod
+    def _event_count(connection: sqlite3.Connection, operation_handle: str, event_kind: str) -> int:
+        return int(
+            connection.execute(
+                "SELECT COUNT(*) FROM operation_events WHERE operation_handle=? AND event_kind=?",
+                (operation_handle, event_kind),
+            ).fetchone()[0]
+        )
+
+    def rearm_spec_serve(self, *, current: OperationRecord, reason: str, created_at: str) -> int:
+        """Journal ONE more permitted serve of a mutating spec (T-2917 5d.2,
+        carry-in N5b; README n3). BEGIN IMMEDIATE; refused unless the
+        operation is dispatchable, its spec was served before and that serve
+        is consumed (no re-arm is outstanding), ``reason`` is in the closed
+        ``REARM_REASONS`` set and fewer than ``MAX_SPEC_REARMS`` re-arms
+        exist. Appends a ``spec_rearmed`` event (also a pre-Execute marker)
+        and returns the new re-arm count.
+
+        The ONLY caller is ``OperationService._reconcile``, after a live-
+        state proof; no D-Bus handler reaches it (AST-tested)."""
+
+        if reason not in REARM_REASONS:
+            raise HostControlError("invalid spec re-arm reason")
+        connection = self._require_open()
+        try:
+            self._begin_immediate(connection, "rearm_spec_serve")
+            row = connection.execute(
+                "SELECT state FROM operations WHERE operation_handle=?",
+                (current.operation_handle,),
+            ).fetchone()
+            if row is None:
+                raise UnknownHandle("unknown operation handle")
+            state = row[0]
+            if state != current.state or state not in ("dispatch_intent", "dispatched"):
+                raise HostControlError("operation is not dispatchable for a spec re-arm")
+            served = self._event_count(connection, current.operation_handle, "spec_served")
+            rearmed = self._event_count(connection, current.operation_handle, "spec_rearmed")
+            if served == 0:
+                raise RecoveryRefused("spec was never served; nothing to re-arm")
+            if served <= rearmed:
+                raise RecoveryRefused("a spec re-arm is already outstanding")
+            if rearmed >= MAX_SPEC_REARMS:
+                raise RecoveryRefused("spec re-arm cap reached")
+            self._insert_event(
+                connection,
+                operation_handle=current.operation_handle,
+                from_state=state,
+                to_state=state,
+                event_kind="spec_rearmed",
+                payload={"reason": reason, "rearm": rearmed + 1},
+                created_at=created_at,
+            )
+            connection.execute("COMMIT")
+            return rearmed + 1
+        except BaseException:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def intents_for(self, operation_handle: str) -> tuple[RollbackIntent, ...]:
+        """Read-only (T-2917 5d.2): EVERY write-ahead intent of an operation,
+        resolved and unresolved, in sequence order (the restorable-set
+        filter of a rollback reads the SOURCE apply's intents)."""
+
+        connection = self._require_open()
+        rows = connection.execute(
+            "SELECT operation_handle, seq, intent_json FROM rollback_intents "
+            "WHERE operation_handle=? ORDER BY seq",
+            (operation_handle,),
+        ).fetchall()
+        return tuple(self._decode_intent_row(row) for row in rows)
+
+    @staticmethod
+    def _decode_intent_row(row: tuple[object, ...]) -> RollbackIntent:
+        try:
+            raw = json.loads(row[2])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HostControlError("corrupt rollback intent JSON") from exc
+        if not isinstance(raw, dict) or row[2] != canonical_json(raw):
+            raise HostControlError("corrupt rollback intent canonical JSON")
+        intent = RollbackIntent.from_dict(raw)
+        if intent.operation_handle != row[0] or intent.seq != row[1]:
+            raise HostControlError("rollback intent row does not match record")
+        return intent
+
+    def dispatch_execution_ref(self, operation_handle: str) -> str | None:
+        """Read-only (T-2917 5b, ruling B11): the execution reference the
+        executor returned at the LATEST dispatch or re-dispatch of this
+        operation, or None if it was never dispatched. Lets the broker's
+        driver resume collecting after a broker restart without ever
+        re-dispatching a mutating operation."""
+
+        connection = self._require_open()
+        row = connection.execute(
+            "SELECT payload_json FROM operation_events "
+            "WHERE operation_handle=? AND event_kind IN ('dispatched', 'redispatched') "
+            "ORDER BY seq DESC LIMIT 1",
+            (operation_handle,),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, json.JSONDecodeError) as exc:
+            raise HostControlError("corrupt operation event JSON") from exc
+        reference = payload.get("execution_ref") if isinstance(payload, dict) else None
+        if not isinstance(reference, str) or not 1 <= len(reference) <= 128:
+            raise HostControlError("corrupt dispatch execution reference")
+        return reference
+
+    def count_events(self, operation_handle: str, event_kinds: tuple[str, ...]) -> int:
+        """Read-only (T-2917 5d.1): how many events of these kinds the
+        operation has, over its whole lifetime (every drive, every broker
+        restart). The lifetime verify re-dispatch cap counts with it."""
+
+        kinds = tuple(str(kind) for kind in event_kinds)
+        if not kinds:
+            return 0
+        connection = self._require_open()
+        placeholders = ",".join("?" for _ in kinds)
+        row = connection.execute(
+            "SELECT COUNT(*) FROM operation_events WHERE operation_handle=? "
+            f"AND event_kind IN ({placeholders})",
+            (operation_handle, *kinds),
+        ).fetchone()
+        return int(row[0])
+
+    def execute_issuance_count(self, operation_handle: str) -> int:
+        """Read-only (T-2917:D27): how many Executes were ever issued for
+        this operation, over its whole lifetime (every arm, every restart),
+        less the issuances the executor definitively answered ``Busy``
+        (T-2917:D29; each void is bound to one distinct marker)."""
+
+        issued = self.count_events(operation_handle, EXECUTE_ISSUANCE_MARKERS)
+        voided = self.count_events(operation_handle, (EXECUTE_VOIDED_EVENT,))
+        return max(issued - voided, 0)
+
+    def void_execute_issuance(self, *, current: OperationRecord, refusal: str, created_at: str) -> int:
+        """Journal that the operation's LATEST Execute issuance created no
+        execution (T-2917 5d.2 follow-up, ruling T-2917:D29): the executor
+        answered it with a definitive ``Busy``. BEGIN IMMEDIATE; refused
+        unless ``refusal`` is in the closed ``VOIDING_REFUSALS`` set, the
+        operation is dispatchable in its recorded state, the latest issuance
+        marker exists, is not already voided and was not followed by a
+        ``dispatched``/``redispatched`` record (an Execute that was ACCEPTED
+        is never voided). Returns the voided marker's sequence number.
+
+        Broker-only: the ONLY caller is ``OperationService._execute_or_void``
+        on the broker's own Execute reply; no D-Bus handler reaches it and
+        the executor package imports no journal machinery (both tested), so
+        the executor uid cannot write it."""
+
+        if refusal not in VOIDING_REFUSALS:
+            raise HostControlError("invalid execute-void refusal")
+        connection = self._require_open()
+        try:
+            self._begin_immediate(connection, "void_execute_issuance")
+            row = connection.execute(
+                "SELECT state FROM operations WHERE operation_handle=?",
+                (current.operation_handle,),
+            ).fetchone()
+            if row is None:
+                raise UnknownHandle("unknown operation handle")
+            state = row[0]
+            if state != current.state or state not in ("dispatch_intent", "dispatched"):
+                raise HostControlError("operation is not dispatchable for an execute void")
+            marker = connection.execute(
+                "SELECT MAX(seq) FROM operation_events WHERE operation_handle=? "
+                f"AND event_kind IN ({','.join('?' for _ in EXECUTE_ISSUANCE_MARKERS)})",
+                (current.operation_handle, *EXECUTE_ISSUANCE_MARKERS),
+            ).fetchone()[0]
+            if marker is None:
+                raise HostControlError("no execute issuance to void")
+            later = connection.execute(
+                "SELECT COUNT(*) FROM operation_events WHERE operation_handle=? AND seq > ? "
+                "AND event_kind IN ('dispatched', 'redispatched', ?)",
+                (current.operation_handle, int(marker), EXECUTE_VOIDED_EVENT),
+            ).fetchone()[0]
+            if int(later):
+                raise HostControlError("the latest execute issuance was accepted or is already voided")
+            self._insert_event(
+                connection,
+                operation_handle=current.operation_handle,
+                from_state=state,
+                to_state=state,
+                event_kind=EXECUTE_VOIDED_EVENT,
+                payload={"refusal": refusal, "marker_seq": int(marker)},
+                created_at=created_at,
+            )
+            connection.execute("COMMIT")
+            return int(marker)
+        except BaseException:
+            try:
+                connection.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+
+    def spec_served_after_latest_dispatch(self, operation_handle: str) -> bool:
+        """Read-only (T-2917 5d.1, ruling T-2917:D14): True when a
+        ``spec_served`` event follows the operation's LATEST pre-Execute
+        marker. The markers are the events the broker writes BEFORE an
+        Execute call (``dispatch_intent``; ``spec_rearmed`` and
+        ``execute_retry`` from 5d.2), never ``dispatched``, which the driver
+        may write after the executor has already fetched the spec.
+
+        A refused execution whose spec was served after that marker was
+        refused by the executor's own parse, before it touched the host. One
+        whose spec was NOT served after it had the SERVE refused (e.g.
+        already served to an earlier attempt), so that earlier attempt's
+        outcome is unknown."""
+
+        connection = self._require_open()
+        marker = connection.execute(
+            "SELECT MAX(seq) FROM operation_events WHERE operation_handle=? "
+            f"AND event_kind IN ({','.join('?' for _ in PRE_EXECUTE_MARKERS)})",
+            (operation_handle, *PRE_EXECUTE_MARKERS),
+        ).fetchone()[0]
+        served = connection.execute(
+            "SELECT 1 FROM operation_events WHERE operation_handle=? "
+            "AND event_kind='spec_served' AND seq > ? LIMIT 1",
+            (operation_handle, int(marker or 0)),
+        ).fetchone()
+        return served is not None
+
+    @staticmethod
+    def _check_compensation(
+        current: OperationRecord,
+        new: OperationRecord,
+        receipt: OperationReceipt,
+        compensation: OperationRecord,
+    ) -> None:
+        if (
+            current.kind != "apply"
+            or new.state != "failed"
+            or receipt.phase != "failed"
+            or not compensation.validate_digest()
+            or compensation.kind != "rollback"
+            or compensation.state != "prepared"
+            or compensation.approval_handle != COMPENSATION_APPROVAL_SENTINEL
+            or compensation.receipt_handle != receipt.receipt_handle
+            or compensation.receipt_digest != receipt.digest
+            or compensation.owner != current.owner
+            or compensation.target_seat_id != current.target_seat_id
+            or compensation.plan_handle != current.plan_handle
+            or compensation.plan_digest != current.plan_digest
+            or compensation.idempotency_key
+            != COMPENSATION_KEY_PREFIX + current.operation_handle
+            or compensation.authority_record_id is not None
+            or tuple(compensation.operation_families)
+            != tuple(current.operation_families)
+        ):
+            raise HostControlError("invalid compensation for this terminal")
+
+    def compensation_ref(
+        self, source_operation_handle: str
+    ) -> tuple[str, str, int, str] | None:
+        """T-4964: ``(operation_handle, state, subject_uid, subject_seat_id)``
+        of the broker-created compensation of a failed apply (the rollback
+        bound to that apply's FAILED receipt, carrying the compensation
+        sentinel), or None. Read from the COLUMNS only, so a compensation
+        parked by ``mark_manual_recovery`` (whose operation_json is left
+        untouched on purpose) still reads, and the source apply's
+        OperationGet never fails on it. Read-only; no DDL change."""
+
+        connection = self._require_open()
+        row = connection.execute(
+            "SELECT operation_handle, state, subject_uid, subject_seat_id "
+            "FROM operations WHERE approval_handle=? AND receipt_handle IN "
+            "(SELECT receipt_handle FROM operation_receipts "
+            "WHERE operation_handle=? AND phase='failed')",
+            (COMPENSATION_APPROVAL_SENTINEL, source_operation_handle),
+        ).fetchone()
+        if row is None:
+            return None
+        return (str(row[0]), str(row[1]), int(row[2]), str(row[3]))
+
+    def compensation_for(self, source_operation_handle: str) -> OperationRecord | None:
+        """T-4964: the decoded compensation record of a failed apply, or None."""
+
+        ref = self.compensation_ref(source_operation_handle)
+        return None if ref is None else self.load_operation_unbound(ref[0])
+
     def pending_operations(self) -> tuple[str, ...]:
         connection = self._require_open()
         placeholders = ",".join("?" for _ in TERMINAL_OPERATION_STATES)
@@ -1275,6 +1710,49 @@ class BrokerJournal:
             raise InvalidTransition(
                 f"illegal transition {current.state} -> {new.state}"
             )
+
+    @classmethod
+    def _insert_operation(
+        cls,
+        connection: sqlite3.Connection,
+        record: OperationRecord,
+    ) -> None:
+        """INSERT one new PREPARED operation and its ``prepared`` event inside
+        the caller's open transaction (shared by ``put_operation_or_replay``
+        and the T-4964 compensation insert in ``record_terminal``)."""
+
+        connection.execute(
+            "INSERT INTO operations VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                record.operation_handle,
+                record.kind,
+                record.state,
+                record.owner.uid,
+                record.owner.seat_id,
+                record.target_seat_id,
+                record.plan_handle,
+                record.plan_digest,
+                record.receipt_handle,
+                record.receipt_digest,
+                record.approval_handle,
+                record.authority_record_id,
+                record.idempotency_key,
+                record.request_digest,
+                canonical_json(record.to_dict()),
+                record.created_at,
+                record.updated_at,
+            ),
+        )
+        cls._insert_event(
+            connection,
+            operation_handle=record.operation_handle,
+            from_state="none",
+            to_state="prepared",
+            event_kind="prepared",
+            payload={"request_digest": record.request_digest},
+            created_at=record.created_at,
+        )
 
     @staticmethod
     def _insert_event(

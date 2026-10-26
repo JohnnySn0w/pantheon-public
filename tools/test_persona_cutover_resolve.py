@@ -16,6 +16,7 @@ channels/tmux/post_start) -- a clean load is NOT the same as "synced".
 from __future__ import annotations
 
 import dataclasses
+import getpass
 import tempfile
 import textwrap
 import unittest
@@ -24,6 +25,14 @@ from types import SimpleNamespace
 from unittest import mock
 
 import yaml
+
+# T-3395: three tests below use another persona's unix account as the
+# stand-in for "some account whose files this seat cannot read". They
+# structurally cannot pass when the runtime seat IS that persona's account.
+# Skip on the matching seat rather than fail; coverage is preserved on the
+# other 4 fleet accounts. See T-3395 for the (b1) dynamic-persona shape if
+# per-seat coverage ever becomes load-bearing.
+_RUNTIME_ACCOUNT = getpass.getuser()
 
 from tools.persona_cutover_resolve import (
     CONTROL_PLANE_CHANNELS,
@@ -121,7 +130,7 @@ class ResolvePersonaCorrectnessGateTest(unittest.TestCase):
 
     def test_recovery_matches_t2590_hardcoded_constants(self) -> None:
         identity = resolve_persona("recovery", manifest_path=INSTANCE_YAML, unit_text=RECOVERY_UNIT_TEXT)
-        self.assertEqual(identity.role, "recovery")
+        self.assertEqual(identity.role, "head-system-orchestrator")
         self.assertEqual(identity.account, "claude-fallback")
         self.assertEqual(identity.uid, 1001)
         self.assertEqual(identity.home, Path("/home/claude-fallback"))
@@ -139,7 +148,7 @@ class ResolvePersonaCorrectnessGateTest(unittest.TestCase):
             identity.supervise_wrapper_path,
             Path("/home/claude-fallback/.local/bin/recovery-bot-supervise.sh"),
         )
-        self.assertEqual(identity.model, "claude-opus-4-8")
+        self.assertEqual(identity.model, "claude-opus-5-5")
         self.assertEqual(identity.channels, CONTROL_PLANE_CHANNELS)
         self.assertEqual(identity.consume_timer, "pantheon-persona-consume@recovery.timer")
         self.assertEqual(identity.consume_service, "pantheon-persona-consume@recovery.service")
@@ -170,7 +179,10 @@ class ResolvePersonaCorrectnessGateTest(unittest.TestCase):
             identity.supervise_wrapper_path,
             Path("/home/claude-research/.local/bin/specialist-bot-supervise.sh"),
         )
-        self.assertEqual(identity.model, "claude-opus-4-8")
+        # T-4526 (the operator TG 7988, 2026-10-04): "can you get specialist onto opus
+        # 5.5?" Reverses T-4021 (TG 3304, opus 4.8). Effort stays xhigh
+        # (T-3084 fleet-effort-policy).
+        self.assertEqual(identity.model, "claude-opus-5-5")
         self.assertEqual(identity.channels, CONTROL_PLANE_CHANNELS)
         self.assertEqual(identity.consume_timer, "pantheon-persona-consume@specialist.timer")
         self.assertEqual(identity.consume_service, "pantheon-persona-consume@specialist.service")
@@ -409,7 +421,7 @@ class ResolveBespokeIdentityTest(unittest.TestCase):
 
     def test_recovery_bespoke_identity_matches_hardcoded_constants(self) -> None:
         identity = resolve_bespoke_identity("recovery", unit_text=RECOVERY_UNIT_TEXT)
-        self.assertEqual(identity.role, "recovery")
+        self.assertEqual(identity.role, "head-system-orchestrator")
         self.assertEqual(identity.account, "claude-fallback")
         self.assertEqual(identity.uid, 1001)
         self.assertEqual(identity.home, Path("/home/claude-fallback"))
@@ -465,6 +477,11 @@ class DefaultManifestPathTest(unittest.TestCase):
             Path("/home/claude-research/pantheon-config/instance.yaml"),
         )
 
+    @unittest.skipIf(
+        _RUNTIME_ACCOUNT == "claude-fallback",
+        "T-3395: seat IS recovery — recovery's own instance.yaml is readable, "
+        "cross-account-failure premise cannot hold.",
+    )
     def test_resolve_persona_with_no_manifest_uses_target_default(self) -> None:
         # This seat cannot read Recovery's own clone (cross-account, verified
         # Permission denied) -- the point of this test is that resolve_persona
@@ -484,6 +501,11 @@ class CliUnreadableUnitFileTest(unittest.TestCase):
     seat's own situation against specialist's/recovery's live unit files. Must
     surface a clean RESOLVE-FAIL line + exit 1, not a raw traceback."""
 
+    @unittest.skipIf(
+        _RUNTIME_ACCOUNT == "claude-research",
+        "T-3395: seat IS specialist — specialist's own unit file is readable, "
+        "cross-account-failure premise cannot hold.",
+    )
     def test_permission_denied_surfaces_clean_failure(self) -> None:
         import contextlib
         import io
@@ -519,6 +541,11 @@ class CliUnreadableUnitFileTest(unittest.TestCase):
             stdout.getvalue(),
         )
 
+    @unittest.skipIf(
+        _RUNTIME_ACCOUNT == "claude-fallback",
+        "T-3395: seat IS recovery — recovery's own unit file is readable, "
+        "cross-account-failure premise cannot hold.",
+    )
     def test_bespoke_identity_subcommand_same_clean_failure_shape(self) -> None:
         import contextlib
         import io

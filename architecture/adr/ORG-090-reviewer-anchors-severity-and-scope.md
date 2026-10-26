@@ -21,7 +21,7 @@ relates: [ORG-041, ORG-089, T-3439, T-3431]
 
 [[ORG-041]] (Ratified 2026-07-11 by the operator via TG 5624) established Codex as the standing adversarial spec-reviewer with a default 3-round cap and cap-exhaustion escalation. It named the flow but did NOT specify how reviewers should CLASSIFY findings, what SCOPE-BOUNDS govern the review, or how HO/dispatchers should FILTER findings on the way back.
 
-Session 2026-09-06 surfaced the gap. The operator steer TG 9034 + 9036 (during the ORG-089 rev-3 arc): *"does cairn have anchors and bounds for how to determine what to critique in a review"* → *"yeah this needs work."* Motivating exhibit is the ORG-089 rev-2 balloon (218 → ~500 lines when HO accepted every Cairn REBOUND wholesale, corrected via the operator TG 9040 rev-3 revert to design-only scope). Session-cumulative pattern: 4 verdicts today (ORG-089 rev-3 + ORG-071 WITH-TRIM + ORG-088 shape-rewrite + ORG-072 WITH-RELOCATION) all steered by the same altitude discipline — the reviewer + HO filter now needs a formal framework so upstream discipline enforces itself rather than requiring the operator's intervention.
+Session 2026-09-06 surfaced the gap. The operator steer TG 9034 + 9036 (during the ORG-089 rev-3 arc): *"does consultant have anchors and bounds for how to determine what to critique in a review"* → *"yeah this needs work."* Motivating exhibit is the ORG-089 rev-2 balloon (218 → ~500 lines when HO accepted every Consultant REBOUND wholesale, corrected via the operator TG 9040 rev-3 revert to design-only scope). Session-cumulative pattern: 4 verdicts today (ORG-089 rev-3 + ORG-071 WITH-TRIM + ORG-088 shape-rewrite + ORG-072 WITH-RELOCATION) all steered by the same altitude discipline — the reviewer + HO filter now needs a formal framework so upstream discipline enforces itself rather than requiring the operator's intervention.
 
 This ADR is the reviewer/dispatcher counterpart to [[ORG-089]]'s drafter anchors (Appetite + Riskiest-assumption), operating on the same altitude discipline (`sop/standard/ratifiable-adr-shape.md`).
 
@@ -37,7 +37,7 @@ Explicit ceiling: SEVERITY taxonomy + SCOPE-BOUNDS + APPROVE-WITH-NIT variant + 
 
 **Reviewers can self-classify findings by severity + scope without additional tooling — a docs-tier convention is enough discipline.**
 
-Cheap test / mitigation: apply the taxonomy on the next 3-5 Cairn/Codex review passes; observe whether reviewers cluster at one severity, fail to distinguish scope, or ignore the taxonomy entirely. If reviewers can't self-classify usefully, the taxonomy needs enforcement (tooling gate at report boundary, or manual gate in HO's dispatch brief). Re-evaluate at 5 review-passes post-ratify; if the self-classification signal is noisy or absent, file the enforcement follow-up as its own arc.
+Cheap test / mitigation: apply the taxonomy on the next 3-5 Consultant/Codex review passes; observe whether reviewers cluster at one severity, fail to distinguish scope, or ignore the taxonomy entirely. If reviewers can't self-classify usefully, the taxonomy needs enforcement (tooling gate at report boundary, or manual gate in HO's dispatch brief). Re-evaluate at 5 review-passes post-ratify; if the self-classification signal is noisy or absent, file the enforcement follow-up as its own arc.
 
 ## Decision
 
@@ -107,7 +107,7 @@ This filter replaces the failure mode "accept every finding as ratifiable" — w
 - Enforcement in tooling (auto-classification prompt, severity linter, verdict schema JSON, report-boundary gate that refuses uncategorized findings).
 - Scoring rubric for reviewer performance across arcs.
 - Obligation for reviewer to auto-file build tickets for OUT-OF-SCOPE findings (proposed: no — reviewer names the concern, HO/author decides ticket-worthiness).
-- Extending this ADR beyond Cairn/Codex to Fable + Claude-tier reviewers (they use the same review flow; the anchors apply, but formalizing that composition is a separate pass).
+- Extending this ADR beyond Consultant/Codex to Fable + Claude-tier reviewers (they use the same review flow; the anchors apply, but formalizing that composition is a separate pass).
 
 **open questions:**
 - Should OUT-OF-SCOPE findings receive an explicit acknowledgement in the reviewer's report (so authors know they were seen + intentionally deferred, not silently dropped)? Proposed: yes, as a "noted, out-of-scope for ratify body" line per finding; author decides follow-up.
@@ -116,11 +116,6 @@ This filter replaces the failure mode "accept every finding as ratifiable" — w
 
 ## Review + build history
 
-Anchors sourced from the 2026-09-06 session (pre-annotated on T-3439 at ledger-adjacent commit before the operator's approach pick):
-
-- **Altitude rule** in action: ORG-089 rev-3 shape-strip (the operator TG 9040); ORG-071 RATIFY-WITH-TRIM (TG 1784); ORG-072 RATIFY-WITH-RELOCATION (TG 1786-1791); ORG-088 shape-rewrite (TG 9056).
-- **Clutter rule** in action: ORG-088 review-log relocated to `notes/2026-09-06-org088-review-history.md`; ORG-072 A1-A8 relocated to `notes/2026-09-06-org072-normative-additions-relocated.md`.
-- **HO reviewer-response filter failure mode** observed: ORG-089 rev-2 balloon corrected via the operator TG 9040 revert to rev-3.
-- **APPROVE-with-nit variant** absent from ORG-041: today's arcs would have benefited from it in multiple places where LOW findings triggered unnecessary REBOUND rounds.
+Where the anchors were sourced (the 2026-09-06 altitude- and clutter-rule cases, and the reviewer-filter failure mode): `notes/2026-10-08-org-090-review-history.md`.
 
 Build disposition: `no-build-needed` — this is convention-tier methodology captured in the ADR body + the SOP surfaces already ratified (`sop/standard/ratifiable-adr-shape.md` + `sop/standard/adr-to-buildout-planning.md` + `sop/standard/plan-first-dispatch.md`). No code lands from this ADR; discipline lands via reviewer briefs applying the taxonomy + HO briefs applying the filter.

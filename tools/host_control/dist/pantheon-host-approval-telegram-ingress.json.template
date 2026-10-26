@@ -1,0 +1,17 @@
+{
+  "schema": "pantheon-telegram-ingress-config/v1",
+  "ingress_uid": "@INGRESS_UID@",
+  "approval_uid": "@APPROVAL_UID@",
+  "credential": {
+    "credential_id": "telegram-approval-bot",
+    "location": "/etc/pantheon/host-approval-telegram/credentials/bot-token",
+    "owner_gid": "@INGRESS_GID@"
+  },
+  "allowlist": {
+    "user_id": "@ALLOWLISTED_TELEGRAM_USER_ID@",
+    "chat_id": "@ALLOWLISTED_TELEGRAM_CHAT_ID@"
+  },
+  "state_dir": "/var/lib/pantheon-host-approval-telegram",
+  "card_ttl_max_seconds": 3600,
+  "poll_timeout_seconds": 2
+}

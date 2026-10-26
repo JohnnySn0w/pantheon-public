@@ -1,0 +1,12 @@
+[Unit]
+Description=Pantheon CI-runner disk monitor — hourly CT202 free-space probe (T-4176)
+Documentation=file:///home/%u/pantheon-config/tools/ci_runner_disk_monitor.py
+
+[Timer]
+# :40, offset from pantheon-disk-usage (:50) so the two probes never overlap.
+OnCalendar=*-*-* *:40:00
+Persistent=true
+Unit=pantheon-ci-runner-disk.service
+
+[Install]
+WantedBy=timers.target

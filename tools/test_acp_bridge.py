@@ -474,7 +474,7 @@ class SessionContinuityIsSelfReportingTest(_CleanRoomBase):
     """T-2341: a restart that LOST session continuity used to be invisible.
 
     The bridge resumes by default — measured across two seats, specialist kept the session
-    id on 19 of 22 restarts and mnemosyne on 3 of 4 — so an id change is the ~14% case
+    id on 19 of 22 restarts and archivist on 3 of 4 — so an id change is the ~14% case
     and it is the lossy one. But "the id changed" carried TWO OPPOSITE meanings
     depending on why the restart happened, and THREE indistinguishable causes:
 
@@ -529,7 +529,7 @@ class SessionContinuityIsSelfReportingTest(_CleanRoomBase):
     def test_a_no_stored_id_is_INFO_and_explicitly_not_a_loss(self):
         """First run / deliberately removed state file. Must not read as a failure —
         removing the state file is the documented way to force a clean session, and
-        that is exactly what mnemosyne's bridge restart did today."""
+        that is exactly what archivist's bridge restart did today."""
         bridge, _t, _i = self._make_bridge(responses=_base_responses())
         with self.assertLogs("root", level="INFO") as cm:
             bridge.start()
@@ -1060,7 +1060,7 @@ class UnknownPaneIsAnExplicitBranchTest(_CleanRoomBase):
     do NEITHER" — and unknown drained. The code implemented two ways what the
     comment described three ways, and `else` carried a decision nobody made.
 
-    The real instance (mnemosyne's bridge log): a degrading tmux client walked the
+    The real instance (archivist's bridge log): a degrading tmux client walked the
     pane writable-and-readable -> unwritable-but-readable (98 consecutive wake
     failures) -> unreadable, and the drain fired on the unreadable step while the
     main seat was ALIVE the whole time. So the discriminating question is not "can

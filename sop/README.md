@@ -1,6 +1,6 @@
 # sop/
 
-Standard Operating Procedures. The "how to do X correctly" tier (`sop/standard/`) and the "what to do when X breaks" tier (`sop/remediation/`). Hand-curated under D2; per-SOP operator-ratification at surface time before the SOP becomes precedent HO autonomously cites.
+Standard Operating Procedures. The "how to do X correctly" tier (`sop/standard/`) and the "what to do when X breaks" tier (`sop/remediation/`). Hand-curated under D2. `standard/` SOPs are adopted by HO below D3's goal-level bar; `remediation/` SOPs keep per-SOP the operator ratification (see §Authoring + adoption flow).
 
 Per the operator msg_822 + msg_826 (military-FM analogy: FM 3-0 doctrine + FM 6-0 SOPs + lessons-learned feedback loop) — SOPs sit in the operational-tier sandwich between principles/directives/policies above and real-time decisions below.
 
@@ -56,14 +56,12 @@ expected outcome, when to escalate.>
 <Principles, directives, policies, ADRs, prior tickets, this ticket's parent.>
 ```
 
-## Authoring + ratification flow
+## Authoring + adoption flow
 
-1. **HO drafts** the SOP (per D2 hand-curated).
-2. **HO surfaces draft** to the operator for ratification at surface-time.
-3. **the operator ratifies** the recommended-remediation path rankings (for `remediation/`) or the procedure steps (for `standard/`) before the SOP becomes precedent.
-4. **Per-SOP ratification logged** in ledger entries — separate audit chain per SOP, not bulk-ratified.
+- **`standard/`:** HO (or the authoring seat) drafts and adopts. An SOP is methodology, below D3's goal-level bar (D3 as amended 2026-06-11, the operator msg 3733/3735), so there is no ratify-ask. The status line reads `Adopted <date> by <author>` with the justification. Adoption gets a ledger entry, and the operator sees it in the digest and can override. An SOP that would set a goal-level rule (D3's reserved list: money, secrets, access grants, outward-facing or irreversible acts) goes to the operator. SOPs that the operator ratified before the amendment keep that status.
+- **`remediation/`:** per-SOP the operator ratification stays (T-0157 ratified design), because a remediation SOP pre-authorizes HO's autonomous discipline maneuvers and fixes their D3 placement. Draft one SOP at a time, don't bulk-author, and log each ratification in the ledger. The rule is still in use: `persona-daemon-liveness-recovery.md` was ratified 2026-10-17 (TG 8525).
 
-This per-SOP gate prevents bulk-author drift where HO compiles many SOPs without validating individual paths.
+Pre-amendment history: until 2026-06-11 every SOP went through per-SOP the operator ratification, to prevent bulk-author drift.
 
 ## Boundary
 
@@ -75,6 +73,8 @@ This per-SOP gate prevents bulk-author drift where HO compiles many SOPs without
 SOPs are the *procedural* tier — what you do, in what order, when. Higher tiers are *what to be / what to do at high level*; lessons are *what we learned*; SOPs are *here's the script*.
 
 ## Founding entries
+
+Historical record of the 2026-05-10 founding set. The Ratification column is not maintained. Each SOP's own status line, mirrored in the `standard/` and `remediation/` Auto-indexes, is current.
 
 | File | Tier | Source | Ratification |
 |---|---|---|---|

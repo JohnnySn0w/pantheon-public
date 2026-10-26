@@ -25,7 +25,9 @@ harness controller. See T-2967 final report "deviations" for the explicit
 flag.
 
 Reuses tools.harness.build_parser()/validate_args() so the telegram argument
-shape can never drift from the CLI's.
+shape can never drift from the CLI's. That includes the ORG-106 L1 (T-5524)
+seat verbs `pause`, `sleep` and `wake` (ORG-106 L3b adds sleep): all are mutating, so a missing --reason yields a
+ReasonPrompt, and a bad --for / --owner / --ticket yields a ParseError.
 """
 
 from __future__ import annotations
@@ -138,9 +140,10 @@ def parse_harness_message(
 
     if not argv:
         return ParseError(
-            message="usage: /harness <persona> <status|restart|clear-cooldown|hold|clear-hold> ..."
+            message="usage: /harness <persona> <status|restart|clear-cooldown|hold|clear-hold|pause|sleep|wake|quarantine> ..."
         )
 
+    # T-5069: shares the CLI parser, so telegram restart inherits the handoff-first step; if this is ever wired to a live bot, give restart a shorter handoff timeout (the handler would block up to 300s).
     parser = harness.build_parser()
     try:
         args = parser.parse_args(argv)

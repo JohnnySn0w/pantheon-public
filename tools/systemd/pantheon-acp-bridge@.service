@@ -6,11 +6,11 @@ After=network.target
 # Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
 # T-2264: this unit was the ONE delivery-critical unit in this directory without the line, and the gap
 # was measured, not theorised — 2026-07-28, same box, same evening, same delivery path:
-#   pantheon-mailbox-wake@metis   HAS this line -> failed 21:47:04Z, routed to Recovery, surfaced in minutes.
-#   pantheon-acp-bridge@mnemosyne LACKED it     -> tmux session died ~19:20Z, status=1/FAILURE, restarted
+#   pantheon-mailbox-wake@mason   HAS this line -> failed 21:47:04Z, routed to Recovery, surfaced in minutes.
+#   pantheon-acp-bridge@archivist LACKED it     -> tmux session died ~19:20Z, status=1/FAILURE, restarted
 #                                                  20:50:14Z. NINETY MINUTES INVISIBLE; surfaced only
 #                                                  because the operator happened to ask.
-# Restart=always does NOT make this redundant: metis measured that OnFailure fires per-failure even under
+# Restart=always does NOT make this redundant: mason measured that OnFailure fires per-failure even under
 # Restart=always (refuting its own earlier reasoning), so a crash-loop alerts every cycle rather than
 # healing silently. A unit that restarts itself forever is exactly the one whose failures are invisible.
 OnFailure=pantheon-unit-failure-alert@%n.service
@@ -21,7 +21,7 @@ OnFailure=pantheon-unit-failure-alert@%n.service
 # the T-1633 Unit 2 build.
 
 [Service]
-# Supervised wrapper (NOT Type=oneshot), mirrors pantheon-ancestor-daemon.service:
+# Supervised wrapper (NOT Type=oneshot), mirrors the claude-telegram supervised wrapper:
 # the wrapper stays alive as MainPID for as long as the tmux-hosted bridge lives,
 # so a dead session => wrapper exits => Restart=always respawns it.
 Type=simple

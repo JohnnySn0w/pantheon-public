@@ -27,7 +27,7 @@ family.
 group-write, so it passes on `0640` — the exact defect. It was ALSO green for an independent reason:
 the author's seat umask is 002, so `O_CREAT 0660` really did yield 0660 there, while root under umask
 022 got 0640. **Too weak AND passing by environmental accident; either alone would have hidden it.**
-(mnemosyne, T-2329.)
+(archivist, T-2329.)
 
 **(b) The instrument encodes the hypothesis.**
 A prober written as `open(path, 'r+')` with the literal comment `# flock needs write access`, testing
@@ -50,12 +50,12 @@ real drain 0.93. Structural, not luck: a bulk op touches everything existing at 
 `arrival_rate > drain_rate ⇒ queue diverges`, over a window anchored at an empty queue. There,
 `arrivals − acks = pending` **by construction**, so the comparison is the backlog re-expressed and
 cannot return "converging". A perfectly good DESCRIPTION read as a TEST — nastier than a purpose-built
-wrong check, because nothing about it looks broken. (mnemosyne, T-2230.)
+wrong check, because nothing about it looks broken. (archivist, T-2230.)
 
 **(f) The scan reads a different surface than the claim.**
 An AST sweep for "modules that send mail at import time" using `ast.walk()` over each top-level node
 — which descends INTO function bodies. **166 hits, all noise.** Cannot distinguish *runs when
-imported* from *defined in a function*, which is the entire question. (mnemosyne; corrected version
+imported* from *defined in a function*, which is the entire question. (archivist; corrected version
 prunes at `FunctionDef`/`ClassDef` and honours `if __name__`: zero.) Same shape as `deploy_hook.py`'s
 activation probe reading `hooks["SessionStart"]` only and reporting a correctly-registered
 `PreToolUse` hook as inert (T-2320), and as reading an allowlist — which records that a hook is
@@ -69,17 +69,17 @@ event directly). All three were measurements of **one idle recipient**, reported
 Verified at source afterwards: `serve()` is sequential (`run_once()` then `sleep`), `run_once()`
 defers the whole drain while the pane is busy (T-1935), and `handle_message` acks on RETURN. **So the
 window is the recipient's remaining turn time, 8.54 s to ≥83 min (T-2259), driven by state the sender
-cannot see.** Not a constant at all. (specialist + mnemosyne, T-2275/T-2337.)
+cannot see.** Not a constant at all. (specialist + archivist, T-2275/T-2337.)
 
 **(h) The diagnostic is real, correct, and disabled by the level it runs at.**
 `acp_bridge._resolve_session()` resumes the stored session and falls through to `session/new` on ANY
 exception, logging the fallback at `logging.debug` — with a comment stating it is *"Logged (not
 silent) so the fallback is diagnosable"*. The bridge does not run at DEBUG. Replicated on two seats:
-**specialist 3 id changes / 0 fallback lines; mnemosyne 3 id transitions (`52e8dd92 → a81699e2 →
+**specialist 3 id changes / 0 fallback lines; archivist 3 id transitions (`52e8dd92 → a81699e2 →
 8c556d8d → ec3b7da8`) / 0 fallback lines in 656 non-JSON log lines.** The instrument exists, is
 correct, is green, and cannot fire. ⇒ A comment asserting a property (*"not silent"*) that a runtime
 setting elsewhere revokes — and the assertion is the kind nothing executes, so §"why it survives
-review" applies to it directly. (specialist cc5aa49d + mnemosyne, filed to recovery.)
+review" applies to it directly. (specialist cc5aa49d + archivist, filed to recovery.)
 
 ⇒ **FIXED `cf0324bf2` (T-2341).** Each of the three causes now logs distinctly at a level that
 emits: (a) no stored id → `INFO` *"nothing was lost"*; (b) load raised → `WARNING` *"CONTINUITY
@@ -91,7 +91,7 @@ which is this defect with better formatting. Verified by mutation: reverting (b)
 exactly that test and the lost-continuity test red, and only those two (specialist `cc5aa49d`;
 independently re-checked at source before this edit — `cf0324bf2` is an ancestor of `origin/main`
 and all three calls are `logging.info`/`logging.warning`).
-⚠️ **Forward-looking only:** the historical id-change events on specialist and mnemosyne stay
+⚠️ **Forward-looking only:** the historical id-change events on specialist and archivist stay
 unattributable, because the evidence to attribute them was never written.
 **This entry was itself stale for four days** — the catalog's canonical entry on instruments that
 report a state they can no longer detect was doing exactly that. Nothing structurally ties a fix to
@@ -156,7 +156,7 @@ sent.** The helper printed the return code and gated nothing. It became true a m
 Paired deliberately with its own null: an audit of 11 claimed annotations on the other seat found
 11 real — *"every claim was true, but not because anything enforced it."* **A null from a population
 that happened not to contain the failure, and a positive from one that did, argue for the same fix
-with very different force; file them together.** (mnemosyne — and that audit's first pass returned
+with very different force; file them together.** (archivist — and that audit's first pass returned
 0/11 by grepping the wrong actor tag, i.e. 100% false negatives, which read as a clean bill.)
 
 ⇒ Fix, and it is the same shape as the paste-ready assertion above: **make the assertion and the

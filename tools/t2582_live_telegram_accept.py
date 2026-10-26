@@ -28,7 +28,7 @@ with a fake ``SendFn`` and never touch the live wiring in :func:`main`.
 
 Operator-refusal (belt-and-suspenders, mirrors ``telegram_outbound.py``'s own
 ``_REAL_OPERATOR_CHAT_ID`` guard): :func:`refuse_operator_chat` HardStops if
-the target chat_id is ever the real operator chat ``456474197`` — an
+the target chat_id is ever the real operator chat ``424242424`` — an
 independent module-level literal, not an import of that module's constant,
 so a future change there cannot silently widen or narrow this guard.
 """
@@ -63,7 +63,7 @@ DEDICATED_TEST_CHAT_ID = "-5356823915"
 # The real operator chat — this leg must NEVER be wired at it. Independent
 # literal (see module docstring) rather than importing telegram_outbound's
 # own constant.
-_REAL_OPERATOR_CHAT_ID = "456474197"
+_REAL_OPERATOR_CHAT_ID = "424242424"
 
 # The isolated pantheon-test-owned token path (mode 600, not readable by the
 # `claude` user without sudo — deliberate isolation from the live operating

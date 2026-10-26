@@ -1,0 +1,24 @@
+  exists. I'll check why the launch ops were admitted before deciding how to
+  proceed.
+
+[92m●[39m [1mBash[0m(sed -n 1,110p tools/host_control/envelope.py | grep -v "^$" | head -120)
+[2m[37m [0m [2m[37m⎿[0m [2m[37m [0m"""The closed per-seat executor envelope (ORG-052 section 8 bootstrap
+     slice;
+     ORG-052 Unit 5a, T-2917).
+     [2m… +97 lines (ctrl+o to expand)[0m
+
+[91m✽[39m [91mBefuddling… [2m[37m(54s · ↓[0m [2m[37m960 tokens · [0m[38;5;248mstill thinking with medium effort[2m[37m)[0m
+[2m[37m  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's [0m
+     [2m[37mcurrent work[0m
+
+[37m────────────────────────────────────────────────────────────────────────────────
+[2m❯ [0m
+[37m────────────────────────────────────────────────────────────────────────────────
+[39m  [91m⏵⏵ bypass permissions on[2m[37m · [0m[96m7 shells[39m
+
+[1m  ● main[0m
+[2m[37m [0m [2m[37m◯[0m [2m[37mimplementer[0m    [2m[37mChecking smoke1.log for crash[0m  [2m[37m1h 41m 18s[0m [2m[37m·[0m [2m[37m↓[0m [2m[37m361.2k[0m [2m[37mtokens[0m
+[2m[37m [0m [2m[37m◯[0m [2m[37minstaller-arc[0m  [2m[37mInstaller[0m [2m[37mhardening[0m [2m[37marc[0m [2m[37morche…[0m                         [2m[37midle[0m
+[2m[37m [0m [2m[37m◯[0m [2m[37mimplementer[0m    [2m[37mCommitting[0m [2m[37mpersona_installer[0m [2m[37m…[0m  [2m[37m1h[0m [2m[37m1m[0m [2m[37m32s[0m [2m[37m·[0m [2m[37m↓[0m [2m[37m130.0k[0m [2m[37mtokens[0m
+[2m[37m [0m [2m[37m◯[0m [2m[37mimplementer[0m    [2m[37mBlocking[0m [2m[37mon[0m [2m[37mpytest[0m [2m[37mlog[0m [2m[37mcomple…[0m    [2m[37m24m 19s[0m [2m[37m·[0m [2m[37m↓[0m [2m[37m264.2k[0m [2m[37mtokens[0m
+

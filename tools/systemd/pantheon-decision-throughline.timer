@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon decision throughline trigger — weekly fire (Monday 11:30 UTC)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=Mon *-*-* 11:30:00 UTC
+Persistent=true
+Unit=pantheon-decision-throughline.service
+
+[Install]
+WantedBy=timers.target

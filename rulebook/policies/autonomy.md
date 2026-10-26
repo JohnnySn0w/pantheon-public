@@ -14,6 +14,8 @@ For the architecture rationale + ratification trail, see `BACKLOG.md` §B9 + Upd
 
 ## Policy
 
+> **Mechanism status (2026-10-18, T-4556):** the pantheon-bridge `/health.last_inbound_at` source named below (the "Bridge /health.last_inbound_at" row, step 4 of the clean cycle, and the `recent_telegram` skip vocab) was decommissioned on 2026-06-04, and the gate silently failed open until T-4205 replaced it. The `recent_telegram` gate now reads this account's own Claude Code session jsonls under `~/.claude/projects/` for the last Telegram inbound (`check_recent_inbound` in `tools/inbox_consumer.py`, via `tools/telegram_inbound.py`). The 5-minute threshold and the fail-open on probe error are unchanged. The decommission fired this policy's "bridge `/health.last_inbound_at` semantics change" re-evaluate trigger, and T-4205 was the repair that answered it. Since T-4556 the weekly re-eval walk (`tools/adr_reeval_walk.py`) also scans `rulebook/policies/` and `sop/` triggers (surface-only: they appear in the weekly summary and never auto-file a ticket). The ratified policy text below is unchanged.
+
 ### What runs where
 
 | Component | Path | Where it runs |
@@ -140,7 +142,7 @@ File a fixture ticket so the first cycle has something to consume. The Ask shoul
 ```bash
 PANTHEON_ACTOR=orchestrator python3 ~/pantheon-config/tools/ticket.py file \
   --requester orchestrator \
-  --target orchestrator \
+  --target role:head_engineering_orchestrator \
   --title "B9 first-fire smoke — no-op ack" \
   --labels "test-fixture,b9-smoke" \
   --stale-after "1d" \
@@ -176,7 +178,7 @@ File a second fixture (same shape as Cycle 1's) before Cycle 3 fires:
 ```bash
 PANTHEON_ACTOR=orchestrator python3 ~/pantheon-config/tools/ticket.py file \
   --requester orchestrator \
-  --target orchestrator \
+  --target role:head_engineering_orchestrator \
   --title "B9 first-fire smoke 2 — verify loop" \
   --labels "test-fixture,b9-smoke" \
   --stale-after "1d" \
@@ -254,6 +256,8 @@ A stuck inject is when `tmux send-keys` returned 0 (logged as `pulled T-NNNN`) b
 
 # Activity digest — operator notes (T-0063 / B10)
 
+> **RETIRED (retired 2026-09-29, T-4289).** `tools/activity_digest.py` and its units were removed: its pulse was status-only under T-4200 (action-only Telegram). The notes below are historical.
+
 A sibling autonomy service to the inbox auto-consumer. Where the consumer pulls work IN, the digest pushes a "what happened" signal OUT. Cron'd under Recovery (post-T-0064 deploy); fires every 5h at fixed UTC offsets (00 / 05 / 10 / 15 / 20). Reads pantheon-config (`tickets/done/` resolved-this-window, BACKLOG.md for arc-name shortform), classifies tickets by project (repo-as-project heuristic via resolve-text scan) and arc (label match on `b<N>` pattern), renders short Telegram-Markdown, posts to the operator's chat. Quiet windows post a one-line "no notable activity" message rather than silence.
 
 For the architecture rationale + ratification trail: BACKLOG.md §B10 + tickets T-0057 (design parent) + T-0063 (build) + T-0064 (Recovery deploy).
@@ -277,6 +281,8 @@ Zero matched tickets in the window → ONE-line `*No notable activity in <window
 This is the structural answer to the digest-broken-vs-healthy ambiguity: if you stop receiving the 5h digests entirely, that's the broken signal; if you receive the quiet-window message, the service is healthy and the org just had a quiet window.
 
 ## Orchestrator-health auto-resolve (T-0201)
+
+> **Mechanism status (2026-09-29, T-4203 / T-4206; updated 2026-10-18, T-4555):** the keystroke implementation described below, `RECOVERY_AUTO_RESOLVE_ALLOWLIST` in `tools/inbox_consumer.py`, was **retired in T-4203**. It was gated on the decommissioned pantheon-bridge and silent since 2026-06-03. **The ratified outcome is delivered structurally instead**: every seat's `permissions.allow` carries bare `Edit`/`Write` (pantheon-bringup SOP, agent-autonomy allowlist; T-0760, 2026-06-03). So file create/edit never prompts, and that includes paths OUTSIDE the seat's cwd (T-4217: observed on mason/artisan, hundreds of unattended out-of-cwd Write/Edit calls succeeding in under 2s). That is broader than posture C's out-of-cwd-escalate rule below. The operator's 2026-10-13 rulings make that rule moot for Pantheon's configured seat launches: permissions are enforced at the unix user, not by harness prompts (TG 11733); all harnesses get full unlocks (TG 11742); and Claude seats switch to bypassPermissions (TG 11753, see the T-4939 amendment below, rolled out via T-4935). The digest FYI T-4217 planned, and the post-hoc review ticket T-4555 asked for, are not needed: with seats in bypassPermissions there is no out-of-cwd prompt left to tighten or loosen. OS permissions still confine each seat to its own home, /tmp and shared dirs. Only Claude Code's protected paths still prompt (`.git`, `.claude`, shell rc files, and similar), which matches the escalate-always "edit its own settings" class. The ratified policy text below is unchanged. The dev-channels boot dialog is dismissed fail-closed by `verify_startup.sh` and the relaunch scripts; `unknown_dialog_monitor.py` alerts Recovery on unknown dialogs and on stuck tool-permission prompts (detect-only).
 
 When the inbox-consumer's orchestrator-health probe detects a pane wedge sentinel, Recovery checks the codified `RECOVERY_AUTO_RESOLVE_ALLOWLIST` (in `tools/inbox_consumer.py`) before escalating. Allowlist entries pair a sentinel substring with a list of tmux send-keys ops; when matched, Recovery applies the keystrokes immediately + emits an informational Telegram (audit, not approval-gated) and clears the wedge state. Non-allowlisted sentinels go to the existing escalation path (alert to the operator with sentinel + recommended remediation).
 
@@ -304,6 +310,15 @@ Specialist's T-0473 research catalogued ~30 Claude Code v2.1.x permission/wedge 
 
 Substrate work to implement posture C (extend `RECOVERY_AUTO_RESOLVE_ALLOWLIST` from binary `dict[str, list[str]]` to context-aware rules with predicates) landed under **T-0479** (PR #12: `AutoResolveRule` + `tools/_pane_predicates.py`). Each auto-resolveable sentinel class gets a per-class operator-ratification entry below (HO drafts the predicate boundary; the operator ratifies the diff; then the implementer wires it into the live allowlist). The T-0142 §3 "ratify before landing a new auto-resolve rule" gate stands — posture C changes the rule SHAPE (predicate-bearing), not the ratification requirement.
 
+#### Amendment — Claude seats launch in bypassPermissions (the operator TG 11753, T-4939 / T-4935, 2026-10-13)
+
+The operator's later decision supersedes the bypass-permissions item and the `skipDangerousModePermissionPrompt` line above, for Pantheon's own Claude seat launches only. Per TG 11742, "all harnesses get full unlocks". Per TG 11733, permissions are enforced at the unix user, not by harness prompts.
+
+- **Launch mode.** Claude seats launch with `--permission-mode bypassPermissions`.
+- **Dialog consent.** The seat's launch path writes `skipDangerousModePermissionPrompt: true` into the account's user-scope `settings.json` (`tools/bypass_consent.py`). Claude Code does not honor this consent from a `--settings` file. Without it, the one-time bypass warning dialog would stall unattended relaunches.
+- **Enforcement is unchanged.** Blocking PreToolUse hooks (worker-guard, mcp-list-guard, background-pipe-gate), `permissions.deny` and `ask` rules all still apply under bypass. T-4935 verified this on the CLI. No seat carried deny or ask rules when this was adopted.
+- **Escalate-always still holds** for a bypass prompt appearing on anything other than a configured seat launch, for example an ad-hoc session or a seat whose consent step failed. Recovery escalates those rather than auto-accepting them.
+
 #### First live-predicate batch — Ratified 2026-05-20 by the operator (Telegram msg_1739, T-0480)
 
 The following two predicate boundaries are ratified to go live. Predicate helpers (`path_in_agent_cwd`, `path_in_canonical_pantheon_dirs`) + dialog extractors already exist + are unit-tested in `tools/_pane_predicates.py` (T-0479). Only **option 1** (the in-scope action) is auto-sent; option-2 trust-expansions ("Yes, and don't ask again…", "allow Claude to edit its own settings") stay escalate-always.
@@ -315,14 +330,16 @@ The following two predicate boundaries are ratified to go live. Predicate helper
 
 Deferred: `Enter plan mode?` auto-resolve (Pantheon agents don't hit it in unattended flows). Ratified 2026-05-20 (T-0480); the implementer cycle that wires these two boundaries into the live allowlist is tracked by T-0489; production go-live is a supervised-first-fire.
 
+*Status (2026-10-18, T-4565): T-0489 wired both boundaries (PR #18, f17679e, 2026-05-20). They went live through Recovery's auto-pull, not a supervised first-fire; T-0490, which tracked that first-fire, was closed overtaken-by-events per the operator (msg 2451, 2026-06-04). The keystroke mechanism was later retired in T-4203 (2026-09-29); see the banner under "Orchestrator-health auto-resolve". Nothing here is pending.*
+
 ## Boundary
 
-This policy covers the inbox auto-consumer's gating + injection mechanics + activity-digest cadence. It does NOT cover:
+This policy covers the inbox auto-consumer's gating + injection mechanics (the activity-digest cadence it also covered was retired 2026-09-29, T-4289). It does NOT cover:
 
 - HO's discretionary direct-action scope (governed by `rulebook/policies/trust-posture.md`).
 - Manual ticket pulls (HO can pull from `tickets/inbox/` directly anytime, bypassing the consumer).
 - Specialist's research-watch cron (separate timer + queue; see `knowledge/watch/`).
-- Recovery's grooming + activity-digest cadence parameters (those tools' parameters live with the tools, not here).
+- Recovery's grooming cadence parameters (those tools' parameters live with the tools, not here).
 - Cap-hit auto-resume (preemptive context-fill restart) — see `sop/standard/auto-resume-operator-runbook.md`.
 
 ## Re-evaluate when
@@ -337,7 +354,7 @@ This policy covers the inbox auto-consumer's gating + injection mechanics + acti
 
 - `rulebook/directives.md` §D1 (bandwidth preservation) + §D3 (autonomy bar) — the org-level rules this policy operationalizes.
 - `rulebook/policies/trust-posture.md` — calibration of HO's direct-action scope; sister policy.
-- `BACKLOG.md` §B9 (inbox auto-consumer) + §B10 (activity digest) — design rationale.
-- `tools/inbox_consumer.py` + `tools/activity_digest.py` — implementation.
+- `BACKLOG.md` §B9 (inbox auto-consumer) + §B10 (activity digest, retired 2026-09-29, T-4289) — design rationale.
+- `tools/inbox_consumer.py` — implementation (`tools/activity_digest.py` retired 2026-09-29, T-4289).
 - `sop/standard/auto-resume-operator-runbook.md` — preemptive context-fill restart (sibling auto-rhythm; T-0184/T-0189).
 - T-0052 (consumer ticket lineage), T-0057 + T-0063 + T-0064 (digest lineage).

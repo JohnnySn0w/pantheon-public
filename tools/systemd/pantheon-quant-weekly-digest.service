@@ -1,0 +1,25 @@
+[Unit]
+Description=Pantheon ORG-102 weekly quant digest and H2 outbox (T-4780)
+Documentation=file:///home/%u/pantheon-config/architecture/adr/ORG-102-fleet-quantification-judgment-calls-and-delivery.md
+
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=%h/.npm-global/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+
+# Canonical first host: Mason/Codex, because this weekly run also produces the
+# Codex-rendered H2 outbox. Pure-Python aggregation can move later; the renderer
+# step must run where `codex exec` is authenticated.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/quant_weekly_digest.py build --out /var/lib/pantheon/quant
+
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=45min
+
+[Install]
+WantedBy=default.target

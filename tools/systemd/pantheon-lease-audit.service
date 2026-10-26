@@ -1,0 +1,38 @@
+[Unit]
+Description=Pantheon detective lease check: repairs taken without the repair lease (T-4884 B4b)
+Documentation=file:///home/%u/pantheon-config/notes/2026-10-12-t4884-codex-recovery-seat-design.md
+
+# NOT auto-installed by any provision script. Template only (T-4884 B4b). Runs
+# on BOTH recovery seats' accounts (claude-fallback = Recovery, codex-fallback =
+# the recovery seat) so that if one seat is dark the other's check still covers it.
+# Explicit --dry-run: it prints findings and would-act lines to the journal and
+# writes only its state file; --live is refused until T-4884 B13.
+#
+# `sg systemd-journal -c` is REQUIRED: a --user unit runs with only the
+# account's primary group (user-mode systemd cannot set SupplementaryGroups),
+# and the sudo records live in the system journal. Without the group the
+# tool's positive control fails and it exits 2 (JOURNAL_UNREADABLE) rather than
+# reporting a false "no repairs". codex-fallback must be added to group
+# systemd-journal at provisioning (B7) before this runs on the recovery seat.
+#
+# The broker lease-event export (/var/lib/codex-recovery-public/lease-events.jsonl,
+# root:pantheon-health 2750/0640; codex-fallback and claude-fallback in group
+# pantheon-health) does not exist until the broker is installed (B11); until
+# then every run reports one LEASE_STATE_UNKNOWN and flags nothing. NOTE for
+# B7/B11: this process needs BOTH groups (systemd-journal via the sg wrap
+# below, pantheon-health for the export). The account's user manager must
+# carry pantheon-health (restart it after the group add), or the wrap must
+# grant both; verify the export reads before relying on a clean run.
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+# The window overlaps the 5-min cadence; findings are de-duplicated per sudo
+# record through the state file (~/.local/state/pantheon/lease_audit.json).
+ExecStart=/usr/bin/sg systemd-journal -c "/usr/bin/python3 %h/pantheon-config/tools/lease_audit.py --dry-run --since=-15min"
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=240s

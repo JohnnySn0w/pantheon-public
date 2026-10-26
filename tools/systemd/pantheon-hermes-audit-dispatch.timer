@@ -1,0 +1,15 @@
+[Unit]
+Description=Pantheon hermes-audit dispatch — every 15 min, audit main's tip if it is uncovered (T-5354)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# The cadence T-5001 meant the workflow's */15 cron to give. GitHub runs this repo's crons hours
+# late, so the cadence is owned here and the cron is only a backstop.
+OnCalendar=*:0/15
+# A tick missed across a reboot is safe to catch up: it dispatches only if the tip is uncovered.
+Persistent=true
+RandomizedDelaySec=60
+Unit=pantheon-hermes-audit-dispatch.service
+
+[Install]
+WantedBy=timers.target

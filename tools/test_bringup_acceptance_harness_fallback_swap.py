@@ -173,32 +173,32 @@ class ArgvGateGuardTest(unittest.TestCase):
 
     def test_exactly_one_passes(self) -> None:
         index = assert_exactly_one_permission_mode(
-            ("claude", "--permission-mode", "default"), expected_value="default", label="t",
+            ("claude", "--permission-mode", "bypassPermissions"), expected_value="bypassPermissions", label="t",
         )
         self.assertEqual(index, 1)
 
     def test_zero_occurrences_raises(self) -> None:
         with self.assertRaises(HardStop):
-            assert_exactly_one_permission_mode(("claude",), expected_value="default", label="t")
+            assert_exactly_one_permission_mode(("claude",), expected_value="bypassPermissions", label="t")
 
     def test_two_occurrences_raises(self) -> None:
         with self.assertRaises(HardStop):
             assert_exactly_one_permission_mode(
-                ("claude", "--permission-mode", "default", "--permission-mode", "default"),
-                expected_value="default", label="t",
+                ("claude", "--permission-mode", "bypassPermissions", "--permission-mode", "bypassPermissions"),
+                expected_value="bypassPermissions", label="t",
             )
 
     def test_wrong_value_raises(self) -> None:
         with self.assertRaises(HardStop):
             assert_exactly_one_permission_mode(
                 ("claude", "--permission-mode", "acceptEdits"),
-                expected_value="default", label="t",
+                expected_value="bypassPermissions", label="t",
             )
 
     def test_dangling_flag_with_no_value_raises(self) -> None:
         with self.assertRaises(HardStop):
             assert_exactly_one_permission_mode(
-                ("claude", "--permission-mode"), expected_value="default", label="t",
+                ("claude", "--permission-mode"), expected_value="bypassPermissions", label="t",
             )
 
 
@@ -207,7 +207,7 @@ class ArgvGateLegTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ctx = _run_context(Path(tmp))
             detail = harness_fallback_swap._argv_gate_leg(ctx)
-            self.assertEqual(detail["cases"]["implicit_default"]["value"], "default")
+            self.assertEqual(detail["cases"]["implicit_default"]["value"], "bypassPermissions")
             self.assertEqual(detail["cases"]["explicit_override"]["value"], "acceptEdits")
             for case in detail["cases"].values():
                 self.assertEqual(
@@ -452,6 +452,11 @@ class KickLandsExecutesStatusTests(unittest.TestCase):
         )
 
 
+def _codex_config_bytes() -> bytes | None:
+    config_path = Path.home() / ".codex" / "config.toml"
+    return config_path.read_bytes() if config_path.exists() else None
+
+
 class LiveKickDisposableScopeLiveTests(unittest.TestCase):
     """Real tmux + real systemd --user, disposable socket/scope only -- never
     the default socket or the production pantheon-runtime-tmux.scope. Self-
@@ -462,10 +467,15 @@ class LiveKickDisposableScopeLiveTests(unittest.TestCase):
 
     def test_stand_in_mode_completes_tears_down_cleanly_and_stays_deferred(self) -> None:
         account = getpass.getuser()
+        config_before = _codex_config_bytes()
         with tempfile.TemporaryDirectory() as tmp:
             work_root = Path(tmp) / "live-kick"
             with _provenance_patch():
                 evidence = run_live_kick_lands_executes(work_root=work_root, account=account)
+
+            # T-5022: the codex leg's trust seed is rolled back, not leaked
+            # into the real account's ~/.codex/config.toml.
+            self.assertEqual(_codex_config_bytes(), config_before)
 
             self.assertEqual(evidence["mode"], harness_fallback_swap._LIVE_KICK_MODE_STAND_IN)
             transition = evidence["completed_transition"]
@@ -497,6 +507,7 @@ class LiveKickDisposableScopeLiveTests(unittest.TestCase):
 
     def test_teardown_runs_even_when_ack_fails_mid_sequence(self) -> None:
         account = getpass.getuser()
+        config_before = _codex_config_bytes()
         with tempfile.TemporaryDirectory() as tmp:
             work_root = Path(tmp) / "live-kick-fail"
             with _provenance_patch(), mock.patch.object(
@@ -507,6 +518,7 @@ class LiveKickDisposableScopeLiveTests(unittest.TestCase):
 
             # The driver's own work_root is gone regardless of the failure.
             self.assertFalse(work_root.exists())
+            self.assertEqual(_codex_config_bytes(), config_before)
             # No pantheon-t2572-* scope survives the forced mid-sequence
             # failure -- guaranteed teardown even on an exception (P4).
             leftover = subprocess.run(

@@ -61,6 +61,26 @@ This entry recurred twice and describes an irreversible outage, but it contains
 no quotable byte/path/field rule — it's a philosophy about distributed systems.
 """
 
+# T-4660 fixtures, modeled on the 2026-10-05 review's false positives.
+NEG_MENTION_ONLY = """# A guard script crashes on a renamed config key
+
+The pre-commit hook runs ticket_lint on every commit.
+The loader must not read `config.yaml:old_key`; it was renamed in T-0999.
+"""
+
+REQUEST_BASE = """# Ticket files must carry a state field
+
+Every ticket frontmatter must have a `state:` field.
+"""
+
+NEG_LANDED_GUARD = """# Tests appended after the __main__ guard never run
+
+Appending a test class with cat >> can land it after `if __name__ == "__main__":`,
+and it never runs. This recurred twice.
+Never put a test class after `if __name__ == "__main__":`. The fix
+landed as `tools/main_guard_lint.py`, wired into .githooks/pre-commit.
+"""
+
 BUG_EXTERNAL_QUIRK = """# CSS intrinsic content min by default
 
 ## Symptom
@@ -91,12 +111,42 @@ class DetectTest(unittest.TestCase):
         self.assertEqual(c.check_kind, "ticket_lint-rule")
         self.assertTrue(c.signals["self_tag"])
 
-    def test_irreversible_high_confidence(self):
+    def test_irreversible_alone_qualifies_at_medium(self):
         c = self._detect("feedback_force_push.md", POS_IRREVERSIBLE)
         self.assertIsNotNone(c)
-        # self-tag (byte-sequence guard) OR (recurrence+irreversible) → high
-        self.assertEqual(c.confidence, "high")
+        # "The byte-sequence guard is the model" MENTIONS a guard; it does not ask
+        # to become one (T-4660), so only (recurrence+irreversible) could make it high.
+        self.assertEqual(c.confidence, "medium")
+        self.assertFalse(c.signals["self_tag"])
         self.assertTrue(c.signals["irreversible"])
+
+    # -- T-4660: the first recovery review found 0 of 19 filed candidates promotable --
+    def test_passing_mention_of_precommit_or_hook_is_not_a_self_tag(self):
+        c = self._detect("bug_mention.md", NEG_MENTION_ONLY, "bugs")
+        self.assertIsNone(c, "describing an existing pre-commit hook is not asking for one")
+
+    def test_request_forms_are_self_tags(self):
+        for phrase in ("This should be a pre-commit check.",
+                       "Promote this to a ticket_lint guard.",
+                       "It is a candidate for a lint rule.",
+                       "This needs to become a hook check."):
+            with self.subTest(phrase=phrase):
+                c = self._detect("feedback_ask.md", REQUEST_BASE + phrase + "\n")
+                self.assertIsNotNone(c)
+                self.assertTrue(c.signals["self_tag"])
+                self.assertEqual(c.confidence, "high")
+
+    def test_entry_naming_its_landed_guard_is_not_proposed(self):
+        self.assertIsNone(self._detect("bug_landed.md", NEG_LANDED_GUARD, "bugs"),
+                          "the entry already points at the guard that enforces it")
+
+    def test_guard_path_without_a_landed_verb_still_qualifies(self):
+        text = POS_SELFTAG + "\nSee `tools/ticket_lint.py` for the existing rule shapes.\n"
+        self.assertIsNotNone(self._detect("feedback_state_field.md", text))
+
+    def test_landed_verb_without_a_guard_path_still_qualifies(self):
+        text = POS_SELFTAG + "\nA partial fix landed in the docs only.\n"
+        self.assertIsNotNone(self._detect("feedback_state_field.md", text))
 
     def test_soft_judgment_vetoed(self):
         self.assertIsNone(self._detect("feedback_verify_root.md", NEG_SOFT_JUDGMENT))

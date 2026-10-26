@@ -88,6 +88,8 @@ the migration crosses a language boundary that warrants its own scope.
 
 The producer-repoint program (send-keys → `mailbox.send()`, T-1826) migrates **work-turn** producers only. The following stay pane-based (`send_keys_submit.sh`) **permanently — this is a design invariant, not a rollout phase**: `ho_resumer` (post-cap-hit resume), `restart_drain` → `handoff_and_restart.sh` (restart choreography), `context_fill_monitor` / `activity_monitor` / Recovery `verify_startup` de-wedge pokes, and all cross-agent recovery injections per this SOP. Why: the recovery layer must not ride the mechanism it exists to recover — a wedged/dead session consumes no mailbox, and the bridge/waker being the wedged component is exactly the failure these tools break. Pane-level send-keys is the lowest common denominator that works on a sick session. Full rationale: `knowledge/episodic/2026-07-20-producer-repoint-mailbox-design/notes.md` §1.
 
+**Usage-gate scope (T-4510).** The fleet usage gate (`tools/fleet_usage_gate.py`, >=95% of the shared weekly Max) suppresses ONLY periodic work-turn pokes: keep_going's nudge and activity_monitor's P1.a/P1.b queue/idle content pokes. Every recovery path above stays live at any usage level, including activity_monitor's cap-modal confirm, its cap/cyber/effectiveness escalations, the P1.d retry-inject and the TUI-wedge escalation. That is pinned by `tools/test_activity_monitor.py` (a real-`main()` ordering test) and a structural test that the carve-out modules never reference the gate.
+
 ## Test coverage
 
 `tools/test_send_keys_submit.sh` — 5 cases:

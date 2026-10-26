@@ -6,7 +6,7 @@ domain: "pantheon, cloudflare, dns, tls, forge, home-infra, misattribution"
 
 ## Symptom
 
-A single public hostname (here `git.snowis.me`, the self-hosted Forgejo primary) is unreachable for ~20h:
+A single public hostname (here `git.your-self-hosted-git.example`, the self-hosted Forgejo primary) is unreachable for ~20h:
 
 - `curl https://host/` → `curl: (35) sslv3 alert handshake failure`, HTTP 000.
 - `openssl s_client` → **0 certificates**, "no peer certificate available." TCP connects (edge is up) but TLS never completes.
@@ -21,7 +21,7 @@ The origin was never down. The failure is entirely at the **Cloudflare edge for 
 
 - The container (Forgejo CT200) was running and serving the whole time.
 - The reverse proxy (caddy) was healthy, had a valid Let's Encrypt cert for the host, reached the origin (`303`), and was **serving the host's SIBLINGS from live public internet traffic throughout the "outage."** No `cloudflared` tunnel existed anywhere — the front door is caddy behind a plain CF-proxied A record, not a tunnel.
-- In Cloudflare DNS, **every** `*.snowis.me` host pointed at the same origin IP and was **DNS-only (grey)** — *except* the dead one, which was the lone **proxied=True (orange)** record. Cloudflare's proxy edge was failing TLS for it (premature/half-configured proxying: the "properly proxy git.\*" work was still deferred, "needs caddy DNS-01 ACME first"). An origin-down record behind CF serves a CF **52x** page over CF's OWN working cert; getting handshake_failure with **no cert** means CF has no working edge routing/cert for that hostname.
+- In Cloudflare DNS, **every** `*.your-domain.example` host pointed at the same origin IP and was **DNS-only (grey)** — *except* the dead one, which was the lone **proxied=True (orange)** record. Cloudflare's proxy edge was failing TLS for it (premature/half-configured proxying: the "properly proxy git.\*" work was still deferred, "needs caddy DNS-01 ACME first"). An origin-down record behind CF serves a CF **52x** page over CF's OWN working cert; getting handshake_failure with **no cert** means CF has no working edge routing/cert for that hostname.
 
 The single falsifying check that would have skipped the whole infra red-herring: **`--resolve host:443:<origin-ip>` and hit the origin directly.** A `303 + valid cert` there proves the origin is fine and the fault is CF-edge-only.
 

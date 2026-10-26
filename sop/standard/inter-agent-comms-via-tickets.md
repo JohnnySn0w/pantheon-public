@@ -46,15 +46,15 @@ For a multi-round HO ↔ Recovery exchange:
 
 ```
 T-0XXX
-  Initial filing — HO authors body, target=recovery, state=inbox
+  Initial filing — HO authors body, target=role:head_system_orchestrator, state=inbox
   → Recovery inbox-consumer pulls
   
   Recovery's reply — append "## <date> — recovery — <topic>" section,
-  flip target=orchestrator, move state=inbox
+  flip target=role:head_engineering_orchestrator, move state=inbox
   → HO inbox-consumer pulls
   
   HO's reply — append "## <date> — orchestrator — <topic>" section,
-  flip target=recovery, move state=inbox
+  flip target=role:head_system_orchestrator, move state=inbox
   → Recovery inbox-consumer pulls
   
   Resolution — Recovery acts (or files closing entry), state=done

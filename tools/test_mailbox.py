@@ -23,6 +23,7 @@ import shutil
 import unittest
 import tools.mailbox as mb
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # bare-import the SUT
 import mailbox  # noqa: E402
@@ -607,6 +608,45 @@ class MailboxExistenceTest(unittest.TestCase):
         self.assertFalse(self.missing.exists(),
                           "a rejected send must create nothing on disk")
 
+    def test_alias_names_the_canonical_box(self):
+        """T-4311: specialist sent to <hub>/consultant and reported Consultant unreachable. The
+        error now names codex's box. It does not deliver there."""
+        hub = Path(self._tmp.name)
+        mailbox.provision(hub / "codex")
+        with self.assertRaises(mailbox.MailboxNotFound) as cm:
+            mailbox.send(hub / "consultant", {"x": 1}, sender="specialist")
+        self.assertIn(f"consultant is an alias of codex, whose mailbox is {hub / 'codex'}",
+                      str(cm.exception))
+        self.assertEqual(list((hub / "codex" / "new").iterdir()), [])  # no redirect
+
+    def test_no_hint_for_an_unknown_name_or_a_missing_canonical_box(self):
+        hub = Path(self._tmp.name)
+        for name in ("nobody", "consultant"):  # consultant: codex's box is NOT provisioned here
+            with self.subTest(name=name), self.assertRaises(mailbox.MailboxNotFound) as cm:
+                mailbox.send(hub / name, {"x": 1}, sender="specialist")
+            self.assertNotIn("alias", str(cm.exception))
+
+    def test_a_failing_alias_lookup_leaves_the_plain_error(self):
+        """T-4320 (T-4311 nit): _alias_hint's fail-soft path. If agent_role_map
+        can't be imported, or raises while being read, the caller still gets the
+        plain MailboxNotFound: no hint, and no other exception in its place."""
+        hub = Path(self._tmp.name)
+        mailbox.provision(hub / "codex")  # a working lookup WOULD add the hint
+
+        class _Unreadable:
+            def __getattr__(self, name):
+                raise RuntimeError("agent_role_map is broken")
+
+        plain = f"recipient inbox {hub / 'consultant'} does not exist (pass provision_if_missing=True"
+        for label, modules in (
+            ("import fails", {"tools.agent_role_map": None, "agent_role_map": None}),
+            ("module raises", {"tools.agent_role_map": _Unreadable(), "agent_role_map": _Unreadable()}),
+        ):
+            with self.subTest(label), mock.patch.dict(sys.modules, modules):
+                with self.assertRaises(mailbox.MailboxNotFound) as cm:
+                    mailbox.send(hub / "consultant", {"x": 1}, sender="specialist")
+                self.assertTrue(str(cm.exception).startswith(plain), str(cm.exception))
+
     def test_mailbox_not_found_is_a_file_not_found_error(self):
         # Locks in OSError-catchability: every existing fail-soft caller
         # already catches OSError (or the (OSError, ValueError, TypeError)
@@ -1144,7 +1184,7 @@ class SenderLedgerTest(unittest.TestCase):
         self.assertEqual(len(self._lines()), 1)
 
     def test_concurrent_senders_on_one_account_interleave_whole_lines(self):
-        """specialist and mnemosyne each run TWO executors against one home, so this is
+        """specialist and archivist each run TWO executors against one home, so this is
         the normal case rather than an edge. O_APPEND must keep lines intact."""
         import subprocess
         src = (
@@ -1164,7 +1204,7 @@ class SenderLedgerTest(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
-# T-2266 (mnemosyne): two structural gaps in the ORG-026 transport.
+# T-2266 (archivist): two structural gaps in the ORG-026 transport.
 # --------------------------------------------------------------------------
 class AckRecordsTheActorTest(unittest.TestCase):
     """A maildir ack records WHEN, never WHO. `_process` renames inside the
@@ -1258,7 +1298,7 @@ class SupersedesAlreadyCancelsPendingTest(unittest.TestCase):
 
 
 class ConcurrentDrainIsNotAnError(unittest.TestCase):
-    """T-2279 (mnemosyne): T-2259 made concurrent drain a FEATURE — an idle main
+    """T-2279 (archivist): T-2259 made concurrent drain a FEATURE — an idle main
     seat takes the queue instead of waiting on a long ACP turn. The loser of that
     race then finds the message already gone at ack time, and the ENOENT was being
     recorded as `ack-failed`. Her bridge log carried 22 real-looking
@@ -1443,7 +1483,7 @@ class TestThePidIsNotASessionDiscriminator(unittest.TestCase):
 
     The ticket's own first candidate was to surface the maildir filename's pid.
     Measured against the live corpus it fails: 76 specialist-signed messages in
-    mnemosyne's cur/ carry 76 DISTINCT pids, because each send is a fresh
+    archivist's cur/ carry 76 DISTINCT pids, because each send is a fresh
     short-lived process. This reproduces that property in miniature rather than
     citing the measurement, so it stays true rather than becoming a claim in a
     docstring."""

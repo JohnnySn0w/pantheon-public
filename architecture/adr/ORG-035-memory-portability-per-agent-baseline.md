@@ -4,6 +4,25 @@ id: ORG-035
 title: "Memory portability — adopt the per-agent canonical baseline, defer the shared tier"
 status: Adopted (Autonomous) 2026-06-13 by HO (Orchestrator); operator-ratifiable / override-available; one sub-decision (canonical store repo + visibility) RESERVED to the operator
 date: 2026-06-13
+# re_evaluate: machine-checkable mirror of this ADR's inline re-eval prose,
+# consumed by tools/adr_reeval_walk.py (T-2527). Backfilled per T-4805 (missed by the T-2530 sweep);
+# trigger text quoted verbatim from the header, no obligation content changed.
+re_evaluate:
+  - id: R1
+    type: event
+    when: "a shared-tier re-trigger fires"
+    fires: surface
+    text: "when a shared-tier re-trigger fires (below)"
+  - id: R2
+    type: event
+    when: "a Claude Code memory-subsystem change moves autoMemoryDirectory"
+    fires: surface
+    text: "on a Claude Code memory-subsystem change that moves `autoMemoryDirectory`"
+  - id: R3
+    type: event
+    when: "rg-over-corpus stops scaling"
+    fires: surface
+    text: "if `rg`-over-corpus stops scaling (the BM25/embeddings \"not yet\" line)"
 ---
 
 # ORG-035 — Memory portability: adopt the per-agent canonical baseline, defer the shared tier
@@ -35,12 +54,9 @@ File-based memory (`MEMORY.md` index + one-fact-per-file pins under `~/.claude/p
 
 **The canonical store's git repo + visibility (design §7.1).** Memory contains operational and possibly user-private content. Recovery recommends a **separate private `pantheon-memory` repo** (durability + provenance without widening pantheon-config's exposure); alternatives are local-only git or a private subtree. This is reserved because it concerns exposing potentially-private content + a new repo's remote/visibility — an access/secrets-adjacent call that is the operator's, not HO's. The rest of the baseline does not block on it.
 
-## Consequences / rollout (sequenced)
+## Consequences / rollout
 
-- **Buildable now, HO-lane, no reserved deps** (operate on the current memory dirs): `memory_lint.py` + `memory_index.py` + `memory_search.py` + the `grep='rg'` alias. Filed as the baseline-tooling follow-up. Reversible (delete the tools).
-- **Gated on the §Reserved decision:** stand up `<canonical>` repo, set `autoMemoryDirectory`, migrate per-agent (Recovery first / dogfood, then HO *with* the fork-merge, Orchestrator, Specialist). Each cutover is reversible (unset the setting → harness reverts).
-- **Cross-agent note:** setting `autoMemoryDirectory` in another agent's `settings.json` is that agent's domain (ORG-027) — coordinate via the queue; HO does HO's own cutover.
-- Document in `sop/standard/` (memory conventions) + update the CLAUDE.md memory section at cutover.
+The baseline tooling (lint, generated index, `rg` search) ships first and needs no reserved decision; the canonical store and the `autoMemoryDirectory` cutover follow per agent, only after the §Reserved decision, and each agent sets its own setting (ORG-027). Every step is reversible. The step-by-step sequence is in `notes/2026-10-08-org-035-rollout-relocated.md`.
 
 ## Forward-links
 

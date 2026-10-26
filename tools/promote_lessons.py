@@ -30,9 +30,13 @@ Promotability — a candidate qualifies IFF (per design §"The P1 core"):
   2. Recurrence (≥2 occurrences / explicit "twice"/"recurred") OR explicit
      irreversibility (data loss, live-bridge kill, force-push, …), AND
   3. NOT a soft/contextual judgment (when-to-defer, autonomy, "verify before
-     asserting" — these stay soft; a hook would be a false-precision tripwire).
+     asserting" — these stay soft; a hook would be a false-precision tripwire), AND
+  4. NOT already enforced: an entry with a sentence naming a repo guard path
+     (tools/, .githooks/, .github/) next to a landed/enforces verb documents
+     its own fix (T-4660).
 An explicit self-tag ("this should be a pre-commit/hook/lint check") is the
-strongest signal and qualifies on its own (still subject to the soft-veto).
+strongest signal and qualifies on its own (still subject to the vetoes). Only
+the REQUEST counts: a bare mention of pre-commit/lint/hook does not (T-4660).
 
 High **precision over recall**: when in doubt, do not emit — a later sweep
 re-sees a missed lesson, but a noisy gate gets ignored.
@@ -74,19 +78,28 @@ CONFIDENCE_ORDER = {"low": 0, "medium": 1, "high": 2}
 # Kept deliberately small + auditable; precision lives here. Tune against the
 # real corpus rather than growing these unboundedly.
 
-# (1) Explicit self-tag — the entry literally asks to be promoted to a guard.
+# (1) Explicit self-tag — the entry literally ASKS to be promoted to a guard.
+# Request forms only (T-4660). Bare mentions of pre-commit / lint / hook /
+# ticket_lint used to count, and in this corpus they are everywhere: the first
+# recovery review (2026-10-05) found 0 of 19 filed candidates promotable, most of
+# them "self-tagged" by an entry merely describing an existing hook.
 SELF_TAG_RE = re.compile(
     r"\b("
-    r"pre-?commit"
-    r"|lint(?:er|-rule)?"
-    r"|\bhook\b"
-    r"|promote .{0,30}\b(guard|check|hook|lint)"
-    r"|(should|could) be a .{0,30}\b(guard|check|hook|lint|rule)"
-    r"|mechanically[- ]check"
-    r"|deterministic guard"
-    r"|ticket_lint"
-    r"|byte-?sequence guard"
+    r"promote\s.{0,30}\b(guard|check|hook|lint)"
+    r"|(should|could|ought\s+to|needs?\s+to)\s+(be|become)\s+(a|an)\s.{0,30}\b(guard|check|hook|lint|rule)"
+    r"|candidate\s+for\s+(a|an)\s.{0,30}\b(guard|check|hook|lint)"
+    r"|worth\s+(a|an)\s.{0,30}\b(guard|check|hook|lint)"
     r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# (5) Already enforced — a sentence naming a repo guard path alongside a
+# landed/enforcing verb. Such an entry documents its own fix; proposing a
+# guard for it is the bulk of the noise T-4660 measured (10 of 19).
+GUARD_PATH_RE = re.compile(r"(?:^|[\s`(])(?:tools|\.githooks|\.github)/[\w./-]+")
+LANDED_VERB_RE = re.compile(
+    r"\b(landed|enforce[sd]?|now (?:blocks|refuses|rejects|fails|catches|flags)|"
+    r"fail(?:s|ed)?[- ]closed|guards? against|fixed (?:in|by))\b",
     re.IGNORECASE,
 )
 
@@ -220,6 +233,13 @@ def _is_mechanical_sentence(s: str) -> bool:
     return bool(INLINE_CODE_RE.search(s) or MECHANICAL_NOUN_RE.search(s))
 
 
+def _names_landed_guard(text: str) -> bool:
+    """True iff one sentence both names a repo guard path and says it landed or
+    enforces — the entry already points at the guard that covers it."""
+    return any(GUARD_PATH_RE.search(s) and LANDED_VERB_RE.search(s)
+               for s in _sentences(text))
+
+
 def _best_invariant(text: str) -> str | None:
     """Pick the most rule-like sentence: modality + concrete mechanical signal."""
     best = None
@@ -276,6 +296,9 @@ def detect(path: Path, text: str, corpus: str) -> Candidate | None:
     """Apply the high-precision promotability criteria. Return a Candidate or None."""
     # (3) Soft veto first — cheapest and most decisive.
     if SOFT_VETO_RE.search(text):
+        return None
+    # (5) Already enforced — the entry names the guard that covers it.
+    if _names_landed_guard(text):
         return None
 
     self_tag = bool(SELF_TAG_RE.search(text))
@@ -376,7 +399,7 @@ LEDGER_STATUSES = ("filed", "landed", "declined")
 
 def _now_stamp(now: datetime | None = None) -> str:
     """ISO-8601 UTC, `Z`-suffixed (matches the convention used elsewhere in
-    this repo, e.g. tools/_git_utils.py, tools/activity_digest.py). `now` is
+    this repo, e.g. tools/_git_utils.py, tools/harness.py). `now` is
     an injectable clock (default the real clock) so callers/tests can pin a
     deterministic timestamp — same shape as tools/_audit.py's `now` param."""
     dt = now if now is not None else datetime.now(timezone.utc)

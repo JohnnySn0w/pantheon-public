@@ -1,0 +1,13 @@
+[Unit]
+Description=Pantheon snapshot-timer liveness monitor — hourly per-persona snapshot-durability sweep (T-3791)
+Documentation=file:///home/%u/pantheon-config/tickets/active/T-3791.md
+
+[Timer]
+# Hourly at :52 (offset from the other Recovery monitors: credential :35, etc.) to
+# avoid a same-minute thundering herd of cross-account sudo probes.
+OnCalendar=*-*-* *:52:00
+Persistent=true
+Unit=pantheon-snapshot-liveness.service
+
+[Install]
+WantedBy=timers.target

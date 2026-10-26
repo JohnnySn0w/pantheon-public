@@ -20,16 +20,22 @@ never by importing runtime_controller internals.
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
 import tempfile
+import time
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Iterator, Mapping
 
 SCHEMA_ACTIVE_RUNTIME = "pantheon-persona-active-runtime/v1"
 SCHEMA_LAST_ATTEMPT = "pantheon-persona-runtime-last-attempt/v1"
 SCHEMA_HOLDS = "pantheon-persona-runtime-holds/v1"
+SCHEMA_OPERATOR_RESTART = "pantheon-operator-restart/v1"
+SCHEMA_SEAT_STATE = "pantheon-seat-state/v1"  # ORG-106 L0 (T-5523)
 
 # Persona names are directory-safe lowercase identifiers (orchestrator, specialist, recovery, ...).
 PERSONA_RE = re.compile(r"^[a-z][a-z0-9_-]*$")
@@ -88,6 +94,98 @@ def last_attempt_path(persona: str, runtime: str, *, root: Path) -> Path:
 
 def holds_path(persona: str, *, root: Path) -> Path:
     return persona_root(persona, root=root) / "overrides" / "holds.json"
+
+
+def seat_state_path(persona: str, *, root: Path) -> Path:
+    """ORG-106 L0 (T-5523): the seat-state record, a sibling of holds.json. Readers go
+    through tools/seat_state.effective(); this module only owns the path + raw load."""
+    return persona_root(persona, root=root) / "overrides" / "seat-state.json"
+
+
+def load_seat_state(persona: str, *, root: Path) -> dict[str, Any] | None:
+    """Raw seat-state record, or None when absent. Raises HarnessStateError on a
+    corrupt file (the fail-open handling lives in seat_state.effective)."""
+    return _read_json_or_none(seat_state_path(persona, root=root))
+
+
+def seat_state_tombstones_path(persona: str, *, root: Path) -> Path:
+    """ORG-106 L1 (T-5524): ended seat-state records, one JSON line each."""
+    return persona_root(persona, root=root) / "overrides" / "seat-state.tombstones.jsonl"
+
+
+def operator_restart_path(persona: str, *, root: Path) -> Path:
+    """T-5483: durable marker an operator `harness restart` drops before the kill.
+    The runtime controller (a separate process that may re-exec) consumes it so the
+    deliberate kill is not recorded as a runtime failure. Same file-schema-level
+    contract as the other state files: runtime_controller keeps its own path copy."""
+    return persona_root(persona, root=root) / "overrides" / "operator-restart.json"
+
+
+def write_operator_restart_marker(
+    persona: str, *, root: Path, operator: str, runtime: str, tmux_session: str,
+    pid: int | None, ts: str, correlation_id: str,
+) -> None:
+    _atomic_json(
+        operator_restart_path(persona, root=root),
+        {
+            "schema": SCHEMA_OPERATOR_RESTART,
+            "operator": operator,
+            "ts": ts,
+            "runtime": runtime,
+            "tmux_session": tmux_session,
+            "pid": pid,
+            "correlation_id": correlation_id,
+        },
+    )
+
+
+SCHEMA_SLEEP_MARKER = "pantheon-seat-sleep-marker/v1"  # ORG-106 L3b (T-5526)
+
+
+def sleep_marker_path(persona: str, *, root: Path) -> Path:
+    """ORG-106 L3b: durable marker the deep-sleep drain drops before it ends the session,
+    so the controller's death classification does not record the end as process_death.
+    Sibling of operator-restart.json; runtime_controller keeps its own path copy (pinned
+    by a parity test)."""
+    return persona_root(persona, root=root) / "overrides" / "sleep-marker.json"
+
+
+def write_sleep_marker(
+    persona: str, *, root: Path, runtime: str, drain_started_ts: str, ts: str,
+    correlation_id: str,
+) -> None:
+    _atomic_json(
+        sleep_marker_path(persona, root=root),
+        {
+            "schema": SCHEMA_SLEEP_MARKER,
+            "ts": ts,
+            "runtime": runtime,
+            "drain_started_ts": drain_started_ts,
+            "correlation_id": correlation_id,
+        },
+    )
+
+
+def load_sleep_marker(persona: str, *, root: Path) -> dict[str, Any] | None:
+    return _read_json_or_none(sleep_marker_path(persona, root=root))
+
+
+def remove_sleep_marker(persona: str, *, root: Path) -> None:
+    try:
+        sleep_marker_path(persona, root=root).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def load_operator_restart_marker(persona: str, *, root: Path) -> dict[str, Any] | None:
+    return _read_json_or_none(operator_restart_path(persona, root=root))
+
+
+def remove_operator_restart_marker(persona: str, *, root: Path) -> None:
+    try:
+        operator_restart_path(persona, root=root).unlink()
+    except FileNotFoundError:
+        pass
 
 
 def _atomic_json(path: Path, payload: Mapping[str, Any], *, mode: int = 0o600) -> None:
@@ -160,6 +258,82 @@ def write_holds(persona: str, doc: Mapping[str, Any], *, root: Path) -> None:
     _atomic_json(holds_path(persona, root=root), doc)
 
 
+def write_seat_state(persona: str, doc: Mapping[str, Any], *, root: Path) -> None:
+    """ORG-106 L1 (T-5524): atomically write the seat-state record (0600). The record
+    is validated first; an invalid one is refused and never written."""
+    from tools import seat_state  # lazy: seat_state imports this module
+
+    problems = seat_state.validate_record(dict(doc))
+    if problems:
+        raise HarnessStateError("refusing to write an invalid seat-state record: " + "; ".join(problems))
+    _atomic_json(seat_state_path(persona, root=root), doc)
+
+
+def clear_seat_state(persona: str, *, root: Path) -> bool:
+    """Remove the seat-state record. True iff one existed."""
+    path = seat_state_path(persona, root=root)
+    if path.is_symlink():
+        raise HarnessStateError(f"refusing to remove a symlink: {path}")
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+class SeatStateBusy(HarnessStateError):
+    """The per-seat seat-state lock could not be taken in time."""
+
+
+def seat_state_lock_path(persona: str, *, root: Path) -> Path:
+    return seat_state_path(persona, root=root).with_name("seat-state.lock")
+
+
+@contextlib.contextmanager
+def seat_state_lock(persona: str, *, root: Path, blocking: bool = True,
+                    timeout_s: float = 30.0) -> Iterator[None]:
+    """ORG-106 L5 (T-5529): the one per-seat lock over seat-state read-modify-write.
+
+    Shared by `harness pause`/`wake` (blocking, bounded) and the L5 janitor
+    (non-blocking). It is a separate file, not a lock on the record, because
+    `os.replace` swaps the record's inode. Raises SeatStateBusy if not taken:
+    immediately when blocking=False, after timeout_s otherwise."""
+    path = seat_state_lock_path(persona, root=root)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink() or path.parent.is_symlink():
+        raise HarnessStateError(f"refusing to lock through a symlink: {path}")
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+    try:
+        deadline = time.monotonic() + (timeout_s if blocking else 0.0)
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise SeatStateBusy(f"seat-state busy, retry ({persona}; lock {path})") from None
+                time.sleep(0.05)
+        yield
+    finally:
+        os.close(fd)  # closing the fd releases the flock
+
+
+def append_seat_tombstone(persona: str, row: Mapping[str, Any], *, root: Path) -> None:
+    """Append one ended-record line to seat-state.tombstones.jsonl (0600, flock-serialised)."""
+    path = seat_state_tombstones_path(persona, root=root)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    if path.is_symlink() or path.parent.is_symlink():
+        raise HarnessStateError(f"refusing to write through a symlink: {path}")
+    line = (json.dumps(row, sort_keys=True) + "\n").encode("utf-8")
+    fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        os.write(fd, line)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def list_runtime_records(persona: str, *, root: Path) -> dict[str, dict[str, Any]]:
     """Discover every runtime with an existing last-attempt.json on disk.
 
@@ -186,6 +360,25 @@ def list_runtime_records(persona: str, *, root: Path) -> dict[str, dict[str, Any
             # Malformed/missing "runtime" field — reconstruct from the slug
             # dirname rather than dropping the record silently.
             result[child.name.replace("--", "/", 1)] = data
+    return result
+
+
+def list_usability(persona: str, *, root: Path) -> dict[str, dict[str, Any]]:
+    """T-4862: per-runtime live-usability verdicts (usability.json), keyed by runtime ref.
+    Read-only; malformed files are skipped, never raised."""
+    base = runtimes_dir(persona, root=root)
+    result: dict[str, dict[str, Any]] = {}
+    if not base.is_dir():
+        return result
+    for child in sorted(base.iterdir()):
+        try:
+            data = _read_json_or_none(child / "usability.json")
+        except HarnessStateError:
+            continue
+        if data is None:
+            continue
+        runtime = data.get("runtime")
+        result[runtime if isinstance(runtime, str) and runtime else child.name.replace("--", "/", 1)] = data
     return result
 
 
@@ -234,12 +427,16 @@ def clear_cooldown(
     Nulls `cooldown_until` and re-stamps provenance to manual-override.
     Deliberately leaves `consecutive_failures` untouched — the operator is
     clearing the cooldown TIMER, not erasing failure history (see DECISIONS).
+    T-5028 (d): a `runtime_blocked` record has no timer (it blocks until
+    cleared), so clearing also resets its `failure_class` to null and counts
+    as having had a cooldown.
     If no record exists yet, a fresh placeholder is created (there was
     nothing to clear, but the CLI still needs a `runtime` field to write).
     """
     validate_runtime(runtime)
     existing = load_last_attempt(persona, runtime, root=root)
-    had_cooldown = bool(existing and existing.get("cooldown_until"))
+    blocked = bool(existing) and existing.get("failure_class") == "runtime_blocked"
+    had_cooldown = bool(existing and existing.get("cooldown_until")) or blocked
     if existing is None:
         doc: dict[str, Any] = {
             "schema": SCHEMA_LAST_ATTEMPT,
@@ -254,16 +451,114 @@ def clear_cooldown(
     else:
         doc = dict(existing)
         doc["cooldown_until"] = None
+        if blocked:
+            doc["failure_class"] = None
         doc["provenance"] = {"trigger": "manual-override", "operator": operator}
     return doc, had_cooldown
 
 
 def state_root_from_env(default: Path | None = None) -> Path:
-    """Resolve the state root, honouring PANTHEON_STATE_DIR (matches
-    tools/restart_request.py / tools/restart_drain.py convention)."""
-    env = os.environ.get("PANTHEON_STATE_DIR")
-    if env:
-        return Path(env)
+    """Resolve the state root (the parent of ``personas/``).
+
+    T-5028 (b): ONE resolution with the runtime planes, so a non-default env can
+    never split the holds path between this CLI and the planes that read it. The
+    planes resolve the personas dir as PANTHEON_PERSONA_STATE_DIR, else
+    ``$PANTHEON_STATE_DIR/personas``, else ``~/.local/state/pantheon/personas``
+    (runtime_controller._state_root, session_chronicle.persona_state_root,
+    proactive_swap_init._default_state_root); this returns that dir's parent.
+
+    Raises HarnessStateError when PANTHEON_PERSONA_STATE_DIR is not named
+    ``personas`` (this CLI's spool lives beside it, at ``<root>/harness-overrides``)
+    or when both variables are set and disagree: refusing beats writing a hold
+    the planes will not read. `default` is used only when neither is set."""
+    persona_env = os.environ.get("PANTHEON_PERSONA_STATE_DIR")
+    state_env = os.environ.get("PANTHEON_STATE_DIR")
+    if persona_env:
+        personas = Path(os.path.abspath(persona_env))
+        if personas.name != "personas":
+            raise HarnessStateError(
+                f"PANTHEON_PERSONA_STATE_DIR={persona_env!r} is not a 'personas' directory; "
+                "the harness CLI cannot place its state beside it"
+            )
+        if state_env and Path(os.path.abspath(state_env)) != personas.parent:
+            raise HarnessStateError(
+                f"PANTHEON_PERSONA_STATE_DIR={persona_env!r} and PANTHEON_STATE_DIR={state_env!r} "
+                "disagree (expected PANTHEON_PERSONA_STATE_DIR = PANTHEON_STATE_DIR/personas); "
+                "refusing so a hold cannot land where the runtime planes do not read"
+            )
+        return personas.parent
+    if state_env:
+        return Path(state_env)
     if default is not None:
         return default
     return Path.home() / ".local" / "state" / "pantheon"
+
+
+#: T-5028 (f+): an override evidence row older than this with no matching
+#: outcome row is flagged (the SIGKILL-mid-swap residual from the MR-2 review).
+OVERRIDE_OUTCOME_GRACE_SECONDS = 900
+OVERRIDE_EVENT = "operator_swap_hold_overridden"
+OVERRIDE_OUTCOME_EVENT = "operator_swap_hold_override_outcome"
+
+
+def _json_lines(lines: Iterable[str]) -> Iterator[dict[str, Any]]:
+    for line in lines:
+        try:
+            value = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(value, dict):
+            yield value
+
+
+def open_quarantine_rows(lines: Iterable[str]) -> list[dict[str, Any]]:
+    """T-5028 (f): quarantine.jsonl rows not yet resolved. A row is
+    ``{"entry", "reason", "quarantined_at"}``; a later tombstone
+    ``{"tombstone": <entry id>, "action": "landed"|"dropped", ...}`` resolves
+    every row whose entry has that id. Unparseable lines are skipped. Pure, so
+    fleet_health can reuse it on a cross-account read."""
+    rows: list[dict[str, Any]] = []
+    resolved: set[str] = set()
+    for value in _json_lines(lines):
+        if isinstance(value.get("tombstone"), str):
+            resolved.add(value["tombstone"])
+        elif isinstance(value.get("entry"), dict):
+            rows.append(value)
+    return [row for row in rows if str(row["entry"].get("id")) not in resolved]
+
+
+def orphan_override_rows(
+    lines: Iterable[str], *, now: datetime, grace_seconds: float = OVERRIDE_OUTCOME_GRACE_SECONDS
+) -> list[dict[str, Any]]:
+    """T-5028 (f+): override evidence rows with no outcome row for the same
+    correlation_id after `grace_seconds`. Pure (lines of controller-evidence.jsonl)."""
+    overrides: dict[str, dict[str, Any]] = {}
+    finished: set[str] = set()
+    for value in _json_lines(lines):
+        correlation = value.get("correlation_id")
+        if not isinstance(correlation, str) or not correlation:
+            continue
+        if value.get("event") == OVERRIDE_EVENT:
+            overrides[correlation] = value
+        elif value.get("event") == OVERRIDE_OUTCOME_EVENT:
+            finished.add(correlation)
+    orphans = []
+    for correlation, row in overrides.items():
+        if correlation in finished:
+            continue
+        try:
+            at = datetime.fromisoformat(str(row.get("recorded_at", "")).replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if (now - at).total_seconds() >= grace_seconds:
+            orphans.append(row)
+    return orphans
+
+
+def root_for_personas_dir(personas_dir: Path) -> Path:
+    """The harness state root for a runtime plane's personas dir (T-5028 (a)):
+    its parent, which must be named ``personas``."""
+    personas = Path(os.path.abspath(personas_dir))
+    if personas.name != "personas":
+        raise HarnessStateError(f"{personas_dir} is not a 'personas' directory")
+    return personas.parent

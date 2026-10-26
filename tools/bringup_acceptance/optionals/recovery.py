@@ -21,7 +21,7 @@ tmux session or mailbox. This sidesteps "touch Recovery's real anything" entirel
 Per-module proof depth differs ON PURPOSE, and that split IS the isolation
 answer for each surface:
 
-* :class:`WardRecoveryWatchdogModule` — STATIC contract-only. Reads the
+* :class:`RecoveryRecoveryWatchdogModule` — STATIC contract-only. Reads the
   timer/service/script triad and asserts their WIRING (cadence, OnFailure
   routing, fail-open flags, bounded-remediation constants). Deliberately NOT
   dynamically executed: ``recovery-telegram-child-watchdog.sh`` hardcodes
@@ -36,19 +36,20 @@ answer for each surface:
   sandbox-``$HOME`` + ``--simulate-absent --dry-run``) is a NAMED GAP,
   deferred to T-2576, to run only on the real Recovery seat where that session
   legitimately exists.
-* :class:`WardSelfRestartModule` — dynamic, genuinely safe: ``self_restart.sh``
+* :class:`RecoverySelfRestartModule` — dynamic, genuinely safe: ``self_restart.sh``
   takes its target pane/service as caller-supplied flags (no hardcoded
   session name), so this module uses randomly-suffixed disposable tmux
   sessions that never collide with anything real. Proves flag validation,
   both preflight guards, and the full ``--dry-run`` happy path — all
   confirmed (by source inspection AND exit-code assertion) to return before
   ever reaching ``systemd-run``/``systemctl``. No real restart ever fires.
-* :class:`WardBootKickModule` — dynamic, fully seam-driven:
+* :class:`RecoveryBootKickModule` — dynamic, fully seam-driven:
   ``recovery_boot_kick.sh`` ships ``RECOVERY_KICK_CAPTURE_CMD``/``RECOVERY_KICK_SEND_CMD``/
   ``RECOVERY_KICK_INFLIGHT_CMD`` test seams for exactly this purpose (see
   ``tools/test_recovery_boot_kick.sh``, which this module's 5 scenarios mirror).
   Zero tmux dependency at all — genuinely off-prod-provable regardless of
-  which account runs it.
+  which account runs it. ``RECOVERY_KICK_LOGGER`` is always pointed at a scratch
+  stub (T-5075), so a run never writes boot-kick lines into the host journal.
 
 Every module's ``declare()`` self-declares on ``target.persona == "recovery"``
 alone (cheap, no filesystem access) — matching ``registry.py``'s own "no
@@ -130,7 +131,7 @@ def _assert_exit(result: subprocess.CompletedProcess[str], expected: int, *, cas
 # ---------------------------------------------------------------------------
 
 
-class WardRecoveryWatchdogModule:
+class RecoveryRecoveryWatchdogModule:
     """Proves the recovery-telegram-child-watchdog timer/service/script WIRING by
     reading the repo-canonical files. Never executes them (see module
     docstring for why: the script's hardcoded real session name)."""
@@ -244,7 +245,7 @@ class WardRecoveryWatchdogModule:
 # ---------------------------------------------------------------------------
 
 
-class WardSelfRestartModule:
+class RecoverySelfRestartModule:
     """Proves tools/self_restart.sh's flag-validation + preflight-guard +
     --dry-run contract via randomly-suffixed disposable tmux sessions --
     never Recovery's real session name, never a real restart."""
@@ -421,12 +422,18 @@ DIALOG_PANE = (
 JUNK_PANE = "booting... please wait"
 
 
-class WardBootKickModule:
+class RecoveryBootKickModule:
     """Proves recovery_boot_kick.sh's 5 guards via its own injectable seams --
-    mirrors tools/test_recovery_boot_kick.sh exactly, zero tmux dependency."""
+    mirrors tools/test_recovery_boot_kick.sh exactly, zero tmux dependency. The
+    RECOVERY_KICK_LOGGER seam is set to a scratch stub on every run (T-5075)."""
 
     id = "recovery-boot-kick"
     tier: Tier = "optional"
+
+    # Hang guard: each scenario's subprocess may run this many seconds past its
+    # own sentinel timeout before it is cut off. A class attribute so tests on a
+    # loaded runner can widen it without loosening the production value (T-4774).
+    RUN_CASE_GRACE_S: int = 10
 
     def __init__(self, *, repo_root: Path | None = None) -> None:
         self._repo_root = repo_root if repo_root is not None else _repo_root()
@@ -443,12 +450,15 @@ class WardBootKickModule:
 
     def _run_case(
         self, script_path: Path, witness: Path, stub: Path, *,
-        inflight: str, capture: str, send_rc: int, timeout: int,
+        logger: Path, inflight: str, capture: str, send_rc: int, timeout: int,
     ) -> subprocess.CompletedProcess[str]:
         witness.write_text("", encoding="utf-8")
         env = dict(os.environ)
         env.update({
             "RECOVERY_KICK_SEND_CMD": str(stub),
+            # T-5075: always this run's scratch stub, overriding any inherited value,
+            # so an acceptance run never reaches the real `logger` (host journal).
+            "RECOVERY_KICK_LOGGER": str(logger),
             "RECOVERY_KICK_SENTINEL_TIMEOUT": str(timeout),
             "RECOVERY_KICK_POLL_INTERVAL": "1",
             "RECOVERY_KICK_INFLIGHT_CMD": inflight,
@@ -457,7 +467,7 @@ class WardBootKickModule:
         })
         pane = "bringup-acceptance-recovery-boot-kick-probe:0"
         return subprocess.run(
-            [str(script_path), pane, "recovery"], capture_output=True, text=True, env=env, timeout=timeout + 10,
+            [str(script_path), pane, "recovery"], capture_output=True, text=True, env=env, timeout=timeout + self.RUN_CASE_GRACE_S,
         )
 
     @staticmethod
@@ -488,6 +498,20 @@ class WardBootKickModule:
             encoding="utf-8",
         )
         stub.chmod(stub.stat().st_mode | stat.S_IEXEC)
+        # T-5075: no-op journal stub. recovery_boot_kick.sh's log() otherwise calls
+        # `logger -t pantheon-recovery-boot-kick`, writing fake boot-kick lines into the
+        # target host's journal. The script's exit status and output do not depend on
+        # the logger (`|| true`); the stub exits 0 anyway, and records each line under
+        # scratch so the evidence shows the seam took.
+        journal = self._scratch_root / "journal"
+        logger_stub = self._scratch_root / "fake_logger.sh"
+        logger_stub.write_text(
+            "#!/usr/bin/env bash\n"
+            f"printf '%s\\n' \"$1\" >> {shlex.quote(str(journal))}\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        logger_stub.chmod(logger_stub.stat().st_mode | stat.S_IEXEC)
 
         def _capture_cmd(text: str) -> str:
             return f"printf %s {shlex.quote(text)}"
@@ -501,11 +525,13 @@ class WardBootKickModule:
         )
         results: dict[str, Mapping[str, Any]] = {}
         for name, inflight, capture, send_rc, timeout, expected_sent in scenarios:
+            journal.write_text("", encoding="utf-8")
             result = self._run_case(
-                script_path, witness, stub, inflight=inflight, capture=capture,
-                send_rc=send_rc, timeout=timeout,
+                script_path, witness, stub, logger=logger_stub, inflight=inflight,
+                capture=capture, send_rc=send_rc, timeout=timeout,
             )
             sent = self._kick_count(witness)
+            logged = len(journal.read_text(encoding="utf-8").splitlines()) if journal.is_file() else 0
             if result.returncode != 0:
                 raise HardStop(
                     f"{self.id} ({name}): expected exit 0 (fail-open by contract), got "
@@ -515,7 +541,7 @@ class WardBootKickModule:
                 raise HardStop(
                     f"{self.id} ({name}): expected {expected_sent} send-attempt(s), observed {sent}"
                 )
-            results[name] = {"exit": result.returncode, "sent": sent}
+            results[name] = {"exit": result.returncode, "sent": sent, "logged": logged}
             recorder.append(name, results[name])
 
         evidence_path = write_module_evidence(paths, self.id, "guard-scenarios", {"scenarios": results})
@@ -563,7 +589,7 @@ def build_optional_modules() -> tuple[AcceptanceModule, ...]:
     """Recovery's three custom-surface optional modules. Asymmetric sudo is
     deliberately not a fourth module here -- see module docstring."""
     return (
-        WardRecoveryWatchdogModule(),
-        WardSelfRestartModule(),
-        WardBootKickModule(),
+        RecoveryRecoveryWatchdogModule(),
+        RecoverySelfRestartModule(),
+        RecoveryBootKickModule(),
     )

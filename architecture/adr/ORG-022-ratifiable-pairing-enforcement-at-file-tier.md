@@ -9,7 +9,7 @@ build_disposition: built
 
 **Status:** **Auto-ratified 2026-05-19 by the operator (Telegram msg_1705):** *"it should be an adr explaining the decision, which is auto-ratified, plus the change to the scripting so the architecture shifts with it."* This ADR documents the decision; the substrate code change ships in the same commit chain. No separate ratify ticket.
 
-**Amended 2026-05-19 (msg_1708)** — initial draft used label `ratifiable`, mismatching the PWA frontend's existing filter for `ratification` at `web/src/components/TicketList.svelte` + `TicketDetail.svelte`. Corrected to canonical `ratification`. Four in-flight ratify tickets (T-0460/0461/0462/0466) migrated in the same commit chain.
+**Amended 2026-05-19 (msg_1708):** the label is `ratification` (the PWA's existing filter). Detail: `notes/2026-10-08-org-022-review-history.md`.
 
 **Date authored:** 2026-05-19
 
@@ -65,17 +65,9 @@ Auto-adding the label when files are present preserves writer ergonomics; refusi
 
 ## Consequences
 
-### New code
+### Code and tests
 
-`tools/ticket.py cmd_file`: validate the pairing per the rules above. ~10-15 LoC.
-
-`tools/ticket.py cmd_retarget`: same validation when the retarget itself touches labels/ratifiable_files (rare; most retargets don't). ~5 LoC defensive.
-
-### Tests
-
-ADR/SOP/docs-only tier per `sop/standard/testing-depth-and-scope.md`: **Ratification check** (this ADR's auto-ratified status footer). Plus, since this ADR ships with code, the **Bugfix tier** applies to the code: unit tests for both failure shapes (label-without-files refuse; files-without-label auto-add) + the happy path (both present) + the unrelated case (neither present, non-ratify ticket — no validation fires).
-
-Smoke loop: existing 895 tests + new tests must remain green; no regression in the existing ratify-ticket file flow.
+`tools/ticket.py` validates the pairing in `file` and in `retarget`, with unit tests for both failure shapes. Size and test-plan detail: `notes/2026-10-08-org-022-build-detail-relocated.md`.
 
 ### No migration
 
@@ -94,6 +86,4 @@ The PWA-side rendering for ratify tickets is ADR-052 / T-0367's scope (pending t
 - T-0465 — `intent` frontmatter field (provides PWA canonical signal once ADR-052 ratifies)
 - The operator Telegram msg_1701 / msg_1702 / msg_1705 — the dialogue that ratified this.
 
----
-
-**Status footer:** Auto-ratified 2026-05-19 by the operator (msg_1705). Substrate code change lands in the same commit chain (commit immediately following this ADR's commit). No separate ratify ticket.
+Review history (the 2026-05-19 label-rename amendment and the status footer): `notes/2026-10-08-org-022-review-history.md`.

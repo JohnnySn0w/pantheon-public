@@ -248,35 +248,47 @@ class TestDriftSeverity(_Base):
     # expected, but any OTHER directive change on the unit still pages.
     _QUOTA = "pantheon-persona-quota@.timer"
 
-    def test_quota_timer_placeholder_vs_rendered_is_cosmetic(self):
-        self._write(self.repo, self._QUOTA,
-                    "[Timer]\nOnBootSec=5min\n"
-                    "OnUnitInactiveSec={quota_cadence_minutes}min\n"
-                    "RandomizedDelaySec={quota_randomized_delay_seconds}s\n"
-                    "Unit=pantheon-persona-quota@%i.service\n")
-        self._write(self.inst, self._QUOTA,
-                    "[Timer]\nOnBootSec=5min\n"
-                    "OnUnitInactiveSec=30min\n"
-                    "RandomizedDelaySec=300s\n"
-                    "Unit=pantheon-persona-quota@%i.service\n")
-        drift = self._kinds(sdl.check(self.repo, self.inst), "drift")
-        self.assertEqual([f.severity for f in drift], ["cosmetic"])
+    # T-4731: the placeholder exemption above was a blunt instrument (ANY value
+    # passed for those two keys). check() now renders the repo template with the
+    # installer's own _render_quota_timer_template and diffs rendered-vs-installed.
+    _TPL = ("[Timer]\nOnBootSec=5min\n"
+            "OnUnitInactiveSec={quota_cadence_minutes}min\n"
+            "RandomizedDelaySec={quota_randomized_delay_seconds}s\n"
+            "Unit=pantheon-persona-quota@%i.service\n")
+
+    def _quota(self, installed_text, values=(30, 300)):
+        self._write(self.repo, self._QUOTA, self._TPL)
+        self._write(self.inst, self._QUOTA, installed_text)
+        return sdl.check(self.repo, self.inst, quota_values=values)
+
+    def test_quota_timer_correctly_rendered_is_clean(self):
+        findings = self._quota(
+            "# managed banner\n[Timer]\nOnBootSec=5min\n"
+            "OnUnitInactiveSec=30min\nRandomizedDelaySec=300s\n"
+            "Unit=pantheon-persona-quota@%i.service\n")
+        self.assertEqual(self._kinds(findings, "drift"), [])
+
+    def test_quota_timer_value_not_matching_render_is_substantive(self):
+        findings = self._quota(
+            "[Timer]\nOnBootSec=5min\nOnUnitInactiveSec=99min\n"
+            "RandomizedDelaySec=300s\nUnit=pantheon-persona-quota@%i.service\n")
+        drift = self._kinds(findings, "drift")
+        self.assertEqual([f.severity for f in drift], ["substantive"])
 
     def test_quota_timer_other_directive_change_still_substantive(self):
-        # Signal preserved: a real scheduling/exec change on the exempt unit
-        # (here OnBootSec, which carries no placeholder) still pages.
-        self._write(self.repo, self._QUOTA,
-                    "[Timer]\nOnBootSec=5min\n"
-                    "OnUnitInactiveSec={quota_cadence_minutes}min\n"
-                    "RandomizedDelaySec={quota_randomized_delay_seconds}s\n"
-                    "Unit=pantheon-persona-quota@%i.service\n")
-        self._write(self.inst, self._QUOTA,
-                    "[Timer]\nOnBootSec=999min\n"
-                    "OnUnitInactiveSec=30min\n"
-                    "RandomizedDelaySec=300s\n"
-                    "Unit=pantheon-persona-quota@%i.service\n")
-        drift = self._kinds(sdl.check(self.repo, self.inst), "drift")
+        findings = self._quota(
+            "[Timer]\nOnBootSec=999min\nOnUnitInactiveSec=30min\n"
+            "RandomizedDelaySec=300s\nUnit=pantheon-persona-quota@%i.service\n")
+        drift = self._kinds(findings, "drift")
         self.assertEqual([f.severity for f in drift], ["substantive"])
+
+    def test_quota_timer_default_values_come_from_repo_manifest(self):
+        # No quota_values override: the real instance.yaml (30/300) is used.
+        self._write(self.repo, self._QUOTA, self._TPL)
+        self._write(self.inst, self._QUOTA,
+                    "[Timer]\nOnBootSec=5min\nOnUnitInactiveSec=30min\n"
+                    "RandomizedDelaySec=300s\nUnit=pantheon-persona-quota@%i.service\n")
+        self.assertEqual(self._kinds(sdl.check(self.repo, self.inst), "drift"), [])
 
 
 class _FakeSource(sdl.InstalledSource):

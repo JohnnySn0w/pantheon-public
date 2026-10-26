@@ -16,8 +16,8 @@ ON-DISK, NOT IN THE REPO (the operator, msg 2758): stored in per-account local s
 pantheon-config. Rationale: portability + the snapshots are a LOT of data — repo-homing
 would steadily bloat .git (the retention concern flagged as deferred under msg 2447). The
 tradeoff vs the earlier repo-homing (msg 2445): we give up git-replication-to-GitHub and
-"present in every clone", so cross-AGENT history serving is the the-ancestor daemon's job
-(it reads other accounts' chronicles), not free-in-every-clone. The common case — an agent
+"present in every clone", so cross-AGENT history serving needs a reader with access to other accounts'
+chronicles, not free-in-every-clone. The common case — an agent
 reading ITS OWN predecessor — is local to its own account, so this fits.
 
 Layout (day-chunked so dirs stay small/traversable):
@@ -86,15 +86,13 @@ class ChronicleDurabilityError(RuntimeError):
 # "cannot resolve agent" rather than mis-filing it. Loud, but still three seats'
 # handoffs never reaching the Chronicle.
 #
-# THE ONE OVERRIDE, and it is deliberate: the-ancestor's agent-name here is
-# "ancestor", not the "the-ancestor" persona the registry carries. That string is
-# a DIRECTORY NAME under ~/.local/state/pantheon/chronicle/ with archived
-# snapshots and an index.md already filed under it. Deriving it would re-home
-# future archives to a sibling dir and orphan everything written before this
-# commit, in a tool whose entire job is not losing dying context — a behaviour
-# change smuggled into a refactor. Renaming it is a data-migration ticket, not
-# this one. Kept verbatim, with the reason attached so it reads as a decision.
-_AGENT_NAME_OVERRIDES = {"the-ancestor": "ancestor"}
+# NAME OVERRIDES: empty. The only override ever carried was the-ancestor -> "ancestor"
+# (its on-disk Chronicle dir name), removed with the persona (ORG-087 sec. 4 step 4,
+# T-3421). Archives already filed under chronicle/ancestor/ stay readable by that dir name
+# (agent_dir_name passes any non-persona string through unchanged); only new filing for the
+# retired account is gone. The seam is kept for any future persona whose dir name must
+# differ from its persona.
+_AGENT_NAME_OVERRIDES: dict[str, str] = {}
 
 
 def _build_user_to_agent() -> dict[str, str]:
@@ -496,6 +494,51 @@ def latest_handoff_text(agent: str, root: Path | None = None) -> str | None:
         return p.read_text(encoding="utf-8") if p else None
     except (FileNotFoundError, OSError):
         return None
+
+
+# ------------------------------------------------- session-end additions (T-5016)
+# Additive only: the functions above keep their behaviour for every current
+# caller. tools/session_chronicle.py (the harness-controller session-end duty)
+# builds on archive_required() + archive_companion() plus the helpers below.
+
+
+def chronicle_root() -> Path:
+    """The Chronicle root resolved NOW (env read at call time), unlike the
+    import-time CHRONICLE_ROOT constant. Same precedence as _chronicle_root()."""
+    return _chronicle_root()
+
+
+def agent_dir_name(persona: str) -> str:
+    """The Chronicle directory name for a persona: the persona itself, unless
+    _AGENT_NAME_OVERRIDES maps it (currently empty)."""
+    return _AGENT_NAME_OVERRIDES.get(persona, persona)
+
+
+def write_companion_text(agent: str, text: str, *, jsonl_uuid: str, ts: str,
+                         suffix: str, root: Path | None = None) -> Path:
+    """Write a small TEXT companion (``<ts>-<uuid>.<suffix>``, uncompressed)
+    beside a snapshot, durably (write + fsync + rename + dir fsync).
+
+    Never overwrites: an existing dest gets a ``.N`` counter, same as
+    archive_companion(). Unlike archive_companion() this one is STRICT: any
+    failure raises ChronicleDurabilityError so the session-end duty can report
+    it and alert, instead of silently returning None.
+    """
+    base = Path(root) if root is not None else _chronicle_root()
+    day_dir = base / agent / ts[:10]
+    try:
+        day_dir.mkdir(parents=True, exist_ok=True)
+        stem = f"{_fs_safe_ts(ts)}-{jsonl_uuid}.{suffix}"
+        dest = day_dir / stem
+        n = 2
+        while dest.exists():
+            dest = day_dir / f"{stem}.{n}"
+            n += 1
+    except Exception as exc:
+        raise ChronicleDurabilityError("companion directory preparation failed") from exc
+    written = _write_snapshot_required(dest, text)
+    _verify_snapshot_readable(written, text)
+    return written
 
 
 # --------------------------------------------------------------------------- CLI

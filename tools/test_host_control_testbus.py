@@ -12,9 +12,11 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import tools._host_control_testbus as testbus
 
@@ -76,7 +78,70 @@ def _cleanup_popen(proc: subprocess.Popen) -> None:
 @requires_private_bus
 class TestbusHelperTests(unittest.TestCase):
     """Direct tests of the shared spawn/teardown/sweep helper -- not the
-    host_control service, just the process-lifecycle plumbing."""
+    host_control service, just the process-lifecycle plumbing.
+
+    Hermetic by construction (parallel/xdist-safe): every test gets its
+    own private root holding (a) the tempdir that ``_short_tmpdir`` /
+    ``spawn_daemon`` create bus dirs under (``tempfile.tempdir`` in this
+    process, ``TMPDIR`` for spawned children), (b) its own
+    ``XDG_RUNTIME_DIR`` so the pidfile dir that ``sweep()`` scans and the
+    symlink-squat tests replace is never the shared
+    ``$XDG_RUNTIME_DIR/pantheon-testbus`` another process is using, and
+    (c) its own no-XDG fallback root. Every "nothing leaked" check is
+    scoped to that root, so a sibling test process can never be seen,
+    swept or killed."""
+
+    def setUp(self) -> None:
+        # Short, unique root directly under /tmp so bus.sock paths stay
+        # under the AF_UNIX limit even when $TMPDIR is long.
+        self._root = Path(tempfile.mkdtemp(prefix="t2932root-", dir="/tmp"))
+        # Registered first => runs last, after every per-test cleanup
+        # (daemon kills, symlink removal) has run.
+        self.addCleanup(shutil.rmtree, self._root, ignore_errors=True)
+        self._tmp_root = self._root / "tmp"
+        self._tmp_root.mkdir(mode=0o700)
+        runtime_dir = self._root / "run"
+        runtime_dir.mkdir(mode=0o700)
+        # Stands in for /tmp itself, which always exists.
+        (self._root / "fallback").mkdir(mode=0o700)
+
+        for patcher in (
+            mock.patch.object(tempfile, "tempdir", str(self._tmp_root)),
+            mock.patch.dict(
+                os.environ,
+                {"XDG_RUNTIME_DIR": str(runtime_dir), "TMPDIR": str(self._tmp_root)},
+            ),
+            mock.patch.object(testbus, "_FALLBACK_BASE_ROOT", self._root / "fallback"),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _live_marked_daemon_pids(self) -> set[int]:
+        """Live dbus-daemon-referencing processes this test created:
+        either the cmdline references THIS test's root, or the process is
+        a direct child of this test process (so a regressed spawn that
+        escaped the per-test tempdir is still caught). Never matches a
+        sibling process's daemon, so the defensive kill in the
+        spawn-refused tests below cannot touch another test's processes."""
+
+        needle = (str(self._root) + os.sep).encode()
+        own_pid = os.getpid()
+        pids: set[int] = set()
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_bytes()
+                if b"dbus-daemon" not in cmdline:
+                    continue
+                # proc(5): ppid is field 4, i.e. index 1 after the last ')'.
+                stat_fields = (entry / "stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+                ppid = int(stat_fields[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            if needle in cmdline or ppid == own_pid:
+                pids.add(int(entry.name))
+        return pids
 
     def _spawn_orphan_daemon(self) -> tuple[int, str, int, int]:
         """Spawn a dbus-daemon via a throwaway python parent that does
@@ -236,9 +301,9 @@ class TestbusHelperTests(unittest.TestCase):
 
         if use_xdg:
             base = testbus._pidfile_base_dir()
-            xdg = os.environ.get("XDG_RUNTIME_DIR")
-            self.assertIsNotNone(xdg, "this host is expected to have XDG_RUNTIME_DIR set")
-            self.assertEqual(base, Path(xdg) / "pantheon-testbus")
+            # setUp always injects a per-test XDG_RUNTIME_DIR, so the XDG
+            # branch is exercisable on every runner, session or not.
+            self.assertEqual(base, Path(os.environ["XDG_RUNTIME_DIR"]) / "pantheon-testbus")
             return base
 
         original = os.environ.pop("XDG_RUNTIME_DIR", None)
@@ -249,7 +314,7 @@ class TestbusHelperTests(unittest.TestCase):
 
         self.addCleanup(_restore)
         base = testbus._pidfile_base_dir()
-        self.assertEqual(base, Path(f"/tmp/pantheon-testbus-{os.getuid()}"))
+        self.assertEqual(base, self._root / "fallback" / f"pantheon-testbus-{os.getuid()}")
         return base
 
     def _squat_with_symlink(self, base: Path) -> None:
@@ -311,30 +376,11 @@ class TestbusHelperTests(unittest.TestCase):
         self.assertEqual(len(lines), 1, lines)
         self.assertIn("PidfileDirRefused", lines[0])
 
-    @unittest.skipUnless(
-        os.environ.get("XDG_RUNTIME_DIR"),
-        "requires XDG_RUNTIME_DIR — the runner UID has no interactive user "
-        "session, so the XDG branch cannot be exercised. Fallback branch is "
-        "covered by the /tmp-fallback tests below (T-3563 slice C).",
-    )
     def test_spawn_daemon_raises_when_base_dir_is_a_symlink(self) -> None:
         base = self._force_base_dir(use_xdg=True)
         self._squat_with_symlink(base)
 
-        def _live_marked_daemon_pids() -> set[int]:
-            pids: set[int] = set()
-            for entry in Path("/proc").iterdir():
-                if not entry.name.isdigit():
-                    continue
-                try:
-                    cmdline = (entry / "cmdline").read_bytes()
-                except OSError:
-                    continue
-                if b"dbus-daemon" in cmdline and b"t2932test-" in cmdline:
-                    pids.add(int(entry.name))
-            return pids
-
-        before = _live_marked_daemon_pids()
+        before = self._live_marked_daemon_pids()
         try:
             with self.assertRaises(testbus.PidfileDirRefused):
                 testbus.spawn_daemon("t2932test-", _BUS_CONFIG)
@@ -343,19 +389,13 @@ class TestbusHelperTests(unittest.TestCase):
             # (see test_spawn_daemon_leaves_nothing_behind_when_base_dir_
             # is_refused below) ever regresses, don't let THIS test leak
             # a daemon while proving the point.
-            for pid in _live_marked_daemon_pids() - before:
+            for pid in self._live_marked_daemon_pids() - before:
                 _kill_if_alive(pid)
                 try:
                     os.waitpid(pid, 0)
                 except ChildProcessError:
                     pass
 
-    @unittest.skipUnless(
-        os.environ.get("XDG_RUNTIME_DIR"),
-        "requires XDG_RUNTIME_DIR — the runner UID has no interactive user "
-        "session, so the XDG branch cannot be exercised. Fallback branch is "
-        "covered by the /tmp-fallback tests (T-3563 slice C).",
-    )
     def test_spawn_daemon_leaves_nothing_behind_when_base_dir_is_refused(self) -> None:
         # Round 2b: the pidfile dir is validated BEFORE anything else is
         # created (_short_tmpdir, the log file, the daemon Popen), so a
@@ -367,27 +407,14 @@ class TestbusHelperTests(unittest.TestCase):
         base = self._force_base_dir(use_xdg=True)
         self._squat_with_symlink(base)
 
-        def _live_marked_daemon_pids() -> set[int]:
-            pids: set[int] = set()
-            for entry in Path("/proc").iterdir():
-                if not entry.name.isdigit():
-                    continue
-                try:
-                    cmdline = (entry / "cmdline").read_bytes()
-                except OSError:
-                    continue
-                if b"dbus-daemon" in cmdline and b"t2932test-" in cmdline:
-                    pids.add(int(entry.name))
-            return pids
-
-        before_pids = _live_marked_daemon_pids()
-        before_tmpdirs = set(Path("/tmp").glob("t2932test-*"))
+        before_pids = self._live_marked_daemon_pids()
+        before_tmpdirs = set(self._tmp_root.glob("t2932test-*"))
         try:
             with self.assertRaises(testbus.PidfileDirRefused):
                 testbus.spawn_daemon("t2932test-", _BUS_CONFIG)
 
-            after_pids = _live_marked_daemon_pids()
-            after_tmpdirs = set(Path("/tmp").glob("t2932test-*"))
+            after_pids = self._live_marked_daemon_pids()
+            after_tmpdirs = set(self._tmp_root.glob("t2932test-*"))
             self.assertEqual(
                 after_pids,
                 before_pids,
@@ -403,13 +430,13 @@ class TestbusHelperTests(unittest.TestCase):
         finally:
             # Same defense-in-depth as the test above, in case this
             # assertion is what catches a future regression.
-            for pid in _live_marked_daemon_pids() - before_pids:
+            for pid in self._live_marked_daemon_pids() - before_pids:
                 _kill_if_alive(pid)
                 try:
                     os.waitpid(pid, 0)
                 except ChildProcessError:
                     pass
-            for tmpdir in set(Path("/tmp").glob("t2932test-*")) - before_tmpdirs:
+            for tmpdir in set(self._tmp_root.glob("t2932test-*")) - before_tmpdirs:
                 shutil.rmtree(tmpdir, ignore_errors=True)
 
 

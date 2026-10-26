@@ -27,7 +27,12 @@
 #   self_restart.sh --service <unit> --target-pane <pane> [--mode user|system] \
 #                   [--handoff-file <path>] [--steady-timeout <sec>] \
 #                   [--self-restart-delay <sec>] [--unit <transient-unit-name>] \
-#                   [--handoff-fresh-hours <h>] [--dry-run]
+#                   [--handoff-fresh-hours <h>] [--supervisor bespoke|control-plane] [--dry-run]
+#
+# --supervisor (T-4159) passes straight through to handoff_and_restart.sh. On a
+# control-plane seat (specialist shape) --service must be pantheon-persona-consume@<p>
+# and the wrapped script kills the session first so the runtime controller
+# relaunches it; `tools/agent_role_map.py restart-target <persona>` prints both.
 #
 # Per-agent invocation is the same flag contract as handoff_and_restart.sh; the
 # agent fires it in-session as its own user (self-restart is always same-account —
@@ -43,6 +48,7 @@ STEADY_TIMEOUT="90"          # claude + plugin + bun boot can exceed the wrapped
 SELF_RESTART_DELAY="3"       # lets the launching turn flush before the restart kills it
 HANDOFF_FRESH_HOURS="1"
 UNIT=""                      # derived from --service if unset
+SUPERVISOR="bespoke"         # T-4159: bespoke | control-plane, passed through to the wrapped script
 DRY_RUN=0
 RESTART_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/handoff_and_restart.sh"
 
@@ -61,6 +67,7 @@ while [[ $# -gt 0 ]]; do
     --self-restart-delay)  SELF_RESTART_DELAY="$2"; shift 2 ;;
     --unit)                UNIT="$2"; shift 2 ;;
     --handoff-fresh-hours) HANDOFF_FRESH_HOURS="$2"; shift 2 ;;
+    --supervisor)          SUPERVISOR="$2"; shift 2 ;;
     --dry-run)             DRY_RUN=1; shift ;;
     -h|--help)             usage; exit 0 ;;
     *) err "unknown arg: $1"; exit 64 ;;
@@ -73,6 +80,10 @@ done
 case "$MODE" in
   user|system) ;;
   *) err "--mode must be 'user' or 'system' (got '$MODE')"; exit 64 ;;
+esac
+case "$SUPERVISOR" in
+  bespoke|control-plane) ;;
+  *) err "--supervisor must be 'bespoke' or 'control-plane' (got '$SUPERVISOR')"; exit 64 ;;
 esac
 
 # Derive the transient unit name from the service if not given (must be unique
@@ -123,7 +134,7 @@ fi
 
 # --- The detached command: wait briefly (let the launching turn flush), then
 # run the restart+kick. exec so the transient unit's MainPID is the restart script.
-INNER="sleep ${SELF_RESTART_DELAY}; exec ${RESTART_SCRIPT} --skip-ack --service ${SERVICE} --mode ${MODE} --target-pane ${TARGET_PANE} --handoff-file ${HANDOFF_FILE} --steady-timeout ${STEADY_TIMEOUT}"
+INNER="sleep ${SELF_RESTART_DELAY}; exec ${RESTART_SCRIPT} --skip-ack --service ${SERVICE} --mode ${MODE} --target-pane ${TARGET_PANE} --handoff-file ${HANDOFF_FILE} --steady-timeout ${STEADY_TIMEOUT} --supervisor ${SUPERVISOR}"
 
 # systemd-run setenv only matters for user scope (XDG_RUNTIME_DIR for the bus).
 RUN_ENV_ARGS=()
@@ -135,7 +146,7 @@ if [[ "$DRY_RUN" == "1" ]]; then
   exit 0
 fi
 
-log "firing detached self-restart (unit=$UNIT, mode=$MODE, service=$SERVICE, pane=$TARGET_PANE, steady=${STEADY_TIMEOUT}s)"
+log "firing detached self-restart (unit=$UNIT, mode=$MODE, supervisor=$SUPERVISOR, service=$SERVICE, pane=$TARGET_PANE, steady=${STEADY_TIMEOUT}s)"
 # Clear any lingering failed instance from a prior run so systemd-run can reuse
 # the fixed unit name (a failed unit would otherwise block the launch).
 "${TMUX_ENV[@]}" systemctl $SCOPE_FLAG reset-failed "$UNIT" 2>/dev/null || true

@@ -99,6 +99,24 @@ class TestBuildCaseTaskPrompt(unittest.TestCase):
                     f"{case.case_id}: gold must_not_flag description leaked into task prompt",
                 )
 
+    def test_null_diff_narrative_path_never_leaks_gold_text_across_committed_set(self):
+        """T-3837 v2: when diff_text is None the source_path narrative is read
+        into the prompt. That path must remain leak-free — a gold description
+        that happens to also appear in the ticket transition-log text would
+        hand the executor the answer key by a different route."""
+        for case in case_loader.load_all_cases().values():
+            text = prompts.build_case_task_prompt(case, diff_text=None, fixed_skills_context="ctx")
+            for finding in case.expected.findings:
+                self.assertNotIn(
+                    finding.description, text,
+                    f"{case.case_id}: null-diff narrative leaked gold finding description",
+                )
+            for finding in case.expected.must_not_flag:
+                self.assertNotIn(
+                    finding.description, text,
+                    f"{case.case_id}: null-diff narrative leaked gold must_not_flag description",
+                )
+
     def test_prompt_requests_the_reviewer_output_contract(self):
         text = prompts.build_case_task_prompt(self.case, diff_text=None, fixed_skills_context="")
         self.assertIn("APPROVE", text)

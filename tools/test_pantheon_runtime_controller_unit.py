@@ -76,7 +76,7 @@ class PantheonRuntimeControllerUnitTest(unittest.TestCase):
     def test_no_timer_companion(self):
         # Type=simple + Restart=always is continuously-supervised, not
         # cron-fired -- a .timer sibling would be the wrong shape (matches
-        # pantheon-acp-bridge@/pantheon-ancestor-daemon/claude-telegram, none
+        # pantheon-acp-bridge@/claude-telegram, neither
         # of which have a .timer either).
         timer_path = UNIT_PATH.with_suffix(".timer")
         self.assertFalse(timer_path.exists(), "controller unit must not have a .timer companion")

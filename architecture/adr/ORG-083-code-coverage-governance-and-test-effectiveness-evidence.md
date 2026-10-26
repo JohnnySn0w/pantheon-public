@@ -4,7 +4,7 @@ id: ORG-083
 title: "Code coverage governance and test-effectiveness evidence"
 status: "Ratified 2026-09-06 by the operator via Telegram 1895. Policy and evidence architecture only; no collector, validator, threshold, CI gate, or repository rollout exists yet."
 date: 2026-08-31
-author: Cairn
+author: Consultant
 steward: orchestrator
 hitl: Ratified
 relates: ORG-038, ORG-041, ORG-065
@@ -24,7 +24,7 @@ Make the reach, effectiveness, and cost of Pantheon's tests measurable without s
 
 ## Context and fleet baseline
 
-The survey behind this ADR covers every project row in `repos.yaml`: 13 live repositories, retired `pantheon-bridge`, and six ignored rows. Cairn directly inspected `pantheon-config@f114a947e538834830f9432a7e744f4b1429c6d5` and `codex-config@79f6b4ed8cc7328f38c3fefb1dea44ca3c501a61`; T-3377 inspected the head-owned repositories and resolved at `24d03d7162`. Absence below means the cited readable revision was searched. Retired and ignored rows were classified, not searched and then mislabeled absent.
+The survey behind this ADR covers every project row in `repos.yaml`: 13 live repositories, retired `pantheon-bridge`, and six ignored rows. Consultant directly inspected `pantheon-config@f114a947e538834830f9432a7e744f4b1429c6d5` and `codex-config@79f6b4ed8cc7328f38c3fefb1dea44ca3c501a61`; T-3377 inspected the head-owned repositories and resolved at `24d03d7162`. Absence below means the cited readable revision was searched. Retired and ignored rows were classified, not searched and then mislabeled absent.
 
 At those revisions, no surveyed live code repository configures line, branch, function, changed-code, or mutation measurement, and none retains a measured flake history. Existing CI and boundary-test maturity varies widely. Therefore every repository begins this policy at `inventory_only`; a test suite or green build does not imply a measured baseline.
 
@@ -274,7 +274,7 @@ Missing, expired, unavailable, incomparable, or malformed evidence lowers eligib
 
 ### 9. Governance and authority
 
-The permanent fleet steward is the role key `orchestrator`, dynamically resolved through the canonical role/persona binding. Cairn is the T-2954 arc author and sole author of these draft bytes and the ratification surface; that grants no permanent waiver, ratchet, or enforcement authority.
+The permanent fleet steward is the role key `orchestrator`, dynamically resolved through the canonical role/persona binding. Consultant is the T-2954 arc author and sole author of these draft bytes and the ratification surface; that grants no permanent waiver, ratchet, or enforcement authority.
 
 Each repository contract explicitly names a `repo_evidence_owner_role` that has `rw` in the cited `repos.yaml` revision. With one eligible role it is the default candidate; with several, the repository remains inventory-only until the fleet steward records an assignment. The repository owner proposes ratchets and maintains evidence. The fleet steward approves ratchets, organization-level drift dispositions, and any waiver that weakens advisory/enforcing obligations. If owner and steward resolve to the same role, an independent reviewer receipt is mandatory. Reassignment records old/new roles, reason, effective revision, registry evidence, and approvals. Resolution failure blocks promotion and waiver approval.
 
@@ -365,7 +365,7 @@ After ratification, the spawned build child must scope and independently review:
 
 This draft derives from T-2954, the T-3377 survey, direct repository-object audits, and three antagonistic proposal-review rounds. The third-boundary amendments make specialized records root-reachable, make retention availability observable, correct the HITL lifecycle, and require the future ratification Ask itself to identify the frozen bytes.
 
-After this file is committed and independently reviewed at that exact commit, Cairn files the the operator ratification ticket through `tools/ticket.py file` with `--intent ratify`, the exact `--ratifiable-file pantheon-config:architecture/adr/ORG-083-code-coverage-governance-and-test-effectiveness-evidence.md`, and `--spawn-impl`. The `--ask` text—not only context—must name the frozen ADR commit and the independent exact-commit verdict/pointer. The generated implementation child then receives `build` and `org-083` labels. No ratification surface is filed while review is red.
+After this file is committed and independently reviewed at that exact commit, Consultant files the the operator ratification ticket through `tools/ticket.py file` with `--intent ratify`, the exact `--ratifiable-file pantheon-config:architecture/adr/ORG-083-code-coverage-governance-and-test-effectiveness-evidence.md`, and `--spawn-impl`. The `--ask` text—not only context—must name the frozen ADR commit and the independent exact-commit verdict/pointer. The generated implementation child then receives `build` and `org-083` labels. No ratification surface is filed while review is red.
 
 ## DECISIONS
 
@@ -374,6 +374,6 @@ After this file is committed and independently reviewed at that exact commit, Ca
 - **Intent: preserve comparisons across changing tools and denominators. Call: reset or refuse comparisons after material input changes unless equivalence is reviewed.** justified-via P1, P3, P4, D5.
 - **Intent: keep exceptions visible and reversible. Call: type exclusions, waivers, deferrals, generated-source treatment, retry, deploy tolerance, quarantine, and flake separately, with expiry and restoration.** justified-via P1, P3, P4, D7.
 - **Intent: avoid unsupported fleet generalization. Call: impose nonnumeric evidence obligations but no universal numeric threshold.** justified-via P2, P3, P6, D12.
-- **Intent: make authority reconstructable without persona conflation. Call: role-key permanent stewardship and repository ownership; Cairn is this arc's author only.** justified-via P3, P4, P5, D7.
+- **Intent: make authority reconstructable without persona conflation. Call: role-key permanent stewardship and repository ownership; Consultant is this arc's author only.** justified-via P3, P4, P5, D7.
 - **Intent: prevent policy prose from masquerading as machinery. Call: keep every repository inventory-only until the ratification-gated contract, validator, adapters, parity, retention, and pilot are built and independently verified.** justified-via P1, P4, D5, D6, D7.
 - **Intent: preserve the ratification/build audit chain. Call: freeze and independently review the canonical commit, name it in the ratification Ask, spawn the gated implementation child, and label that child `build` plus `org-083`.** justified-via P3, P4, P5, D2, D7, D9.

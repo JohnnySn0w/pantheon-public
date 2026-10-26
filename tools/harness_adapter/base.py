@@ -184,6 +184,20 @@ class PantheonHarnessAdapter(ABC):
         """Return the provider-native quota evidence reader for this profile."""
         ...
 
+    def prepare_launch(self, binding: Any, *, cwd: Path) -> None:
+        """Harness-specific launch preparation, run before the interactive launch.
+
+        T-5005 (T-4924 plan §2.4): an optional hook with a no-op default.
+        hermes renders its per-seat files here. The controller dispatches
+        launch preparation through ``HarnessIntegration.prepare_launch``
+        (T-5011 PR-A), keyed on the binding's harness so a test or stub
+        adapter cannot skip it; codex's ``ensure_*`` seeding and claude's
+        bypass consent live there (``prepare_codex_launch`` /
+        ``prepare_claude_launch``), not on the adapter.
+        """
+        del binding, cwd
+        return None
+
     def assess_post_start_readiness(
         self,
         *,
@@ -191,8 +205,16 @@ class PantheonHarnessAdapter(ABC):
         profile: str,
         baseline: PostStartPaneSample,
         samples: Iterable[PostStartPaneSample],
+        now: datetime | None = None,
     ) -> PostStartAssessment:
-        """Assess provider UI after post-start hooks without serializing text."""
+        """Assess provider UI after post-start hooks without serializing text.
+
+        ``now`` (T-4047) is accepted for interface parity with concrete
+        overrides that parse a reset instant (see
+        ``ClaudeHarnessAdapter.assess_post_start_readiness``) -- this generic
+        default never classifies "subscription-cap", so it never needs it.
+        """
+        del now
         sample_tuple = tuple(samples)
         return PostStartAssessment(
             schema="pantheon-harness-post-start-assessment/v1",
@@ -253,6 +275,22 @@ class PantheonHarnessAdapter(ABC):
             capture_count=len(sample_tuple),
             changed_capture_indices=(),
         )
+
+    def interactive_provider_completion_submitted(
+        self,
+        *,
+        probe: ProviderCompletionProbe,
+    ) -> bool | None:
+        """Did the harness take the probe as a prompt at all? (T-4321)
+
+        True: it did. False: positively not (the controller may re-type it).
+        None: can't tell, and the controller never reads that as swallowed.
+        The default is None, so a harness without a prompt-history surface
+        never has its probe re-typed.
+        """
+
+        del probe
+        return None
 
     # -------------------------------------------------------------------------
     # Partition 1 — Generalized surfaces (7).
@@ -387,6 +425,15 @@ class PantheonHarnessAdapter(ABC):
     def inject_inbound(self, message: str, **kwargs: Any) -> None:
         """Inject an inbound message as a new turn via the harness's native turn API.
 
+        PRINCIPLE (stated once, here; the operator TG 11733/11741/11742, ORG-031 §(ii)
+        as amended, T-4929): every harness gets the MAXIMAL unlock — claude:
+        ``--permission-mode bypassPermissions``; codex: ``danger-full-access`` +
+        ``approval_policy=never``. The security boundary is the unix account
+        (permissions operate at the user level), not the harness sandbox.
+        STATUS: codex implements this today. Claude's adapter default is still
+        ``default`` mode pending follow-up ticket T-4935 (it changes every live
+        Claude seat's launch mode).
+
         THIS IS A BRIDGE SURFACE — the mechanism is harness-specific and the
         implementations are NOT interchangeable.
 
@@ -409,14 +456,13 @@ class PantheonHarnessAdapter(ABC):
         THIS IS A BRIDGE SURFACE — the two harnesses use orthogonal approval
         mechanisms; the returned dict shapes are harness-specific.
 
-        claude-code: {"permission_mode": "default",
-                      "flag": "--permission-mode default",
-                      "tool_approval": "scoped-permissions.allow"}
+        claude-code: {"permission_mode": "bypassPermissions",
+                      "flag": "--permission-mode bypassPermissions",
+                      "tool_approval": "bypass-permissions"}  (T-4935)
         codex:       {"approval_policy": "never",
-                      "sandbox_mode": "workspace-write",
-                      "sandbox_workspace_write": {"network_access": True},
+                      "sandbox_mode": "danger-full-access",
                       "mcp_tool_approval": "approve", ...}
-                     (ORG-031 §ii live-verified; ``trust_level`` alone does NOT silence
+                     (ORG-031 §(ii) as amended; ``trust_level`` alone does NOT silence
                      prompts. NOTE the precise truth (live find 2026-06-09, T-1033):
                      ``approval_policy="never"`` silences *shell/command* prompts but
                      NOT *MCP-tool* prompts — a freshly-registered MCP tool prompts on
@@ -446,9 +492,9 @@ class PantheonHarnessAdapter(ABC):
 
         NOT ABSTRACTED — forcing a common call would hide load-bearing semantics:
           claude-code: native sandboxing plus permission modes/settings.
-          codex:       approval_policy × sandbox_mode (2 orthogonal axes) +
-                       sandbox_workspace_write.{writable_roots, network_access}.
-                       ORG-031 §ii ratified: never + workspace-write + network_access=true.
+          codex:       approval_policy × sandbox_mode (2 orthogonal axes).
+                       Full-unlock default: never + danger-full-access (see
+                       approval_defaults for the principle; T-4929).
 
         Concrete subclasses override this to return their per-harness config dict.
         """

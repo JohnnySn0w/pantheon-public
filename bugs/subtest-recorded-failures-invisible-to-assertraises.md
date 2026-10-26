@@ -30,7 +30,7 @@ on fixtures, not from invoking the guard test and trying to observe its failure.
 
 ## Provenance
 
-Metis, T-1958 (2026-07-22), building the meta-test that fails when a KNOWN-VIOLATION lint entry's
+Mason, T-1958 (2026-07-22), building the meta-test that fails when a KNOWN-VIOLATION lint entry's
 tracking ticket is already resolved — their first attempt wrapped the guard test in assertRaises and
 hit both symptoms; the refactor made the check testable at all.
 

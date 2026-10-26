@@ -41,8 +41,6 @@ The handshake and the identity model say nothing about *load*. A federation surf
 
 ## Decision
 
-*(v2, 2026-08-11: expanded to close the Codex ORG-041 round-1 review — connection-taxonomy + tiered pre/post-auth budgets, an explicit STRICT stale-on-error policy, failure-classed negative caching, resolution-amplification bounds, ABORT/observability semantics, and a named parameter table. Record: notes/2026-08-11-org071-review-round1.md.)*
-
 ### D1 — DoS bounds, fail-closed under load (connection taxonomy + tiered budgets + amplification)
 
 Bounds are enforced at three layers, all fail-closed (excess is **rejected, never degraded** — shed connections before weakening authentication; a rejection is an ABORT with a logged reason, distinct from an auth failure):
@@ -111,6 +109,4 @@ A bound-breach ABORT uses a **coarse** error vocabulary deliberately (rate-limit
 
 ## Provenance / review trail
 
-- 2026-08-10 — HO-drafted as ORG-047 Split B per the T-2803 triage (disposition: SPLIT; operator-named split-candidate #2). Absorbs the DoS-bounds (#6) and cost/quota (#14) considerations.
-- 2026-08-11 — Codex ORG-041 review **round 1**: not-clean (directionally sound but too much security-critical network behavior left for builders to infer). HO integrated into **v2** (this revision): connection taxonomy + tiered pre/post-auth budgets (D1), STRICT stale-on-error + failure-classed negative caching + singleflight (D2), named timeout taxonomy (D3), phase-specific counterparty identity keys (D4), uniform-not-identical + weighted cost (D5), coarse-ABORT + named audit events (D6), and a build-time parameter table. Review record: `notes/2026-08-11-org071-review-round1.md`.
-- RATIFIED 2026-09-06 (the operator, per architecture/adr/README index + status frontmatter). On ratify: file the build sub-ticket set (rate-limiter, timeout policy, resolution cache with negative-caching + singleflight + jitter, quota enforcer, circuit breaker) under scoping ticket T-2812, per the ADR-scoping rule.
+Drafting, the Codex ORG-041 round-1 review and the v2 revision record: `notes/2026-10-08-org-071-review-history.md` (round-1 review record: `notes/2026-08-11-org071-review-round1.md`).

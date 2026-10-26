@@ -1,0 +1,79 @@
+# rulebook/seat-context/slices.yaml — the orchestrator-curated slices of Orchestrator's memory
+# pins that tools/seat_context_bundle.py exports to a seat (T-4065; ORG-075 D2 / E2).
+#
+# D2 hand-curated: orchestrator authors this file. Workers propose changes in their
+# reports; they don't edit it directly.
+#
+# Selection rule (T-2425: precision over bulk; irrelevant memory costs
+# instruction-following): a pin belongs in a slice only if a seat in that role
+# needs it to take an HO-level handoff and run the arc to the same standard
+# Orchestrator would. So the slice leaves out:
+#   - pins that only make sense with Orchestrator's own credentials, sudo or Telegram
+#     seat (e.g. the peer-pane poke, sudo paths, bot topology);
+#   - operator-facing voice and preferences (engineering orchestrators report to
+#     Orchestrator, and Orchestrator owns the the operator channel);
+#   - project-specific state that goes stale fast (read the tickets instead).
+#
+# Schema (see tools/fixtures/seat_context/slices.example.yaml):
+#   slices:
+#     <slice-name>:
+#       description: <str>              # optional
+#       pins: [<pin-filename.md>, ...]  # required
+#
+# Rollout (T-4065): as orchestrator run
+#   python3 tools/seat_context_bundle.py export --slice engineering_orchestrator \
+#       --slice-file rulebook/seat-context/slices.yaml \
+#       --source ~/.claude/projects/-home-claude/memory \
+#       --out /var/lib/pantheon/context-bundles/<persona>
+# then each seat imports into its OWN memory dir. Re-export after editing a
+# listed pin or this file; import is idempotent and never overwrites a
+# seat-edited copy.
+
+slices:
+  engineering_orchestrator:
+    description: >-
+      HO context an engineering-orchestrator seat (mason, artisan) needs to take
+      HO-level handoffs: dispatch mechanics, ticket/ledger/mailbox tooling
+      gotchas, verification discipline, and fleet facts.
+    pins:
+      # --- dispatch + worker orchestration ---
+      - feedback_use_subagents_by_default.md
+      - reference_reviewer_cwd_tmp_worktree_dispatch.md
+      - reference_subagent_restriction_agent_type_hook.md
+      - feedback_implementer_idles_after_plan_approval.md
+      - feedback_implementer_stops_on_background_wait.md
+      - feedback_reviewer_brief_names_destructive_side_effects.md
+      - feedback_active_team_worker_check.md
+      - feedback_persist_worker_decisions_to_ticket.md
+      # --- verification discipline ---
+      - feedback_dispatch_brief_claims_are_unverified.md
+      - feedback_isolating_test_before_root_cause_claim.md
+      - feedback_smoke_must_include_ci_command_not_curated_subset.md
+      - feedback_echo_smoke_full_command.md
+      - feedback_no_fabricated_tool_results.md
+      # --- branches, merges, worktrees ---
+      - feedback_merge_main_into_agent_before_review.md
+      - feedback_confirm_commits_on_branch_before_worktree_teardown.md
+      - feedback_never_delete_branch_before_merge_confirms.md
+      - reference_echo_shared_cargo_target_env.md
+      # --- ticket / ledger / mailbox tooling ---
+      - reference_ticket_py_file_subcommand_flags.md
+      - reference_ticket_py_annotate_refuses_on_done.md
+      - reference_ticket_wip_cap_serializes_claims.md
+      - reference_ticket_resolve_shell_quoting.md
+      - feedback_ticket_body_fill_dont_duplicate_transition_log_header.md
+      - feedback_not_before_reserved_for_real_calendar_deps.md
+      - reference_ledger_append_push_before_groom.md
+      - reference_ledger_handwrite_timestamp_discipline.md
+      - reference_mailbox_import_absolute_path.md
+      - reference_mailbox_supersedes_deletes_prior_message.md
+      - reference_coord_via_ticket_not_mailbox_for_concurrent_persona_sessions.md
+      - reference_concurrent_persona_arc_coord_protocol.md
+      # --- shell mechanics that bite orchestrators ---
+      - feedback_heredoc_breaks_and_chain_gate.md
+      - feedback_background_task_exit_code_is_last_command.md
+      - feedback_parallel_bash_calls_share_cwd_use_explicit_paths.md
+      # --- fleet facts ---
+      - reference_pantheon_bugs_directory.md
+      - project_pantheon_account_topology.md
+      - project_model_policy_opus_standard.md

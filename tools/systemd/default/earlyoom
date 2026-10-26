@@ -1,0 +1,15 @@
+# Pantheon earlyoom config (T-5157) -> /etc/default/earlyoom.
+#
+# Swap/low-memory backstop replacing oomd's SwapUsedLimit kill, which cascades
+# across accounts on systemd 255 (see tools/systemd/system/user.slice.d/). earlyoom
+# SIGTERMs (then SIGKILLs) ONE process when available RAM <= -m AND free swap <= -s,
+# so it never walks a candidate list. --prefer steers it to build workers (python3 is NOT preferred: ~30 fleet daemons run as python3);
+# --avoid keeps it off agent sessions and session plumbing unless nothing else is
+# left. Regexes match /proc/<pid>/comm (max 15 chars); the installed claude binary
+# runs as comm "claude.exe", hence claude([.]exe)? (brackets, not a backslash). NO inner quotes: the unit
+# expands $EARLYOOM_ARGS word-split, and a literal ' would silently void --avoid.
+# Keep the regexes free of spaces.
+# T-5297: mosquitto is avoided. Killing a 3 MiB broker frees nothing, and on 10-19
+# it took echo down for 19 h. The echo daemon itself is NOT avoided: it holds real
+# memory and restarts on its own (Restart=always).
+EARLYOOM_ARGS="-m 5 -s 10 -r 3600 --prefer ^(rustc|cargo.*|cc1|cc1plus|ld|ld.lld)$ --avoid ^(claude([.]exe)?|codex.*|node|bun|tmux.*|systemd.*|sshd|dbus.*|tailscaled|caddy|postgres|mosquitto)$"

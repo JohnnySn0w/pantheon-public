@@ -80,7 +80,7 @@ MODULE_ID = "telegram-outbound"
 # change to that module's constant does not silently widen or narrow this
 # guard — same posture mailbox_roundtrip's own docstring gives for its
 # _REAL_HUB_DEFAULT constant.
-_REAL_OPERATOR_CHAT_ID = "456474197"
+_REAL_OPERATOR_CHAT_ID = "424242424"
 
 # classify_send_error()'s four named failure-mode kinds.
 WRONG_CHAT_ID = "wrong_chat_id"

@@ -3,7 +3,7 @@ aliases: [ORG-073]
 title: "Concordance — retrieval-policy and injection layer (decision-corpus PoC)"
 status: "RATIFIED 2026-08-21 by the operator (TG msg 8093, via T-3001). Supersedes the 2026-08-12 v1 ratify."
 date: 2026-08-20
-author: Orchestrator (HO) with Cairn (Codex, ORG-041) spec review; Specialist (claude-research) foundational research (2026-08-10 info-flow study)
+author: Orchestrator (HO) with Consultant (Codex, ORG-041) spec review; Specialist (claude-research) foundational research (2026-08-10 info-flow study)
 relates: ORG-058, ORG-062, ORG-065, ORG-061, ORG-017, ORG-035, ORG-012, ORG-044, ORG-031, T-2107, T-2106, T-2113, T-2425, T-2533, T-2816, T-2998, T-2999, T-3000
 supersedes:
   - id: ORG-073-v1
@@ -164,7 +164,7 @@ Adapt T-2107's protocol design (Specialist, `knowledge/episodic/2026-07-28-searc
 
 ## Post-PoC follow-ups (deferred content — separately scoped ADRs)
 
-The following work is intentionally outside this ADR's scope and lives in separate follow-up ADR-authoring tickets, each gated on this ADR's PoC passing PMB-1. Each follow-up ADR gets its own scoping ticket, design pass, Cairn ORG-041 review, and operator-ratify.
+The following work is intentionally outside this ADR's scope and lives in separate follow-up ADR-authoring tickets, each gated on this ADR's PoC passing PMB-1. Each follow-up ADR gets its own scoping ticket, design pass, Consultant ORG-041 review, and operator-ratify.
 
 - **T-2998** — **Concordance push-at-write / retrieval-on-write ADR.** The genuinely-novel non-recipe piece. On commit of an ADR/decision, a hook propagates a pointer into affected personas' surfaces. **Primary design risk = inflation:** the mechanism must model expected volume, per-persona pending-pointer budget, back-pressure caps + digest consolidation, supersession-based dedupe (not commit-sha), authoritative post-receive trigger (not local git hook), and MUST prove non-inflationary at scale before proposing implementation. Gated on T-2816 (PoC) passing PMB-1.
 - **T-2999** — **Concordance/memex instance ADR.** Memex-corpus (the operator's `~/notes/` Obsidian vault) as the second scope-qualified instance of the Concordance substrate. Requires per-corpus adaptation obligations validated separately; deployment-shape decision (shared multi-corpus service vs isolated per-instance) MUST be made explicitly with security + operations analysis, not as a build-time preference. Gated on T-2816 (PoC) passing PMB-1 + the operator's separate go.

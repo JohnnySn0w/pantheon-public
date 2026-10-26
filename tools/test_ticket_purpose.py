@@ -6,6 +6,7 @@ from dataclasses import replace
 from pathlib import Path
 import argparse
 import contextlib
+import io
 import shutil
 import tempfile
 import unittest
@@ -237,6 +238,119 @@ class TicketPurposeTests(unittest.TestCase):
             self.assertIn("purpose-set", body)
             commit.assert_called_once()
 
+    def test_purpose_command_auto_adds_justifying_label_when_unjustified(self) -> None:
+        """T-4090: `cmd_purpose` sets project_id + nearest_intent_ref
+        together -- same failure class as `file` (T-4080). `purpose` has no
+        --labels flag, so when neither the ticket's existing labels nor the
+        new nearest_intent_ref justify the project_id, the project id is
+        auto-added as a label rather than landing unjustified."""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            tickets_root = repo_root / "tickets"
+            path = tickets_root / "active" / "T-4000.md"
+            path.parent.mkdir(parents=True)
+            path.write_text(
+                "---\nid: T-4000\ncreated: 2026-09-01T00:00:00Z\n"
+                "requester: recovery\ntarget: orchestrator\nstate: active\n"
+                "parent_ticket: null\ndepends_on: []\n"
+                "serves: old purpose\n---\n\n# Work\n\n## Transition log\n\n"
+                "- 2026-09-01T00:00:00Z [recovery] filed in inbox\n",
+                encoding="utf-8",
+            )
+            records_root = repo_root / "projects" / "records"
+            records_root.mkdir(parents=True)
+            (records_root / "alpha-project.yaml").write_text(
+                "schema_version: 1\n"
+                "project_id: alpha-project\n"
+                "telos: test fixture\n"
+                "parent_goal_ref: null\n"
+                "classification: independent\n"
+                "boundary: {inside: [x], outside: [y], not_owned: [z]}\n"
+                "interfaces: {provides: [a], requires: [b]}\n"
+                "stewardship: {role: project-steward, authority_surface: 'decision:x'}\n"
+                "lifecycle: {developmental_mode: shaping, "
+                "formed_at: '2026-08-26T00:00:00Z', transition_refs: []}\n"
+                "evidence: {health: [], user_value: [], safety: [], developmental: []}\n"
+                "tensions: [{pole_a: a, pole_b: b, rebalance_trigger: c}]\n"
+                "operational_contract:\n"
+                "  obligations: {deployment: [], data: [], security: [], cost: [], "
+                "maintenance: [], recovery: []}\n"
+                "  lifecycle: {install: [], configure: [], health_monitor: [], "
+                "update: [], remove: []}\n",
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                ticket="T-4000",
+                project_id="alpha-project",
+                nearest_intent_ref="maintenance:ticket-board",
+                serves=None,
+                no_push=True,
+            )
+            with patch.object(ticket, "TICKETS_ROOT", tickets_root), patch.object(
+                ticket, "REPO_ROOT", repo_root
+            ), patch.object(
+                ticket, "_purpose_issues_for_fields", return_value=()
+            ), patch.object(ticket, "_pull_if_needed"), patch.object(
+                ticket, "git_mutation_lock", return_value=contextlib.nullcontext()
+            ), patch.object(ticket, "_commit_and_push") as commit:
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    self.assertEqual(ticket.cmd_purpose(args), 0)
+            fields, _body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+            self.assertEqual(fields.get("labels"), ["alpha-project"])
+            self.assertIn("auto-added label", buf.getvalue())
+            commit.assert_called_once()
+
+    def test_purpose_command_refuses_nonexistent_project_before_any_auto_add_note(
+        self,
+    ) -> None:
+        """T-4090 REBOUND-1 finding 2: a nonexistent --project-id record
+        must refuse cleanly and EARLY -- before `_ensure_project_label_
+        justifies_filing` ever prints its WARN-mode "WARNING" / "auto-added
+        label ... to justify" note (default TICKET_PURPOSE_ENFORCEMENT is
+        "warn", left un-patched here). Deliberately does NOT stub
+        `_purpose_issues_for_fields`, so the real interplay between the new
+        early check and the pre-existing hardcoded-ENFORCE downstream graph
+        check is exercised, not mocked away."""
+        with tempfile.TemporaryDirectory() as td:
+            repo_root = Path(td)
+            tickets_root = repo_root / "tickets"
+            path = tickets_root / "active" / "T-4001.md"
+            path.parent.mkdir(parents=True)
+            original_text = (
+                "---\nid: T-4001\ncreated: 2026-09-01T00:00:00Z\n"
+                "requester: recovery\ntarget: orchestrator\nstate: active\n"
+                "parent_ticket: null\ndepends_on: []\n"
+                "serves: old purpose\n---\n\n# Work\n\n## Transition log\n\n"
+                "- 2026-09-01T00:00:00Z [recovery] filed in inbox\n"
+            )
+            path.write_text(original_text, encoding="utf-8")
+            # No projects/records/ directory at all -- load_project_records
+            # degrades to {} for a missing root, so "ghost-project" is
+            # unambiguously not a real project record.
+            args = argparse.Namespace(
+                ticket="T-4001",
+                project_id="ghost-project",
+                nearest_intent_ref="maintenance:ticket-board",
+                serves=None,
+                no_push=True,
+            )
+            with patch.object(ticket, "TICKETS_ROOT", tickets_root), patch.object(
+                ticket, "REPO_ROOT", repo_root
+            ), patch.object(ticket, "_pull_if_needed"), patch.object(
+                ticket, "git_mutation_lock", return_value=contextlib.nullcontext()
+            ), patch.object(ticket, "_commit_and_push") as commit:
+                buf = io.StringIO()
+                with contextlib.redirect_stderr(buf):
+                    with self.assertRaises(ticket.TicketError) as ctx:
+                        ticket.cmd_purpose(args)
+            self.assertIn("ghost-project", str(ctx.exception))
+            self.assertIn("projects/records", str(ctx.exception))
+            self.assertNotIn("auto-added label", buf.getvalue())
+            self.assertNotIn("WARNING", buf.getvalue())
+            commit.assert_not_called()
+            self.assertEqual(path.read_text(encoding="utf-8"), original_text)
+
     def test_loader_round_trips_explicit_null_and_absence(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -278,6 +392,73 @@ class TicketPurposeTests(unittest.TestCase):
             self.assertIn("Structured ticket-purpose warnings (2)", digest)
             self.assertIn("ticket.py purpose <tid>", digest)
 
+    def test_initial_backfill_never_infers_project_from_repo_or_persona(self) -> None:
+        """T-2414 plan's named T-3169 acceptance test: a ticket's project_id is
+        legitimate only via an exact-label match on a real project id, or via
+        a ticket:<parent> nearest_intent_ref chain hop landing on a ticket
+        that already carries that project_id -- never merely because a
+        subject, repository, or persona string happens to contain the
+        project's name (T-3169's own live check found exactly this false
+        positive: 'pantheon-config' and 'pantheon-pwa-release-mirror' both
+        word-boundary-match 'pantheon' without being that project).
+
+        T-4090: the predicate itself now lives in tools.ticket_purpose as
+        `project_id_justified` (shared with ticket.py's file-time /
+        purpose-set / label-remove enforcement) -- this test exercises the
+        same 4 fixture cases against the shared function rather than a local
+        copy, so the two can never drift apart the way they did in T-4080."""
+
+        justified = tp.project_id_justified
+
+        tracker = _purpose(
+            "T-9000",
+            project_id="biometrics",
+            nearest=None,
+            labels=frozenset({"biometrics", "project-tracker"}),
+        )
+        unjustified = _purpose(
+            "T-9001",
+            project_id="biometrics",
+            nearest=None,
+            labels=frozenset({"hardware"}),
+        )
+        chained = _purpose(
+            "T-9002",
+            project_id="biometrics",
+            nearest="ticket:T-9000",
+            labels=frozenset({"hardware"}),
+        )
+        broken_chain = _purpose(
+            "T-9003",
+            project_id="biometrics",
+            nearest="ticket:T-9999",
+            labels=frozenset({"hardware"}),
+        )
+        index = {"T-9000": tracker, "T-9002": chained, "T-9003": broken_chain}
+        self.assertTrue(justified(tracker, index))
+        self.assertFalse(justified(unjustified, index))
+        self.assertTrue(justified(chained, index))
+        self.assertFalse(justified(broken_chain, index))
+
+        # Live-corpus enforcement: every currently-committed non-done ticket
+        # whose project_id is set must be justified the same way. The corpus
+        # now legitimately carries hundreds of justified project_ids (the
+        # project-mapping backfill landed) -- this is no longer a
+        # starts-empty-stays-empty check. As of T-4090, `ticket.py file` /
+        # `purpose` auto-add the justifying label at write time and `label
+        # remove` refuses a removal that would break it, so this assertion
+        # is now a backstop rather than the sole enforcement: it still
+        # catches any filing path that bypasses ticket.py entirely (direct
+        # file writes, migrations, hand edits) -- which is exactly how
+        # T-4080's 8 unjustified tickets got onto main in the first place.
+        live = tp.load_ticket_purpose_index(REPO_ROOT / "tickets")
+        violations = [
+            pid
+            for pid, purpose in live.items()
+            if purpose.state != "done" and not justified(purpose, live)
+        ]
+        self.assertEqual(violations, [])
+
     def test_automated_filer_inventory_and_omission_threat(self) -> None:
         self.assertEqual(tp.audit_automated_filers(REPO_ROOT), ())
         self.assertNotIn("tools/cascade_diff_scan.py", tp.AUTOMATED_FILER_EXPECTATIONS)
@@ -297,6 +478,53 @@ class TicketPurposeTests(unittest.TestCase):
             )
             issues = tp.audit_automated_filers(root)
             self.assertEqual({issue.ticket_id for issue in issues}, {"tools/knowledge_sweep.py"})
+
+
+class TestPurposeFromText(unittest.TestCase):
+    """T-4402: `purpose_from_text` parses ONE ticket's text (e.g. a staged
+    blob) with exactly the parser and field rules `load_ticket_purpose_index`
+    uses, so the pre-commit content gate and the nightly live-corpus test can
+    never disagree about what a ticket says."""
+
+    TEXT = (
+        "---\n"
+        "id: T-9100\n"
+        "state: active\n"
+        "project_id: biometrics\n"
+        "nearest_intent_ref: ticket:T-9000\n"
+        "labels: [hardware, biometrics]\n"
+        "serves: keep the parity test honest\n"
+        "---\n\n# title\n"
+    )
+
+    def test_matches_the_index_loader_for_the_same_file(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            (root / "active").mkdir()
+            (root / "active" / "T-9100.md").write_text(self.TEXT, encoding="utf-8")
+            loaded = tp.load_ticket_purpose_index(root)["T-9100"]
+        parsed = tp.purpose_from_text(
+            self.TEXT, source="tickets/active/T-9100.md", default_state="active"
+        )
+        self.assertEqual(parsed, loaded)
+        self.assertEqual(parsed.project_id, "biometrics")
+        self.assertEqual(parsed.labels, frozenset({"hardware", "biometrics"}))
+
+    def test_default_state_used_only_when_frontmatter_has_none(self) -> None:
+        text = self.TEXT.replace("state: active\n", "")
+        parsed = tp.purpose_from_text(text, source="x", default_state="inbox")
+        self.assertEqual(parsed.state, "inbox")
+        explicit = tp.purpose_from_text(self.TEXT, source="x", default_state="inbox")
+        self.assertEqual(explicit.state, "active")
+
+    def test_bad_frontmatter_raises_purpose_error_naming_the_source(self) -> None:
+        with self.assertRaises(tp.PurposeError) as cm:
+            tp.purpose_from_text("no frontmatter\n", source="tickets/inbox/T-1.md",
+                                 default_state="inbox")
+        self.assertIn("tickets/inbox/T-1.md", str(cm.exception))
+        with self.assertRaises(tp.PurposeError):
+            tp.purpose_from_text("---\nstate: inbox\n---\n", source="x",
+                                 default_state="inbox")  # no id
 
 
 class TestAppetiteValidation(unittest.TestCase):
@@ -334,6 +562,14 @@ class TestAppetiteValidation(unittest.TestCase):
         })
         tp.validate_appetite_fields({})  # all absent is valid
 
+    def test_validate_fields_accepts_awaiting_merge_substate(self) -> None:
+        # T-4119: awaiting-merge is a recognized substate (symmetric with the
+        # appetite-overrun / dropped acceptances above) — no awaiting_merge_ref
+        # shape rule lives here (validate_appetite_fields stays scoped to the
+        # ORG-089 fields it already owned; ref/substate consistency is a
+        # ticket_lint.py corpus check, not this file's concern).
+        tp.validate_appetite_fields({"substate": "awaiting-merge"})
+
     def test_validate_fields_refuses_unknown_substate(self) -> None:
         with self.assertRaises(tp.AppetiteError):
             tp.validate_appetite_fields({"substate": "paused"})
@@ -355,6 +591,8 @@ class TestAppetiteValidation(unittest.TestCase):
                 "dropped_reason": "x",
                 "dropped_from_state": "done",
             })
+
+
 
 
 if __name__ == "__main__":

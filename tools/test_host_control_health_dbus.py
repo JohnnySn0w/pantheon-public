@@ -178,8 +178,20 @@ class HealthBusHarness:
             if time.monotonic() > deadline:
                 raise AssertionError("driver never wrote state")
             if self.state_path.exists():
-                self.state = json.loads(self.state_path.read_text(encoding="utf-8"))
-                if self.state.get("baseline", {}).get("baseline_ready") is True:
+                # T-4118: a partial/empty read here just means "driver hasn't
+                # finished writing yet" -- treat it as not-ready and keep
+                # polling, rather than crashing the whole harness setup. The
+                # driver now writes state.json atomically, so this is
+                # belt-and-braces against any partial-write window that
+                # `pytest -n auto` contention could widen.
+                try:
+                    state = json.loads(self.state_path.read_text(encoding="utf-8"))
+                except json.JSONDecodeError:
+                    state = None
+                if state is not None and state.get("baseline", {}).get(
+                    "baseline_ready"
+                ) is True:
+                    self.state = state
                     break
             time.sleep(0.05)
 
@@ -289,9 +301,23 @@ class HealthBusHarness:
             f"broker:{time.monotonic_ns()}",
             encoding="utf-8",
         )
+        # T-4118: the delivery (non-denied) wait is a GENEROUS HANG CEILING,
+        # not a timing budget. The loop returns the instant the signal is
+        # received, so the assertion depends on the received CONTENT, not on
+        # wall-clock -- a healthy run returns in ~100ms (the driver's emit
+        # poll interval), and only a genuine delivery hang waits the ceiling
+        # out and fails. The old 3.0s was a tight budget that false-failed
+        # under `pytest -n auto` contention, where the driver subprocess's
+        # poll + signal round-trip can be scheduled late. The denied wait
+        # stays SHORT on purpose: it is a NEGATIVE assertion (a suppressed
+        # signal must NOT arrive), which a longer window cannot make more
+        # correct, and which load can only make safer -- and the paired
+        # allowed-case call in the same test already proves delivery is live.
+        delivery_hang_ceiling_s = 30.0
+        window_s = 0.8 if denied else delivery_hang_ceiling_s
         loop = GLib.MainLoop()
-        GLib.timeout_add(800 if denied else 3000, loop.quit)
-        deadline = time.monotonic() + (0.8 if denied else 3.0)
+        GLib.timeout_add(int(window_s * 1000), loop.quit)
+        deadline = time.monotonic() + window_s
         while time.monotonic() < deadline and (denied or not received):
             loop.get_context().iteration(True)
             if received and not denied:

@@ -35,10 +35,20 @@ No `gepa` import (see package docstring).
 
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
 from typing import Sequence
 
-CLAUDE_BINARY = "claude"
+# Prefer the resolved absolute path so subprocesses invoked from a systemd-run
+# --user context (which inherits a minimal PATH) don't hit FileNotFoundError.
+# Falls back to bare "claude" when not resolvable (e.g. in pure unit tests
+# that mock subprocess).
+CLAUDE_BINARY = (
+    os.environ.get("PANTHEON_CLAUDE_BIN")
+    or shutil.which("claude", path=f"{os.path.expanduser('~/.npm-global/bin')}:{os.environ.get('PATH', '')}")
+    or "claude"
+)
 
 
 class ClaudeExecutorError(Exception):
@@ -94,7 +104,7 @@ def build_claude_argv(
     return argv
 
 
-def run_argv(argv: Sequence[str], *, timeout: float = 300.0) -> str:
+def run_argv(argv: Sequence[str], *, timeout: float = 300.0, cwd: str | None = None) -> str:
     """Run a pre-built argv (from `build_claude_argv`) and return stdout text.
 
     Split out from `run_claude` so callers that need to CAPTURE the exact
@@ -106,6 +116,11 @@ def run_argv(argv: Sequence[str], *, timeout: float = 300.0) -> str:
     responsible for catching this per-rollout and folding it into a
     tolerated 0.0-score example, per the GEPAAdapter contract's "never raise
     for individual example failures" rule.
+
+    `cwd`: working directory for the subprocess. Load-bearing when the invoked
+    persona (e.g. reviewer) has a main-path cwd guard that refuses to run from
+    a canonical project root — the caller must pre-stage a /tmp worktree and
+    pass its path here. Absent, inherits the parent's cwd.
     """
     try:
         result = subprocess.run(
@@ -115,6 +130,7 @@ def run_argv(argv: Sequence[str], *, timeout: float = 300.0) -> str:
             timeout=timeout,
             shell=False,
             check=False,
+            cwd=cwd,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise ClaudeExecutorError(f"claude -p invocation failed: {type(exc).__name__}: {exc}") from exc
@@ -135,6 +151,7 @@ def run_claude(
     system_prompt: str | None = None,
     keep_sessions: bool = False,
     timeout: float = 300.0,
+    cwd: str | None = None,
 ) -> str:
     """Run one headless, isolated `claude -p` call and return its stdout text.
 
@@ -150,7 +167,7 @@ def run_claude(
         system_prompt=system_prompt,
         keep_sessions=keep_sessions,
     )
-    return run_argv(argv, timeout=timeout)
+    return run_argv(argv, timeout=timeout, cwd=cwd)
 
 
 def argv_repr(argv: Sequence[str]) -> str:

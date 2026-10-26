@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # acp-bridge-supervise.sh — systemd-supervised wrapper for the mailbox->ACP inbound
-# bridge (T-1633 Unit 2, ORG-031). Modeled on ancestor-bot-supervise.sh: hosts the
+# bridge (T-1633 Unit 2, ORG-031). Modeled on the (since-removed) ancestor bot supervisor: hosts the
 # bridge as a detached tmux session so the operator can still `tmux capture-pane` /
 # `send-keys` for debugging (operator surface preserved, per the T-1630 spike's
 # rung-5 discussion), and blocks as systemd's MainPID for as long as that session
@@ -39,11 +39,23 @@ SESSION="${ACP_BRIDGE_SESSION:-acp-bridge-$ACP_BRIDGE_AGENT}"
 # mapping): each agent's REAL cwd for its live session is its own $HOME, so the
 # bridge's --cwd must match that, not the pantheon-config checkout.
 BRIDGE_CWD="${ACP_BRIDGE_CWD:-$HOME}"
-# Path-A hub inbox root (T-1015, 2026-06-09): /home/the-ancestor/mailbox/<agent>,
+# Path-A hub inbox root (T-1015, 2026-06-09): /home/post-office/mailbox/<agent> (T-2693),
 # mode 2770 group veneration. tools/mailbox.py's `inbox` param is the ROOT dir
 # (it owns {tmp,new,cur} under it), not new/ itself.
-BRIDGE_INBOX="${ACP_BRIDGE_INBOX:-/home/the-ancestor/mailbox/$ACP_BRIDGE_AGENT}"
-# Working-turn agents need more than the 300s default (mnemosyne redelivery loop,
+# T-4096: the hub root is instance.yaml's mailbox.hub via agent_role_map (stdlib-only;
+# the bridge below needs python3 anyway), so an ORG-087 move is a manifest flip.
+# ACP_BRIDGE_INBOX still wins outright. Unresolvable hub = loud exit, never a guess.
+BRIDGE_INBOX="${ACP_BRIDGE_INBOX:-}"
+if [[ -z "$BRIDGE_INBOX" ]]; then
+  _tools_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  _hub="$(python3 -c 'import sys; sys.path.insert(0, sys.argv[1]); import agent_role_map as a; print(a.mailbox_hub())' "$_tools_dir")" || _hub=""
+  if [[ -z "$_hub" ]]; then
+    echo "acp-bridge-supervise: could not resolve the mailbox hub from $_tools_dir/agent_role_map.py (set ACP_BRIDGE_INBOX to override)" >&2
+    exit 1
+  fi
+  BRIDGE_INBOX="$_hub/$ACP_BRIDGE_AGENT"
+fi
+# Working-turn agents need more than the 300s default (archivist redelivery loop,
 # T-1830 residue): override per-agent via unit drop-in Environment=.
 BRIDGE_PROMPT_TIMEOUT="${ACP_BRIDGE_PROMPT_TIMEOUT:-300}"
 # Mailbox consumer-lease TTL (T-1935/T-1990). A deep multi-message drain is
@@ -117,7 +129,7 @@ mkdir -p "$(dirname "$BRIDGE_LOG")"
 # there, and the script that just completed successfully reported status=1.
 #
 # Consequence, measured: EVERY clean bridge shutdown was recorded as a unit
-# FAILURE — 7 for mnemosyne and 8 for specialist in 24h. Harmless until T-2264 wired
+# FAILURE — 7 for archivist and 8 for specialist in 24h. Harmless until T-2264 wired
 # OnFailure= onto this unit, at which point each one pages Recovery. A recovery
 # alert that fires on every routine restart is one nobody reads, which would
 # have quietly undone the reason T-2264 exists (a real 90-minute bridge outage

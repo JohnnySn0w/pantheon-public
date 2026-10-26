@@ -1,0 +1,14 @@
+# kino Health mute toggle, Recovery side (T-5397): fire the apply when kino drops a request.
+# The watch needs no supplementary group (the user manager has none, T-1015):
+# /var/lib/pantheon is world-traversable and kino-mute/ + requests/ are owned by this
+# account. Install: copy both units to ~/.config/systemd/user/, daemon-reload,
+# `systemctl --user enable --now pantheon-kino-mute.path`.
+[Unit]
+Description=kino mute dropbox watch (T-5397)
+
+[Path]
+DirectoryNotEmpty=/var/lib/pantheon/kino-mute/requests
+Unit=pantheon-kino-mute.service
+
+[Install]
+WantedBy=paths.target

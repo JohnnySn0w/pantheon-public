@@ -40,8 +40,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from activity_monitor import (  # noqa: E402
     AGENT_CONFIG,
     capture_pane,
-    latest_jsonl_mtime,
+    jsonl_turn_signal,
 )
+# T-4159: SAMPLE_TARGETS jsonl_dir derivation. Imported as tools.agent_role_map,
+# the same module object activity_monitor uses (its import put the repo root on path).
+from tools import agent_role_map  # noqa: E402
 
 # ⚠️ THE SAMPLER OWNS ITS OWN TARGET LIST, deliberately not AGENT_CONFIG's.
 # activity_monitor.AGENT_CONFIG is an ACTUATOR's config — it lists the agents that
@@ -58,16 +61,18 @@ from activity_monitor import (  # noqa: E402
 # read. It also adds genuine workload diversity — recovery's turn shape (long tool
 # chains, cross-account probes) differs markedly from orchestrator's, and a ceiling
 # derived from one agent's habits is a ceiling for that agent, not for the fleet.
+# T-4159: jsonl_dir is DERIVED from the seat's launch shape (agent_role_map), not
+# hardcoded. Bespoke seats write under the home-cwd slug, control-plane seats under
+# -pantheon-config, and recovery/orchestrator flip at their T-3650 hand-move. The old literals
+# were wrong in both directions: recovery pointed at -pantheon-config while bespoke
+# (that dir holds no jsonl; checked 2026-09-28), and orchestrator would freeze on home.
 SAMPLE_TARGETS = {
     "orchestrator": {"tmux_target_pane": "claude-telegram-bot:0",
               "sudo_user": "claude",
-              "jsonl_dir": "/home/claude/.claude/projects/-home-claude"},
+              "jsonl_dir": agent_role_map.live_session_projects_dir("claude")},
     "recovery":  {"tmux_target_pane": "claude-telegram-bot-fallback:0",
               "sudo_user": None,   # own account; _sudo() short-circuits on self
-              # T-2682: recovery launches cwd=pantheon-config (control-plane consume
-              # scope), so its live-session jsonl is under the -pantheon-config
-              # slug — the plain -home-claude-fallback dir is stale/other.
-              "jsonl_dir": str(Path.home() / ".claude/projects/-home-claude-fallback-pantheon-config")},
+              "jsonl_dir": agent_role_map.live_session_projects_dir("claude-fallback")},
 }
 
 DEFAULT_SAMPLE_PATH = (
@@ -199,7 +204,7 @@ def sample_agent(agent: str, cfg: dict) -> dict:
     else:
         text = capture_pane(pane, user)
     mtime = (_mtime_self(cfg["jsonl_dir"]) if is_self
-             else latest_jsonl_mtime(cfg.get("jsonl_dir"), user))
+             else jsonl_turn_signal(cfg.get("jsonl_dir"), user))  # T-5400
     return {
         "agent": agent,
         "ts": int(time.time()),

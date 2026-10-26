@@ -91,9 +91,14 @@ class DebounceBypassTest(unittest.TestCase):
         return True
 
     def _run(self, now=1000.0, session="S1"):
+        # T-4292: UNKNOWN now needs positive evidence to inject. These cases test
+        # the debounce/urgent-bypass logic, not that policy, so the fallback is
+        # stubbed permissive (as in test_mailbox_wake.py). pane_idle stays None:
+        # True would add decide()'s one-shot idle re-kick and change the counts.
         return mw.run("recovery", inbox=self.inbox, do_inject=self._ok_inject,
                       session_key_fn=lambda pane: session, now=now,
-                      pane_idle_fn=lambda pane: None)
+                      pane_idle_fn=lambda pane: None,
+                      unknown_pane_ok_fn=lambda pane, harness: True)
 
     def test_flag_off_urgent_still_debounces_like_today(self):
         mailbox.send(self.inbox, {"x": 1}, sender="orchestrator", subject="wedge",

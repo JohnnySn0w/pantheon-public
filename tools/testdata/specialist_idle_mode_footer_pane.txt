@@ -1,0 +1,25 @@
+● Clean — git matches origin, T-4233 build phase complete.
+
+  T-4233 this turn: archivist confirmed the burden (118/254 non-blank = 46%
+  flagged by the T-4045 digit gate — the second pass is justified), so I built
+  both verification variants into the pipeline, flag-gated OFF:
+  - Numbers-only + full re-transcription passes, transcription-only wording,
+    blanks excluded (the T-3825 hallucination lesson), with content-blind
+    disagreement metrics (digit_seq_diff / token_diff in run_meta) and a refined
+    verify_disagreement review reason when a gate variant is enabled.
+  - Unit-tested (metrics + gate logic) and e2e-verified (a synthetic printed
+    page ran both passes with zero disagreement → would auto-admit under a gate;
+    blank page correctly excluded). Zero behavior change while SN_VERIFY is
+    unset.
+  - Sent archivist the exact candidate wordings + metric design. Enable is gated
+    on her T-4291 anchor recall (she freezes the prompt + threshold on measured
+    metrics; her acceptance = 100% anchor recall AND flag-rate materially below
+    46%), which starts after her active T-4234.
+
+
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+
+  ⏸ manual mode on · ← for agents
+

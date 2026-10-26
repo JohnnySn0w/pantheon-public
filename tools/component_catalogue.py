@@ -58,7 +58,34 @@ COMPONENT_RECORD_KEYS = (
     "tensions",
 )
 SOURCE_KEYS = ("logical_repo", "path", "artifact")
-PROVISION_KEYS = ("capability", "contract", "schema", "version", "features")
+PROVISION_REQUIRED_KEYS = ("capability", "contract", "schema", "version", "features")
+PROVISION_OPTIONAL_KEYS = (
+    "equivalence_class",
+    "trust_class",
+    "subject_visibility",
+    "navigator_provider_selection",
+)
+PROVISION_KEYS = PROVISION_REQUIRED_KEYS + PROVISION_OPTIONAL_KEYS
+NAVIGATOR_PROVIDER_SELECTION_KEYS = (
+    "role",
+    "primary_provider_component_id",
+    "fallback_rank",
+    "provider_organ_id",
+    "health_dependency_id",
+)
+ORGAN_REF_PREFIX = "organ:"
+DEPENDENCY_REF_PREFIX = "dependency:"
+ORGAN_REF_PATTERN = r"^organ:[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+DEPENDENCY_REF_PATTERN = r"^dependency:[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+SUBJECT_VISIBILITY_KEYS = (
+    "subject_refs",
+    "role_refs",
+    "instance_refs",
+    "trust_zones",
+    "policy_refs",
+    "evidence_refs",
+)
+FORBIDDEN_SUBJECT_VISIBILITY_TOKENS = frozenset(("*", "all", "any", "everyone"))
 REQUIREMENT_KEYS = (
     "capability",
     "contract",
@@ -206,6 +233,11 @@ class KeepTogetherReason(str, Enum):
     COORDINATION_ONLY_EXTRACTION = "coordination-only-extraction"
 
 
+class NavigatorProviderRole(str, Enum):
+    PRIMARY = "primary"
+    FALLBACK = "fallback"
+
+
 @dataclass(frozen=True)
 class ComponentIssue:
     code: str
@@ -221,12 +253,35 @@ class ComponentSource:
 
 
 @dataclass(frozen=True)
+class SubjectVisibilityPolicy:
+    subject_refs: tuple[str, ...]
+    role_refs: tuple[str, ...]
+    instance_refs: tuple[str, ...]
+    trust_zones: tuple[str, ...]
+    policy_refs: tuple[str, ...]
+    evidence_refs: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NavigatorProviderSelection:
+    role: NavigatorProviderRole
+    primary_provider_component_id: str | None
+    fallback_rank: int | None
+    provider_organ_id: str
+    health_dependency_id: str
+
+
+@dataclass(frozen=True)
 class CapabilityProvision:
     capability: str
     contract: str
     schema: str
     version: str
     features: tuple[str, ...]
+    equivalence_class: str | None
+    trust_class: str | None
+    subject_visibility: SubjectVisibilityPolicy | None
+    navigator_provider_selection: NavigatorProviderSelection | None
 
 
 @dataclass(frozen=True)
@@ -460,6 +515,28 @@ def _exact_mapping(
     return value
 
 
+def _closed_mapping(
+    value: object,
+    *,
+    path: str,
+    required_keys: Sequence[str],
+    allowed_keys: Sequence[str],
+) -> Mapping[str, object]:
+    if not isinstance(value, dict):
+        raise ComponentCatalogueError(f"{path} must be an object")
+    if any(not isinstance(key, str) for key in value):
+        raise ComponentCatalogueError(f"{path} keys must be strings")
+    actual = set(value)
+    required = set(required_keys)
+    allowed = set(allowed_keys)
+    if not required <= actual or not actual <= allowed:
+        raise ComponentCatalogueError(
+            f"{path} keys differ: missing={sorted(required - actual)!r} "
+            f"unknown={sorted(actual - allowed)!r}"
+        )
+    return value
+
+
 def _string(value: object, *, path: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ComponentCatalogueError(f"{path} must be a non-empty trimmed string")
@@ -480,6 +557,20 @@ def _string_tuple(
         raise ComponentCatalogueError(f"{path} must not be empty")
     if len(set(result)) != len(result):
         raise ComponentCatalogueError(f"{path} must not contain duplicates")
+    return result
+
+
+def _subject_visibility_tuple(
+    value: object, *, path: str, require_nonempty: bool = False
+) -> tuple[str, ...]:
+    result = _string_tuple(value, path=path, require_nonempty=require_nonempty)
+    forbidden = sorted(
+        token for token in result if token in FORBIDDEN_SUBJECT_VISIBILITY_TOKENS
+    )
+    if forbidden:
+        raise ComponentCatalogueError(
+            f"{path} must not contain wildcard subject visibility tokens: {forbidden!r}"
+        )
     return result
 
 
@@ -569,6 +660,28 @@ def _quantity(value: object, *, path: str) -> float:
     return result
 
 
+def _positive_int(value: object, *, path: str) -> int:
+    if type(value) is not int:
+        raise ComponentCatalogueError(f"{path} must be an integer")
+    if value < 1:
+        raise ComponentCatalogueError(f"{path} must be a positive integer")
+    return value
+
+
+def _prefixed_ref(value: object, *, path: str, prefix: str) -> str:
+    text = _string(value, path=path)
+    pattern = (
+        ORGAN_REF_PATTERN
+        if prefix == ORGAN_REF_PREFIX
+        else DEPENDENCY_REF_PATTERN
+        if prefix == DEPENDENCY_REF_PREFIX
+        else rf"^{re.escape(prefix)}.+$"
+    )
+    if re.fullmatch(pattern, text) is None:
+        raise ComponentCatalogueError(f"{path} must use {prefix!r} reference form")
+    return text
+
+
 def _load_yaml(path: Path) -> tuple[object, bytes]:
     try:
         info = path.lstat()
@@ -603,8 +716,96 @@ def _load_yaml(path: Path) -> tuple[object, bytes]:
         raise ComponentCatalogueError(f"invalid YAML in {path.name}: {exc}") from exc
 
 
+def _parse_subject_visibility(
+    value: object, *, path: str
+) -> SubjectVisibilityPolicy | None:
+    if value is None:
+        return None
+    item = _exact_mapping(value, path=path, keys=SUBJECT_VISIBILITY_KEYS)
+    dimensions = {
+        key: _subject_visibility_tuple(item[key], path=f"{path}.{key}")
+        for key in ("subject_refs", "role_refs", "instance_refs", "trust_zones")
+    }
+    if not any(dimensions.values()):
+        raise ComponentCatalogueError(
+            f"{path} requires at least one subject, role, instance, or trust zone"
+        )
+    return SubjectVisibilityPolicy(
+        subject_refs=dimensions["subject_refs"],
+        role_refs=dimensions["role_refs"],
+        instance_refs=dimensions["instance_refs"],
+        trust_zones=dimensions["trust_zones"],
+        policy_refs=_subject_visibility_tuple(
+            item["policy_refs"], path=f"{path}.policy_refs", require_nonempty=True
+        ),
+        evidence_refs=_subject_visibility_tuple(
+            item["evidence_refs"], path=f"{path}.evidence_refs", require_nonempty=True
+        ),
+    )
+
+
+def _parse_navigator_provider_selection(
+    value: object, *, path: str
+) -> NavigatorProviderSelection | None:
+    if value is None:
+        return None
+    item = _exact_mapping(value, path=path, keys=NAVIGATOR_PROVIDER_SELECTION_KEYS)
+    role = _enum(NavigatorProviderRole, item["role"], path=f"{path}.role")
+    primary_provider_component_id: str | None
+    fallback_rank: int | None
+    if role is NavigatorProviderRole.PRIMARY:
+        if item["primary_provider_component_id"] is not None:
+            raise ComponentCatalogueError(
+                f"{path}.primary_provider_component_id must be null for primary"
+            )
+        if item["fallback_rank"] is not None:
+            raise ComponentCatalogueError(f"{path}.fallback_rank must be null for primary")
+        primary_provider_component_id = None
+        fallback_rank = None
+    else:
+        primary_provider_component_id = _stable_id(
+            item["primary_provider_component_id"],
+            path=f"{path}.primary_provider_component_id",
+        )
+        fallback_rank = _positive_int(item["fallback_rank"], path=f"{path}.fallback_rank")
+    return NavigatorProviderSelection(
+        role=role,
+        primary_provider_component_id=primary_provider_component_id,
+        fallback_rank=fallback_rank,
+        provider_organ_id=_prefixed_ref(
+            item["provider_organ_id"],
+            path=f"{path}.provider_organ_id",
+            prefix=ORGAN_REF_PREFIX,
+        ),
+        health_dependency_id=_prefixed_ref(
+            item["health_dependency_id"],
+            path=f"{path}.health_dependency_id",
+            prefix=DEPENDENCY_REF_PREFIX,
+        ),
+    )
+
+
+def navigator_provider_selection_to_json(
+    selection: NavigatorProviderSelection | None,
+) -> dict[str, object] | None:
+    if selection is None:
+        return None
+    return {
+        "role": selection.role.value,
+        "primary_provider_component_id": selection.primary_provider_component_id,
+        "fallback_rank": selection.fallback_rank,
+        "provider_organ_id": selection.provider_organ_id,
+        "health_dependency_id": selection.health_dependency_id,
+    }
+
+
 def _parse_provision(value: object, *, path: str) -> CapabilityProvision:
-    item = _exact_mapping(value, path=path, keys=PROVISION_KEYS)
+    item = _closed_mapping(
+        value,
+        path=path,
+        required_keys=PROVISION_REQUIRED_KEYS,
+        allowed_keys=PROVISION_KEYS,
+    )
     return CapabilityProvision(
         capability=_stable_id(item["capability"], path=f"{path}.capability"),
         contract=_stable_id(item["contract"], path=f"{path}.contract"),
@@ -613,6 +814,17 @@ def _parse_provision(value: object, *, path: str) -> CapabilityProvision:
         features=tuple(
             _stable_id(feature, path=f"{path}.features[]")
             for feature in _string_tuple(item["features"], path=f"{path}.features")
+        ),
+        equivalence_class=_nullable_string(
+            item.get("equivalence_class"), path=f"{path}.equivalence_class"
+        ),
+        trust_class=_nullable_string(item.get("trust_class"), path=f"{path}.trust_class"),
+        subject_visibility=_parse_subject_visibility(
+            item.get("subject_visibility"), path=f"{path}.subject_visibility"
+        ),
+        navigator_provider_selection=_parse_navigator_provider_selection(
+            item.get("navigator_provider_selection"),
+            path=f"{path}.navigator_provider_selection",
         ),
     )
 
@@ -1190,16 +1402,88 @@ def _nullable_string_schema() -> dict[str, object]:
     return {"anyOf": [{"type": "null"}, {"type": "string", "minLength": 1}]}
 
 
+def _subject_visibility_array_schema(*, min_items: int = 0) -> dict[str, object]:
+    schema = _array_schema(
+        {
+            "type": "string",
+            "minLength": 1,
+            "not": {"enum": sorted(FORBIDDEN_SUBJECT_VISIBILITY_TOKENS)},
+        }
+    )
+    if min_items:
+        schema["minItems"] = min_items
+    return schema
+
+
+def _subject_visibility_schema() -> dict[str, object]:
+    subject_visibility = _object_schema(
+        SUBJECT_VISIBILITY_KEYS,
+        {
+            "subject_refs": _subject_visibility_array_schema(),
+            "role_refs": _subject_visibility_array_schema(),
+            "instance_refs": _subject_visibility_array_schema(),
+            "trust_zones": _subject_visibility_array_schema(),
+            "policy_refs": _subject_visibility_array_schema(min_items=1),
+            "evidence_refs": _subject_visibility_array_schema(min_items=1),
+        },
+    )
+    subject_visibility["anyOf"] = [
+        {"properties": {key: {"minItems": 1}}}
+        for key in ("subject_refs", "role_refs", "instance_refs", "trust_zones")
+    ]
+    return {"anyOf": [{"type": "null"}, subject_visibility]}
+
+
+def _navigator_provider_selection_schema() -> dict[str, object]:
+    stable = {"type": "string", "pattern": STABLE_ID_PATTERN}
+    ref_text = {"type": "string", "minLength": 1}
+    selection = _object_schema(
+        NAVIGATOR_PROVIDER_SELECTION_KEYS,
+        {
+            "role": {"type": "string", "enum": [item.value for item in NavigatorProviderRole]},
+            "primary_provider_component_id": {"anyOf": [{"type": "null"}, stable]},
+            "fallback_rank": {"anyOf": [{"type": "null"}, {"type": "integer", "minimum": 1}]},
+            "provider_organ_id": {**ref_text, "pattern": ORGAN_REF_PATTERN},
+            "health_dependency_id": {**ref_text, "pattern": DEPENDENCY_REF_PATTERN},
+        },
+    )
+    selection["allOf"] = [
+        {
+            "if": {"properties": {"role": {"const": NavigatorProviderRole.PRIMARY.value}}},
+            "then": {
+                "properties": {
+                    "primary_provider_component_id": {"type": "null"},
+                    "fallback_rank": {"type": "null"},
+                }
+            },
+        },
+        {
+            "if": {"properties": {"role": {"const": NavigatorProviderRole.FALLBACK.value}}},
+            "then": {
+                "properties": {
+                    "primary_provider_component_id": stable,
+                    "fallback_rank": {"type": "integer", "minimum": 1},
+                }
+            },
+        },
+    ]
+    return {"anyOf": [{"type": "null"}, selection]}
+
+
 def _component_record_schema() -> dict[str, object]:
     stable = {"type": "string", "pattern": STABLE_ID_PATTERN}
     text = {"type": "string", "minLength": 1}
     version = {"type": "string", "pattern": VERSION_PATTERN}
     provision = _object_schema(
-        PROVISION_KEYS,
+        PROVISION_REQUIRED_KEYS,
         {
             "capability": stable,
             "contract": stable,
+            "equivalence_class": _nullable_string_schema(),
             "schema": stable,
+            "trust_class": _nullable_string_schema(),
+            "subject_visibility": _subject_visibility_schema(),
+            "navigator_provider_selection": _navigator_provider_selection_schema(),
             "version": version,
             "features": _array_schema(stable),
         },

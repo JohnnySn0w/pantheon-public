@@ -61,6 +61,7 @@ from tools._git_utils import (  # noqa: E402  — after sys.path bootstrap.
     pull_repo_strict,
     push_with_retry,
 )
+from tools import agent_role_map  # noqa: E402  — T-4737 ledger identity
 from tools._audit import append_ledger_entries, build_ledger_entry  # noqa: E402
 from tools._md_table import _md_row  # noqa: E402  — leaf module, re-only (T-1936)
 from tools.ledger_shard import current_write_target  # noqa: E402
@@ -71,6 +72,7 @@ REPORTS_ROOT = REPO_ROOT / "knowledge" / "watch" / "reports"
 
 STATE_DIR = Path.home() / ".local" / "state" / "pantheon" / "watch"
 STATE_FILE = STATE_DIR / "state.json"
+PROBE_STATE_FILE = STATE_DIR / "probes.json"
 LOG_DIR = Path.home() / ".local" / "log" / "pantheon" / "watch"
 
 # Cadence values; everything else is treated as "paused".
@@ -82,7 +84,7 @@ TICKET_BIN = REPO_ROOT / "tools" / "ticket.py"
 _MAX_ACTUATION_RETRIES = 3
 
 # Topic policy: maps topic-slug → routing policy for B11 actuation.
-# Schema: {"target": "orchestrator"|"recovery",
+# Schema: {"target": "role:<R>" (a role pool; persona targets are refused, ORG-088 amendment 2026-10-19),
 #          "labels": list[str] (merged with always-applied),
 #          "interactive_required": bool}
 # To add a topic, add a key here. Missing topics fall through to _DEFAULT_POLICY,
@@ -90,17 +92,17 @@ _MAX_ACTUATION_RETRIES = 3
 # than silently auto-actuating.
 TOPIC_POLICY: dict[str, dict] = {
     "anthropic-claude-code-changelog": {
-        "target": "orchestrator",
+        "target": "role:engineering_orchestrator",
         "labels": ["watch-finding"],
         "interactive_required": False,
     },
     "anthropic-quota-interface": {
-        "target": "orchestrator",
+        "target": "role:engineering_orchestrator",
         "labels": ["watch-finding", "harness", "quota"],
         "interactive_required": False,
     },
     "agentic-harness-landscape": {
-        "target": "orchestrator",
+        "target": "role:engineering_orchestrator",
         "labels": ["watch-finding"],
         "interactive_required": False,
     },
@@ -108,17 +110,17 @@ TOPIC_POLICY: dict[str, dict] = {
     # A research/competitive-intel digest → HO triage (ORG-012 portion), so
     # interactive_required=False = deliver to HO's queue (matches the other digests).
     "grand-goal-competitor-watch": {
-        "target": "orchestrator",
+        "target": "role:engineering_orchestrator",
         "labels": ["watch-finding", "competitive-intel", "grand-goal"],
         "interactive_required": False,
     },
     "mcp-supply-chain": {
-        "target": "recovery",
+        "target": "role:system_orchestrator",
         "labels": ["watch-finding", "security"],
         "interactive_required": True,
     },
     "anthropic-policy-and-billing": {
-        "target": "recovery",
+        "target": "role:system_orchestrator",
         "labels": ["watch-finding", "cost-or-billing"],
         "interactive_required": True,
     },
@@ -129,22 +131,22 @@ TOPIC_POLICY: dict[str, dict] = {
     # not-auto-pullable), not autonomous action, so False means "deliver this to
     # HO's queue for triage", which is precisely what was silently not happening.
     "llm-agent-failure-modes-research": {
-        "target": "orchestrator",
+        "target": "role:engineering_orchestrator",
         "labels": ["watch-finding", "research-digest"],
         "interactive_required": False,
     },
     "context-engineering-research": {
-        "target": "orchestrator",
+        "target": "role:engineering_orchestrator",
         "labels": ["watch-finding", "research-digest"],
         "interactive_required": False,
     },
     "context-management": {
-        "target": "orchestrator",
+        "target": "role:engineering_orchestrator",
         "labels": ["watch-finding", "research-digest"],
         "interactive_required": False,
     },
     "voice-as-interface": {
-        "target": "orchestrator",
+        "target": "role:engineering_orchestrator",
         "labels": ["watch-finding", "research-digest", "echo"],
         "interactive_required": False,
     },
@@ -153,17 +155,151 @@ TOPIC_POLICY: dict[str, dict] = {
     # exactly what that needs, so False here too. Billing-shaped findings are
     # already routed separately by the T-1442 rule documented in topics.md.
     "echo-stack-vendor-changes": {
-        "target": "orchestrator",
+        "target": "role:engineering_orchestrator",
         "labels": ["watch-finding", "vendor-change", "echo"],
+        "interactive_required": False,
+    },
+    # T-3810 (added 2026-09-20 per the operator TG msg 2222): blog-monitor watch for
+    # https://glop.it/blog. Change-report style — findings are "new posts" the
+    # HO wants to see for signal, not policy asks. Matches the digest shape of
+    # grand-goal-competitor-watch (competitive-intel to HO's queue, no
+    # interactive-required gate).
+    "glop-it-blog": {
+        "target": "role:engineering_orchestrator",
+        "labels": ["watch-finding", "blog-monitor", "external-signal"],
+        "interactive_required": False,
+    },
+    # T-3820 (added 2026-09-20 per the operator TG msg 2226): standing landscape
+    # assessment of frontier-adjacent + usable-by-us AI models. Digest whose
+    # triage is HO's ORG-012 portion; findings can carry both "here's what
+    # arrived" signal AND concrete "we could stand this up this week" items
+    # (harness-fit angle). Deliver to HO's queue for triage — same shape as
+    # grand-goal-competitor-watch + echo-stack-vendor-changes overlap.
+    "free-frontier-adjacent-models": {
+        "target": "role:engineering_orchestrator",
+        "labels": ["watch-finding", "model-landscape", "harness-fit"],
+        "interactive_required": False,
+    },
+    # Added 2026-10-20 per the operator TG 4727: daily launch-catch for the Flipper
+    # One crowdfund/preorder (he wants the early-bird tiers). Findings are a
+    # purchase signal for the operator, relayed by the research seat, so they go to
+    # its queue rather than the HO's.
+    "flipper-one-launch-watch": {
+        "target": "role:head_research_orchestrator",
+        "labels": ["watch-finding", "purchase-watch", "external-signal"],
         "interactive_required": False,
     },
 }
 
 _DEFAULT_POLICY = {
-    "target": "orchestrator",
+    "target": "role:engineering_orchestrator",
     "labels": ["watch-finding", "unknown-topic"],
     "interactive_required": True,
 }
+
+# T-4904 / T-4967: one-lane recovery-metric pilot, inspired by
+# OrchestraBench's move from pass/fail-only scoring to per-failure recovery,
+# cascade-radius, and decisive-context acquisition reporting.
+# Keep this lane-local until the next few fires show whether the extra reporting
+# burden pays for itself.
+RECOVERY_METRIC_PILOT_TOPICS = {"llm-agent-failure-modes-research"}
+
+
+# T-4543: deterministic change probes. A due topic listed here dispatches its
+# researcher only when the probe sees a change since the last landed full fire,
+# when the probe itself fails (fail-open: a broken probe must never silence a
+# topic), or when the topic has gone `max_quiet_days` without a full fire (the
+# probe watches one page; the full researcher sweeps the other surfaces).
+# --force / --topic bypass probes entirely. A skip leaves `last_fire` untouched,
+# so a daily topic is probed again tomorrow.
+TOPIC_PROBES: dict[str, dict] = {
+    # (empty) The first probe (anthropic-cyber-verification-models, T-4543) retired with
+    # its topic on 2026-10-07: the operator's CVP application was accepted (TG 4156). Kind
+    # "json_ld_date_modified" remains supported for future topics.
+}
+
+_PROBE_TIMEOUT_S = 20
+_PROBE_MAX_BYTES = 4 * 1024 * 1024
+_DATE_MODIFIED_RE = re.compile(r'"dateModified"\s*:\s*"([^"]+)"')
+
+
+def _fetch_url(url: str) -> str:
+    import urllib.request
+
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (pantheon-watch-probe)"})
+    with urllib.request.urlopen(req, timeout=_PROBE_TIMEOUT_S) as resp:
+        return resp.read(_PROBE_MAX_BYTES).decode("utf-8", errors="replace")
+
+
+def _probe_value(spec: dict, fetch: Callable[[str], str]) -> str:
+    """Return the probe's observed value; raise on any failure (caller fails open)."""
+    if spec["kind"] != "json_ld_date_modified":
+        raise ValueError(f"unknown probe kind {spec['kind']!r}")
+    values = set(_DATE_MODIFIED_RE.findall(fetch(spec["url"])))
+    if len(values) != 1:
+        raise ValueError(f"expected one dateModified value, found {sorted(values)}")
+    return values.pop()
+
+
+def load_probe_state() -> dict:
+    if not PROBE_STATE_FILE.exists():
+        return {}
+    return json.loads(PROBE_STATE_FILE.read_text(encoding="utf-8"))
+
+
+def save_probe_state(probes: dict) -> None:
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    PROBE_STATE_FILE.write_text(json.dumps(probes, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def probe_skip(
+    slug: str, state: dict, today: date, *, fetch: Callable[[str], str] | None = None
+) -> tuple[bool, str]:
+    """Decide whether a due topic's researcher can be skipped today.
+
+    Returns (skip, reason). Topics without a probe never skip. The decision is
+    cached per day in PROBE_STATE_FILE, so --file-watch-ticket, --emit-due-briefs
+    and --land-commit agree on the same day without re-fetching.
+    """
+    spec = TOPIC_PROBES.get(slug)
+    if spec is None:
+        return False, "no probe"
+    probes = load_probe_state()
+    entry = probes.get(slug, {})
+    if entry.get("checked_on") == today.isoformat():
+        return entry["skip"], entry["reason"]
+
+    baseline = entry.get("baseline", spec["baseline"])
+    try:
+        observed: str | None = _probe_value(spec, fetch or _fetch_url)
+    except Exception as exc:
+        observed, skip, reason = None, False, f"probe failed ({exc!r}); dispatching (fail-open)"
+    else:
+        last = last_fire_date(state, slug)
+        quiet = (today - last).days if last else None
+        if observed != baseline:
+            skip, reason = False, f"changed: {baseline} -> {observed}"
+        elif quiet is None or quiet >= spec["max_quiet_days"]:
+            skip, reason = False, f"unchanged ({observed}) but no full fire in {spec['max_quiet_days']}d"
+        else:
+            skip, reason = True, f"unchanged ({observed})"
+
+    entry.update(baseline=baseline, checked_on=today.isoformat(),
+                 observed=observed, skip=skip, reason=reason)
+    probes[slug] = entry
+    save_probe_state(probes)
+    _append_runner_log(f"[{today.isoformat()}] probe {slug}: {'skip' if skip else 'fire'} ({reason})")
+    return skip, reason
+
+
+def advance_probe_baseline(slug: str, today: date) -> None:
+    """After a landed-ok full fire, make today's observed value the new baseline."""
+    probes = load_probe_state()
+    entry = probes.get(slug)
+    if not entry or entry.get("checked_on") != today.isoformat() or not entry.get("observed"):
+        return
+    entry["baseline"] = entry["observed"]
+    save_probe_state(probes)
 
 
 @dataclass
@@ -399,8 +535,16 @@ def update_state(state: dict, slug: str, fired_on: date, outcome: str) -> None:
     }
 
 
+# T-5593: look-back window for the brief's HN recipe, one day of slack past
+# the cadence so a late fire still overlaps the previous one.
+HN_WINDOW_DAYS = {"daily": 2, "weekly": 8, "monthly": 32, "quarterly": 93}
+
+
 def build_brief(
-    topic: Topic, output_path: Path, corrections: list[dict] | None = None
+    topic: Topic,
+    output_path: Path,
+    corrections: list[dict] | None = None,
+    today: date | None = None,
 ) -> str:
     """Construct the prompt for the researcher dispatch.
 
@@ -416,7 +560,14 @@ def build_brief(
     byte-identical to before T-2614 — the block below is a pure no-op in
     that case. A non-empty list appends one operator-context section so the
     next cycle's researcher sees the correction instead of re-deriving it.
+
+    `today` (T-5593) anchors the HN recipe's window start; it defaults to the
+    current UTC date. The epoch is midnight-aligned so two calls on the same
+    day render identically.
     """
+    today = today or datetime.now(timezone.utc).date()
+    hn_since = today - timedelta(days=HN_WINDOW_DAYS.get(topic.cadence, 8))
+    hn_epoch = int(datetime(hn_since.year, hn_since.month, hn_since.day, tzinfo=timezone.utc).timestamp())
     sources = "\n".join(f"  - {s}" for s in topic.seed_sources) or "  - (none specified — discover via WebSearch)"
     corrections_block = ""
     if corrections:
@@ -433,6 +584,38 @@ def build_brief(
             "clears each one after folding it in):\n"
             f"{items}\n"
         )
+    recovery_metric_block = ""
+    if topic.slug in RECOVERY_METRIC_PILOT_TOPICS:
+        recovery_metric_block = (
+            "\n## Recovery metric pilot (T-4904)\n\n"
+            "This lane is piloting OrchestraBench-style recovery accounting. In "
+            "your report, include a `## Recovery metric pilot` section near the "
+            "end, before `## Follow-ups` if follow-ups exist. Do not invent "
+            "events: if no watch-loop failure or recovery episode is visible, "
+            "write one row with `failure_event: none`.\n\n"
+            "For each failure/recovery episode visible in this lane since the "
+            "previous fire, record:\n"
+            "- `task_success`: yes / partial / no, based on whether the lane's "
+            "intended report-and-actuation outcome was achieved.\n"
+            "- `decisive_file_acquisition`: early / late / missed / "
+            "not-applicable / unknown. Use this for the first interaction with "
+            "the ultimately edited or test-relevant files/context: `early` if "
+            "the decisive file/context was touched before the first substantive "
+            "action, `late` if found only after detour/rework, `missed` if the "
+            "run succeeded or failed without touching it, `not-applicable` when "
+            "no file/context acquisition was relevant, and `unknown` when the "
+            "trace is insufficient.\n"
+            "- `failure_event`: the concrete failure, or `none`.\n"
+            "- `failure_mode`: MAST label if known, otherwise a short local label.\n"
+            "- `recovery_outcome`: recovered / partially-recovered / reproduced "
+            "or no-recovery / unknown / not-applicable.\n"
+            "- `cascade_radius`: integer count of downstream artifacts touched "
+            "before containment (tickets, follow-up reports, brief corrections, "
+            "cross-topic notes, or operator escalations), plus the names you counted.\n"
+            "- `detection_and_attribution`: how the failure was detected and where "
+            "the first unrecoverable or decisive step appears to be.\n\n"
+            "Keep the section compact; it is a pilot measurement, not a second report.\n"
+        )
     return f"""You are the `researcher` worker persona. The Orchestrator (the cron'd Pantheon watch-loop driver) is dispatching you.
 
 ## Topic
@@ -447,6 +630,7 @@ def build_brief(
 ## Operator-side notes
 {topic.notes or "(none)"}
 {corrections_block}
+{recovery_metric_block}
 ## Output
 
 Write your report to: `{output_path}`
@@ -468,6 +652,8 @@ Set `surface: above-bar` ONLY for genuinely operator-noteworthy findings — a n
 
 Structure (after the frontmatter): section headers, inline citations, distinguish primary from secondary, tag `[weak]` / `[single-source]` where appropriate. End with a `## Sources` section listing every URL/citation with one-line characterization.
 
+**Inline the supporting quote for every above-bar / load-bearing claim** — right next to the claim, a short verbatim excerpt (in quotes) from the cited source, not only a URL in `## Sources`. A `## Sources` list alone lets an ungrounded claim hide behind a plausible-looking citation; an inline quote makes each load-bearing claim grounding-checkable by construction (a claim whose inline quote does not actually support it is exactly the failure a grounding check exists to catch). Routine below-bar claims do not need inline quotes — reserve this for the consequential ones you would set `surface: above-bar` for.
+
 Honor your persona's hard rules: one topic, cite everything non-synthesis, mark weak claims, no code, no editing hand-curated docs outside the assigned output path, stay under budget, surface what couldn't be determined. (The `HERMES\\.md` escaping rule at the top of this section is load-bearing — re-check it before committing.)
 
 ## Instruments — try a second one before you record a negative
@@ -478,6 +664,7 @@ Specific instruments, in preference order:
 
 - PDF text: WebFetch CANNOT parse PDFs — a PDF that "returns structure but no readable text" via WebFetch is a WebFetch limitation, not an unreadable source. Extract locally: curl -sL -o p.pdf <url> then pdftotext -layout p.pdf - (both installed). If pdftotext gives poor output, fall back to pypdf (PdfReader(...).pages, .extract_text()). For arXiv, arxiv.org/html/<id> is a second route to the same content as HTML.
 - Vendor docs: modern docs platforms (Mintlify-class — OpenAI, Anthropic, Speechmatics, Gradium all confirmed) serve clean Markdown. Try docs.<vendor>/llms-full.txt (whole corpus, one fetch), then docs.<vendor>/llms.txt (index), then <page-url>.md, and only THEN scrape HTML — HTML tag-stripping has produced factually WRONG answers that the .md corrected. The docs live on the docs SUBDOMAIN; the marketing host (www.<vendor>) 404s/403s these and says nothing about the docs host.
+- Hacker News: query Algolia with curl's own encoding, never a hand-built URL (hand-built queries returned HTTP 400 on two topics, T-5593): curl -sG 'https://hn.algolia.com/api/v1/search' --data-urlencode 'query=<terms>' --data-urlencode 'tags=story' --data-urlencode 'numericFilters=created_at_i>{hn_epoch}' --data-urlencode 'hitsPerPage=20' -w '%{{http_code}}'. The window start {hn_epoch} ({hn_since.isoformat()}T00:00:00Z) is computed for you; do not shell out to `date`. If a query does not return 200, report the status and the query in your report rather than recording "no HN data".
 - A 403/404/empty on ONE host or ONE API is not a vendor-level or topic-level negative. Third-party release-note hosts (featurebase, canny, launchnotes) share no path structure with the docs host; for "did this vendor change its commercial terms", the archived marketing page (Wayback, two pre-change captures) is often the only record — vendors do not put repricings in product changelogs.
 
 If the research surfaces any actionable follow-up work (tooling gaps, harvest candidates, adjacent bugs, "worth evaluating" items), end the report with a `## Follow-ups` section enumerating each as a one-line filable item — `<short title> — <one-line ask>`. Surface them there; do NOT try to file tickets yourself (that is the dispatching tier's job). Omit the section if there are none. Per sop/standard/research-dispatch-filing.md.
@@ -499,9 +686,13 @@ def compute_due_briefs(
     retired headless `claude -p` subprocess. It computes which topics
     are due — reusing the exact cadence/state logic main() uses — and for each
     emits {slug, cadence, output_path, brief}. Specialist (the interactive session) reads
-    this JSON, dispatches one general-purpose `researcher`-brief subagent (Agent
-    tool, model sonnet) per record, and the subagent writes its report to
-    `output_path`. No dispatch, no state mutation, no commit happens here.
+    this JSON, dispatches one `researcher` subagent (Agent tool, subagent_type
+    researcher, the claude-config persona with model sonnet and effort low; T-4670)
+    per record, and the subagent writes its report to `output_path`. Where the seat
+    has no researcher persona provisioned, fall back to general-purpose, model sonnet. No dispatch, no state mutation, no commit happens here. The
+    one write is the T-4543 probe cache (PROBE_STATE_FILE): a due topic with a
+    change probe is fetched once per day and dropped from the records when
+    unchanged; `last_fire` is never touched.
 
     `output_path` is the REAL reports path (REPORTS_ROOT/<date>/<slug>.md) unless
     `reports_root` overrides it (smoke/worktree). The brief is byte-identical to
@@ -525,6 +716,12 @@ def compute_due_briefs(
             due = topic.cadence != "paused"
         else:
             due = topic.is_due(last_fire_date(state, topic.slug), today)
+            if due:
+                # T-4543: stderr only; --emit-due-briefs stdout must stay pure JSON.
+                skip, reason = probe_skip(topic.slug, state, today)
+                if skip:
+                    print(f"[probe] {topic.slug}: not dispatched ({reason})", file=sys.stderr)
+                    continue
         if not due:
             continue
         output_path = date_dir / f"{topic.slug}.md"
@@ -1078,6 +1275,22 @@ def _parse_report_frontmatter(report_path: Path) -> dict[str, str]:
     return fm
 
 
+# T-5500: day-index suffix for an above-bar report that skipped the T-5213
+# readback step. extract_findings strips it so it never reaches a ticket title.
+READBACK_MISSING_MARK = " (readback: missing)"
+
+
+def readback_missing(report_path: Path) -> bool:
+    """True iff the report is `surface: above-bar` with no non-empty
+    `readback:` frontmatter line (the T-5213 guarded-readback step was skipped).
+    Routine reports never need one.
+    """
+    fm = _parse_report_frontmatter(report_path)
+    if not fm.get("surface", "").startswith("above-bar"):
+        return False
+    return not fm.get("readback", "")
+
+
 def _utc_iso_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
@@ -1104,6 +1317,8 @@ def extract_findings(date_dir: Path, statuses: dict[str, str]) -> list[Finding]:
             print(f"[actuation] skip {slug}: summary missing TL;DR prefix", file=sys.stderr)
             continue
         tldr = summary[len("TL;DR:"):].strip()
+        if tldr.endswith(READBACK_MISSING_MARK.strip()):
+            tldr = tldr[: -len(READBACK_MISSING_MARK.strip())].rstrip()
         report_path = date_dir / f"{slug}.md"
         excerpt = ""
         if report_path.exists():
@@ -1287,6 +1502,31 @@ _NO_FOLLOWUP_SENTINEL_RE = re.compile(
     re.IGNORECASE,
 )
 
+# T-4302: the follow-ups section heading. Canonically ``## Follow-ups`` but real
+# reports also number it (``## 5. Follow-ups`` / ``## 5) Follow-ups`` /
+# ``## 5 Follow-ups``) or prefix a section sign (``## § Follow-ups`` /
+# ``## §5. Follow-ups``). The optional prefix is a ``§``, a number, or both, with
+# an optional ``.``/``)`` after the number. The ``\s*$`` end-anchor is
+# load-bearing: it EXCLUDES a heading with trailing words such as
+# ``## Follow-ups Resolved From ...`` (mcp-supply-chain 2026-09-21 uses that
+# legitimately for a non-filing section). IGNORECASE for robustness. Before this
+# fix the regex was the bare ``^## Follow-ups\s*$``, which silently dropped 13
+# numbered/section-sign reports since 2026-08-09 (7 items lost from the
+# 2026-09-29 context-management report) — no parsed item, no rejected entry.
+_FOLLOWUP_HEADING_RE = re.compile(
+    r"^##\s+(?:§\s*)?(?:\d+\s*[.)]?\s*)?Follow-ups\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# T-4302 fail-loud backstop: any ``## …follow(-)up(s)…`` heading, however spelled.
+# Used only to DETECT a follow-ups-like section the strict regex above declined,
+# so it can never vanish without a trace. The strict-matched heading and a
+# ``… Resolved From …`` non-filing heading are excluded by the caller below.
+_LOOSE_FOLLOWUP_HEADING_RE = re.compile(
+    r"^##\s+.*follow[- ]?ups?.*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # The auto-commit classifier's forbidden filename is constructed in pieces so
 # that the trigger bytes never occur in source. Escape at the ticket-filing
 # sink: parsed items and lossless catch-alls share that sink, so neither can
@@ -1354,55 +1594,97 @@ def parse_followups_detailed(body: str) -> FollowupParseResult:
     no-follow-up sentinels are intentional absence. Every other unparseable or
     over-cap line is returned verbatim in ``rejected`` for durable filing.
     """
-    match = re.search(r"^## Follow-ups\s*$", body, re.MULTILINE)
-    if not match:
-        return FollowupParseResult((), ())
-
-    section_body = body[match.end():]
-    end_match = re.search(r"^(?:## |---)", section_body, re.MULTILINE)
-    if end_match:
-        section_body = section_body[: end_match.start()]
-
     parsed: list[tuple[str, str]] = []
     rejected: list[str] = []
-    overflow = 0
-    for raw_line in section_body.splitlines():
-        raw = raw_line.strip()
-        if not raw:
-            continue
-        line = _LIST_MARKER_RE.sub("", raw, count=1).strip()
-        if _NO_FOLLOWUP_SENTINEL_RE.fullmatch(line):
-            continue
 
-        item = _split_followup_line(line)
-        if item is None:
+    # T-4302: accept the numbered / section-sign heading variants too. The
+    # section-slice + item-parse logic below is unchanged; only the heading it
+    # keys off is broadened.
+    match = _FOLLOWUP_HEADING_RE.search(body)
+    if match:
+        section_body = body[match.end():]
+        end_match = re.search(r"^(?:## |---)", section_body, re.MULTILINE)
+        if end_match:
+            section_body = section_body[: end_match.start()]
+
+        overflow = 0
+        for raw_line in section_body.splitlines():
+            raw = raw_line.strip()
+            if not raw:
+                continue
+            line = _LIST_MARKER_RE.sub("", raw, count=1).strip()
+            if _NO_FOLLOWUP_SENTINEL_RE.fullmatch(line):
+                continue
+
+            item = _split_followup_line(line)
+            if item is None:
+                print(
+                    f"[actuation] followup: preserving malformed line in catch-all: {raw!r}",
+                    file=sys.stderr,
+                )
+                rejected.append(raw)
+                continue
+            # T-3069: post-split sentinel guard — a `- None — <explanation>` line
+            # parses as (title='None', ask='<explanation>') but is still a no-follow-up
+            # declaration with prose after the separator. The pre-split sentinel-check
+            # only catches bare `- None` / `- No follow-ups` etc. Extend the guard to
+            # the split TITLE so declared no-ops with trailing explanation don't file
+            # as a "None"-titled ticket (observed 2026-08-21 T-3057 specialist watch fire).
+            title, _ask = item
+            if _NO_FOLLOWUP_SENTINEL_RE.fullmatch(title.strip()):
+                continue
+            if len(parsed) >= _FOLLOWUP_SOFT_CAP:
+                overflow += 1
+                rejected.append(raw)
+                continue
+            parsed.append(item)
+
+        if overflow:
             print(
-                f"[actuation] followup: preserving malformed line in catch-all: {raw!r}",
+                f"[actuation] followup: follow-up cap ({_FOLLOWUP_SOFT_CAP}) exceeded; "
+                f"preserving {overflow} overflow item(s) in catch-all",
                 file=sys.stderr,
             )
-            rejected.append(raw)
-            continue
-        # T-3069: post-split sentinel guard — a `- None — <explanation>` line
-        # parses as (title='None', ask='<explanation>') but is still a no-follow-up
-        # declaration with prose after the separator. The pre-split sentinel-check
-        # only catches bare `- None` / `- No follow-ups` etc. Extend the guard to
-        # the split TITLE so declared no-ops with trailing explanation don't file
-        # as a "None"-titled ticket (observed 2026-08-21 T-3057 specialist watch fire).
-        title, _ask = item
-        if _NO_FOLLOWUP_SENTINEL_RE.fullmatch(title.strip()):
-            continue
-        if len(parsed) >= _FOLLOWUP_SOFT_CAP:
-            overflow += 1
-            rejected.append(raw)
-            continue
-        parsed.append(item)
 
-    if overflow:
-        print(
-            f"[actuation] followup: follow-up cap ({_FOLLOWUP_SOFT_CAP}) exceeded; "
-            f"preserving {overflow} overflow item(s) in catch-all",
-            file=sys.stderr,
-        )
+    # T-4302: fail-loud backstop. A follow-ups-like heading the strict regex did
+    # not accept (e.g. `## Follow-up items:`, `## Followups (misc)`) must never
+    # vanish without a trace. If a loose follow-ups heading exists that (a) is not
+    # the heading the strict regex already matched and (b) is not a
+    # `Follow-ups Resolved From ...` non-filing section, AND the strict parse
+    # produced nothing at all (zero parsed, zero rejected), AND that loose section
+    # carries real (non-sentinel) content, record a LOUD rejected marker. Net
+    # invariant: every follow-up reaches a ticket (parsed) or fails loudly
+    # (rejected) — never a silent drop.
+    if not parsed and not rejected:
+        for loose in _LOOSE_FOLLOWUP_HEADING_RE.finditer(body):
+            if match is not None and loose.start() == match.start():
+                continue  # (a) the heading the strict regex already handled
+            heading_line = loose.group(0).strip()
+            if re.search(r"follow[- ]?ups?.*resolved", heading_line, re.IGNORECASE):
+                continue  # (b) `Follow-ups Resolved From ...` — non-filing section
+            # (c) intentional absence: an empty / sentinel-only loose section is
+            # not a loud drop.
+            loose_body = body[loose.end():]
+            loose_end = re.search(r"^(?:## |---)", loose_body, re.MULTILINE)
+            if loose_end:
+                loose_body = loose_body[: loose_end.start()]
+            has_content = any(
+                not _NO_FOLLOWUP_SENTINEL_RE.fullmatch(
+                    _LIST_MARKER_RE.sub("", stripped, count=1).strip()
+                )
+                for stripped in (ln.strip() for ln in loose_body.splitlines())
+                if stripped
+            )
+            if not has_content:
+                continue
+            print(
+                f"[actuation] followup: unparsed follow-ups-like heading; "
+                f"preserving loud marker in catch-all: {heading_line!r}",
+                file=sys.stderr,
+            )
+            rejected.append(f"[unparsed-heading] {heading_line}")
+            break
+
     return FollowupParseResult(tuple(parsed), tuple(rejected))
 
 
@@ -1465,14 +1747,14 @@ def file_followup(
     target=specialist; labels low-pri, triage, from-watch, source-topic-<slug>.
 
     Routing (T-1217, per orchestrator mailbox triage 2026-06-16): follow-ups go to
-    **specialist** (the watch-loop owner), NOT orchestrator. A follow-up's TYPE
+    **specialist** (the watch-loop owner), NOT head_engineering_orchestrator. A follow-up's TYPE
     (research/eval/landscape vs security vs Echo vs methodology) is content-
     dependent, not determined by its source topic — context-engineering spawns
     both research AND brief-shape methodology follow-ups; mcp-supply-chain spawns
     both security AND research-eval. No automated topic→owner rule is correct, so
     the watch-loop owner (specialist, who knows the topics + content) triages its own
     follow-ups and routes the domain ones (security→recovery, Echo/methodology→orchestrator)
-    onward. Defaulting to orchestrator dumped that triage on HO and
+    onward. Defaulting to head_engineering_orchestrator dumped that triage on HO and
     mis-routed the research majority (the recurrence this fixes).
     """
     if env is None:
@@ -1495,7 +1777,7 @@ def file_followup(
         str(ticket_bin),
         "file",
         "--requester", "specialist",
-        "--target", "specialist",
+        "--target", "role:research_orchestrator",
         "--title", title[:120],
         "--labels", ",".join(merged_labels),
         "--project-id", "null",
@@ -1602,7 +1884,7 @@ def file_followup_overflow_summary(
         str(ticket_bin),
         "file",
         "--requester", "specialist",
-        "--target", "specialist",
+        "--target", "role:research_orchestrator",
         "--title", title[:120],
         "--labels", "low-pri,triage,from-watch,actuation-overflow",
         "--project-id", "null",
@@ -1756,6 +2038,11 @@ def log_actuation_summary(
         )
 
 
+# T-4737: ORG-001 (amended 2026-10-08): the watch runner is specialist's; its
+# entries carry specialist's ORG-100 role id and seat slot, not the persona name.
+_LEDGER_AGENT, _LEDGER_EXECUTOR = agent_role_map.ledger_identity("specialist")
+
+
 def write_actuation_ledger(
     today: date,
     filed_ids: list[str],
@@ -1784,7 +2071,8 @@ def write_actuation_ledger(
     entry = build_ledger_entry(
         entry_id=f"{ts}-actuation",
         ts=ts,
-        agent="specialist",
+        agent=_LEDGER_AGENT,
+        executor=_LEDGER_EXECUTOR,
         action=f"actuation_{date_iso}",
         rationale=(
             f"Auto-filed {len(filed_ids)} ticket(s) from {date_iso} watch reports."
@@ -2033,10 +2321,25 @@ def land_reports(
 
         report_path = date_dir / f"{topic.slug}.md"
         landed = report_landed_ok(report_path)
+        if not landed and not (force or topic_filter):
+            # T-4543: a probe-skipped topic was never dispatched; no report is
+            # the expected outcome, not a failure. Same-day cached decision.
+            skip, reason = probe_skip(topic.slug, state, today)
+            if skip:
+                print(f"  {topic.slug} → skipped (probe: {reason})")
+                continue
         if landed:
             status = "ok"
             headline = parse_report_headline(report_path)
             summary = f"TL;DR: {headline}" if headline else "TL;DR: (no headline frontmatter)"
+            # T-5500: warn, never refuse. A missed readback must not block landing.
+            if readback_missing(report_path):
+                print(
+                    f"WARN [readback] {report_path.name}: surface: above-bar with no "
+                    f"readback: line (T-5213 step 2b skipped)",
+                    file=sys.stderr,
+                )
+                summary += READBACK_MISSING_MARK
             # T-2614: accumulate any brief_corrections this report found —
             # the "rides the same pipe as the defect" step. Best-effort:
             # accumulate_brief_corrections never raises.
@@ -2053,6 +2356,8 @@ def land_reports(
         if not day_index_has_row(date_dir, topic.slug):
             append_day_index_entry(date_dir, topic.slug, status, summary)
         update_state(state, topic.slug, today, status)
+        if status == "ok" and topic.slug in TOPIC_PROBES:
+            advance_probe_baseline(topic.slug, today)
         print(f"  {topic.slug} → {status}")
 
     # T-2148: sweep for reports that reached disk outside the topics.md dispatch
@@ -2163,9 +2468,19 @@ def file_watch_ticket(
         f"Dispatch each in-session (ORG-025), then land:\n"
         f"1. `python3 tools/watch_runner.py --emit-due-briefs` → JSON list of "
         f"{{slug, brief, output_path}}.\n"
-        f"2. For each record, dispatch a general-purpose subagent (Agent tool, "
-        f"model sonnet) with prompt = the record's `brief`; the subagent writes "
-        f"its report to `output_path`.\n"
+        f"2. For each record, dispatch a subagent (Agent tool, "
+        f"subagent_type `researcher`, the claude-config persona: sonnet, effort "
+        f"low; T-4670) with prompt = the record's `brief`; the subagent writes "
+        f"its report to `output_path`. If `researcher` is not an available "
+        f"subagent type on this seat, use general-purpose with model sonnet and "
+        f"say so in the land note.\n"
+        f"2b. Guarded readback (T-5213): for each report with "
+        f"`surface: above-bar`, re-fetch the headline claim's primary source "
+        f"and add a frontmatter line `readback: confirmed|corrected|"
+        f"unconfirmed: <source>`. Fetch directly only an allowlisted primary "
+        f"document (NVD, vendor advisory, arXiv, official release); anything "
+        f"else goes through a disposable subagent (web-research-isolation). "
+        f"Skip routine reports.\n"
         f"3. `python3 tools/watch_runner.py --land-commit` → lands the reports, "
         f"commits (narrow scope + HERMES guard), and actuates.\n"
         f"Due slugs:\n{slug_lines}"
@@ -2185,7 +2500,7 @@ def file_watch_ticket(
         str(ticket_bin),
         "file",
         "--requester", "specialist",
-        "--target", "specialist",
+        "--target", "role:research_orchestrator",
         "--title", title,
         "--labels", "watch,watch-dispatch,ORG-025",
         "--project-id", "null",

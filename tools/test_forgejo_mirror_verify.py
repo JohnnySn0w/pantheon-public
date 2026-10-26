@@ -8,7 +8,10 @@ cries wolf gets disabled and then there is no verifier at all.
 Run: python3 -m unittest tools.test_forgejo_mirror_verify -v
 """
 import json
+import subprocess
 import unittest
+from pathlib import Path
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 
 from tools import forgejo_mirror_verify as v
@@ -224,6 +227,74 @@ class TestPrivateUpstreamAuth(unittest.TestCase):
         v.ref_set("https://github.com/example-org/pub.git", run=run)
         self.assertNotIn("credential.https://github.com.helper", " ".join(cap["cmd"]))
         self.assertIsNone(cap["env"], "no pat → inherit env, nothing injected")
+
+
+class TestMirrorCredentialIsExplicit(unittest.TestCase):
+    """T-5067: the mirror read is pantheon-mirror whatever the store file's line order."""
+    URL = "https://pantheon-mirror@git.your-self-hosted-git.example/pantheon/pantheon-bridge.git"
+
+    def setUp(self):
+        import tempfile
+        self.tmp = Path(tempfile.mkdtemp())
+        self.cred = self.tmp / "creds"
+        # fleet FIRST: the order a `git credential approve` as pantheon-fleet leaves behind
+        self.cred.write_text("https://pantheon-fleet:FLEETPW@git.your-self-hosted-git.example\n"
+                             "https://pantheon-mirror:MIRROR%2FPW@git.your-self-hosted-git.example\n")
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _capture(self, url=None, token=None):
+        captured = {}
+
+        def run(cmd, **kw):
+            import types
+            captured["cmd"], captured["env"] = list(cmd), kw.get("env")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        got = v.ref_set(url or self.URL, token=str(token or self.cred), run=run)
+        return got, captured
+
+    def test_store_password_picks_by_user_not_order(self):
+        self.assertEqual(v.store_password(str(self.cred), "git.your-self-hosted-git.example", "pantheon-mirror"), "MIRROR/PW")
+        self.assertEqual(v.store_password(str(self.cred), "git.your-self-hosted-git.example", "pantheon-fleet"), "FLEETPW")
+        self.assertIsNone(v.store_password(str(self.cred), "github.com", "pantheon-mirror"))
+
+    def test_fleet_first_file_still_sends_the_mirror_password_via_env_only(self):
+        _, cap = self._capture()
+        joined = " ".join(cap["cmd"])
+        self.assertEqual(cap["env"]["PANTHEON_FORGE_PW"], "MIRROR/PW")
+        self.assertNotIn("MIRROR/PW", joined)
+        self.assertNotIn("FLEETPW", joined)
+        self.assertNotIn("store", joined, "the order-dependent store helper is gone")
+        self.assertIn("credential.helper=", cap["cmd"])
+        self.assertIn("credential.https://git.your-self-hosted-git.example.helper=", cap["cmd"])
+
+    def test_no_matching_entry_is_unreadable_and_runs_nothing(self):
+        self.cred.write_text("https://pantheon-fleet:FLEETPW@git.your-self-hosted-git.example\n")
+        got, cap = self._capture()
+        self.assertIsNone(got)
+        self.assertEqual(cap, {})
+
+    def test_real_git_resolves_pantheon_mirror_despite_an_inherited_host_helper(self):
+        import shutil
+        if not shutil.which("git"):
+            self.skipTest("git not installed")
+        home = self.tmp / "home"
+        home.mkdir()
+        (home / ".gitconfig").write_text(
+            "[credential \"https://git.your-self-hosted-git.example\"]\n"
+            f"\thelper = store --file={self.cred}\n")
+        _, cap = self._capture()
+        prefix = cap["cmd"][:cap["cmd"].index("ls-remote")]
+        env = {**cap["env"], "HOME": str(home), "XDG_CONFIG_HOME": str(home / ".config"),
+               "GIT_CONFIG_NOSYSTEM": "1"}
+        r = subprocess.run(prefix + ["credential", "fill"], input="protocol=https\nhost=git.your-self-hosted-git.example\n\n",
+                           capture_output=True, text=True, env=env, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("username=pantheon-mirror", r.stdout)
+        self.assertIn("password=MIRROR/PW", r.stdout)
+        self.assertNotIn("FLEETPW", r.stdout)
 
 
 class TestMainRoutesPatToPrivateOnly(unittest.TestCase):
@@ -525,6 +596,69 @@ class TestStateBasedGrace(unittest.TestCase):
              mock.patch("builtins.open", mock.mock_open(read_data="forge-token")):
             rc2 = v.main(["--quiet-ok"])
         self.assertEqual(rc2, 1, "a ref still missing after a sync is a real gap → DRIFT → exit 1")
+
+
+def fresh(**kw):
+    """A mirror that synced a minute ago by the REAL clock (main() compares against now)."""
+    return repo(mirror_updated=(datetime.now(timezone.utc) - timedelta(minutes=1))
+                .strftime("%Y-%m-%dT%H:%M:%SZ"), **kw)
+
+
+class TestBlindVerifier(unittest.TestCase):
+    """T-4690: the verifier was blind for days (UNKNOWN=50, exit 0) for three reasons."""
+
+    def _main(self, api, ref_set):
+        with mock.patch.object(v, "ref_set", side_effect=ref_set), \
+             mock.patch.object(v, "_api", side_effect=api), \
+             mock.patch.object(v, "read_github_pat", return_value=None), \
+             mock.patch.object(v, "github_repo_private", return_value=None), \
+             mock.patch.object(v, "load_state", return_value={}), \
+             mock.patch.object(v, "save_state"), \
+             mock.patch("builtins.open", mock.mock_open(read_data="forge-token")):
+            return v.main(["--quiet-ok"])
+
+    def test_unreadable_mirror_fails_the_run(self):
+        # Our own credential failing must be loud, not UNKNOWN-and-exit-0.
+        rc = self._main(lambda path, tok: [fresh(name="a", private=False)],
+                        lambda url, **kw: None if "git.your-self-hosted-git.example" in url else {"x refs/heads/main"})
+        self.assertEqual(rc, 1)
+
+    def test_unreadable_upstream_alone_stays_benign(self):
+        rc = self._main(lambda path, tok: [fresh(name="a", private=True)],
+                        lambda url, **kw: None if "github.com" in url else {"x refs/heads/main"})
+        self.assertEqual(rc, 0)
+
+    def test_mirror_url_names_the_mirror_identity(self):
+        seen = []
+        def ref_set(url, **kw):
+            seen.append(url)
+            return {"x refs/heads/main"}
+        self._main(lambda path, tok: [fresh(name="a", private=False)], ref_set)
+        self.assertIn("https://pantheon-mirror@git.your-self-hosted-git.example/github-mirror/a.git", seen)
+
+    def test_paginates_past_fifty(self):
+        pages = {1: [fresh(name=f"r{i}", private=False) for i in range(50)],
+                 2: [fresh(name="r50", private=False)]}
+        def api(path, tok):
+            page = int(path.rsplit("page=", 1)[1])
+            return pages.get(page, [])
+        names = []
+        def ref_set(url, **kw):
+            names.append(url)
+            return {"x refs/heads/main"}
+        self.assertEqual(self._main(api, ref_set), 0)
+        self.assertTrue(any(u.endswith("/r50.git") and "git.your-self-hosted-git.example" in u for u in names),
+                        "repo 51 (page 2) was never checked")
+
+    def test_pager_that_never_ends_is_bounded_and_loud(self):
+        calls = []
+        def api(path, tok):
+            calls.append(path)
+            if len(calls) > v.MAX_PAGES + 5:
+                raise AssertionError("pager did not stop")
+            return [fresh(name="same", private=False)] * v.PAGE
+        self.assertEqual(self._main(api, lambda url, **kw: {"x refs/heads/main"}), 65)
+        self.assertEqual(len(calls), v.MAX_PAGES)
 
 
 if __name__ == "__main__":

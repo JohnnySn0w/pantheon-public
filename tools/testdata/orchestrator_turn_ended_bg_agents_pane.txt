@@ -1,0 +1,11 @@
+  flag, with rollback ready. Still waiting on #538's third CI attempt and the
+  T-4230 and T-4226 implementers.
+────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────
+  ⏸ manual mode on · 2 shells, 1 monitor · ← for agents · ↓ to manage
+  ● main
+  ◯ rev-t4220   INTENT: a cascade sweep that sil…                         idle
+  ◯ rev-t4226   INTENT: code reaches main only t…                         idle
+  ◯ impl-t4230  Timing test_links_cli_expands_th… 1h 19m 30s · ↓ 279.3k tokens
+  ◯ impl-t4226  Waiting on full_suite4.log           48m 30s · ↓ 431.8k tokens

@@ -39,6 +39,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -65,7 +66,9 @@ class _RepoSnapshot:
     can default to the same path without requiring the caller to repeat it.
     """
 
-    local_only: frozenset[str]
+    # None = the snapshot could not be taken (git failed or timed out). The
+    # guard is then UNKNOWN, not empty; see assert_real_repo_untouched (T-4108).
+    local_only: frozenset[str] | None
     repo_path: Path
 
 
@@ -116,6 +119,35 @@ def local_only_commits(repo_path: Path) -> frozenset[str]:
     return frozenset(shas)
 
 
+# T-4108: the guard's own snapshots need a failure signal that local_only_commits
+# (lenient by contract: frozenset() on any failure) can't give. A timed-out
+# setUp snapshot used to become an EMPTY baseline. Then a successful tearDown
+# read reported every pre-existing local-only commit as "new". On a CI
+# pull_request checkout, HEAD is GitHub's refs/pull/N/merge commit, which is
+# local-only by construction, so under runner IO contention this produced
+# false "leaked commit" failures (PRs #495/#497/#501, 2026-09-28).
+_GUARD_GIT_TIMEOUT_S = 60
+
+
+def _local_only_commits_or_none(repo_path: Path) -> frozenset[str] | None:
+    """Like local_only_commits, but None (unknown) on any git failure or
+    timeout instead of an empty set, so the guard can tell 'no local commits'
+    from 'could not look'."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo_path), "log",
+             "HEAD", "--not", "--remotes=origin",
+             "--format=%H"],
+            capture_output=True, text=True, check=False,
+            timeout=_GUARD_GIT_TIMEOUT_S,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if r.returncode != 0:
+        return None
+    return frozenset(line.strip() for line in r.stdout.splitlines() if line.strip())
+
+
 def snapshot_real_repo(repo_path: Path | None = None) -> _RepoSnapshot:
     """Record the real repo's local-only commit set before the test runs.
 
@@ -131,7 +163,7 @@ def snapshot_real_repo(repo_path: Path | None = None) -> _RepoSnapshot:
     """
     resolved = repo_path if repo_path is not None else REPO_ROOT
     return _RepoSnapshot(
-        local_only=local_only_commits(resolved),
+        local_only=_local_only_commits_or_none(resolved),
         repo_path=resolved,
     )
 
@@ -170,7 +202,18 @@ def assert_real_repo_untouched(
         AssertionError: if new local-only commits appeared since the snapshot.
     """
     resolved = repo_path if repo_path is not None else snapshot.repo_path
-    current = local_only_commits(resolved)
+    current = _local_only_commits_or_none(resolved)
+    if snapshot.local_only is None or current is None:
+        # UNKNOWN on either side (git failed or timed out): skip rather than
+        # diff against a fake-empty set, which is the T-4108 false positive.
+        # Lenient in the same direction local_only_commits already documents.
+        warnings.warn(
+            f"assert_real_repo_untouched: could not read local-only commits in "
+            f"{resolved} ({'setUp' if snapshot.local_only is None else 'tearDown'} "
+            f"snapshot failed); guard skipped for this test (T-4108).",
+            RuntimeWarning, stacklevel=2,
+        )
+        return
     new_local = current - snapshot.local_only
     if new_local:
         raise AssertionError(
@@ -178,7 +221,42 @@ def assert_real_repo_untouched(
             f"the test (not reachable from any origin/* ref). "
             f"Tests must not commit to the real repo. "
             f"New local-only SHAs: {sorted(new_local)}"
+            f"{_describe_commits(resolved, sorted(new_local))}"
         )
+
+
+def _describe_commits(repo_path: Path, shas: list[str], max_files: int = 8) -> str:
+    """Best-effort forensic detail for leaked SHAs: author, date, subject and the
+    first changed paths of each (T-4108).
+
+    Under pytest-xdist the tearDown guard that fires is often NOT the test that
+    committed; a concurrent test in another worker is. And the leaked commit
+    exists only in that checkout (often a CI runner workspace, unrecoverable
+    afterwards). The commit's own subject and paths are the only reliable
+    pointer to the culprit, so they go into the assertion message. Fail-safe:
+    any error degrades to a note and never masks the guard's AssertionError.
+    """
+    lines: list[str] = []
+    for sha in shas:
+        try:
+            out = subprocess.run(
+                ["git", "-C", str(repo_path), "show", "--no-patch",
+                 "--format=%h | %an <%ae> | %aI | %s", sha],
+                capture_output=True, text=True, timeout=10,
+            )
+            files = subprocess.run(
+                ["git", "-C", str(repo_path), "show", "--name-only",
+                 "--format=", sha],
+                capture_output=True, text=True, timeout=10,
+            )
+            head = out.stdout.strip() or f"{sha[:10]} | (no detail: {out.stderr.strip()[:120]})"
+            paths = [f for f in files.stdout.splitlines() if f.strip()]
+            shown = ", ".join(paths[:max_files])
+            more = f" (+{len(paths) - max_files} more)" if len(paths) > max_files else ""
+            lines.append(f"  - {head}\n      files: {shown or '(none)'}{more}")
+        except Exception as exc:  # noqa: BLE001 - forensic helper must never raise
+            lines.append(f"  - {sha[:10]} | (could not describe: {exc!r})")
+    return "\nLeaked commit detail (T-4108):\n" + "\n".join(lines) if lines else ""
 
 
 # ---------------------------------------------------------------------------
@@ -241,6 +319,9 @@ def setup_integration_env() -> IntegrationEnv:
 
     env_overrides = {
         "PANTHEON_STATE_DIR": str(state),
+        # T-4167: the spawned script's sync helpers resolve the REAL checkout; never
+        # let a Layer-3 run fetch + fast-forward it (see _git_utils._real_repo_sync_blocked).
+        "PANTHEON_TEST_NO_REAL_REPO_SYNC": "1",
         # Pin the caller to a KNOWN_ACCOUNTS value so the own-account read
         # branch honors PANTHEON_STATE_DIR. Without this, a CI runner's login
         # name (e.g. "runner") routes reads through the cross-account sudo path
@@ -304,6 +385,108 @@ def run_script(
         timeout=timeout,
     )
     return result.returncode, result.stdout, result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Fake `git mv` containment (T-4167)
+# ---------------------------------------------------------------------------
+
+
+def contained_path(root: Path, arg: str) -> Path:
+    """``root / arg`` for a fake-git stub, refusing any path that escapes ``root``.
+
+    pathlib DISCARDS ``root`` when ``arg`` is absolute (and ``..`` climbs out of
+    it), so a stub doing ``shutil.move(root / argv[2], root / argv[3])`` would move
+    a REAL file in the shared checkout -- the CI flake behind T-4165 moved
+    tickets/active/T-4137.md mid-run. Raising names the offending argv in the
+    failing test instead of touching the live tree.
+    """
+    candidate = Path(root) / arg
+    real_root = os.path.realpath(root)
+    if os.path.commonpath([real_root, os.path.realpath(candidate)]) != real_root:
+        raise AssertionError(
+            f"fake git stub refused a path outside the test root: {arg!r} "
+            f"(root {root}) -- it would touch the real checkout (T-4167)"
+        )
+    return candidate
+
+
+class TicketTreeWatch:
+    """Cheap per-test drift check on a REAL ticket tree + checkout (T-4167 CI tripwire).
+
+    ``stamp()`` is only the mtimes of the tree root and its immediate subdirs, which
+    change whenever an entry is added, removed or renamed, plus (given ``git_dir``)
+    the checkout's fetch/ref markers, so the common no-drift case costs a handful of
+    stats. The full listing is rebuilt only when the stamp moves, and it is cached per
+    stamp, so ``begin()`` stays cheap across tests.
+
+    The git markers exist because the T-4165 flake was most likely a REAL ``git pull``
+    in CI's checkout: T-4137 moved active->done exactly as origin's resolve did,
+    mid-job. That only shows in the tree when origin happens to change tickets/
+    during the run; FETCH_HEAD (any fetch/pull), ORIG_HEAD (merge/rebase/reset),
+    HEAD, packed-refs and the loose branch ref catch it on every run.
+    """
+
+    GIT_MARKERS = ("FETCH_HEAD", "ORIG_HEAD", "HEAD", "packed-refs")
+
+    def __init__(self, tickets_root: Path, git_dir: Path | None = None) -> None:
+        self.root = Path(tickets_root)
+        self.git_dir = Path(git_dir) if git_dir is not None else None
+        self._cache: tuple[tuple, frozenset[str]] | None = None
+
+    def _git_stamp(self) -> tuple:
+        if self.git_dir is None or not self.git_dir.is_dir():
+            return ()
+        names = list(self.GIT_MARKERS)
+        try:
+            head = (self.git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        except OSError:
+            head = ""
+        if head.startswith("ref: "):
+            names.append(head[len("ref: "):])
+        out = []
+        for name in names:
+            try:
+                out.append((name, (self.git_dir / name).stat().st_mtime_ns))
+            except OSError:
+                out.append((name, None))
+        return tuple(out)
+
+    def stamp(self) -> tuple:
+        dirs = [self.root, *sorted(p for p in self.root.iterdir() if p.is_dir())]
+        return tuple((d.name, d.stat().st_mtime_ns) for d in dirs), self._git_stamp()
+
+    def _listing(self, stamp: tuple) -> frozenset[str]:
+        if self._cache is None or self._cache[0] != stamp[0]:
+            entries = set()
+            for child in self.root.iterdir():
+                entries.add(child.name)
+                if child.is_dir():
+                    entries.update(f"{child.name}/{e.name}" for e in os.scandir(child))
+            self._cache = (stamp[0], frozenset(entries))
+        return self._cache[1]
+
+    def begin(self) -> tuple[tuple, frozenset[str]]:
+        stamp = self.stamp()
+        return stamp, self._listing(stamp)
+
+    def drift(
+        self, token: tuple[tuple, frozenset[str]]
+    ) -> tuple[list[str], list[str], list[str]] | None:
+        """None when untouched, else (removed, added, git_markers_changed) since ``begin()``.
+
+        removed/added can both be empty (an entry created then removed still bumps
+        the mtime); that is still a write into the real tree.
+        """
+        stamp, before = token
+        now = self.stamp()
+        if now == stamp:
+            return None
+        after = self._listing(now)
+        git_changed = sorted(
+            {name for name, _ in set(stamp[1]) ^ set(now[1])}
+        )
+        return sorted(before - after), sorted(after - before), git_changed
 
 
 # ---------------------------------------------------------------------------

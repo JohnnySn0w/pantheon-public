@@ -1,0 +1,105 @@
+# Pantheon naming-history registry — canonical old→new resolver.
+#
+# T-3815 (2026-09-19, self-filed) per the operator TG 10145: "in order to ease tickets
+# over, a mapping should track old names for things in general." Machine-queryable
+# forward-resolution surface for renames that would otherwise stay as ad-hoc
+# per-namespace continuity (agent_role_map backward-resolve, per-rename lessons
+# entries). Historical audit-chain surfaces (ledger, tickets, notes) stay
+# immutable per P4; this registry is a READ-time resolver over them, not a
+# rewrite.
+#
+# Schema per entry:
+#   old:            string, the retired name (byte-exact match)
+#   new:            string, the current canonical name (or the literal string
+#                   "retired" for retirements that map to nothing)
+#   kind:           one of: role_id, role_key, persona, instance, agent_id
+#                   (extensible; add here + in tools/naming_history.py first)
+#   retired_date:   YYYY-MM-DD, calendar date the rename ratified
+#   ratified_by:    ticket_id (T-NNNN) or ADR id (ORG-NNN); the authority
+#   scope:          one-line prose scoping which manifestation sites the
+#                   rename covers (for readers; not machine-consumed)
+#
+# Write discipline: every ratified rename appends an entry as part of the rename
+# ticket's closure. Historical (pre-registry) renames back-filled from ledger
+# review or opportunistic — not urgent.
+#
+# Consumers: tools/naming_history.py (the resolver) is the canonical read path.
+# Other callers (ticket.py resolvers, ledger writers, doc-search) may embed
+# lookups via that module; not by re-reading this file directly.
+
+schema_version: 1
+
+entries:
+  # T-3807 role-terminology rename batch (operator-ratified TG 10103/10105/10109
+  # /10111/10116/10118/10120; ORG-088 rev-2 authority). Landed 2026-09-19.
+  - old: sub_orchestrator
+    new: engineering_orchestrator
+    kind: role_id
+    retired_date: 2026-09-19
+    ratified_by: T-3807
+    scope: L2 role_id for mason + artisan seats (persona_roles.yaml, agent_role_map, downstream refs)
+  - old: recovery
+    new: head_system_orchestrator
+    kind: role_id
+    retired_date: 2026-09-19
+    ratified_by: T-3807
+    scope: L2 role_id for recovery; TG 10116 subsumes repair/maintenance/system+seat health under system orchestrator
+  - old: reviewer
+    new: head_auditor
+    kind: role_id
+    retired_date: 2026-09-19
+    ratified_by: T-3807
+    scope: L2 role_id for codex only; TG 10116 "System 3* is the VSM label; the ROLE is Head Auditor". Worker-role `reviewer` (per-dispatch subagent type) is DIFFERENT and NOT renamed
+  - old: research
+    new: head_research_orchestrator
+    kind: role_id
+    retired_date: 2026-09-19
+    ratified_by: T-3807
+    scope: L2 role_id for specialist (head-seat uniformity with head-X pattern per TG 10103)
+  - old: orchestrator
+    new: retired
+    kind: role_id
+    retired_date: 2026-09-19
+    ratified_by: T-3807
+    scope: universal `orchestrator` role_id dropped from every persona per TG 10116 item 3; 3-layer dispatch pattern (self → project_orchestrator → implementer/reviewer) applies by convention at each key seat, not by inheritance
+  - old: orchestrator
+    new: head_memory_orchestrator
+    kind: role_id
+    retired_date: 2026-09-19
+    ratified_by: T-3807
+    scope: L2 role_id for ARCHIVIST only (head-memory, not head-engineering, per TG 10103+10111 domain split). NOTE - orchestrator's L2 orchestrator was ALSO renamed but to head_engineering_orchestrator (see T-3814 entry below); consumers must disambiguate by persona context.
+
+  # T-3814 shorthand-retire + role-in-role-field batch (ORG-100 amendment
+  # @7a058aa2e). Landed 2026-09-19.
+  - old: orchestrator
+    new: head_engineering_orchestrator
+    kind: role_id
+    retired_date: 2026-09-19
+    ratified_by: T-3814
+    scope: L2 role_id for ORCHESTRATOR only. Disambiguates from the archivist orchestrator→head_memory_orchestrator rename in T-3807. "orchestrator" as orchestrator's LEGACY SHORTHAND alias stays permitted for audit-chain continuity (agent_role_map D1 backward-resolve).
+
+  # Historical HO persona renames (pre-registry back-fill, informal).
+  - old: orchestrator
+    new: orchestrator
+    kind: persona
+    retired_date: 2026-05-01
+    ratified_by: informal
+    scope: original identifier for the Orchestrator persona; superseded by orchestrator (mid-May 2026)
+  - old: Orchestrator
+    new: orchestrator
+    kind: persona
+    retired_date: 2026-05-01
+    ratified_by: informal
+    scope: brief transitional identifier for the Orchestrator persona between orchestrator and orchestrator
+  - old: suborch1
+    new: mason
+    kind: persona
+    retired_date: 2026-09-07
+    ratified_by: T-3807
+    scope: legacy unix-account identifier; retired in favor of the personal name. The unix account name `suborch1` remains for audit-chain continuity (OS-level immutable) — this rename applies to PERSONA references in prose and tickets
+  - old: suborch2
+    new: artisan
+    kind: persona
+    retired_date: 2026-09-07
+    ratified_by: T-3807
+    scope: legacy unix-account identifier; retired in favor of the personal name. Same discipline as suborch1 — unix account `suborch2` unchanged; persona references renamed

@@ -11,6 +11,9 @@ Covers:
     passes escaped form, refuses contaminated commit message
   - Main-guard lint wiring (T-2314): staged-blob scoping, fail-open on
     infrastructural error, fail-closed on a finding, real-git smoke
+  - Rename-aware staged checks (T-4451): a renamed-and-edited file gets the same
+    checks as an added/modified one; a pure rename of a baselined finding is not
+    newly blocked; a copy is never given baseline credit
 
 Fixture-string note: the unescaped HERMES trigger is constructed at runtime via
 source-time string concatenation (`b"HERME" + b"S.md"` / `"HERME" + "S.md"`)
@@ -22,6 +25,7 @@ discipline convention in `tools/_git_utils.py`.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.machinery
 import importlib.util
 import io
@@ -677,6 +681,252 @@ class TestQuotedStagedPathsAreScanned(unittest.TestCase):
         result = self._commit()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(b"main-guard lint violation", result.stdout + result.stderr)
+
+
+class TestRenameAwareStagedChecks(unittest.TestCase):
+    """T-4451: `git mv` + edit is status R, which `--diff-filter=ACM` dropped, so
+    the renamed blob skipped the byte-sequence scan and every staged-content
+    gate. These run REAL git on real files (a synthetic path list cannot express
+    git's own rename pairing) and, for the commit cases, the live hook through
+    `core.hooksPath`.
+
+    Two rules under test. Whole-blob checks (byte-sequence scan, main-guard lint)
+    scan the DESTINATION blob exactly as they do for A/M: a rename that adds a
+    violation is refused. Baselined checks (content gate, self-sudo guard, ledger
+    validity) compare against the rename SOURCE, so a pure rename of a
+    pre-existing finding is not newly blocked.
+    """
+
+    OLD = "notes/old_name.txt"
+    NEW = "notes/new_name.txt"
+    BODY = "".join(f"line {i} of a reasonably sized file\n" for i in range(24)).encode()
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.hook = _load_pre_commit_hook_module()
+
+    def setUp(self) -> None:
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.repo = Path(self._td.name)
+        self._git("init", "-q", ".")
+
+    def _git(self, *args: str, hook: bool = False) -> subprocess.CompletedProcess:
+        cmd = ["git", "-c", "user.email=t@example.com", "-c", "user.name=t"]
+        if hook:
+            cmd += ["-c", f"core.hooksPath={HOOKS_DIR}"]
+        return subprocess.run(
+            [*cmd, *args], cwd=self.repo, capture_output=True, text=True, check=False
+        )
+
+    def _write(self, name: str, content: bytes) -> None:
+        path = self.repo / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+
+    def _seed(self, name: str, content: bytes) -> None:
+        """Land `content` at HEAD, bypassing the hook (it may be a deliberate
+        pre-existing violation)."""
+        self._write(name, content)
+        self._git("add", "-A")
+        done = self._git("commit", "-q", "--no-verify", "-m", "seed")
+        self.assertEqual(done.returncode, 0, done.stderr)
+
+    def _stage_move(self, old: str, new: str, content: bytes | None = None) -> None:
+        """`git mv old new`, optionally rewriting the moved file, then stage."""
+        (self.repo / new).parent.mkdir(parents=True, exist_ok=True)
+        moved = self._git("mv", old, new)
+        self.assertEqual(moved.returncode, 0, moved.stderr)
+        if content is not None:
+            self._write(new, content)
+        self._git("add", "-A")
+
+    def _commit(self) -> subprocess.CompletedProcess:
+        return self._git("commit", "-q", "-m", "test: rename", hook=True)
+
+    def _assert_is_rename(self) -> None:
+        status = self._git("diff", "--cached", "-M", "--name-status").stdout
+        self.assertTrue(status.startswith("R"), f"precondition: want an R entry, got {status!r}")
+
+    # -- the staged list itself ----------------------------------------------
+
+    def test_staged_list_reports_rename_destination_and_source(self) -> None:
+        self._seed(self.OLD, self.BODY)
+        self._stage_move(self.OLD, self.NEW, self.BODY + b"one more line\n")
+        self._assert_is_rename()
+        with contextlib.chdir(self.repo):
+            self.assertEqual(self.hook._staged_files(), [self.NEW])
+            self.assertEqual(self.hook._staged_changes(), [(self.NEW, self.OLD)])
+
+    def test_a_rename_is_detected_even_when_the_seat_disables_rename_detection(self) -> None:
+        """`-M` is pinned rather than left to `diff.renames`: a seat with it off would
+        otherwise see D+A, list the destination with no source, and have a pure claim of
+        a pre-existing-red ticket refused by the content gate."""
+        self._seed(self.OLD, self.BODY)
+        self._git("config", "diff.renames", "false")
+        self._stage_move(self.OLD, self.NEW, self.BODY + b"one more line\n")
+        plain = self._git("diff", "--cached", "--name-status").stdout
+        self.assertNotIn("R", plain, f"precondition: plain diff should show no rename, got {plain!r}")
+        with contextlib.chdir(self.repo):
+            self.assertEqual(self.hook._staged_changes(), [(self.NEW, self.OLD)])
+
+    def test_staged_changes_leaves_added_and_modified_without_a_source(self) -> None:
+        self._seed("keep.txt", self.BODY)
+        self._write("keep.txt", self.BODY + b"edited\n")
+        self._write("fresh.txt", b"brand new\n")
+        self._git("add", "-A")
+        with contextlib.chdir(self.repo):
+            self.assertEqual(
+                sorted(self.hook._staged_changes()),
+                [("fresh.txt", None), ("keep.txt", None)],
+            )
+
+    def _parsed(self, raw: bytes, returncode: int = 0):
+        done = subprocess.CompletedProcess([], returncode, stdout=raw, stderr=b"")
+        with patch.object(self.hook.subprocess, "run", return_value=done):
+            return self.hook._staged_changes()
+
+    def test_name_status_parser_handles_each_shape_git_emits(self) -> None:
+        raw = (b"M\0tools/a.py\0"
+               b"R095\0tickets/inbox/T-1.md\0tickets/active/T-1.md\0"
+               b"A\0tickets/inbox/T-2.md\0"
+               b"C070\0src.md\0copy.md\0")
+        self.assertEqual(self._parsed(raw), [
+            ("tools/a.py", None),
+            ("tickets/active/T-1.md", "tickets/inbox/T-1.md"),
+            ("tickets/inbox/T-2.md", None),
+            ("copy.md", None),  # a copy never carries a baseline source
+        ])
+
+    def test_name_status_parser_is_safe_on_empty_truncated_and_failed_input(self) -> None:
+        self.assertEqual(self._parsed(b""), [])
+        self.assertEqual(self._parsed(b"R100\0only-one-path\0"), [])
+        self.assertEqual(self._parsed(b"M\0"), [])
+        self.assertEqual(self._parsed(b"M\0tools/a.py\0", returncode=128), [])  # fail-open
+
+    # -- whole-blob checks scan the destination ------------------------------
+
+    def test_rename_plus_edit_introducing_the_byte_sequence_is_refused(self) -> None:
+        self._seed(self.OLD, self.BODY)
+        trigger = b"mentions " + (b"HERME" + b"S.md") + b" inline\n"
+        self._stage_move(self.OLD, self.NEW, self.BODY + trigger)
+        self._assert_is_rename()
+        result = self._commit()
+        self.assertNotEqual(result.returncode, 0, "renamed+edited blob skipped the scan")
+        self.assertIn("discipline violation", result.stderr)
+        self.assertIn(f"{self.NEW}:25", result.stderr)
+
+    def test_pure_rename_of_a_clean_file_is_allowed(self) -> None:
+        self._seed(self.OLD, self.BODY)
+        self._stage_move(self.OLD, self.NEW)
+        self._assert_is_rename()
+        result = self._commit()
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_pure_rename_of_a_file_holding_the_byte_sequence_is_still_refused(self) -> None:
+        """Deliberate M-parity: a whole-blob scan has no HEAD baseline, so moving a
+        contaminated file is refused exactly as editing it would be (T-4451 answer 2).
+        HEAD holds no such file, so no legitimate path depends on the opposite."""
+        contaminated = self.BODY + b"x " + (b"HERME" + b"S.md") + b"\n"
+        self._seed(self.OLD, contaminated)
+        self._stage_move(self.OLD, self.NEW)
+        self._assert_is_rename()
+        result = self._commit()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("discipline violation", result.stderr)
+
+    def test_rename_plus_edit_adding_a_stranded_class_reaches_main_guard_lint(self) -> None:
+        clean = b'class Fine:\n    pass\n\nif __name__ == "__main__":\n    pass\n'
+        self._seed("tools/old_mod.py", clean)
+        stranded = (
+            b'if __name__ == "__main__":\n    pass\n\nclass TestStranded:\n    pass\n'
+        )
+        self._stage_move("tools/old_mod.py", "tools/new_mod.py", stranded)
+        self._assert_is_rename()
+        result = self._commit()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("main-guard lint violation", result.stderr)
+        self.assertIn("TestStranded", result.stderr)
+
+    # -- copies ---------------------------------------------------------------
+
+    def test_a_copy_is_reported_without_a_source_even_when_git_is_configured_to_detect_copies(self) -> None:
+        """A copy gets no pre-existing-finding credit: it leaves its source in place,
+        so its findings are duplicated, not relocated. The hook pins `-M`, which
+        overrides `diff.renames=copies` (the copy is listed as an ADDED file), and its
+        parser also drops the source of any `C` entry it is ever handed. Plain `git
+        diff --cached` under that config DOES emit C, so the precondition below proves
+        the scenario is real."""
+        self._seed("a.txt", self.BODY)
+        self._git("config", "diff.renames", "copies")
+        trigger = b"copy mentions " + (b"HERME" + b"S.md") + b"\n"
+        self._write("a.txt", self.BODY + b"edited source\n")
+        self._write("b.txt", self.BODY + b"edited source\n" + trigger)
+        self._git("add", "-A")
+        plain = self._git("diff", "--cached", "--name-status").stdout.split()
+        self.assertIn(
+            "C", "".join(tok[0] for tok in plain),
+            f"precondition: plain diff should emit a C entry, got {plain!r}",
+        )
+        with contextlib.chdir(self.repo):
+            self.assertEqual(
+                sorted(self.hook._staged_changes()), [("a.txt", None), ("b.txt", None)]
+            )
+        result = self._commit()
+        self.assertNotEqual(result.returncode, 0, "a copy carrying the trigger must be refused")
+        self.assertIn("b.txt:", result.stderr)
+
+
+class TestSelfSudoGuardRenameBaseline(unittest.TestCase):
+    """T-4451: the self-sudo baseline and allowlist are keyed by PATH, so without a
+    rename-source lookup a pure `git mv` of a grandfathered tools/*.py would read
+    as a brand-new unguarded construction and be refused."""
+
+    SRC = (
+        "import subprocess\n\n"
+        "def seat_run(account):\n"
+        '    return subprocess.run(["sudo", "-u", account, "true"])\n'
+    )
+    OLD, NEW = "tools/old_seat.py", "tools/new_seat.py"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.hook = _load_pre_commit_hook_module()
+
+    def _findings(self, src, *, renames, baseline=frozenset(), allow=()):
+        with patch("tools.self_sudo_guard_lint.load_baseline", return_value=frozenset(baseline)), \
+                patch("tools.self_sudo_guard_lint.ALLOWLIST", tuple(allow)), \
+                patch.object(self.hook, "_read_staged_blob", return_value=src.encode()):
+            return self.hook._self_sudo_guard_findings([self.NEW], renames)
+
+    def test_pure_rename_of_a_baselined_construction_is_not_newly_blocked(self) -> None:
+        self.assertEqual(
+            self._findings(self.SRC, renames={self.NEW: self.OLD},
+                           baseline={(self.OLD, "seat_run")}),
+            [],
+        )
+
+    def test_control_without_the_rename_map_the_same_blob_is_flagged(self) -> None:
+        found = self._findings(self.SRC, renames=None, baseline={(self.OLD, "seat_run")})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn(self.NEW, found[0])
+        self.assertIn("seat_run", found[0])
+
+    def test_rename_plus_a_new_unguarded_construction_is_still_refused(self) -> None:
+        src = self.SRC + (
+            "\ndef fresh_seat(account):\n"
+            '    return subprocess.run(["sudo", "-u", account, "true"])\n'
+        )
+        found = self._findings(src, renames={self.NEW: self.OLD},
+                               baseline={(self.OLD, "seat_run")})
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("fresh_seat", found[0])
+        self.assertIn(self.NEW, found[0])  # reported under the path the commit creates
+
+    def test_an_allowlisted_source_path_is_honoured_after_the_rename(self) -> None:
+        allow = [(self.OLD, "fixed foreign target")]
+        self.assertEqual(self._findings(self.SRC, renames={self.NEW: self.OLD}, allow=allow), [])
+        self.assertEqual(len(self._findings(self.SRC, renames=None, allow=allow)), 1)
 
 
 if __name__ == "__main__":

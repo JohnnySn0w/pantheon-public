@@ -6,7 +6,7 @@
 
 When a daemon-bringup acceptance run (or any Pantheon test) needs to prove a **genuine** Telegram outbound send-accept — a real `sendMessage` → `message_id` round-trip against the live Bot API — rather than the mocked-contract boundary that `tools/bringup_acceptance/telegram_outbound.py` exercises in the always-run suite. This upgrades T-2568's mocked row to a live-accepted proof.
 
-**Do NOT use this to send to the operator.** The whole harness exists to prove a live send WITHOUT ever touching the operator chat `456474197`. The operator-refusal guard is structural (HardStop), but the discipline is yours too.
+**Do NOT use this to send to the operator.** The whole harness exists to prove a live send WITHOUT ever touching the operator chat `424242424`. The operator-refusal guard is structural (HardStop), but the discipline is yours too.
 
 ## The isolation model (why it's built this way)
 
@@ -14,7 +14,7 @@ Three isolation boundaries, each load-bearing:
 
 1. **Separate bot, separate token.** A dedicated throwaway bot (`@pantheon_sendtest_bot`), NOT the live operating bot. Its token lives at `/home/pantheon-test/.config/telegram-test-bot/token` (mode 600). This is deliberately NOT `~/.claude/channels/telegram/.env` — writing a test token there would repoint the live operating channel and go comms-dark.
 2. **Separate unix user.** The token is owned by unix user `pantheon-test` (uid 1009), mode 600 — the `claude` user cannot read it without sudo. The live leg runs AS `pantheon-test` via attended sudo; there is NO NOPASSWD sudoers entry (the leg is gated + attended, so it doesn't need one).
-3. **Separate recipient chat.** A NON-operator test group, `chat_id -5356823915` (negative = group). Distinct from the operator chat `456474197`. A private DM to any bot carries the USER's id (456474197 for the operator) — so a test recipient MUST be a group/channel with a distinct negative/large id, never a DM.
+3. **Separate recipient chat.** A NON-operator test group, `chat_id -5356823915` (negative = group). Distinct from the operator chat `424242424`. A private DM to any bot carries the USER's id (424242424 for the operator) — so a test recipient MUST be a group/channel with a distinct negative/large id, never a DM.
 
 ## One-time setup (operator-provisioned; recorded so it's reproducible)
 
@@ -30,7 +30,7 @@ The bot + group provisioning is on the operator's Telegram account (surface, don
 The leg is `tools/t2582_live_telegram_accept.py`.
 
 - It is **gated** behind env `T2582_LIVE_TELEGRAM_ACCEPT` (∈ {`1`,`true`,`yes`}). Absent the gate its `main()` prints `SKIPPED: ...` and exits 0 — and the always-run `python -m pytest tools/ -q` NEVER sets that var, so the suite NEVER makes a real send (SEND-ISOLATION invariant). The unit tests exercise the pure logic through an injected fake `SendFn`; the live `make_live_send_fn` wiring is only ever constructed inside `main()` behind the gate.
-- When fired with the gate set, it: reads the isolated token, sends one probe message to the dedicated test chat, asserts `ok` + a real `message_id` + the echoed `chat_id` matches (reusing `telegram_outbound.assert_chat_id_matches`), and **HardStops before sending** if the target chat_id is ever `456474197`.
+- When fired with the gate set, it: reads the isolated token, sends one probe message to the dedicated test chat, asserts `ok` + a real `message_id` + the echoed `chat_id` matches (reusing `telegram_outbound.assert_chat_id_matches`), and **HardStops before sending** if the target chat_id is ever `424242424`.
 - Defaults: `--chat-id -5356823915`, `--token-path /home/pantheon-test/.config/telegram-test-bot/token`.
 
 **Invocation (attended, run AS `pantheon-test` so it can read the 600 token):**

@@ -40,6 +40,8 @@ if str(_REPO_ROOT) not in sys.path:
 from tools.context_fill_monitor import (  # noqa: E402
     AGENT_CONFIG,
     HOOK_ALLOWLIST,
+    PLUGIN_DEVIATION_PREFIX,
+    PLUGIN_DIR_ALLOWLIST,
     check_hook_allowlist,
 )
 
@@ -85,7 +87,15 @@ def format_failure(agent: str, deviations: list[str]) -> str:
         f"  tools/context_fill_monitor.py (curate it deliberately — do NOT auto-derive),\n"
         f"  stage that change, and re-commit. This prevents the runtime T-0536\n"
         f"  'possible injection' false-positive firing on your legitimate hook.\n"
-        f"  (Emergency bypass: git commit --no-verify.)\n"
+        + (
+            f"\n  {PLUGIN_DEVIATION_PREFIX.strip()} deviations (T-4577) are mods loaded via\n"
+            f"  settings.json env: point the entry at your own clone's\n"
+            f"  pantheon-config/tools/mods/<name> and add <name> to\n"
+            f"  PLUGIN_DIR_ALLOWLIST['{agent}'] (currently "
+            f"{sorted(PLUGIN_DIR_ALLOWLIST.get(agent, set()))}).\n"
+            if any(d.startswith(PLUGIN_DEVIATION_PREFIX) for d in deviations) else ""
+        )
+        + "  (Emergency bypass: git commit --no-verify.)\n"
     )
 
 

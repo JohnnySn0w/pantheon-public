@@ -63,12 +63,13 @@ except Exception:  # pragma: no cover - role map optional
     # be imported at all — so it is the one list in this file that CANNOT derive
     # from the canonical map, by construction. It therefore gets the repo's other
     # answer to a hand-carried list: a check that fails. Held the pre-ORG-042/043
-    # five until T-2256 (orchestrator/specialist/recovery/codex/the-ancestor), a silent 5-of-8 that
-    # would have warned "unknown dispatchee" for every mnemosyne/metis/atlas
+    # five until T-2256 (orchestrator/specialist/recovery/codex/+ the since-retired the-ancestor), a silent 5-of-8 that
+    # would have warned "unknown dispatchee" for every archivist/mason/artisan
     # dispatch in a degraded import. test_dispatch enforces the sync.
     _KNOWN_AGENTS = {
-        "orchestrator", "specialist", "recovery", "codex", "the-ancestor",
-        "mnemosyne", "metis", "atlas",
+        "orchestrator", "specialist", "recovery", "codex",
+        "archivist", "mason", "artisan",
+        "watchman",  # T-4884 B6
     }
 
 # Standard non-enumerable role names that are valid dispatch endpoints. Ephemeral

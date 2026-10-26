@@ -182,8 +182,8 @@ drains the dedicated `specialist-a2a` result mailbox inbox every
 `sop/standard/a2a-research-request-handling.md`) sends a result back.
 **Reprovisioning this unit after a BT-5 deploy needs nothing new beyond
 the existing `systemctl --user restart specialist-a2a.service`** — the request
-inbox (`/home/the-ancestor/mailbox/specialist`) and result inbox
-(`/home/the-ancestor/mailbox/specialist-a2a`) are both already provisioned on
+inbox (`/home/post-office/mailbox/specialist`) and result inbox
+(`/home/post-office/mailbox/specialist-a2a`) are both already provisioned on
 the shared substrate and are hardcoded module defaults
 (`DEFAULT_REQUEST_INBOX`/`DEFAULT_RESULT_INBOX` in
 `specialist_seat_server.py`), not new env vars — no unit-file edit is required

@@ -184,6 +184,51 @@ class ClaudeQuotaProbeTest(unittest.TestCase):
         self.assertIsNotNone(result.statusline_sha256)
         self.assertTrue(result.pong_observed)
         self.assertEqual(submitted_at, [1.0])
+        # T-4369: the probe is the first paste into a just-booted TUI, so its Enter is
+        # render-gated, and the flag sits before the positional target and prompt.
+        (submit,) = [call for call in calls if call[0].endswith("send_keys_submit.sh")]
+        self.assertEqual(submit[1:5], ("--harness", "claude-code", "--render-wait", "8"))
+
+    def test_probe_settings_disable_telegram_plugin(self) -> None:
+        # T-4742: the probe runs as the persona's own account, whose user settings
+        # enable the telegram plugin. Loaded in the probe, its server.ts SIGTERMs
+        # the live session's poller (bot.pid) on start and deletes bot.pid on exit,
+        # so every probe left the persona comms-dark until a watchdog restart.
+        clock = _Clock()
+        launched: list[str] = []
+
+        def runner(argv, **kwargs):
+            command = tuple(argv)
+            if command[:2] == ("tmux", "new-session"):
+                launched.append(command[-1])
+            if command[:2] == ("tmux", "capture-pane"):
+                return subprocess.CompletedProcess(
+                    command, 0, "You've hit your session limit · resets 5:10pm (UTC)\n", ""
+                )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        run_probe(
+            account="fixture",
+            persona="recovery",
+            executable=self.executable,
+            repo_root=self.repo,
+            state_root=self.state_root,
+            run_id="20260804T010000Z",
+            timeout_seconds=10.0,
+            runner=runner,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            now=clock.now,
+            enforce_identity=False,
+        )
+        (command,) = launched
+        argv = command.split()
+        settings = json.loads(
+            Path(argv[argv.index("--settings") + 1]).read_text(encoding="utf-8")
+        )
+        self.assertIs(
+            settings["enabledPlugins"]["telegram@claude-plugins-official"], False
+        )
 
     def test_probe_never_submits_on_persistent_nonempty_startup_banner(self) -> None:
         clock = _Clock()
@@ -215,6 +260,59 @@ class ClaudeQuotaProbeTest(unittest.TestCase):
             any(call[0].endswith("send_keys_submit.sh") for call in calls)
         )
         self.assertTrue(any(call[:2] == ("tmux", "kill-session") for call in calls))
+
+    def test_probe_accepts_prompt_after_slow_claude_startup(self) -> None:
+        # T-5144: Claude 2.1.302 did not render the input frame until between
+        # 12 and 24 seconds after launch. The old 20-second startup ceiling
+        # therefore rejected a healthy TUI before it could accept the probe.
+        clock = _Clock()
+        submitted_at: list[float] = []
+
+        def runner(argv, **kwargs):
+            command = tuple(argv)
+            if command[:2] == ("tmux", "capture-pane"):
+                if clock.seconds < 24.0:
+                    text = "Permission allow rule warning\n"
+                elif not submitted_at:
+                    text = "Claude ready\n❯\u00a0Try a command\n"
+                else:
+                    text = "Claude ready\nPONG\n"
+                return subprocess.CompletedProcess(command, 0, text, "")
+            if command[0].endswith("send_keys_submit.sh"):
+                submitted_at.append(clock.seconds)
+                quota = self.state_root / "recovery" / "quota" / "claude-statusline.json"
+                quota.parent.mkdir(parents=True, exist_ok=True)
+                quota.write_text(
+                    json.dumps(
+                        {
+                            "schema": STATUSLINE_SCHEMA,
+                            "observed_at": "2026-08-04T01:00:25Z",
+                            "session_id": probe_session_id(
+                                "fixture", "recovery", "20260804T010007Z"
+                            ),
+                            "rate_limits": {"seven_day": {"used_percentage": 20.0}},
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        result = run_probe(
+            account="fixture",
+            persona="recovery",
+            executable=self.executable,
+            repo_root=self.repo,
+            state_root=self.state_root,
+            run_id="20260804T010007Z",
+            timeout_seconds=90.0,
+            runner=runner,
+            monotonic=clock.monotonic,
+            sleep=clock.sleep,
+            now=clock.now,
+            enforce_identity=False,
+        )
+        self.assertEqual(result.status, "observed")
+        self.assertEqual(submitted_at, [24.0])
 
     def test_probe_cap_sentinel_fails_fast_without_positive_quota(self) -> None:
         clock = _Clock()

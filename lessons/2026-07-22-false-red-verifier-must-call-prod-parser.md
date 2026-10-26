@@ -1,6 +1,6 @@
 # A verifier that reimplements production's parsing manufactures the defect it hunts
 
-**Promoted from T-1966 (Metis, ORG-012 criterion-1: three instances, two agents, one day.)**
+**Promoted from T-1966 (Mason, ORG-012 criterion-1: three instances, two agents, one day.)**
 
 ## The class
 
@@ -21,7 +21,7 @@ opposite failure sign, and a **different remedy** — you cannot derive one rule
    `_parse_frontmatter` from `spine_index_groom` rather than reimplementing it — because a second
    parser could drift from the generator's, producing lint-green-while-the-index-renders-dashes.
    The decision IS this lesson, made before the class had a name.
-2. **Caught pre-report (Metis, T-1965 scoping):** a HOOK_ALLOWLIST staleness sweep assumed all
+2. **Caught pre-report (Mason, T-1965 scoping):** a HOOK_ALLOWLIST staleness sweep assumed all
    hooks live in `tools/hooks/` and falsely flagged `adaptive_finish_detect.py` (lives in
    `tools/`). Publishing it would have cost Recovery an investigation into nothing.
 3. **Caught at build time (Recovery, T-1965):** a naive whitespace tokenizer falsely flagged

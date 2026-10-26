@@ -23,8 +23,9 @@ behavior: an unrecognized $USER raises before any filesystem op (see
 _caller_persona), so a misconfigured launch cannot send-as or drain an arbitrary
 inbox.
 
-MAILBOX HUB: /home/the-ancestor/mailbox/<persona> (ORG-026 Path A), matching
-mailbox_wake.py's MAILBOX_HUB. Override with env MAILBOX_MCP_HUB for testing.
+MAILBOX HUB: /home/post-office/mailbox/<persona> (ORG-026 Path A; resolved from
+instance.yaml, T-2693), matching mailbox_wake.py's MAILBOX_HUB. Override with env
+MAILBOX_MCP_HUB for testing.
 
 REGISTRATION (one-time, run as the target agent's unix user; production-enable
 is an HO supervised step after merge — do NOT run without HO sign-off):
@@ -81,9 +82,23 @@ from mcp import types
 # Constants.
 # ---------------------------------------------------------------------------
 
-# Mailbox hub path — override via MAILBOX_MCP_HUB for testing.
-_DEFAULT_HUB = Path("/home/the-ancestor/mailbox")
-MAILBOX_HUB: Path = Path(os.environ.get("MAILBOX_MCP_HUB", str(_DEFAULT_HUB)))
+# Mailbox hub path — override via MAILBOX_MCP_HUB for testing. The default is
+# instance.yaml's mailbox.hub (T-4096), never a hand-carried literal.
+try:
+    from tools.agent_role_map import current_mailbox_hub as _current_mailbox_hub  # noqa: E402
+except ImportError:  # tools/ is on sys.path but the repo root is not
+    from agent_role_map import current_mailbox_hub as _current_mailbox_hub  # type: ignore[no-redef]  # noqa: E402
+
+# T-2693: the hub is resolved PER CALL (see _hub()). This server lives as long as
+# its agent session, and binding the hub at import left a pre-move server
+# consuming the retired hub (silently deaf) until the session restarted.
+# MAILBOX_HUB is only an override (env MAILBOX_MCP_HUB, or tests setting it).
+_ENV_HUB = os.environ.get("MAILBOX_MCP_HUB")
+MAILBOX_HUB: Path | None = Path(_ENV_HUB) if _ENV_HUB else None
+
+
+def _hub() -> Path:
+    return MAILBOX_HUB if MAILBOX_HUB is not None else Path(_current_mailbox_hub())
 
 # Known recipients — validated so send cannot create arbitrary directories.
 #
@@ -96,8 +111,9 @@ MAILBOX_HUB: Path = Path(os.environ.get("MAILBOX_MCP_HUB", str(_DEFAULT_HUB)))
 # What changed (T-2285) is not the derivation rule but the ONE unsettled entry.
 # Every registry persona is now an EXPLICIT DECISION — addressable here, or
 # listed in `_NO_MCP_RECIPIENT` below with a stated reason — and none may be
-# silently absent. Same mapped-or-exempt shape as `ancestor_consume`'s
-# `_NO_REPLY_INBOX` (T-2252) and `inbox_consumer.DELIVERY_EXEMPT` (T-2144).
+# silently absent. Same mapped-or-exempt shape as `inbox_consumer.DELIVERY_EXEMPT`
+# (T-2144) and the former `ancestor_consume._NO_REPLY_INBOX` (T-2252; module
+# removed T-4741 #835).
 # Silence is the defect class; a persona in neither structure fails a test.
 #
 # codex — ADDED. Its exclusion was drift, not a decision, and it was the T-2144
@@ -110,36 +126,29 @@ MAILBOX_HUB: Path = Path(os.environ.get("MAILBOX_MCP_HUB", str(_DEFAULT_HUB)))
 #   even offered, and the check in `_handle_send`) while `tools/mailbox.py`
 #   send() has no allowlist at all. So an MCP seat could not mail codex and
 #   anything importing the library directly could. The enum predates ORG-031
-#   integration. Ruled during T-2256 (atlas escalation 3); executed here.
+#   integration. Ruled during T-2256 (artisan escalation 3); executed here.
 #   Note codex is currently dormant — mail sits until the seat revives, which
 #   the staleness detector covers (T-2257). That is not a reason to withhold
 #   the fix; undeliverable-until-awake is a different thing from unaddressable.
 _KNOWN_RECIPIENTS: frozenset[str] = frozenset(
-    {"orchestrator", "specialist", "recovery", "mnemosyne", "metis", "atlas", "codex"}
+    {"orchestrator", "specialist", "recovery", "archivist", "mason", "artisan", "codex",
+     # T-4884 B6: Watchman (codex-fallback) reports to Recovery by mailbox (design §6),
+     # so it must be addressable both ways.
+     "watchman"}
 )
 
 # Registry personas deliberately NOT addressable through this MCP, with reasons.
 # Keep in lockstep with `_KNOWN_RECIPIENTS`: the coverage test fails if a
 # registry persona is in neither, or in both.
-_NO_MCP_RECIPIENT: dict[str, str] = {
-    "the-ancestor": (
-        "hub host, not a peer: daemon decommissioned 2026-07-28 (T-2214) with "
-        "account + hub box retained but no consumer, so MCP-addressing it "
-        "manufactures mail nothing will ever ack. Its inbox existing on disk is "
-        "provisioning uniformity, not reachability intent — consistent with "
-        "inbox_consumer.DELIVERY_EXEMPT and ancestor_consume._NO_REPLY_INBOX"
-    ),
-}
+_NO_MCP_RECIPIENT: dict[str, str] = {}
 
 # Unix user → Pantheon persona, DERIVED from instance.yaml (T-2256).
 #
-# Was a hand-carried 7-of-8 (the-ancestor missing). _caller_persona() fails
-# CLOSED, so that omission was loud rather than silent — but it still meant the
-# account that HOSTS the mailbox hub could not resolve an identity through the
-# MCP server. Identity here is advisory anyway ($USER is env, not a kernel
-# credential — see the module docstring), and the-ancestor already owns every
-# inbox directory on disk, so deriving the full set adds no reachability that
-# filesystem ownership did not already grant.
+# Was a hand-carried subset that silently under-covered the fleet. _caller_persona()
+# fails CLOSED, so an omission was loud rather than silent. Identity here is
+# advisory anyway ($USER is env, not a kernel credential — see the module
+# docstring), so deriving the full set adds no reachability that filesystem
+# ownership did not already grant.
 try:
     from tools.agent_role_map import account_persona_map  # noqa: E402
 except ImportError:  # tools/ is on sys.path but the repo root is not
@@ -520,7 +529,7 @@ async def _handle_send(args: dict) -> list[types.TextContent]:
             + ", ".join(sorted(_KNOWN_RECIPIENTS))
         )
 
-    inbox_path = MAILBOX_HUB / recipient
+    inbox_path = _hub() / recipient
     if not _mailbox.is_safe_inbox(inbox_path):
         raise ValueError(f"Computed inbox path {inbox_path!r} failed safety check.")
 
@@ -544,7 +553,7 @@ async def _handle_send(args: dict) -> list[types.TextContent]:
 #
 # MEASURED LIVE at 20:2xZ, both holders alive and already past the window:
 #     specialist     pid 323758  held 5111s
-#     mnemosyne pid 385082  held 3375s
+#     archivist pid 385082  held 3375s
 # One MCP mailbox_consume call would have killed either.
 #
 # orchestrator's PR #118 is the correct general fix (record ttl_secs and honour the
@@ -567,7 +576,7 @@ _BRIDGE_CONSUME_TTL_SECS = _mailbox._DEFAULT_CONSUME_TTL_SECS
 
 async def _handle_consume(args: dict) -> list[types.TextContent]:  # noqa: ARG001
     persona = _caller_persona()
-    inbox_path = MAILBOX_HUB / persona
+    inbox_path = _hub() / persona
     if not _mailbox.is_safe_inbox(inbox_path):
         raise ValueError(f"Computed inbox path {inbox_path!r} failed safety check.")
 
@@ -608,7 +617,9 @@ async def _handle_consume(args: dict) -> list[types.TextContent]:  # noqa: ARG00
         reason = _skip_reason_prose(result.get("reason"))
         return [types.TextContent(
             type="text",
-            text=json.dumps({"skipped": True, "reason": reason}),
+            # "inbox" (T-2693): name the path, so a wrong one is visible instead of
+            # reading as an empty mailbox.
+            text=json.dumps({"skipped": True, "reason": reason, "inbox": str(inbox_path)}),
         )]
 
     # consume() records per-message handler failures in errors[] (those stay in

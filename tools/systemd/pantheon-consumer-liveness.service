@@ -14,6 +14,12 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # (advances every 10-min cycle including skip:empty_inbox) read cross-account, READ-ONLY, via
 # `sudo -u <account> systemctl --user show`. DETECT + ALERT only — no enable/disable/restart.
 #
+# It also watches a registry of plain oneshot units (WATCHED_UNITS in the tool, T-4220; the ORG-013
+# cascade sweep on the `claude` seat is the first), each with its own max-silence threshold, read
+# the same way from its OWNER's account. `--unit <key> --dry-run` checks one. For those units a
+# missing/disabled timer is report-only (delivery_reachability covers inbox-consumers only), so a
+# deleted sweep timer is NOT paged.
+#
 # Deliberately NOT covered here, because other guards own it: a RUN that fails/hangs is caught by
 # the consumer service's own TimeoutStartSec=5min -> OnFailure; a never-armed timer by
 # verify_startup C8; a missing/disabled unit by delivery_reachability. This module's niche is the

@@ -54,6 +54,11 @@ DBUS_DAEMON = shutil.which("dbus-daemon")
 # /usr/include/linux/prctl.h -- verified at source on this host (T-2932 plan).
 _PR_SET_PDEATHSIG = 1
 
+# Root of the no-XDG fallback pidfile dir (``<root>/pantheon-testbus-<uid>``).
+# A module constant rather than an inline literal so the helper's own tests
+# can point it at a per-test root and stay hermetic under parallel runs.
+_FALLBACK_BASE_ROOT = Path("/tmp")
+
 
 def pdeathsig_preexec_fn(sig: int = signal.SIGTERM) -> Callable[[], None]:
     """Return a ``preexec_fn`` for ``subprocess.Popen`` that asks the
@@ -105,7 +110,7 @@ def _pidfile_base_dir() -> Path:
             owned = False
         if owned:
             return base / "pantheon-testbus"
-    return Path(f"/tmp/pantheon-testbus-{os.getuid()}")
+    return _FALLBACK_BASE_ROOT / f"pantheon-testbus-{os.getuid()}"
 
 
 class PidfileDirRefused(OSError):

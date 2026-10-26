@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""codex_recovery_sudoers — generate the codex-recovery sudoers fragment from a
+broker manifest (T-4884 B4; design note §4.3, review round-2 #3).
+
+PRINTS ONLY. It never writes /etc, never calls sudo, never runs privileged.
+The output is what the gated install (T-4884 B11, orchestrator/root) reviews with
+`visudo -c -f` and installs; this tool has no install path of its own.
+
+Rules (no wildcards anywhere — round-2 #3):
+  - An invoker with any verb beyond the exact-line set (`lease`, `selftest`,
+    `linger-enable`)
+    gets the ONE full-broker line, e.g.
+        codex-fallback ALL=(root) NOPASSWD: /usr/local/sbin/codex-recovery
+    Its argv is then constrained by the broker itself (enum argparse, the
+    manifest `invokers` verb list, the lease check).
+  - An invoker whose verbs are only `lease`/`selftest`/`linger-enable` gets ONE
+    EXACT LINE PER (op, target), e.g.
+        claude-fallback ALL=(root) NOPASSWD: /usr/local/sbin/codex-recovery lease acquire claude-fallback
+        claude-fallback ALL=(root) NOPASSWD: /usr/local/sbin/codex-recovery linger-enable claude-fallback
+    so sudo itself refuses every other argv for that account.
+  - Header: `Defaults!<broker> env_reset`, plus a note that secure_path comes
+    from the global sudoers Defaults (the broker uses absolute binary paths
+    regardless).
+
+Every emitted line is checked against a strict shape before printing; a
+manifest that would produce anything else (a wildcard, a sudoers special
+character, a non-fleet invoker) is refused with exit 2.
+
+Usage:
+    python3 tools/codex_recovery_sudoers.py --manifest tools/codex_recovery_manifest.sample.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from tools.codex_recovery import (  # noqa: E402
+    LEASE_OPS,
+    BrokerManifest,
+    ManifestValidationError,
+    parse_manifest_bytes,
+)
+
+BROKER_INSTALL_PATH = "/usr/local/sbin/codex-recovery"
+# Verbs that do not need the full broker grant: the invoker gets exact lines.
+EXACT_LINE_VERBS = frozenset({"lease", "selftest", "linger-enable"})
+MAX_MANIFEST_BYTES = 65536
+
+_NAME = r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9])?"
+_BROKER_RE = re.escape(BROKER_INSTALL_PATH)
+_ALLOWED_LINE_RES = (
+    re.compile(rf"^Defaults!{_BROKER_RE} env_reset$"),
+    re.compile(rf"^{_NAME} ALL=\(root\) NOPASSWD: {_BROKER_RE}$"),
+    re.compile(rf"^{_NAME} ALL=\(root\) NOPASSWD: {_BROKER_RE} lease (?:acquire|release|status) {_NAME}$"),
+    re.compile(rf"^{_NAME} ALL=\(root\) NOPASSWD: {_BROKER_RE} selftest$"),
+    re.compile(rf"^{_NAME} ALL=\(root\) NOPASSWD: {_BROKER_RE} linger-enable {_NAME}$"),
+)
+# Belt-and-braces: sudoers glob/escape/separator characters that must never
+# appear in a non-comment line (the Defaults '!' is the one sanctioned use).
+_FORBIDDEN_CHARS = frozenset("*?[]\\,:=\"'")
+
+
+class SudoersGenerationError(ValueError):
+    pass
+
+
+def _check_line(line: str) -> None:
+    if not any(r.fullmatch(line) for r in _ALLOWED_LINE_RES):
+        raise SudoersGenerationError(f"generated line has an unexpected shape: {line!r}")
+    body = line.split("NOPASSWD: ", 1)[-1] if "NOPASSWD: " in line else line.split("!", 1)[-1]
+    bad = _FORBIDDEN_CHARS & set(body)
+    if bad:
+        raise SudoersGenerationError(f"generated line contains forbidden characters {sorted(bad)}: {line!r}")
+
+
+def generate(manifest: BrokerManifest, *, broker_path: str = BROKER_INSTALL_PATH) -> str:
+    if broker_path != BROKER_INSTALL_PATH:
+        raise SudoersGenerationError("broker path is fixed")
+    targets = sorted(manifest.targets)
+    rule_lines: list[str] = []
+    for account in sorted(manifest.invokers):
+        verbs = manifest.invokers[account].verbs
+        if verbs - EXACT_LINE_VERBS:
+            rule_lines.append(f"{account} ALL=(root) NOPASSWD: {broker_path}")
+            continue
+        if "selftest" in verbs:
+            rule_lines.append(f"{account} ALL=(root) NOPASSWD: {broker_path} selftest")
+        if "lease" in verbs:
+            for target in targets:
+                for op in LEASE_OPS:
+                    rule_lines.append(f"{account} ALL=(root) NOPASSWD: {broker_path} lease {op} {target}")
+        if "linger-enable" in verbs:
+            # T-5130: a lease_only target refuses every verb (the broker checks), so its
+            # linger-enable line would grant nothing. Leave it out to keep the fragment tight.
+            for target in (t for t in targets if not manifest.targets[t].lease_only):
+                rule_lines.append(f"{account} ALL=(root) NOPASSWD: {broker_path} linger-enable {target}")
+
+    header_rule = f"Defaults!{broker_path} env_reset"
+    for line in [header_rule, *rule_lines]:
+        _check_line(line)
+
+    out = [
+        "# codex-recovery sudoers fragment — GENERATED by tools/codex_recovery_sudoers.py",
+        "# from the broker manifest. Do not hand-edit; regenerate and re-review.",
+        "# No wildcards: lease/linger-enable-only invokers get one exact argv line per (op, target).",
+        "# secure_path: not set per-command here; the global `Defaults secure_path=...` in",
+        "# /etc/sudoers applies, and the broker invokes only absolute binary paths anyway.",
+        "# Validate before install: visudo -c -f <this file>",
+        header_rule,
+        "",
+        *rule_lines,
+    ]
+    return "\n".join(out) + "\n"
+
+
+def load_for_generation(path: Path) -> BrokerManifest:
+    """Structural parse only (no ownership, no getpwnam): this runs
+    unprivileged against a repo copy; the broker re-validates at run time."""
+    raw = Path(path).read_bytes()
+    if len(raw) > MAX_MANIFEST_BYTES:
+        raise ManifestValidationError("manifest exceeds maximum size")
+    return parse_manifest_bytes(raw, pwnam=None)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0], allow_abbrev=False)
+    parser.add_argument("--manifest", type=Path, required=True)
+    args = parser.parse_args(argv)
+    try:
+        text = generate(load_for_generation(args.manifest))
+    except (OSError, ManifestValidationError, SudoersGenerationError) as exc:
+        print(f"codex_recovery_sudoers: refused: {exc}", file=sys.stderr)
+        return 2
+    sys.stdout.write(text)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

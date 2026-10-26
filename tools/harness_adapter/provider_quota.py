@@ -10,19 +10,28 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import selectors
 import stat
 import subprocess
 import time
+import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from hashlib import sha256
 from math import isfinite
 from pathlib import Path
 from typing import Any, BinaryIO
 
-from tools.harness_adapter.quota import QuotaSnapshot, QuotaWindow
+from tools.harness_adapter.quota import (
+    BalanceReading,
+    BalanceThresholds,
+    QuotaSnapshot,
+    QuotaWindow,
+    classify_balance,
+)
 
 
 DEFAULT_MAX_AGE = timedelta(minutes=15)
@@ -54,6 +63,56 @@ def read_codex_app_server_rate_limits(
     create a thread or submit a model turn.
     """
 
+    return _codex_app_server_request(
+        executable,
+        codex_home=codex_home,
+        method="account/rateLimits/read",
+        timeout=timeout,
+    )
+
+
+def read_codex_app_server_hooks(
+    executable: Path,
+    *,
+    codex_home: Path,
+    cwd: Path | None = None,
+    timeout: float = 15.0,
+) -> list[Mapping[str, Any]] | None:
+    """Every hook Codex reports via ``hooks/list`` for ``codex_home``, flattened (T-4166).
+
+    Each entry carries ``key``, ``eventName``, ``command``, ``currentHash`` and
+    ``trustStatus``. Same short-lived app-server as the quota reader: initialize
+    plus one read, no thread, no model turn. None on any failure.
+    """
+
+    result = _codex_app_server_request(
+        executable,
+        codex_home=codex_home,
+        method="hooks/list",
+        params={},
+        cwd=cwd,
+        timeout=timeout,
+    )
+    if result is None:
+        return None
+    hooks: list[Mapping[str, Any]] = []
+    for entry in result.get("data") or []:
+        if isinstance(entry, Mapping):
+            hooks.extend(h for h in entry.get("hooks") or [] if isinstance(h, Mapping))
+    return hooks
+
+
+def _codex_app_server_request(
+    executable: Path,
+    *,
+    codex_home: Path,
+    method: str,
+    params: Mapping[str, Any] | None = None,
+    cwd: Path | None = None,
+    timeout: float = 15.0,
+) -> Mapping[str, Any] | None:
+    """initialize, initialized, then ONE ``method`` call; its result, or None on any failure."""
+
     environment = dict(os.environ)
     environment["CODEX_HOME"] = str(codex_home)
     process: subprocess.Popen[bytes] | None = None
@@ -67,6 +126,7 @@ def read_codex_app_server_rate_limits(
             stderr=subprocess.PIPE,
             shell=False,
             env=environment,
+            cwd=None if cwd is None else str(cwd),
         )
         if process.stdin is None or process.stdout is None or process.stderr is None:
             return None
@@ -96,7 +156,10 @@ def read_codex_app_server_rate_limits(
             return None
         if not _write_json_line(process.stdin, {"method": "initialized"}):
             return None
-        if not _write_json_line(process.stdin, {"id": 2, "method": "account/rateLimits/read"}):
+        request: dict[str, Any] = {"id": 2, "method": method}
+        if params is not None:
+            request["params"] = dict(params)
+        if not _write_json_line(process.stdin, request):
             return None
         response = _wait_for_rpc_response(
             process, selector, stdout_buffer, active_streams, deadline, 2
@@ -744,9 +807,11 @@ def _looks_like_window(raw: Mapping[str, Any]) -> bool:
         key in raw
         for key in (
             "used_percent",
+            "used_percentage",
             "usedPercent",
             "usage_percent",
             "remaining_percent",
+            "remaining_percentage",
             "resets_at",
             "resetsAt",
             "reset_at",
@@ -826,6 +891,7 @@ def _percent_pair(raw: Mapping[str, Any]) -> tuple[float | None, float | None]:
         "used_percent",
         "usage_percent",
         "percent_used",
+        "used_percentage",
         "usedPercentage",
         "usedPercent",
         "used_pct",
@@ -834,6 +900,7 @@ def _percent_pair(raw: Mapping[str, Any]) -> tuple[float | None, float | None]:
         raw,
         "remaining_percent",
         "percent_remaining",
+        "remaining_percentage",
         "remainingPercentage",
         "remainingPercent",
         "remaining_pct",
@@ -985,3 +1052,242 @@ def _as_aware_utc(value: datetime) -> datetime:
 
 def _iso(value: datetime) -> str:
     return _as_aware_utc(value).isoformat().replace("+00:00", "Z")
+
+
+# ---------------------------------------------------------------------------
+# T-5005 (T-4924 H1): DeepSeek prepaid balance (plan §4.3, D-7/D-11).
+#
+# One stdlib client feeds both the seat watcher (H3) and the HC (through
+# HermesHarnessAdapter.quota_observer). INERT in H1: nothing live constructs it.
+# The response shape is DeepSeek's documented GET /user/balance body
+# (spec-derived; a redacted live capture joins the tests at H7). Bearer auth on
+# this route is UNVERIFIED until H7.
+# ---------------------------------------------------------------------------
+
+DEEPSEEK_BALANCE_BASE_URL = "https://api.deepseek.com"
+DEEPSEEK_BALANCE_PATH = "/user/balance"
+DEEPSEEK_API_KEY_ENV = "DEEPSEEK_API_KEY"
+DEEPSEEK_CURRENCIES = frozenset({"CNY", "USD"})
+_DEEPSEEK_BODY_CAP = 64 * 1024
+
+
+class DeepSeekBalanceReadError(Exception):
+    """A balance read failed. The message never carries the key."""
+
+
+def _read_env_key(env_file: Path, name: str) -> str | None:
+    try:
+        text = env_file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("export "):
+            stripped = stripped[len("export "):].lstrip()
+        key, sep, value = stripped.partition("=")
+        if sep and key.strip() == name:
+            return _env_value(value) or None
+    return None
+
+
+def _env_value(raw: str) -> str:
+    """A dotenv value: a quoted value is taken verbatim between its quotes; an
+    unquoted value loses any whitespace-led ``#`` comment tail."""
+    value = raw.strip()
+    if len(value) >= 2 and value[0] in "'\"":
+        closing = value.find(value[0], 1)
+        if closing > 0:
+            return value[1:closing]
+    value = re.split(r"\s#", value, maxsplit=1)[0]
+    return value.strip()
+
+
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a 3xx. CPython's redirect handler copies the Authorization
+    header onto the new request, even cross-host or https->http, so following
+    one would send the Bearer key elsewhere. Returning None makes urllib raise
+    the 3xx as an HTTPError, which the client reports as a read failure."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        del req, fp, code, msg, headers, newurl
+        return None
+
+
+def build_deepseek_opener(*extra_handlers: urllib.request.BaseHandler) -> urllib.request.OpenerDirector:
+    """The balance client's opener: redirects refused. ``extra_handlers`` is a
+    test seam (fake transports); production passes none."""
+    return urllib.request.build_opener(_RefuseRedirects(), *extra_handlers)
+
+
+def read_deepseek_balance(
+    env_file: Path,
+    *,
+    base_url: str = DEEPSEEK_BALANCE_BASE_URL,
+    timeout: float = 10.0,
+    opener: Callable[..., Any] | None = None,
+) -> Mapping[str, Any]:
+    """GET /user/balance with the key from ``env_file`` and return the JSON body.
+
+    Free (no model turn). Raises ``DeepSeekBalanceReadError`` on any failure.
+    The key is never logged, printed, or put in an exception message, and never
+    sent anywhere but an https ``base_url`` (redirects are refused).
+    """
+
+    if not base_url.startswith("https://"):
+        raise DeepSeekBalanceReadError("balance base_url must be https")
+    key = _read_env_key(env_file, DEEPSEEK_API_KEY_ENV)
+    if key is None:
+        raise DeepSeekBalanceReadError("api key missing from env file")
+    request = urllib.request.Request(
+        base_url.rstrip("/") + DEEPSEEK_BALANCE_PATH,
+        headers={"Authorization": f"Bearer {key}", "Accept": "application/json"},
+        method="GET",
+    )
+    open_request = opener if opener is not None else build_deepseek_opener().open
+    raw: bytes | None = None
+    failure: str | None = None
+    try:
+        with open_request(request, timeout=timeout) as response:
+            raw = response.read(_DEEPSEEK_BODY_CAP + 1)
+    except Exception as exc:  # network/HTTP failures are evidence, not crashes
+        failure = f"balance request failed: {type(exc).__name__}"
+    # Raised outside the except block so neither __cause__ nor __context__
+    # carries the original exception (which may hold request details).
+    if failure is not None or raw is None:
+        raise DeepSeekBalanceReadError(failure or "balance request returned nothing")
+    if len(raw) > _DEEPSEEK_BODY_CAP:
+        raise DeepSeekBalanceReadError("balance response oversize")
+    body: Any = None
+    try:
+        body = json.loads(raw.decode("utf-8"))
+        parsed = True
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        parsed = False
+    if not parsed:
+        raise DeepSeekBalanceReadError("balance response is not JSON")
+    if not isinstance(body, Mapping):
+        raise DeepSeekBalanceReadError("balance response is not an object")
+    return body
+
+
+def _decimal_field(raw: Mapping[str, Any], key: str) -> Decimal | None:
+    value = raw.get(key)
+    if isinstance(value, bool) or not isinstance(value, (str, int)):
+        return None
+    try:
+        parsed = Decimal(str(value).strip())
+    except InvalidOperation:
+        return None
+    return parsed if parsed.is_finite() else None
+
+
+def parse_deepseek_balance_observation(
+    body: Mapping[str, Any],
+    *,
+    profile: str,
+    thresholds: BalanceThresholds | None,
+    observed_at: datetime,
+) -> QuotaSnapshot:
+    """Normalize a /user/balance body into a windowless snapshot with a balance.
+
+    A malformed body, an unknown currency, or a body without the thresholds'
+    currency gives ``balance=None`` and ``balance_band=unknown``.
+    """
+
+    evidence: dict[str, str] = {
+        "provider": "deepseek",
+        "source": "provider-api",
+        "observed_at": _iso(observed_at),
+    }
+    is_available = body.get("is_available")
+    infos = body.get("balance_infos")
+    reading: BalanceReading | None = None
+    if not isinstance(is_available, bool) or not isinstance(infos, list):
+        reason = "malformed-body"
+    elif thresholds is None:
+        reason = "no-thresholds"
+    else:
+        reason = "currency-absent"
+        for info in infos:
+            if not isinstance(info, Mapping):
+                reason = "malformed-body"
+                break
+            currency = info.get("currency")
+            if currency not in DEEPSEEK_CURRENCIES or currency != thresholds.currency:
+                continue
+            total = _decimal_field(info, "total_balance")
+            granted = _decimal_field(info, "granted_balance")
+            topped_up = _decimal_field(info, "topped_up_balance")
+            if total is None or granted is None or topped_up is None:
+                reason = "malformed-body"
+                break
+            reading = BalanceReading(
+                is_available=is_available,
+                currency=currency,
+                total=total,
+                granted=granted,
+                topped_up=topped_up,
+                observed_at=_as_aware_utc(observed_at),
+            )
+            reason = "ok"
+            break
+    band = classify_balance(reading, thresholds)
+    evidence["balance_band"] = band
+    evidence["reason"] = reason
+    if reading is not None:
+        evidence["currency"] = reading.currency
+        evidence["balance_total"] = str(reading.total)
+    return QuotaSnapshot(
+        profile=profile,
+        windows=(),
+        observed_at=_as_aware_utc(observed_at),
+        freshness="fresh" if reading is not None else "unavailable",
+        evidence=evidence,
+        balance=reading,
+    )
+
+
+@dataclass(frozen=True)
+class DeepSeekBalanceObserver:
+    """Read DeepSeek's prepaid balance and band it against manifest thresholds."""
+
+    read_body: Callable[[], Mapping[str, Any] | None]
+    profile: str
+    thresholds: BalanceThresholds | None
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+
+    def read(self) -> QuotaSnapshot:
+        observed_at = _as_aware_utc(self.now())
+        try:
+            body = self.read_body()
+        except Exception as exc:  # provider read failures are unknown/nonblocking
+            return _unknown_snapshot(
+                self.profile,
+                now=observed_at,
+                freshness="unavailable",
+                evidence={
+                    "provider": "deepseek",
+                    "source": "provider-api",
+                    "reason": "read-failed",
+                    "error_type": type(exc).__name__,
+                    "balance_band": "unknown",
+                },
+            )
+        if not isinstance(body, Mapping):
+            return _unknown_snapshot(
+                self.profile,
+                now=observed_at,
+                freshness="unavailable",
+                evidence={
+                    "provider": "deepseek",
+                    "source": "provider-api",
+                    "reason": "missing-observation",
+                    "balance_band": "unknown",
+                },
+            )
+        return parse_deepseek_balance_observation(
+            body,
+            profile=self.profile,
+            thresholds=self.thresholds,
+            observed_at=observed_at,
+        )

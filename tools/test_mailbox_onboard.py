@@ -16,6 +16,8 @@ mailbox_onboard.provision()/verify() tracks the manifest, not a constant.
 from __future__ import annotations
 
 import dataclasses
+import os
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -34,12 +36,15 @@ def _manifest_dict(
     hub_owner: str | None = None,
     group: str = "pantheon-mailbox",
     wake_timer_personas: tuple[str, ...] | None = None,
+    wake_timer_secondary_personas: tuple[str, ...] | None = None,
 ) -> dict:
     mailbox: dict = {"hub": mailbox_hub, "group": group, "probe_peer": "orchestrator"}
     if hub_owner is not None:
         mailbox["hub_owner"] = hub_owner
     if wake_timer_personas is not None:
         mailbox["wake_timer_personas"] = list(wake_timer_personas)
+    if wake_timer_secondary_personas is not None:
+        mailbox["wake_timer_secondary_personas"] = list(wake_timer_secondary_personas)
     roles = {}
     for index, (persona, account) in enumerate(personas):
         roles[f"role-{index}"] = {"persona": persona, "account": account, "harness": "claude-code"}
@@ -83,6 +88,7 @@ class MailboxOnboardTestCase(unittest.TestCase):
         hub_owner: str | None = None,
         group: str = "pantheon-mailbox",
         wake_timer_personas: tuple[str, ...] | None = None,
+        wake_timer_secondary_personas: tuple[str, ...] | None = None,
     ) -> None:
         doc = _manifest_dict(
             str(self.mailbox_hub),
@@ -90,6 +96,7 @@ class MailboxOnboardTestCase(unittest.TestCase):
             hub_owner=hub_owner,
             group=group,
             wake_timer_personas=wake_timer_personas,
+            wake_timer_secondary_personas=wake_timer_secondary_personas,
         )
         self.manifest_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
 
@@ -206,6 +213,45 @@ class HubSetupTests(MailboxOnboardTestCase):
         self.assertIn(("useradd", "-m", "-G", "pantheon-mailbox", "the-ancestor"), runner.calls)
         self.assertIn(("loginctl", "enable-linger", "the-ancestor"), runner.calls)
         self.assertTrue(ctx.mailbox_hub.is_dir())
+
+    def test_owner_home_made_group_traversable_like_the_ancestor(self) -> None:
+        """T-4096/T-2693 prep: `useradd -m` leaves the new hub-owner's home 0750
+        owner:owner, so no mailbox-group member (every seat) could traverse into the
+        hub after a move. hub-setup must leave the owner's tree at the live
+        the-ancestor shape: group = mailbox group, group bits traverse-only (0710)."""
+        import getpass
+        import grp as _grp
+        home = self.tmp_path / "po-home"
+        home.mkdir(mode=0o750)
+        os.chmod(home, 0o750)
+        ctx = dataclasses.replace(
+            self._load_ctx(hub_owner=getpass.getuser()),
+            mailbox_hub=home / "mailbox",
+            mailbox_group=_grp.getgrgid(os.getgid()).gr_name,   # a group we may chgrp to
+        )
+        report = mo.hub_setup(ctx, mo.FakeCommandRunner(),
+                              mo.FakeHostIdentity(users=(getpass.getuser(),), groups=(ctx.mailbox_group,)),
+                              execute=True)
+        self.assertEqual(stat.S_IMODE(home.stat().st_mode), 0o710)
+        self.assertTrue(any("group-traversable" in c for c in report.changed))
+
+    def test_group_traverse_stops_at_a_dir_the_owner_does_not_own(self) -> None:
+        home = self.tmp_path / "po-home"
+        hub = home / "mailbox"
+        hub.mkdir(parents=True)
+        os.chmod(home, 0o750)
+        # An owner uid that owns none of these dirs: nothing is touched.
+        changed = mo._ensure_group_traverse(hub, os.getuid() + 1, "nogroup")
+        self.assertEqual(changed, [])
+        self.assertEqual(stat.S_IMODE(home.stat().st_mode), 0o750)
+
+    def test_group_traverse_never_climbs_past_the_owner_tree(self) -> None:
+        # /tmp (root-owned) bounds the walk: it must be left exactly as it was.
+        hub = self.tmp_path / "po-home" / "mailbox"
+        hub.mkdir(parents=True)
+        tmp_root_mode = stat.S_IMODE(Path("/tmp").stat().st_mode)
+        mo._ensure_group_traverse(hub, os.getuid(), "nogroup")
+        self.assertEqual(stat.S_IMODE(Path("/tmp").stat().st_mode), tmp_root_mode)
 
     def test_second_execute_is_idempotent_no_redundant_group_or_user_calls(self) -> None:
         ctx = self._load_ctx(hub_owner="the-ancestor")
@@ -340,8 +386,8 @@ class ProvisionAllowlistTests(MailboxOnboardTestCase):
             else:
                 self.assertNotIn(enable_call, runner.calls, f"{persona} should NOT be enabled")
 
-    def test_never_enables_mnemosyne_the_safety_driver_case(self) -> None:
-        # T-2702 safety driver: mnemosyne's mailbox_wake.AGENT_PANE points at
+    def test_never_enables_archivist_the_safety_driver_case(self) -> None:
+        # T-2702 safety driver: archivist's mailbox_wake.AGENT_PANE points at
         # the operator's own chat tmux target (claude-telegram-bot-exocortex:0). A
         # standalone wake timer poking her would send-keys into the operator's own
         # conversation and guarantee a unit failure (exit 64, unknown agent).
@@ -349,38 +395,38 @@ class ProvisionAllowlistTests(MailboxOnboardTestCase):
         # asserted explicitly, not folded into a generic allowlist test, so
         # the WHY survives in the suite.
         ctx = self._load_ctx(
-            personas=(("mnemosyne", "acct-mnemosyne"),), hub_owner="the-ancestor", wake_timer_personas=()
+            personas=(("archivist", "acct-archivist"),), hub_owner="the-ancestor", wake_timer_personas=()
         )
         bindings = mo._all_persona_bindings(ctx.manifest)
         runner = mo.FakeCommandRunner()
-        home = self.tmp_path / "home-mnemosyne"
-        report = mo.provision(ctx, bindings, runner, execute=True, current_account="acct-mnemosyne", home=home)
+        home = self.tmp_path / "home-archivist"
+        report = mo.provision(ctx, bindings, runner, execute=True, current_account="acct-archivist", home=home)
 
         self.assertNotIn(
-            ("systemctl", "--user", "enable", "--now", "pantheon-mailbox-wake@mnemosyne.timer"), runner.calls
+            ("systemctl", "--user", "enable", "--now", "pantheon-mailbox-wake@archivist.timer"), runner.calls
         )
-        mnemosyne_result = next(r for r in report.personas if r.persona == "mnemosyne")
-        self.assertTrue(mnemosyne_result.unit_leg.startswith("skipped"))
+        archivist_result = next(r for r in report.personas if r.persona == "archivist")
+        self.assertTrue(archivist_result.unit_leg.startswith("skipped"))
         service_path = home / ".config" / "systemd" / "user" / f"{mo.WAKE_UNIT_STEM}@.service"
         self.assertFalse(service_path.exists())
 
     def test_skips_consume_plane_persona(self) -> None:
-        # Consume-plane seats (specialist/recovery/metis/atlas) share mnemosyne's
+        # Consume-plane seats (specialist/recovery/mason/artisan) share archivist's
         # "excluded" bucket but for a different reason: they're woken by the
-        # consume runtime, not by absence of a wake path at all. metis stands
+        # consume runtime, not by absence of a wake path at all. mason stands
         # in for the class.
-        personas = (("orchestrator", "acct-orchestrator"), ("metis", "acct-metis"))
+        personas = (("orchestrator", "acct-orchestrator"), ("mason", "acct-mason"))
         ctx = self._load_ctx(personas=personas, hub_owner="the-ancestor", wake_timer_personas=("orchestrator",))
         bindings = mo._all_persona_bindings(ctx.manifest)
         runner = mo.FakeCommandRunner()
-        home = self.tmp_path / "home-metis"
-        report = mo.provision(ctx, bindings, runner, execute=True, current_account="acct-metis", home=home)
+        home = self.tmp_path / "home-mason"
+        report = mo.provision(ctx, bindings, runner, execute=True, current_account="acct-mason", home=home)
 
         self.assertNotIn(
-            ("systemctl", "--user", "enable", "--now", "pantheon-mailbox-wake@metis.timer"), runner.calls
+            ("systemctl", "--user", "enable", "--now", "pantheon-mailbox-wake@mason.timer"), runner.calls
         )
-        metis_result = next(r for r in report.personas if r.persona == "metis")
-        self.assertTrue(metis_result.unit_leg.startswith("skipped"))
+        mason_result = next(r for r in report.personas if r.persona == "mason")
+        self.assertTrue(mason_result.unit_leg.startswith("skipped"))
 
     def test_default_absent_wake_timer_personas_enables_nobody(self) -> None:
         # Default-deny: a fresh seed with no `wake_timer_personas` key at all
@@ -402,13 +448,13 @@ class ProvisionAllowlistTests(MailboxOnboardTestCase):
 
     def test_dry_run_planned_line_reflects_skip_for_non_allowlisted_persona(self) -> None:
         ctx = self._load_ctx(
-            personas=(("mnemosyne", "acct-mnemosyne"),), hub_owner="the-ancestor", wake_timer_personas=()
+            personas=(("archivist", "acct-archivist"),), hub_owner="the-ancestor", wake_timer_personas=()
         )
         bindings = mo._all_persona_bindings(ctx.manifest)
         report = mo.provision(ctx, bindings, mo.FakeCommandRunner(), execute=False)
-        mnemosyne_result = next(r for r in report.personas if r.persona == "mnemosyne")
-        self.assertTrue(mnemosyne_result.unit_leg.startswith("skipped"))
-        self.assertNotIn("enable --now", mnemosyne_result.unit_leg)
+        archivist_result = next(r for r in report.personas if r.persona == "archivist")
+        self.assertTrue(archivist_result.unit_leg.startswith("skipped"))
+        self.assertNotIn("enable --now", archivist_result.unit_leg)
 
 
 # ---------------------------------------------------------------------------
@@ -491,19 +537,19 @@ class VerifyAllowlistTests(MailboxOnboardTestCase):
         self.assertTrue(by_name["wake_timer.enabled"].ok)
 
     def test_non_allowlisted_persona_not_enabled_is_green(self) -> None:
-        # mnemosyne, correctly never enabled -- verify must treat this as
+        # archivist, correctly never enabled -- verify must treat this as
         # healthy, not flag it.
-        ctx = self._load_ctx(personas=(("mnemosyne", "acct-mnemosyne"),), wake_timer_personas=())
-        self._make_hub_dir("mnemosyne")
+        ctx = self._load_ctx(personas=(("archivist", "acct-archivist"),), wake_timer_personas=())
+        self._make_hub_dir("archivist")
         bindings = mo._all_persona_bindings(ctx.manifest)
         runner = mo.FakeCommandRunner(
             scripted={
-                ("systemctl", "--user", "is-enabled", "pantheon-mailbox-wake@mnemosyne.timer"): mo.CommandResult(
+                ("systemctl", "--user", "is-enabled", "pantheon-mailbox-wake@archivist.timer"): mo.CommandResult(
                     1, "disabled\n", ""
                 )
             }
         )
-        identity = mo.FakeHostIdentity(memberships={("acct-mnemosyne", "pantheon-mailbox"): (True, "ok")})
+        identity = mo.FakeHostIdentity(memberships={("acct-archivist", "pantheon-mailbox"): (True, "ok")})
         checks = mo.verify(ctx, bindings, runner, identity)
         by_name = {c.name: c for c in checks}
         self.assertIn("wake_timer.not_enabled", by_name)
@@ -514,17 +560,17 @@ class VerifyAllowlistTests(MailboxOnboardTestCase):
         # Drift case: a non-allowlisted persona's timer is somehow enabled
         # anyway (e.g. stale state from before this ticket). verify must
         # catch that as a failure, not silently treat it as fine.
-        ctx = self._load_ctx(personas=(("metis", "acct-metis"),), wake_timer_personas=())
-        self._make_hub_dir("metis")
+        ctx = self._load_ctx(personas=(("mason", "acct-mason"),), wake_timer_personas=())
+        self._make_hub_dir("mason")
         bindings = mo._all_persona_bindings(ctx.manifest)
         runner = mo.FakeCommandRunner(
             scripted={
-                ("systemctl", "--user", "is-enabled", "pantheon-mailbox-wake@metis.timer"): mo.CommandResult(
+                ("systemctl", "--user", "is-enabled", "pantheon-mailbox-wake@mason.timer"): mo.CommandResult(
                     0, "enabled\n", ""
                 )
             }
         )
-        identity = mo.FakeHostIdentity(memberships={("acct-metis", "pantheon-mailbox"): (True, "ok")})
+        identity = mo.FakeHostIdentity(memberships={("acct-mason", "pantheon-mailbox"): (True, "ok")})
         checks = mo.verify(ctx, bindings, runner, identity)
         by_name = {c.name: c for c in checks}
         self.assertFalse(by_name["wake_timer.not_enabled"].ok)
@@ -634,13 +680,13 @@ class TeardownTests(MailboxOnboardTestCase):
 class TeardownAllowlistTests(MailboxOnboardTestCase):
     def test_execute_skips_disable_for_non_allowlisted_persona(self) -> None:
         ctx = self._load_ctx(
-            personas=(("mnemosyne", "acct-mnemosyne"),), hub_owner="the-ancestor", wake_timer_personas=()
+            personas=(("archivist", "acct-archivist"),), hub_owner="the-ancestor", wake_timer_personas=()
         )
         binding = mo._all_persona_bindings(ctx.manifest)[0]
         runner = mo.FakeCommandRunner()
-        report = mo.teardown(ctx, binding, runner, execute=True, current_account="acct-mnemosyne")
+        report = mo.teardown(ctx, binding, runner, execute=True, current_account="acct-archivist")
         self.assertNotIn(
-            ("systemctl", "--user", "disable", "--now", "pantheon-mailbox-wake@mnemosyne.timer"), runner.calls
+            ("systemctl", "--user", "disable", "--now", "pantheon-mailbox-wake@archivist.timer"), runner.calls
         )
         self.assertEqual(runner.calls, [])
         self.assertTrue(
@@ -650,7 +696,7 @@ class TeardownAllowlistTests(MailboxOnboardTestCase):
 
     def test_dry_run_plan_reflects_skip_not_a_misleading_disable_line(self) -> None:
         ctx = self._load_ctx(
-            personas=(("mnemosyne", "acct-mnemosyne"),), hub_owner="the-ancestor", wake_timer_personas=()
+            personas=(("archivist", "acct-archivist"),), hub_owner="the-ancestor", wake_timer_personas=()
         )
         binding = mo._all_persona_bindings(ctx.manifest)[0]
         report = mo.teardown(ctx, binding, mo.FakeCommandRunner(), execute=False)
@@ -838,6 +884,128 @@ class RealHostIdentityTests(unittest.TestCase):
     def test_user_exists_false_for_a_made_up_user(self) -> None:
         identity = mo.RealHostIdentity()
         self.assertFalse(identity.user_exists("t2683-mailbox-onboard-test-nonexistent-user"))
+
+
+# ---------------------------------------------------------------------------
+# T-5323: wake_timer_secondary_personas -- seats whose standalone
+# pantheon-mailbox-wake@<p>.timer is ALLOWED (a deliberate second waker,
+# serialized with consume by the T-5283 .wake.lock) but NOT provisioned by
+# this tool. verify accepts either state; provision/teardown skip them.
+# ---------------------------------------------------------------------------
+
+
+class SecondaryWakeTimerTests(MailboxOnboardTestCase):
+    def _verify_with_state(self, persona: str, rc: int, state: str) -> dict:
+        ctx = self._load_ctx(
+            personas=((persona, f"acct-{persona}"),),
+            wake_timer_personas=("orchestrator",),
+            wake_timer_secondary_personas=(persona,),
+        )
+        self._make_hub_dir(persona)
+        bindings = mo._all_persona_bindings(ctx.manifest)
+        runner = mo.FakeCommandRunner(
+            scripted={
+                ("systemctl", "--user", "is-enabled", f"pantheon-mailbox-wake@{persona}.timer"): mo.CommandResult(
+                    rc, f"{state}\n", ""
+                )
+            }
+        )
+        identity = mo.FakeHostIdentity(memberships={(f"acct-{persona}", "pantheon-mailbox"): (True, "ok")})
+        checks = mo.verify(ctx, bindings, runner, identity)
+        return {c.name: c for c in checks}
+
+    def test_absent_key_resolves_to_empty_set(self) -> None:
+        ctx = self._load_ctx(wake_timer_personas=("alice",))
+        self.assertEqual(ctx.wake_timer_secondary_personas, frozenset())
+
+    def test_key_parsed_into_frozenset(self) -> None:
+        ctx = self._load_ctx(wake_timer_personas=("orchestrator",), wake_timer_secondary_personas=("artisan", "recovery"))
+        self.assertEqual(ctx.wake_timer_secondary_personas, frozenset({"artisan", "recovery"}))
+
+    def test_malformed_key_is_rejected(self) -> None:
+        for bad in ("artisan", ["artisan", ""], ["artisan", 3], {"artisan": True}):
+            with self.subTest(bad=bad):
+                self._write_manifest(wake_timer_personas=("orchestrator",))
+                doc = yaml.safe_load(self.manifest_path.read_text(encoding="utf-8"))
+                doc["persona_installer"]["mailbox"]["wake_timer_secondary_personas"] = bad
+                self.manifest_path.write_text(yaml.safe_dump(doc), encoding="utf-8")
+                with self.assertRaisesRegex(mo.OnboardError, "wake_timer_secondary_personas"):
+                    mo.load_mailbox_context(self.manifest_path, REPO_ROOT)
+
+    def test_persona_in_both_lists_is_a_manifest_error(self) -> None:
+        with self.assertRaises(mo.OnboardError) as caught:
+            self._load_ctx(wake_timer_personas=("orchestrator", "artisan"), wake_timer_secondary_personas=("artisan", "recovery"))
+        message = str(caught.exception)
+        self.assertIn("artisan", message)
+        self.assertIn("wake_timer_personas", message)
+        self.assertIn("wake_timer_secondary_personas", message)
+        self.assertNotIn("recovery", message)
+
+    def test_verify_secondary_persona_enabled_passes(self) -> None:
+        by_name = self._verify_with_state("artisan", 0, "enabled")
+        self.assertNotIn("wake_timer.not_enabled", by_name)
+        self.assertNotIn("wake_timer.enabled", by_name)
+        self.assertTrue(by_name["wake_timer.secondary"].ok)
+        self.assertIn("enabled", by_name["wake_timer.secondary"].detail)
+        self.assertTrue(all(c.ok for c in by_name.values()))
+
+    def test_verify_secondary_persona_disabled_passes(self) -> None:
+        by_name = self._verify_with_state("artisan", 1, "disabled")
+        self.assertTrue(by_name["wake_timer.secondary"].ok)
+        self.assertIn("disabled", by_name["wake_timer.secondary"].detail)
+        self.assertTrue(all(c.ok for c in by_name.values()))
+
+    def test_verify_unlisted_persona_still_default_deny(self) -> None:
+        # A persona on NEITHER list keeps the T-2702 not_enabled assertion.
+        ctx = self._load_ctx(
+            personas=(("mason", "acct-mason"),), wake_timer_personas=("orchestrator",), wake_timer_secondary_personas=("artisan",)
+        )
+        self._make_hub_dir("mason")
+        bindings = mo._all_persona_bindings(ctx.manifest)
+        runner = mo.FakeCommandRunner(
+            scripted={
+                ("systemctl", "--user", "is-enabled", "pantheon-mailbox-wake@mason.timer"): mo.CommandResult(
+                    0, "enabled\n", ""
+                )
+            }
+        )
+        identity = mo.FakeHostIdentity(memberships={("acct-mason", "pantheon-mailbox"): (True, "ok")})
+        by_name = {c.name: c for c in mo.verify(ctx, bindings, runner, identity)}
+        self.assertFalse(by_name["wake_timer.not_enabled"].ok)
+        self.assertNotIn("wake_timer.secondary", by_name)
+
+    def test_provision_skips_secondary_persona(self) -> None:
+        ctx = self._load_ctx(
+            personas=(("artisan", "acct-artisan"),), hub_owner="the-ancestor", wake_timer_secondary_personas=("artisan",)
+        )
+        bindings = mo._all_persona_bindings(ctx.manifest)
+        runner = mo.FakeCommandRunner()
+        home = self.tmp_path / "home-artisan"
+        report = mo.provision(ctx, bindings, runner, execute=True, current_account="acct-artisan", home=home)
+        self.assertFalse(any(call[:3] == ("systemctl", "--user", "enable") for call in runner.calls), runner.calls)
+        result = next(r for r in report.personas if r.persona == "artisan")
+        self.assertTrue(result.unit_leg.startswith("skipped"))
+        self.assertFalse((home / ".config" / "systemd" / "user" / f"{mo.WAKE_UNIT_STEM}@.timer").exists())
+        dry = mo.provision(ctx, bindings, mo.FakeCommandRunner(), execute=False)
+        dry_result = next(r for r in dry.personas if r.persona == "artisan")
+        self.assertTrue(dry_result.unit_leg.startswith("skipped"))
+
+    def test_teardown_skips_secondary_persona(self) -> None:
+        ctx = self._load_ctx(
+            personas=(("artisan", "acct-artisan"),), hub_owner="the-ancestor", wake_timer_secondary_personas=("artisan",)
+        )
+        binding = mo._all_persona_bindings(ctx.manifest)[0]
+        runner = mo.FakeCommandRunner()
+        report = mo.teardown(ctx, binding, runner, execute=True, current_account="acct-artisan")
+        self.assertEqual(runner.calls, [])
+        self.assertTrue(any(item.startswith("skipped unit-leg") for item in report.changed), report.changed)
+        dry = mo.teardown(ctx, binding, mo.FakeCommandRunner(), execute=False)
+        self.assertFalse(any("disable --now" in item for item in dry.planned))
+
+    def test_live_instance_yaml_lists_consume_plane_secondaries(self) -> None:
+        ctx = mo.load_mailbox_context(REPO_ROOT / "instance.yaml", REPO_ROOT)
+        self.assertEqual(ctx.wake_timer_secondary_personas, frozenset({"artisan", "specialist", "recovery", "mason"}))
+        self.assertFalse(ctx.wake_timer_personas & ctx.wake_timer_secondary_personas)
 
 
 if __name__ == "__main__":

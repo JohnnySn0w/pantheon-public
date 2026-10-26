@@ -1,0 +1,61 @@
+# STAGED TEMPLATE (T-2917, ORG-052 Unit 5b) - nothing in this unit installs
+# it. The T-2920 install leg renders ONE unit per registered seat from the
+# root-owned seat registry, substituting @SEAT_ACCOUNT@, @SEAT_UID@,
+# @SEAT_ROOT@ (the seat's <install_root>/home/<account>) and @MAILBOX_HUB@
+# (the executor config's mailbox_hub, T-2917 5d.3), and installs it as
+# pantheon-host-executor@<seat_id>.service.
+#
+# The instance name (%i) is a LABEL ONLY and is deliberately not used
+# anywhere below: the executor resolves its seat from getuid() through the
+# root-owned registry and ignores the instance name (ORG-052 section 3:
+# unit identity and target uid come from the registry, never a parameter).
+#
+# PROVISIONAL values pending T-2920 ratification (ruling B5):
+#   - ExecStart  /usr/local/libexec/pantheon-host-executor
+#                (wraps `python3 -m tools.host_control.executor`)
+#   - config     /etc/pantheon/host-executor/config.json,
+#                schema pantheon-host-executor-config/v1
+#   - bus name   org.pantheon.HostExecutor1.U<uid> (ruling i5)
+#   - @MAILBOX_HUB@ write surface (ruling T-2917:D19; the T-2920 install
+#                reviewer verifies it): mailbox probes write transient,
+#                dot-named probe files under hub/<persona>[/tmp|new|cur]
+#                only; the hub's ACLs remain the real control
+
+[Unit]
+Description=Pantheon per-seat host executor (org.pantheon.HostExecutor1.U@SEAT_UID@)
+Documentation=file:adr/ORG-052-harness-neutral-host-capability-broker.md
+Requires=dbus.service
+After=dbus.service user@@SEAT_UID@.service
+
+[Service]
+Type=dbus
+BusName=org.pantheon.HostExecutor1.U@SEAT_UID@
+ExecStart=/usr/local/libexec/pantheon-host-executor
+User=@SEAT_ACCOUNT@
+
+# Runs AS the target seat account and holds nothing beyond it (ORG-052
+# gate 19): no capabilities, no privilege escalation, writes only inside
+# the seat root and (transient mailbox probes, 5d.3) the mailbox hub.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ReadWritePaths=@SEAT_ROOT@ @MAILBOX_HUB@
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077

@@ -1,0 +1,19 @@
+[Unit]
+Description=Pantheon pve2 heat — 10-min average CPU package and A2000 temperature under their limits (T-5309)
+Documentation=file:///home/%u/pantheon-config/tools/pve2_heat_monitor.py
+After=network-online.target
+
+# Transition-shaped: exits 1 on the first hot run (and every 6h while hot); this check failing IS the alert.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/pve2_heat_monitor.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=2min
+
+[Install]
+WantedBy=default.target

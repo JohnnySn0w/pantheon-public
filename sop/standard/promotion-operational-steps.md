@@ -93,7 +93,7 @@ date: <date>
 
 **Frontmatter status line** (all tier targets): always include a one-line status declaring draft, authoring ticket, and "awaiting the operator ratification" for any operator-gated tier (all targets except scratch→lesson writes, which are HO autonomous).
 
-**Slug convention:** use the same kebab-case descriptive slug pattern existing files use (`<topic-summary>.md`). For ADRs, the next sequential `ORG-NNN` — check the `adr/` directory for the current highest number.
+**Slug convention:** use the same kebab-case descriptive slug pattern existing files use (`<topic-summary>.md`). For ADRs, the next sequential `ORG-NNN` — check the `architecture/adr/` directory for the current highest number.
 
 ### 3. Cross-reference the promotion in the new artifact
 
@@ -152,7 +152,7 @@ When the operator ratifies (resolves the intent=ratify ticket), update the sourc
 **For `rulebook/directives.md` entries promoted to principle:**
 Mark inline as `Superseded: <date> per T-NNNN → P-NN`. Do not delete the directive entry.
 
-**For `adr/` supersedures:**
+**For `architecture/adr/` supersedures:**
 Add an explicit `Superseded by ORG-NNN` block at the top per the existing ADR supersedure pattern.
 
 **For `feedback_*.md` memory pins promoted to SOP:**
@@ -171,7 +171,7 @@ If the operator rejects (or redirects) the promotion:
 
 ### 8. Index / README suggestions (operator-curated constraint)
 
-Top-level index files (`sop/standard/README.md`, `adr/README.md`, `rulebook/directives.md` preamble, etc.) are **operator-curated** — HO and agents suggest rows but do not auto-merge index edits. The pattern:
+Top-level index files (`sop/standard/README.md`, `architecture/adr/README.md`, `rulebook/directives.md` preamble, etc.) are **operator-curated** — HO and agents suggest rows but do not auto-merge index edits. The pattern:
 
 - After building the artifact, **suggest the index row** in the ratify ticket's ask: include the one-line README entry the operator should add when they merge the ratification.
 - Do not auto-edit `sop/standard/README.md` or other top-level indexes as part of the promotion build.

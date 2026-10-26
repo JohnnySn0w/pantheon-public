@@ -1,0 +1,16 @@
+[97m●[39m Reviews are out for all six of Recovery's branches. T-4284 now merges right after the move's short soak, around 19:45Z. #547 (mason's T-4298) is merged.
+  In flight:
+  - Reviewers: rev-t4230, rev-t4307 (round 2), rev-t4284b (round 3), rev-recovery-batch.
+  - impl-t3026b is updating the 8 tests commit B needs.
+  Next checkpoint is move prep at about 18:45Z.
+[37m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ [2mkeep going[0m
+[37m────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [37mEnter to view · x to stop · ctrl+x ctrl+k to stop all agents[39m
+[1m  ● main[0m
+❯ ◯ echo-t1802-logread  INTENT: Verify from logs whether Echo's T-1802 fix...                                                                         idle
+[37m  ◯ watch-triage-0929[39m   [37mINTENT: Clear Orchestrator's backlog of weekly watch find...[39m                                                                         [37midle[39m
+[37m  ◯ weekly-w39[39m          [37mINTENT: Produce Pantheon's 2026-W39 weekly ticket ...[39m                                                                         [37midle[39m
+[37m  ◯ rev-t4284b[39m          [37mINTENT: Decide whether Recovery's T-4284 rework (and t...[39m                                                      [37m6m 8s · ↓ 194.4k tokens[39m
+[37m [39m [37m◯[39m [37m1 idle agent[39m
+[37m [39m [37m↓[39m [37m4 more[39m

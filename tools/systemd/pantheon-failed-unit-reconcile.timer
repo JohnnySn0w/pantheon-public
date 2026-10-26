@@ -1,16 +1,24 @@
-# Daily at 06:15 UTC — after the overnight window where correlated failures have
-# actually happened, and clear of grooming (12:00), the watch loop (08:00) and the
-# citation lints (Sun 05:00/05:30).
+# Every 6h at :15 past (00/06/12/18 UTC) — :15 keeps clear of grooming (12:00), the
+# watch loop (08:00) and the citation lints (Sun 05:00/05:30); the 06:15 slot remains
+# the post-overnight sweep the correlated-outage case (T-2358) was tuned for.
 #
-# Daily rather than weekly: a latched failure persists, so a later run still SEES
-# it, but the point of the tool is to shorten the interval in which a lost alert is
-# indistinguishable from silence. Weekly would leave that window a week wide.
+# 6-hourly rather than daily (T-3836, 2026-09-20): a latched failure persists, so a
+# later run still SEES it, but the point of the tool is to shorten the interval in
+# which a lost alert is indistinguishable from silence. The daily cadence left that
+# window up to ~24h — a real gap for transient/one-shot units (systemd-run), which
+# carry NO OnFailure=pantheon-unit-failure-alert@ (no manager-level default is
+# possible in --user mode), so this reconcile scan is their ONLY visibility. Live
+# case: gepa-t2809-phase2 exit-1 at 00:42Z sat silent until the 06:15 sweep (~5.5h).
+# 6h caps that worst case at ~6h for every transient unit + the correlated-outage
+# case. Weekly→daily→6h is the same axis, tightened by an incident each time.
+# Trade accepted: an UNTRIAGED silent re-fires OnFailure each run (4/day vs 1/day),
+# which is self-limiting — silents are rare and a reset-failed after triage clears it.
 [Unit]
-Description=Pantheon failed-unit reconcile — daily fire (06:15 UTC)
+Description=Pantheon failed-unit reconcile — 6-hourly fire (00/06/12/18:15 UTC)
 Documentation=file:///home/%u/pantheon-config/tools/failed_unit_reconcile.py
 
 [Timer]
-OnCalendar=*-*-* 06:15:00 UTC
+OnCalendar=*-*-* 00,06,12,18:15:00 UTC
 Persistent=true
 Unit=pantheon-failed-unit-reconcile.service
 

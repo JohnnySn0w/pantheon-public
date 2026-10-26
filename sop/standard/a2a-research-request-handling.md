@@ -2,6 +2,8 @@
 
 **Status: Ratified by Orchestrator (HO) at T-1890 merge, 2026-07-21** (BT-5; drafted by the BT-5 implementer, reviewed + accepted + landed by HO — sop/ is an HO-written surface per D2). Re-evaluate at BT-6 soak (the above-bar trigger set + this procedure's wording tune on what the soak surfaces). This is a session-side CONVENTION, not code — there is no thinner entry point for a Claude session's own researcher-dispatch machinery than "the session applies its standing SOPs at dispatch time" (design notes `knowledge/episodic/2026-07-20-a2a-rung1-specialist-seat/notes.md` §7.2). The specialist session applies this procedure by hand (aided by whatever tooling already exists — `tools/mailbox.py`, the normal researcher-dispatch path) whenever it drains an `a2a research-request <task-id>` message from its own inbox.
 
+> **Note — BT-6 soak closed (2026-10-16, Orchestrator, T-5060).** The soak ran and closed on 2026-07-22 (T-1891): three live requests, both injection probes held, and no change to the above-bar trigger set or to this procedure's wording. This procedure stands as written. Retro: `knowledge/episodic/2026-07-20-a2a-rung1-design/bt6-soak-retro.md`.
+
 ## When to use this
 
 Any time the specialist session's mailbox drain (`tools/mailbox.py` `consume()`, same inbox and same drain path as every other inbound message) surfaces a message with subject `a2a research-request <task-id>`, sent by the `specialist-a2a` A2A server (`tools/a2a/specialist_seat_server.py`). The payload is the staged object built by that server's `build_staged_object()`: `{task_id, question, depth, scope, deadline, untrusted_requester_context}`.

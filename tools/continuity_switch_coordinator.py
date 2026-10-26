@@ -37,6 +37,7 @@ import subprocess
 import tempfile
 import time
 from dataclasses import dataclass
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
@@ -273,7 +274,15 @@ def _default_enter_maintenance(persona: str, *, minutes: int, reason: str) -> st
 
 
 def _default_exit_maintenance(persona: str) -> bool:
-    return notify_policy.exit_maintenance(persona)
+    # T-5396: exit now refuses to rewrite a registry it cannot read (instead of wiping
+    # every other seat's window). After a commit or rollback that must not abort the
+    # transition; the window is bounded and expires on its own, so warn and go on.
+    try:
+        return notify_policy.exit_maintenance(persona)
+    except notify_policy.RegistryUnreadable as exc:
+        print(f"[continuity_switch] could not clear maintenance for {persona}: {exc}; "
+              f"it expires on its own", file=sys.stderr)
+        return False
 
 
 _CODEX_NETWORK_OVERRIDE_KEY = "sandbox_workspace_write.network_access"
@@ -512,7 +521,15 @@ def default_ports(config: CoordinatorConfig) -> CoordinatorPorts:
         from tools.harness_adapter import base as harness_base
 
         adapter = harness_base.adapter_for(binding)  # type: ignore[attr-defined]
-        return runtime_controller.ensure_runtime(binding, adapter, state_root=config.state_root)
+        # T-4179: opt out of ensure_runtime's prior-codex-poller stop. The
+        # coordinator owns the receiver handoff (commit_transfer ->
+        # transition_runtime_with_receiver_handoff); stopping the old seat's
+        # poller at candidate START would go comms-dark before the candidate is
+        # proven, and rollback (ensure_runtime reuse of the live old pane) would
+        # never restart it.
+        return runtime_controller.ensure_runtime(
+            binding, adapter, state_root=config.state_root, stop_prior_receiver=False
+        )
 
     def communicate(handle: "runtime_controller.RuntimeHandle", prompt: str) -> CommunicationResult:
         # T-3461: replaces the T-3177 scaffold (DEC-8/DEC-9) that hardcoded

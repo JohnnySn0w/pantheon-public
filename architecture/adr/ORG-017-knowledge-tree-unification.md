@@ -58,71 +58,9 @@ The cadence-vs-arc distinction is preserved structurally (one child per flavor);
 | **C** | Hierarchy under `knowledge/` with `episodic/` + `watch/` children | **Ratified.** Single search root; structural cadence-vs-arc preservation; explicit umbrella signal in path layout itself. Migration churn one-time; survives subsequent grep audits cleanly. |
 | **D** | Tag-based unification (frontmatter tags + tag-index tool) | Zero physical migration BUT requires frontmatter migration on all existing docs + a new tag-index tool to maintain + the umbrella signal lives in tooling not paths. Higher long-term maintenance; the structural-via-path-layout choice (C) is more durable. |
 
-## Migration plan
+## Migration (done)
 
-### Atomic shape
-
-The migration MUST be atomic for Specialist's `watch_runner.py` — it reads `watch/topics.md` on each cron fire; a half-migrated repo (paths moved but code unchanged) would fail. All filesystem renames + code-reference updates land in ONE commit. Specialist's claude-research user auto-pulls pantheon-config; the next cron fire after the merge sees the post-migration state cleanly.
-
-### Renames (`git mv` preserves history)
-
-```bash
-git mv research/ knowledge/episodic/
-git mv watch/    knowledge/watch/
-```
-
-### Code refs to update (forward-looking; live)
-
-Confirmed via grep — ~260 references across the repo. Forward-looking refs (active code + docs) MUST be updated atomically with the rename. Audit covers (non-exhaustive):
-
-- `tools/watch_runner.py` — primary watch-loop driver; reads `watch/topics.md` + writes `watch/reports/<date>/`.
-- `tools/watch_digest.py` — end-of-day digest walks `watch/reports/<date>/`.
-- `tools/_git_utils.py` — HERMES guard scope-assertion includes watch paths; narrow-scope regex needs update.
-- `tools/context_fill_monitor.py` — may reference research/watch paths for self-monitoring (verify in implementer plan).
-- `tools/test_watch_runner.py`, `tools/test_*` — fixtures + path constants.
-- `tools/README.md` — index/explainer references.
-- `tools/systemd/README.md`, `tools/systemd/claude-telegram-research.service` — operational references.
-- `CLAUDE.md` (pantheon-config root + `/home/claude/CLAUDE.md`) — the auto-commit heads-up text currently says `watch/reports/<date>/`; update to `knowledge/watch/reports/<date>/`.
-- `rulebook/directives.md`, `rulebook/policies/cost-monitoring-thresholds.md` — text references.
-- `sop/standard/*.md` — multiple references in operational SOPs (auto-resume runbook, cross-account ops, etc.).
-- `adr/README.md` — index references.
-- Specialist's persona brief (lives in `claude-config/agents/researcher.md`) — write-scope discipline names `watch/reports/<date>/` as Specialist's narrow surface; needs update to `knowledge/watch/reports/<date>/`. **Cross-repo coordination.**
-
-### Historical refs — DO NOT update (preserve audit chain)
-
-Refs in the following classes are **historical** and stay as-written:
-- `ledger/2026.jsonl` (and earlier ledger files) — append-only audit chain; ledger entries reference paths "as-of-when-written." Rewriting them would erode the audit chain's authenticity.
-- `tickets/done/T-*.md` — closed tickets are immutable history. Path refs in resolved tickets are "as-of-closure."
-- The CONTENT of moved reports themselves (e.g., the prose inside `research/2026-04-29-cybernetics-org-theory/notes.md` — soon to be `knowledge/episodic/2026-04-29-cybernetics-org-theory/notes.md` — that references `../watch/topics.md`). After the git mv, the relative-path link `../watch/topics.md` from `knowledge/episodic/<dir>/notes.md` resolves correctly to `knowledge/watch/topics.md` because the relative depth shifts identically for both source + target. Absolute path mentions in prose ("see watch/topics.md") become stale; leave as-is in historical documents (reader can resolve via git log if needed) UNLESS the document is also a live SOP / ADR / README where forward-looking update applies.
-
-Rationale: historical immutability vs forward-looking accuracy is the standard ADR/ledger discipline (per ORG-001 ledger-format + ORG-003 ticket-system). This ADR explicitly inherits it for the migration.
-
-### README inheritance
-
-- `knowledge/README.md` (new) — umbrella explainer: cadence-vs-arc semantics, when to look in episodic/ vs watch/, cross-link to ORG-017.
-- `knowledge/episodic/README.md` — short purpose-specific (currently at `research/README.md`); restructured to drop the cross-reference-to-watch verbatim now that umbrella explains it.
-- `knowledge/watch/README.md` — short purpose-specific (currently at `watch/README.md`); same shape.
-- `knowledge/watch/reports/README.md` — date-bucket index (was `watch/reports/README.md`); unchanged content except header.
-
-### State file (out-of-repo)
-
-`~/.local/state/pantheon/watch/state.json` lives outside the repo + is Specialist-owned. **Out of migration scope** unless implementer notices a code reference that hard-codes the state path — in which case keep the state-file path unchanged (it's not a "watch tree" semantic; it's the watch_runner's runtime state) but flag for HO decision if it surfaces as confusing.
-
-### Cross-actor coordination
-
-Specialist (claude-research user) auto-pulls pantheon-config on the inbox-consumer cadence. After the merge commit lands on origin/main, Specialist's next pull picks up both the rename + the code updates simultaneously. **No window where Specialist is on stale code.**
-
-Specialist's persona brief lives in `claude-config/agents/researcher.md` — separate repo. The persona-brief update (write-scope path change from `watch/reports/<date>/` to `knowledge/watch/reports/<date>/`) lands in a coordinated PR on `claude-config`. Sequencing: pantheon-config migration commit lands first; claude-config persona update follows within the same dispatch window; Specialist's NEXT cron fire after both lands.
-
-### Migration sub-ticket
-
-This ADR captures the decision + plan. The implementation lands in a separate sub-ticket dispatched as a single-implementer plan-first cycle:
-- Worktree pre-staged per T-0357 on `agent/<sub-ticket-id>` per T-0176 convention.
-- Atomic single-commit migration; all path renames + code-ref updates in one PR.
-- Reviewer verifies: smoke loop green (all `python3 -m unittest discover tools` tests pass); no stale `watch/` or `research/` refs in forward-looking files; historical refs preserved per the rule above.
-- Followed by claude-config persona-brief PR.
-
-Filed as **T-XXXX** post-this-ADR-landing.
+The one-shot migration (atomic rename + forward-looking ref updates, historical refs left as written; sub-ticket T-0412) is complete. The plan is in `notes/2026-10-08-org-017-migration-plan-relocated.md`.
 
 ## Consequences
 
@@ -150,8 +88,4 @@ Filed as **T-XXXX** post-this-ADR-landing.
 - Cross-repo coordination (claude-config persona-brief) named explicitly — justifies via D9 (orchestrator response contract; surface cross-actor coupling at design time, not implementer-discovery time).
 - README inheritance (umbrella + child-purpose docs) — justifies via D10 (minimum-traversal: umbrella is one click; children disambiguate when needed; no redundant prose) — same shape as `sop/standard/README.md` vs `sop/remediation/README.md` precedent.
 
-## Ratify trigger
-
-Already ratified per the operator msg_1443. This ADR is the durable record of the decision + migration plan. No separate ratification ticket needed; T-0372 (the parent unification ticket) resolves on this ADR landing + migration sub-ticket filing.
-
-If migration sub-ticket surfaces decisions not anticipated here (naming variant on the umbrella, additional child class needed, state-file path question), implementer escalates via DECISIONS section; HO triages.
+Ratification note: `notes/2026-10-08-org-017-review-history.md` (ratified per the operator msg_1443).

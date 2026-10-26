@@ -1,0 +1,29 @@
+{
+ "json_format_version": [
+  1,
+  0
+ ],
+ "smartctl": {
+  "argv": [
+   "smartctl",
+   "-j",
+   "-a",
+   "/dev/sdd"
+  ],
+  "build_info": "(local build)",
+  "exit_status": 1,
+  "messages": [
+   {
+    "severity": "error",
+    "string": "/dev/sdd: Unknown USB bridge [0x058f:0x6387 (0x100)]"
+   }
+  ],
+  "platform_info": "x86_64-linux-7.0.14-6-pve",
+  "pre_release": false,
+  "svn_revision": "5714",
+  "version": [
+   7,
+   5
+  ]
+ }
+}

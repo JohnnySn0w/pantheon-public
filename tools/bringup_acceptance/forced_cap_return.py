@@ -92,6 +92,7 @@ from pathlib import Path
 from typing import Any, Mapping
 from unittest import mock
 
+from tools import agent_role_map
 from tools import mailbox
 from tools import persona_bringup
 from tools import runtime_controller as rc
@@ -116,8 +117,10 @@ DEFERRED_TO_TICKET = "T-2574"
 RECOVERY_GAP_TICKET = "T-2584"  # now the RESOLUTION ticket -- see leg 4's module docstring section
 
 # The real hub this module must NEVER write to -- mirrors mailbox_roundtrip.
-# py's / harness_fallback_swap.py's own module-level guard constant.
-_REAL_HUB_DEFAULT = Path("/home/the-ancestor/mailbox")
+# py's / harness_fallback_swap.py's own module-level guard constant. Resolved
+# from instance.yaml's mailbox.hub (T-4096) so the guard follows the real hub
+# across an ORG-087 move instead of guarding a retired path.
+_REAL_HUB_DEFAULT = Path(agent_role_map.mailbox_hub())
 
 # Frame edge + composer glyph + no confirm-dialog text -- satisfies tools.
 # submit_verify.ready_for_submission's full conjunction (mirrors harness_
@@ -165,7 +168,7 @@ harness_runtime:
         profile: interactive-subscription
         model: null
         native:
-          permission_mode: default
+          permission_mode: bypassPermissions
       codex:
         profile: interactive-chatgpt
         model: null

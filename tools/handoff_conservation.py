@@ -14,13 +14,23 @@ Design (decided in T-2533, implemented here):
   1. A deterministic STRUCTURAL FINGERPRINT of a HANDOFF's content — NO LLM —
      over four entity classes: ticket IDs, owner/target references, section
      headings, and fenced code/shell blocks. See compute_fingerprint().
-  2. Diff OLD vs NEW fingerprints via three independent, min-gated checks
-     (any one firing raises an alert — see check_conservation()):
+  2. Diff OLD vs NEW fingerprints via four independent checks (any one
+     firing raises an alert — see check_conservation()):
        - size-cliff:    new/old character length collapses
        - entity-cliff:  new/old total tracked-entity count collapses
        - section-loss:  most of OLD's headings vanish from NEW (the T-1771
                          signature specifically — a whole section gone even
                          when overall length/entity count looks survivable)
+       - open-ticket-loss (T-5347): ticket ids in OLD, absent from NEW, whose
+                         ticket file sits in tickets/inbox or tickets/active
+                         (exists and is not done). Catches the item-level drop
+                         the three cliff checks miss (T-2819 replay: artisan
+                         10-02 and 10-13). Done and unknown ids never alert;
+                         the alert lists at most OPEN_TICKET_LIST_CAP ids plus
+                         a "+N more" tail. The tickets root resolves from this
+                         file's location (repo-root/tickets, --tickets-root
+                         overrides); a missing or unreadable root skips the
+                         check with one stderr note.
   3. ALERT, never block. This is advisory only; every failure mode here
      degrades to "no alert printed", never to a blocked restart.
 
@@ -42,6 +52,7 @@ each alert line prints its ratio + raw counts so real alerts self-calibrate.
 from __future__ import annotations
 
 import argparse
+import os
 import re
 import sys
 from pathlib import Path
@@ -69,8 +80,11 @@ MIN_OLD_ENTITIES = 5        # skip entity-cliff check below this OLD entity coun
 HEADING_LOSS_RATIO = 0.4    # heading-survival fraction below this -> section-loss
 MIN_OLD_HEADINGS = 2        # skip section-loss check below this OLD heading count
 
+OPEN_TICKET_LIST_CAP = 20   # open-ticket-loss: list at most this many ids, then "+N more"
+
 # ----------------------------------------------------------- entity extractors
 _TICKET_RE = re.compile(r"\bT-\d+\b")
+_TICKET_ID_FULL_RE = re.compile(r"^T-\d+$")
 # Ticket frontmatter convention already live in this repo (target:/requester:,
 # see CLAUDE.md's persona identity section) — also matches owner:/assignee:
 # for the same shape used elsewhere.
@@ -141,12 +155,70 @@ def compute_fingerprint(text: str) -> dict[str, set[str]]:
     }
 
 
+# ---------------------------------------------------------- open-ticket lookup
+def default_tickets_root() -> Path:
+    """repo-root/tickets, resolved from this file's own location."""
+    return Path(__file__).resolve().parent.parent / "tickets"
+
+
+def _ticket_ids_in(d: Path) -> set[str] | None:
+    """Ticket ids (T-NNNN.md stems) in one tickets/ subdir; None if unreadable."""
+    try:
+        with os.scandir(d) as it:
+            return {e.name[:-3] for e in it
+                    if e.name.endswith(".md") and _TICKET_ID_FULL_RE.match(e.name[:-3])}
+    except OSError:
+        return None
+
+
+def open_ticket_ids(tickets_root: Path | str) -> set[str] | None:
+    """Ids whose ticket file is in tickets/inbox or tickets/active and NOT in
+    tickets/done. None when neither inbox nor active is readable (the caller
+    skips the check). Never raises."""
+    try:
+        root = Path(tickets_root)
+        inbox = _ticket_ids_in(root / "inbox")
+        active = _ticket_ids_in(root / "active")
+        if inbox is None and active is None:
+            return None
+        done = _ticket_ids_in(root / "done") or set()
+        return ((inbox or set()) | (active or set())) - done
+    except Exception:  # advisory contract: degrade to "skip", never raise
+        return None
+
+
+def _ticket_sort_key(tid: str) -> tuple[int, str]:
+    try:
+        return (int(tid[2:]), tid)
+    except ValueError:
+        return (0, tid)
+
+
+def _open_ticket_loss(old_ids: set[str], new_ids: set[str],
+                      tickets_root: Path | str) -> str | None:
+    open_ids = open_ticket_ids(tickets_root)
+    if open_ids is None:
+        return None
+    lost = sorted((old_ids - new_ids) & open_ids, key=_ticket_sort_key)
+    if not lost:
+        return None
+    shown = ", ".join(lost[:OPEN_TICKET_LIST_CAP])
+    more = len(lost) - OPEN_TICKET_LIST_CAP
+    tail = f" +{more} more" if more > 0 else ""
+    return (f"open-ticket-loss: {len(lost)} still-open ticket id(s) in prior "
+            f"handoff absent from new (inbox/active): {shown}{tail}")
+
+
 # ------------------------------------------------------- conservation predicate
-def check_conservation(old_text: str, new_text: str) -> list[str]:
+def check_conservation(old_text: str, new_text: str,
+                       tickets_root: Path | str | None = None) -> list[str]:
     """Compare a prior HANDOFF snapshot (old_text) against the current one
     (new_text). Returns a list of human-readable alert reasons; an empty list
     means quiet — no suspected loss. Each reason embeds its ratio + raw
-    counts so a real alert is self-explaining without reading this file."""
+    counts so a real alert is self-explaining without reading this file.
+
+    tickets_root enables the open-ticket-loss check (T-5347); None skips it,
+    keeping the three cliff checks a pure function of the two texts."""
     alerts: list[str] = []
 
     old_len, new_len = len(old_text), len(new_text)
@@ -184,6 +256,15 @@ def check_conservation(old_text: str, new_text: str) -> list[str]:
                 f"lost: {lost}"
             )
 
+    if tickets_root is not None:
+        try:
+            reason = _open_ticket_loss(old_fp["ticket_ids"], new_fp["ticket_ids"],
+                                       tickets_root)
+        except Exception:  # advisory contract: never raise
+            reason = None
+        if reason:
+            alerts.append(reason)
+
     return alerts
 
 
@@ -213,7 +294,13 @@ def _cli_check(args: argparse.Namespace) -> int:
         _log(f"no prior chronicle snapshot for {agent}; nothing to compare, skipping")
         return 0
 
-    alerts = check_conservation(old_text, new_text)
+    tickets_root = Path(args.tickets_root) if args.tickets_root else default_tickets_root()
+    if open_ticket_ids(tickets_root) is None:
+        _log(f"tickets root {tickets_root} missing or unreadable; "
+             f"skipping open-ticket-loss check (non-fatal)")
+        tickets_root = None
+
+    alerts = check_conservation(old_text, new_text, tickets_root=tickets_root)
     if not alerts:
         return 0
     for reason in alerts:
@@ -235,6 +322,9 @@ def _build_parser() -> argparse.ArgumentParser:
     c.add_argument("--handoff-file", required=True)
     c.add_argument("--agent", default=None, help="override (else derived from handoff path)")
     c.add_argument("--root", default=None, help="chronicle root (default: <state-dir>/chronicle)")
+    c.add_argument("--tickets-root", default=None,
+                   help="tickets dir for the open-ticket-loss check "
+                        "(default: <repo-root>/tickets, from this file's location)")
     c.set_defaults(func=_cli_check)
     return p
 

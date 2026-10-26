@@ -1345,7 +1345,11 @@ class TestFullFireIntegration(unittest.TestCase):
             transition_lines=[f"- {_ts(a_fresh)} [recovery] claimed; moving to active"],
         )
 
+        # T-4881: this stale-flow fixture deliberately holds 3 active tickets for
+        # one persona; keep the WIP-drift commit out of the exact-pipeline
+        # assertion below (drift has its own tests: TestWipCapDriftCheck).
         with patch("tools._git_utils.subprocess.run") as mock_run, \
+             patch.object(ticket_grooming, "_wip_cap_drift_check", return_value=[]), \
              patch.object(ticket_grooming, "_send_digest", return_value=True) as mock_send, \
              patch.object(ticket_grooming, "run_history_audit",
                           return_value="HERMES audit: 0 unescaped occurrence(s) across 0 commit(s) scanned."):
@@ -1360,7 +1364,9 @@ class TestFullFireIntegration(unittest.TestCase):
                 return MagicMock(returncode=0, stdout="", stderr="")
 
             mock_run.side_effect = fake_run
-            rc = ticket_grooming.main(["--commit-prod"])
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = ticket_grooming.main(["--commit-prod"])
 
         self.assertEqual(rc, 0)
         # T-0001 + T-0002 should have a [grooming] stale line; T-0003 should not.
@@ -1406,16 +1412,24 @@ class TestFullFireIntegration(unittest.TestCase):
             "the stale-rebase probe (T-1191, rev-parse x2 at pull entry) must still run",
         )
 
-        # Digest send invoked once with a message containing both stale ids.
-        mock_send.assert_called_once()
-        sent_text = mock_send.call_args.args[0]
-        self.assertIn("T-0001", sent_text)
-        self.assertIn("T-0002", sent_text)
-        self.assertNotIn("T-0003", sent_text)
-        self.assertIn("2 stale ticket(s)", sent_text)
+        # Action-only operator digest (the operator TG 3608-3616 / T-4200): the two
+        # stale tickets target Recovery, not the operator, so NOTHING is sent to the
+        # operator Telegram. The full digest is still emitted to stdout — the
+        # systemd journal record, which (with the git commit +
+        # failed_unit_reconcile) is the proof-of-life, replacing the old
+        # always-send Telegram.
+        mock_send.assert_not_called()
+        journal = buf.getvalue()
+        self.assertIn("T-0001", journal)
+        self.assertIn("T-0002", journal)
+        self.assertNotIn("T-0003", journal)
+        self.assertIn("2 stale ticket(s)", journal)
 
-    def test_no_stale_tickets_still_sends_proof_of_life_digest(self) -> None:
-        # All tickets fresh -> no flags, no commit, but digest still sends.
+    def test_no_stale_tickets_is_silent_but_records_full_digest(self) -> None:
+        # All tickets fresh -> no flags, no commit. Action-only contract
+        # (the operator TG 3608-3616 / T-4200): with no operator-action item the
+        # operator Telegram is SILENT (no "No stale tickets found" placeholder),
+        # but the full proof-of-life digest is still emitted to stdout (journal).
         fresh = datetime(2026, 5, 2, 11, 0, 0, tzinfo=timezone.utc)
         p1 = self.root / "active" / "T-0050.md"
         _make_ticket_file(
@@ -1428,13 +1442,90 @@ class TestFullFireIntegration(unittest.TestCase):
              patch.object(ticket_grooming, "_send_digest", return_value=True) as mock_send, \
              patch.object(ticket_grooming, "run_history_audit",
                           return_value="HERMES audit: 0 unescaped occurrence(s) across 0 commit(s) scanned."):
-            rc = ticket_grooming.main(["--commit-prod"])
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = ticket_grooming.main(["--commit-prod"])
         self.assertEqual(rc, 0)
         # No git activity (zero appends -> empty list, skip commit entirely).
         mock_git.assert_not_called()
-        # But digest fires.
+        # Operator Telegram is silent when nothing needs the operator.
+        mock_send.assert_not_called()
+        # But the full digest is on the record (stdout -> journal).
+        self.assertIn("No stale tickets found", buf.getvalue())
+
+    def test_stale_operator_ticket_sends_action_only(self) -> None:
+        # A stale ticket TARGETED to the operator is the one grooming finding class
+        # that is a genuine operator-action item, so the operator Telegram DOES
+        # fire (T-4200) -- but with an action-only body, not the full digest.
+        stale = datetime(2026, 5, 2, 6, 0, 0, tzinfo=timezone.utc)  # 6h old > 4h
+        p1 = self.root / "active" / "T-0060.md"
+        _make_ticket_file(
+            p1, tid="T-0060", state="active", target="operator",
+            title="Decide the flash-tail read-back method",
+            transition_lines=[f"- {_ts(stale)} [specialist] claimed; moving to active"],
+        )
+        with patch.object(
+            ticket_grooming, "git_commit_and_push", return_value=(True, "mocked")
+        ), \
+             patch.object(ticket_grooming, "_send_digest", return_value=True) as mock_send, \
+             patch.object(ticket_grooming, "run_history_audit",
+                          return_value="HERMES audit: 0 unescaped occurrence(s) across 0 commit(s) scanned."):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                rc = ticket_grooming.main(["--commit-prod"])
+        self.assertEqual(rc, 0)
+        # Operator Telegram fires, action-only.
         mock_send.assert_called_once()
-        self.assertIn("No stale tickets found", mock_send.call_args.args[0])
+        sent = mock_send.call_args.args[0]
+        self.assertIn("T-0060", sent)
+        self.assertIn("awaiting your call", sent)
+        # Action-only: the full-digest scaffolding stays OUT of the operator
+        # message (it lives in the stdout/journal record instead).
+        self.assertNotIn("No stale tickets found", sent)
+        self.assertNotIn("Total under grooming", sent)
+        self.assertNotIn("HERMES audit", sent)
+        # Full digest still on the record.
+        self.assertIn("T-0060", buf.getvalue())
+
+
+class TestOperatorActionOnlyHelpers(unittest.TestCase):
+    """Unit tests for the action-only operator-digest helpers (T-4200)."""
+
+    def _flagged(self, tid: str, target: str, title: str = "x") -> "ticket_grooming.FlaggedTicket":
+        return ticket_grooming.FlaggedTicket(
+            path=Path(f"/tmp/{tid}.md"), tid=tid, state="active",
+            requester="specialist", target=target, title=title,
+            last_ts=datetime(2026, 5, 2, 6, 0, 0, tzinfo=timezone.utc),
+            stale_age=timedelta(hours=6),
+        )
+
+    def test_operator_action_items_filters_target(self) -> None:
+        flagged = [
+            self._flagged("T-1", "recovery"),
+            self._flagged("T-2", "operator"),
+            self._flagged("T-3", "orchestrator"),
+            self._flagged("T-4", "the operator"),  # case-insensitive
+        ]
+        got = [f.tid for f in ticket_grooming._operator_action_items(flagged)]
+        self.assertEqual(got, ["T-2", "T-4"])
+
+    def test_operator_digest_none_when_no_action_items(self) -> None:
+        self.assertIsNone(ticket_grooming.build_operator_digest("2026-05-02", []))
+
+    def test_operator_digest_renders_action_items(self) -> None:
+        items = [self._flagged("T-9", "operator", title="Approve the spend")]
+        msg = ticket_grooming.build_operator_digest("2026-05-02 12:00 UTC", items)
+        self.assertIsNotNone(msg)
+        self.assertIn("T-9", msg)
+        self.assertIn("Approve the spend", msg)
+        self.assertIn("awaiting your call", msg)
+        self.assertIn("🧹", msg)  # Recovery grooming header preserved
+        self.assertIn("1 ticket ", msg)  # singular
+
+    def test_operator_digest_plural(self) -> None:
+        items = [self._flagged("T-9", "operator"), self._flagged("T-10", "operator")]
+        msg = ticket_grooming.build_operator_digest("2026-05-02", items)
+        self.assertIn("2 tickets ", msg)
 
 
 class TestPullRepoOrWarn(unittest.TestCase):
@@ -1523,6 +1614,19 @@ class TestDefaultSafeContractT0260(unittest.TestCase):
                 rc = ticket_grooming.main(["--repo-root", str(self.root)])
         self.assertEqual(rc, 0)
 
+    def test_grooming_runs_the_audit_with_its_cache(self) -> None:
+        """T-4308: the cache wiring is the point of the change; without it the fire
+        re-shows every commit and nears its 10-min kill."""
+        from tools.hermes_history_audit import default_cache_path
+        with patch.object(ticket_grooming, "pull_repo_or_warn"), \
+             patch.object(ticket_grooming, "git_commit_and_push", return_value=(True, "mocked")), \
+             patch.object(ticket_grooming, "_send_digest", return_value=True), \
+             patch.object(ticket_grooming, "run_history_audit", return_value="HERMES audit clean.") as audit:
+            with redirect_stdout(io.StringIO()):
+                ticket_grooming.main(["--repo-root", str(self.root)])
+        audit.assert_called_once()
+        self.assertEqual(audit.call_args.kwargs, {"cache_path": default_cache_path()})
+
     def test_commit_prod_alone_is_accepted(self) -> None:
         # T-1490: bypass the real worktree shim (fn(None)) like every other
         # --commit-prod test. Without this, `--commit-prod` alone hits
@@ -1577,8 +1681,10 @@ class TestT0260Layer3Integration(unittest.TestCase):
 
     def test_dry_run_returns_zero_against_empty_tickets(self) -> None:
         from tools._test_fixtures import run_script
+        # --repo-root pins the scan to the seeded tmp repo. Without it REPO_ROOT is the
+        # real checkout, so this scanned every real ticket + ADR and timed out on CI (T-4228).
         rc, stdout, _stderr = run_script(
-            "ticket_grooming", ["--dry-run"],
+            "ticket_grooming", ["--dry-run", "--repo-root", str(self.env.repo_path)],
             env=self.env.env_overrides,
         )
         self.assertEqual(rc, 0)
@@ -1681,11 +1787,11 @@ class TestBuildActiveQueueSnapshot(unittest.TestCase):
         self.assertIn("recovery", result)
 
     def test_role_id_target_counts_under_persona(self):
-        """Ticket with target=orchestrator is counted under orchestrator."""
+        """Ticket with target=head_engineering_orchestrator is counted under orchestrator."""
         with tempfile.TemporaryDirectory() as tmp:
             tickets_root = Path(tmp) / "tickets"
             active_dir = tickets_root / "active"
-            _make_active_ticket_file(active_dir, "T-0001", "orchestrator")
+            _make_active_ticket_file(active_dir, "T-0001", "head_engineering_orchestrator")
             with patch("tools.ticket_grooming.TICKETS_ROOT", tickets_root):
                 result = self.build_active_queue_snapshot(["orchestrator"])
         self.assertIn("orchestrator", result)
@@ -2875,7 +2981,8 @@ class TestDryRunRatifiedUnbuiltADR(unittest.TestCase):
 
 
 class TestTicketIntegrityIssues(unittest.TestCase):
-    """T-2982: find_ticket_integrity_issues detects dup-IDs + same-not_before clusters."""
+    """T-2982 / T-3830: find_ticket_integrity_issues detects dup-IDs +
+    same-not_before clusters + stale-done-deps."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -2884,10 +2991,18 @@ class TestTicketIntegrityIssues(unittest.TestCase):
             (self.root / state).mkdir()
         self.addCleanup(self._tmp.cleanup)
 
-    def _write(self, state: str, tid: str, not_before: str | None = None) -> None:
+    def _write(
+        self,
+        state: str,
+        tid: str,
+        not_before: str | None = None,
+        depends_on: list[str] | None = None,
+    ) -> None:
         fm = ["---", f"id: {tid}", "target: recovery", f"state: {state}"]
         if not_before is not None:
             fm.append(f"not_before: {not_before}")
+        if depends_on:
+            fm.append(f"depends_on: [{', '.join(depends_on)}]")
         fm.append("---")
         (self.root / state / f"{tid}.md").write_text("\n".join(fm) + f"\n# {tid}\n", encoding="utf-8")
 
@@ -2925,6 +3040,44 @@ class TestTicketIntegrityIssues(unittest.TestCase):
         self._write("inbox", "T-0012", not_before="2026-08-22T12:00:00Z")
         self.assertEqual(ticket_grooming.find_ticket_integrity_issues(self.root), [])
 
+    def test_stale_done_dep_flagged_on_inbox_ticket(self) -> None:
+        # T-3830: an open ticket's depends_on names a done ticket → cascade
+        # never fires post-hoc; grooming surfaces it as the backstop.
+        self._write("done", "T-0100")
+        self._write("inbox", "T-0200", depends_on=["T-0100"])
+        issues = ticket_grooming.find_ticket_integrity_issues(self.root)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("STALE-DONE-DEP", issues[0])
+        self.assertIn("T-0200", issues[0])
+        self.assertIn("T-0100", issues[0])
+        # The finding also names the operator remedy verb.
+        self.assertIn("--clear-dep", issues[0])
+
+    def test_stale_done_dep_flagged_on_active_ticket(self) -> None:
+        self._write("done", "T-0100")
+        self._write("active", "T-0300", depends_on=["T-0100"])
+        issues = ticket_grooming.find_ticket_integrity_issues(self.root)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("STALE-DONE-DEP", issues[0])
+        self.assertIn("T-0300", issues[0])
+
+    def test_live_dep_not_flagged(self) -> None:
+        # depends_on target is in inbox/, not done/ → legitimate live gate.
+        self._write("inbox", "T-0100")
+        self._write("inbox", "T-0200", depends_on=["T-0100"])
+        self.assertEqual(ticket_grooming.find_ticket_integrity_issues(self.root), [])
+
+    def test_mixed_dep_only_stale_flagged(self) -> None:
+        # T-0200 has two deps: one done (stale), one still live. Finding
+        # names ONLY the stale target so the operator's clear verb is precise.
+        self._write("done", "T-0100")
+        self._write("inbox", "T-0101")
+        self._write("inbox", "T-0200", depends_on=["T-0100", "T-0101"])
+        issues = ticket_grooming.find_ticket_integrity_issues(self.root)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("T-0100", issues[0])
+        self.assertNotIn("T-0101", issues[0])
+
     def test_render_section_empty_when_clean(self) -> None:
         self.assertEqual(ticket_grooming._render_integrity_section([]), "")
 
@@ -2932,6 +3085,186 @@ class TestTicketIntegrityIssues(unittest.TestCase):
         out = ticket_grooming._render_integrity_section(["[DUP-ID] T-0001 ...", "[GATE-CLUSTER] 3 tickets ..."])
         self.assertIn("Ticket-integrity issues (2)", out)
         self.assertIn("DUP-ID", out)
+
+
+class TestWipCapDriftCheck(unittest.TestCase):
+    """T-4881: grooming flags any holder with >1 active ticket (cap is 1)."""
+
+    NOW = datetime(2026, 10, 12, 22, 0, 0, tzinfo=timezone.utc)
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        (self.root / "active").mkdir()
+        self.sent: list[tuple] = []
+
+    def tearDown(self) -> None:
+        self._tmp.cleanup()
+
+    def _send(self, inbox, payload, sender=None, subject=None):
+        self.sent.append((inbox, subject))
+
+    def _active(self, tid, claim_ts, *, target="artisan", extra_fm=None, extra_lines=None):
+        lines = [f"- 2026-10-01T00:00:00Z [orchestrator] filed in inbox",
+                 f"- {claim_ts} [{target}] claimed @abc; moving to active"]
+        lines += extra_lines or []
+        path = self.root / "active" / f"{tid}.md"
+        _make_ticket_file(path, tid=tid, state="active", target=target,
+                          transition_lines=lines)
+        if extra_fm:
+            t = path.read_text()
+            path.write_text(t.replace("state: active\n", f"state: active\n{extra_fm}\n", 1))
+        return path
+
+    def _run(self, **kw):
+        return ticket_grooming._wip_cap_drift_check(
+            self.root, self.NOW, send_fn=self._send, **kw)
+
+    def test_single_active_not_flagged(self) -> None:
+        self._active("T-0001", "2026-10-09T01:00:00Z")
+        self.assertEqual(self._run(), [])
+
+    def test_flags_extras_not_oldest_claim(self) -> None:
+        p1 = self._active("T-0001", "2026-10-09T01:00:00Z")
+        p2 = self._active("T-0002", "2026-10-09T17:36:45Z")
+        p3 = self._active("T-0003", "2026-10-10T02:00:31Z")
+        f = self._run()
+        self.assertEqual(len(f), 1)
+        self.assertEqual(f[0].holder, "artisan")
+        self.assertEqual(f[0].primary, "T-0001")
+        self.assertEqual(f[0].extras, ["T-0002", "T-0003"])
+        self.assertNotIn("wip-drift", p1.read_text())
+        self.assertIn("[grooming] wip-drift", p2.read_text())
+        self.assertIn("[grooming] wip-drift", p3.read_text())
+
+    def test_idempotent_second_run_writes_nothing_and_no_second_advisory(self) -> None:
+        self._active("T-0001", "2026-10-09T01:00:00Z")
+        p2 = self._active("T-0002", "2026-10-09T17:36:45Z")
+        self._run()
+        after_first = p2.read_text()
+        n_sent = len(self.sent)
+        self.assertTrue(n_sent > 0)
+        f = self._run()
+        self.assertEqual(p2.read_text(), after_first)
+        self.assertEqual(len(self.sent), n_sent)
+        self.assertEqual(len(f), 1)  # still reported for the digest
+
+    def test_reclaim_after_flag_reflags(self) -> None:
+        self._active("T-0001", "2026-10-09T01:00:00Z")
+        p2 = self._active("T-0002", "2026-10-09T17:36:45Z",
+                          extra_lines=["- 2026-10-10T00:00:00Z [grooming] wip-drift: x",
+                                       "- 2026-10-11T00:00:00Z [artisan] claimed @def; moving to active"])
+        self._run()
+        self.assertEqual(p2.read_text().count("wip-drift"), 2)
+
+    def _active_no_claim(self, tid, *, created, delivered_at=None):
+        path = self.root / "active" / f"{tid}.md"
+        _make_ticket_file(path, tid=tid, state="active", target="artisan",
+                          transition_lines=["- 2026-10-01T00:00:00Z [orchestrator] filed in inbox"])
+        t = path.read_text().replace("created: 2026-05-01T00:00:00Z", f"created: {created}", 1)
+        if delivered_at:
+            t = t.replace("state: active\n", f"state: active\ndelivered_at: {delivered_at}\n", 1)
+        path.write_text(t)
+        return path
+
+    def test_no_claim_entry_falls_back_to_created_and_stays_primary(self) -> None:
+        # T-4881 review note 2: the oldest-held ticket has no parseable claim line.
+        self._active_no_claim("T-0001", created="2026-10-01T00:00:00Z")
+        self._active("T-0002", "2026-10-09T17:36:45Z")
+        f = self._run()
+        self.assertEqual(f[0].primary, "T-0001")
+        self.assertEqual(f[0].extras, ["T-0002"])
+
+    def test_no_claim_entry_prefers_delivered_at_over_created(self) -> None:
+        self._active_no_claim("T-0001", created="2026-10-01T00:00:00Z",
+                              delivered_at="2026-10-11T00:00:00Z")
+        self._active("T-0002", "2026-10-09T17:36:45Z")
+        f = self._run()
+        self.assertEqual(f[0].primary, "T-0002")
+        self.assertEqual(f[0].extras, ["T-0001"])
+
+    def test_awaiting_merge_excluded(self) -> None:
+        self._active("T-0001", "2026-10-09T01:00:00Z")
+        self._active("T-0002", "2026-10-09T17:36:45Z", extra_fm="substate: awaiting-merge")
+        self.assertEqual(self._run(), [])
+
+    def test_operator_exempt(self) -> None:
+        self._active("T-0001", "2026-10-09T01:00:00Z", target="operator")
+        self._active("T-0002", "2026-10-09T17:36:45Z", target="operator")
+        self.assertEqual(self._run(), [])
+
+    def test_role_pool_counts_for_taker(self) -> None:
+        self._active("T-0001", "2026-10-09T01:00:00Z", target="mason")
+        self._active("T-0002", "2026-10-09T17:36:45Z", target="role:orchestrator",
+                     extra_fm="delivered_to: mason")
+        f = self._run()
+        self.assertEqual([x.holder for x in f], ["mason"])
+
+    def test_apply_false_writes_nothing(self) -> None:
+        self._active("T-0001", "2026-10-09T01:00:00Z")
+        p2 = self._active("T-0002", "2026-10-09T17:36:45Z")
+        before = p2.read_text()
+        f = self._run(apply=False)
+        self.assertEqual(len(f), 1)
+        self.assertEqual(p2.read_text(), before)
+        self.assertEqual(self.sent, [])
+
+    def test_default_never_touches_real_mailbox_hub(self) -> None:
+        # Isolation regression (2026-10-12): the drift path with no injected
+        # sender must not reach tools.mailbox.send (the live hub).
+        self._active("T-0001", "2026-10-09T01:00:00Z")
+        p2 = self._active("T-0002", "2026-10-09T17:36:45Z")
+        with patch("tools.mailbox.send") as real_send:
+            f = ticket_grooming._wip_cap_drift_check(self.root, self.NOW)
+        real_send.assert_not_called()
+        self.assertEqual(f[0].newly_flagged, ["T-0002"])
+        self.assertIn("wip-drift", p2.read_text())
+
+    def test_main_unit_bypass_never_touches_real_mailbox_hub(self) -> None:
+        # main() with the worktree shim bypassed (wt_path None) -- the shape every
+        # integration test uses -- must not hand the real sender to the check.
+        self._active("T-0001", "2026-10-09T01:00:00Z")
+        self._active("T-0002", "2026-10-09T17:36:45Z")
+        with patch.object(ticket_grooming, "TICKETS_ROOT", self.root), \
+             patch.object(ticket_grooming, "_now_utc", return_value=self.NOW), \
+             patch.object(ticket_grooming, "git_commit_and_push", return_value=(True, "m")), \
+             patch.object(ticket_grooming, "run_history_audit", return_value="ok"), \
+             patch.object(ticket_grooming, "_with_worktree", lambda fn: fn(None)), \
+             patch.object(ticket_grooming, "_send_digest", return_value=True), \
+             patch("tools.mailbox.send") as real_send:
+            ticket_grooming.main(["--no-digest", "--commit-prod"])
+        real_send.assert_not_called()
+
+    def test_render_section(self) -> None:
+        self.assertEqual(ticket_grooming._render_wip_drift_section([]), "")
+        self._active("T-0001", "2026-10-09T01:00:00Z")
+        self._active("T-0002", "2026-10-09T17:36:45Z")
+        out = ticket_grooming._render_wip_drift_section(self._run(apply=False))
+        self.assertIn("artisan", out)
+        self.assertIn("T-0002", out)
+
+    def test_digest_includes_section(self) -> None:
+        self._active("T-0001", "2026-10-09T01:00:00Z")
+        self._active("T-0002", "2026-10-09T17:36:45Z")
+        f = self._run(apply=False)
+        d = ticket_grooming.build_digest("now", [], {"active": 2}, wip_drift_findings=f)
+        self.assertIn("T-0002", d)
+
+
+# T-4940: isolate the seat's state dir for plain-unittest runs (pytest's conftest
+# _isolate_state_dir already does this per test). See tools/_seat_state_isolation.py.
+try:
+    from tools import _seat_state_isolation
+except ImportError:  # pragma: no cover - run from tools/
+    import _seat_state_isolation  # type: ignore[no-redef]
+
+
+def setUpModule() -> None:
+    _seat_state_isolation.start()
+
+
+def tearDownModule() -> None:
+    _seat_state_isolation.stop()
 
 
 if __name__ == "__main__":

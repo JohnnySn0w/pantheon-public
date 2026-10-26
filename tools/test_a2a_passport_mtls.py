@@ -30,7 +30,7 @@ if _HAVE_CRYPTO:
         verify_mtls_binding,
     )
 
-DID = "did:web:snowis.me"
+DID = "did:web:your-domain.example"
 
 
 def _jwk_from_ec_pub(pub, crv="P-256", alg="ES256"):

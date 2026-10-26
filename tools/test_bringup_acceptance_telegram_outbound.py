@@ -34,7 +34,7 @@ from tools.bringup_acceptance.types import HardStop, InventoryPathEntry, RunCont
 
 PERSONA = "testpersona"
 DISPOSABLE_CHAT_ID = "-1009999999999"  # a disposable/non-operator target, never the operator's real chat
-REAL_OPERATOR_CHAT_ID = "456474197"
+REAL_OPERATOR_CHAT_ID = "424242424"
 
 
 def _run_context(root: Path, *, run_id: str = "20260805T000000Z") -> RunContext:

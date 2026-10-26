@@ -18,15 +18,19 @@ Key scenarios (per T-1034):
 
 from __future__ import annotations
 
+import os
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 # Import the module under test — local import to pick up worktree version.
 from tools._test_fixtures import (
     _RepoSnapshot,
     assert_real_repo_untouched,
+    TicketTreeWatch,
+    contained_path,
     local_only_commits,
     snapshot_real_repo,
 )
@@ -207,6 +211,50 @@ class TestSnapshotAndAssert(unittest.TestCase):
         with self.assertRaises(AssertionError) as ctx:
             assert_real_repo_untouched(snap)
         self.assertIn("new local-only commits", str(ctx.exception).lower())
+        # T-4108: the message names the leaked commit's subject and paths, so a
+        # leak caught by the wrong test under xdist still points at its source.
+        self.assertIn("erroneous commit", str(ctx.exception))
+        self.assertIn("bad.txt", str(ctx.exception))
+
+    # --- T-4108: an unknown snapshot must not become an empty baseline -------
+
+    def test_setup_snapshot_failure_does_not_false_positive(self) -> None:
+        """Repro of the 2026-09-28 CI false positive. HEAD already carries a
+        local-only commit (as a PR merge-ref checkout does), and the setUp
+        snapshot's git call times out under IO contention. tearDown must NOT
+        report that pre-existing commit as newly leaked."""
+        repo = _init_repo(self._base)
+        _commit(repo, "a.txt", "init")
+        _push(repo)
+        _commit(repo, "pr.txt", "Merge abc into def (PR merge ref)")  # local-only, pre-existing
+        real_run = subprocess.run
+
+        def timeout_git(*a, **kw):
+            raise subprocess.TimeoutExpired(cmd="git log", timeout=1)
+
+        with mock.patch("tools._test_fixtures.subprocess.run", side_effect=timeout_git):
+            snap = snapshot_real_repo(repo_path=repo)
+        self.assertIsNone(snap.local_only)
+        self.assertIs(subprocess.run, real_run)
+        with self.assertWarns(RuntimeWarning):
+            assert_real_repo_untouched(snap)  # must not raise
+
+    def test_teardown_read_failure_skips_not_raises(self) -> None:
+        """A tearDown git failure is also UNKNOWN: skip with a warning, never
+        diff against an empty set."""
+        repo = _init_repo(self._base)
+        _commit(repo, "a.txt", "init")
+        _push(repo)
+        snap = snapshot_real_repo(repo_path=repo)
+        self.assertEqual(snap.local_only, frozenset())
+        _commit(repo, "bad.txt", "erroneous commit")
+
+        def timeout_git(*a, **kw):
+            raise subprocess.TimeoutExpired(cmd="git log", timeout=1)
+
+        with mock.patch("tools._test_fixtures.subprocess.run", side_effect=timeout_git):
+            with self.assertWarns(RuntimeWarning):
+                assert_real_repo_untouched(snap)  # unknown, so skipped
 
     # --- (E) commit + push does NOT trip guard --------------------------------
 
@@ -352,6 +400,159 @@ class TestSnapshotAndAssert(unittest.TestCase):
 
         # Guard must NOT trip (local HEAD didn't change; no new local-only).
         assert_real_repo_untouched(snap)  # must not raise
+
+
+class TestContainedPath(unittest.TestCase):
+    """T-4167: a fake `git mv` stub must never resolve a path outside its test root.
+
+    pathlib discards the root for an absolute argv, so the pre-T-4167 stubs
+    (`self.root / argv[2]`) would shutil.move a REAL file in the shared checkout.
+    """
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name) / "root"
+        self.root.mkdir()
+        self.outside = Path(tmp.name) / "real-checkout" / "tickets" / "active" / "T-9999.md"
+        self.outside.parent.mkdir(parents=True)
+        self.outside.write_text("live ticket\n")
+
+    def test_relative_path_is_joined_under_the_root(self) -> None:
+        self.assertEqual(contained_path(self.root, "tickets/active/T-0001.md"),
+                         self.root / "tickets/active/T-0001.md")
+
+    def test_absolute_path_inside_the_root_is_allowed(self) -> None:
+        inside = str(self.root / "tickets" / "done" / "T-0001.md")
+        self.assertEqual(contained_path(self.root, inside), Path(inside))
+
+    def test_absolute_path_outside_the_root_is_refused_and_named(self) -> None:
+        with self.assertRaises(AssertionError) as cm:
+            contained_path(self.root, str(self.outside))
+        self.assertIn(str(self.outside), str(cm.exception))
+        self.assertTrue(self.outside.exists())
+
+    def test_dotdot_escape_is_refused(self) -> None:
+        with self.assertRaises(AssertionError):
+            contained_path(self.root, "../real-checkout/tickets/active/T-9999.md")
+
+    def test_symlink_out_of_the_root_is_refused(self) -> None:
+        (self.root / "escape").symlink_to(self.outside.parent)
+        with self.assertRaises(AssertionError):
+            contained_path(self.root, "escape/T-9999.md")
+
+
+class TestTicketTreeWatch(unittest.TestCase):
+    """T-4167: the CI tripwire's drift check on a ticket tree."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tickets = Path(tmp.name) / "tickets"
+        for state in ("inbox", "active", "done"):
+            (self.tickets / state).mkdir(parents=True)
+        (self.tickets / "active" / "T-4137.md").write_text("x\n")
+        (self.tickets / "README.md").write_text("r\n")
+        self.watch = TicketTreeWatch(self.tickets)
+
+    def _bump(self, path: Path) -> None:
+        # Make an mtime change visible even on a coarse-mtime filesystem.
+        st = path.stat()
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
+
+    def test_untouched_tree_reports_no_drift(self) -> None:
+        token = self.watch.begin()
+        (self.tickets / "active" / "T-4137.md").read_text()
+        self.assertIsNone(self.watch.drift(token))
+
+    def test_a_moved_ticket_is_reported_removed_and_added(self) -> None:
+        token = self.watch.begin()
+        (self.tickets / "active" / "T-4137.md").rename(self.tickets / "done" / "T-4137.md")
+        self._bump(self.tickets / "active")
+        self._bump(self.tickets / "done")
+        self.assertEqual(self.watch.drift(token), (["active/T-4137.md"], ["done/T-4137.md"], []))
+
+    def test_a_write_that_leaves_the_listing_unchanged_still_reports(self) -> None:
+        token = self.watch.begin()
+        tmp = self.tickets / "inbox" / ".scratch"
+        tmp.write_text("x")
+        tmp.unlink()
+        self._bump(self.tickets / "inbox")
+        self.assertEqual(self.watch.drift(token), ([], [], []))
+
+    def test_a_new_top_level_entry_is_reported(self) -> None:
+        token = self.watch.begin()
+        (self.tickets / "stray.md").write_text("x")
+        self._bump(self.tickets)
+        self.assertEqual(self.watch.drift(token), ([], ["stray.md"], []))
+
+
+class TestTicketTreeWatchGit(unittest.TestCase):
+    """T-4167: a REAL `git pull` in the watched checkout is reported (the likely
+    T-4165 mover), including when it brings no ticket changes."""
+
+    def setUp(self) -> None:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        base = Path(tmp.name)
+        self.origin = base / "origin.git"
+        self.clone = base / "clone"
+        self.other = base / "other"
+        subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(self.origin)], check=True)
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(self.other)], check=True,
+                       capture_output=True)
+        (self.other / "tickets" / "active").mkdir(parents=True)
+        (self.other / "tickets" / "done").mkdir()
+        (self.other / "tickets" / "active" / "T-4137.md").write_text("x\n")
+        (self.other / "tickets" / "done" / ".keep").write_text("")
+        (self.other / "tickets" / "active" / ".keep").write_text("")
+        self._commit_push("seed")
+        subprocess.run(["git", "clone", "-q", str(self.origin), str(self.clone)], check=True,
+                       capture_output=True)
+        self.watch = TicketTreeWatch(self.clone / "tickets", git_dir=self.clone / ".git")
+
+    def _git(self, repo: Path, *args: str) -> None:
+        subprocess.run(["git", "-C", str(repo), "-c", "user.email=t@t", "-c", "user.name=t",
+                        *args], check=True, capture_output=True)
+
+    def _commit_push(self, msg: str) -> None:
+        self._git(self.other, "add", "-A")
+        self._git(self.other, "commit", "-q", "--allow-empty", "-m", msg)
+        self._git(self.other, "push", "-q", "origin", "HEAD:main")
+
+    def _age(self) -> None:
+        # Backdate the clone's markers + ticket dirs so a same-tick rewrite still
+        # reads as a change on a coarse-mtime filesystem.
+        for p in [*(self.clone / ".git").rglob("*"), *(self.clone / "tickets").rglob("*"),
+                  self.clone / "tickets"]:
+            os.utime(p, ns=(0, 1_000_000_000), follow_symlinks=False)
+
+    def test_pull_that_resolves_a_ticket_upstream_is_reported(self) -> None:
+        self._git(self.other, "mv", "tickets/active/T-4137.md", "tickets/done/T-4137.md")
+        self._commit_push("resolve T-4137")
+        self._age()
+        token = self.watch.begin()
+        self._git(self.clone, "pull", "-q", "--ff-only")
+        removed, added, git_changed = self.watch.drift(token)
+        self.assertEqual((removed, added), (["active/T-4137.md"], ["done/T-4137.md"]))
+        self.assertIn("FETCH_HEAD", git_changed)
+        self.assertIn("refs/heads/main", git_changed)
+
+    def test_pull_with_no_ticket_changes_is_still_reported(self) -> None:
+        self._commit_push("unrelated")
+        self._age()
+        token = self.watch.begin()
+        self._git(self.clone, "pull", "-q", "--ff-only")
+        removed, added, git_changed = self.watch.drift(token)
+        self.assertEqual((removed, added), ([], []))
+        self.assertIn("FETCH_HEAD", git_changed)
+
+    def test_read_only_git_reports_nothing(self) -> None:
+        self._age()
+        token = self.watch.begin()
+        self._git(self.clone, "rev-parse", "HEAD")
+        self._git(self.clone, "log", "-1", "--format=%H")
+        self.assertIsNone(self.watch.drift(token))
 
 
 if __name__ == "__main__":

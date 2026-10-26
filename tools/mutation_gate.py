@@ -46,6 +46,14 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+# Repo root on sys.path so the shared diff framing imports from any cwd
+# (mirrors tools/hermes_diff_scan.py's own bootstrap).
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from tools.hermes_diff_scan import iter_added_lines  # noqa: E402  (T-4202)
+
 
 @dataclass
 class MutationResult:
@@ -98,35 +106,55 @@ def is_mutable_line(line: str) -> bool:
     return True
 
 
+def _read_source(source: Path) -> str:
+    """Read the source with NO newline translation (T-4202), so lines are
+    numbered the way git numbers them: only "\\n" ends a line, and a lone
+    `\\r` stays content. (Python's tokenizer would treat a lone CR as a line
+    break; the gate follows git, whose line numbers --diff targets.)"""
+    with source.open(encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
+def _split_lines_keepends(text: str) -> list[str]:
+    """Split on "\\n" only, keeping it (T-4202). `str.splitlines()` also
+    breaks on form feed, U+2028 and friends, which git and Python do not
+    count as line ends, so its indexes drift from git's line numbers."""
+    parts = text.split("\n")
+    out = [p + "\n" for p in parts[:-1]]
+    if parts[-1]:
+        out.append(parts[-1])
+    return out
+
+
+def _source_lines(source: Path) -> list[str]:
+    """The source's lines, numbered as git numbers them (no terminators)."""
+    return [ln[:-1] if ln.endswith("\n") else ln
+            for ln in _split_lines_keepends(_read_source(source))]
+
+
 def load_line_numbers(source: Path, mode: str, arg: str) -> list[int]:
-    lines = source.read_text().splitlines()
+    lines = _source_lines(source)
     if mode == "lines":
         return [int(x) for x in arg.split(",") if x.strip()]
     if mode == "auto":
         return [i + 1 for i, line in enumerate(lines) if is_mutable_line(line)]
     if mode == "diff":
-        # git diff <ref>..HEAD -- source, extract added/context lines' numbers
-        # For prototype: use git blame + git diff --unified=0 to identify changed lines
+        # Every line ADDED in <ref>..HEAD on the source file, numbered in the
+        # new file. Framed by the shared structural parser (T-4202,
+        # hermes_diff_scan.iter_added_lines): hunk-count tracked, so an added
+        # line whose content starts `++` (rendered `+++`) is a target and
+        # still advances the count. Two-endpoint `git diff` only; combined
+        # (`@@@`) diffs are never read here.
         result = subprocess.run(
-            ["git", "diff", "--unified=0", f"{arg}..HEAD", "--", str(source)],
-            capture_output=True, text=True, check=True,
+            ["git", "diff", "--text", "--no-color", "--unified=0",
+             f"{arg}..HEAD", "--", str(source)],
+            capture_output=True, check=True,
         )
         line_nums = []
-        current_line = 0
-        for diff_line in result.stdout.splitlines():
-            if diff_line.startswith("@@"):
-                # @@ -old,c +new,c @@ — parse new-file line-start
-                try:
-                    new_part = diff_line.split("+", 1)[1].split(" ", 1)[0]
-                    current_line = int(new_part.split(",")[0])
-                except (IndexError, ValueError):
-                    continue
-            elif diff_line.startswith("+") and not diff_line.startswith("+++"):
-                if current_line <= len(lines) and is_mutable_line(lines[current_line - 1]):
-                    line_nums.append(current_line)
-                current_line += 1
-            elif diff_line.startswith(" "):
-                current_line += 1
+        for ev in iter_added_lines(result.stdout):
+            n = ev.lineno
+            if 1 <= n <= len(lines) and is_mutable_line(lines[n - 1]):
+                line_nums.append(n)
         return line_nums
     raise ValueError(f"unknown targeting mode: {mode}")
 
@@ -141,7 +169,7 @@ def mutate_line(source: Path, line_num: int, backup: Path) -> tuple[str, str]:
     a top-level `def` whose removal orphans downstream references — treat as
     "structural, skip").
     """
-    lines = source.read_text().splitlines(keepends=True)
+    lines = _split_lines_keepends(_read_source(source))
     original = lines[line_num - 1]
     stripped = original.lstrip()
     indent = original[: len(original) - len(stripped)]

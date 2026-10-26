@@ -15,7 +15,9 @@
 # ACP_SUPERVISE_UNDER_TEST at a mutated copy to reproduce.
 #
 # HARNESS: same stub-tmux + sandbox-HOME pattern as the trap/session_death tests —
-# no real tmux/sg/python3. The stub records the new-session invocation; we inspect
+# no real tmux or sg, and no bridge python3. The supervise script's own python3
+# mailbox-hub lookup DOES run here on purpose (T-4348): this is the suite that keeps
+# the default launch path covered. The stub records the new-session invocation; we inspect
 # the captured command for the --batch flag per ACP_BRIDGE_BATCH value, then KILL the
 # supervise loop (we only need the one-shot launch argv, not the lifecycle).
 #
@@ -47,13 +49,36 @@ case "\$1" in
 esac
 STUB
   chmod +x "$stubdir/tmux"
+  # The supervise script's output goes to a sandbox file and NEVER to this
+  # function's stdout (T-4348). The caller reads this function through $(...), and
+  # $(...) returns only when every holder of its pipe closes it. Killing $pid does
+  # not kill that script's children (its poll-loop `sleep 5`, or a stuck step
+  # before new-session), so an inherited pipe kept this test blocked. That cost
+  # about 5s per case when healthy and was an unbounded HANG when the supervisor
+  # never reached new-session. Mutation-found.
   if [[ "$spec" == "UNSET" ]]; then
-    env -u ACP_BRIDGE_BATCH PATH="$stubdir:$PATH" HOME="$sandbox" ACP_BRIDGE_AGENT="batchtest" "$SUPERVISE" &
+    env -u ACP_BRIDGE_BATCH PATH="$stubdir:$PATH" HOME="$sandbox" ACP_BRIDGE_AGENT="batchtest" "$SUPERVISE" >"$sandbox/supervise.out" 2>&1 &
   else
-    env ACP_BRIDGE_BATCH="$spec" PATH="$stubdir:$PATH" HOME="$sandbox" ACP_BRIDGE_AGENT="batchtest" "$SUPERVISE" &
+    env ACP_BRIDGE_BATCH="$spec" PATH="$stubdir:$PATH" HOME="$sandbox" ACP_BRIDGE_AGENT="batchtest" "$SUPERVISE" >"$sandbox/supervise.out" 2>&1 &
   fi
   pid=$!
-  for _ in $(seq 1 50); do [[ -s "$log" ]] && { up=1; break; }; sleep 0.1; done
+  # Bounded wait on the POSITIVE readiness signal: the stub's new-session log line
+  # (T-4348). Deliberately NO ACP_BRIDGE_INBOX override. This suite keeps the
+  # DEFAULT launch path covered, including the python3 mailbox-hub lookup, while
+  # the trap and session_death suites skip that path. The lookup measured 4-5s on
+  # the loaded runner by itself, so the old 5s (50 x 0.1s) poll was a timing guess
+  # that load could beat. The bound is 60s wall-clock ($SECONDS, not an iteration
+  # count), and it only caps a launch that never happens.
+  local deadline=$((SECONDS + 60))
+  # A supervisor that died before new-session never will, so the kill -0 check
+  # breaks out at once instead of spending the whole 60s.
+  while (( SECONDS < deadline )); do
+    [[ -s "$log" ]] && { up=1; break; }
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  # Reap the children first (see above), then the script itself.
+  pkill -KILL -P "$pid" 2>/dev/null
   kill -KILL "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
   if [[ "$up" -eq 1 ]]; then cat "$log"; else echo "__NONE__"; fi
   rm -rf "$sandbox"
@@ -70,7 +95,11 @@ if grep -qF -- '--batch' <<<"$out"; then pass "ACP_BRIDGE_BATCH=1 -> --batch pre
 else fail "=1 did NOT add --batch (out: $out)"; fi
 
 out="$(capture_new_session 0)"
-if grep -qF -- '--batch' <<<"$out"; then fail "ACP_BRIDGE_BATCH=0 STILL added --batch — opt-out BROKEN (out: $out)"
+# An absence assertion must first prove there was a launch to inspect (T-4348).
+# Without this guard a launch that never happened ("__NONE__") has no --batch
+# either, so this case would PASS vacuously on a supervisor that never starts.
+if [[ "$out" == "__NONE__" ]]; then fail "ACP_BRIDGE_BATCH=0: supervise never reached new-session, so there was no launch argv to inspect"
+elif grep -qF -- '--batch' <<<"$out"; then fail "ACP_BRIDGE_BATCH=0 STILL added --batch — opt-out BROKEN (out: $out)"
 else pass "ACP_BRIDGE_BATCH=0 -> --batch absent (opt-out honored)"; fi
 
 echo

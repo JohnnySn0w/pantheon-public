@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ADR re-evaluation trigger walk (T-2527, design T-2526).
+"""ADR / policy / SOP re-evaluation trigger walk (T-2527, design T-2526; T-4556).
 
 Surfaces ADRs' re-evaluation triggers so they actually fire instead of becoming
 invisible permanent rules (the ORG-002 failure mode). Home is the weekly-review
@@ -9,10 +9,10 @@ is also runnable standalone (`python3 tools/adr_reeval_walk.py --dry-run`).
 Two tiers, per the accepted design (the operator TG 6798 "Auto file"):
 
   * DETERMINISTIC triggers (calendar past-due; a named ticket resolved; an
-    instrumented metric crossed) -> AUTO-FILE a target=orchestrator re-eval ticket,
+    instrumented metric crossed) -> AUTO-FILE a target=role:engineering_orchestrator re-eval ticket,
     DEDUPED against open re-eval tickets so a weekly re-run never re-files.
   * FUZZY / event / prose triggers (cannot be machine-decided as "fired") ->
-    SURFACE-ONLY in an "ADR re-eval watch" section of the weekly review,
+    SURFACE-ONLY in an "ADR / policy / SOP re-eval watch" section of the weekly review,
     keyword-flagged against the week's activity.
 
 Triggers are read from a structured `re_evaluate:` frontmatter key AND the prose
@@ -24,6 +24,21 @@ so an ADR that states its trigger only inline — no `## Re-evaluate when` secti
 and no structured key — is currently UNCAUGHT. T-2530 tracks backfilling a
 structured `re_evaluate:` key onto those. The structured key is the forward-going,
 machine-checkable form (seeded on ORG-062:R1-R4 as the reference example).
+
+Policy and SOP roots (T-4556): `rulebook/policies/` and `sop/` (recursive) are
+also scanned, so a trigger declared in a governance doc (e.g. autonomy.md's dead-
+bridge trigger, which fired unseen for ~4 months) reaches the watch section. Two
+declaration shapes are read for these roots ONLY (ADR parsing is unchanged, so
+ADR trigger ids stay stable): the `## Re-evaluate when` section (bullets, or plain
+lines when the section has none) and `**Re-evaluate when:** a; b; c.` lines
+(split on `;`). A METADATA header line (before the first `##` heading) is dropped
+when the doc also has a non-empty section (it is a compressed copy); a mid-body
+line (after the first `##`) scopes a subsection and is always kept; a pointer
+("see ... section") yields nothing. Every non-ADR trigger is SURFACE-ONLY — no
+auto-filing from policy/SOP prose. Ids are path-derived: `policy:<name>:S<n>|H<n>`
+and `sop:<subdir>/<name>:S<n>|H<n>` (S = section, H = header line); the `adr_id`
+field holds the doc label (`policy:<name>` / `sop:<subdir>/<name>`).
+`grand_program.scan_source_obligations` stays ADR-only.
 
 The dedup guard mirrors tools/mirror_drift_sweep.existing_open_refresh_ticket
 (the proven idempotent-auto-file pattern; T-1994 / T-0838 directive analog).
@@ -47,6 +62,9 @@ from tools import grand_project_program as grand_program
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ADR_DIR = REPO_ROOT / "architecture" / "adr"
 TICKETS_ROOT = REPO_ROOT / "tickets"
+# Governance-doc roots scanned (surface-only) alongside ADRs — T-4556.
+POLICY_DIR_REL = Path("rulebook") / "policies"
+SOP_DIR_REL = Path("sop")
 TICKET_BIN = REPO_ROOT / "tools" / "ticket.py"
 
 # Label vocabulary — the dedup key lives in labels so open-ticket scanning finds it.
@@ -230,6 +248,96 @@ def scan_adrs(adr_dir: Path = ADR_DIR) -> list[Trigger]:
 
 
 # ---------------------------------------------------------------------------
+# Policy / SOP docs (T-4556) — surface-only, header-line + section shapes
+# ---------------------------------------------------------------------------
+
+_HEADER_LINE_RE = re.compile(r"^\*\*Re-evaluate when:\*\*[ \t]*(?P<text>\S.*?)[ \t]*$", re.MULTILINE)
+_FIRST_H2_RE = re.compile(r"^#{2,}\s", re.MULTILINE)
+_POINTER_RE = re.compile(r"^see\b", re.IGNORECASE)
+
+
+def _split_semicolons(text: str) -> list[str]:
+    """Split on `;` outside parentheses/backticks; strip a trailing period."""
+    parts: list[str] = []
+    depth = 0
+    in_tick = False
+    cur: list[str] = []
+    for ch in text:
+        if ch == "`":
+            in_tick = not in_tick
+        elif not in_tick:
+            if ch == "(":
+                depth += 1
+            elif ch == ")" and depth:
+                depth -= 1
+            elif ch == ";" and depth == 0:
+                parts.append("".join(cur))
+                cur = []
+                continue
+        cur.append(ch)
+    parts.append("".join(cur))
+    return [p.strip().rstrip(".").strip() for p in parts if p.strip().rstrip(".").strip()]
+
+
+def _governance_label(path: Path, repo_root: Path) -> str:
+    rel = path.relative_to(repo_root)
+    if rel.parts[:2] == POLICY_DIR_REL.parts:
+        return "policy:" + rel.relative_to(POLICY_DIR_REL).with_suffix("").as_posix()
+    return "sop:" + rel.relative_to(SOP_DIR_REL).with_suffix("").as_posix()
+
+
+def parse_governance_doc(path: Path, repo_root: Path = REPO_ROOT) -> list[Trigger]:
+    """Extract surface-only re-eval triggers from one policy/SOP doc."""
+    text = path.read_text(encoding="utf-8", errors="replace")
+    label = _governance_label(path, repo_root)
+
+    def mk(tid_suffix: str, when: str) -> Trigger:
+        return Trigger(adr_id=label, trigger_id=f"{label}:{tid_suffix}", ttype="prose",
+                       when=when, fires="surface", source="prose", text=when)
+
+    # Section triggers: bullets, else plain non-empty lines.
+    section_whens: list[str] = []
+    m = _REEVAL_SECTION_RE.search(text)
+    if m:
+        body = m.group("body")
+        bullets = [b.group("text").strip() for b in _PLAIN_BULLET_RE.finditer(body)]
+        if bullets:
+            section_whens = bullets
+        else:
+            section_whens = [ln.strip() for ln in body.splitlines()
+                             if ln.strip() and not ln.lstrip().startswith("#")]
+
+    h2 = _FIRST_H2_RE.search(text)
+    first_h2 = h2.start() if h2 else len(text)
+    header_whens: list[str] = []
+    for hm in _HEADER_LINE_RE.finditer(text):
+        in_meta = hm.start() < first_h2
+        if in_meta and section_whens:
+            continue  # metadata header is a compressed copy of the section
+        raw = hm.group("text")
+        if _POINTER_RE.match(raw):
+            continue
+        header_whens.extend(_split_semicolons(raw))
+
+    out = [mk(f"S{i}", w) for i, w in enumerate(section_whens, 1)]
+    out += [mk(f"H{i}", w) for i, w in enumerate(header_whens, 1)]
+    return out
+
+
+def scan_governance_docs(repo_root: Path = REPO_ROOT) -> list[Trigger]:
+    triggers: list[Trigger] = []
+    for rel in (POLICY_DIR_REL, SOP_DIR_REL):
+        root = repo_root / rel
+        if not root.is_dir():
+            continue
+        for path in sorted(root.rglob("*.md")):
+            if path.name.upper().startswith("README"):
+                continue
+            triggers.extend(parse_governance_doc(path, repo_root))
+    return triggers
+
+
+# ---------------------------------------------------------------------------
 # Deterministic evaluation
 # ---------------------------------------------------------------------------
 
@@ -319,7 +427,7 @@ def existing_open_reeval_ticket(
 def file_reeval_ticket(
     trigger: Trigger, *, repo_root: Path = REPO_ROOT, push: bool = True
 ) -> str:
-    """Shell out to tools/ticket.py to file a target=orchestrator re-eval ticket."""
+    """Shell out to tools/ticket.py to file a target=role:engineering_orchestrator re-eval ticket."""
     title = f"Re-evaluate {trigger.adr_id} ({trigger.trigger_id}): trigger fired"
     ask = (
         f"The re-evaluation trigger {trigger.trigger_id} on {trigger.adr_id} has "
@@ -333,7 +441,7 @@ def file_reeval_ticket(
     cmd = [
         sys.executable, str(repo_root / "tools" / "ticket.py"), "file",
         "--requester", "recovery",
-        "--target", "orchestrator",
+        "--target", "role:engineering_orchestrator",
         "--title", title,
         "--labels", labels,
         "--project-id", "null",
@@ -379,22 +487,22 @@ _STOPWORDS = frozenset({
 
 
 def build_watch_section(surface_triggers: list[Trigger], week_activity: str = "") -> str:
-    """Render the 'ADR re-eval watch' markdown section for the weekly review."""
+    """Render the 'ADR / policy / SOP re-eval watch' markdown section for the weekly review."""
     if not surface_triggers:
         return (
-            "## ADR re-eval watch\n\n"
+            "## ADR / policy / SOP re-eval watch\n\n"
             "_No prose/event re-evaluation triggers to surface this week._\n"
         )
     lines = [
-        "## ADR re-eval watch",
+        "## ADR / policy / SOP re-eval watch",
         "",
-        "Surface-only re-evaluation triggers (event/prose — not machine-decidable "
+        "Surface-only re-evaluation triggers from ADRs, policies and SOPs (event/prose — not machine-decidable "
         "as fired). A ⚑ marks a trigger whose keywords intersect this week's "
         "activity, i.e. worth a look now. Deterministic triggers (calendar / "
         "resolved-ticket / instrumented-metric) auto-file their own re-eval "
         "tickets and are not listed here.",
         "",
-        "| ADR | Trigger | Re-evaluate when | ⚑ |",
+        "| Doc | Trigger | Re-evaluate when | ⚑ |",
         "|---|---|---|---|",
     ]
     for t in sorted(surface_triggers, key=lambda x: x.trigger_id):
@@ -471,6 +579,7 @@ def run_walk(
     now: dt.date,
     week_activity: str = "",
     adr_dir: Path = ADR_DIR,
+    governance_root: Path | None = None,
     tickets_root: Path = TICKETS_ROOT,
     metrics: dict[str, float] | None = None,
     metric_evidence_refs: dict[str, str] | None = None,
@@ -482,6 +591,12 @@ def run_walk(
     """Walk all ADRs: auto-file fired deterministic triggers (deduped), and build
     the surface-only watch section."""
     triggers = scan_adrs(adr_dir)
+    # Policy/SOP docs (T-4556): surface-only. Default root is the real repo only
+    # when walking the real ADR dir, so fixture-ADR callers stay hermetic.
+    if governance_root is None and adr_dir == ADR_DIR:
+        governance_root = REPO_ROOT
+    if governance_root is not None:
+        triggers = triggers + scan_governance_docs(governance_root)
     resolved = resolved_ticket_ids(tickets_root)
 
     surface = [t for t in triggers if t.fires != "auto-ticket" or t.ttype not in DETERMINISTIC_TYPES]
@@ -601,7 +716,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     now = args.today or dt.date.today()
     result = run_walk(now=now, dry_run=args.dry_run, push=not args.no_push)
-    print(f"[adr_reeval_walk] scanned ADRs; {len(result.fired)} deterministic trigger(s) fired, "
+    print(f"[adr_reeval_walk] scanned ADRs + policies/SOPs; {len(result.fired)} deterministic trigger(s) fired, "
           f"{len(result.filed)} filed, {len(result.deduped)} deduped, "
           f"{result.surface_count} surface-only.")
     print(

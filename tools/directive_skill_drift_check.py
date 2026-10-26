@@ -11,9 +11,10 @@ named it. This makes that drift LOUD instead of silent.
 Checks that every `## DN` header in directives.md is mentioned in the skill.
 Exit 0 = in sync; exit 1 = drift (skill missing one or more directive ids).
 
-Cross-repo: directives.md lives in pantheon-config; the canonical skill lives in
-the claude-code harness-config repo. Skill path resolves in order: --skill arg,
-$ORG_SKILL_PATH, then a list of known local fallbacks.
+Since ORG-091 (T-4750) the canonical skill lives in this repo's harness/claude/; a
+fork may carry it in a separate harness-config repo instead. Skill path resolves in
+order: --skill arg, $ORG_SKILL_PATH, then the known fallbacks, in-repo harness/claude
+first (T-4763: the old ~/claude-config clone is frozen and can go stale).
 
 Decoupling contract (ORG-039 §4): a fork of pantheon-config WITHOUT a harness-config
 repo configured must not half-break. So:
@@ -33,6 +34,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DIRECTIVES = os.path.join(REPO, "rulebook", "directives.md")
 
 SKILL_FALLBACKS = [
+    os.path.join(REPO, "harness", "claude", "skills", "pantheon-org-discipline", "SKILL.md"),
     os.path.expanduser("~/claude-config/skills/pantheon-org-discipline/SKILL.md"),
     os.path.expanduser("~/.claude/skills/pantheon-org-discipline/SKILL.md"),
     os.path.join(REPO, "claude-config", "skills", "pantheon-org-discipline", "SKILL.md"),
@@ -93,8 +95,8 @@ def main():
             print("[directive-skill-drift] SKIP: no harness-config repo configured "
                   "(pantheon-org-discipline SKILL.md not found). This is expected for a fork "
                   "without a harness-config repo. To enable the drift check, set $ORG_SKILL_PATH "
-                  "(or --skill) to your harness-config skill, or clone claude-code-config beside "
-                  "pantheon-config. Strict validation runs only when the skill is present (ORG-039 §4).")
+                  "(or --skill) to your harness-config skill, or restore harness/claude/ in this "
+                  "repo. Strict validation runs only when the skill is present (ORG-039 §4).")
         return 0
 
     have = skill_ids(skill)
@@ -104,7 +106,8 @@ def main():
         print(f"[directive-skill-drift] DRIFT: directives.md defines {ids} but the "
               f"pantheon-org-discipline skill does not mention them.\n"
               f"  source : {DIRECTIVES}\n  skill  : {skill}\n"
-              f"  -> update the skill (claude-config) + bump the vendored submodule pins. "
+              f"  -> update the skill (harness/claude/skills/pantheon-org-discipline/ in this repo, "
+              f"or your fork's harness-config repo). "
               f"This is the T-0603 staleness class.")
         return 1
     print(f"[directive-skill-drift] OK: skill covers all {len(src)} directive ids "

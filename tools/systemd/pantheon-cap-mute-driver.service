@@ -1,0 +1,49 @@
+# Cap-collateral auto-mute driver (T-3844). During a weekly spend-cap window every
+# capped seat keeps tripping the monitors — no-progress reads exactly like wedged/
+# stale/down — and floods the operator with ~30 cap-COLLATERAL alerts. The seats are
+# not broken, they are capped. This driver reads each seat's cap flag from the T-4037
+# mid-session-cap detector (<persona>/mid-session-cap.json: modal_present + fresh
+# observed_at, cross-account via sudo — re-pointed off breaker_open per T-4041, which
+# T-3847 proved blind to mid-session caps) and drives the SHARED notify-mute registry:
+# capped -> mute(reason=usage-cap), cap-lift -> unmute. It manages ONLY its own cap-auto
+# mutes (a manual/operator mute is never touched), fails OPEN toward alerting (an
+# unreadable/stale flag never auto-mutes), and force-unmutes a stuck mute older than the
+# backstop window.
+#
+# ARM GATE (T-4041): the live registry write is default-OFF. ExecStart below runs
+# OBSERVE-only (logs the would-* dispositions, writes nothing) until the SUPERVISED
+# first-fire; add `--arm` (or Environment=CAP_MUTE_ARM=1) to go live thereafter.
+#
+# Runs on RECOVERY's account (same posture as context_fill_monitor + credential_expiry):
+# one write to the group-readable hub registry covers every alert-emitting monitor,
+# because route_failure_alert (the 13-monitor chokepoint), context_fill_monitor's
+# _seat_muted, and unit_failure_alert (T-3844 inc2a) all read is_muted() from it.
+#
+# Level-triggered + idempotent: each fire reconciles current breaker vs current mute,
+# so a missed cycle simply resumes (no Persistent= needed).
+[Unit]
+Description=Pantheon cap-mute driver — auto-mute cap-collateral alerts while a seat is usage-capped; auto-clear on cap-lift (T-3844)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# ORG-076 §7 per-persona notify-mute registry (T-2978/T-2987 go-live) — the SAME
+# source of truth is_muted() reads. This driver is a WRITER of it; the monitors are
+# readers. Fail-open if absent (notify_policy defaults to the never-created /opt path).
+Environment=PANTHEON_MUTE_REGISTRY=/var/lib/pantheon/notify-mute/notify_mute.json
+# Pure file-reads (sudo cat of each seat's transition.json) + a registry write — no
+# LLM, no Claude API — so it keeps working during a full cap/auth outage, which is
+# exactly when it must run. 6 sequential sudo reads at 15s timeout each => ~90s worst
+# case; TimeoutStartSec gives headroom.
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/cap_mute_driver.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=3min
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,32 @@
+# host-substrate verify invariant list (T-5084, tranche GE).
+#
+# CURRENT (co-author recovery; D15 approved at 71fd484cc). Evaluated by
+# tools/germinate/host_substrate/invariants.py, UNWIRED: the engine verify leg
+# does not evaluate invariant lists yet (engine seam gap S1, T-5135). The
+# contract's invariant_list_digest is list_digest() over {id, invariants}.
+schema: pantheon-invariant-list/v0
+id: org.pantheon.host-substrate/v1
+status: CURRENT
+co_author: recovery
+signoff: approved
+invariants:
+  - id: HS1-accounts
+    check: every manifest account's passwd entry matches uid, gid == uid, home, shell; unlocked
+  - id: HS2-groups
+    check: every allowlisted group exists with its manifest gid
+  - id: HS3-memberships
+    check: every allowlisted membership is present
+  - id: HS4-linger
+    check: linger is enabled for every manifest account declaring it
+  - id: HS5-owned-paths
+    check: owner, group, mode and ACL entries match below the installer-owned roots
+  - id: HS6-mailbox-dirs
+    check: every mailbox directory exists with its manifest owner, group and mode
+  - id: HS7-system-units
+    check: every system unit and drop-in matches its pinned sha256 (0644 root); declared units are enabled
+  - id: HS8-dbus-policies
+    check: every D-Bus policy fragment matches its pinned sha256 (0644 root)
+  - id: HS9-sudoers-fragments
+    check: every sudoers fragment matches its rendered template sha256 (0440 root)
+  - id: HS10-legacy-requirements
+    check: every legacy_requirements path is present (read-only; T-3401 pieces outside the families)

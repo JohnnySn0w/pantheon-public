@@ -16,7 +16,7 @@ elements:
   - {id: E1, text: "D1: Handshake-failure handling — clean ABORT (ORG-047 D1) then bounded exponential backoff + temporary throttle; repeated failures do NOT trigger immediate permanent de-auth"}
   - {id: E2, text: "D2: Session quarantine — automatic, reversible isolation of a misbehaving live counterparty (downgrade attempt / quota breach / auth anomaly / denied-action storm); permanent de-auth stays operator-owned"}
   - {id: E3, text: "D3: Seat and seed recovery runbooks — seat recovery (revoke delegated cred, re-mint, rotate seat-specific keys) is per-seat; seed recovery is a governance decision"}
-  - {id: E4, text: "D4: DID-host disaster-recovery — did:web:snowis.me anchor is a SPOF; fail-closed beyond cache TTL; a different DID is a different identity, not a recovery (no identity hot-swap)"}
+  - {id: E4, text: "D4: DID-host disaster-recovery — did:web:your-domain.example anchor is a SPOF; fail-closed beyond cache TTL; a different DID is a different identity, not a recovery (no identity hot-swap)"}
   - {id: E5, text: "D5: Health signals feed fleet monitoring — handshake success/abort rate, resolution latency, apex reachability, quarantine count emitted so degrading surfaces are detected proactively"}
 ---
 
@@ -29,7 +29,7 @@ elements:
 
 ## Why this ADR exists
 
-ORG-047 specifies the *happy path* (a clean mutually-authenticated handshake) and the *root-compromise* path (D5 rotation-recovery), but the space between is unspecified: a handshake that keeps failing, a counterparty that authenticates cleanly then misbehaves mid-session, a single seat whose credential is compromised, and — the sharpest gap — an **anchor that is unreachable**. `did:web:snowis.me` is a single point of verification for the entire federation: if the apex is down, *no* passport verifies. This ADR names the failure-handling, quarantine, recovery, and DR so the federation degrades safely rather than unpredictably.
+ORG-047 specifies the *happy path* (a clean mutually-authenticated handshake) and the *root-compromise* path (D5 rotation-recovery), but the space between is unspecified: a handshake that keeps failing, a counterparty that authenticates cleanly then misbehaves mid-session, a single seat whose credential is compromised, and — the sharpest gap — an **anchor that is unreachable**. `did:web:your-domain.example` is a single point of verification for the entire federation: if the apex is down, *no* passport verifies. This ADR names the failure-handling, quarantine, recovery, and DR so the federation degrades safely rather than unpredictably.
 
 ## Context — what is already fixed (do not design over it)
 
@@ -58,10 +58,10 @@ A counterparty that authenticated cleanly but then misbehaves — a downgrade at
 
 ### D4 — DID-host disaster-recovery: the anchor is a SPOF; bound the failure
 
-`did:web:snowis.me` at the apex is a single point of verification for the whole federation. DR:
+`did:web:your-domain.example` at the apex is a single point of verification for the whole federation. DR:
 - **Availability target + restore path** — the anon-resolvable apex vhost (the ORG-046 / caddy substrate) has a documented, tested restore path; the DID document + StatusList are static files, so restoration is fast and does not require the offline root.
 - **Behavior when unreachable (fail-closed within cache)** — counterparties serve the DID doc from cache within its short TTL (ORG-047 D5 / ORG-071 D2); **beyond** the TTL, a handshake that cannot resolve the anchor **fails closed** (a passport cannot be honored against an unverifiable anchor). This is the deliberate cost of the freshness-first caching choice (ORG-071 D2): a brief anchor outage degrades to failed handshakes, never to accepted-but-unverified sessions.
-- **No hot-swap of the identity** — DR restores the *same* `did:web:snowis.me`; it never silently fails over to a different DID (which would be an identity change, not a recovery).
+- **No hot-swap of the identity** — DR restores the *same* `did:web:your-domain.example`; it never silently fails over to a different DID (which would be an identity change, not a recovery).
 
 *Justifies-via:* ORG-047 D2 (anon-resolvable apex) + ORG-071 D2 (freshness-first) + P1 (a specified, tested restore path over an assumed one).
 
@@ -98,6 +98,4 @@ The federation surface emits health signals — handshake success/abort rate, re
 
 ## Provenance / review trail
 
-- 2026-08-10 — HO-drafted as ORG-047 Split C per the T-2803 triage (disposition: SPLIT; operator-named split-candidate #3). Absorbs the failure/quarantine/recovery (#5) and DID-host-DR (#15) considerations.
-- 2026-08-11 — Codex ORG-041 review **round 1**: not-clean (core decisions sound — rejecting auto-de-auth + backup-DID-hotswap — but missing normative surfaces: named availability target, two-phase backoff keying, quarantine state machine, partial-anchor-failure handling, recovery triggers, alert thresholds). HO integrated into **v2**: the **Normative additions** section (A1–A8). Record: `notes/2026-08-11-org072-review-round1.md`.
-- RATIFIED 2026-09-06 (the operator, per architecture/adr/README index + status frontmatter). On ratify: file the build sub-ticket set (backoff/quarantine logic, seat/seed recovery runbooks, apex DR restore + fail-closed behavior, health-signal emitters) under scoping ticket T-2813, per the ADR-scoping rule.
+Drafting and review history (ORG-047 Split C; Codex ORG-041 round 1 → v2; ratified with relocation 2026-09-06): `notes/2026-10-08-org-072-review-history.md`.

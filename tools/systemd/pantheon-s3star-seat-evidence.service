@@ -1,0 +1,23 @@
+[Unit]
+Description=Pantheon S3* per-seat evidence — Recovery captures each account's user units, timers and transcript inventory for the auditor (T-4928)
+Documentation=file:///home/%u/pantheon-config/tools/s3star_seat_evidence.py
+After=network.target
+
+# Exit 1 (a capture failed; bundle still written) and 2 (bundle not written) both alert Recovery.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# The workspace is group pantheon-mailbox (2770) and user units cannot set
+# supplementary groups (SupplementaryGroups= fails 216 on --user), hence sg.
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/s3star_seat_evidence.py"
+StandardOutput=journal
+StandardError=journal
+# 9 accounts x 4 short reads, each capped at 60s by the tool.
+TimeoutStartSec=10min
+Nice=10
+
+[Install]
+WantedBy=default.target

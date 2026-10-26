@@ -1,0 +1,28 @@
+#!/usr/bin/python3 -I
+"""FAKE loginctl, bind-mounted over /usr/bin/loginctl INSIDE the T-2918 sandbox only.
+
+systemd-logind does not run in a user namespace. This fake reproduces the
+observable effect of `loginctl enable-linger|disable-linger <user>` on a real
+host (the /var/lib/systemd/linger/<user> flag file) and logs every argv.
+Evidence from it is "fake-port tier" (ORG-052 gate 8); real linger is T-2924's.
+"""
+import os
+import pwd
+import sys
+
+LOG = "/var/lib/systemd/pantheon-fake-systemd.log"
+with open(LOG, "a", encoding="utf-8") as log:
+    log.write("loginctl " + " ".join(sys.argv[1:]) + "\n")
+if len(sys.argv) != 3 or sys.argv[1] not in ("enable-linger", "disable-linger"):
+    sys.stderr.write("fake loginctl: unsupported invocation\n")
+    sys.exit(1)
+try:
+    pwd.getpwnam(sys.argv[2])
+except KeyError:
+    sys.stderr.write(f"Failed to look up user {sys.argv[2]}\n")
+    sys.exit(1)
+flag = os.path.join("/var/lib/systemd/linger", sys.argv[2])
+if sys.argv[1] == "enable-linger":
+    open(flag, "a").close()
+elif os.path.exists(flag):
+    os.unlink(flag)

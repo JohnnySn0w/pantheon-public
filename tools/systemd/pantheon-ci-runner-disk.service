@@ -1,0 +1,15 @@
+[Unit]
+Description=Pantheon CI-runner disk monitor — CT202 (pve2 ci-runner) rootfs + /ci-cache free space, mails Recovery (T-4176)
+Documentation=file:///home/%u/pantheon-config/tools/ci_runner_disk_monitor.py
+# Silent-failure guard (T-1868): exit 2 = an alert that could not be mailed.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/ci_runner_disk_monitor.py --check
+StandardOutput=journal
+StandardError=journal
+# ssh + df (60s) plus a best-effort du on a seek-bound HDD (150s) on a breach.
+TimeoutStartSec=5min

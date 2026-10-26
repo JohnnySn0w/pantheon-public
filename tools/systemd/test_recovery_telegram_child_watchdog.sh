@@ -42,6 +42,10 @@ assert "consec=1 logged" 'consec=1'
 echo "T2: second absent fire -> debounce met -> WOULD FIRE"
 seed "consec=1" "last_restart=0" "restarts=" "escalated_at=0"; run
 assert "would-fire self_restart" 'WOULD FIRE self_restart'
+# T-4159: the fire goes through recovery_self_restart.sh (target resolved from
+# instance.yaml), never a hardcoded bespoke unit that a control-plane move retires.
+assert "fires the resolving wrapper" 'WOULD FIRE self_restart .*recovery_self_restart\.sh'
+[[ "$(last)" == *claude-telegram-fallback.service* ]] && { echo "  FAIL: fire names the bespoke unit"; FAIL=$((FAIL+1)); } || { echo "  PASS: no hardcoded bespoke unit"; PASS=$((PASS+1)); }
 
 echo "T3: within cooldown of a recent restart -> HOLD"
 seed "consec=1" "last_restart=$NOW" "restarts=$NOW" "escalated_at=0"; run

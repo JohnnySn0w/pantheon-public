@@ -1,0 +1,22 @@
+[Unit]
+Description=memex failed-unit check (T-4598) — mail archivist when a --user unit on LXC 203 is failed; fail when 203 is unreachable or the mail cannot be delivered
+Documentation=file:///home/%u/pantheon-config/tools/memex_failed_unit_check.py
+# No After=/Wants=network-online.target: they are no-ops in a --user manager.
+# A broken CHECK reaches the fleet (exit 1 = mail undeliverable, exit 3 = 203
+# unreachable/unparseable). A failed memex unit is a DOMAIN failure: it is mailed to
+# its owner and this unit stays green (exit 0), so a multi-day failure does not page
+# Recovery every run. Do not "fix" that into a failing exit.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# `sg pantheon-mailbox -c` is REQUIRED: the mailbox hub is mode-2770 group
+# pantheon-mailbox, and a user-mode systemd service runs with only the account's
+# primary group (SupplementaryGroups= fails 216 on --user units). Same wrap as the
+# installed pantheon-mailbox-wake@.service (T-1015).
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/memex_failed_unit_check.py"
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=5min

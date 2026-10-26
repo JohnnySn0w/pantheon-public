@@ -520,7 +520,7 @@ class TestT2261RegistrationParsing(unittest.TestCase):
         self.assertIn(self.DEPLOYED, detail)
 
     def test_bytes_present_but_a_different_hook_registered_is_INERT(self):
-        """THE MEASURED CASE. metis's and atlas's seats both had this exact settings.json —
+        """THE MEASURED CASE. mason's and artisan's seats both had this exact settings.json —
         one SessionStart entry, ensure-hooks-active.sh — while handoff-auto-read.sh sat on
         disk byte-perfect, mode 755, VERIFIED, and was never invoked by anything."""
         status, detail = self._p(_settings(
@@ -1144,6 +1144,85 @@ class RefuseMessageNamesTheRealFailureT2317(unittest.TestCase):
                          dh.ACTION_PULL)
         self.assertEqual(dh.plan_step("a", pathlib.Path("/p"), is_symlink=False).action,
                          dh.ACTION_COPY)
+
+
+class TestT4473ClassifyDeployedCopy(unittest.TestCase):
+    """T-4473: verify-hook-integrity.sh downgrades a drifted copy to INFO only when it is
+    PROVABLY never executed. DORMANT needs a registration of the basename ELSEWHERE, and no
+    settings file that runs the deployed path or cannot be read. Every other shape keeps
+    the alarm (dormant == False)."""
+
+    HOOK = "background-pipe-gate.py"
+    ACCT = "someone"
+
+    def setUp(self):
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.user = f"{self.home}/.claude/settings.json"
+        self.local = f"{self.home}/.claude/settings.local.json"
+        os.makedirs(f"{self.home}/.claude")
+
+    def _write(self, path, commands, *, key="PreToolUse"):
+        Path(path).write_text(_settings(commands, key=key), encoding="utf-8")
+
+    def _classify(self):
+        return dh.classify_deployed_copy(self.HOOK, self.home, self.ACCT,
+                                         sources=[self.user, self.local])
+
+    def test_registered_from_the_clone_is_DORMANT_and_names_the_path(self):
+        clone = f"{self.home}/pantheon-config/tools/hooks/{self.HOOK}"
+        self._write(self.user, [f"python3 {clone}"])
+        dormant, detail = self._classify()
+        self.assertTrue(dormant)
+        self.assertIn(clone, detail)
+
+    def test_registered_at_the_deployed_path_is_not_dormant(self):
+        self._write(self.user, [f"python3 ~/.claude/hooks/{self.HOOK}"])
+        self.assertFalse(self._classify()[0])
+
+    def test_home_kwarg_resolves_tilde_against_that_home(self):
+        # Without home=, ~ would resolve to /home/someone and the deployed path under the
+        # sandbox HOME would read as ELSEWHERE: an executed copy misfiled as dormant.
+        self._write(self.user, [f"python3 ~/.claude/hooks/{self.HOOK}"])
+        status, _ = dh.parse_registration(Path(self.user).read_text(), self.HOOK, self.ACCT,
+                                          home=self.home)
+        self.assertEqual(status, dh.STATUS_ACTIVE)
+
+    def test_registered_nowhere_is_not_dormant(self):
+        self._write(self.user, ["python3 /opt/other.py"])
+        dormant, detail = self._classify()
+        self.assertFalse(dormant)
+        self.assertIn("registered nowhere", detail)
+
+    def test_no_settings_at_all_is_not_dormant(self):
+        self.assertFalse(self._classify()[0])
+
+    def test_a_second_settings_file_that_runs_the_deployed_path_wins(self):
+        self._write(self.user, [f"python3 /x/pantheon-config/tools/hooks/{self.HOOK}"])
+        self._write(self.local, [f"python3 {self.home}/.claude/hooks/{self.HOOK}"], key="SessionStart")
+        self.assertFalse(self._classify()[0])
+
+    def test_an_unparseable_settings_file_is_not_dormant(self):
+        self._write(self.user, [f"python3 /x/pantheon-config/tools/hooks/{self.HOOK}"])
+        Path(self.local).write_text("{not json", encoding="utf-8")
+        self.assertFalse(self._classify()[0])
+
+    def test_an_unreadable_settings_file_is_not_dormant(self):
+        if os.geteuid() == 0:
+            self.skipTest("root reads mode-000 files")
+        self._write(self.user, [f"python3 /x/pantheon-config/tools/hooks/{self.HOOK}"])
+        Path(self.local).write_text("{}", encoding="utf-8")
+        os.chmod(self.local, 0)
+        self.addCleanup(os.chmod, self.local, 0o600)
+        self.assertFalse(self._classify()[0])
+
+    def test_default_sources_cover_user_project_and_managed_settings(self):
+        sources = dh._settings_sources("/home/x")
+        self.assertIn("/home/x/.claude/settings.json", sources)
+        self.assertIn("/home/x/.claude/settings.local.json", sources)
+        self.assertIn("/home/x/pantheon-config/.claude/settings.json", sources)
+        self.assertIn("/home/x/pantheon-config/.claude/settings.local.json", sources)
+        self.assertIn(dh.MANAGED_SETTINGS, sources)
 
 
 if __name__ == "__main__":

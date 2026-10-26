@@ -12,11 +12,13 @@ function).
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from . import marker
 from .exceptions import PostbootPreconditionUnmet, PrimitiveUnavailable
 
 
-def require_or_refuse() -> None:
+def require_or_refuse(*, marker_path: Path | None = None, boot_id_path: Path | None = None) -> None:
     """Raise unless postboot has completed on the current boot.
 
     Dispatch by ``marker.read_marker()``'s ``MarkerState``:
@@ -30,9 +32,13 @@ def require_or_refuse() -> None:
       enough").
     - ``MarkerPresent`` with matching boot_id -> returns ``None``
       (admitted).
+
+    ``marker_path`` / ``boot_id_path`` (T-5074, additive) let the
+    germination engine's simulated backend point the same decision at its
+    own sandbox files; ``None`` keeps the module-level production paths.
     """
 
-    state = marker.read_marker()
+    state = marker.read_marker(marker_path)
 
     if isinstance(state, marker.MarkerAbsent):
         raise PostbootPreconditionUnmet("postboot marker absent")
@@ -44,7 +50,7 @@ def require_or_refuse() -> None:
         raise PrimitiveUnavailable("postboot-marker", f"compat warning: {state.shape}")
 
     # isinstance(state, marker.MarkerPresent) -- the only remaining variant.
-    current = marker.current_boot_id()
+    current = marker.current_boot_id(boot_id_path)
     if state.boot_id != current:
         raise PostbootPreconditionUnmet(
             f"postboot marker stale: marker_boot={state.boot_id} current_boot={current}"

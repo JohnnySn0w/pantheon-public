@@ -164,7 +164,7 @@ class LiveBearerAdapter:
     def __init__(
         self,
         token: str,
-        parsed_doc: ParsedDidDocument,
+        parsed_doc: ParsedDidDocument | None = None,
         *,
         audience: str,
         replay_store: ReplayStore | None = None,
@@ -182,12 +182,29 @@ class LiveBearerAdapter:
     def scheme(self) -> Scheme:
         return Scheme.OIDC_BEARER
 
+    @property
+    def needs_did_doc(self) -> bool:
+        """True when built without a pre-parsed doc: PassportHandshake then
+        resolves the DID doc inside run() and calls verify_with_doc()."""
+        return self._doc is None
+
+    def verify_with_doc(self, endpoint_id: str, allowlist_entry: AllowlistEntry,
+                        did_doc: ParsedDidDocument) -> bool:
+        """Verify against the run-resolved document (stateless)."""
+        return self._verify(endpoint_id, did_doc)
+
     def verify(self, endpoint_id: str, allowlist_entry: AllowlistEntry) -> bool:
-        if self._doc.did != endpoint_id:
+        if self._doc is None:
+            logger.warning("bearer: no DID document (run-resolved doc not supplied)")
+            return False
+        return self._verify(endpoint_id, self._doc)
+
+    def _verify(self, endpoint_id: str, doc: ParsedDidDocument) -> bool:
+        if doc.did != endpoint_id:
             logger.warning("bearer: adapter DID %r != handshake endpoint %r",
-                           self._doc.did, endpoint_id)
+                           doc.did, endpoint_id)
             return False
         return verify_bearer_jwt(
-            self._token, self._doc,
+            self._token, doc,
             audience=self._audience, replay_store=self._replay,
             required_algorithm=self._alg, leeway_seconds=self._leeway)

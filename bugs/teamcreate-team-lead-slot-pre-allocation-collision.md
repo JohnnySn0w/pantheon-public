@@ -5,6 +5,8 @@ domain: pantheon, teamcreate, agent-spawn, sendmessage-routing
 ---
 
 
+**RETIRED 2026-09-14 — Claude Code 2.1.178 removed `TeamCreate`/`TeamDelete` (T-1281, 2026-06-22).** Teams are implicit now: every session has one, teammates are spawned via `Agent(name=...)` and addressed by that name. The specific pre-allocation collision below cannot happen without an explicit `TeamCreate` call — the mechanism is gone. Kept as-is (per T-1281's "keep-as-historical" disposition) to document past mechanics for anyone reading old cycles on old versions; the current-harness dispatch pattern is what the checklist below carries.
+
 > **Superseded as load-bearing by** [`sop/standard/team-orchestrator-dispatch-checklist.md`](../sop/standard/team-orchestrator-dispatch-checklist.md) — the live dispatch guidance these symptoms taught now lives in that checklist (ORG-012 supersedure-trail, T-0833 D-1). This entry remains the recorded symptom + diagnosis; act on the checklist for current guidance.
 
 ## Symptom

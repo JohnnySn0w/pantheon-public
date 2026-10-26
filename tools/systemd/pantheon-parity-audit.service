@@ -1,0 +1,30 @@
+[Unit]
+Description=Pantheon seat-parity audit — scheduled fleet ORG-099 parity sweep under recovery's substrate-audit lane (T-3750)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on a genuine crash (an unreadable
+# manifest, an import failure), wake Recovery via the ORG-026 mailbox. Ordinary drift is NOT a
+# failure here — the runner returns 0 and the ESCALATION is the output (same choice as
+# delivery_reachability), so this fires only on the runner itself breaking.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# READ-ONLY by construction: it invokes tools/parity_render.py (which never injects, enables or
+# sends) and writes only to recovery's OWN ~/parity-audit report dir and to the mailbox/ticket
+# escalation lanes. It pokes no live agent pane.
+#
+# `sg pantheon-mailbox` for the same reason mail_staleness / mailbox-wake / unit-failure-alert
+# use it: a `systemctl --user` unit does NOT inherit recovery's pantheon-mailbox supplementary group
+# (SupplementaryGroups= fails 216 on --user), and the escalation leg writes into orchestrator's hub
+# inbox (group pantheon-mailbox, mode 2770). The reports themselves land in recovery's own dir and
+# need no group; the wrap is for the mailbox send + is harmless for the report-only runs.
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/parity_audit_runner.py"
+StandardOutput=journal
+StandardError=journal
+# The audit shells one cross-account sudo probe per applicable (seat, axis) — ~8 seats over
+# ~20 axes. parity_render bounds each probe at 30s; this ceiling covers a slow manager or a
+# hung probe without wedging the runner.
+TimeoutStartSec=15min

@@ -70,7 +70,13 @@ from tools._git_utils import (  # noqa: E402
     push_with_retry,
     with_worktree,
 )
-from tools.agent_role_map import resolve_instance_role, resolve_persona  # noqa: E402
+from tools.agent_role_map import (  # noqa: E402
+    PersonaRoleMembershipError,
+    known_role_ids,
+    resolve_instance_role,
+    resolve_persona,
+    valid_target_values,
+)
 from tools import grand_project_program  # noqa: E402 — T-2426 / ORG-061 indexes
 from tools.adr_reeval_walk import (  # noqa: E402 — T-2841/ORG-065 BT1 reuse
     _adr_id_from,
@@ -82,6 +88,7 @@ from tools.ticket import (  # noqa: E402
     TICKET_FILENAME_RE,
     TicketError,
     _build_ticket_text,
+    _fm_snapshot,
     parse_front_matter,
     serialize_front_matter,
 )
@@ -89,7 +96,27 @@ from tools.watch_digest import read_telegram_token  # noqa: E402
 
 # Role IDs that are not persona-canonical — detected for AUTO-FIX class 3.
 # operator is excluded (no persona alias; passes through unchanged).
-_ROLE_ID_TARGETS: frozenset[str] = frozenset({"orchestrator", "specialist"})
+# head_research_orchestrator is specialist's T-3807 forward audit-id; specialist is
+# retained as the legacy audit-id (D1, P4 audit-continuity) — both normalize to specialist.
+# ORG-100 (T-3814) added the four UNAMBIGUOUS role-class audit-ids
+# (head_engineering_orchestrator→orchestrator, head_system_orchestrator→recovery,
+# head_memory_orchestrator→archivist, head_auditor→codex) — each normalizes 1:1 via
+# resolve_persona. orchestrator (orchestrator's OLD id) is KEPT: it still normalizes to
+# orchestrator via the PERSONA_ALIASES legacy alias (audit-continuity for historical targets).
+# engineering_orchestrator is DELIBERATELY EXCLUDED: its reverse is ambiguous
+# (mason OR artisan), so auto-normalizing it would silently mis-retarget — those two
+# seats' legacy [mason]/[artisan] targets ride persona-name identity instead (D-c).
+_ROLE_ID_TARGETS: frozenset[str] = frozenset(
+    {
+        "orchestrator",
+        "head_research_orchestrator",
+        "specialist",
+        "head_engineering_orchestrator",
+        "head_system_orchestrator",
+        "head_memory_orchestrator",
+        "head_auditor",
+    }
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -139,7 +166,7 @@ def _default_telegram_env() -> Path:
 TELEGRAM_ENV = Path(
     os.environ.get("PANTHEON_TELEGRAM_ENV", str(_default_telegram_env()))
 )
-TELEGRAM_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "456474197")  # the operator
+TELEGRAM_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "424242424")  # the operator
 
 # Telegram sendMessage text limit (below 4096 for safety headroom).
 _TELEGRAM_MAX_TEXT = 4000
@@ -331,6 +358,28 @@ def validate_repos_field(
         for e in entries
         if isinstance(e, dict) and e.get("name")
     }
+    # T-5239 / ORG-088: tickets route by ROLE, so the target is a pool of seats, not one
+    # persona. The declaration is satisfiable iff AT LEAST ONE member of the pool holds
+    # a sufficient grant (whichever member pulls it can do the work only if it has
+    # access; requiring EVERY member would flag any pool with a narrower-granted seat).
+    # An unverifiable membership source or an empty pool fails OPEN (no registry
+    # judgement is possible); an entry-shape error (bad access / unknown repo) is the
+    # same for every member, so the first member's error is reported.
+    if target and str(target).startswith("role:"):
+        from tools.agent_role_map import role_members
+        try:
+            members = sorted(role_members(str(target).split(":", 1)[1]))
+        except PersonaRoleMembershipError:
+            return None
+        if not members:
+            return None
+        first_err: str | None = None
+        for member in members:
+            err = validate_repos_field(repos_list, member, registry)
+            if err is None:
+                return None
+            first_err = first_err or err
+        return first_err
     # Two-step resolution (ORG-030 Phase 1):
     #   1. Normalize audit role-id or persona → canonical persona name.
     #   2. Persona → instance role-key (the grants table axis in repos.yaml).
@@ -417,20 +466,70 @@ def detect_malformations(
             ),
         )
 
-    # ---- AUTO-FIX class 3: target is a role-ID, not a persona name (T-0492) ----
-    # Persona names are now canonical for ticket target; role IDs are accepted
-    # as aliased input but normalized to persona names on write (msg_1661).
-    if target in _ROLE_ID_TARGETS:
-        persona = resolve_persona(target)
-        return LintResult(
-            tid=tid,
-            path=path,
-            action=LintAction.AUTO_FIX,
-            description=(
-                f"target={target!r} is a role-ID; persona name is canonical "
-                f"per T-0492/msg_1661; will normalize to {persona!r}"
-            ),
-        )
+    # ---- FLAG class: target is a PERSONA (or alias / bare audit role-id) — T-5239 ----
+    # ORG-088 amendment (the operator TG 12076/12077, 2026-10-19): tickets route by ROLE
+    # only. An OPEN (inbox/active) ticket carrying a seat target is malformed. FLAG,
+    # not AUTO_FIX: which role pool fits is the filer's call (the old T-0492 class-3
+    # role-id -> persona rewrite is RETIRED — it would now write the very thing this
+    # flags). Done tickets are never scanned (STATES_TO_LINT), so historical persona
+    # targets stay immutable. `operator` is the operator, not a seat — exempt.
+    if target and target != "operator" and not str(target).startswith("role:"):
+        from tools.agent_role_map import persona_pool_role
+        try:
+            pool = persona_pool_role(str(target))
+        except Exception:  # noqa: BLE001 - hint only
+            pool = None
+        if pool or target in _ROLE_ID_TARGETS or target in valid_target_values():
+            hint = f"role:{pool}" if pool else "a role:<R> pool"
+            return LintResult(
+                tid=tid,
+                path=path,
+                action=LintAction.FLAG,
+                description=(
+                    f"target={target!r} is a persona/seat; persona targeting is removed "
+                    f"(ORG-088, T-5239) - retarget to {hint}"
+                ),
+            )
+
+    # ---- FLAG class: target is `role:<R>` naming an UNKNOWN functional role ----
+    # ORG-088 Plane-A (T-3761). A fail-closed WRITE-class vocabulary check over the
+    # SAME known_role_ids() source the CLI file/retarget refusal uses. A role-pool
+    # ticket whose R is not a declared functional role_id — or whose membership
+    # vocabulary is unverifiable — can never resolve to eligible members, so FLAG it
+    # (no silent pass). FLAG, not AUTO_FIX: the correct role is a judgment call, not a
+    # mechanical rewrite. `role:<R>` is never target=operator, so this sits ahead of
+    # the operator-specific IMPROPER classes below. Shape via ticket_purpose's
+    # canonical ROLE_TARGET_RE (lazy import — the same idiom this module uses for its
+    # other ticket_purpose references); the role VOCABULARY authority is
+    # known_role_ids(), never duplicated.
+    from tools.ticket_purpose import ROLE_TARGET_RE
+
+    if isinstance(target, str) and ROLE_TARGET_RE.fullmatch(target):
+        role = target.split(":", 1)[1]
+        try:
+            vocab = known_role_ids()
+        except PersonaRoleMembershipError as exc:
+            return LintResult(
+                tid=tid,
+                path=path,
+                action=LintAction.FLAG,
+                description=(
+                    f"target={target!r} is a role-pool target but the functional-role "
+                    f"membership vocabulary is unverifiable ({exc}); cannot confirm the "
+                    f"role is known — fail-closed FLAG (ORG-088 Plane-A)"
+                ),
+            )
+        if role not in vocab:
+            return LintResult(
+                tid=tid,
+                path=path,
+                action=LintAction.FLAG,
+                description=(
+                    f"target={target!r} names an UNKNOWN functional role {role!r}; "
+                    f"not in known_role_ids() {sorted(vocab)} — a role-pool ticket must "
+                    f"target a declared functional role (ORG-088 Plane-A)"
+                ),
+            )
 
     # A genuinely-improper operator+ratify ticket should bounce to its
     # originator (RETARGET) rather than just FLAG. But we can only bounce when
@@ -536,7 +635,10 @@ def detect_malformations(
     # (positively-confirmed-absent) / None (unresolvable). ONLY False is a
     # defect. True and None are both non-defects — never flag/bounce what we
     # cannot positively verify as absent (the T-0549 false-bounce property).
-    if target == "operator" and intent == "ratify" and ratifiable_files:
+    # T-5014: widened from intent=ratify to EVERY target=operator ticket carrying
+    # ratifiable_files — an intent=action ask with a dead attachment is just as
+    # unopenable for the operator.
+    if target == "operator" and ratifiable_files:
         for entry in ratifiable_files:
             if ":" in entry:
                 _repo, _sep, rel_path = entry.partition(":")
@@ -547,7 +649,7 @@ def detect_malformations(
                 return _improper(
                     f"ratifiable_files entry {entry!r} positively confirmed absent "
                     f"at the canonical ref; STALE-PATH — originator must correct "
-                    f"the path before operator can ratify"
+                    f"the path before operator can open it"
                 )
 
     # ---- FLAG class: invalid `repos:` field vs the registry (T-0761) ----
@@ -568,6 +670,90 @@ def detect_malformations(
                     action=LintAction.FLAG,
                     description=f"repos: field invalid — {err}",
                 )
+
+    # ---- FLAG class: substate: awaiting-merge / awaiting_merge_ref
+    # consistency (T-4119) ----
+    # The two fields always travel together: `awaiting_merge_ref` is only
+    # meaningful alongside `substate: awaiting-merge`, and that substate is
+    # meaningless without a ref naming WHAT it's awaiting. FLAG (never
+    # AUTO_FIX) — the correct fix is either to run `ticket.py await-merge`
+    # properly or to hand-correct a stale/drifted pair; a lint auto-fix
+    # cannot know which the operator intended.
+    substate = fields.get("substate")
+    awaiting_merge_ref = fields.get("awaiting_merge_ref")
+    if substate == "awaiting-merge" and not (
+        isinstance(awaiting_merge_ref, str) and awaiting_merge_ref.strip()
+    ):
+        return LintResult(
+            tid=tid,
+            path=path,
+            action=LintAction.FLAG,
+            description=(
+                "substate: awaiting-merge with no (or empty) awaiting_merge_ref; "
+                "T-4119 requires a ref (e.g. <repo>#<pr> or <repo>:<branch>) "
+                "naming the external merge this ticket is parked on"
+            ),
+        )
+    if awaiting_merge_ref and substate != "awaiting-merge":
+        return LintResult(
+            tid=tid,
+            path=path,
+            action=LintAction.FLAG,
+            description=(
+                f"awaiting_merge_ref={awaiting_merge_ref!r} present but "
+                f"substate is {substate!r} (not awaiting-merge); T-4119's ref "
+                f"field is only meaningful alongside substate: awaiting-merge"
+            ),
+        )
+
+    # ---- FLAG class: substate: awaiting-merge outside active/ (T-4119
+    # REBOUND-1 finding #6) ----
+    # The pair-consistency checks above only verify the two fields travel
+    # together; they say nothing about WHERE the ticket lives. The substate
+    # is only meaningful while the ticket is actively held (cmd_await_merge
+    # refuses to set it anywhere else) — a well-formed pair sitting in
+    # inbox/ or done/ means unclaim/retarget/drop failed to strip it (T-4119
+    # closes those transition-time paths), or the pair was hand-edited into
+    # an invalid state directly. Either way it is a leaked marker: FLAG
+    # (never AUTO_FIX — same rationale as the pair checks above, a lint
+    # auto-fix cannot know whether the correct repair is to strip the
+    # marker or to re-claim the ticket first).
+    if substate == "awaiting-merge" and path.parent.name != "active":
+        return LintResult(
+            tid=tid,
+            path=path,
+            action=LintAction.FLAG,
+            description=(
+                f"substate: awaiting-merge found in `{path.parent.name}/`, not "
+                f"`active/`; T-4119's substate is only valid while the ticket "
+                f"is actively held — this is a leaked marker (unclaim / "
+                f"retarget / drop should have stripped it) and must be "
+                f"hand-corrected"
+            ),
+        )
+
+    # ---- FLAG class: duplicate `## Transition log` section header ----
+    # A body-fill Edit that includes a second `## Transition log` header
+    # after the template's built-in one produces a file that ticket.py
+    # append_transition cannot detect or dedupe: the function only verifies
+    # the header EXISTS, then appends the new entry at the tail. Subsequent
+    # annotates keep growing the file past the duplicate header without
+    # noticing. Caught only at read-time (or by this lint). FLAG, not
+    # AUTO_FIX: the two "filed in inbox" lines are byte-identical (from a
+    # freshly-filed ticket) but a hand-repair still wants the operator to
+    # confirm nothing else got duplicated. Discovered 2026-09-21 (T-3851 +
+    # T-3852 body-fills both did this).
+    if text.count("## Transition log") > 1:
+        return LintResult(
+            tid=tid,
+            path=path,
+            action=LintAction.FLAG,
+            description=(
+                "body contains multiple `## Transition log` section headers "
+                "(operator body-fill Edit likely duplicated the template's "
+                "built-in section); repair via direct Edit to keep exactly one"
+            ),
+        )
 
     # ---- CLEAN ----
     return LintResult(
@@ -608,6 +794,7 @@ def apply_auto_fix(path: Path, repo_root: Path | None = None) -> None:
     # Re-parse to get fields + body.
     text = path.read_text(encoding="utf-8")
     fields, body = parse_front_matter(text)
+    old_fields = _fm_snapshot(fields)  # T-4760: explicit old for the registry check
 
     target = fields.get("target", "")
     intent = fields.get("intent")
@@ -621,11 +808,8 @@ def apply_auto_fix(path: Path, repo_root: Path | None = None) -> None:
         # Class 2: drop intent — it is operator-only.
         del fields["intent"]
 
-    elif target in _ROLE_ID_TARGETS:
-        # Class 3 (T-0492): normalize role-ID target to persona name.
-        fields["target"] = resolve_persona(target)
 
-    new_text = _build_ticket_text(fields, body)
+    new_text = _build_ticket_text(fields, body, old_fields=old_fields)
     path.write_text(new_text, encoding="utf-8")
 
 
@@ -707,6 +891,76 @@ def warn_tickets(paths: list[Path]) -> list[LintResult]:
                 "add --serves '<arc-intent or goals.md key>' when filing; "
                 "goal-neutral maintenance must name its asset with "
                 "nearest_intent_ref: maintenance:<asset-ref>"
+            ),
+        ))
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Unattached-ask advisory (T-5014).
+#
+# BACKSTOP to the file-time forced choice in ticket.py (`--ratifiable-file` or
+# `--no-file`): an OPEN target=operator ticket with no ratifiable_files whose
+# Ask/Context names something path-like is probably citing a file the operator cannot
+# open (T-4944: a draft under /home/<persona>/ with nothing attached). WARN only
+# — legacy tickets must not red CI — and it fires whether or not the ticket
+# carries a `no_file_reason` (the reason is audited, not trusted).
+# ---------------------------------------------------------------------------
+
+# Path-like tokens: a *.md/*.yaml/*.json filename, an absolute /home/ or /tmp/
+# path, or a `repo:path/with.ext` reference.
+_UNATTACHED_PATH_RE = re.compile(
+    r"(?:"
+    r"[\w./-]+\.(?:md|ya?ml|json)\b"
+    r"|/(?:home|tmp)/[\w./-]+"
+    r"|\b[a-z][\w-]*:[\w./-]*[\w-]/[\w./-]+"
+    r")"
+)
+# An ADR/ORG id within <=6 words of "draft" or "Amendment" (either order).
+_UNATTACHED_ADR_ID = r"(?:ADR|ORG)-\d+"
+_UNATTACHED_DRAFT_WORD = r"(?:draft|amendment)s?"
+_UNATTACHED_ADR_DRAFT_RE = re.compile(
+    rf"\b{_UNATTACHED_ADR_ID}\b(?:\W+\w+){{0,6}}?\W+{_UNATTACHED_DRAFT_WORD}\b"
+    rf"|\b{_UNATTACHED_DRAFT_WORD}\b(?:\W+\w+){{0,6}}?\W+{_UNATTACHED_ADR_ID}\b",
+    re.IGNORECASE,
+)
+
+
+def _unattached_ask_evidence(text: str) -> str | None:
+    """First path-like / draft-ADR token in `text`, or None."""
+    m = _UNATTACHED_PATH_RE.search(text) or _UNATTACHED_ADR_DRAFT_RE.search(text)
+    return " ".join(m.group(0).split()) if m else None
+
+
+def warn_operator_unattached(paths: list[Path]) -> list[LintResult]:
+    """WARN for open target=operator tickets with no ratifiable_files whose
+    Ask/Context cites something path-like (T-5014). Never raises; unparseable
+    tickets are skipped (already reported by detect_malformations)."""
+    results: list[LintResult] = []
+    for path in paths:
+        if path.parent.name not in ("inbox", "active"):
+            continue
+        try:
+            fields, body = parse_front_matter(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — parse/IO failures: skip silently
+            continue
+        if fields.get("target") != "operator" or fields.get("ratifiable_files"):
+            continue
+        # Scan only Ask + Context (the log and title are not the ask).
+        m = re.search(r"^## Ask\s*$(.*?)(?=^## Transition log\s*$|\Z)", body, re.M | re.S)
+        evidence = _unattached_ask_evidence(m.group(1) if m else "")
+        if evidence is None:
+            continue
+        has_reason = bool(str(fields.get("no_file_reason") or "").strip())
+        results.append(LintResult(
+            tid=path.stem,
+            path=path,
+            action=LintAction.WARN,
+            description=(
+                f"target=operator ask names {evidence!r} but attaches no "
+                f"ratifiable_files"
+                + (" (no_file_reason is set, but the ask still reads as citing a file)"
+                   if has_reason else "")
             ),
         ))
     return results
@@ -2327,6 +2581,39 @@ def detect_duplicate_receipt_ids(tickets_root: Path) -> list:
     return findings
 
 
+def detect_duplicate_episode_ids(tickets_root: Path) -> list:
+    """Corpus-wide ORG-076 ``episode_id`` uniqueness scan (T-4707 / RFC-004 §3(a)).
+
+    One repair ticket per fault episode: two tickets (any state) carrying the same
+    ``episode_id`` frontmatter value is a duplicate-emission defect. Complements the
+    CLI-side refusal in ``ticket.py file --repair-fields-json`` (which checks the
+    COMMITTED corpus) for hand-edited / racing writers. Reuses TypedGraphFinding for
+    report plumbing only, like detect_duplicate_receipt_ids.
+    """
+    owners: dict = {}
+    for st in STATES:
+        d = tickets_root / st
+        if not d.exists():
+            continue
+        for entry in sorted(d.iterdir()):
+            if not entry.is_file() or not TICKET_FILENAME_RE.fullmatch(entry.name):
+                continue
+            try:
+                fields, _body = parse_front_matter(entry.read_text(encoding="utf-8"))
+            except (TicketError, OSError):
+                continue
+            ep = fields.get("episode_id")
+            if isinstance(ep, str) and ep:
+                owners.setdefault(ep, set()).add(entry.stem)
+    return [
+        TypedGraphFinding(
+            kind="duplicate_episode_id",
+            detail=f"episode_id {ep!r} is carried by multiple tickets: {', '.join(sorted(tids))}",
+        )
+        for ep, tids in sorted(owners.items()) if len(tids) > 1
+    ]
+
+
 # ---------------------------------------------------------------------------
 # T-2845 / ORG-065 BT5: closure-gate health monitor — the ORG-068 "health-
 # monitor" gap the T-2842 reviewer named (nothing observed gate-mode drift or
@@ -2634,6 +2921,17 @@ def _apply_retarget(
         # Defensive — detect_malformations should never emit RETARGET here.
         return False, f"{result.tid}: no bounceable originator (requester={requester!r})"
 
+    # T-5239 / ORG-088: the bounce routes to the originator's ROLE pool, never to the
+    # requester persona (a persona target is refused on every write surface).
+    from tools.agent_role_map import persona_pool_role
+    try:
+        pool = persona_pool_role(requester)
+    except PersonaRoleMembershipError as exc:
+        return False, f"{result.tid}: cannot derive a role for requester {requester!r}: {exc}"
+    if not pool:
+        return False, f"{result.tid}: no role pool for requester {requester!r}"
+    bounce_to = f"role:{pool}"
+
     _cwd = cwd if cwd is not None else REPO_ROOT
     note = f"ticket_lint auto-bounce (T-0556): {result.description}"
     cmd = [
@@ -2642,7 +2940,7 @@ def _apply_retarget(
         "retarget",
         result.tid,
         "--to",
-        requester,
+        bounce_to,
         "--note",
         note,
     ]
@@ -2661,7 +2959,7 @@ def _apply_retarget(
             f"{result.tid}: retarget failed: "
             f"{proc.stderr.strip() or proc.stdout.strip()}"
         )
-    return True, f"{result.tid}: retargeted to {requester}"
+    return True, f"{result.tid}: retargeted to {bounce_to}"
 
 
 # ---------------------------------------------------------------------------
@@ -2721,6 +3019,7 @@ def build_lint_digest(
     unanchored_gates: list[UnanchoredGateFinding] | None = None,
     warned: list[LintResult] | None = None,
     purpose_warned: list[LintResult] | None = None,
+    unattached_warned: list[LintResult] | None = None,
     typed_graph_findings: list[TypedGraphFinding] | None = None,
     program_index_findings: list[ProgramIndexFinding] | None = None,
 ) -> str:
@@ -2760,6 +3059,7 @@ def build_lint_digest(
     unanchored_gates = unanchored_gates or []
     warned = warned or []
     purpose_warned = purpose_warned or []
+    unattached_warned = unattached_warned or []
     typed_graph_findings = typed_graph_findings or []
     program_index_findings = program_index_findings or []
     header = f"[Recovery · ticket-lint · {now_iso}]"
@@ -2767,6 +3067,7 @@ def build_lint_digest(
     if (not auto_fixed and not flagged and not retargeted
             and not orphan_ratifications and not dep_graph_findings
             and not unanchored_gates and not warned and not purpose_warned
+            and not unattached_warned
             and not typed_graph_findings
             and not program_index_findings):
         return (
@@ -2863,6 +3164,20 @@ def build_lint_digest(
         )
         lines.append("")
 
+    # T-5014: unattached-ask advisory — report-only, never affects exit code.
+    if unattached_warned:
+        lines.append(
+            f"the operator asks citing a file with none attached ({len(unattached_warned)}):"
+        )
+        for r in unattached_warned:
+            lines.append(f"  - {r.tid}: {r.description}")
+        lines.append(
+            "    Fix: commit the file into a tracked repo, then "
+            "ticket.py retarget <tid> --to operator --ratifiable-file <repo>:<path> "
+            "(or --no-file '<reason>' if the ask truly has no file)"
+        )
+        lines.append("")
+
     # T-3168 / ORG-054: warn-first migration for structured purpose fields.
     # This is separate from the legacy serves nudge so callers can distinguish
     # compatibility debt from malformed/dangling typed graph state.
@@ -2889,6 +3204,8 @@ def build_lint_digest(
                            if f.kind in ("malformed_id", "duplicate_id")]
         typed_receipt_dupes = [f for f in typed_graph_findings
                                 if f.kind == "duplicate_receipt_id"]
+        typed_episode_dupes = [f for f in typed_graph_findings
+                                if f.kind == "duplicate_episode_id"]
         typed_unverified = [f for f in typed_graph_findings
                              if f.kind == "unverified_element"]
         typed_implemented_unverified = [f for f in typed_graph_findings
@@ -2921,6 +3238,14 @@ def build_lint_digest(
                 f"tickets ({len(typed_receipt_dupes)}):"
             )
             for f in typed_receipt_dupes:
+                lines.append(f"  - {f.detail}")
+            lines.append("")
+        if typed_episode_dupes:
+            lines.append(
+                f"Duplicate episode_ids — ORG-076 emitted more than one ticket for "
+                f"one fault episode ({len(typed_episode_dupes)}):"
+            )
+            for f in typed_episode_dupes:
                 lines.append(f"  - {f.detail}")
             lines.append("")
         if typed_unverified:
@@ -3062,6 +3387,7 @@ def _do_lint(
     # for that predicate). Warns never affect failures, push, or exit code.
     warn_results = warn_tickets([r.path for r in results])
     purpose_warn_results = warn_ticket_purposes([r.path for r in results])
+    unattached_warn_results = warn_operator_unattached([r.path for r in results])
 
     # T-2841 / ORG-065 BT1: generalized typed-edge graph scan — cycles +
     # dangling targets + ADR elements: id defects (report-only; warn-only
@@ -3084,6 +3410,7 @@ def _do_lint(
             _tickets_root, _adr_dirs, exempt_dangling_target=is_echo_scoped_id,
         )
         + detect_duplicate_receipt_ids(_tickets_root)
+        + detect_duplicate_episode_ids(_tickets_root)
         + detect_unverified_elements(_tickets_root, _adr_dirs)
     )
 
@@ -3181,6 +3508,7 @@ def _do_lint(
             unanchored_gates=unanchored_gates,
             warned=warn_results,
             purpose_warned=purpose_warn_results,
+            unattached_warned=unattached_warn_results,
             typed_graph_findings=typed_graph_findings,
             program_index_findings=program_index_findings,
         )
@@ -3294,6 +3622,7 @@ def main(argv: list[str] | None = None) -> int:
         dep_graph_findings = detect_dep_graph_issues(tickets_root_dry)
         # T-1105 / ORG-034: dry-run warn parity — same tickets as the cron digest shows.
         dry_warns = warn_tickets([r.path for r in results])
+        dry_unattached = warn_operator_unattached([r.path for r in results])
         # T-2841 / ORG-065 BT1: dry-run parity for the generalized typed-edge graph.
         # T-2926: dry-run parity for the corpus-wide receipt-id uniqueness scan.
         # T-2843: dry-run parity for the element-lineage leak detector.
@@ -3306,6 +3635,7 @@ def main(argv: list[str] | None = None) -> int:
                 tickets_root_dry, _adr_dirs_dry, exempt_dangling_target=is_echo_scoped_id,
             )
             + detect_duplicate_receipt_ids(tickets_root_dry)
+            + detect_duplicate_episode_ids(tickets_root_dry)
             + detect_unverified_elements(tickets_root_dry, _adr_dirs_dry)
         )
         print(f"[ticket_lint] dry-run — {now.strftime('%Y-%m-%d %H:%M UTC')}")
@@ -3330,12 +3660,16 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  serves-field nudges ({len(dry_warns)}):")
             for r in dry_warns:
                 print(f"    {r.tid}: {r.description}")
+        if dry_unattached:
+            print(f"  operator asks citing a file with none attached ({len(dry_unattached)}):")
+            for r in dry_unattached:
+                print(f"    {r.tid}: {r.description}")
         if typed_graph_findings:
             print(f"  typed-edge graph findings ({len(typed_graph_findings)}):")
             for f in typed_graph_findings:
                 print(f"    [{f.kind}] {f.detail}")
         if (not auto_fix and not flags and not retargets and not dep_graph_findings
-                and not dry_warns and not typed_graph_findings):
+                and not dry_warns and not dry_unattached and not typed_graph_findings):
             print("  all clean — no actions needed")
         return 0
 

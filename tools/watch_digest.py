@@ -34,10 +34,20 @@ from tools._git_utils import commit_scoped, pull_repo_or_warn  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 REPORTS_ROOT = REPO_ROOT / "knowledge" / "watch" / "reports"
 
-# Bot token comes from the same .env the Telegram MCP plugin reads.
-# Pantheon convention; matches B2 cost monitor.
-TELEGRAM_ENV = Path(os.environ.get("PANTHEON_TELEGRAM_ENV", str(Path.home() / ".claude" / "channels" / "telegram" / ".env")))
-TELEGRAM_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "456474197")  # the operator
+# Bot token: same resolution chain as ticket_grooming / ticket_lint / artifact_gc /
+# mirror_drift_sweep — prefer the per-bot `pantheon.env` when present, else the
+# `.env` the Telegram MCP plugin reads. T-4131: the systemd unit used to pin
+# PANTHEON_TELEGRAM_ENV to pantheon.env; dropping that pin must not move specialist's
+# digest (claude-research has pantheon.env) off its bot, so the default carries
+# the preference instead. The env var still overrides (tests use it to disable).
+def _default_telegram_env() -> Path:
+    chan = Path.home() / ".claude" / "channels" / "telegram"
+    pantheon = chan / "pantheon.env"
+    return pantheon if pantheon.exists() else chan / ".env"
+
+
+TELEGRAM_ENV = Path(os.environ.get("PANTHEON_TELEGRAM_ENV", str(_default_telegram_env())))
+TELEGRAM_CHAT_ID = os.environ.get("PANTHEON_TELEGRAM_CHAT_ID", "424242424")  # the operator
 
 # Surfacing is producer-declared (P1: structural signal at the source), with the
 # keyword list below as a fallback/security-fast-path only. The researcher emits
@@ -199,7 +209,7 @@ def collect_today(date_dir: Path) -> list[tuple[str, bool, str, str | None]]:
 # THE GAP THIS CLOSES. sop/standard/throughline-sweep-result-filing.md:45 makes it
 # a MUST that a goal-level `target=operator` ticket is ALSO lean-surfaced to the operator
 # ("Telegram/digest"), because nothing auto-delivers to him — inbox_consumer is
-# agent-only, activity_digest posts only RESOLVED, ticket_state_sweep surfaces only
+# agent-only, ticket_state_sweep surfaces only
 # operator-MOOT. For specialist that MUST had NO MECHANISM: this digest was a pure
 # function of knowledge/watch/reports/<date>/*.md, with no flag, file or env var by
 # which any other text could reach the send. Specialist asserted the surfacing twice
@@ -213,7 +223,7 @@ def collect_today(date_dir: Path) -> list[tuple[str, bool, str, str | None]]:
 # less. `target: operator` + parked-for-N-days is already computable from the
 # tickets themselves, so there is nothing to keep in sync and nothing to forget to
 # write. It also fixes the gap for EVERY agent rather than for specialist specifically —
-# recovery and mnemosyne have the same hole, and neither had noticed.
+# recovery and archivist have the same hole, and neither had noticed.
 #
 # DELIVER BEFORE RECORDING (T-2152, restated by specialist as a constraint on this fix).
 # The stamp is written ONLY after send_telegram returns True. A lean-surface whose
@@ -547,6 +557,58 @@ def build_digest(
     return "\n".join(parts)
 
 
+def build_operator_digest(
+    date_iso: str,
+    rows: list[tuple[str, bool, str, str | None]],
+    leans: list[tuple[str, str, int, "Path", datetime | None]] | None = None,
+) -> str | None:
+    """Render the ACTION-ONLY operator watch digest, or None when nothing needs the operator.
+
+    Action-only operator-digest discipline (the operator TG 3608-3616, 2026-09-28;
+    T-4200): the watch digest pings the operator's Telegram ONLY when the day carries
+    something that needs him -- an above-the-bar finding, a label disagreement
+    (a topic declared routine that tripped an above-bar keyword), or a parked
+    `target: operator` lean (T-2199). The routine heartbeat (the topic count, the
+    below-the-bar rows, the "no reports today" line, the day-index drift warning)
+    is fleet-facing and stays in the full digest that main() prints to stdout
+    (the journal record). Returns None to mean "send nothing" -- silence, not a
+    "nothing changed" placeholder. Drift never by itself triggers a send.
+
+    NOTE: the lean/above/disagreement row rendering deliberately mirrors
+    build_digest so a Telegram reader sees the same shapes; kept inline (small
+    duplication) to leave build_digest and its tests untouched. Dedup later if a
+    third caller appears.
+    """
+    leans = list(leans or ())
+    above = [r for r in rows if r[1]]
+    disagreements = [r for r in rows if r[3]]
+    if not (above or disagreements or leans):
+        return None
+    parts = [f"📡 *[Specialist · watch · {date_iso}]*"]
+    if disagreements:
+        parts.append("")
+        parts.append("⚠️ *Label disagreements (declared routine, above-bar keyword tripped):*")
+        for slug, _, summary, kw in disagreements:
+            parts.append(f"• `{slug}` — keyword `{kw}` — {summary}")
+    if above:
+        parts.append("")
+        parts.append("⚠️ *Above the bar:*")
+        for slug, _, summary, _ in above:
+            parts.append(f"• `{slug}` — {summary}")
+    if leans:
+        shown = leans[:LEAN_MAX_ROWS]
+        parts.append("")
+        parts.append("🔸 *Parked on you:*")
+        for tid, title, days, _path, decide_by in shown:
+            lead = f"⏳ decide by {decide_by:%Y-%m-%d}" if decide_by else f"{days}d"
+            parts.append(f"• `{tid}` — {lead} — {title}")
+        if len(leans) > LEAN_MAX_ROWS:
+            parts.append(f"• …and {len(leans) - LEAN_MAX_ROWS} more — `ticket.py list --target operator`")
+    parts.append("")
+    parts.append(f"Full reports: `pantheon-config/knowledge/watch/reports/{date_iso}/`")
+    return "\n".join(parts)
+
+
 # Telegram hard-caps a sendMessage at 4096 chars; an over-long body 400s on BOTH Markdown
 # AND plain text (the limit is LENGTH, not formatting, so the plain-text fallback can't save
 # it). A big watch day overflows — observed 2026-08-24 (T-3135 day, 20 topics fired): the
@@ -669,7 +731,19 @@ def main() -> int:
     if not token:
         print(f"warning: no Telegram token at {TELEGRAM_ENV}; skipping send", file=sys.stderr)
         return 0
-    ok = send_telegram(token, TELEGRAM_CHAT_ID, digest)
+    # Operator Telegram: ACTION-ONLY (the operator TG 3608-3616, 2026-09-28; T-4200).
+    # Send only when the day carries something that needs the operator (above-bar /
+    # disagreement / lean); silent otherwise. The full digest printed above is
+    # the journal / proof-of-life record.
+    operator = build_operator_digest(date_iso, rows, leans)
+    if operator is None:
+        print(
+            "watch_digest: no operator-action content (all routine); Telegram "
+            "send suppressed (action-only, T-4200). Full digest above is the record.",
+            file=sys.stderr,
+        )
+        return 0
+    ok = send_telegram(token, TELEGRAM_CHAT_ID, operator)
     if not ok:
         # No stamp on a failed send. The leans stay unsurfaced and ride the next
         # fire — which is the correct failure direction, and the whole point.

@@ -1,5 +1,10 @@
 """Tests for T-0492: persona-canonical target/requester normalization.
 
+T-5239 / ORG-088 (the operator TG 12076/12077): TARGETS are role-only now - a persona,
+alias or bare role-id `target:` is REFUSED on write (see test_ticket_role_only_targets).
+`requester:` stays persona-canonical (provenance), which is what the requester
+normalization tests below still pin. Done/legacy persona targets still parse.
+
 Covers:
   - Unit: resolve_persona() helper in agent_role_map
   - Unit: cmd_file normalizes target + requester (role-ID → persona)
@@ -67,6 +72,12 @@ def _make_file_args(
     # T-3328: this module tests persona-normalization mechanics, orthogonal
     # to DAG connectivity — orphan escape hatch, not a real lineage edge.
     args.orphan = "test fixture: T-0492 persona-canonical target/requester normalization"
+    # T-5014: gate-orthogonal fixture; operator-without-files gets an explicit no-file reason.
+    args.no_file = (
+        "test fixture: T-5014 gate is orthogonal to this test"
+        if getattr(args, "target", None) == "operator" and not getattr(args, "ratifiable_file", None)
+        else None
+    )
     return args
 
 
@@ -153,22 +164,24 @@ class TestResolvePersona(unittest.TestCase):
 class TestResolveInstanceRole(unittest.TestCase):
     """agent_role_map.resolve_instance_role() — persona/audit-id → instance role-key."""
 
-    def test_orchestrator_to_orchestrator(self) -> None:
-        self.assertEqual(resolve_instance_role("orchestrator"), "orchestrator")
+    def test_orchestrator_to_head_engineering_orchestrator(self) -> None:
+        self.assertEqual(resolve_instance_role("orchestrator"), "head-engineering-orchestrator")
 
     def test_specialist_to_specialist(self) -> None:
         self.assertEqual(resolve_instance_role("specialist"), "specialist")
 
-    def test_recovery_to_recovery(self) -> None:
-        self.assertEqual(resolve_instance_role("recovery"), "recovery")
+    def test_recovery_to_head_system_orchestrator(self) -> None:
+        self.assertEqual(resolve_instance_role("recovery"), "head-system-orchestrator")
 
     def test_audit_id_specialist_normalizes_to_specialist(self) -> None:
         """Audit role-id specialist → specialist → specialist (two-step resolution)."""
         self.assertEqual(resolve_instance_role("specialist"), "specialist")
 
-    def test_audit_id_orchestrator_normalizes_to_orchestrator_key(self) -> None:
-        """Audit role-id orchestrator → orchestrator → orchestrator (hyphenated)."""
-        self.assertEqual(resolve_instance_role("orchestrator"), "orchestrator")
+    def test_audit_id_orchestrator_normalizes_to_head_engineering_orchestrator_key(self) -> None:
+        """Legacy audit-id orchestrator → (PERSONA_ALIASES) orchestrator → head-engineering-orchestrator
+        (hyphenated). The old id still resolves via the T-3814 legacy alias, now landing on
+        orchestrator's renamed instance role-key."""
+        self.assertEqual(resolve_instance_role("orchestrator"), "head-engineering-orchestrator")
 
     def test_operator_passthrough(self) -> None:
         """Unregistered names pass through unchanged."""
@@ -184,7 +197,7 @@ class TestResolveInstanceRole(unittest.TestCase):
 
 
 class TestCmdFileTargetNormalization(unittest.TestCase):
-    """cmd_file normalizes role-ID targets to persona names on write."""
+    """cmd_file takes role pools / operator as targets; seats are refused (T-5239)."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
@@ -226,21 +239,17 @@ class TestCmdFileTargetNormalization(unittest.TestCase):
         fields, _ = ticket.parse_front_matter(filed[0].read_text(encoding="utf-8"))
         return fields
 
-    def test_orchestrator_target_normalized_to_orchestrator(self) -> None:
-        fields = self._file_and_read(target="orchestrator")
-        self.assertEqual(fields["target"], "orchestrator")
+    def test_role_id_and_persona_targets_refused_not_normalized(self) -> None:
+        """T-5239: the old T-0492 role-id -> persona normalization on write is gone."""
+        for target in ("orchestrator", "specialist", "orchestrator", "recovery"):
+            with self.subTest(target=target):
+                with self.assertRaises(ticket.TicketRefusal):
+                    self._file_and_read(target=target)
+                self.assertEqual(list((self.root / "inbox").iterdir()), [])
 
-    def test_specialist_target_normalized_to_specialist(self) -> None:
-        fields = self._file_and_read(target="specialist")
-        self.assertEqual(fields["target"], "specialist")
-
-    def test_orchestrator_target_passthrough(self) -> None:
-        fields = self._file_and_read(target="orchestrator")
-        self.assertEqual(fields["target"], "orchestrator")
-
-    def test_recovery_target_passthrough(self) -> None:
-        fields = self._file_and_read(target="recovery")
-        self.assertEqual(fields["target"], "recovery")
+    def test_role_target_passthrough_unchanged(self) -> None:
+        fields = self._file_and_read(target="role:system_orchestrator")
+        self.assertEqual(fields["target"], "role:system_orchestrator")
 
     def test_operator_target_passthrough(self) -> None:
         # operator target requires intent; auto-defaults to 'action'
@@ -284,7 +293,7 @@ class TestCmdFileRequesterNormalization(unittest.TestCase):
         self._tickets_patch.stop()
         self._tmp.cleanup()
 
-    def _file_and_read_requester(self, requester: str, target: str = "recovery") -> str:
+    def _file_and_read_requester(self, requester: str, target: str = "role:system_orchestrator") -> str:
         args = _make_file_args(target=target, requester=requester)
         rc = ticket.cmd_file(args)
         self.assertEqual(rc, 0)
@@ -364,40 +373,35 @@ class TestCmdRetargetNormalization(unittest.TestCase):
         path.write_text(content, encoding="utf-8")
         return path
 
-    def test_retarget_orchestrator_normalizes_to_orchestrator(self) -> None:
-        path = self._seed("T-0001", "inbox", target="recovery")
-        rc = ticket.cmd_retarget(_make_retarget_args("T-0001", "orchestrator"))
-        self.assertEqual(rc, 0)
-        fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
-        self.assertEqual(fields["target"], "orchestrator")
+    def test_retarget_role_id_and_persona_refused(self) -> None:
+        """T-5239: no role-id -> persona normalization; a seat is not a retarget target."""
+        for to in ("orchestrator", "specialist", "orchestrator", "specialist"):
+            with self.subTest(to=to):
+                path = self._seed("T-0001", "inbox", target="role:system_orchestrator")
+                with self.assertRaises(ticket.TicketRefusal):
+                    ticket.cmd_retarget(_make_retarget_args("T-0001", to))
+                fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+                self.assertEqual(fields["target"], "role:system_orchestrator")
+        self.mock_commit.assert_not_called()
 
-    def test_retarget_specialist_normalizes_to_specialist(self) -> None:
-        path = self._seed("T-0002", "inbox", target="recovery")
-        rc = ticket.cmd_retarget(_make_retarget_args("T-0002", "specialist"))
-        self.assertEqual(rc, 0)
-        fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
-        self.assertEqual(fields["target"], "specialist")
-
-    def test_retarget_orchestrator_on_orchestrator_ticket_is_noop(self) -> None:
-        """retarget --to orchestrator on target=orchestrator ticket must no-op (invariant)."""
-        import io, sys
-        path = self._seed("T-0003", "inbox", target="orchestrator")
-        # Capture stderr for the no-op message
+    def test_retarget_same_role_is_noop(self) -> None:
+        """role:R -> role:R retarget no-ops (invariant) and does not commit."""
+        import io
+        path = self._seed("T-0003", "inbox", target="role:engineering_orchestrator")
         buf = io.StringIO()
         with patch("sys.stderr", buf):
-            rc = ticket.cmd_retarget(_make_retarget_args("T-0003", "orchestrator"))
+            rc = ticket.cmd_retarget(_make_retarget_args("T-0003", "role:engineering_orchestrator"))
         self.assertEqual(rc, 0)
         self.mock_commit.assert_not_called()
-        # File unchanged
         fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
-        self.assertEqual(fields["target"], "orchestrator")
+        self.assertEqual(fields["target"], "role:engineering_orchestrator")
 
-    def test_retarget_persona_still_works(self) -> None:
-        path = self._seed("T-0004", "inbox", target="recovery")
-        rc = ticket.cmd_retarget(_make_retarget_args("T-0004", "orchestrator"))
+    def test_retarget_to_role_works(self) -> None:
+        path = self._seed("T-0004", "inbox", target="role:system_orchestrator")
+        rc = ticket.cmd_retarget(_make_retarget_args("T-0004", "role:engineering_orchestrator"))
         self.assertEqual(rc, 0)
         fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
-        self.assertEqual(fields["target"], "orchestrator")
+        self.assertEqual(fields["target"], "role:engineering_orchestrator")
 
 
 # ---------------------------------------------------------------------------
@@ -478,20 +482,14 @@ class TestRoundTripNormalization(unittest.TestCase):
         self._tickets_patch.stop()
         self._tmp.cleanup()
 
-    def test_file_orchestrator_roundtrip_stores_orchestrator(self) -> None:
+    def test_file_orchestrator_target_refused_nothing_stored(self) -> None:
         args = _make_file_args(target="orchestrator", requester="operator")
-        ticket.cmd_file(args)
-        filed = list((self.root / "inbox").iterdir())
-        self.assertEqual(len(filed), 1)
-        fields, _ = ticket.parse_front_matter(filed[0].read_text(encoding="utf-8"))
-        self.assertEqual(fields["target"], "orchestrator")
-        # Confirm raw file text also has persona form
-        raw = filed[0].read_text(encoding="utf-8")
-        self.assertIn("target: orchestrator", raw)
-        self.assertNotIn("target: orchestrator", raw)
+        with self.assertRaises(ticket.TicketRefusal):
+            ticket.cmd_file(args)
+        self.assertEqual(list((self.root / "inbox").iterdir()), [])
 
     def test_file_orchestrator_requester_roundtrip(self) -> None:
-        args = _make_file_args(target="recovery", requester="orchestrator")
+        args = _make_file_args(target="role:system_orchestrator", requester="orchestrator")
         ticket.cmd_file(args)
         filed = list((self.root / "inbox").iterdir())
         fields, _ = ticket.parse_front_matter(filed[0].read_text(encoding="utf-8"))
@@ -573,8 +571,9 @@ class TestInboxConsumerDualMatch(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TestTicketLintRoleIdAutoFix(unittest.TestCase):
-    """ticket_lint detects role-ID targets and normalizes them to persona names."""
+class TestTicketLintPersonaTargetFlag(unittest.TestCase):
+    """T-5239: a role-ID / persona target on an open ticket is FLAGGED (the T-0492
+    auto-fix to a persona is retired); role pools are not."""
 
     def _write_ticket(self, tmp_dir: Path, target: str) -> Path:
         path = tmp_dir / "T-0001.md"
@@ -597,50 +596,45 @@ class TestTicketLintRoleIdAutoFix(unittest.TestCase):
         path.write_text(content, encoding="utf-8")
         return path
 
-    def test_detect_orchestrator_target_as_auto_fix(self) -> None:
+    def test_detect_orchestrator_target_as_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_ticket(Path(tmp), "orchestrator")
             result = ticket_lint.detect_malformations(path, repo_root=Path(tmp))
-        self.assertEqual(result.action, ticket_lint.LintAction.AUTO_FIX)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
         self.assertIn("orchestrator", result.description)
 
-    def test_detect_specialist_target_as_auto_fix(self) -> None:
+    def test_detect_specialist_target_as_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_ticket(Path(tmp), "specialist")
             result = ticket_lint.detect_malformations(path, repo_root=Path(tmp))
-        self.assertEqual(result.action, ticket_lint.LintAction.AUTO_FIX)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
         self.assertIn("specialist", result.description)
 
-    def test_detect_orchestrator_target_as_clean(self) -> None:
+    def test_detect_orchestrator_target_as_flag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_ticket(Path(tmp), "orchestrator")
             result = ticket_lint.detect_malformations(path, repo_root=Path(tmp))
-        self.assertEqual(result.action, ticket_lint.LintAction.CLEAN)
+        self.assertEqual(result.action, ticket_lint.LintAction.FLAG)
 
-    def test_detect_recovery_target_as_clean(self) -> None:
+    def test_detect_recovery_role_target_as_clean(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_ticket(Path(tmp), "recovery")
+            path = self._write_ticket(Path(tmp), "role:system_orchestrator")
             result = ticket_lint.detect_malformations(path, repo_root=Path(tmp))
         self.assertEqual(result.action, ticket_lint.LintAction.CLEAN)
 
-    def test_apply_auto_fix_orchestrator_to_orchestrator(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_ticket(Path(tmp), "orchestrator")
-            ticket_lint.apply_auto_fix(path, repo_root=Path(tmp))
-            fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
-        self.assertEqual(fields["target"], "orchestrator")
-
-    def test_apply_auto_fix_specialist_to_specialist(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_ticket(Path(tmp), "specialist")
-            ticket_lint.apply_auto_fix(path, repo_root=Path(tmp))
-            fields, _ = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
-        self.assertEqual(fields["target"], "specialist")
+    def test_apply_auto_fix_refuses_flag_class_and_leaves_file(self) -> None:
+        for target in ("orchestrator", "specialist", "orchestrator"):
+            with self.subTest(target=target), tempfile.TemporaryDirectory() as tmp:
+                path = self._write_ticket(Path(tmp), target)
+                before = path.read_text(encoding="utf-8")
+                with self.assertRaises(ticket_lint.LintError):
+                    ticket_lint.apply_auto_fix(path, repo_root=Path(tmp))
+                self.assertEqual(path.read_text(encoding="utf-8"), before)
 
     def test_apply_auto_fix_idempotent_on_clean(self) -> None:
-        """apply_auto_fix on an orchestrator ticket must be a no-op (idempotent)."""
+        """apply_auto_fix on a role-pool ticket must be a no-op (idempotent)."""
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_ticket(Path(tmp), "orchestrator")
+            path = self._write_ticket(Path(tmp), "role:engineering_orchestrator")
             original_text = path.read_text(encoding="utf-8")
             ticket_lint.apply_auto_fix(path, repo_root=Path(tmp))
             self.assertEqual(path.read_text(encoding="utf-8"), original_text)

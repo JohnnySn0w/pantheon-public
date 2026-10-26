@@ -42,6 +42,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tools import ticket, ticket_lint
+from tools._test_fixtures import contained_path
 
 
 # ---------------------------------------------------------------------------
@@ -753,8 +754,8 @@ class TestClosureGateModeResolve(unittest.TestCase):
             import shutil
             from unittest.mock import MagicMock as _MM
             if argv[:1] == ("mv",):
-                src = self.root / argv[1]
-                dst = self.root / argv[2]
+                src = contained_path(self.root, argv[1])
+                dst = contained_path(self.root, argv[2])
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(src), str(dst))
             return _MM(returncode=0, stdout="", stderr="")
@@ -924,6 +925,8 @@ class TestClosureGateModeResolve(unittest.TestCase):
         args.ticket = "T-0008"
         args.with_summary = "did it"
         args.no_push = True
+        from tools.test_ticket import with_ruling  # T-5015 register flags
+        with_ruling(args, self.root)
         with self.assertRaises(ticket.TicketError) as ctx:
             ticket.cmd_close_action(args)
         self.assertIn("closure-gate", str(ctx.exception))
@@ -1094,8 +1097,8 @@ class TestClosureGateCrossRepoEcho(unittest.TestCase):
             import shutil
             from unittest.mock import MagicMock as _MM
             if argv[:1] == ("mv",):
-                src = self.root / argv[1]
-                dst = self.root / argv[2]
+                src = contained_path(self.root, argv[1])
+                dst = contained_path(self.root, argv[2])
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.move(str(src), str(dst))
             return _MM(returncode=0, stdout="", stderr="")

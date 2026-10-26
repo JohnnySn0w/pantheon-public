@@ -2,7 +2,7 @@
 aliases: [ORG-094]
 id: ORG-094
 title: "Architecture umbrella — unify adr + rfc + engineering-practices + atlas under architecture/ (reversing the ADRs-stay-in-adr rule)"
-status: Draft 2026-09-06 by Orchestrator (HO). Direction ratified by the operator via Telegram 9161 ("A") + 9164 ("semantically, /architecture would/should contain things like adrs/rfcs/methodology") + 9168 ("engineering-practices works") + 9166 ("the atlas can stay as well, it seems relevant"). Pending ratification against this ADR body (bundle includes the umbrella ADR + the physical moves + ORG-092/ORG-093 body edits + H/I/J extraction + tooling updates).
+status: Adopted 2026-09-27 by Orchestrator (HO) under D3 (T-4002). Direction ratified by the operator via Telegram 9161 ("A") + 9164 ("semantically, /architecture would/should contain things like adrs/rfcs/methodology") + 9168 ("engineering-practices works") + 9166 ("the atlas can stay as well, it seems relevant"); moves executed under T-3472. An org-layout decision sits below the goal-level bar, so the body-level ratify step originally planned is not owed. Drafted 2026-09-06.
 date: 2026-09-06
 author: Orchestrator (HO)
 appetite: 5
@@ -17,7 +17,7 @@ ratifiable_files: [pantheon-config:architecture/adr/ORG-094-architecture-umbrell
 
 # ORG-094 — Architecture umbrella: unify normative + descriptive under `architecture/`
 
-**Status:** Draft 2026-09-06 (Orchestrator, HO) — pending the operator ratify against this ADR body. **Date:** 2026-09-06 **Author:** Orchestrator (HO) **HITL:** Ratify-required. **Related:** [[ORG-053]] (SSEED Grand Project north star — the object atlas indexes), [[ORG-092]] (RFC tier), [[ORG-093]] (engineering-practices tier — landed as "methodology tier," renamed by this arc), [[T-3246]] (original architecture/ + atlas landing), [[T-3472]] (this arc).
+**Status:** Adopted 2026-09-27 by Orchestrator (HO) under D3 (T-4002); direction operator-ratified via Telegram 9161/9164/9166/9168; drafted 2026-09-06. **Date:** 2026-09-06 **Author:** Orchestrator (HO) **HITL:** Adopted. **Related:** [[ORG-053]] (SSEED Grand Project north star — the object atlas indexes), [[ORG-092]] (RFC tier), [[ORG-093]] (engineering-practices tier — landed as "methodology tier," renamed by this arc), [[T-3246]] (original architecture/ + atlas landing), [[T-3472]] (this arc).
 
 **Appetite:** 5/10
 

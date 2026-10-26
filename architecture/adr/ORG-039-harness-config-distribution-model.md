@@ -83,16 +83,7 @@ The distribution ships a **lightweight but explicit** provisioning contract so t
 
 ## Implementation / sequencing
 
-This ADR is the **S1 design** in `notes/harness-config-distribution-plan.md`. On ratification it unblocks:
-
-| Step | Owner | Work |
-|---|---|---|
-| S3a | recovery (build) → orchestrator (GitHub publish) | [[T-1469]] — genericize the `claude-code-config` reference template (target name, parameterized paths, drift-check SKIP contract, layer-4 provisioning artifacts), bundle with seed `pantheon-config` + kino, tied by `instance.yaml`. |
-| S4 | recovery | clean-home dry-run bringup in a throwaway account; leakage scan + per-role boot smoke as release gates. |
-| S2 | orchestrator (the operator uploads keys) | reference-instance cleanup, **non-blocking / parallel**: [[T-0913]] per-agent deploy keys → Recovery-brief rejoins the harness repo; [[T-0915]] live `claude-config`→`claude-code-config` rename. Gates nothing in the build track. |
-| S3b/S4b | recovery | codex-config generic template + sandbox smoke — fast-follow after the reference harness passes S4. |
-
-`sop/standard/pantheon-bringup.md` gains a "harness-config distribution posture" paragraph (the layer-2/4 analog of the §11 posture ORG-029 added), filable with S3a.
+This ADR is the S1 design in `notes/harness-config-distribution-plan.md`. The S-sequence it unblocked (owners and work per step) is in `notes/2026-10-08-org-039-implementation-sequencing-relocated.md`.
 
 ## DECISIONS
 

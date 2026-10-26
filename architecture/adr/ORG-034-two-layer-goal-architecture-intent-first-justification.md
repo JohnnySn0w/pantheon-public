@@ -5,6 +5,25 @@ title: "Two-layer goal architecture — arc-intents as the missing justification
 status: Adopted 2026-06-12 (operator-ratified live, Telegram msgs 3761–3767, "Make it so" msg 3767)
 date: 2026-06-12
 build_disposition: no-build-needed
+# re_evaluate: machine-checkable mirror of this ADR's inline re-eval prose,
+# consumed by tools/adr_reeval_walk.py (T-2527). Backfilled per T-4805 (missed by the T-2530 sweep);
+# trigger text quoted verbatim from the header, no obligation content changed.
+re_evaluate:
+  - id: R1
+    type: event
+    when: "the 2026-09-12 review date (evaluated 2026-10-09 under T-4741: CONFIRM)"
+    fires: surface
+    text: "2026-09-12"
+  - id: R2
+    type: event
+    when: "a goal-coverage audit runs (T-4806)"
+    fires: surface
+    text: "when a goal-coverage audit shows the intent layer has itself become ceremony (intent lines going boilerplate)"
+  - id: R3
+    type: event
+    when: "the next north-star change"
+    fires: surface
+    text: "on next north-star change"
 ---
 
 # ORG-034 — Two-layer goal architecture: arc-intents as the missing justification tier
@@ -44,15 +63,9 @@ The standing review question (ledger reviews, weekly summaries, quarterly re-eva
 
 OKR systems (work traces to Objectives precisely because output/process metrics otherwise capture the org); mission command / Auftragstaktik (nested intent at every echelon — the strongest fit for autonomous agents at tiers); hoshin kanri (true-north cascade with alignment review; its known failure mode — lean cargo-culting, process theater without true north — is exactly the tail-wags-dog risk this ADR addresses). Common thread: **the goal is the first sentence of the work artifact, not a reference document beside it.**
 
-## Implementation deltas (this ADR's commit + follow-ups)
+## Implementation
 
-1. `rulebook/directives.md` D7 — brief contract amended: briefs open with the arc-intent line; DECISIONS = intent-first + P/D-as-how. (This commit.)
-2. `rulebook/goals.md` — header gains the two-layer note; north-star lines untouched. (This commit.)
-3. `rulebook/README.md` — tier table updated (goals row was missing entirely; ratification-authority column updated to post-msg-3733 reality). (This commit.)
-4. `pantheon-org-discipline` skill §2 (DECISIONS format) + §7 (plan shape) — intent-first wording. (claude-config, this arc.)
-5. `~/CLAUDE.md` chain-of-justification section — one-line amendment. (claude-config, this arc.)
-6. **Follow-up ticket:** `ticket.py` `serves:` frontmatter field + lint nudge (implementation-tier; filed at adoption).
-7. Worker personas pick the format change up through the skill; no persona-file edits needed.
+The adoption-time edits (directive D7 brief contract, goals and rulebook README headers, the org-discipline skill, the `serves:` ticket field) are in `notes/2026-10-08-org-034-implementation-deltas-relocated.md`.
 
 ## What this is NOT
 

@@ -1,0 +1,39 @@
+[Unit]
+Description=Pantheon fleet health watcher: PropertiesChanged subscribing leg of the health collector (T-5409)
+Documentation=file:///home/%u/pantheon-config/architecture/rfc/RFC-004-fleet-health-and-repair-mechanism.md
+
+# Installed on recovery 2026-10-25 (T-5409, ORG-080 SS5.5 subscribing leg). Runs on the
+# Recovery account (claude-fallback) next to pantheon-health-collector.{service,timer}, which are
+# UNCHANGED and remain the stateless 60 s backstop. This unit only makes the aggregate refresh
+# sooner: on any PropertiesChanged it triggers a fresh FULL collect (no signal payload is read).
+#
+# DEPLOY DELTA (HO): install + enable this one unit; the timer/oneshot need no unit edit (the
+# oneshot gains an out-dir flock via the code deploy). ROLLBACK: `systemctl disable --now` this
+# unit; the timer carries on exactly as before.
+#
+# PREREQUISITE (UNVERIFIED, deploy-time): each session-bus tap runs
+#     sudo -n -u <acct> env DBUS_SESSION_BUS_ADDRESS=... XDG_RUNTIME_DIR=... python3 -I -c <tap> ...
+# Recovery's documented grants are blanket `ALL=(<acct>) NOPASSWD: ALL`; if any account is
+# command-scoped and refuses python3, the watcher counts+logs that tap, leaves the account to the
+# 60 s tick, and retries with capped backoff. It never reports fresher than it is: `collected_at`
+# is stamped only by a completed collect, and a dead watcher leaves the timer's heartbeat alone.
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/pantheon-config
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/health_watcher.py
+Restart=on-failure
+RestartSec=5s
+KillMode=control-group
+# T-5427: defense in depth. The watcher plus one small tap per account fits well under this.
+MemoryHigh=384M
+MemoryMax=512M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# Long-running (not timer-driven), so it must come back with the user manager on reboot.
+WantedBy=default.target

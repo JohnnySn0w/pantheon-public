@@ -22,9 +22,7 @@ elements:
 
 # ORG-054 — Project ontology and recursive upward justification
 
-**Status:** **Ratified 2026-08-02 by the operator with ORG-053 (Telegram message
-665; T-2399).** **HITL:** Autonomous draft under the operator's explicit direction.
-**Tracking:** T-2388/T-2399.
+**Status:** **Ratified 2026-08-02 by the operator with ORG-053 (Telegram message 665; T-2399).** HITL/tracking provenance: `notes/2026-10-08-org-054-review-history.md`.
 
 **Extends:** ORG-034. **Source:** the ORG-053 capture note. **Scope:** what a
 project is and how work justifies upward; repository realization is ORG-055.

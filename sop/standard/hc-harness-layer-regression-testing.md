@@ -20,6 +20,7 @@ Do NOT use for: routine session restarts (just fire the wrapper), Max-window cap
    ```
    python3 /home/<user>/pantheon-config/tools/notify_policy.py enter-maintenance <persona> --minutes 30
    ```
+   Any pantheon-shared account can arm: the registry is the shared `/var/lib/pantheon/seat-maintenance/` (T-4150), and the CLI prints it on stderr. A `WARNING ... PER-ACCOUNT` line means the monitors won't see the arm.
    Extend if a class takes longer. Exit maintenance at the end of each session: `notify_policy.py exit-maintenance <persona>`.
 3. **Baseline snapshot** — capture pre-test state so post-test comparisons are grounded:
    ```
@@ -119,7 +120,7 @@ These fire post-cadence + verify last-fire timestamps are BOTH within period AND
 
 ### C1. Mailbox-intake path probe (mailbox-mode seats only)
 
-**Applies to:** seats in `DELIVERY_MODE 'mailbox'` per T-1827 (currently: specialist, the-ancestor). Skips for pane-only seats.
+**Applies to:** seats in `DELIVERY_MODE 'mailbox'` per T-1827 (currently: specialist). Skips for pane-only seats.
 
 **Command:**
 ```

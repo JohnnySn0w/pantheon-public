@@ -9,50 +9,7 @@ build_disposition: built
 
 # ORG-066 — pantheon-config CI fleet-mirror on the existing pve2 CT202 runner
 
-**Status:** **RATIFIED 2026-08-09** (the operator fire-on-green, TG 7481/7490; codex second-opinion GREEN on Rev 2 after a first-pass YELLOW). Drafted 2026-08-09 by Metis
-(sub-orchestrator-1) per T-2723 (operator-greenlit, TG 7435). **Revised 2026-08-09**
-after the operator's simplest-first challenge (TG 7450 / 7453, relayed via Orchestrator): the
-first draft proposed a net-new pve2 VM + self-hosted runner; this revision
-re-baselines on the runner that **already exists** (CT202) and recommends the
-minimal delta that makes CI honest. **Rev 2 (2026-08-09)** tightened three codex
-caveats (see next section), which cleared codex to GREEN. This record scopes the design; it does not authorize a build order that skips the D-5 hard gate (T-2443 isolation precedes any full-suite run on CT202). Division: Metis drafts → HO (Orchestrator) relays → the operator
-ratifies → **Recovery owns the pve2 build (T-2219)** → **Codex isolates the one
-mutating test (T-2443)**.
-
-## Revision 2 — codex-YELLOW tightenings (2026-08-09)
-
-Codex reviewed Revision 1 (the simplest-first re-baseline) and returned YELLOW —
-no design hole, three concrete caveats to tighten before green. DECISIONS taken in
-response, each `justifies-via` P/D:
-
-- **C1 — Rung 1 forbids `systemd --user` capability for the runner account** (D-2
-  Rung-1 boundary + D-3 opening). Revision 1's "reconcile … and, where a test
-  needs it, `loginctl enable-linger`" was self-undermining: enabling linger / a
-  user bus for the runner account would satisfy skip-guard clause 3
-  (`systemctl --user is-system-running`), **un-skip** the real-systemd legs, and
-  turn them into new failures — breaking the central claim. Struck the linger
-  clause; Rung 1 provisions passwd entries + `tmux` only, with an explicit
-  no-linger/no-user-manager boundary for the runner account. Systemd capability is
-  now a stated Rung-2/3 transition, never a Rung-1 side effect.
-  `justifies-via` **D11** (don't let the provisioning quietly defeat the real
-  surface the guard reads) + **P1** + **D12** (smallest correct footprint).
-- **C2 — hard build-sequencing gate on the mutating test** (D-5 + Consequences +
-  Division). Elevated the T-2443 mutating test from "flagged residual" to a hard
-  precondition: **no full-suite run on the provisioned CT202 until T-2443 is
-  isolated or that test is deselected.** Rung-1 provisioning removes the
-  `getpwnam`-KeyError accidental circuit-breaker, making the live
-  `systemctl --user start` path *more* reachable, so isolation must precede the
-  first real run. `justifies-via` **D11** (a real mirror makes a real mutation path
-  reachable — close it before the real run) + **P1** + **P5** (codex owns the fix;
-  Metis gates the order) + **D5**.
-- **C3 — sharpened D-3 provisioning boundaries** (D-3 boundaries a–e): reconcile
-  only the manifest's account set (never touch unrelated/local/runner/root
-  accounts); fail-loud on UID/GID conflict (no clobber); minimal inert account
-  posture (locked, nologin, scoped home, no CI-path ownership); pre-job drift mode
-  is strictly read-only (never silently mutates); reconciliation stays
-  target-agnostic/portable so Rung 2/3 reuse it. `justifies-via` **P4**
-  (traceable, bounded, manifest-derived state) + **ORG-049** (Layer-0 provisioning
-  discipline — convergent, idempotent, verifiable).
+**Status:** **RATIFIED 2026-08-09** (the operator fire-on-green, TG 7481/7490; codex second-opinion GREEN on Rev 2). Drafted by Mason per T-2723. Draft/revision narrative and the Rev 2 codex-YELLOW tightenings (C1-C3, now carried in D-2, D-3 and D-5): `notes/2026-10-08-org-066-review-history.md`.
 
 **Related:** [[ORG-049]] (manifest-driven installation + convergent bringup — the
 provisioning here is its Layer-0/Layer-1 applied to a CI target), [[ORG-039]]
@@ -101,61 +58,7 @@ pantheon-config CI is chronically red and merged past with admin bypass:
 
 ## Empirical finding — what the 26 failures actually need (the crux)
 
-The whole design collapses onto one empirical question: do the failing tests need
-only **(a) daemon accounts + (b) a `tmux` binary** — both trivial on the existing
-CT202, no systemd — or does any of them genuinely need **real `systemd --user`**
-(worse: `systemctl --user --machine=<account>@.host`, which needs systemd +
-machined)? Verified test-by-test in the source:
-
-- **The failing set needs only accounts + tmux.** Two classes fail on a bare
-  runner and neither touches real systemd:
-  - **getpwnam / accounts** — `persona_cutover_resolve` and the `load_binding`
-    path in `bringup_acceptance` resolve fleet accounts via `pwd.getpwnam`;
-    absent-account ⇒ `KeyError`. Provisioning the accounts fixes these.
-  - **real tmux, private socket** — the `bringup_acceptance` `readiness_gate` leg
-    proves the real `submit_verify.ready_for_submission` predicate against real
-    `tmux capture-pane` output using, verbatim, "a fully private
-    `tmux -S <socket file>` server. **No systemd scope**, no default tmux server
-    interaction of any kind — total isolation" (`tools/bringup_acceptance/harness_runtime.py:18`).
-    Absent-`tmux` ⇒ `FileNotFoundError`. Provisioning the `tmux` binary fixes
-    these.
-- **The real-`systemd --user` tests are NOT in the failing set — they self-skip,
-  and stay skipped even after accounts+tmux are provisioned.** Every real-systemd
-  leg (`harness_codex_ready`, `harness_codex_rc_ready`, `harness_fallback_swap`,
-  `producer_fires`, `restore`) is guarded by a **three-part probe** before it runs
-  (`_skip_unless_disposable_tmux_available`):
-  1. `shutil.which("tmux")` present, **and**
-  2. `shutil.which("systemd-run")` present, **and**
-  3. `systemctl --user is-system-running` returns `running` or `degraded` — i.e. a
-     **genuinely usable `systemd --user` session for the runner account**.
-
-  A GitHub Actions job runs as the runner account (`ci-runner`/`runner`) with no
-  linger and no login session, so clause (3) does not hold in the CI job context —
-  the tests skip. Crucially, **provisioning accounts + `tmux` does not un-skip
-  them**: clause (3) still fails without a real per-account user manager, so they
-  remain skips rather than becoming new failures. `producer_fires.py:258` labels
-  its real-systemd wiring "Not exercised by the [default suite]"; `harness_runtime`
-  leg 3 (`ensure_runtime_chain`) **mocks** the systemd/tmux-touching internals via
-  `test_runtime_controller.py`'s established seam. The fixture-based files that
-  merely *mention* tmux/systemctl in comments (`forced_cap_return`,
-  `urgent_mail_preempt`, `inventory`, `optionals_recovery`) inject observations and
-  shell out to neither.
-
-**The tmux-on-logout regression does not apply.** The grounding report's
-load-bearing argument for a VM was the Debian-12-LXC regression where user
-processes die on logout. That bug is a **logind session-teardown** artifact — it
-fires when a *login session* ends. The tests spawn tmux **in-process on a private
-`tmux -S <socket>`** inside a short-lived test process; there is no login-then-
-logout cycle for the regression to act on. So the concrete landmine that pushed
-the first draft toward a VM **dissolves** for this test pattern. (Confirmed on-box
-is still cheaper than certain — see Open Questions.)
-
-**Basis of this finding:** a test-by-test read of the source (the three-part skip
-guard, the private-`tmux -S` isolation, and the fixture-only files that shell to
-neither tmux nor systemd) — not a claim about a specific reproduced failure count.
-The definitive confirmation is the on-box re-run after provisioning (Open Question
-(a)), which only CT202 can give; the source read establishes what that re-run
-should show and why (accounts+tmux pass, real-systemd legs stay skipped).
+The test-by-test source walk (the three-part systemd skip guard, the private `tmux -S` isolation, why the LXC tmux-on-logout regression does not apply) is in `notes/2026-10-08-org-066-build-detail-relocated.md`. Its conclusion is carried in D-2.
 
 ## Decisions
 
@@ -231,9 +134,9 @@ Re-running produces no diff when already in sync. Running it in `--check`
 validate against.
 
 **Accounts to mirror** (from `instance.yaml`, role→persona→account): `claude`
-(orchestrator), `claude-research` (specialist), `claude-fallback` (recovery), `codex` (cairn),
-`the-ancestor` (the-ancestor), `suborch1` (metis), `suborch2` (atlas),
-`exocortex` (mnemosyne). Fixed UIDs/usernames created **at provision time**, not
+(orchestrator), `claude-research` (specialist), `claude-fallback` (recovery), `codex` (consultant),
+`the-ancestor` (the-ancestor), `suborch1` (mason), `suborch2` (artisan),
+`exocortex` (archivist). Fixed UIDs/usernames created **at provision time**, not
 test time. `tmux` installed on `$PATH`.
 
 **Provisioning boundaries (codex C3) — the reconciler must:**
@@ -332,7 +235,7 @@ documented, just not re-opened).
   surfaced here so it cannot be missed.
 
 `justifies-via` **P5** (roles don't hop — the persona_installer fix is codex's
-domain; Metis flags + gates, does not fix) + **P6** (two fixes with opposite
+domain; Mason flags + gates, does not fix) + **P6** (two fixes with opposite
 meanings kept distinct rather than collapsed into "the container fixes CI") +
 **D11** (the real mirror makes a real mutation path reachable — validate-against-
 real cuts both ways, so the dangerous path must be closed before the real run) +
@@ -340,18 +243,7 @@ real cuts both ways, so the dangerous path must be closed before the real run) +
 
 ### D-6 — Migration / cutover / rollback (simplified — no runner cutover needed)
 
-Because the runner is unchanged, there is **no `runs-on` cutover and no new
-registration**. Migration is just: land the D-3 provisioning + pre-job hook on
-CT202; re-run the suite; confirm green. **Rollback** is trivial — the provisioning
-is additive and reversible (remove the accounts/hook), and CI returns to its
-current (honestly-red) state with no runner surgery. Carry Recovery's T-2219
-Debian-container gotcha: `actions/setup-python` has no Debian prebuilt CPython, so
-the tool cache is seeded from `astral-sh/python-build-standalone` with
-`AGENT_TOOLSDIRECTORY=/opt/hostedtoolcache` — already solved on CT202, noted so a
-Rung-2/3 escalation re-applies it.
-
-`justifies-via` **P1** + **D5** (prove green on CT202 before declaring the fix
-landed; never call it done on an unverified re-run).
+No `runs-on` cutover and no new registration; the provisioning is additive and reversible. The migration steps, rollback and the carried T-2219 Debian tool-cache gotcha are in `notes/2026-10-08-org-066-build-detail-relocated.md`.
 
 ## Open questions — on-box verification on CT202, NOT blocking this design
 
@@ -370,10 +262,6 @@ which *rung* is built, not whether the design is sound:
   gate is met** (codex C2).
 - **(b) VM capacity/headroom on pve2** — relevant **only** if forced to Rung 3;
   moot for Rung 1/2.
-
-**Sourcing caveat (carried from the research):** the "ephemeral mode is now
-GitHub-default-recommended as of March 2026" claim rests on a single unverified
-blog source and is **not** relied on anywhere here.
 
 ## Consequences
 
@@ -395,14 +283,4 @@ blog source and is **not** relied on anywhere here.
 
 ## Division of labor
 
-| Step | Owner | Ticket |
-|---|---|---|
-| Draft this ADR | Metis (sub-orch-1) | T-2723 |
-| Relay to the operator + re-run codex | Orchestrator (HO) | — |
-| Ratify (gated on codex-green) | the operator | — |
-| **Isolate/deselect the mutating test — BEFORE any full-suite run on CT202 (D-5 gate)** | Codex | T-2443 |
-| Build (provision CT202 passwd+tmux, NO runner linger; drift-sync; on-box check (a)) | Recovery | T-2219 |
-
-**Build-order note:** the T-2443 row is sequenced *before* the first real suite run
-in the T-2219 build, per the D-5 hard gate — they are separate owners but a fixed
-order, not parallel.
+The owner/ticket table (Mason drafts, T-2723; Codex isolates or deselects the mutating test, T-2443, before any full-suite run per the D-5 gate; Recovery builds, T-2219) is in `notes/2026-10-08-org-066-build-detail-relocated.md`.

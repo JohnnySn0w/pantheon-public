@@ -44,6 +44,11 @@ SENTINEL_TIMEOUT="${RECOVERY_KICK_SENTINEL_TIMEOUT:-180}"    # s; then give up q
 POLL_INTERVAL="${RECOVERY_KICK_POLL_INTERVAL:-3}"            # s between pane polls
 HANDOFF_FILE="${RECOVERY_HANDOFF_FILE:-$HOME/HANDOFF.md}"
 SEND_CMD="${RECOVERY_KICK_SEND_CMD:-$SCRIPT_DIR/send_keys_submit.sh}"
+# T-4455: the kick lands on a FRESH TUI, which is slow to render a paste (T-4362).
+# Ungated, the Enter beat the render and the verify read the still-empty composer
+# as "submitted" (a false rc 0: 2026-09-30 15:51:38Z, the kick sat unsent 2m41s).
+# 8s matches runtime_controller's FRESH_RUNTIME_SUBMIT_RENDER_WAIT_SECONDS.
+RENDER_WAIT="${RECOVERY_KICK_RENDER_WAIT:-8}"
 
 # Steady-state sentinel conjunction — identical to handoff_and_restart.sh step 7.
 # The `─` quantifiers MUST stay grouped: `─` is 3 bytes and in a byte locale a bare
@@ -51,11 +56,37 @@ SEND_CMD="${RECOVERY_KICK_SEND_CMD:-$SCRIPT_DIR/send_keys_submit.sh}"
 # (the CI-red lesson noted in handoff_and_restart.sh). Grouping is identical under UTF-8.
 VERIFY_PATTERN='(╭(─)+╮|(─){20,})'                        # prompt-frame top edge
 IDLE_SENTINEL='❯'                                         # positive idle-prompt cursor (T-0528)
-DIALOG_EXCLUDE='Enter to confirm|Esc to cancel'          # negative: a focused confirm modal disqualifies
+DIALOG_EXCLUDE='Enter to confirm|Esc to cancel|Yes, set auto mode as my default permission mode'          # negative: a focused confirm modal disqualifies
 
 KICK_PROMPT="${RECOVERY_BOOT_KICK_PROMPT:-Fresh session on a bare respawn: read ${HANDOFF_FILE}, then resume your queued work / next ticket per standing priority. Post a one-line status to the operator via the Telegram reply tool only if something genuinely needs his attention.}"
 
-log() { echo "[recovery_boot_kick] $*"; }
+# T-4459: the controller's post_start runs this in the background with stdout and stderr
+# on DEVNULL, so echo alone left the kick's outcome recorded nowhere. Every line also goes
+# to the journal (journalctl -t pantheon-recovery-boot-kick). RECOVERY_KICK_LOGGER is a seam:
+# an executable that takes the message as its one argument. Used by test_recovery_boot_kick.sh
+# and by the bring-up acceptance RecoveryBootKickModule (T-5075), so neither writes the host
+# journal. Logging never affects exit status (`|| true`).
+JOURNAL_TAG="pantheon-recovery-boot-kick"
+log() {
+  echo "[recovery_boot_kick] $*"
+  if [[ -n "${RECOVERY_KICK_LOGGER:-}" ]]; then
+    "$RECOVERY_KICK_LOGGER" "$*" 2>/dev/null || true
+  else
+    logger -t "$JOURNAL_TAG" -- "$*" 2>/dev/null || true
+  fi
+}
+
+# T-4459: ready = submit_verify's not_ready_reason (frame + composer glyph + no modal)
+# AND busy_reason (no generating footer, no background-agent rows). The frame and ❯ are
+# drawn mid-turn too, so the old grep conjunction passed a BUSY pane: in T-3026 attempt 4
+# the kick fired into a still-running probe turn and sat unsent. Prints the verdict
+# ('ready' / 'not_ready:<r>' / 'busy:<r>'); anything else, or a failed predicate, is
+# "not ready" (fail-safe: the worst case is the pre-T-2453 idle-but-alive).
+READY_CHECK="${RECOVERY_KICK_READY_CHECK:-$SCRIPT_DIR/submit_verify.py}"
+_ready_verdict() {
+  printf '%s' "$1" | python3 "$READY_CHECK" --harness claude-code --ready-check 2>/dev/null \
+    || echo "check_failed"
+}
 
 _now() { date +%s 2>/dev/null || echo 0; }
 
@@ -87,21 +118,27 @@ fi
 
 # --- wait for the fresh session to reach a real idle prompt, then kick once ---
 deadline=$(( $(_now) + SENTINEL_TIMEOUT ))
+verdict="none"
 while (( $(_now) < deadline )); do
   pane_text="$(_capture)"
   if [[ -n "$pane_text" ]] \
      && printf '%s' "$pane_text" | grep -Eq "$VERIFY_PATTERN" \
      && printf '%s' "$pane_text" | grep -q "$IDLE_SENTINEL" \
      && ! printf '%s' "$pane_text" | grep -Eq "$DIALOG_EXCLUDE"; then
-    log "idle prompt confirmed on $PANE; delivering boot kick"
-    if "$SEND_CMD" "$PANE" "$KICK_PROMPT"; then
-      log "boot kick submitted"
-    else
-      log "boot kick submit failed; leaving session idle-but-alive (fail-open)"
+    verdict="$(_ready_verdict "$pane_text")"
+    if [[ "$verdict" == "ready" ]]; then
+      log "idle prompt confirmed on $PANE (ready, not busy); delivering boot kick"
+      "$SEND_CMD" --render-wait "$RENDER_WAIT" "$PANE" "$KICK_PROMPT"
+      rc=$?
+      if (( rc == 0 )); then
+        log "boot kick submitted (send_keys_submit rc=0)"
+      else
+        log "boot kick submit failed (send_keys_submit rc=$rc); leaving session idle-but-alive (fail-open)"
+      fi
+      exit 0
     fi
-    exit 0
   fi
   sleep "$POLL_INTERVAL"
 done
-log "idle sentinel not seen within ${SENTINEL_TIMEOUT}s; NOT kicking (idle-but-alive == pre-T-2453)"
+log "no idle, not-busy prompt within ${SENTINEL_TIMEOUT}s (last verdict: ${verdict}); NOT kicking (idle-but-alive == pre-T-2453)"
 exit 0

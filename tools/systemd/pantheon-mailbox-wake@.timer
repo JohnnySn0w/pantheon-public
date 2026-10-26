@@ -11,7 +11,11 @@ Documentation=file:///home/%u/pantheon-config/adr/ORG-026-inter-agent-message-pa
 # marker-debounced, so it NEVER re-kicks already-kicked mail; it only catches
 # deliveries the .path missed. An empty inbox is a clean no-op.
 OnBootSec=2min
-OnUnitActiveSec=5min
+# T-3832 (the operator TG 7231, 2026-09-20): 5min → 2min. Standardizes the mailbox-check
+# cadence to 2min fleet-wide — the consume-plane seats (specialist/recovery/mason/artisan) already
+# sweep at 2min via pantheon-persona-consume@.timer (OnActiveSec=2min); this brings the
+# wake_timer_personas (orchestrator/codex/archivist) to the same 2min mail-check latency.
+OnUnitActiveSec=2min
 
 [Install]
 WantedBy=timers.target

@@ -1,0 +1,16 @@
+# kino Health mute toggle (T-5397): refresh status.json every 5 min, so a mute made
+# outside kino (notify_policy CLI, cap_mute_driver) reaches the kino page without a
+# request. The registry dir is group-only (pantheon-mailbox), which a user manager
+# cannot watch (T-1015), hence a timer and not a .path on the registry. Install with
+# the .path: copy to ~/.config/systemd/user/, daemon-reload,
+# `systemctl --user enable --now pantheon-kino-mute.timer`.
+[Unit]
+Description=kino mute status refresh (T-5397)
+
+[Timer]
+OnCalendar=*:0/5
+AccuracySec=30s
+Unit=pantheon-kino-mute.service
+
+[Install]
+WantedBy=timers.target

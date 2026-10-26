@@ -2,11 +2,11 @@
 
 THE GAP, stated precisely, because it is one word wide: T-2144's guard asserts every persona is
 CLASSIFIED — present in DELIVERY_MODE (how it receives) or DELIVERY_EXEMPT (why it does not). That
-is a check on the DECLARATION. atlas was declared `send-keys` and had no inbox-consumer unit on its
-account at all, so a ticket filed at atlas went nowhere while the guard stayed green. A declaration
+is a check on the DECLARATION. artisan was declared `send-keys` and had no inbox-consumer unit on its
+account at all, so a ticket filed at artisan went nowhere while the guard stayed green. A declaration
 is a promise; delivery is a capability; the guard checked the promise.
 
-AND THE OTHER HALF, which is why "the consumer ran fine" was never evidence either: metis's consumer
+AND THE OTHER HALF, which is why "the consumer ran fine" was never evidence either: mason's consumer
 passed for weeks on `skip:empty_inbox` — it exited before the inject step because there was nothing
 to deliver. A run that never exercises the path cannot testify about the path. So THIS MODULE NEVER
 READS CONSUMER OUTCOMES. Not once. It asks only about the substrate, because that is the thing whose
@@ -22,7 +22,7 @@ exactly the "self-targeted alert" class we do not do. Preconditions are what is 
 so READY is deliberately worded as an absence of known blockers rather than a positive guarantee —
 overclaiming here would rebuild the very substitution this module exists to break.
 
-FIVE STATES, and the split between two of them IS the finding:
+SIX STATES (HELD added by T-5254), and the split between two of them IS the finding:
 
     READY     unit installed AND enabled, and the target (tmux session / inbox) is present.
     DISABLED  the unit exists and is switched off. SOMEBODY RAN `disable` — a deliberate act, so
@@ -32,6 +32,9 @@ FIVE STATES, and the split between two of them IS the finding:
     BROKEN    unit enabled but its target is gone (no tmux session / no inbox) — a poke would fail.
               ALERT.
     UNKNOWN   could not determine. ALERT, never silently green.
+    HELD      the seat is in an ACTIVE seat-maintenance window (notify_policy, T-2984) — held on
+              purpose, so its missing unit/pane is expected. Reported, never alerted, and not
+              probed at all. Fail-open: any registry fault reads "not held" and probes normally.
 
 ⭐ DISABLED vs MISSING is the load-bearing line, and it is what the TG-6694 pause manifest could not
 express. A pause manifest can only list what was STOPPED, so a seat that never had a unit is absent
@@ -59,6 +62,7 @@ CONSUMER_TEMPLATE = "pantheon-inbox-consumer@.timer"
 PROBE_TIMEOUT = 30
 
 READY, DISABLED, MISSING, BROKEN, UNKNOWN = "READY", "DISABLED", "MISSING", "BROKEN", "UNKNOWN"
+HELD = "HELD"  # T-5254: non-alerting; deliberately held seat-maintenance window
 ALERTING = (MISSING, BROKEN, UNKNOWN)
 
 
@@ -70,6 +74,22 @@ def _me() -> str:
         return pwd.getpwuid(os.geteuid()).pw_name
     except Exception:
         return os.environ.get("USER", "")
+
+
+def _seat_in_maintenance(agent: str) -> bool:
+    """T-5254: True iff `agent` is in an ACTIVE seat-maintenance window. Fail-open (False)
+    on any fault so a registry problem can never mask a real delivery gap. ORG-106 L4c: a
+    shim over the shared seat_state.maintenance_active."""
+    return _seat_state_mod().maintenance_active(agent)
+
+
+def _seat_state_mod():
+    """ORG-106 L4c: the seat_state module, importable from a package or a bare run."""
+    try:
+        from tools import seat_state
+    except ImportError:  # bare run with cwd=tools/
+        import seat_state  # type: ignore
+    return seat_state
 
 
 def _log(msg: str) -> None:
@@ -246,7 +266,19 @@ def probe_all(ops: Ops | None = None, substrate: dict | None = None,
         return [{"agent": "*", "mode": "?", "state": UNKNOWN,
                  "detail": "DELIVERY_MODE could not be read — the seat inventory is unknown, "
                            "which is not the same as empty"}]
-    return [probe_agent(a, m, sub.get(a, {}), ops) for a, m in sorted(modes.items())]
+    out = []
+    for a, m in sorted(modes.items()):
+        seat = None if _seat_in_maintenance(a) else _seat_state_mod().safe_effective_for(a)
+        if _seat_in_maintenance(a):
+            out.append({"agent": a, "mode": m, "state": HELD,
+                        "detail": "seat-maintenance ACTIVE — held on purpose; not probed (T-5254)"})
+        elif seat is not None and seat.remediation_vetoed:
+            # ORG-106 L4c: a seat in deep-sleep is down on purpose; its delivery is not a fault.
+            out.append({"agent": a, "mode": m, "state": HELD,
+                        "detail": f"seat-state {seat.state} — held on purpose; not probed (ORG-106)"})
+        else:
+            out.append(probe_agent(a, m, sub.get(a, {}), ops))
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:

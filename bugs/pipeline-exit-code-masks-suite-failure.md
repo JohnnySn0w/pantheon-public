@@ -6,9 +6,9 @@ domain: bash, smoke, ci, pipeline, false-green
 
 # Pipeline exit code masks suite failure — `unittest | tail` returns tail's 0
 
-**Date:** 2026-07-21 (Atlas, T-1922 baseline run; second same-day sibling: Metis's push-loop success-message-on-failed-rebase in T-1912)
+**Date:** 2026-07-21 (Artisan, T-1922 baseline run; second same-day sibling: Mason's push-loop success-message-on-failed-rebase in T-1912)
 
-Atlas's first T-1922 baseline run reported exit 0 while the suite was failing 9F/5E — they had piped `python3 -m unittest ... | tail`, so the pipeline's status was tail's. Caught by re-running unpiped. Same family as the SIGPIPE/head gotcha in echo-merge (a pipe changing the observable outcome of the command in front of it) and the wrong-layer-GREEN lesson (the exit code is a proxy layer; the result lines are the capability).
+Artisan's first T-1922 baseline run reported exit 0 while the suite was failing 9F/5E — they had piped `python3 -m unittest ... | tail`, so the pipeline's status was tail's. Caught by re-running unpiped. Same family as the SIGPIPE/head gotcha in echo-merge (a pipe changing the observable outcome of the command in front of it) and the wrong-layer-GREEN lesson (the exit code is a proxy layer; the result lines are the capability).
 
 Audit candidates: any fleet smoke/CI/watchdog check that gates on `$?` of a piped command.
 

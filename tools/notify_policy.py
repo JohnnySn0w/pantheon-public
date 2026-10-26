@@ -21,11 +21,10 @@ DESIGN INVARIANTS
 
 REGISTRY LOCATION: overridable via `PANTHEON_MUTE_REGISTRY`; the module default is
 `/opt/pantheon-health/notify_mute.json` (the original root-provisioned design target,
-never created). The LIVE monitor-side location provisioned at the T-2987 go-live is the
-NON-root `/home/the-ancestor/health-plane/notify_mute.json` — a `pantheon-mailbox`-group,
-setgid (2770) dir under the ORG-026 hub, so every alert-emitting monitor (all run under
-Recovery's `systemctl --user`) reads the same group-readable (0640) source of truth without a
-root step. The T-2987 monitor units set `PANTHEON_MUTE_REGISTRY` to that path explicitly.
+never created). The LIVE location is `/var/lib/pantheon/notify-mute/notify_mute.json`
+(T-5440): Recovery-owned, `pantheon-shared`, setgid directory and a group-readable (0640)
+registry. Every alert-emitting monitor and writer runs under Recovery's user manager. The
+monitor units set `PANTHEON_MUTE_REGISTRY` to that path explicitly.
 kino's read (T-2979, orchestrator) is a separate leg — kino is not in `pantheon-mailbox`. Because
 a caller with NO env falls back to the (absent) `/opt` default, `is_muted` fail-opens there
 (nobody muted): a missing env can only cause a spurious page, never a silenced one.
@@ -54,8 +53,17 @@ then, but maintenance must work NOW — and every consumer (context-fill + chann
 monitors, and the enter/exit CLI) runs under the SAME account (Recovery's `systemctl --user`
 manager, verified T-2984), so a Recovery-writable state-dir file needs no cross-account
 provisioning. Path: `$PANTHEON_MAINTENANCE_REGISTRY`, else `$PANTHEON_STATE_DIR/
-seat_maintenance.json`, else `~/.local/state/pantheon/seat_maintenance.json` (mirrors
-context_fill_monitor's state_dir resolution + T-2965's flag pattern).
+seat_maintenance.json`, else the SHARED `/var/lib/pantheon/seat-maintenance/
+seat_maintenance.json` when that dir exists, else `~/.local/state/pantheon/
+seat_maintenance.json` (the CLI warns loudly on that per-account fallback).
+T-4150: the shared default exists because the "same account" premise held for the
+CONSUMERS but not the ARMERS. orchestrator drives cutovers from its own account, and its
+per-account arm for recovery never reached Recovery's monitors.
+T-4362: maintenance also PAUSES the seat's inbox consumer. inbox_consumer skips its whole
+cycle (skip:seat_maintenance: no clone pull, no ticket delivery) while the seat is armed,
+so a hand-move's clone stays still. That makes it a delivery pause as well as an action
+veto: an armed seat gets no inbox deliveries until the entry exits or expires. The
+hand-move SOP's phase 0 refuses to fire unless the seat is armed (T-4377).
 """
 from __future__ import annotations
 
@@ -75,21 +83,72 @@ MAINTENANCE_DEFAULT_MINUTES = 60   # a typical cutover-install window
 MAINTENANCE_MAX_MINUTES = 240      # hard cap (mirrors T-2965 WEDGE_SUPPRESS_MAX_MINUTES)
 
 
+# T-4668: where the registry actually lives. DEFAULT_REGISTRY (/opt) was never
+# provisioned, and only 3 of the 21 units that route alerts through
+# route_failure_alert set PANTHEON_MUTE_REGISTRY, so on the other 18 is_muted read
+# a missing file, failed open, and the mute chokepoint silenced nothing. Falling
+# back here, once, at the chokepoint means a new unit cannot drift out of it.
+HEALTH_PLANE_REGISTRY = "/var/lib/pantheon/notify-mute/notify_mute.json"
+
+_load_fault_logged = False
+
+
 def _registry_path(registry: str | os.PathLike | None = None) -> Path:
+    """Explicit argument, else $PANTHEON_MUTE_REGISTRY, else the /opt default if it
+    exists, else HEALTH_PLANE_REGISTRY (T-4668). os.path.exists, not Path.exists:
+    the latter raises on EACCES under 3.12, and an unreadable /opt is 'absent' here."""
     if registry is not None:
         return Path(registry)
-    return Path(os.environ.get("PANTHEON_MUTE_REGISTRY", DEFAULT_REGISTRY))
+    env = os.environ.get("PANTHEON_MUTE_REGISTRY")
+    if env:
+        return Path(env)
+    if os.path.exists(DEFAULT_REGISTRY):
+        return Path(DEFAULT_REGISTRY)
+    return Path(HEALTH_PLANE_REGISTRY)
 
 
 def _load(registry: str | os.PathLike | None = None) -> dict:
-    """Return the parsed registry, or an empty-but-valid one on ANY fault (fail-open)."""
+    """Return the parsed registry, or an empty-but-valid one on ANY fault (fail-open).
+    The first fault in a process is logged to stderr (T-4668): a registry nobody can
+    read used to fail open in silence, which is how 18 units lost muting unnoticed."""
+    global _load_fault_logged
     path = _registry_path(registry)
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, UnicodeDecodeError):
+    except (OSError, ValueError, UnicodeDecodeError) as exc:
+        if not _load_fault_logged:
+            _load_fault_logged = True
+            print(f"[notify_policy] mute registry {path} unreadable ({exc.__class__.__name__}); "
+                  f"failing open: nothing reads as muted", file=sys.stderr)
         return {"schema": SCHEMA, "muted": {}}
     if not isinstance(data, dict) or not isinstance(data.get("muted"), dict):
         return {"schema": SCHEMA, "muted": {}}
+    return data
+
+
+class RegistryUnreadable(OSError):
+    """T-5396: a registry that EXISTS but cannot be read or parsed. Writers refuse on it;
+    only readers fail open. (An OSError, so CLI paths that already catch OSError exit 1.)"""
+
+
+def _load_strict(path: Path, key: str, schema: str) -> dict:
+    """The registry a WRITER may build on: absent = empty (the first write creates it);
+    present but unreadable, malformed or wrong-shaped = RegistryUnreadable. A writer that
+    used the fail-open load would rewrite the file with only its own entry, silently
+    dropping every other mute or maintenance window (T-5396)."""
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return {"schema": schema, key: {}}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise RegistryUnreadable(f"{path}: unreadable ({exc.__class__.__name__}); refusing to "
+                                 f"write over it") from exc
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise RegistryUnreadable(f"{path}: not valid JSON; refusing to write over it") from exc
+    if not isinstance(data, dict) or not isinstance(data.get(key), dict):
+        raise RegistryUnreadable(f"{path}: no '{key}' mapping; refusing to write over it")
     return data
 
 
@@ -136,8 +195,8 @@ def mute(persona: str, *, by: str = "", reason: str = "",
     """Mute `persona`. Returns True if newly muted, False if already muted (idempotent)."""
     if not persona:
         raise ValueError("persona must be non-empty")
-    data = _load(registry)
-    muted = data.setdefault("muted", {})
+    data = _load_strict(_registry_path(registry), "muted", SCHEMA)
+    muted = data["muted"]
     data.setdefault("schema", SCHEMA)
     if persona in muted:
         return False
@@ -151,8 +210,8 @@ def unmute(persona: str, registry: str | os.PathLike | None = None) -> bool:
     """Unmute `persona`. Returns True if it was muted (and is now removed), else False."""
     if not persona:
         raise ValueError("persona must be non-empty")
-    data = _load(registry)
-    muted = data.setdefault("muted", {})
+    data = _load_strict(_registry_path(registry), "muted", SCHEMA)
+    muted = data["muted"]
     if persona not in muted:
         return False
     del muted[persona]
@@ -163,6 +222,14 @@ def unmute(persona: str, registry: str | os.PathLike | None = None) -> bool:
 
 # --- Seat maintenance mode (T-2984): suppress remediation ACTIONS with auto-expiry ---
 
+# T-4150: the default registry is SHARED, so an arm reaches the monitors whichever
+# account runs it. The monitors run as Recovery; a cutover is often driven from orchestrator's
+# account. Under the old per-account default, orchestrator's 09-11 arm for recovery landed in
+# /home/claude and suppressed nothing. The dir is 2775 claude-fallback:pantheon-shared
+# (every seat account but codex is a member; T-4150 provisioned it, no root needed).
+SHARED_MAINTENANCE_DIR = Path("/var/lib/pantheon/seat-maintenance")
+
+
 def _maintenance_registry_path(registry: str | os.PathLike | None = None) -> Path:
     if registry is not None:
         return Path(registry)
@@ -170,8 +237,17 @@ def _maintenance_registry_path(registry: str | os.PathLike | None = None) -> Pat
     if env:
         return Path(env)
     state = os.environ.get("PANTHEON_STATE_DIR")
-    base = Path(state) if state else Path.home() / ".local" / "state" / "pantheon"
-    return base / "seat_maintenance.json"
+    if state:
+        return Path(state) / "seat_maintenance.json"
+    if SHARED_MAINTENANCE_DIR.is_dir():
+        return SHARED_MAINTENANCE_DIR / "seat_maintenance.json"
+    # Unprovisioned host: per-account, so only monitors running as THIS account see
+    # the arm. The CLI warns loudly when it lands here.
+    return Path.home() / ".local" / "state" / "pantheon" / "seat_maintenance.json"
+
+
+def _maintenance_registry_is_shared(path: Path) -> bool:
+    return path.parent == SHARED_MAINTENANCE_DIR
 
 
 def _load_maintenance(registry: str | os.PathLike | None = None) -> dict:
@@ -241,8 +317,8 @@ def enter_maintenance(persona: str, *, minutes: int = MAINTENANCE_DEFAULT_MINUTE
     minutes = max(1, min(minutes, MAINTENANCE_MAX_MINUTES))
     now = (_parse_iso(now_iso) if now_iso else None) or datetime.now(timezone.utc)
     expires_dt = now + timedelta(minutes=minutes)
-    data = _load_maintenance(registry)
-    m = data.setdefault("maintenance", {})
+    data = _load_strict(_maintenance_registry_path(registry), "maintenance", MAINTENANCE_SCHEMA)
+    m = data["maintenance"]
     data.setdefault("schema", MAINTENANCE_SCHEMA)
     _prune_expired(m, now)
     stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -257,14 +333,25 @@ def exit_maintenance(persona: str, registry: str | os.PathLike | None = None) ->
     """Clear `persona`'s maintenance window. Returns True if it was present, else False."""
     if not persona:
         raise ValueError("persona must be non-empty")
-    data = _load_maintenance(registry)
-    m = data.setdefault("maintenance", {})
+    data = _load_strict(_maintenance_registry_path(registry), "maintenance", MAINTENANCE_SCHEMA)
+    m = data["maintenance"]
     if persona not in m:
         return False
     del m[persona]
     data.setdefault("schema", MAINTENANCE_SCHEMA)
     _atomic_write(_maintenance_registry_path(registry), data)
     return True
+
+
+def _cli_mute(args) -> int:
+    if args.cmd == "mute":
+        by = args.by or f"cli:{os.environ.get('USER', '?')}"
+        newly = mute(args.persona, by=by, reason=args.reason, registry=args.registry)
+        print(f"{args.persona}: {'muted' if newly else 'already muted'}")
+        return 0
+    was = unmute(args.persona, registry=args.registry)
+    print(f"{args.persona}: {'unmuted' if was else 'was not muted'}")
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -276,6 +363,8 @@ def main(argv: list[str] | None = None) -> int:
         sp.add_argument("persona")
         if verb == "mute":
             sp.add_argument("--reason", default="")
+            sp.add_argument("--by", default=None,
+                            help="who asked (default cli:$USER); e.g. kino:<user> (T-5397)")
     sp_list = sub.add_parser("list")
     sp_is = sub.add_parser("is-muted")
     sp_is.add_argument("persona")
@@ -288,14 +377,13 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("list-maintenance")
     args = p.parse_args(argv)
 
-    if args.cmd == "mute":
-        newly = mute(args.persona, by=f"cli:{os.environ.get('USER', '?')}", reason=args.reason, registry=args.registry)
-        print(f"{args.persona}: {'muted' if newly else 'already muted'}")
-        return 0
-    if args.cmd == "unmute":
-        was = unmute(args.persona, registry=args.registry)
-        print(f"{args.persona}: {'unmuted' if was else 'was not muted'}")
-        return 0
+    if args.cmd in ("mute", "unmute"):
+        try:
+            return _cli_mute(args)
+        except RegistryUnreadable as exc:
+            print(f"[notify_policy] REFUSED {args.cmd}: {exc}. No mute changed (T-5396).",
+                  file=sys.stderr)
+            return 3
     if args.cmd == "list":
         muted = list_muted(args.registry)
         if not muted:
@@ -307,15 +395,29 @@ def main(argv: list[str] | None = None) -> int:
         muted = is_muted(args.persona, args.registry)
         print("muted" if muted else "not-muted")
         return 0 if muted else 1
-    if args.cmd == "enter-maintenance":
-        expires = enter_maintenance(args.persona, minutes=args.minutes,
-                                    by=f"cli:{os.environ.get('USER', '?')}",
-                                    reason=args.reason, registry=args.registry)
-        print(f"{args.persona}: maintenance ARMED until {expires} ({args.minutes}m)")
-        return 0
-    if args.cmd == "exit-maintenance":
-        was = exit_maintenance(args.persona, registry=args.registry)
-        print(f"{args.persona}: {'maintenance cleared' if was else 'was not in maintenance'}")
+    if args.cmd in ("enter-maintenance", "exit-maintenance"):
+        # T-4150: name the file every time, and say loudly when it is per-account,
+        # because an arm the acting monitors never read fails silently otherwise.
+        path = _maintenance_registry_path(args.registry)
+        try:
+            if args.cmd == "enter-maintenance":
+                expires = enter_maintenance(args.persona, minutes=args.minutes,
+                                            by=f"cli:{os.environ.get('USER', '?')}",
+                                            reason=args.reason, registry=args.registry)
+                print(f"{args.persona}: maintenance ARMED until {expires} ({args.minutes}m)")
+            else:
+                was = exit_maintenance(args.persona, registry=args.registry)
+                print(f"{args.persona}: {'maintenance cleared' if was else 'was not in maintenance'}")
+        except OSError as exc:
+            print(f"ERROR: cannot write maintenance registry {path}: {exc}. Arm from an "
+                  f"account in group pantheon-shared (e.g. recovery or orchestrator).", file=sys.stderr)
+            return 1
+        print(f"registry: {path}", file=sys.stderr)
+        if not _maintenance_registry_is_shared(path) and args.registry is None and not (
+                os.environ.get("PANTHEON_MAINTENANCE_REGISTRY") or os.environ.get("PANTHEON_STATE_DIR")):
+            print(f"WARNING: {SHARED_MAINTENANCE_DIR} is not provisioned on this host, so this "
+                  f"arm is PER-ACCOUNT. Only monitors running as {os.environ.get('USER', 'this user')} "
+                  f"will honor it.", file=sys.stderr)
         return 0
     if args.cmd == "in-maintenance":
         active = in_maintenance(args.persona, args.registry)

@@ -1,10 +1,23 @@
-"""Server-owned plan construction for the host capability broker."""
+"""Server-owned plan construction for the host capability broker.
+
+Import-closure exception (T-5516, ORG-052 §1/§3): this is the ONLY module in
+``tools/host_control`` allowed to import ``tools.persona_installer``. The broker
+plans in-process -- ``Manifest.from_bytes`` and ``PersonaInstaller.plan`` validate
+and render the seat's Codex Telegram bridge block, so the broker process loads the
+installer's agent-facing closure (Telegram bridge, mailbox client, harness
+adapter). Every other host_control module takes the pure contract types from
+``tools.persona_installer_contracts``. ``tools/test_host_control_import_closure.py``
+pins this exception by name. T-5533 removes it (split the pure bridge
+validate/render functions, or move planning into a sandboxed unprivileged
+process) before T-2920 enables the broker.
+"""
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Callable, Literal
+from typing import Callable, Final, Iterable, Literal
 
 from tools.host_control.contracts import (
     CapabilitiesResult,
@@ -16,13 +29,110 @@ from tools.host_control.contracts import (
     compute_effect_digest,
     sha256_json,
 )
+from tools.host_control.envelope import (
+    EXECUTOR_KIND_CLASSES,
+    OutOfEnvelopeKinds,
+    require_executor_envelope,
+)
 from tools.host_control.journal import BrokerJournal
 from tools.host_control.policy import HostPolicy
 from tools.host_control.registry import SeatRegistry
+from tools.host_control.runtime_table import DaemonRuntime, load_daemon_runtime
+from tools.host_control.self_amendment import default_protected_roots, refuse_self_amendment
+# Sanctioned exception, see the module docstring (T-5516 / T-5533).
 from tools.persona_installer import Manifest, PersonaInstaller
+from tools.persona_installer_contracts import (
+    InstallOperation,
+    InstallPlan,
+    OperatorAction,
+)
 
 
 _HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
+
+# T-2917 5b planner partition (HO ruling T-4861, coordinator ruling B8).
+SEAT_LOCAL_RESIDUE_LIMIT: Final = 32
+SEAT_LOCAL_STATUS: Final = "pending-seat-local"
+SEAT_LOCAL_ACTION_PREFIX: Final = "seat-local."
+SEAT_LOCAL_CAPABILITY_PREFIX: Final = "seat-local:"
+
+
+def partition_installer_plan(
+    plan: InstallPlan,
+) -> tuple[InstallPlan, tuple[InstallOperation, ...]]:
+    """Split an installer plan into the BROKER plan (only kinds the
+    executor envelope admits) and an explicit seat-local residue.
+
+    Every excluded or unclassified kind is named in the residue, which is
+    carried as ``OperatorAction`` entries on the broker plan so it is bound
+    by both the plan digest and the effect digest and the approver sees it
+    (nothing widens quietly). Fail closed, refusing the WHOLE plan, when
+    the residue is over its bound or when an admitted operation is ordered
+    after a residue operation: its ``precondition["after"]`` or
+    ``desired["after"]`` (comma list, whitespace-tolerant) names a residue
+    operation id or a residue kind (nothing partially applies out of order).
+    """
+
+    admitted = tuple(op for op in plan.operations if op.kind in EXECUTOR_KIND_CLASSES)
+    residue = tuple(op for op in plan.operations if op.kind not in EXECUTOR_KIND_CLASSES)
+    if not residue:
+        return plan, ()
+    if len(residue) > SEAT_LOCAL_RESIDUE_LIMIT:
+        raise PolicyDenied("family_denied")
+    residue_by_id = {op.operation_id: op for op in residue}
+    residue_kinds = {op.kind for op in residue}
+    blocked: set[str] = set()
+    for operation in admitted:
+        # ordering declarations live in precondition["after"] and, for
+        # some kinds, desired["after"] (e.g. timer-observe names KINDS);
+        # an entry may name an operation id or an operation kind
+        for source in (operation.precondition, operation.desired):
+            after = str(source.get("after", "") or "")
+            for dependency in (item.strip() for item in after.split(",")):
+                if not dependency:
+                    continue
+                if dependency in residue_by_id:
+                    blocked.add(residue_by_id[dependency].kind)
+                elif dependency in residue_kinds:
+                    blocked.add(dependency)
+    if blocked:
+        raise OutOfEnvelopeKinds(blocked)
+    actions = plan.operator_actions + tuple(
+        OperatorAction(
+            action_id=f"{SEAT_LOCAL_ACTION_PREFIX}{op.operation_id}",
+            layer=op.layer,
+            target=op.target,
+            reason=f"{SEAT_LOCAL_STATUS}: {op.kind}",
+            required_capability=f"{SEAT_LOCAL_CAPABILITY_PREFIX}{op.kind}",
+        )
+        for op in residue
+    )
+    values = {
+        field.name: getattr(plan, field.name)
+        for field in dataclasses.fields(plan)
+        if field.name != "digest"
+    }
+    values.update(operations=admitted, operator_actions=actions)
+    return InstallPlan.create(**values), residue
+
+
+def seat_local_residue(plan: InstallPlan) -> list[dict[str, str]]:
+    """The bounded residue list as the approver-facing summary shows it."""
+
+    entries = []
+    for action in plan.operator_actions:
+        if not action.action_id.startswith(SEAT_LOCAL_ACTION_PREFIX):
+            continue
+        entries.append(
+            {
+                "operation_id": action.action_id[len(SEAT_LOCAL_ACTION_PREFIX):],
+                "kind": action.required_capability[len(SEAT_LOCAL_CAPABILITY_PREFIX):],
+                "status": SEAT_LOCAL_STATUS,
+            }
+        )
+    if len(entries) > SEAT_LOCAL_RESIDUE_LIMIT:
+        raise HostControlError("seat-local residue exceeds its bound")
+    return entries
 
 
 class HostPlanService:
@@ -40,11 +150,24 @@ class HostPlanService:
         broker_revision: str,
         host_operation_families: frozenset[str],
         health_check: Callable[[], Literal["ready", "degraded"]],
+        runtime: DaemonRuntime | None = None,
+        protected_roots: Iterable[str] = (),
     ) -> None:
+        # gate 36: the static + loaded-package roots, plus any configured
+        # trusted-config roots the daemon passes in.
+        self._protected_roots = default_protected_roots(protected_roots)
         if plan_ttl <= timedelta(0):
             raise HostControlError("plan TTL must be positive")
         if not host_operation_families:
             raise HostControlError("host operation families must not be empty")
+        # ORG-082 steps 3 + 5 (T-2918): constructing the plan composer IS the
+        # daemon load; it captures the op-registry digest and asserts the
+        # substrate-free dispatch table, or refuses (DaemonStartRefused).
+        if runtime is None:
+            runtime = load_daemon_runtime(host_operation_families=host_operation_families)
+        elif runtime.host_operation_families != frozenset(host_operation_families):
+            raise HostControlError("runtime table was loaded for different host operation families")
+        self._runtime = runtime
         self._registry = registry
         self._policy = policy
         self._journal = journal
@@ -65,6 +188,12 @@ class HostPlanService:
             for value in host_operation_families
         )
         self._health_check = health_check
+
+    @property
+    def runtime(self) -> DaemonRuntime:
+        """The load-time runtime table (digest + dispatch table) this composer uses."""
+
+        return self._runtime
 
     @staticmethod
     def _bounded_scalar(value: object, field_name: str) -> str:
@@ -143,14 +272,36 @@ class HostPlanService:
         if not allowed_families:
             raise PolicyDenied("family_denied")
 
-        installer_plan = self._installer.plan(
+        full_plan = self._installer.plan(
             frozen_manifest,
             target.persona,
             harness_override=target.harness,
             root=target.install_root,
         )
-        if not installer_plan.validate_digest():
+        if not full_plan.validate_digest():
             raise HostControlError("installer returned an invalid plan digest")
+        # ORG-082 §2 (T-2918, F1): a substrate family is absent from the
+        # daemon's dispatch table, so the composer refuses it HERE, before
+        # partition can turn it into seat-local residue and before any
+        # handle is minted or anything is journaled.
+        self._runtime.refuse_outside_table(
+            (operation.kind for operation in full_plan.operations),
+            manifest_revision=manifest_revision,
+        )
+        # ORG-052 gate 36 (T-2918): a plan never amends the broker's own
+        # authority surfaces (executables, units, bus rules, root registries,
+        # approver policy, allowlists, op-enum definitions, journals).
+        refuse_self_amendment(full_plan.operations, self._protected_roots)
+        # T-2917 5b partition (HO ruling T-4861, superseding the 5a
+        # whole-plan refusal of ruling i4): the broker plan holds ONLY
+        # admitted kinds; everything else is the named seat-local residue.
+        installer_plan, _residue = partition_installer_plan(full_plan)
+        # Belt and braces: the broker still refuses, whole-plan, any
+        # non-admitted kind INSIDE its own plan, before any handle is
+        # minted or anything is journaled.
+        require_executor_envelope(
+            operation.kind for operation in installer_plan.operations
+        )
         effect_digest = compute_effect_digest(
             target=target,
             manifest=manifest_record,
@@ -259,6 +410,7 @@ class HostPlanService:
                 }
                 for operation in plan.installer_plan.operations
             ],
+            "seat_local_residue": seat_local_residue(plan.installer_plan),
             "expires_at": plan.expires_at,
         }
         encoded = canonical_json(summary)

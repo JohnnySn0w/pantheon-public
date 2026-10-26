@@ -49,6 +49,16 @@ def _targets(mock_invoke: mock.Mock) -> list[str]:
     return out
 
 
+def _subjects(mock_invoke: mock.Mock) -> list[str]:
+    """The `subject:<agent>` label from each call (T-5239: the seat a leg MEASURES)."""
+    out = []
+    for call in mock_invoke.call_args_list:
+        argv = call.args[0]
+        labels = argv[argv.index("--labels") + 1].split(",")
+        out.extend(l.split(":", 1)[1] for l in labels if l.startswith("subject:"))
+    return out
+
+
 class SoakFilerTest(unittest.TestCase):
     def setUp(self):
         self._tmp = TemporaryDirectory()
@@ -72,9 +82,15 @@ class SoakFilerTest(unittest.TestCase):
     def test_files_all_three_when_none_exist(self):
         rc, m = self._file()
         self.assertEqual(rc, 0)
-        self.assertEqual(_targets(m), ["specialist", "orchestrator", "recovery"])
+        # T-5239 / ORG-088: routed to the seat's POOL ROLE; the measured seat is a label.
+        self.assertEqual(_targets(m), [
+            "role:research_orchestrator", "role:engineering_orchestrator", "role:system_orchestrator",
+        ])
+        self.assertEqual(_subjects(m), ["specialist", "orchestrator", "recovery"])
         for call in m.call_args_list:
             argv = call.args[0]
+            self.assertTrue(argv[argv.index("--target") + 1].startswith("role:"))
+            self.assertIn("SUBJECT SEAT", argv[argv.index("--ask") + 1])
             # carries the idempotency label
             labels = argv[argv.index("--labels") + 1]
             self.assertIn(soak_filer.SOAK_LABEL, labels.split(","))
@@ -91,7 +107,7 @@ class SoakFilerTest(unittest.TestCase):
         _write_ticket(self.root, "inbox", "T-1000", "specialist", ["suite-health", soak_filer.SOAK_LABEL])
         rc, m = self._file()
         self.assertEqual(rc, 0)
-        self.assertEqual(_targets(m), ["orchestrator", "recovery"])  # specialist skipped
+        self.assertEqual(_subjects(m), ["orchestrator", "recovery"])  # specialist skipped
 
     # 3 -----------------------------------------------------------------  (critical)
     def test_skip_when_unresolved_in_active(self):
@@ -100,7 +116,7 @@ class SoakFilerTest(unittest.TestCase):
         _write_ticket(self.root, "active", "T-1001", "specialist", [soak_filer.SOAK_LABEL])
         rc, m = self._file()
         self.assertEqual(rc, 0)
-        self.assertEqual(_targets(m), ["orchestrator", "recovery"])  # specialist still skipped
+        self.assertEqual(_subjects(m), ["orchestrator", "recovery"])  # specialist still skipped
 
     # 4 -----------------------------------------------------------------
     def test_per_account_isolation(self):
@@ -108,7 +124,7 @@ class SoakFilerTest(unittest.TestCase):
         _write_ticket(self.root, "active", "T-1002", "recovery", [soak_filer.SOAK_LABEL])
         rc, m = self._file()
         self.assertEqual(rc, 0)
-        self.assertEqual(_targets(m), ["specialist", "orchestrator"])  # recovery skipped only
+        self.assertEqual(_subjects(m), ["specialist", "orchestrator"])  # recovery skipped only
 
     # 5 -----------------------------------------------------------------
     def test_refile_after_resolved(self):
@@ -116,7 +132,7 @@ class SoakFilerTest(unittest.TestCase):
         _write_ticket(self.root, "done", "T-1003", "specialist", [soak_filer.SOAK_LABEL])
         rc, m = self._file()
         self.assertEqual(rc, 0)
-        self.assertEqual(_targets(m), ["specialist", "orchestrator", "recovery"])
+        self.assertEqual(_subjects(m), ["specialist", "orchestrator", "recovery"])
 
     # 6 -----------------------------------------------------------------
     def test_label_match_not_substring(self):
@@ -132,7 +148,7 @@ class SoakFilerTest(unittest.TestCase):
         )
         rc, m = self._file()
         self.assertEqual(rc, 0)
-        self.assertEqual(_targets(m), ["specialist", "orchestrator", "recovery"])  # specialist NOT suppressed
+        self.assertEqual(_subjects(m), ["specialist", "orchestrator", "recovery"])  # specialist NOT suppressed
 
     # 7 -----------------------------------------------------------------
     def test_produced_text_is_hermes_clean(self):
@@ -154,7 +170,7 @@ class SoakFilerTest(unittest.TestCase):
             _write_ticket(self.root, "active", f"T-200-{agent}", agent, [soak_filer.SOAK_LABEL])
         rc, m = self._file(force=True)
         self.assertEqual(rc, 0)
-        self.assertEqual(_targets(m), ["specialist", "orchestrator", "recovery"])  # all re-filed
+        self.assertEqual(_subjects(m), ["specialist", "orchestrator", "recovery"])  # all re-filed
 
     # 9 -----------------------------------------------------------------
     def test_partial_failure_is_resilient(self):
@@ -170,7 +186,7 @@ class SoakFilerTest(unittest.TestCase):
                 ticket_bin=self.root / "tools" / "ticket.py", env={},
             )
         self.assertEqual(rc, 1)
-        self.assertEqual(_targets(m), ["specialist", "orchestrator", "recovery"])
+        self.assertEqual(_subjects(m), ["specialist", "orchestrator", "recovery"])
 
     # 10 ----------------------------------------------------------------
     def test_dry_run_makes_no_subprocess_calls(self):
@@ -181,16 +197,32 @@ class SoakFilerTest(unittest.TestCase):
         self.assertEqual(m.call_count, 0)
 
     # 11 ----------------------------------------------------------------
-    def test_recovery_self_file_has_matching_requester_and_target(self):
+    def test_recovery_leg_targets_its_pool_role_and_labels_its_subject(self):
         rc, m = self._file()
         self.assertEqual(rc, 0)
         recovery_call = next(
             c for c in m.call_args_list
-            if c.args[0][c.args[0].index("--target") + 1] == "recovery"
+            if "subject:recovery" in c.args[0][c.args[0].index("--labels") + 1].split(",")
         )
         argv = recovery_call.args[0]
         self.assertEqual(argv[argv.index("--requester") + 1], "recovery")
-        self.assertEqual(argv[argv.index("--target") + 1], "recovery")
+        self.assertEqual(argv[argv.index("--target") + 1], "role:system_orchestrator")
+
+    # 11b ---------------------------------------------------------------
+    def test_idempotency_matches_the_subject_label_on_a_role_targeted_leg(self):
+        # New-shape leg: target is a shared role pool, the measured seat is the label.
+        _write_ticket(self.root, "active", "T-1005", "role:engineering_orchestrator",
+                      [soak_filer.SOAK_LABEL, "subject:orchestrator"])
+        rc, m = self._file()
+        self.assertEqual(rc, 0)
+        self.assertEqual(_subjects(m), ["specialist", "recovery"])  # orchestrator skipped, others not
+
+    def test_a_role_pool_alone_does_not_suppress_other_subjects(self):
+        # Same pool, different subject: must NOT be read as orchestrator's leg.
+        _write_ticket(self.root, "active", "T-1006", "role:system_orchestrator",
+                      [soak_filer.SOAK_LABEL, "subject:recovery"])
+        rc, m = self._file()
+        self.assertEqual(_subjects(m), ["specialist", "orchestrator"])
 
     # 12 ----------------------------------------------------------------
     def test_ask_hardens_against_flake_on_red(self):

@@ -4,7 +4,7 @@ Reads bugs/seed-own-suite-expected-failures.manifest.json (sibling to this
 file, since this conftest.py sits at the seed root) and SKIPS (not xfail —
 xfail still executes the test body, which would ERROR on missing CLEAR-set
 data rather than being cleanly skipped) every collected test item matching a
-manifest target, at module or module+class granularity. Silently a no-op if
+manifest target, at module, module+class or (T-5486) single-test granularity. Silently a no-op if
 the manifest is absent, unreadable, or malformed — including valid JSON with
 the WRONG SHAPE (e.g. a top-level array instead of an object, or a
 "classes": null) — a fork that deletes, never regenerates, or somehow ships
@@ -74,7 +74,8 @@ def _build_module_targets(manifest):
             module = target.get("module")
             if not module:
                 continue
-            module_targets.setdefault(module, []).append((target.get("test_class"), class_id))
+            module_targets.setdefault(module, []).append(
+                (target.get("test_class"), target.get("test"), class_id))
     return module_targets
 
 
@@ -94,14 +95,19 @@ def _skip_expected_failures(items):
             continue
         item_cls = getattr(item, "cls", None)
         cls_name = item_cls.__name__ if item_cls is not None else None
-        for test_class, class_id in targets:
-            if test_class is None or test_class == cls_name:
-                reason = (
-                    f"expected failure per {_MANIFEST_REL} (T-1677): class {class_id}"
-                    + (f", {test_class}" if test_class else "")
-                )
-                item.add_marker(pytest.mark.skip(reason=reason))
-                break
+        test_name = getattr(item, "originalname", None) or item.name.split("[", 1)[0]
+        for test_class, test, class_id in targets:
+            if test_class is not None and test_class != cls_name:
+                continue
+            if test is not None and test != test_name:
+                continue
+            reason = (
+                f"expected failure per {_MANIFEST_REL} (T-1677): class {class_id}"
+                + (f", {test_class}" if test_class else "")
+                + (f"::{test}" if test else "")
+            )
+            item.add_marker(pytest.mark.skip(reason=reason))
+            break
 
 
 def pytest_collection_modifyitems(config, items):

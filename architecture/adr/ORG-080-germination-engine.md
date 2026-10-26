@@ -2,14 +2,16 @@
 aliases: [ORG-080]
 id: ORG-080
 title: "Germination engine — apex lifecycle composer over typed component contracts (the SSEED installer/manager)"
-status: Ratified 2026-08-26 by the operator via Telegram 8612 as the ORG-080 + ORG-081 + ORG-082 bundle at goal-level authority. Frozen ratify candidate at v15 (commit 845aa519a). Supersedes [[ORG-049]]. Amends [[ORG-068]] (matrix retires to [[ORG-081]] registry pointer; three-part health-leg predicate). Companion [[ORG-082]] amends [[ORG-052]] (gate 32a — same-registry-digest acceptance). Revision history at §Revision history.
+status: Ratified 2026-08-26 by the operator via Telegram 8612 as the ORG-080 + ORG-081 + ORG-082 bundle at goal-level authority. Frozen ratify candidate at v15 (commit 845aa519a). Supersedes [[ORG-049]]. Amends [[ORG-068]] (matrix retires to [[ORG-081]] registry pointer; three-part health-leg predicate). Companion [[ORG-082]] amends [[ORG-052]] (gate 32a — same-registry-digest acceptance). Revision history at §Revision history. Amended 2026-10-17 (buildout charter, T-2667; A-3/A-5/A-7 HO-decided by orchestrator 2026-10-17, pending the operator ratification).
 date: 2026-08-26
 author: Orchestrator (Orchestrator)
 steward: orchestrator
 supersedes: ORG-049
-relates: ORG-042, ORG-043, ORG-046, ORG-050, ORG-051, ORG-052, ORG-053, ORG-055, ORG-057, ORG-063, ORG-064, ORG-065, ORG-066, ORG-068, ORG-076, ORG-079, ORG-082
+relates: ORG-042, ORG-043, ORG-046, ORG-050, ORG-051, ORG-052, ORG-053, ORG-055, ORG-057, ORG-063, ORG-064, ORG-065, ORG-066, ORG-068, ORG-076, ORG-079, ORG-082, ORG-084, ORG-089, ORG-099, RFC-004
 build_disposition: needs-build
 scoping_ticket: T-2667
+appetite: 8
+riskiest_assumption: "Wrap, don't rewrite: an existing tool adopts the component contract through a thin adapter (probe: T-5081 on repo_reconciler)."
 # ADR ↔ registry link (per D-10 of [[ORG-081]]).
 # ORG-080 names day-one components (F4) that MUST have registry rows once
 # [[ORG-081]]'s validator lands (T-2667 tranche a). The waiver is not admissible
@@ -22,7 +24,7 @@ registers_components: [germination-engine, system-registry, host-substrate, harn
 
 **Status:** **Ratified 2026-08-26 by the operator via Telegram 8612** as the ORG-080 + ORG-081 + ORG-082 bundle. **Authority: goal-level.** Frozen ratify candidate at v15 (commit 845aa519a). Supersedes [[ORG-049]]. Amends [[ORG-068]] (matrix → [[ORG-081]] registry pointer; three-part health-leg predicate). Companion [[ORG-082]] amends [[ORG-052]] (gate 32a — same-registry-digest acceptance). The sandbox+admission subsystem's implementation-mechanism (kernel/POSIX and systemd behaviors) lives in the reference-implementation at `tools/germinate/planner_sandbox/` (T-3274), not this ADR; this ADR carries the architectural commitments the reference-implementation must satisfy (see §Architectural-tier scope carve). See §Revision history for the fold-chain.
 
-**Related:** [[ORG-049]] (**PROPOSED supersession** — its layers become the op taxonomy, its four modes become the engine verbs), [[ORG-052]] (§8 + Unit 6 — **PROPOSED amendment** via companion [[ORG-082]], removing substrate op families from broker daemon exposed surface), [[ORG-051]] (credential broker verbs — called), [[ORG-057]] (six-step harness switch — consumed as configure sub-op b), [[ORG-063]] (isolates ruling 2 — constraint on the composer), [[ORG-064]] (scheduler render + apply — called), [[ORG-068]] (five lifecycle legs + subsystem invariants + health interface — **PROPOSED amendment** alongside), [[ORG-076]] (fleet health plane — adjacent, seam at §Health-plane seam; rev-3 restarts inside this arc per F7), [[ORG-079]] (persona-stack L1 invariants — consumed as the harness-manager component's verify block), [[ORG-053]] (SSEED north star — served). [[ORG-081]] (System Registry — companion ADR; the engine reads it), [[ORG-082]] (ORG-052 substrate-off-daemon amendment — companion for F2 reconciliation).
+**Related:** [[ORG-049]] (**Supersession, ratified 2026-08-26** — its layers become the op taxonomy, its four modes become the engine verbs), [[ORG-052]] (§8 + Unit 6 — **amended 2026-08-26** via companion [[ORG-082]], removing substrate op families from broker daemon exposed surface), [[ORG-051]] (credential broker verbs — called), [[ORG-057]] (six-step harness switch — consumed as configure sub-op b), [[ORG-063]] (isolates ruling 2 — constraint on the composer), [[ORG-064]] (scheduler render + apply — called), [[ORG-068]] (five lifecycle legs + subsystem invariants + health interface — **amended 2026-08-26** alongside), [[ORG-076]] (fleet health plane — adjacent, seam at §Health-plane seam; rev-3 restarts inside this arc per F7), [[ORG-079]] (persona-stack L1 invariants — consumed as the harness-manager component's verify block), [[ORG-053]] (SSEED north star — served). [[ORG-081]] (System Registry — companion ADR; the engine reads it), [[ORG-082]] (ORG-052 substrate-off-daemon amendment — companion for F2 reconciliation).
 
 ## Intent
 
@@ -40,8 +42,8 @@ The operator named the fix on 2026-08-08 (T-2667): a general seed installer/mana
 
 | ADR | Layer | Relationship to this engine |
 |---|---|---|
-| [[ORG-049]] | contract — installer shape | **Proposed supersession** by this ADR (F1) — effective with bundle adoption; its four modes become the engine verbs, its layers become the op taxonomy |
-| [[ORG-068]] | contract — the five lifecycle legs + system invariants | **Proposed amendment** (companion) — effective with bundle adoption; principle, legs, invariants and health interface kept; the prose coverage matrix becomes a pointer to the [[ORG-081]] system registry (F3) |
+| [[ORG-049]] | contract — installer shape | **Superseded** by this ADR (F1) — ratified 2026-08-26 with the bundle; its four modes become the engine verbs, its layers become the op taxonomy |
+| [[ORG-068]] | contract — the five lifecycle legs + system invariants | **Amended** (companion) — ratified 2026-08-26 with the bundle; principle, legs, invariants and health interface kept; the prose coverage matrix becomes a pointer to the [[ORG-081]] system registry (F3) |
 | [[ORG-079]] | contract — L1 install-completeness (persona stack) | **Consumed as data**: its V1–V19 are the `harness-manager` component's invariant list; rides with this ADR rather than a separate ratification |
 | [[ORG-052]] | service — the Action Broker (privileged host ops) | **Called**: engine's root path shares its typed-operation registry; Units 5/6/8 are the build that makes it real (F2) |
 | [[ORG-051]] | service — credential broker | **Called**: credential verbs; installed early in the order so secrets have a home before seats need them |
@@ -348,7 +350,7 @@ The tuple-to-path mapping is bijective and URL-safe encoded — no implementatio
 
         On the same boot pass, engine startup reads `/proc/sys/kernel/random/boot_id` (36-char dashed form, byte-identical to what the schema stores), then walks both scope_roots' gate records (at their §Gate location paths); for each gate whose `active_run_id != null`, compares `gate.boot_id` against the current boot id. **Mismatch (stale) → the previously-active run was interrupted by reboot**; routed to the reconciliation matrix as a pre-boot terminal state (transitioned to `HALTED` with `halted.op_id: "system-reboot"`, `halted.reason: "interrupted-by-reboot"`, `halted.at: <boot-time-approx from /proc/uptime + wall clock>`). **Match (same boot, tmpfs lost the lock, engine restart after crash)** → the previously-active run was interrupted by an executor crash within this boot; routed to the reconciliation matrix as an in-boot crash (any receipts committed apply; incomplete transaction rolled back via the parking/admission matrices below).
 
-**Cross-scope lock rationale. [Documentary — informs C1 + C4, per §Architectural-tier scope carve. The specific 0755 / 0700 mode split and same-filesystem gate/record scheme is an implementation-mechanism artifact; C1 requires only that admission serialize component-wide across scopes/lifecycles, and C4 requires fail-closed on primitive unreachability. Reference-implementation per T-3274 may retire, replace, or redesign these mechanism specifics.]** Root-owned + non-replaceable + world-readable-gates + world-traversable-ancestor-chain is the minimum trust base sufficient to enforce single-lock-domain semantics across the F2 tri-context isolate model. A group-write scheme is insufficient — group members can replace the lock inode, which breaks the "single lock" claim because Linux `flock(2)` binds to the open file description; a root-owned dir + 0444 lock file removes that surface without adding a runtime broker dependency. Holding the lock for the whole run (not just admission) is the invariant Cairn's finding requires — a lock released before mutation begins does not serialize mutation. Gate world-readability is the minimum information exposure sufficient to close the seat-cannot-read-sibling observation gap; the gate contents carry no authority-bearing tokens (per §Interaction model). Locating the gate tree on a shared world-traversable path (not under a seat's home) makes world-readability actually reachable on the deployed 0750-home shape — the run-record subtree stays at 0700 to preserve run-record confidentiality.
+**Cross-scope lock rationale. [Documentary — informs C1 + C4, per §Architectural-tier scope carve. The specific 0755 / 0700 mode split and same-filesystem gate/record scheme is an implementation-mechanism artifact; C1 requires only that admission serialize component-wide across scopes/lifecycles, and C4 requires fail-closed on primitive unreachability. Reference-implementation per T-3274 may retire, replace, or redesign these mechanism specifics.]** Root-owned + non-replaceable + world-readable-gates + world-traversable-ancestor-chain is the minimum trust base sufficient to enforce single-lock-domain semantics across the F2 tri-context isolate model. A group-write scheme is insufficient — group members can replace the lock inode, which breaks the "single lock" claim because Linux `flock(2)` binds to the open file description; a root-owned dir + 0444 lock file removes that surface without adding a runtime broker dependency. Holding the lock for the whole run (not just admission) is the invariant Consultant's finding requires — a lock released before mutation begins does not serialize mutation. Gate world-readability is the minimum information exposure sufficient to close the seat-cannot-read-sibling observation gap; the gate contents carry no authority-bearing tokens (per §Interaction model). Locating the gate tree on a shared world-traversable path (not under a seat's home) makes world-readability actually reachable on the deployed 0750-home shape — the run-record subtree stays at 0700 to preserve run-record confidentiality.
 - **Gate + record admission transaction.** Gate admission and run-record creation are two files on the same filesystem; POSIX gives no cross-file atomic rename. The transaction defines an **ordered pair of atomic writes** so every crash prefix is reconciler-classifiable:
 
     1. **Acquire cross-scope tmpfs lock** at `/run/pantheon/germinate/component-locks/<instance>-<component>.lock` (`flock LOCK_EX`). Read BOTH scope_roots' `_component_gate.json` — the 0755 gate-tree ancestor-chain above lets any uid traverse to either scope's gate, and the 0644 gate leaf lets any uid read it, so BOTH gates are readable from EITHER scope's admission path (seat-scope admission reads system gate; system-scope admission reads seat gate as root). Refuse per the admission table above (§Acquire order).
@@ -583,9 +585,9 @@ Health-plane build (T-2941 / T-2978 / T-2979) proceeds in parallel on its own ti
 - **D-D. Registry is data; the matrix is rendered; status values are a closed enum whose evidence rules the schema validates — F3, P1, P4.**
 - **D-E. `rollback` is the receipt-scoped undo of one attempt; `remove` is decommission — two verbs, no mode flag — P1, [[ORG-052]] §8 (retire ≠ delete).**
 - **D-F. Gates only at declared operation gates (with their approval contract) and reserved-authority gates; necessary external interactions park, they do not gate — D1 (operator bandwidth), [[ORG-050]] apply-after-gates + authority identity, [[ORG-042]] reserved flips, [[ORG-052]] acceptance 9–16, R6.**
-- **D-G. T-0753's no-`bringup.sh` ruling has a PROPOSED supersession — effective with bundle adoption.** [[ORG-068]] ratified after it; its concern (substrate-tier paste-and-run) is answered by typed ops + preflight + gates + receipts, not by keeping the procedure in prose. Until the operator ratifies the bundle, the original T-0753 verdict stands; on ratify all status surfaces (this D-G, the T-0753 banner, the [[ORG-049]] supersession, the [[ORG-068]] amendment, the [[ORG-081]]/[[ORG-082]] PROPOSED banners) flip together.
+- **D-G. T-0753's no-`bringup.sh` ruling is superseded (ratified 2026-08-26 with the bundle).** [[ORG-068]] ratified after it; its concern (substrate-tier paste-and-run) is answered by typed ops + preflight + gates + receipts, not by keeping the procedure in prose. Before ratification the original T-0753 verdict stood; at ratify all status surfaces (this D-G, the T-0753 banner, the [[ORG-049]] supersession, the [[ORG-068]] amendment, the [[ORG-081]]/[[ORG-082]] PROPOSED banners) flip together.
 - **D-H. Update leg per component: auto-apply for unprivileged, auto-stage + supervised cutover for privileged — [[ORG-068]] §1 + T-2922's rationale.**
-- **D-I. Wrap, don't rewrite — D10 (reuse the canonical implementation rather than a second one).** `persona_installer` / `mailbox_onboard` / `consume_onboard` / `persona_cutover` / `codex_telegram_bridge` / `scheduler_reconcile` / `host_control` become component engines behind one contract, extending `_organ_lifecycle.py`.
+- **D-I. Wrap, don't rewrite — P1 (one structural contract over the existing tools, not a second implementation of each).** `persona_installer` / `mailbox_onboard` / `consume_onboard` / `persona_cutover` / `codex_telegram_bridge` / `scheduler_reconcile` / `host_control` become component engines behind one contract, extending `_organ_lifecycle.py`.
 - **D-J. Health is not an installer stage; the installer's obligation is the three-part predicate — [[ORG-068]] E9.C3 (unchanged), [[ORG-076]] §6, P1 (one boundary: mutate vs observe).** The installer proves (a) emitter installed + reporting, (b) the emitter's `invariant_list_ref` and the component's `verify` `invariant_list_ref` resolve to the same `<id>@<digest>`, (c) collector attachment + proven alert delivery (or explicit `partial_by_design` waiver acknowledging E9.C3 non-cover per D-AB). Emitter-install alone does NOT satisfy E9.C3.
 - **D-K. Repair tier stays above the installer; break-glass is installer-independent — [[ORG-063]] ruling 4 applied one level up, Recovery co-review, P1.**
 - **D-L. Supervisor-model cutover and harness-runtime swap are two composable configure sub-ops, each with its own gate — Recovery co-review (T-2950 evidence), [[ORG-057]] §3, P6.**
@@ -631,13 +633,162 @@ Health-plane build (T-2941 / T-2978 / T-2979) proceeds in parallel on its own ti
 
 Fold arc across 14 rounds, all 2026-08-26. Each round appears as a git commit on `main`; the sequence is preserved there for audit. High-level shape:
 
-- **v1–v9** — Nine prose fold rounds through Cairn's ORG-041 spec-review, each closing the previous round's findings surgically. Substrate work: state-enum + parking transaction (v5), cross-scope tmpfs lock (v6), root-owned lock + world-readable gates + boot_id (v7), ancestor-mode / uuid-shape / postboot-target (v8), gate relocation + admission-predicate correction + runtime postboot marker + planner_kind schema (v9). Convergence pattern shifted from "you missed the wire" (v3–v7) to "you missed the provider fact" (v8–v9): kernel/POSIX and systemd behaviors the ADR-prose tier could not mechanically discover in advance.
+- **v1–v9** — Nine prose fold rounds through Consultant's ORG-041 spec-review, each closing the previous round's findings surgically. Substrate work: state-enum + parking transaction (v5), cross-scope tmpfs lock (v6), root-owned lock + world-readable gates + boot_id (v7), ancestor-mode / uuid-shape / postboot-target (v8), gate relocation + admission-predicate correction + runtime postboot marker + planner_kind schema (v9). Convergence pattern shifted from "you missed the wire" (v3–v7) to "you missed the provider fact" (v8–v9): kernel/POSIX and systemd behaviors the ADR-prose tier could not mechanically discover in advance.
 - **v10 — Architectural-tier CARVE.** Per the operator TG 8579/8585/8586/8590/8594, the sandbox+admission subsystem's implementation-mechanism authority moved out of the ADR body into a reference-implementation deliverable at `tools/germinate/planner_sandbox/` (T-3274). The ADR retains the architectural commitments (C1–C4 at v10, extended to C5 at v11); the reference-implementation demonstrates the mechanism against real host semantics. Layer-anchor critique discipline (TG 8590) governs the review contract from here forward — REBOUND is reserved for architectural-prose-tier findings the ADR can actually carry.
-- **v11 — Cairn v10-REBOUND fold (2 BLOCK + 2 FIX-SOON, all architectural-prose-tier).** Added C5 (sandbox capability/no-actuation outcome), C2 quantifier split (initial-vs-non-initial for incoming, terminal-vs-non-terminal for outgoing), inline `[Documentary — informs Cn]` markers at the four sandbox+admission passages in §Decision.
-- **v12 — Cairn v11-REBOUND fold (1 BLOCK, architectural-prose-tier).** C2 reclassified `PARKING_FAILED` as non-terminal with operator-invoked rollback as its only admissible outgoing transition (option (i) of Cairn's disposition, chosen over option (ii) because ORG-080:574 reads as a same-record transition).
-- **v13 — Cairn v12 FIX-SOON landing (0 BLOCK + 2 FIX-SOON).** Cairn v12 verdict architecturally APPROVED. Aligned the two remaining PARKING_FAILED wording sites (§Component contract enum row + §Reconciliation-failed halted escalation paragraph) to the C2 reclassification; aligned ORG-081 v12 frontmatter identity.
-- **v14 — the operator editorial pass** (TG 8604): stripped revision-history/process scaffolding from all three bundle ADRs. Frontmatter status collapsed to one sentence; §Architectural-tier scope carve reduced to commitments-only (Cairn-verdict-disposition subsections retired); parenthetical process refs stripped from C1–C5 titles; per-section "**vN (T-NNNN fold):**" callouts in §Decision retired; fold signatures consolidated into this section. No semantic change to any commitment.
+- **v11 — Consultant v10-REBOUND fold (2 BLOCK + 2 FIX-SOON, all architectural-prose-tier).** Added C5 (sandbox capability/no-actuation outcome), C2 quantifier split (initial-vs-non-initial for incoming, terminal-vs-non-terminal for outgoing), inline `[Documentary — informs Cn]` markers at the four sandbox+admission passages in §Decision.
+- **v12 — Consultant v11-REBOUND fold (1 BLOCK, architectural-prose-tier).** C2 reclassified `PARKING_FAILED` as non-terminal with operator-invoked rollback as its only admissible outgoing transition (option (i) of Consultant's disposition, chosen over option (ii) because ORG-080:574 reads as a same-record transition).
+- **v13 — Consultant v12 FIX-SOON landing (0 BLOCK + 2 FIX-SOON).** Consultant v12 verdict architecturally APPROVED. Aligned the two remaining PARKING_FAILED wording sites (§Component contract enum row + §Reconciliation-failed halted escalation paragraph) to the C2 reclassification; aligned ORG-081 v12 frontmatter identity.
+- **v14 — the operator editorial pass** (TG 8604): stripped revision-history/process scaffolding from all three bundle ADRs. Frontmatter status collapsed to one sentence; §Architectural-tier scope carve reduced to commitments-only (Consultant-verdict-disposition subsections retired); parenthetical process refs stripped from C1–C5 titles; per-section "**vN (T-NNNN fold):**" callouts in §Decision retired; fold signatures consolidated into this section. No semantic change to any commitment.
 - **v15 — the operator's external-reviewer final-review pass** (TG 8609). Two ORG-080 fixes: (a) §8 parked-resume no longer undercounts persisted states — reworded to "three operator-visible parking-phase states, plus PENDING_PARK / PARKING_FAILED defined in the run-record schema"; (b) §Mid-leg failure `rollback_incomplete` paragraph now names `ROLLBACK_INCOMPLETE` explicitly as a run-record state in the closed enum (matches the schema table) while preserving the "not a new lifecycle leg / not a new verb" distinction. No architectural change; both edits align prose to the already-normative enum.
 
 Convergence trajectory across the T-3273/T-3284 review arc: v9 3-BLOCK → v10 2-BLOCK → v11 1-BLOCK → v12 0-BLOCK-2-FIX-SOON → v13 landing → v14 editorial. Zero implementation-tier findings routed as REBOUND across v10/v11/v12 — R/D carve held structurally throughout.
 
+
+## Amendment (2026-10-17, T-2667): buildout charter
+
+**Status.** Drafted under T-2667 on 2026-10-17. Calls A-3, A-5 and A-7 (marked *HO-decided*) were decided at HO tier by orchestrator on 2026-10-17. All of it is pending the operator's ratification. It changes no ratified decision above. It adds decisions the 2026-08-26 bundle left open, plus the [[ORG-089]] viability fields the bundle predates. Until the operator ratifies, the HO-decided items govern how the build is sequenced. They don't change what the ratified text requires.
+
+**Intent.** One coherent apex controller that installs, configures, monitors and removes any organ or seat (the operator TG 7285). The bundle ratified *what* that controller is. This amendment decides *how it gets built without ballooning*:
+- what the installable unit is called and what pins it;
+- what fires the engine when no operator does;
+- which slice proves the bet first;
+- how the bespoke-automation backlog ([[T-3433]]) maps onto the build.
+
+**Context.** Seven weeks after ratification, `registry/` and the engine skeleton did not exist. The de-risking reference implementations did: the planner sandbox (T-3274), the WAL (T-3336), the runtime-effect adapter (T-3340) and the broker executor (T-2917). Four gaps sat at decision altitude:
+1. "Seed" was defined only in a design-draft note.
+2. D-U makes updates automatic and D-P makes the engine a command, but nothing named what fires the command unattended, or with what privilege.
+3. The build plan had no viability gate. The bundle took 15 fold rounds, and its closest probe (T-3334 Arc B) hit the 3-REBOUND cap.
+4. [[ORG-099]]'s HARD axes created a second verify vocabulary beside [[ORG-079]] V1–V19.
+
+### A-1. Seed: the installable unit of an instance
+
+A **seed** is inert data. It consists of:
+- an instance manifest (`instance.yaml`);
+- the [[ORG-081]] system registry;
+- the framework revision;
+- the set of component contracts;
+- secret *references* (never values).
+
+The [[ORG-055]] generated assembly lock pins all of it.
+
+A **component** is the installable unit for one organ or seat. A seed is the set of components plus the bindings that make them one instance.
+- **Identity:** a seed is its instance id plus its assembly-lock digest. A component is its registry `id` plus its `contract_digest` ([[ORG-081]] D-9).
+- **Versioning** is the lock: a new seed version is a new lock digest.
+
+**Germination** is this engine applying legs to a seed. The engine never edits a seed; it converges a host toward one. Source: design draft §3.1 (`notes/2026-08-24-seed-installer-system-design-draft.md`), lifted into the ratified record.
+
+### A-2. Lifecycle: no new legs, no new verbs
+
+Seed → running organ or seat is §1 of this ADR, unchanged: preflight → install → configure → health → update → remove.
+- **Health:** the installer's duty is the three-part obligation in [[ORG-068]] §Amendment item 2. Continuous observation belongs to [[ORG-076]].
+- Verify, repair and rollback remain engine verbs.
+
+### A-3. Cadence seam: the Scheduler fires the engine; scheduled runs never run as root (*HO-decided*)
+
+The engine calls the Scheduler to install timers (§ADR layer map). In the other direction, **Scheduler timers are the only unattended trigger for `germinate`**. That covers auto-update under `update.policy: auto`, and periodic verify.
+
+Limits on a scheduled run:
+- It may execute only legs whose ops are `privilege: none | seat`.
+- For a privileged component it may auto-*stage* an update but never cut over; cutover stays supervised (D-H).
+- The bootstrap in-process root path ([[ORG-082]]) remains operator-run only.
+
+The repair seam is where [[ORG-076]] / [[RFC-004]] put it:
+- A repair ticket's action is `germinate repair` ([[RFC-004]] §3).
+- Who may invoke it is bounded by the repair grant ([[RFC-004]] §4).
+- Repair stays above the installer (D-K).
+
+### A-4. A new module, not the Harness Manager renamed: D-B confirmed
+
+The engine is a new thin composer. The Harness Manager is one component it composes. "Main controller" means the apex *executor*. The apex *decider* remains an operator persona (R12b; the future Bridge head seat, [[ORG-063]] OPEN item 2).
+
+Alternatives rejected:
+- **Harness Manager renamed at the top:** it would hold seat-lifecycle and host-capability power together, which [[ORG-063]] ruling 2 forbids.
+- **A resident controller daemon:** contradicts D-P, and duplicates the health plane and the Scheduler.
+- **Inside the Action Broker:** the broker daemon may not expose substrate ops ([[ORG-082]]).
+- **Scheduler-driven:** the Scheduler owns *when*, never *what* ([[ORG-064]] 1b).
+
+### A-5. Build order: walking skeleton first, then one go/no-go (*HO-decided*)
+
+The build starts with three pieces:
+1. the registry (T-5073);
+2. the engine skeleton over the simulated backend (T-5074);
+3. **one real, unprivileged component adopting the contract** (T-5081).
+
+The root-path and harness-manager tranches (T-5084, T-5090, T-5091, T-5092) start only after T-5081 passes a go/no-go against §Riskiest assumption below. Tranche asks, acceptance and sequencing live in those tickets, not here.
+
+### A-6. One verify list per seat
+
+The harness-manager component's `verify` invariant list is a single `invariant_list_ref`. It resolves [[ORG-079]] V1–V19 together with [[ORG-099]]'s HARD axes. Neither list keeps a parallel verifier.
+
+### A-7. Absorbing the bespoke-automation backlog (*HO-decided* for the publish exclusion)
+
+A [[T-3433]] child is an engine-absorption candidate only if its op is a leg of a registered component. A candidate retires in one of two ways:
+- when its absorbing tranche lands; or
+- when another durable mechanism replaces it, recorded as the component's `legacy_coverage` (the T-3434 precedent).
+
+**Cross-repo publishing (echo merge, release-mirror refresh) is out of the engine, and no new verb is added for it.** It is not a lifecycle leg of a host component. Those ops keep their scripts and SOPs.
+
+### Appetite
+
+**8.**
+- **Value-if-it-works 9:** it ends runbook-driven live transitions. Two of T-2950's three halts were preflight-catchable.
+- **Strategic alignment 9:** [[ORG-053]] §6 and SSEED.
+- **Reversibility 6:** the engine is a command, and legacy tools stay as fallback until each retires. But substrate ops are high-stakes.
+
+**Ceiling:** the build widens past the skeleton only through the A-5 go/no-go. Any of these is an overrun signal (halt and re-scope):
+- a tranche that needs a new verb;
+- a new interaction class;
+- a rewrite of a wrapped tool's own logic.
+
+### Riskiest assumption
+
+**"Wrap, don't rewrite" (D-I).** The assumption: an existing tool can adopt the component contract through a thin adapter, at a cost well below rewriting it. The contract means typed ops, a declared privilege and crash contract, a sandboxed data-only planner, and a contract digest. If it is false, every component becomes a rewrite, and the "thin composer" is thin only on paper.
+
+Evidence for the risk:
+- the bundle needed 15 review rounds;
+- T-3334 Arc B hit the REBOUND cap;
+- `persona_installer` still offers only plan and simulate.
+
+**Cheap test:** T-5081 adopts `tools/repo_reconciler.py` as the `pantheon-config` self-update component. That component is unprivileged, already reconciler-shaped, and a day-one component (F4).
+
+**Kill or re-scope signal:** the adoption needs changes to the reconciler's own logic beyond an adapter, or any of its ops cannot declare a crash contract.
+
+**Secondary:** C5 sandbox confinement holds on the production host. If it doesn't, D-AC's enforcement weakens to a lint. T-3296 is the test.
+
+### Consequences
+
+- T-2667 becomes a pure scoping ticket. It closes now that T-5073, T-5074 and T-5081–T-5092 exist with the `org-080` + `build` labels, and its dependents (T-3382, T-2156) are repointed to the tranches they actually need.
+- [[ORG-064]]'s `system:` field joins [[ORG-081]] registry ids. The Scheduler gains a stated invocation role ([[ORG-064]] 2d).
+- [[ORG-084]]'s build (T-3382) gates on the registry tranche (T-5073), not on the whole engine.
+- Two [[T-3433]] children retire as out of engine scope (A-7): T-3443 and T-3446. T-3445 waits for the pantheon-pwa organ's own adoption (F4).
+
+### Re-evaluate when
+
+- The A-5 go/no-go returns "no".
+- A scheduled `germinate` run is found to need root.
+- A third verify vocabulary appears beside [[ORG-079]] and [[ORG-099]].
+- A cross-repo op class reaches the volume where a verb is cheaper than its scripts.
+
+### DECISIONS (this amendment)
+
+- **D-AF. Seed defined; component stays the unit of modularity.** Intent: one apex controller needs one named installable unit. Justifies via P4 (lifts the draft definition into the ratified record) and P1; uses [[ORG-055]] and [[ORG-081]] D-9.
+- **D-AG. The Scheduler is the sole unattended trigger; scheduled runs never run as root.** Intent: auto-update without a resident controller. Justifies via P1 (privilege bounded by structure, not operator care), D-H, D-P and [[ORG-082]].
+- **D-AH. D-B confirmed; executor and decider stay distinct.** Intent: the "main controller" without collapsing the isolates. Justifies via P5, P1 and [[ORG-063]] ruling 2.
+- **D-AI. Walking skeleton plus go/no-go before the privileged tranches.** Intent: prove the controller cheaply before investing deep. Justifies via P7, [[ORG-089]] §Riskiest assumption, and D12 (structural correctness over momentum).
+- **D-AJ. One verify list.** Intent: one source of truth for seat health. Justifies via P1 and [[ORG-081]] D-9.
+- **D-AK. Absorption limited to lifecycle legs; publishing out; retire-by-other-mechanism allowed.** Intent: keep the apex engine a lifecycle composer. Justifies via P1, P6 (the publish tension is preserved, with a named re-evaluate trigger) and P4 (retirements recorded).
+
+### A-8. Build readings (T-5074)
+
+**Note (2026-10-17, T-5074 build readings; HO-accepted, pending the operator's ratification with the T-2667 Amendment).** "A-8" is the next label after the Amendment's A-1..A-7. These readings record how the engine skeleton (T-5074, #1030) interprets text above that a builder had to resolve. They change no decision.
+
+- **A-8.1 plan admits nothing.** `germinate plan` is read-only and non-admitting. It reports drift and a plan digest, refuses while another run holds the mutation claim, and writes nothing under the host root. Admission (the claim plus a run record) starts at `apply`. §4's admission table lists `plan` as admitting; read that as documentary.
+- **A-8.2 op keys are op-registry kinds.** A contract's privilege lists name kinds from the typed-op registry. The registry is built from the Action Broker envelope tables, the ORG-082 substrate families and the engine's own table. The op names in §2's example (`file.atomic-write`, `unit.user.install`) are illustrative.
+- **A-8.3 privilege vocabulary.** §2's `none | seat | root` maps onto the installer's levels: `none` and `seat` are unprivileged; `root` is privileged-helper.
+- **A-8.4 privilege-list disjointness.** `bootstrap_root` is disjoint from `seat` ∪ `broker_runtime`, and `broker_runtime` contains no ORG-082 substrate family. The §2 example's overlap of `seat` and `broker_runtime` is allowed.
+- **A-8.5 component op kinds stay under the engine (D-AC).** A component may declare its own op kinds, as literal data the engine reads without importing component code. Those kinds are seat privilege only. They may not take a reserved capability class (broker or envelope classes, substrate, read-only diagnostics), shadow an engine kind, or be an LLM-path kind (D-N). Root and read-only kinds are defined only by the engine's own registry, so the registry stays engine-owned.
+- **A-8.6 `germinate sim` is a harness verb.** `germinate sim init` prepares a simulated host root for CI and operator smoke tests. It is a simulation-harness verb, not a lifecycle verb or leg, so it does not count against A-5's "no new verb" ceiling.
+- **A-8.7 the CI tier is not confinement.** The in-process planner runner, with its audit-hook guard, catches accidents at CI tier only. It does not cover reads, native code, inherited file descriptors, `os.mkfifo`, direct `fork_exec`, or a planner that disables the guard. C5's sandboxed runner (T-3296, T-5106) is the confinement. Component handler modules are executor-trust code; revisit that trust when a real backend lands (T-5084).
+- **A-8.8 a wrapping planner's imports must be admitted (T-5081, S3).** A wrapping planner's transitive imports must be admitted by the C5 import hook. Either the component contract declares a planner import allowlist, or the launcher admits the repo's tools/ import closure read-only. The planner's declarative inputs (for the pantheon-config component, checkouts/) must sit inside the visibility root as manifest data. This is launcher policy for T-5106/T-3296, not a technical impossibility.
+
+**Note (2026-10-17, Orchestrator): A-5 go/no-go result (T-5081, #1037).** GO at the CI tier for "wrap, don't rewrite". repo_reconciler was adopted as the pantheon-config component through the GB seam, with no change to the reconciler or the engine; planning and verify reuse its public API, and apply is designed but not yet built (T-5133). The engine may rewind only its own receipted, clean fast-forward advance (HEAD equals the receipted sha and the tree is clean; otherwise it refuses as drift); this is a component-contract rule, not reconciler behaviour. CONDITION: the root and harness tranches (T-5084, T-5090, T-5091) may be built and land dark, but no live-host actuation happens until S3 (A-8.8) is decided and C5 holds on the production host (T-3296, T-5106).

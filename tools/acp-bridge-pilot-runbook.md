@@ -4,7 +4,7 @@ Supervised-first-fire procedure for piloting ONE agent (suggested: **specialist*
 
 Engine: `tools/acp_bridge.py` (+ `tools/acp_bridge_wetrun.py` empirical-gate driver). Deploy layer: `tools/acp-bridge-supervise.sh`, `tools/systemd/pantheon-acp-bridge@.service`, `tools/systemd/pantheon-acp-bridge-backlog@.service` + `.timer`. Spike ground truth: `knowledge/episodic/2026-07-07-claude-code-acp-spike/notes.md` (all rungs PASS).
 
-Throughout, `<AGENT>` = the piloted persona (e.g. `specialist`), `<AGENT_CWD>` = that agent's REAL working directory (the cwd that makes its transcript land at `~/.claude/projects/<mangled-cwd>/…`, so `context_fill_monitor.py` composes unchanged), `<INBOX>` = the agent's Path-A hub inbox root `/home/the-ancestor/mailbox/<AGENT>` (its `new/` is what the bridge consumes).
+Throughout, `<AGENT>` = the piloted persona (e.g. `specialist`), `<AGENT_CWD>` = that agent's REAL working directory (the cwd that makes its transcript land at `~/.claude/projects/<mangled-cwd>/…`, so `context_fill_monitor.py` composes unchanged), `<INBOX>` = the agent's Path-A hub inbox root `/home/post-office/mailbox/<AGENT>` (its `new/` is what the bridge consumes).
 
 ---
 

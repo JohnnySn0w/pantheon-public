@@ -93,7 +93,7 @@ def _validate_fixture_names(persona: str, account: str) -> None:
         raise FixtureRefused(
             f"fixture identity must be exactly {FIXTURE_PERSONA}/{FIXTURE_ACCOUNT}"
         )
-    if persona in {"cairn", "codex", "recovery", "orchestrator", "specialist", "mnemosyne"}:
+    if persona in {"consultant", "codex", "recovery", "orchestrator", "specialist", "archivist"}:
         raise FixtureRefused("fixture persona collides with a durable Pantheon identity")
 
 
@@ -413,7 +413,7 @@ def run_live_acceptance(
         capabilities=_all_capabilities(plan),
     )
     backend = LocalHostBackend(command_timeout=30, timed_fire_timeout=240)
-    applied = installer.apply(plan, plan.digest, backend, actor)
+    applied = installer.apply(plan, plan.digest, backend, actor, manifest=manifest)
     verified = installer.verify(plan, backend)
     success = (
         applied.status in {"applied", "noop"}

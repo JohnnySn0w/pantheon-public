@@ -1,0 +1,48 @@
+# Cap-modal auto-reaper (T-4024 increment 2). The weekly usage-cap window pops a BLOCKING
+# /rate-limit-options spend-limit modal on a seat's pane. Unlike the idle-429 variant (which
+# resumes when the window rolls), the MODAL blocks the pane and does NOT auto-dismiss even
+# after the reset — it needs an Esc. On 2026-09-27 that wedged the whole fleet (specialist/orchestrator/
+# mason/artisan) for ~34h until Recovery hand-cleared each pane. This reaper does that Esc
+# automatically, but ONLY after the window has actually rolled (T-2290), gated hard against
+# Esc-ing a healthy pane.
+#
+# CAP SIGNAL: the T-4037 mid-session-cap detector (<persona>/mid-session-cap.json:
+# modal_present + parsed reset_at + fresh observed_at, read cross-account via sudo). The Esc
+# is an ACTIVE keystroke, so before it fires the reaper RE-VERIFIES live: re-capture the pane
+# and confirm the modal chrome is still the LAST non-empty line (guards a stale/false state or
+# a pane merely quoting the modal), and re-confirm the window has rolled. Fail-CLOSED on any
+# ambiguity: an unreadable pane, a modal no longer at the bottom, or a changed state file =>
+# NO keystroke. NEVER targets Recovery's own pane (T-0559). Esc is CANCEL — never Enter/→ (the
+# money 'Adjust' option).
+#
+# ARM GATE (T-4024): the live Esc is default-OFF. This unit runs OBSERVE-only (reads state,
+# does the full live re-verify, logs the would-reap(verified) disposition, sends NOTHING)
+# until the SUPERVISED first-fire; add `--arm` (or Environment=CAP_REAPER_ARM=1) to go live
+# thereafter. Mirrors cap_mute_driver's default-OFF posture.
+#
+# Runs on RECOVERY's account (same posture as cap_mute_driver / context_fill_monitor): pure pane
+# reads + a keystroke, no LLM/Claude API, so it keeps working during a full cap/auth outage —
+# exactly when it must run. Level-triggered + idempotent: each fire reconciles the current
+# pane vs the current state, so a missed cycle simply resumes.
+[Unit]
+Description=Pantheon cap-modal reaper — auto-dismiss a rolled spend-limit modal once its window has rolled (T-4024); OBSERVE-only until --arm
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+# Default OBSERVE (no --arm): reads state + live re-verify, sends NO keystroke. Arm the live
+# Esc only after the supervised first-fire (append --arm here, or set CAP_REAPER_ARM=1).
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/cap_modal_reaper.py
+StandardOutput=journal
+StandardError=journal
+# Per-seat cross-account tmux capture (only for reap candidates) at 8s + a 5s send + settle;
+# the common uncapped cycle is 6 state reads. Generous headroom.
+TimeoutStartSec=3min
+
+[Install]
+WantedBy=default.target

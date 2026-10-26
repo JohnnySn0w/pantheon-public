@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-06 · **Author:** Orchestrator (HO) · **Status:** Authored (`lessons/` is a
 non-ratifiable class per ORG-015)
-**Origin:** codex's (Cairn's) live session wedged mid-T-2382 on a harness *update* prompt and
+**Origin:** codex's (Consultant's) live session wedged mid-T-2382 on a harness *update* prompt and
 needed the operator to manually resume it; same family as the T-2382 first-fire/readiness bug and
 the T-2599 model-migration-modal gap. ORG-031 named the class at bringup time; this generalises
 it to mid-run and records why a config fix is not enough.
@@ -29,7 +29,7 @@ The class kept re-manifesting in different costumes, and each was handled as a o
 |---|---|---|
 | Fresh/updated TUI doesn't consume injected input (paste-readiness race) | bringup / first-fire | T-2382, `bugs/telegram-inbound-injects-input-but-turn-doesnt-fire.md` |
 | Login / device-code, hook-trust, trust-dir, sandbox/bubblewrap, NUX press-enter | bringup | ORG-031 §Decision (scripted-bypass onboarder step) |
-| Harness **update** prompt fires *mid-run* → session wedges | any time after bringup | T-2553 (the Cairn incident) |
+| Harness **update** prompt fires *mid-run* → session wedges | any time after bringup | T-2553 (the Consultant incident) |
 | **Model-migration** modal fires, unsuppressable by config in this binary | any time after bringup | T-2599 / T-2597 |
 
 Seen apart, each looks like a distinct bug. Seen together they are one class with one shape:

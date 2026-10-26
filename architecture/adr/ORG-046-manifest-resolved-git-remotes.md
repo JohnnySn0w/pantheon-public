@@ -74,27 +74,27 @@ repos:
   - name: pantheon-config          # logical name — stable, never the break surface
     remotes:
       # WHICH physical host is `primary` is Q1 — the addendum recommends GitHub-primary
-      # AT FIRST, flipped to git.snowis.me-primary later by reordering this list (one line).
+      # AT FIRST, flipped to git.your-self-hosted-git.example-primary later by reordering this list (one line).
       # The assignment shown reflects that recommendation; hosts/URLs are AS-BUILT 2026-07-24
       # (see §7-REVISED of the T-1997 spec).
       - role: primary              # exactly one primary; preference = list order
-        url: git@github-pantheon-config:example-org/pantheon-config.git   # GitHub, until self-hosted has a track record (Q1)
+        url: git@github.com:example-org/pantheon-config.git   # GitHub, until self-hosted has a track record (Q1)
         auth: deploy-key:pantheon-config
       - role: mirror               # zero or more mirrors
-        url: https://git.snowis.me/pantheon/pantheon-config.git          # self-hosted: public + auth-to-pull, HTTPS (SSH §8 deferred, so https not ssh)
+        url: https://git.your-self-hosted-git.example/pantheon/pantheon-config.git          # self-hosted: public + auth-to-pull, HTTPS (SSH §8 deferred, so https not ssh)
         auth: token:forgejo-pantheon-config
 auth_refs:
   deploy-key:pantheon-config:
     key: <path>
-    allowed_hosts: [github-pantheon-config]                  # a per-repo SSH host-alias — the deploy key is repo-scoped BY the alias; resolver REFUSES url/auth whose host is outside this
+    allowed_hosts: [github.com]                  # a per-repo SSH host-alias — the deploy key is repo-scoped BY the alias; resolver REFUSES url/auth whose host is outside this
   token:forgejo-pantheon-config:
     token: <path>                                            # Forgejo access token (HTTPS auth-to-pull)
-    allowed_hosts: [git.snowis.me]                           # a shared host — repo-scoping rides on the token's forge-side scope, not this host binding
+    allowed_hosts: [git.your-self-hosted-git.example]                           # a shared host — repo-scoping rides on the token's forge-side scope, not this host binding
 ```
 
 > **As-built note (2026-07-24, updated at ratify-time — transparent, not a silent edit):** the example
 > above was updated from its original `git@git.<tailnet>:…` tailnet-SSH placeholder to the now-LIVE
-> public identity. `git.snowis.me` resolves, serves HTTPS behind caddy with a valid Let's Encrypt cert,
+> public identity. `git.your-self-hosted-git.example` resolves, serves HTTPS behind caddy with a valid Let's Encrypt cert,
 > and is verified 200 from swarm. The change is illustrative-only: the **mechanism** this ADR
 > ratifies — manifest resolution, the `allowed_hosts` binding (finding 6), redirect-never-authority,
 > self-heal — is unchanged; only the example's scheme/host move from a superseded placeholder to
@@ -235,7 +235,7 @@ state, just not on day one.** Three facts, all post-stand-up:
   in the fleet.
 - ~~**Its reachability is still being built.**~~ **RETIRED 2026-07-28 — this bullet's premise is
   FALSE and the objection is withdrawn** (Specialist flagged it, T-2193; I verified at the surface:
-  `curl https://git.snowis.me/` returns **HTTP 303 in 0.30s**). The front door **does** exist. Per
+  `curl https://git.your-self-hosted-git.example/` returns **HTTP 303 in 0.30s**). The front door **does** exist. Per
   the TG-4078 ruling the primary goes public-facing with auth-to-pull fronted by caddy, and the
   manifest `url:` becomes that public DNS identity (still identity-not-IP, so finding-6's binding is
   satisfied unchanged; see §7-REVISED of the T-1997 spec) — and that identity now resolves and

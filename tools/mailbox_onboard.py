@@ -42,9 +42,13 @@ Two-step shape, mirroring the sibling `tools/consume_onboard.py` (T-2679):
                             `persona_installer.mailbox.wake_timer_personas`
                             allowlist (default-deny when absent). Consume-plane
                             seats (woken by the consume runtime kick) and
-                            mnemosyne (whose wake pane is the operator's own chat
+                            archivist (whose wake pane is the operator's own chat
                             surface) are deliberately excluded; a non-allowlisted
                             persona's unit leg is skipped-and-surfaced (T-2702).
+                            Seats on `wake_timer_secondary_personas` (T-5323)
+                            run an allowed-but-unprovisioned standalone timer:
+                            skipped here and in teardown, either state passes
+                            verify.
 
                 Invoked once per relevant account (hub-owner, then each
                 persona), the whole mailbox organ converges -- no single
@@ -95,6 +99,7 @@ import grp
 import os
 import pwd
 import shutil
+import stat
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -134,8 +139,8 @@ WAKE_UNIT_STEM = "pantheon-mailbox-wake"
 MAILBOX_SUBDIRS = ("tmp", "new", "cur")
 MAILBOX_DIR_MODE = 0o2770
 # Code/seed default when instance.yaml carries no persona_installer.mailbox.hub_owner
-# field. The LIVE value (this instance) is "the-ancestor", set explicitly in
-# instance.yaml -- this default is reached only by a fresh seed with no field.
+# field. The LIVE value (this instance) is "post-office", set explicitly in
+# instance.yaml (T-2693) -- this default is reached only by a fresh seed with no field.
 DEFAULT_HUB_OWNER = "post-office"
 
 
@@ -218,13 +223,29 @@ class MailboxContext:
     # see load_mailbox_context and the module's provision()/verify()/
     # teardown() gating.
     wake_timer_personas: frozenset[str]
+    # T-5323: seats whose standalone pantheon-mailbox-wake@<persona>.timer is
+    # ALLOWED as a secondary waker (alongside consume, serialized by the
+    # T-5283 .wake.lock) but NOT provisioned by this tool. verify() accepts
+    # either timer state; provision()/teardown() skip them like any other
+    # non-wake_timer_personas seat. Disjoint from wake_timer_personas.
+    wake_timer_secondary_personas: frozenset[str]
     service_template: Path
     timer_template: Path
     revision: str
 
 
+def _persona_list_field(mailbox_config: dict, key: str) -> frozenset[str]:
+    """Parse an optional list-of-persona-strings field; absent => empty set."""
+    value = mailbox_config.get(key)
+    if value is None:
+        return frozenset()
+    if isinstance(value, list) and all(isinstance(item, str) and item for item in value):
+        return frozenset(value)
+    raise OnboardError(f"persona_installer.mailbox.{key} must be a list of persona strings")
+
+
 def load_mailbox_context(manifest_path: Path, repo_root: Path) -> MailboxContext:
-    manifest = Manifest.load(manifest_path)
+    manifest = Manifest.load(manifest_path, strict_flip_keys=False)
     installer = manifest.installer
     mailbox_config = installer.get("mailbox")
     if not isinstance(mailbox_config, dict):
@@ -247,15 +268,17 @@ def load_mailbox_context(manifest_path: Path, repo_root: Path) -> MailboxContext
     # unconditional-enable-for-every-persona behavior is exactly the bug this
     # ticket fixes, so silently falling back to "everyone" here would just
     # relocate it.
-    wake_timer_personas_value = mailbox_config.get("wake_timer_personas")
-    if wake_timer_personas_value is None:
-        wake_timer_personas: frozenset[str] = frozenset()
-    elif isinstance(wake_timer_personas_value, list) and all(
-        isinstance(item, str) and item for item in wake_timer_personas_value
-    ):
-        wake_timer_personas = frozenset(wake_timer_personas_value)
-    else:
-        raise OnboardError("persona_installer.mailbox.wake_timer_personas must be a list of persona strings")
+    wake_timer_personas = _persona_list_field(mailbox_config, "wake_timer_personas")
+    # T-5323: allowed-but-unprovisioned secondary wakers; absent => empty set.
+    wake_timer_secondary_personas = _persona_list_field(mailbox_config, "wake_timer_secondary_personas")
+    overlap = wake_timer_personas & wake_timer_secondary_personas
+    if overlap:
+        raise OnboardError(
+            "persona_installer.mailbox: persona(s) "
+            f"{sorted(overlap)} listed in both wake_timer_personas and "
+            "wake_timer_secondary_personas -- a seat's standalone timer is either "
+            "its sole wake path (provisioned) or an allowed secondary waker, not both"
+        )
 
     # The mailbox wake-unit templates are an ORG-026-specific, fixed repo-relative
     # convention (mirroring provision_mailbox.sh's own UNIT_SRC), not yet promoted
@@ -271,6 +294,7 @@ def load_mailbox_context(manifest_path: Path, repo_root: Path) -> MailboxContext
         mailbox_group=group,
         hub_owner=hub_owner,
         wake_timer_personas=wake_timer_personas,
+        wake_timer_secondary_personas=wake_timer_secondary_personas,
         service_template=service_template,
         timer_template=timer_template,
         revision=_git_head(repo_root),
@@ -343,8 +367,40 @@ def _planned_hub_setup_actions(ctx: MailboxContext) -> tuple[str, ...]:
         f"ensure group {ctx.mailbox_group!r} exists (groupadd if missing)",
         f"ensure user {ctx.hub_owner!r} exists (useradd -m -G {ctx.mailbox_group} if missing)",
         f"mkdir -p {ctx.mailbox_hub} (mode 02770, best-effort group {ctx.mailbox_group})",
+        f"make {ctx.hub_owner!r}-owned parents of the hub group-TRAVERSABLE by "
+        f"{ctx.mailbox_group} (chgrp + g=x, the live post-office 0710 shape)",
         f"loginctl enable-linger {ctx.hub_owner}",
     )
+
+
+def _ensure_group_traverse(hub: Path, owner_uid: int, group: str) -> list[str]:
+    """Make every hub-owner-owned ANCESTOR of the hub (the owner's home and any dir
+    between it and the hub) traversable by the mailbox group: chgrp to it and set the
+    group bits to traverse-only (g=x), i.e. the live post-office home's 0710.
+
+    WHY (T-4096 / T-2693 prep): `useradd -m` creates the home 0750 owner:owner
+    (login.defs HOME_MODE), so the mailbox group's members — every seat — could not
+    traverse into the hub and every cross-account delivery would EACCES after a hub
+    move. Only dirs the OWNER owns are touched, so /home and / never are. Best-effort
+    like _best_effort_chgrp; returns what changed."""
+    changed: list[str] = []
+    for parent in hub.parents:
+        try:
+            st = parent.stat()
+        except OSError:
+            break
+        if st.st_uid != owner_uid:
+            break                                   # left the owner's tree
+        _best_effort_chgrp(parent, group)
+        mode = stat.S_IMODE(st.st_mode)
+        want = (mode | stat.S_IXGRP) & ~(stat.S_IRGRP | stat.S_IWGRP)
+        if want != mode:
+            try:
+                os.chmod(parent, want)
+                changed.append(f"chmod {oct(want)} {parent} (group-traversable)")
+            except OSError:
+                pass
+    return changed
 
 
 def hub_setup(
@@ -373,6 +429,12 @@ def hub_setup(
     if _ensure_dir(ctx.mailbox_hub, MAILBOX_DIR_MODE):
         changed.append(f"created {ctx.mailbox_hub}")
     _best_effort_chgrp(ctx.mailbox_hub, ctx.mailbox_group)
+    try:
+        owner_uid = pwd.getpwnam(ctx.hub_owner).pw_uid
+    except KeyError:
+        owner_uid = None           # a FakeRunner "created" it; nothing real to fix up
+    if owner_uid is not None:
+        changed.extend(_ensure_group_traverse(ctx.mailbox_hub, owner_uid, ctx.mailbox_group))
     runner.run(["loginctl", "enable-linger", ctx.hub_owner])
     changed.append(f"enable-linger {ctx.hub_owner}")
 
@@ -543,13 +605,24 @@ def verify_persona(
     # T-2702: the assertion direction flips with the allowlist -- for an
     # allowlisted (standalone-wake) persona, healthy means enabled; for
     # everyone else, healthy means NOT enabled (their wake path is the
-    # consume runtime, or -- for mnemosyne -- no wake path at all). Distinct
+    # consume runtime, or -- for archivist -- no wake path at all). Distinct
     # check names (rather than reusing "wake_timer.enabled" with an inverted
-    # `ok`) keep a FAIL on e.g. mnemosyne unambiguous: it reads as "this
+    # `ok`) keep a FAIL on e.g. archivist unambiguous: it reads as "this
     # non-wake-seat's timer is anomalously enabled", not "should be enabled
     # but isn't".
+    # T-5323: a secondary-waker seat's timer is allowed but not owned here,
+    # so either state is healthy; the observed state is reported as info.
     if binding.persona in ctx.wake_timer_personas:
         checks.append(VerifyCheck(binding.persona, "wake_timer.enabled", enabled, detail))
+    elif binding.persona in ctx.wake_timer_secondary_personas:
+        checks.append(
+            VerifyCheck(
+                binding.persona,
+                "wake_timer.secondary",
+                True,
+                f"allowed secondary waker (not provisioned here); observed: {detail}",
+            )
+        )
     else:
         checks.append(VerifyCheck(binding.persona, "wake_timer.not_enabled", not enabled, detail))
 

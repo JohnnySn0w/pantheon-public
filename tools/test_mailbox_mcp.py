@@ -21,6 +21,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 # Locate the server script relative to this test file.
 _TOOLS_DIR = Path(__file__).resolve().parent
@@ -40,7 +41,7 @@ _HAS_MCP = importlib.util.find_spec("mcp") is not None
 # T-1971: the caller's inbox is $USER-derived by the SERVER (mailbox_mcp's
 # `_caller_persona` → `_USER_TO_PERSONA`). A test that seeds a hardcoded "orchestrator"
 # box only matches the server when $USER == "claude"; on any seat it seeds one
-# box while the server drains another ($USER=suborch1 → metis, suborch2 → atlas)
+# box while the server drains another ($USER=suborch1 → mason, suborch2 → artisan)
 # and asserts 0 != N. Fix: pin a KNOWN caller and derive its box from the
 # server's OWN map — import it, never reimplement, so the test and server cannot
 # disagree on the mapping (lessons/2026-07-22-false-red-verifier-must-call-prod-
@@ -87,6 +88,47 @@ _MCP_DECODE_SKIP = (
     "mcp >= 1.28 changed the structured-content envelope shape; this harness "
     "decodes the 1.27.x shape (T-1971). Adapt the decode or pin mcp==1.27.1."
 )
+
+
+# T-4230: upper bound (NOT an expected duration) for a spawned MCP server to exit
+# after its stdin closes. The server's exit is CPU-bound interpreter teardown
+# (~0.4s idle) and scales with host load: 3s under 9x CPU contention, 6.6-7.1s
+# under 17x, which is what a full -n 4 suite on a shared box looks like. The old
+# fixed 5s therefore reported "the host was busy" as a red test. `wait()` returns
+# the moment the server exits, so a generous bound costs nothing when healthy; it
+# only decides how long a genuinely hung server takes to be reported.
+#
+# FAIL-FAST TRIP (T-4230): a wide bound is slow to report a BROKEN server: ~40 tests
+# x 60s if it never exits at EOF. So the first wait that actually hits the bound
+# trips `_exit_wait_tripped`, and every later wait in this process uses the short
+# `_SERVER_EXIT_TIMEOUT_AFTER_TRIP_SECONDS`: a hung server fails every test quickly
+# after the first, and the run goes red in minutes with the cause in the first
+# failure's TimeoutExpired. A healthy but slow host never hits 60s, never trips,
+# and is unaffected. State is per process (each pytest-xdist worker trips on its own).
+_SERVER_EXIT_TIMEOUT_SECONDS = 60
+_SERVER_EXIT_TIMEOUT_AFTER_TRIP_SECONDS = 5
+_exit_wait_tripped = False
+
+
+def _wait_for_server_exit(proc: subprocess.Popen) -> None:
+    """Wait for `proc` to exit after its stdin was closed.
+
+    Returns as soon as it exits. On expiry the process is killed and reaped BEFORE the
+    TimeoutExpired propagates: a truly hung server still fails the test (nothing is
+    weakened), and it is no longer left running as an orphan. The first expiry trips
+    the fail-fast flag (see above) so later waits are short.
+    """
+    global _exit_wait_tripped
+    timeout = (
+        _SERVER_EXIT_TIMEOUT_AFTER_TRIP_SECONDS if _exit_wait_tripped else _SERVER_EXIT_TIMEOUT_SECONDS
+    )
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _exit_wait_tripped = True
+        proc.kill()
+        proc.wait()
+        raise
 
 
 class _MCPClient:
@@ -166,7 +208,7 @@ class _MCPClient:
             self._proc.stderr.close()
         except OSError:
             pass
-        self._proc.wait(timeout=5)
+        _wait_for_server_exit(self._proc)
 
     def __enter__(self):
         return self
@@ -333,21 +375,29 @@ class MCPServerTest(unittest.TestCase):
         shuts stderr before it can be read, so the audit tests manage the client
         manually and drain here. Fail-open is structural (the audit's try/except
         swallows its own errors), so these tests assert the two observable halves:
-        the audit line appears, AND the operation still succeeds."""
+        the audit line appears, AND the operation still succeeds.
+
+        T-4230: the exit is awaited BEFORE stderr is read. This used to be
+        `stderr.read()` (blocks until the server closes stderr, i.e. exits, with NO
+        bound) followed by a `wait(timeout=5)` whose expiry was swallowed: a server that
+        hangs at stdin-EOF hung these tests forever instead of failing them, which
+        defeated the fail-fast in `_wait_for_server_exit`. Now a hung server raises
+        TimeoutExpired (killed and reaped, flag tripped) like every other test. Audit
+        output is a few short lines, far below the pipe buffer, so waiting first
+        cannot deadlock on a full stderr pipe."""
         try:
             c._proc.stdin.close()
         except OSError:
             pass
-        out = c._proc.stderr.read() or ""
         try:
-            c._proc.wait(timeout=5)
-        except Exception:
-            c._proc.kill()
-        for stream in (c._proc.stdout, c._proc.stderr):
-            try:
-                stream.close()
-            except OSError:
-                pass
+            _wait_for_server_exit(c._proc)
+            out = c._proc.stderr.read() or ""
+        finally:
+            for stream in (c._proc.stdout, c._proc.stderr):
+                try:
+                    stream.close()
+                except OSError:
+                    pass
         return out
 
     def test_audit_send_emits_metadata_line_without_body(self):
@@ -711,7 +761,118 @@ class MCPServerTest(unittest.TestCase):
             self.assertEqual(resp["result"]["serverInfo"]["name"], "mailbox")
         finally:
             proc.stdin.close()
-            proc.wait(timeout=5)
+            _wait_for_server_exit(proc)
+
+
+class ServerExitWaitT4230(unittest.TestCase):
+    """T-4230: the shared post-EOF wait must (a) tolerate a slow-but-healthy exit,
+    (b) still FAIL a genuinely hung server, and (c) never leak the hung process.
+    No MCP SDK needed: the "server" is a plain child process."""
+
+    def setUp(self):
+        # These tests trip the module-level fail-fast flag on purpose; restore it (to
+        # whatever it was, normally False) afterwards so no other test in the process
+        # sees a leaked short bound, and so each test here starts from the wide one.
+        patcher = mock.patch.object(sys.modules[__name__], "_exit_wait_tripped", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _spawn(self, code: str) -> subprocess.Popen:
+        return subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE)
+
+    def test_returns_as_soon_as_the_process_exits(self):
+        proc = self._spawn("import sys; sys.stdin.read()")
+        proc.stdin.close()
+        start = time.monotonic()
+        _wait_for_server_exit(proc)
+        self.assertIsNotNone(proc.returncode)
+        self.assertLess(time.monotonic() - start, 30, "must not sleep out the bound")
+
+    def test_a_slow_exit_inside_the_bound_is_not_a_failure(self):
+        # Slower than an expected healthy exit but far inside the bound: no raise.
+        proc = self._spawn("import time; time.sleep(1.5)")
+        _wait_for_server_exit(proc)
+        self.assertEqual(proc.returncode, 0)
+
+    def test_a_hung_server_still_fails_and_is_reaped(self):
+        proc = self._spawn("import time; time.sleep(120)")
+        try:
+            with mock.patch.object(sys.modules[__name__], "_SERVER_EXIT_TIMEOUT_SECONDS", 0.5):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    _wait_for_server_exit(proc)
+            self.assertIsNotNone(proc.returncode, "hung server must be killed AND reaped, not leaked")
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+
+    def test_the_bound_it_waits_with_clears_the_measured_loaded_exit_time(self):
+        # 7.1s measured under 17x contention; the old fixed 5s was the flake. Asserted
+        # on the timeout actually PASSED to wait(), not on the constant, and without
+        # sleeping (a real 6s child would re-add exactly the fixed wait this removes).
+        class _Recorder:
+            timeout = None
+
+            def wait(self, timeout=None):
+                self.timeout = timeout
+                return 0
+
+        rec = _Recorder()
+        _wait_for_server_exit(rec)
+        self.assertIsNotNone(rec.timeout)
+        self.assertGreaterEqual(rec.timeout, 30)
+
+    def test_the_first_timeout_trips_the_flag_and_later_waits_are_short(self):
+        # The fail-fast: a hung server costs the wide bound ONCE; every later wait in
+        # the process then uses the short one, so the rest of the module goes red in
+        # seconds, not ~40 x 60s. Asserted on the timeout actually passed to wait().
+        mod = sys.modules[__name__]
+        self.assertFalse(mod._exit_wait_tripped)
+        proc = self._spawn("import time; time.sleep(120)")
+        try:
+            with mock.patch.object(mod, "_SERVER_EXIT_TIMEOUT_SECONDS", 0.5):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    _wait_for_server_exit(proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertTrue(mod._exit_wait_tripped, "the timeout must trip the fail-fast flag")
+
+        class _Recorder:
+            timeout = None
+
+            def wait(self, timeout=None):
+                self.timeout = timeout
+                return 0
+
+        rec = _Recorder()
+        _wait_for_server_exit(rec)
+        self.assertEqual(rec.timeout, mod._SERVER_EXIT_TIMEOUT_AFTER_TRIP_SECONDS)
+        self.assertLessEqual(rec.timeout, 10)
+
+    def test_a_second_hung_server_fails_at_the_short_bound(self):
+        # End to end on real children: after one trip the NEXT hung server is reported
+        # in ~the short bound (patched to 1s here to keep the test quick), not the wide one.
+        mod = sys.modules[__name__]
+        mod._exit_wait_tripped = True  # restored by setUp's patcher
+        proc = self._spawn("import time; time.sleep(120)")
+        start = time.monotonic()
+        try:
+            with mock.patch.object(mod, "_SERVER_EXIT_TIMEOUT_AFTER_TRIP_SECONDS", 1):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    _wait_for_server_exit(proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertLess(time.monotonic() - start, 30)
+        self.assertIsNotNone(proc.returncode, "hung server must still be killed AND reaped")
+
+    def test_a_slow_but_healthy_exit_does_not_trip_the_flag(self):
+        proc = self._spawn("import time; time.sleep(1.0)")
+        _wait_for_server_exit(proc)
+        self.assertFalse(sys.modules[__name__]._exit_wait_tripped)
 
 
 class AdapterLibraryParityT2289(unittest.TestCase):
@@ -794,7 +955,7 @@ class KnownRecipientsCoverageT2285(unittest.TestCase):
     could tell that omission from an intentional one, which is exactly what
     `_NO_MCP_RECIPIENT` now makes impossible.
 
-    Same mapped-or-exempt shape as `ancestor_consume._NO_REPLY_INBOX` (T-2252).
+    Same mapped-or-exempt shape as `inbox_consumer.DELIVERY_EXEMPT` (T-2144).
     """
 
     def _registry(self) -> set[str]:
@@ -843,6 +1004,15 @@ class KnownRecipientsCoverageT2285(unittest.TestCase):
         import mailbox_mcp
 
         self.assertIn("codex", mailbox_mcp._KNOWN_RECIPIENTS)
+
+    def test_watchman_is_addressable(self) -> None:
+        """T-4884 B6: the recovery seat (watchman, codex-fallback) reports to Recovery
+        by mailbox and is woken by mail, so peers must reach it through the MCP
+        send path, and it must appear in the client-facing enum."""
+        import mailbox_mcp
+
+        self.assertIn("watchman", mailbox_mcp._KNOWN_RECIPIENTS)
+        self.assertNotIn("watchman", mailbox_mcp._NO_MCP_RECIPIENT)
 
     def test_client_facing_enum_regenerates_from_the_set(self) -> None:
         """Implementation note (1) of the ticket, checked rather than assumed.
@@ -981,6 +1151,29 @@ class SkipReasonAttributionT2288(unittest.TestCase):
                       "the latent bridge shapes are the point — they must be carried")
         # a non-str, non-None reason must not crash and must not name a cause
         self.assertIn("unrecognized", mailbox_mcp._skip_reason_prose(object()).lower())
+
+
+
+@unittest.skipUnless(_HAS_MCP, "mcp SDK not installed; mailbox_mcp cannot be imported")
+class HubResolvedPerCallTest(unittest.TestCase):
+    """T-2693: a hub move must reach a RUNNING server. orchestrator's MCP (started before
+    the flip) consumed the retired hub and went silently deaf until restart."""
+
+    def test_hub_follows_instance_yaml_between_calls(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import mailbox_mcp  # noqa: E402
+        from unittest import mock
+        with mock.patch.object(mailbox_mcp, "MAILBOX_HUB", None), \
+             mock.patch.object(mailbox_mcp, "_current_mailbox_hub",
+                               side_effect=["/home/the-ancestor/mailbox", "/home/post-office/mailbox"]):
+            self.assertEqual(str(mailbox_mcp._hub()), "/home/the-ancestor/mailbox")
+            self.assertEqual(str(mailbox_mcp._hub()), "/home/post-office/mailbox")
+
+    def test_env_override_still_wins(self):
+        import mailbox_mcp  # noqa: E402
+        from unittest import mock
+        with mock.patch.object(mailbox_mcp, "MAILBOX_HUB", Path("/tmp/x-hub")):
+            self.assertEqual(str(mailbox_mcp._hub()), "/tmp/x-hub")
 
 
 if __name__ == "__main__":

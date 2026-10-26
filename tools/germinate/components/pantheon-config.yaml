@@ -1,0 +1,26 @@
+# pantheon-config component contract (ORG-080 §2; T-5081, germination tranche GC).
+#
+# The go/no-go probe for "wrap, don't rewrite": the self-update leg adopts
+# tools/repo_reconciler.py through an adapter only. The planner
+# (pantheon-config.py) calls RepoReconciler.reconcile_plan() over injected
+# observations; the handlers (pantheon-config_handlers.py) bring the three op
+# kinds below. The simulated handler is the only registered one; the real
+# git-backed handler (pantheon_config_git.py, T-5133) lands dark and unselected.
+component:
+  id: pantheon-config
+  steward: orchestrator
+  version: 1
+  planner_kind: python
+  contract_digest: sha256:d166114d8f608190f51c31f761a24585437ec7183918261ea41f73a19f2bc777
+  handlers_digest: sha256:5703896135b50d12f715f19db5035dba17ce7d009919cd814fd161355eaf229e
+  depends_on: []
+  scopes: [system]
+  privilege:
+    seat: [repo.clone, repo.ff-advance, repo.reclaim]
+  legs:
+    install: plan_install
+    update: plan_update(source_rev_from, source_rev_to)
+    remove: plan_remove
+    repair: plan_repair(verify_result)
+  receipts:
+    schema: pantheon-receipt/v1

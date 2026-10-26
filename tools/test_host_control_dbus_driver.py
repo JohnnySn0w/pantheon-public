@@ -45,7 +45,7 @@ from tools.host_control.planner import HostPlanService
 from tools.host_control.policy import HostPolicy
 from tools.host_control.registry import SeatRegistry
 from tools.host_control.trusted_files import RootOwnedFileLoader
-from tools.persona_installer import PersonaInstaller
+from tools.persona_installer import MutationRecord, PersonaInstaller
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -393,7 +393,7 @@ def seed_other_subject(fixture: DomainFixture, *, seat_b_uid: int = 60001) -> di
         plan_result.plan_handle,
         plan_result.plan_digest,
         "seed-apply-1",
-        "seed-approval-1",
+        "5a" * 32,
     )
     seed_operations.authorize(record.operation_handle)
     seed_operations.dispatch(record.operation_handle, _SeedExecutor())
@@ -427,14 +427,32 @@ def seed_subject_complete_receipt(
         plan_result.plan_handle,
         plan_result.plan_digest,
         "seed-alpha-apply-1",
-        "seed-alpha-approval-1",
+        "5b" * 32,
     )
     seed_operations.authorize(record.operation_handle)
     seed_operations.dispatch(record.operation_handle, _SeedExecutor())
+    # T-2917 5d.2: a rollback is prepared only against a RESTORABLE receipt
+    # (a changed mutation backed by a write-ahead intent of this apply), so
+    # the seed records one owned mkdir, exactly as an executor would
+    intent = next(
+        item
+        for item in fixture.journal.intents_for(record.operation_handle)
+        if item.kind == "mkdir"
+    )
     completed = seed_operations.append_result(
         record.operation_handle,
         ok=True,
-        mutations=(),
+        mutations=(
+            MutationRecord(
+                operation_id=intent.operation_id,
+                kind=intent.kind,
+                target=intent.target,
+                owner=intent.owner,
+                changed=True,
+                before={"state": "absent"},
+                after_fingerprint="directory",
+            ),
+        ),
         evidence=(),
         detail="seed complete",
     )
@@ -486,6 +504,7 @@ def serve(config_path: str) -> int:
 
     from tools.host_control import wire
     from tools.host_control.approval_source import BrokerApprovalSource
+    from tools.host_control.execution_source import BrokerExecutionSource
     from tools.host_control.dbus_service import (
         HostBroker1Object,
         UnavailableApprovalStatus,
@@ -521,6 +540,12 @@ def serve(config_path: str) -> int:
         approval_source=approval_source,
         approval_status=UnavailableApprovalStatus(),
         approval_uid=int(config["approval_uid"]),
+        # T-2917 5a: ExecutionSource wired so the bus tests can prove a
+        # registered REQUESTER cannot read another seat's execution spec.
+        execution_source=BrokerExecutionSource(
+            journal=fixture.journal,
+            registry=fixture.registry,
+        ),
     )
     state_path = root / "state.json"
     state_path.write_text(json.dumps(state), encoding="utf-8")

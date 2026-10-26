@@ -30,8 +30,9 @@ Scheduled + Hooked + Reactive — and never these.
 - **CRITICAL verification footgun:** `systemctl restart` is a **NO-OP for the inner claude** (supervisor wrapper is idempotent; inner claude lives outside the unit cgroup) — the canonical restart "succeeds" with the *same PID*. True restart = `tmux kill-session` + supervisor respawn; **verify by PID change on `.npm-global/bin/claude`**, never exit-zero/is-active/sentinel (memory `reference_handoff_restart_systemctl_no_op`).
 - **Stale-flock wedge:** repeating `lock … held by another instance` = a wedged child holds the flock; `lsof` → SIGKILL holder+child → rm lockfile → re-fire (memory `reference_stale_flock_restart_pipeline`). **Self-restart** leaves the fresh session silent unless the kick comes from a detached transient unit — use `tools/self_restart.sh` / `tools/recovery_self_restart.sh` (SOP `agent-self-restart-with-kick.md`).
 
-### veneration — resurrect-a-dead-agent harness
-- `tools/veneration.py` (T-0766); HANDOFF archive in `tools/chronicle.py`.
+### veneration — REMOVED (resurrect-a-dead-agent harness)
+- **Retired T-2214 (2026-07-28); `tools/veneration.py` removed T-4741 (#835, 2026-10-09).** Use `tools/chronicle.py` to recover a HANDOFF from a dead session. History below.
+- Was `tools/veneration.py` (T-0766); HANDOFF archive in `tools/chronicle.py`.
 - The heavyweight stand-a-fresh-daemon-back-up harness: session selection from the durable HANDOFF Chronicle → fresh daemon. CODE substrate complete + tested (88 tests, 2026-06-07); the **supervised live stand-up is the remaining step — do NOT rebuild** (memory `project_veneration_build_state`). Lends its group name to the ORG-026 hub.
 
 ## Subtype: One-off — migrations kept for repeatability

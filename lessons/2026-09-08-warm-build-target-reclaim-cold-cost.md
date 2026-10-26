@@ -1,13 +1,13 @@
 # Reclaiming a warm build target has a cold-build cost the next dispatch inherits
 
-Filed 2026-09-08 (orchestrator) after T-1671 (atlas) — a 3h+ wall-clock on a plan-first
+Filed 2026-09-08 (orchestrator) after T-1671 (artisan) — a 3h+ wall-clock on a plan-first
 implementer build that read as a stall to the watcher.
 
 ## The pattern
 
 Freeing disk headroom by reclaiming a warm build cache (Rust `target/`, npm
 `node_modules/`, cargo/pip caches, Docker layers, etc.) is often the right call
-when the box is tight — atlas's echo `target/` was 18G on a shared box at 94%,
+when the box is tight — artisan's echo `target/` was 18G on a shared box at 94%,
 freeing it dropped free from 11G → ~22G. But the next build that reads from that
 cache is now COLD, and for a large workspace the cold-build wall-clock can be
 hours where a warm build was minutes.
@@ -46,5 +46,5 @@ posture; don't-reclaim-because-someone-might-dispatch is not.
 - Not the same as [[feedback_new_delay_is_never_local]] (which is about
   attributing a specific delay to a specific mechanism); this is about the
   substrate-level cache invalidation cost being invisible to non-participants.
-- Atlas's disciplinary commitment: flag-at-reclaim-time when reclaim is within
+- Artisan's disciplinary commitment: flag-at-reclaim-time when reclaim is within
   dispatch horizon.

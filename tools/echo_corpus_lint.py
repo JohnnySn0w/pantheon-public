@@ -65,8 +65,9 @@ from tools.ticket_lint import (  # noqa: E402
     detect_unverified_elements,
     is_echo_scoped_id,
 )
+from tools.agent_role_map import mailbox_hub  # noqa: E402  (T-4096: hub from instance.yaml)
 
-RECOVERY_INBOX = os.environ.get("PANTHEON_RECOVERY_INBOX", "/home/the-ancestor/mailbox/recovery")
+RECOVERY_INBOX = os.environ.get("PANTHEON_RECOVERY_INBOX") or f"{mailbox_hub()}/recovery"
 
 STATE_DIR = Path.home() / ".local" / "state" / "pantheon"
 STATE_PATH = STATE_DIR / "echo_corpus_lint_state.json"
@@ -79,6 +80,13 @@ STATE_PATH = STATE_DIR / "echo_corpus_lint_state.json"
 ALERT_COOLDOWN_SECONDS = int(
     os.environ.get("PANTHEON_ECHO_LINT_COOLDOWN_SECONDS", str(24 * 3600))
 )
+
+# ORG-065 §3.4: `implements:` without `verifies:` is the expected transitional
+# shape, not a defect (T-3572 disposition; a verifies edge is earned when a
+# ticket actually verifies). Such findings are counted in the alert body but
+# never trigger or sign an alert on their own, so a set made only of them no
+# longer re-mails recovery every cooldown.
+TRANSITIONAL_KINDS = frozenset({"implemented_unverified_element"})
 
 
 def scan_echo_scoped_findings(repo_root: Path, echo_adr_dir: Path) -> list[TypedGraphFinding]:
@@ -129,7 +137,8 @@ def _should_alert(state: dict, signature: str, now: float, cooldown_seconds: int
     return (now - last_alert_ts) >= cooldown_seconds
 
 
-def _compose_body(findings: list[TypedGraphFinding], now: float) -> str:
+def _compose_body(findings: list[TypedGraphFinding], now: float,
+                  n_transitional: int = 0) -> str:
     ts = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now))
     lines = [
         f"Echo-corpus obligation lint (T-3495 companion to T-3477/ORG-065) — "
@@ -138,6 +147,11 @@ def _compose_body(findings: list[TypedGraphFinding], now: float) -> str:
     ]
     for f in findings:
         lines.append(f"  - {f.kind}: {f.detail}")
+    if n_transitional:
+        lines.append(
+            f"  (plus {n_transitional} expected-transitional "
+            f"implemented_unverified_element finding(s), ORG-065 §3.4; not listed)"
+        )
     lines.append("")
     lines.append(
         "Action (recovery): echo-prismatic (/home/claude/echo-prismatic/adr) "
@@ -183,19 +197,28 @@ def run(
             print(f"  - {f.kind}: {f.detail}")
         return 0
 
-    signature = _finding_signature(findings)
-    state = _load_state(state_path)
-    if not _should_alert(state, signature, now, cooldown_seconds):
+    actionable = [f for f in findings if f.kind not in TRANSITIONAL_KINDS]
+    n_transitional = len(findings) - len(actionable)
+    if not actionable:
         print(
-            f"[echo_corpus_lint] {len(findings)} finding(s), unchanged + within "
-            f"cooldown — throttled"
+            f"[echo_corpus_lint] {n_transitional} expected-transitional finding(s) "
+            f"(ORG-065 §3.4), nothing actionable — no alert"
         )
         return 0
 
-    body = _compose_body(findings, now)
-    _alert_recovery(body, len(findings), sender, recovery_inbox)
+    signature = _finding_signature(actionable)
+    state = _load_state(state_path)
+    if not _should_alert(state, signature, now, cooldown_seconds):
+        print(
+            f"[echo_corpus_lint] {len(actionable)} actionable finding(s), unchanged "
+            f"+ within cooldown — throttled"
+        )
+        return 0
+
+    body = _compose_body(actionable, now, n_transitional)
+    _alert_recovery(body, len(actionable), sender, recovery_inbox)
     _save_state(state_path, {"last_alert_ts": now, "last_signature": signature})
-    print(f"[echo_corpus_lint] alerted recovery: {len(findings)} finding(s)")
+    print(f"[echo_corpus_lint] alerted recovery: {len(actionable)} actionable finding(s)")
     return 0
 
 

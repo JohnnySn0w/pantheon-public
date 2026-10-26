@@ -66,7 +66,7 @@ class Classify(unittest.TestCase):
         self.assertIn("cliff", detail.lower())
 
     def test_refresh_cliff_already_passed_is_near_cliff(self):
-        # refresh token already expired — the atlas/orchestrator cascade state
+        # refresh token already expired — the artisan/orchestrator cascade state
         cls, _ = self._classify_with("ok", _cred(refresh="rt", rte_offset_h=-5))
         self.assertEqual(cls, "NEAR_CLIFF")
 
@@ -113,6 +113,10 @@ class CheckLoop(unittest.TestCase):
         )
         self._cfg.start()
         self.addCleanup(self._cfg.stop)
+        # Hermetic: the T-4791 hold lookup reads other accounts' state via sudo.
+        self._hold = mock.patch.object(cem, "_claude_hold", return_value=None)
+        self._hold.start()
+        self.addCleanup(self._hold.stop)
 
     def _patched_classify(self):
         def fake(agent, cfg, now=None):
@@ -218,7 +222,7 @@ class CheckLoop(unittest.TestCase):
         self.assertEqual(problems, 1)
 
 
-class WardWake(unittest.TestCase):
+class RecoveryWake(unittest.TestCase):
     """T-1873: the first (un-throttled) alert also wakes Recovery's mailbox so the
     relogin legwork starts in minutes, not hours. Delivery seam always mocked —
     tests must never write the real ORG-026 hub."""
@@ -227,7 +231,7 @@ class WardWake(unittest.TestCase):
         with mock.patch("tools.mailbox.send") as msend:
             cem._wake_recovery("orchestrator", "MALFORMED", "credential no accessToken field")
         args, kwargs = msend.call_args
-        self.assertEqual(args[0], "/home/the-ancestor/mailbox/recovery")
+        self.assertEqual(args[0], "/home/post-office/mailbox/recovery")
         self.assertIn("credential-MALFORMED on orchestrator", args[1])
         self.assertIn("agent-oauth-relogin", args[1])
         self.assertEqual(kwargs["subject"], "auth-dead: orchestrator (MALFORMED)")
@@ -336,6 +340,82 @@ class MainModes(unittest.TestCase):
     def test_dry_run_all_exits_zero(self):
         with mock.patch.object(cem, "check", return_value=0):
             self.assertEqual(cem.main(["--all", "--dry-run"]), 0)
+
+
+class ClaudeHold(unittest.TestCase):
+    """T-4791: a persona the operator HELD off claude/* and that runs another harness
+    has a Claude credential nothing uses, so its cliff must not page the operator every 6h.
+    Real holds.json / active-runtime.json shapes (copied from mason's 10-09 state)."""
+
+    HOLDS = {"schema": "pantheon-persona-runtime-holds/v1", "holds": {
+        "claude/interactive-subscription": {
+            "reason": "T-4786: mason runs on codex (the operator TG 11564)",
+            "set_by": "operator:recovery", "set_ts": "2026-10-09T03:42:50Z"}}}
+
+    def _runtime(self, rt):
+        return {"schema": "pantheon-persona-active-runtime/v1", "runtime": rt,
+                "note": "Cache only -- tmux existence + pid liveness is authoritative"}
+
+    def _hold(self, files):
+        def fake(user, path):
+            return files.get(Path(path).name)
+        with mock.patch.object(cem, "_read_account_json", side_effect=fake):
+            return cem._claude_hold("mason", {"sudo_user": "suborch1"})
+
+    def test_held_and_running_codex_is_a_hold(self):
+        h = self._hold({"holds.json": self.HOLDS,
+                        "active-runtime.json": self._runtime("codex/interactive-chatgpt")})
+        self.assertIsNotNone(h)
+        self.assertIn("claude/interactive-subscription", h)
+        self.assertIn("codex/interactive-chatgpt", h)
+
+    def test_held_but_running_claude_still_alerts(self):
+        self.assertIsNone(self._hold({"holds.json": self.HOLDS,
+                                      "active-runtime.json": self._runtime("claude/interactive-subscription")}))
+
+    def test_no_hold_still_alerts(self):
+        self.assertIsNone(self._hold({"active-runtime.json": self._runtime("codex/interactive-chatgpt")}))
+
+    def test_hold_on_another_harness_only_still_alerts(self):
+        codex_hold = {"holds": {"codex/interactive-chatgpt": {"reason": "capped"}}}
+        self.assertIsNone(self._hold({"holds.json": codex_hold,
+                                      "active-runtime.json": self._runtime("claude/interactive-subscription")}))
+
+    def test_unreadable_runtime_fails_open_to_alerting(self):
+        self.assertIsNone(self._hold({"holds.json": self.HOLDS}))
+
+    def test_check_skips_held_persona_and_still_alerts_unheld(self):
+        hold = "claude/interactive-subscription held (T-4786); live runtime codex/interactive-chatgpt"
+        with mock.patch.object(cem, "STATE_PATH", Path("/nonexistent/cem_state.json")), \
+             mock.patch.object(cem, "CREDENTIALED_ACCOUNTS", {"mason": "suborch1", "specialist": "claude-research"}), \
+             mock.patch.object(cem, "classify", return_value=("NEAR_CLIFF", "cliff in 1d")), \
+             mock.patch.object(cem, "_claude_hold", side_effect=lambda a, c: hold if a == "mason" else None), \
+             mock.patch.object(cem, "CREDENTIAL_ALERT_SKIP", set()), \
+             mock.patch.object(cem, "_persona_is_muted", return_value=False), \
+             mock.patch.object(cem, "_load_state", return_value={}), \
+             mock.patch.object(cem, "_save_state"), \
+             mock.patch.object(cem, "_track_login_event"), \
+             mock.patch.object(cem, "_wake_recovery") as mwake, \
+             mock.patch.object(cem, "_alert") as malert, \
+             mock.patch.object(cem, "_log") as mlog:
+            problems = cem.check(["mason", "specialist"], dry_run=False, now=NOW)
+        self.assertEqual(problems, 1)
+        self.assertEqual(malert.call_count, 1)
+        self.assertIn("specialist", malert.call_args[0][0])
+        self.assertEqual(mwake.call_count, 1)
+        logged = [c.args[1] for c in mlog.call_args_list if c.args[0] == "mason"]
+        self.assertTrue(any("held" in m and "claude/interactive-subscription" in m for m in logged), logged)
+
+
+
+class RetiredSeatsNotMonitoredTest(unittest.TestCase):
+    """T-3421 (the operator TG 8778, 2026-10-24): the-ancestor is retired and runs no agent.
+    Its leftover credential file paged the operator NEAR_CLIFF once a mute was cleared, so
+    it is not a monitored account at all, rather than a muted one."""
+
+    def test_the_ancestor_is_not_a_credentialed_account(self):
+        self.assertNotIn("the-ancestor", cem.CREDENTIALED_ACCOUNTS)
+        self.assertNotIn("the-ancestor", cem.CREDENTIALED_ACCOUNTS.values())
 
 
 if __name__ == "__main__":

@@ -3,7 +3,7 @@
 The defect is NOT queue depth — it is that turn-serialised delivery makes
 staleness invisible to the RECEIVER. Nothing in a delivered message says "three
 later messages from this sender are already queued behind me", so a message and
-its own RETRACTION are indistinguishable on arrival. Mnemosyne measured the cost
+its own RETRACTION are indistinguishable on arrival. Archivist measured the cost
 (2026-07-28): she re-derived work a peer had already withdrawn, and once
 corrected a figure the sender had retracted 16 minutes earlier.
 

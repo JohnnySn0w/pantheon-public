@@ -7,7 +7,7 @@ domain: pantheon, teamcreate, agent-spawn, dispatch-pattern
 
 > **⚠️ PREMISE REVERSED (T-1291, probe-verified 2026-06-24).** The core claim below — that a team-spawned project-orchestrator's inventory does NOT include `Agent` — is **FALSE as of CC 2.1.178+'s implicit-team model**. A probe spawn confirmed the orchestrator HAS `Agent` (effective inventory `Read, Edit, Write, Bash, Agent, SendMessage, Task*`; only `ToolSearch`/`Skill`/`mcp__*` absent). So the symptom/fix frontmatter above describes a since-removed substrate restriction, NOT current reality. **Current guidance (ORG-036 / T-1292): self-spawn is the DEFAULT — the orchestrator spawns its own implementer/reviewer; HO pre-stages only by exception.** This entry is retained as a historical record of the pre-2.1.178 restriction; do NOT act on its frontmatter.
 >
-> **Superseded as load-bearing by** [`sop/standard/team-orchestrator-dispatch-checklist.md`](../sop/standard/team-orchestrator-dispatch-checklist.md) + [`adr/ORG-036-dispatch-flow-default-self-spawn.md`](../adr/ORG-036-dispatch-flow-default-self-spawn.md) — the live dispatch guidance now lives there (ORG-012 supersedure-trail, T-0833 D-1).
+> **Superseded as load-bearing by** [`sop/standard/team-orchestrator-dispatch-checklist.md`](../sop/standard/team-orchestrator-dispatch-checklist.md) + [`architecture/adr/ORG-036-dispatch-flow-default-self-spawn.md`](../architecture/adr/ORG-036-dispatch-flow-default-self-spawn.md) — the live dispatch guidance now lives there (ORG-012 supersedure-trail, T-0833 D-1).
 
 ## Symptom
 

@@ -204,7 +204,7 @@ class FleetHealthAdapterTests(unittest.TestCase):
             {"agent": "orchestrator", "status": "OK", "checks": []},
             {"agent": "recovery", "status": "PAUSED", "checks": []},
             {"agent": "codex", "status": "FAIL", "checks": []},
-            {"agent": "metis", "status": "OK", "checks": []},  # no organ binding -> excluded
+            {"agent": "mason", "status": "OK", "checks": []},  # no organ binding -> excluded
         ]
     }
 
@@ -212,7 +212,7 @@ class FleetHealthAdapterTests(unittest.TestCase):
         snapshot = ch.evidence_from_fleet_health(
             self._REPORT, observed_at="2026-08-26T11:00:00Z", fresh_until="2026-08-26T13:00:00Z"
         )
-        self.assertEqual(len(snapshot.records), 3)  # orchestrator, recovery, codex; metis excluded
+        self.assertEqual(len(snapshot.records), 3)  # orchestrator, recovery, codex; mason excluded
         by_binding = {r.subject_ref.id: r for r in snapshot.records.values()}
         self.assertEqual(
             {r.facet for r in snapshot.records.values()}, {ot.HealthFacet.LIVENESS}

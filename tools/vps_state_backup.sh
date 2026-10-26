@@ -29,10 +29,33 @@ set -euo pipefail
 REPO_DIR="${VPS_BACKUP_REPO_DIR:-/var/lib/vps-backup/pantheon-vps-backup}"
 ACCOUNTS="claude claude-fallback claude-research codex the-ancestor exocortex suborch1 suborch2"
 
+# --- T-4546 perms preamble: begin ---
+# SECURITY (T-4546). This checkout holds every seat's memory pins, HANDOFF.md files
+# and kino.db, copied by root out of 0750 homes. Created under root's default umask
+# 022 it was world-readable and flattened that cordon. Two layers, both on every run:
+#   1. umask 077: everything this script creates (mkdir'd dirs, the sqlite .backup
+#      copy, MANIFEST.txt, new .git objects) is owner-only from birth. `cp -a` still
+#      preserves SOURCE modes inside the tree; that is fine, the barrier is layer 2.
+#   2. harden_backup_perms (called once the checkout is known to exist): chmod 0700
+#      the checkout AND its parent, so a re-provisioned host or a loosened dir heals on
+#      the next run. Top level only, deliberately: a 0700 root is the barrier, and a
+#      recursive chmod would only mask drift. Root-only; nothing local needs to read it
+#      (backup_staleness_check.py reads the GitHub copy). Modes are not part of git
+#      content beyond the exec bit, so what is committed + pushed is unchanged.
+# The test (tools/test_vps_state_backup.py) executes this fenced block, so keep it
+# self-contained: umask + function definition only, no calls, no other dependencies
+# than $REPO_DIR.
+umask 077
+harden_backup_perms() {
+  chmod 0700 "$(dirname "$REPO_DIR")" "$REPO_DIR"
+}
+# --- T-4546 perms preamble: end ---
+
 if [ ! -d "$REPO_DIR/.git" ]; then
   echo "backup repo checkout missing at $REPO_DIR/.git — provision it first" >&2
   exit 1
 fi
+harden_backup_perms
 
 # Wipe content (keep .git) so a removed source path drops from the backup too.
 find "$REPO_DIR" -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
@@ -107,7 +130,12 @@ find "$REPO_DIR/hosts" -type f \( -iname '*credential*index*' -o -iname '*secret
 # Strip any nested .git dirs captured from source (some memory dirs are their
 # own git repos) — an embedded repo becomes a gitlink and its content is lost.
 # mindepth 2 guarantees the backup repo's own top-level .git is never matched.
-find "$REPO_DIR" -mindepth 2 -type d -name .git -exec rm -rf {} + 2>/dev/null || true
+# T-4871: match .git of ANY type. A linked worktree's .git is a FILE pointing
+# back into the LIVE seat repo; left in place, root's `git add -A` below
+# refreshes that live worktree's index as root:root 0600 and breaks the seat.
+# --- T-4871 nested-git strip: begin ---
+find "$REPO_DIR" -mindepth 2 -name .git -prune -exec rm -rf {} + 2>/dev/null || true
+# --- T-4871 nested-git strip: end ---
 
 cd "$REPO_DIR"
 git add -A

@@ -47,19 +47,28 @@ class TestBuildLedgerEntry(unittest.TestCase):
             "session_id": "sess-abc",
             "resets_at": 12345,
         }
-        le = build_ledger_entry(src)
+        le = build_ledger_entry(src, "2026-05-12T12:05:00Z")
         self.assertEqual(le["action"], "session_reset")
-        self.assertEqual(le["agent"], "recovery")
-        self.assertEqual(le["ts"], "2026-05-12T12:00:00Z")
+        # T-4737: ORG-001 role id + seat slot; ts = write time, event -> decided_at.
+        self.assertEqual(le["agent"], "head_system_orchestrator")
+        self.assertEqual(le["executor"], "head-system-orchestrator")
+        self.assertEqual(le["ts"], "2026-05-12T12:05:00Z")
+        self.assertEqual(le["decided_at"], "2026-05-12T12:00:00Z")
         self.assertEqual(le["justifies_via"], ["D1"])
         self.assertIsNone(le["cost_usd"])
         self.assertIsNone(le["parent_id"])
         self.assertIsNone(le["supersedes"])
         # ID format
-        self.assertTrue(le["id"].startswith("2026-05-12T12:00:00Z-session-reset-cap-hit-auto-resume-"))
+        self.assertTrue(le["id"].startswith("2026-05-12T12:05:00Z-session-reset-cap-hit-auto-resume-"))
         # Links
         self.assertEqual(le["links"][0]["type"], "session_reset_log_entry")
         self.assertEqual(le["links"][0]["ref"], "cap_hit_auto_resume:2026-05-12T12:00:00Z")
+
+    def test_no_event_time_means_no_decided_at(self):
+        # review F5: decided_at is omitted, not "", when the source has no ts_iso.
+        le = build_ledger_entry({"class": "handoff_restart", "trigger": "x"}, "2026-05-12T12:05:00Z")
+        self.assertNotIn("decided_at", le)
+        self.assertEqual(le["ts"], "2026-05-12T12:05:00Z")
 
     def test_rationale_includes_extras(self):
         src = {
@@ -200,6 +209,53 @@ class TestJournalStartedEvents(unittest.TestCase):
             run.return_value = MagicMock(returncode=0, stdout=sample, stderr="")
             out = journal_started_events()
         self.assertEqual(len(out), 1)
+
+    def test_own_account_runs_without_sudo(self):
+        # sudo-to-self is rejected -> empty stdout -> a false "no Started events" (T-4058).
+        import getpass
+        with patch("tools.session_reset_reconcile.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            journal_started_events(sudo_user=getpass.getuser())
+        self.assertNotIn("sudo", run.call_args.args[0])
+
+    def test_other_account_crosses_via_sudo(self):
+        with patch("tools.session_reset_reconcile.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            journal_started_events(sudo_user="definitely-not-me-account")
+        self.assertEqual(run.call_args.args[0][:4],
+                         ["sudo", "-n", "-u", "definitely-not-me-account"])
+
+
+class TestJournalUnitFollowsSeatShape(unittest.TestCase):
+    """T-4159: the swept unit is orchestrator's session unit per instance.yaml, not a
+    hardcoded bespoke name that the T-3650 hand-move retires."""
+
+    def _binding(self, **extra):
+        base = {"account": "claude", "restart_service": "claude-telegram.service",
+                "restart_mode": "user", "restart_pane": "claude-telegram-bot:0"}
+        return {**base, **extra}
+
+    def test_bespoke_orchestrator_sweeps_the_bespoke_unit(self):
+        with patch("tools.agent_role_map._PERSONA_TO_BINDING", {"orchestrator": self._binding()}):
+            self.assertEqual(srr._journal_user_unit(), "claude-telegram.service")
+
+    def test_control_plane_orchestrator_sweeps_the_runtime_controller(self):
+        with patch("tools.agent_role_map._PERSONA_TO_BINDING",
+                   {"orchestrator": self._binding(supervisor="control-plane")}):
+            self.assertEqual(srr._journal_user_unit(), "pantheon-runtime-controller@orchestrator.service")
+
+    def test_default_call_uses_the_resolved_unit(self):
+        with patch("tools.session_reset_reconcile._journal_user_unit",
+                   return_value="pantheon-runtime-controller@orchestrator.service"), \
+             patch("tools.session_reset_reconcile.subprocess.run") as run:
+            run.return_value = MagicMock(returncode=0, stdout="", stderr="")
+            journal_started_events(sudo_user="definitely-not-me-account")
+        self.assertIn("--user-unit pantheon-runtime-controller@orchestrator.service",
+                      run.call_args.args[0][-1])
+
+    def test_unresolvable_falls_back_to_bespoke_constant(self):
+        with patch("tools.agent_role_map._PERSONA_TO_BINDING", {}):
+            self.assertEqual(srr._journal_user_unit(), "claude-telegram.service")
 
 
 class TestFindUnattributedRestarts(unittest.TestCase):
@@ -568,6 +624,66 @@ class TestCurrentAccountOverride(unittest.TestCase):
         with patch.dict(os.environ, env, clear=True):
             self.assertEqual(srl._current_account(), getpass.getuser())
 
+
+
+class TestCommitAndPushRoutesThroughPushWithRetry(unittest.TestCase):
+    """T-4388: the push goes through push_with_retry (one attempt, as before), so a
+    rebase the pre-push freshness hook strands is aborted and a rebase already in
+    progress is never pushed (both behaviours are tested on push_with_retry itself)."""
+
+    def _call(self, push_result):
+        import contextlib
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            f = root / "ledger.jsonl"
+            f.write_text("{}\n")
+            ok_proc = subprocess.CompletedProcess([], 0, "", "")
+            with patch.object(srr, "_REPO_ROOT", root), \
+                 patch.object(srr, "_hermes_scan_file", return_value=(True, "")), \
+                 patch.object(srr, "_hermes_scan_message", return_value=True), \
+                 patch.object(srr, "_git", return_value=ok_proc) as git, \
+                 patch("tools._git_utils.git_mutation_lock", lambda **k: contextlib.nullcontext()), \
+                 patch.object(srr, "push_with_retry", return_value=push_result) as pwr:
+                result = srr.commit_and_push([f], "reconcile: test")
+            return result, git, pwr, root
+
+    def test_push_uses_push_with_retry_one_attempt(self):
+        result, git, pwr, root = self._call((True, "pushed main (attempt 1)"))
+        self.assertEqual(result, (True, ""))
+        pwr.assert_called_once_with(root, refspec="main", attempts=1)
+        self.assertNotIn("push", [c.args[0] for c in git.call_args_list], "no raw git push")
+
+    def test_push_failure_detail_is_returned(self):
+        result, _git, _pwr, _root = self._call((False, "rebase conflict ... ABORTED ... THE OP DID NOT LAND"))
+        self.assertFalse(result[0])
+        self.assertIn("THE OP DID NOT LAND", result[1])
+
+
+class TestRetiredTimerContract(unittest.TestCase):
+    """T-4288: do not make the retired utility look deployed again."""
+
+    def test_no_session_reset_unit_pair_is_shipped(self):
+        unit_dir = srr._REPO_ROOT / "tools" / "systemd"
+        self.assertFalse((unit_dir / "pantheon-session-reset-reconcile.service").exists())
+        self.assertFalse((unit_dir / "pantheon-session-reset-reconcile.timer").exists())
+
+    def test_systemd_readme_records_silent_death_lesson(self):
+        text = (srr._REPO_ROOT / "tools" / "systemd" / "README.md").read_text()
+        self.assertIn("timer that was never installed cannot fire", text)
+        self.assertIn("expected-unit/liveness declaration", text)
+
+    def test_current_authority_surfaces_mark_timer_retired(self):
+        expected = (
+            srr._REPO_ROOT / "tools" / "systemd" / "expected-units.yaml"
+        ).read_text()
+        bringup = (
+            srr._REPO_ROOT / "sop" / "standard" / "pantheon-bringup.md"
+        ).read_text()
+        self.assertIn(
+            "pantheon-session-reset-reconcile.{timer,service}: NOT expected — RETIRED",
+            expected,
+        )
+        self.assertIn("`pantheon-session-reset-reconcile` is **retired**", bringup)
 
 if __name__ == "__main__":
     unittest.main()

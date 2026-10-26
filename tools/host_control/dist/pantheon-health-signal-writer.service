@@ -1,0 +1,79 @@
+# STAGED ARTIFACT (T-3652, ORG-097 / RFC-003) — nothing in this repo installs it.
+# Installation, the `pantheon-healthsig` service-account creation, the /etc allowlist,
+# the /var/lib signal tree, and the per-store_path BindPaths injection are owned by the
+# ORG-050 installer's system-scoped OperationKinds, whose APPLY is gated on the T-2920
+# supervised-root backend (unbuilt) + the operator's ratify of RFC-003. This unit ships the
+# hardened service class only; it declares no live socket path activation.
+#
+# PROVISIONAL values pending T-2920 ratification:
+#   - service account          pantheon-healthsig      (RFC-003 R1)
+#   - ExecStart path            /usr/local/libexec/pantheon-health-signal-writer
+#     (convention-consistent with ORG-052 §7 /usr/local/libexec/ paths; not ratified)
+#
+# INSTALL-TIME TEMPLATING (the installer renders these from the root-owned allowlist):
+#   - one `BindPaths=<store_path>` line PER writer entry (RFC-003 MED-3): bind EXACTLY
+#     the enumerated store_paths (each `<persona>/tmp`), NEVER the hub root — so the
+#     broker's mount namespace contains only the probe dirs and the confinement is
+#     kernel-enforced, not code-only. Rendered after ProtectHome=tmpfs. See §MED-3.
+
+[Unit]
+Description=Pantheon external-authority health signal-writer (ORG-097)
+Documentation=file:architecture/rfc/RFC-003-health-signal-writer-broker.md
+Documentation=file:architecture/adr/ORG-097-external-authority-signal-writer.md
+
+[Service]
+Type=simple
+ExecStart=/usr/local/libexec/pantheon-health-signal-writer
+User=pantheon-healthsig
+Group=pantheon-healthsig
+# R1: member of pantheon-mailbox for the HUB-LEVEL --x traverse to
+# /home/post-office/mailbox only; the store-leaf WRITE comes from a per-store named-
+# user ACL (installer `store-acl-grant`), NOT this group (HIGH-1, getfacl-verified).
+SupplementaryGroups=pantheon-mailbox
+
+# The socket lives on the per-boot tmpfs; systemd recreates it each boot (M1). The
+# daemon does an in-daemon unlink-then-bind at $RUNTIME_DIRECTORY/health-signal-writer.sock
+# (0660 pantheon-healthsig:pantheon-mailbox) — there is no .socket unit (RFC R1).
+RuntimeDirectory=pantheon
+RuntimeDirectoryMode=0755
+# The signal tree. Dirs 0755 + files 0644 (world-readable so any account can VERIFY
+# freshness; the daemon fchmod's leaves to 0644 explicitly, independent of UMask).
+StateDirectory=pantheon/health-signals
+StateDirectoryMode=0755
+
+# Unprivileged by design (ORG-052 alignment; RFC-003 R1) — never root, no capabilities.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+# ProtectHome=tmpfs (NOT yes): the R6 canary probe must reach the account store under
+# /home/post-office/mailbox. The installer injects per-store_path `BindPaths=` (RW)
+# below this line so ONLY the enumerated <persona>/tmp dirs are visible (MED-3). A
+# read-only bind would break the O_EXCL probe; the hub root must NOT be bound.
+ProtectHome=tmpfs
+# >>> installer injects: BindPaths=/home/post-office/mailbox/<persona>/tmp  (one per writer) <<<
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+SystemCallArchitectures=native
+UMask=0077
+# D-8: RuntimeMaxSec is deliberately NOT set — it caps how long a HEALTHY service may
+# run, which is not a crash/liveness bound. SIGHUP reloads the allowlist (M7).
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

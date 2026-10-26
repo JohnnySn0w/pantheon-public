@@ -1,0 +1,111 @@
+# ============================================================================
+# ⚠️ REFERENCE-INSTANCE EXAMPLE — REPLACE FOR YOUR INSTANCE.
+# The personas below are the reference instance's (neutralized), kept so the
+# role-routing path runs out of the box. Replace them with your own, then bump
+# source_revision and re-pin source_digest here and instance.yaml's
+# role_membership_projection (the procedure is in the comments below).
+# ============================================================================
+# persona_roles.yaml — L3 PersonaRoleMembership source (ORG-085 L3 / ORG-088 D-2).
+#
+# THE SOLE AUTHORITY for functional-role membership (`role_ids`). This is the
+# concrete L3 PersonaDefinition membership source that ORG-085 defined
+# conceptually (§ conceptual serializable signatures, PersonaDefinition.role_ids)
+# and ORG-088 D-2 owns the routing use of: "Functional-role membership is owned
+# solely by the L3 PersonaDefinition. The binding layer (instance.yaml) must not
+# author role_ids; it may carry a read-only, digest-bound projection."
+#
+# WHY A NEW FILE, NOT instance.yaml. ORG-085 §253 (field-ownership table) is
+# explicit: "functional Role membership and default | L3 | PersonaDefinition;
+# PersonaBinding and instance role-key MUST NOT duplicate membership." instance.yaml
+# is the BINDING layer (role-key -> persona/account/harness) — putting role_ids
+# there would make the binding plane a second authority. role_ids are governed
+# NOWHERE machine-readable today (a grep of tools/ + instance.yaml is empty), so
+# this file is the SOLE writer for an ungoverned field — it is the L3 source §253
+# mandates ("explicit L3 source amendment only"), NOT the "persona registry beside
+# the System Registry" ORG-085 rejects (that alternative is rejected because it
+# would DUPLICATE facts already governed by ORG-080/081/instance.yaml — this
+# duplicates nothing).
+#
+# AI-PERSONA LAYER, NOT THE OPERATOR. This file is the AI-persona role membership
+# layer. operator-as-operator is CEREMONIAL here: he holds no schema slot in
+# `personas` below and is not a functional-role member, by design. Operator
+# authority is a DIFFERENT axis — it lives in the organism layer's `role:operator`
+# (organism/), which this file neither shadows nor duplicates. A reader looking for
+# where operator authority is modeled should look there, not here; the absence of a
+# the operator entry below is intentional, not an omission.
+#
+# ROLE_ID VOCABULARY (the RATIFIED per-persona L2 target — the operator, T-3807). role_ids
+# are L2 functional-role ids per ORG-088 D-2 / ORG-085 L2 RoleDefinition — a
+# DISTINCT namespace from agent_role_map.py's audit-role-ids and from the
+# rulebook/persona-orientation spawn-orientation role names. The prior universal
+# `orchestrator` tier is RETIRED: every persona now carries exactly ONE narrow
+# head/engineering role, and that sole role is its default_role_id. The canonical
+# set: head_engineering_orchestrator (orchestrator), head_memory_orchestrator (archivist),
+# engineering_orchestrator (mason + artisan), head_research_orchestrator (specialist),
+# head_system_orchestrator (recovery), head_auditor (codex). T2's eligible()/consumers
+# consume THIS vocabulary.
+#
+# ROSTER PROVENANCE. The universal `orchestrator` set of ORG-088 D-2 was replaced by
+# the operator's ratified per-persona role vocabulary (T-3807): each persona holds one
+# narrow role. The FINAL roster is operator-amendable per ORG-088 §open-questions (the
+# L3 role-membership roster is the operator's) — the routing mechanism is content-agnostic:
+# reshaping membership is a one-line-per-persona data edit, and bumping `source_revision`
+# + the paired `expected_revision`/`expected_digest` in instance.yaml's
+# role_membership_projection.
+#
+# FRESHNESS + DIGEST CONTRACT (ORG-085 invariants 4 + 5). `source_revision` is a
+# monotonic integer bumped on every membership amendment; `source_digest` is the
+# sha256 over this document's canonical content EXCLUDING the source_digest field
+# itself (sorted-key compact JSON of {schema, source_revision, personas}). The
+# read-only projection in instance.yaml (role_membership_projection) pins
+# expected_revision + expected_digest; tools/agent_role_map.py's reader recomputes
+# and REFUSES fail-closed on digest mismatch (inv 4) or missing/stale revision
+# (inv 5). Editing membership below WITHOUT updating both this source_digest AND
+# instance.yaml's expected_digest is a fail-closed refusal by design, not a silent
+# stale load.
+#
+# TO AMEND MEMBERSHIP: edit personas below, bump source_revision, recompute
+# source_digest (python3 -c over the canonical form — see agent_role_map.py
+# _compute_source_digest), and update instance.yaml role_membership_projection's
+# expected_revision + expected_digest to match. tools/test_agent_role_membership.py
+# guards the load contract.
+
+schema: pantheon-persona-role-membership/v1
+source_revision: 4
+personas:
+  orchestrator:
+    role_ids: [head_engineering_orchestrator]
+    default_role_id: head_engineering_orchestrator
+    lifecycle: declared
+  archivist:
+    role_ids: [head_memory_orchestrator]
+    default_role_id: head_memory_orchestrator
+    lifecycle: declared
+  mason:
+    role_ids: [engineering_orchestrator]
+    default_role_id: engineering_orchestrator
+    lifecycle: declared
+  artisan:
+    role_ids: [engineering_orchestrator]
+    default_role_id: engineering_orchestrator
+    lifecycle: declared
+  specialist:
+    role_ids: [head_research_orchestrator]
+    default_role_id: head_research_orchestrator
+    lifecycle: declared
+  recovery:
+    role_ids: [head_system_orchestrator]
+    default_role_id: head_system_orchestrator
+    lifecycle: declared
+  codex:
+    role_ids: [head_auditor]
+    default_role_id: head_auditor
+    lifecycle: declared
+  # T-4884 B6 (the operator TG 11698/11700): Watchman, the codex-primary recovery seat on
+  # the codex-fallback account. ORG-100 §1 regular in Recovery's System domain (Recovery is
+  # the head), partial seating (§3): no Operator channel, reports to Recovery.
+  watchman:
+    role_ids: [system_orchestrator]
+    default_role_id: system_orchestrator
+    lifecycle: declared
+source_digest: 7887c838cc7fcdb2c0b3bb98b955849bc16562680166028933b371e8dfa890bc

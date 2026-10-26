@@ -2,6 +2,8 @@
 
 **Status:** **Ratified 2026-06-07 by the operator.** Drafted 2026-05-11 (per the operator msg_1311).
 
+> **Note — targets are roles (2026-10-19, Orchestrator, T-5239; supersedes the 2026-10-16 T-5060 note).** A ticket `target:` is a `role:<R>` pool or `operator`. `ticket.py file` refuses a seat name (ORG-088 amendment 2026-10-19). Role ids: `role:head_engineering_orchestrator` (orchestrator), `role:engineering_orchestrator` (artisan, mason, orchestrator), `role:head_system_orchestrator` (recovery), `role:system_orchestrator` (recovery, watchman), `role:head_research_orchestrator` (specialist), `role:head_memory_orchestrator` (archivist). The legacy ids `orchestrator` and `specialist` are retired. Read them as `role:head_engineering_orchestrator` and `role:head_research_orchestrator`.
+
 This is the operational SOP for handling observations that surface during normal work but aren't the current focus — bugs, possible lessons-learned, feature ideas, follow-on tasks, gotchas, retrospective items. The discipline: **file as a ticket, don't try to handle inline, don't lose the observation.** Applies to all three agents (Orchestrator/Recovery/Specialist); the message from the operator was "it's important the team feels fine to submit their own tickets."
 
 ## When to use this
@@ -58,12 +60,12 @@ python3 tools/ticket.py file \
 
 | Observation kind | Default target | Notes |
 |---|---|---|
-| Bug in current agent's domain | `orchestrator` (or `orchestrator`) | HO triages + decides who handles |
-| Bug in another agent's domain | the relevant agent (`recovery`, `specialist`, `specialist`) | They'll inherit the autonomy-bar check on pull |
-| Possible lesson / pattern observation | `orchestrator` | Lessons authoring is HO-tier per ORG-012 methodology |
-| Feature idea / spec-question | `operator` (label `interactive-required`) or `orchestrator` (HO drafts strawman, surfaces to the operator) | Pick by whether the idea needs the operator's framing OR HO can draft autonomously |
-| Tooling gap (script you wish existed) | `orchestrator` | HO triages: HO-direct OR Recovery-target depending on the tool |
-| Spec §clarification-candidate (the spec says X, substrate has Y) | `orchestrator` | HO batches into resolve-summary at cycle close |
+| Bug in current agent's domain | `role:engineering_orchestrator` | Any engineering orchestrator (HO included) triages and decides who handles |
+| Bug in another agent's domain | that agent's role (`role:head_system_orchestrator` for Recovery's tooling, `role:system_orchestrator` for recovery paths, `role:head_research_orchestrator` for Specialist's) | They'll inherit the autonomy-bar check on pull |
+| Possible lesson / pattern observation | `role:head_engineering_orchestrator` | Lessons authoring is HO-tier per ORG-012 methodology |
+| Feature idea / spec-question | `operator` (label `interactive-required`) or `role:head_engineering_orchestrator` (HO drafts strawman, surfaces to the operator) | Pick by whether the idea needs the operator's framing OR HO can draft autonomously |
+| Tooling gap (script you wish existed) | `role:engineering_orchestrator` | Pooled: any engineering orchestrator (HO included) takes it; infra is dual-owned with the system pool under D15 |
+| Spec §clarification-candidate (the spec says X, substrate has Y) | `role:head_engineering_orchestrator` | HO batches into resolve-summary at cycle close |
 
 ### 4. Naming + labels
 
@@ -99,21 +101,21 @@ If the file invocation fails (e.g., git push conflict): log the failure, retry o
 
 ### Orchestrator (HO)
 
-- HO is the natural triage point for many observations; HO-target auto-files are common.
-- HO can also self-target tickets for own future work — completely fine. The auto-consumer will surface them on the next pull cycle.
+- HO is the natural triage point for many observations; `role:head_engineering_orchestrator` auto-files are common.
+- HO can also file its own future work to `role:head_engineering_orchestrator` (HO-only) or `role:engineering_orchestrator` (any engineering orchestrator) — completely fine. The auto-consumer will surface them on the next pull cycle.
 - For lessons-candidates, HO drafts the lessons/ entry inline when the observation is ripe + HO-autonomous per ORG-012. Filing as `lesson-candidate` ticket is for the cases where HO isn't ready to author yet.
 
 ### Recovery (claude-fallback)
 
 - Recovery observes a lot during grooming + system-monitor work. Most observations are tooling/bug/refactor candidates in pantheon-config (or another live project repo — e.g. kino-pwa, codex-config).
-- Recovery-target tickets for own work, HO-target for items needing triage. Don't hesitate to file — the cost of an extra ticket Recovery could have done inline is much lower than the cost of losing the observation.
+- `role:head_system_orchestrator` tickets for own work, `role:head_engineering_orchestrator` for items needing triage. Don't hesitate to file — the cost of an extra ticket Recovery could have done inline is much lower than the cost of losing the observation.
 - Use `requester: recovery` so the ledger thread is clean.
 
 ### Specialist (claude-research / specialist)
 
 - Specialist surfaces external observations (research findings, watch-report deltas, etc). The cron-fired auto-actuation loop (B11 / T-0215 pattern) files these as tickets when the daily README index gets built — that covers topics-list-driven watch_runner dispatches.
 - For **episodic research arcs** (ad-hoc HO-dispatched surveys, NOT watch_runner topic dispatches), the B11 path does NOT fire — those deliverables land in `knowledge/episodic/<date>-<topic>/` but bypass the auto-actuation index. Specialist must **manually file individual tickets for each above-the-bar finding BEFORE resolving the parent research ticket**. See §Research-arc deliverables below for the canonical shape.
-- For *internal* observations during research dispatch (e.g., "the topic-list itself has a gap here"), Specialist files just like Recovery — use `requester: specialist` + `target: specialist` (own work) or `orchestrator` (cross-cutting).
+- For *internal* observations during research dispatch (e.g., "the topic-list itself has a gap here"), Specialist files just like Recovery — use `requester: specialist` + `target: role:head_research_orchestrator` (own work) or `role:head_engineering_orchestrator` (cross-cutting).
 
 ## Research-arc deliverables — above-the-bar item filing
 
@@ -121,9 +123,9 @@ Applies to: any agent (Specialist primarily, Orchestrator secondarily) completin
 
 **The rule:** before resolving the parent research ticket, file one ticket per above-the-bar item. Each ticket cites the deliverable as source via `--context` reference. Targets per item type:
 
-- **Primitive to borrow / Pantheon eval candidate / discipline-anchor** → `target: orchestrator` for triage + design-tier ratification draft.
-- **Pilot direction / mechanism choice / architectural decision** → `target: operator` with `ratifiable_files` attached IF the deliverable points at an ADR; otherwise `target: orchestrator` to draft the ADR per ORG-015's allow-list.
-- **Followup research deeper-dive** → `target: specialist` for Specialist's own queue.
+- **Primitive to borrow / Pantheon eval candidate / discipline-anchor** → `target: role:head_engineering_orchestrator` for triage + design-tier ratification draft.
+- **Pilot direction / mechanism choice / architectural decision** → `target: operator` with `ratifiable_files` attached IF the deliverable points at an ADR; otherwise `target: role:head_engineering_orchestrator` to draft the ADR per ORG-015's allow-list.
+- **Followup research deeper-dive** → `target: role:head_research_orchestrator` for Specialist's own research.
 
 **Labels:** include `b11-manual` (distinguishes from cron-fired B11 actuations) AND `from-<agent>-arc-<NNN>` (cross-references the parent research ticket).
 

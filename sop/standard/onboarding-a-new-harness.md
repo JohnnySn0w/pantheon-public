@@ -113,7 +113,7 @@ PantheonHarnessAdapter
 | exec | `codex exec [PROMPT]` — same prompt→result shape. Note: `required=true` per-MCP causes `codex exec` to exit if an MCP fails (vs interactive graceful-degrade). |
 | auth | `codex login --with-api-key` (headless) or `--device-auth` (browser, interactive). Creds at `~/.codex/auth.json` (0600). OAuth session unlocks built-in multimodal tools (`image_gen`) that the API-key path may not expose. |
 | inbound (bridge) | No Telegram plugin; inbound via custom MCP server or manual `tmux send-keys` kick. Outbound: direct-curl `sendMessage` with token at `~/.codex/pantheon.env`. |
-| policy (org) | `approval_policy = "never"` + `sandbox_mode = "workspace-write"` + `network_access = true` (ORG-031 §ii, live-verified). `trust_level` alone does NOT silence prompts — both axes required. |
+| policy (org) | `approval_policy = "never"` + `sandbox_mode = "danger-full-access"` (ORG-031 §ii as amended 2026-10-12, the operator TG 11733/11742: every harness gets the full unlock; the unix account is the boundary). `trust_level` alone does NOT silence prompts — both axes required. |
 
 ---
 
@@ -123,7 +123,7 @@ These steps wire the new daemon into Pantheon's loops. They are **identical** re
 
 ### 2.1 Supervise script + systemd unit
 
-Copy the pattern from `tools/systemd/recovery-bot-supervise.sh` (or `tools/systemd/ancestor-bot-supervise.sh` for a non-claude harness reference). The two key variables to adapt:
+Copy the pattern from `tools/systemd/recovery-bot-supervise.sh`. The two key variables to adapt:
 
 ```bash
 CLAUDE_BIN="$HOME/.npm-global/bin/<harness>"   # e.g. codex
@@ -200,7 +200,7 @@ tmux ls | grep <session>                                   # → session present
 
 ### 2.6 Ledger
 
-`tools/ledger_shard.py` and the JSONL append pattern are **harness-independent** — they write to `ledger/<ISO-year>-W<NN>/<same>.jsonl` on disk via repo file ops. Any agent with repo access and an MCP write tool (or a hook that calls `python3 tools/ledger_shard.py append`) can write ledger entries. Wire this the same way as any other agent: provide the agent's `AGENTS.md` / `CLAUDE.md` with a ledger-append instruction, or register a `PostToolUse` hook that fires on significant actions.
+`tools/ledger_shard.py` and the JSONL append pattern are **harness-independent** — they write to `ledger/<ISO-year>-W<NN>/<same>.jsonl` on disk via repo file ops. Any agent with repo access and an MCP write tool (or a hook that calls `ledger_shard.append_entry`, as in `sop/standard/appending-a-ledger-entry.md`; there is no append CLI) can write ledger entries. Wire this the same way as any other agent: provide the agent's `AGENTS.md` / `CLAUDE.md` with a ledger-append instruction, or register a `PostToolUse` hook that fires on significant actions.
 
 ### 2.7 Telegram
 
@@ -269,11 +269,10 @@ The blunt alternative (drops the hardening fleet-wide) is `sysctl -w kernel.appa
 Inserts into `~<account>/.codex/config.toml`:
 ```toml
 approval_policy = "never"
-sandbox_mode = "workspace-write"
-
-[sandbox_workspace_write]
-network_access = true
+sandbox_mode = "danger-full-access"
 ```
+
+If `sandbox_mode` is already present with another value, the script leaves it alone and its verify step **fails loudly**; fix the value by hand (T-4929).
 
 Idempotent: checks each key before inserting; skips if already present. **Critical:** `trust_level = "trusted"` alone does NOT silence approval prompts — `approval_policy` is the required axis (live-verified on the codex daemon, ORG-031 §ii).
 
@@ -342,7 +341,7 @@ Run top-to-bottom before declaring the daemon live.
 - [ ] Bare respawn confirmed via kill-respawn test above.
 
 ### Ledger / Telegram
-- [ ] Daemon can write a test ledger entry: append a line to `ledger/<current-week>/<shard>.jsonl` and confirm it commits + pushes cleanly.
+- [ ] Daemon can write a test ledger entry through `ledger_shard.append_entry` (the ledger-append SOP; agent = its ORG-100 role id, executor = its seat slot) with no `ledger: WARN ORG-001` line, and confirm it commits + pushes cleanly.
 - [ ] Outbound Telegram: `curl .../sendMessage` with the agent's bot token reaches the operator's device (outbound-only, no inbound required for initial verification).
 
 ---

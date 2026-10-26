@@ -5,6 +5,17 @@ broker reachability legs that are not built yet remain machine-legible
 as ``not_configured`` subcomponents, so the monitor can distinguish
 "known absent leg" from a live probe failure instead of treating every
 degraded broker as an incident.
+
+T-2917 5d.4 (ruling T-2917:D21; HO ruling on the roster): the broker roster
+gains ``operation_driver`` (PROVISIONAL name), and the operation driver's
+cache (``tools.host_control.driver``) supplies real ``operation_driver``,
+``executor_reachability`` and ``approval_reachability`` probes. A leg whose
+source is not wired in a broker instance stays ``not_configured``.
+
+Roster growth rule (for every consumer, e.g. the B7 recovery seat, T-4884):
+legs are only ever APPENDED, existing legs keep their names and order, and a
+reader must key by leg name and tolerate legs it does not know. A pinned
+test holds the pre-5d prefix.
 """
 
 from __future__ import annotations
@@ -41,6 +52,8 @@ BROKER_ROSTER: Final[tuple[str, ...]] = (
     "policy",
     "approval_reachability",
     "executor_reachability",
+    # T-2917 5d.4 (PROVISIONAL, HO ruling): the broker operation driver
+    "operation_driver",
 )
 APPROVAL_ROSTER: Final[tuple[str, ...]] = (
     "journal",
@@ -233,6 +246,7 @@ def make_broker_health_provider(
     policy_probe: HealthProbe,
     approval_reachability_probe: HealthProbe | None = None,
     executor_reachability_probe: HealthProbe | None = None,
+    operation_driver_probe: HealthProbe | None = None,
 ) -> HealthProvider:
     return HealthProvider(
         service="broker",
@@ -242,12 +256,17 @@ def make_broker_health_provider(
             "policy": policy_probe,
             "approval_reachability": approval_reachability_probe
             or unavailable_probe(
-                reason="approval reachability is not configured until T-2917",
+                reason="approval reachability probe is not wired in this broker (T-2917 driver cache)",
                 revision="T-2917",
             ),
             "executor_reachability": executor_reachability_probe
             or unavailable_probe(
-                reason="executor reachability is not configured until T-2917",
+                reason="executor reachability probe is not wired in this broker (T-2917 driver cache)",
+                revision="T-2917",
+            ),
+            "operation_driver": operation_driver_probe
+            or unavailable_probe(
+                reason="operation driver is not wired in this broker (T-2917 driver cache)",
                 revision="T-2917",
             ),
         },

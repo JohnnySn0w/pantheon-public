@@ -28,9 +28,11 @@ import hashlib
 import inspect
 import io
 import json
+import os
 import tempfile
 import tomllib  # stdlib ≥3.11 — the declared floor (T-2733: production harness_adapter needs it)
 import unittest
+import unittest.mock
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -48,10 +50,19 @@ from tools.harness_adapter.codex import (
     ensure_model_migration_prompts_hidden,
     ensure_project_trusted,
     ensure_update_check_disabled,
+    ensure_worker_guard_hook,
+    worker_guard_command,
+    worker_guard_hook_status,
     gc_stale_project_trust_entries,
     gc_trust_entries_cli,
 )
+from tools.harness_adapter import codex as codex_adapter
+from tools.harness_adapter.claude import (
+    _parse_claude_mid_session_cap_reset_at,
+    classify_claude_mid_session_cap,
+)
 from tools.harness_adapter.types import HarnessLaunchConfig, PostStartPaneSample, TmuxTarget
+from tools.harness_adapter import claude as claude_adapter
 from tools import mailbox
 
 
@@ -349,13 +360,13 @@ class TestClaudeTranslations(unittest.TestCase):
         self.assertEqual(result["harness"], "claude")
         self.assertIn("key_source", result)
 
-    def test_legacy_interactive_launch_still_pins_default_permission_mode(self) -> None:
+    def test_legacy_interactive_launch_still_pins_bypass_permission_mode(self) -> None:
         command = self.adapter.build_interactive_launch(
             TmuxTarget(session="recovery", window="harness", pane="0"),
             cwd=Path("/tmp/launch"),
         )
         self.assertEqual(command.argv.count("--permission-mode"), 1)
-        self.assertEqual(command.argv[-2:], ("--permission-mode", "default"))
+        self.assertEqual(command.argv[-2:], ("--permission-mode", "bypassPermissions"))
 
     def test_claude_post_start_weekly_limit_is_subscription_cap_not_runtime_started(self) -> None:
         adapter = ClaudeHarnessAdapter(
@@ -376,8 +387,73 @@ class TestClaudeTranslations(unittest.TestCase):
         self.assertEqual(assessment.cause, "post-start-subscription-cap")
         self.assertEqual(assessment.pattern_id, "claude-rate-limit-options-modal")
         self.assertEqual(assessment.baseline_sha256, baseline.sha256)
-        self.assertNotIn("You've hit your", json.dumps(payload, sort_keys=True))
-        self.assertNotIn("What do you want to do?", json.dumps(payload, sort_keys=True))
+        # T-4047: reset_at is a derived datetime, not raw text -- json.dumps
+        # needs `default=str` to serialize it; the invariant under test
+        # (no raw pane prose leaks into the assessment) still holds against
+        # the str()-rendered payload.
+        self.assertNotIn("You've hit your", json.dumps(payload, sort_keys=True, default=str))
+        self.assertNotIn("What do you want to do?", json.dumps(payload, sort_keys=True, default=str))
+
+    def test_claude_post_start_cap_assessment_parses_reset_at_and_cap_kind(self) -> None:
+        """T-4047: the fixture's bare-time reset ("resets 2:50pm (UTC)" on a
+        SESSION-limit sentinel) parses to an absolute UTC instant and a
+        session-limit cap_kind, given a deterministic `now`."""
+        adapter = ClaudeHarnessAdapter(
+            "orchestrator",
+            claude_home=Path("/tmp/fake-claude-home"),
+            launch=_claude_launch_config({}),
+        )
+        cap_text = (Path(__file__).resolve().parent / "testdata" / "orchestrator_cap_modal_pane.txt").read_text(encoding="utf-8")
+        fixed_now = datetime(2026, 9, 27, 10, 0, 0, tzinfo=timezone.utc)
+        assessment = adapter.assess_post_start_readiness(
+            harness="claude",
+            profile="interactive-subscription",
+            baseline=_post_start_sample("❯ \n", 0),
+            samples=(_post_start_sample(cap_text, 1),),
+            now=fixed_now,
+        )
+        self.assertEqual(assessment.status, "subscription-cap")
+        self.assertEqual(assessment.cap_kind, "session-limit")
+        self.assertEqual(assessment.reset_at, datetime(2026, 9, 27, 14, 50, 0, tzinfo=timezone.utc))
+
+    def test_claude_post_start_cap_assessment_unparseable_weekly_kind_has_no_reset_at(self) -> None:
+        """T-4047: a weekly-limit sentinel with unparseable reset text yields
+        cap_kind="weekly-limit" and reset_at=None -- the caller
+        (_post_start_cap_cooldown_override) is what decides a weekly,
+        unparseable cap should legitimately stay on the long next_weekly_reset
+        default; this classifier's job is only to report what it saw."""
+        adapter = ClaudeHarnessAdapter(
+            "orchestrator",
+            claude_home=Path("/tmp/fake-claude-home"),
+            launch=_claude_launch_config({}),
+        )
+        # Plain text (no embedded ANSI) -- classify_claude_post_start_subscription_cap's
+        # framing check is a simple substring test over the whole normalized
+        # text, so real styling adds nothing this synthetic fixture needs;
+        # unlike the mid-session classifier's stricter position-anchored
+        # checks, this one has no footer/chrome requirement to satisfy.
+        weekly_unparseable = (
+            "  ⎿  You've hit your weekly limit · resets whenever the moon says so\n"
+            "\n"
+            "❯ /rate-limit-options\n"
+            "\n"
+            "What do you want to do?\n"
+            "\n"
+            "❯ 1. Stop and wait for limit to reset\n"
+            "  2. Upgrade your plan\n"
+            "\n"
+            "Enter to confirm · Esc to cancel\n"
+        )
+        assessment = adapter.assess_post_start_readiness(
+            harness="claude",
+            profile="interactive-subscription",
+            baseline=_post_start_sample("❯ \n", 0),
+            samples=(_post_start_sample(weekly_unparseable, 1),),
+            now=datetime(2026, 9, 27, 10, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(assessment.status, "subscription-cap")
+        self.assertEqual(assessment.cap_kind, "weekly-limit")
+        self.assertIsNone(assessment.reset_at)
 
     def test_claude_post_start_cap_classifier_rejects_prompt_history_and_broad_limit_text(self) -> None:
         adapter = ClaudeHarnessAdapter(
@@ -484,6 +560,153 @@ class TestClaudeTranslations(unittest.TestCase):
         self.assertNotIn("old turn", payload)
         self.assertNotIn("ready changed", payload)
         self.assertNotIn(str(transcript), payload)
+
+    _HISTORY_SUBMITTED_AT = datetime(2026, 8, 14, 0, 0, 1, tzinfo=timezone.utc)
+
+    def _history_probe(self, root: Path, marker: str = "PANTHEON_PROVIDER_COMPLETION_hist"):
+        account_home = root / "account"
+        (account_home / ".claude").mkdir(parents=True)
+        adapter = ClaudeHarnessAdapter("orchestrator", claude_home=account_home)
+        probe = adapter.prepare_interactive_provider_completion(
+            harness="claude",
+            profile="interactive-subscription",
+            persona="recovery",
+            account_home=account_home,
+            state_dir=root / "state" / "recovery" / "runtime-controller",
+            pane_baseline=_post_start_sample("ready\n❯ \n", 0),
+            submitted_at=self._HISTORY_SUBMITTED_AT,
+            nonce_marker=marker,
+            nonce_sha256=hashlib.sha256(marker.encode("utf-8")).hexdigest(),
+        )
+        assert probe is not None
+        return adapter, probe, account_home / ".claude" / "history.jsonl"
+
+    def _history_line(self, display: str, *, stamp_ms: int, pasted: bool = False) -> str:
+        contents = {"1": {"id": "1", "type": "text", "contentHash": "261f3e63d6f0d48a"}} if pasted else {}
+        return json.dumps({"display": display, "pastedContents": contents, "timestamp": stamp_ms}) + "\n"
+
+    def test_claude_probe_submitted_reads_the_nonce_from_prompt_history(self) -> None:
+        # T-4321: Claude Code appends each submitted prompt to history.jsonl.
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, probe, history = self._history_probe(Path(tmp))
+            submit_ms = int(self._HISTORY_SUBMITTED_AT.timestamp() * 1000)
+            history.write_text(self._history_line("an older prompt", stamp_ms=submit_ms - 5000), encoding="utf-8")
+            self.assertIs(adapter.interactive_provider_completion_submitted(probe=probe), False)
+            with history.open("a", encoding="utf-8") as handle:
+                handle.write(self._history_line(probe.prompt, stamp_ms=submit_ms + 100))
+            self.assertIs(adapter.interactive_provider_completion_submitted(probe=probe), True)
+
+    def test_claude_probe_submitted_counts_a_collapsed_paste_after_the_submit(self) -> None:
+        # A collapsed paste keeps its text in paste-cache, so the nonce isn't
+        # in history. A pasted entry stamped at/after the submit still counts;
+        # an older one doesn't.
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, probe, history = self._history_probe(Path(tmp))
+            submit_ms = int(self._HISTORY_SUBMITTED_AT.timestamp() * 1000)
+            history.write_text(
+                self._history_line("[Pasted text #1 +1 lines]", stamp_ms=submit_ms - 1, pasted=True),
+                encoding="utf-8",
+            )
+            self.assertIs(adapter.interactive_provider_completion_submitted(probe=probe), False)
+            with history.open("a", encoding="utf-8") as handle:
+                handle.write(self._history_line("[Pasted text #2 +1 lines]", stamp_ms=submit_ms, pasted=True))
+            self.assertIs(adapter.interactive_provider_completion_submitted(probe=probe), True)
+
+    def test_claude_probe_submitted_ignores_other_prompts_after_the_submit(self) -> None:
+        # T-4321 r1 N3 (A7): history.jsonl is per ACCOUNT, so another session's
+        # ordinary prompt can land after the submit. Only the nonce, or a paste,
+        # counts; the compact and the spaced JSON forms both count as "no paste".
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, probe, history = self._history_probe(Path(tmp))
+            submit_ms = int(self._HISTORY_SUBMITTED_AT.timestamp() * 1000)
+            compact = json.dumps({"display": "unrelated", "pastedContents": {}, "timestamp": submit_ms + 50},
+                                 separators=(",", ":"))
+            history.write_text(compact + "\n" + self._history_line("unrelated too", stamp_ms=submit_ms + 60),
+                               encoding="utf-8")
+            self.assertIs(adapter.interactive_provider_completion_submitted(probe=probe), False)
+
+    def _probe_transcript(self, account_home: Path, records: list[dict], *, name: str = "sess.jsonl") -> Path:
+        project = account_home / ".claude" / "projects" / "-home-recovery-pantheon-config"
+        project.mkdir(parents=True, exist_ok=True)
+        path = project / name
+        path.write_text("".join(json.dumps(r) + "\n" for r in records), encoding="utf-8")
+        return path
+
+    def _unflushed_history(self, history: Path) -> None:
+        # T-4459: readable history that does NOT yet hold the probe (the write is buffered).
+        submit_ms = int(self._HISTORY_SUBMITTED_AT.timestamp() * 1000)
+        history.write_text(self._history_line("an older prompt", stamp_ms=submit_ms - 5000), encoding="utf-8")
+
+    def test_claude_probe_taken_when_history_is_unflushed_but_the_transcript_has_it(self) -> None:
+        # T-4459 (T-3026 attempt 4): Claude Code buffers history writes, so the entry
+        # was missing while the probe turn was already running, and the controller
+        # re-typed it. The transcript's user event is written at submit.
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, probe, history = self._history_probe(Path(tmp))
+            self._unflushed_history(history)
+            self.assertIs(adapter.interactive_provider_completion_submitted(probe=probe), False)
+            self._probe_transcript(
+                history.parent.parent,
+                [{"type": "user", "message": {"role": "user", "content": probe.prompt}}],
+            )
+            self.assertIs(adapter.interactive_provider_completion_submitted(probe=probe), True)
+
+    def test_claude_probe_transcript_fallback_needs_a_user_event(self) -> None:
+        # Only the user event proves the prompt was taken; the nonce elsewhere doesn't.
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, probe, history = self._history_probe(Path(tmp))
+            self._unflushed_history(history)
+            self._probe_transcript(
+                history.parent.parent,
+                [{"type": "assistant", "message": {"role": "assistant",
+                                                   "content": [{"type": "text", "text": probe.nonce_marker}]}}],
+            )
+            self.assertIs(adapter.interactive_provider_completion_submitted(probe=probe), False)
+
+    def test_claude_probe_transcript_fallback_ignores_transcripts_older_than_the_submit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, probe, history = self._history_probe(Path(tmp))
+            self._unflushed_history(history)
+            path = self._probe_transcript(
+                history.parent.parent,
+                [{"type": "user", "message": {"role": "user", "content": probe.prompt}}],
+            )
+            old = self._HISTORY_SUBMITTED_AT.timestamp() - 3600
+            os.utime(path, (old, old))
+            self.assertIs(adapter.interactive_provider_completion_submitted(probe=probe), False)
+
+    def test_claude_probe_transcript_fallback_never_follows_a_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, probe, history = self._history_probe(Path(tmp))
+            self._unflushed_history(history)
+            outside = Path(tmp) / "outside.jsonl"
+            outside.write_text(
+                json.dumps({"type": "user", "message": {"role": "user", "content": probe.prompt}}) + "\n",
+                encoding="utf-8",
+            )
+            project = history.parent / "projects" / "-p"
+            project.mkdir(parents=True)
+            (project / "linked.jsonl").symlink_to(outside)
+            self.assertIs(adapter.interactive_provider_completion_submitted(probe=probe), False)
+
+    def test_probe_submitted_defaults_to_unknown_for_other_harnesses(self) -> None:
+        # T-4321 r1 N1: the base hook says None, so a harness without a
+        # prompt-history surface never has its probe re-typed.
+        adapter = CodexHarnessAdapter("specialist")
+        with tempfile.TemporaryDirectory() as tmp:
+            _claude, probe, _history = self._history_probe(Path(tmp))
+            self.assertIsNone(adapter.interactive_provider_completion_submitted(probe=probe))
+
+    def test_claude_probe_submitted_is_unknown_without_a_readable_history(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter, probe, history = self._history_probe(Path(tmp))
+            self.assertIsNone(adapter.interactive_provider_completion_submitted(probe=probe))
+            history.write_text(self._history_line("an older prompt", stamp_ms=1), encoding="utf-8")
+            history.chmod(0)
+            try:
+                self.assertIsNone(adapter.interactive_provider_completion_submitted(probe=probe))
+            finally:
+                history.chmod(0o600)
 
     def test_claude_interactive_completion_rejects_nonce_with_non_whitespace_prefix_suffix(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -642,9 +865,9 @@ class TestClaudeTranslations(unittest.TestCase):
         idx = command.argv.index("--effort")
         self.assertEqual(command.argv[idx + 1], "xhigh")
         # Composition check: --permission-mode must stay the trailing pair --
-        # test_legacy_interactive_launch_still_pins_default_permission_mode and
+        # test_legacy_interactive_launch_still_pins_bypass_permission_mode and
         # the T-2382 fixture both pin argv[-2:] to it.
-        self.assertEqual(command.argv[-2:], ("--permission-mode", "default"))
+        self.assertEqual(command.argv[-2:], ("--permission-mode", "bypassPermissions"))
 
     def test_build_interactive_launch_omits_effort_flag_when_native_empty(
         self,
@@ -660,13 +883,12 @@ class TestClaudeTranslations(unittest.TestCase):
         )
         self.assertNotIn("--effort", command.argv)
 
-    def test_approval_defaults_uses_explicit_default_and_scoped_allowlist(self) -> None:
+    def test_approval_defaults_uses_bypass_permissions(self) -> None:
         result = self.adapter.approval_defaults()
         self.assertIsInstance(result, dict)
-        self.assertEqual(result["permission_mode"], "default")
-        self.assertEqual(result["flag"], "--permission-mode default")
-        self.assertEqual(result["tool_approval"], "scoped-permissions.allow")
-        self.assertNotIn("bypass", str(result).lower())
+        self.assertEqual(result["permission_mode"], "bypassPermissions")
+        self.assertEqual(result["flag"], "--permission-mode bypassPermissions")
+        self.assertEqual(result["tool_approval"], "bypass-permissions")
 
     def test_spawn_subagent_returns_dict(self) -> None:
         result = self.adapter.spawn_subagent("specialist", {"model": "claude-opus-4"})
@@ -684,8 +906,402 @@ class TestClaudeTranslations(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 5b. T-4037 — mid-session (no-baseline) subscription-cap classification
+# ---------------------------------------------------------------------------
+
+class TestClaudeMidSessionCap(unittest.TestCase):
+    def setUp(self) -> None:
+        self.session_cap_text = (
+            Path(__file__).resolve().parent / "testdata" / "orchestrator_cap_modal_pane.txt"
+        ).read_text(encoding="utf-8")
+        self.spend_limit_text = (
+            Path(__file__).resolve().parent / "testdata" / "orchestrator_spend_limit_modal_pane.txt"
+        ).read_text(encoding="utf-8")
+
+    def test_session_limit_modal_classified_without_baseline(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        modal = classify_claude_mid_session_cap(self.session_cap_text, now=now)
+        self.assertIsNotNone(modal)
+        self.assertEqual(modal.modal_kind, "session-limit")
+        self.assertEqual(modal.reset_source, "parsed")
+        # "resets 2:50pm (UTC)" observed at noon UTC -> later today.
+        self.assertEqual(
+            modal.reset_at,
+            datetime(2026, 9, 27, 14, 50, 0, tzinfo=timezone.utc),
+        )
+
+    def test_spend_limit_modal_classified_with_dated_reset(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        modal = classify_claude_mid_session_cap(self.spend_limit_text, now=now)
+        self.assertIsNotNone(modal)
+        self.assertEqual(modal.modal_kind, "monthly-spend-limit")
+        self.assertEqual(modal.reset_source, "parsed")
+        self.assertEqual(
+            modal.reset_at,
+            datetime(2026, 9, 27, 17, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_prompt_echoed_cap_text_is_not_classified(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        text = "User prompt: You've hit your weekly limit · resets 2:50pm (UTC)\n"
+        self.assertIsNone(classify_claude_mid_session_cap(text, now=now))
+
+    def test_broad_limit_mention_without_modal_framing_is_not_classified(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertIsNone(
+            classify_claude_mid_session_cap("weekly limit reached somewhere in docs\n", now=now)
+        )
+
+    def test_partial_spend_limit_framing_without_options_is_not_classified(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        text = "You've hit your monthly spend limit, contact support.\n"
+        self.assertIsNone(classify_claude_mid_session_cap(text, now=now))
+
+    def test_empty_text_is_not_classified(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertIsNone(classify_claude_mid_session_cap("", now=now))
+
+    # -- T-4037 REBOUND Finding 1: chrome, not framing-phrases alone --------
+
+    def test_prose_quoting_session_variant_framing_without_chrome_is_not_classified(self) -> None:
+        """Finding 1 test (a): prose that quotes the sentinel line AND every
+        OLD framing phrase (`_has_claude_rate_limit_modal_framing`'s four
+        substrings) for the session/weekly/opus variant, but never
+        reproduces the live modal's numbered-option-list + footer chrome,
+        must NOT classify."""
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        text = (
+            "Reviewing the T-4037 false positive: a captured pane read\n"
+            "  You've hit your session limit · resets 2:50pm (UTC)\n"
+            "and the classifier also keys on /rate-limit-options plus the phrases\n"
+            "\"what do you want to do?\", \"stop and wait for limit to reset\", and\n"
+            "\"upgrade your plan\" -- none of which means a modal is actually open.\n"
+        )
+        self.assertIsNone(classify_claude_mid_session_cap(text, now=now))
+
+    def test_prose_quoting_spend_variant_framing_without_chrome_is_not_classified(self) -> None:
+        """Same as above, spend-limit variant: quotes the OLD three-substring
+        framing set (pre-fix `_has_claude_spend_limit_modal_framing`) without
+        the live modal's credit-balance / adjust-limit / footer chrome. Each
+        phrase stays contiguous (not line-wrapped) so it genuinely satisfies
+        the old substring check -- confirmed to classify (wrongly) pre-fix."""
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        text = (
+            "The false positive: any prose saying \"you've hit your monthly spend limit\" and asking\n"
+            "\"what do you want to do?\" and mentioning \"wait for limit to reset\" would\n"
+            "previously classify -- even this sentence, quoted for illustration.\n"
+        )
+        self.assertIsNone(classify_claude_mid_session_cap(text, now=now))
+
+    def test_indented_quote_of_modal_opening_without_footer_or_options_is_not_classified(self) -> None:
+        """Finding 1 test (b): an indented/quoted block mimicking the
+        modal's FIRST lines (sentinel + "What do you want to do?" opening)
+        but stopping short of the live footer/options chrome -- both
+        variants."""
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        session_text = (
+            "    You've hit your session limit · resets 2:50pm (UTC)\n"
+            "    What do you want to do?\n"
+        )
+        spend_text = (
+            "    You've hit your monthly spend limit · your weekly limit"
+            " resets Sep 27, 5pm (UTC)\n"
+            "    What do you want to do?\n"
+        )
+        self.assertIsNone(classify_claude_mid_session_cap(session_text, now=now))
+        self.assertIsNone(classify_claude_mid_session_cap(spend_text, now=now))
+
+    def test_real_fixtures_still_classified_with_correct_modal_kind(self) -> None:
+        """Finding 1 test (c): both real captures still detect, chrome and
+        all -- redundant with (but explicit alongside) the pre-existing
+        baseline tests above, which must also stay green under the
+        chrome-tightened checks. The session fixture ends with a trailing
+        blank line on disk (orchestrator_cap_modal_pane.txt); the spend fixture does
+        not -- between the two, both "with" and "without a trailing blank
+        line" are exercised for the round-2 footer-is-final-line check."""
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        session_modal = classify_claude_mid_session_cap(self.session_cap_text, now=now)
+        self.assertIsNotNone(session_modal)
+        self.assertEqual(session_modal.modal_kind, "session-limit")
+        spend_modal = classify_claude_mid_session_cap(self.spend_limit_text, now=now)
+        self.assertIsNotNone(spend_modal)
+        self.assertEqual(spend_modal.modal_kind, "monthly-spend-limit")
+
+    # -- T-4037 REBOUND round 2 Finding 1 + 2: footer-position + glyph -------
+
+    def test_render_span_sha256_is_present_and_deterministic(self) -> None:
+        """`render_span_sha256` (T-4037 REBOUND round 2 Finding 3's debounce
+        input) must be a non-empty, deterministic digest of the tight render
+        span -- identical across repeat calls on the same text, and different
+        between the two structurally different real fixtures."""
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        first = classify_claude_mid_session_cap(self.session_cap_text, now=now)
+        second = classify_claude_mid_session_cap(self.session_cap_text, now=now)
+        self.assertTrue(first.render_span_sha256)
+        self.assertEqual(first.render_span_sha256, second.render_span_sha256)
+        spend = classify_claude_mid_session_cap(self.spend_limit_text, now=now)
+        self.assertNotEqual(first.render_span_sha256, spend.render_span_sha256)
+
+    def test_render_span_sha256_ignores_churn_above_the_tight_region(self) -> None:
+        """The hash must be scoped to the modal's own tight render span, not
+        the full pane -- unrelated scrollback ABOVE the modal (e.g. a ticking
+        status line) changing between polls must not perturb it, or the
+        round-2 Finding 3 debounce could never confirm a real, genuinely
+        static, still-open modal."""
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        baseline = classify_claude_mid_session_cap(self.session_cap_text, now=now)
+        churned_text = "an entirely different unrelated transcript line\n" + self.session_cap_text
+        churned = classify_claude_mid_session_cap(churned_text, now=now)
+        self.assertIsNotNone(churned)
+        self.assertEqual(baseline.render_span_sha256, churned.render_span_sha256)
+
+    def _repro_fenced_session_quote(self) -> str:
+        """The round-2 reviewer's exact repro: a code-fenced, byte-exact
+        quote of the session-limit modal, followed by explanatory prose."""
+        return (
+            "Here's the fixture content I'm reviewing for T-4037:\n"
+            "\n"
+            "```\n"
+            "You've hit your session limit · resets 2:50pm (UTC)\n"
+            "\n"
+            "What do you want to do?\n"
+            "\n"
+            "1. Stop and wait for limit to reset\n"
+            "2. Upgrade your plan\n"
+            "\n"
+            "Enter to confirm · Esc to cancel\n"
+            "```\n"
+            "\n"
+            "This is the modal chrome the classifier checks for.\n"
+        )
+
+    def _repro_verbatim_spend_quote(self) -> str:
+        """The round-2 reviewer's spend-limit variant: verbatim quote, no
+        code fence, followed by explanatory prose."""
+        return (
+            "And the spend-limit variant has the same problem:\n"
+            "You've hit your monthly spend limit · your weekly limit resets Sep 27, 5pm\n"
+            "   (UTC)\n"
+            "What do you want to do?                        Usage credit balance: $8.08\n"
+            "Adjust monthly spend limit:        ← or → to adjust · Del to remove limit\n"
+            "  Wait for limit to reset                         Resets Sep 27, 5pm (UTC)\n"
+            "Enter to confirm · Esc to cancel\n"
+            "\n"
+            "Same fixture-quoting shape as the session variant above.\n"
+        )
+
+    def _repro_no_fence_session_quote(self) -> str:
+        """Same session-limit quote as `_repro_fenced_session_quote`, but
+        without the surrounding code fence."""
+        return (
+            "You've hit your session limit · resets 2:50pm (UTC)\n"
+            "\n"
+            "What do you want to do?\n"
+            "\n"
+            "1. Stop and wait for limit to reset\n"
+            "2. Upgrade your plan\n"
+            "\n"
+            "Enter to confirm · Esc to cancel\n"
+            "\n"
+            "This is the modal chrome the classifier checks for.\n"
+        )
+
+    def test_reviewer_repro_fenced_session_quote_is_not_classified(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertIsNone(
+            classify_claude_mid_session_cap(self._repro_fenced_session_quote(), now=now)
+        )
+
+    def test_reviewer_repro_verbatim_spend_quote_is_not_classified(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertIsNone(
+            classify_claude_mid_session_cap(self._repro_verbatim_spend_quote(), now=now)
+        )
+
+    def test_reviewer_repro_no_fence_session_quote_is_not_classified(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertIsNone(
+            classify_claude_mid_session_cap(self._repro_no_fence_session_quote(), now=now)
+        )
+
+    def test_reviewer_repros_followed_by_realistic_input_box_tail_are_not_classified(
+        self,
+    ) -> None:
+        """Each of the three repros, followed by the Claude Code UI's own
+        always-rendered input-box/prompt/status-line tail (what a REAL pane
+        capture carries once the modal has actually closed) -- still None."""
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        realistic_tail = (
+            "\n"
+            "────────────────────\n"
+            "> \n"
+            "────────────────────\n"
+            "  ? for shortcuts                          Context left until auto-compact: 42%\n"
+        )
+        for repro in (
+            self._repro_fenced_session_quote(),
+            self._repro_verbatim_spend_quote(),
+            self._repro_no_fence_session_quote(),
+        ):
+            with self.subTest(repro=repro.splitlines()[0]):
+                self.assertIsNone(
+                    classify_claude_mid_session_cap(repro + realistic_tail, now=now)
+                )
+
+    def test_footer_as_last_content_without_glyph_adjacency_is_not_classified(self) -> None:
+        """Finding 2: a quote where the modal's confirm/cancel footer IS the
+        pane's absolute last content (passes the round-2 Finding 1 gate) but
+        the option lines lack the "❯" selector glyph immediately before them
+        -- must still not classify. Both variants."""
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        session_text = (
+            "You've hit your session limit · resets 2:50pm (UTC)\n"
+            "\n"
+            "What do you want to do?\n"
+            "\n"
+            "1. Stop and wait for limit to reset\n"
+            "2. Upgrade your plan\n"
+            "\n"
+            "Enter to confirm · Esc to cancel\n"
+        )
+        spend_text = (
+            "You've hit your monthly spend limit · your weekly limit resets Sep 27, 5pm\n"
+            "   (UTC)\n"
+            "What do you want to do?                        Usage credit balance: $8.08\n"
+            "Adjust monthly spend limit:        ← or → to adjust · Del to remove limit\n"
+            "  Wait for limit to reset                         Resets Sep 27, 5pm (UTC)\n"
+            "Enter to confirm · Esc to cancel\n"
+        )
+        self.assertIsNone(classify_claude_mid_session_cap(session_text, now=now))
+        self.assertIsNone(classify_claude_mid_session_cap(spend_text, now=now))
+
+
+class TestParseClaudeMidSessionCapResetAt(unittest.TestCase):
+    def test_bare_form_same_day(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            _parse_claude_mid_session_cap_reset_at(
+                "You've hit your session limit · resets 2:50pm (UTC)", now=now
+            ),
+            datetime(2026, 9, 27, 14, 50, 0, tzinfo=timezone.utc),
+        )
+
+    def test_bare_form_rolls_to_tomorrow_past_skew_grace(self) -> None:
+        now = datetime(2026, 9, 27, 16, 0, 0, tzinfo=timezone.utc)  # well past 2:50pm
+        self.assertEqual(
+            _parse_claude_mid_session_cap_reset_at(
+                "You've hit your session limit · resets 2:50pm (UTC)", now=now
+            ),
+            datetime(2026, 9, 28, 14, 50, 0, tzinfo=timezone.utc),
+        )
+
+    def test_bare_form_within_skew_grace_returns_none(self) -> None:
+        now = datetime(2026, 9, 27, 15, 0, 0, tzinfo=timezone.utc)  # 10 min past 2:50pm
+        self.assertIsNone(
+            _parse_claude_mid_session_cap_reset_at(
+                "You've hit your session limit · resets 2:50pm (UTC)", now=now
+            )
+        )
+
+    def test_dated_form_parses_month_day_time(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            _parse_claude_mid_session_cap_reset_at("Resets Sep 27, 5pm (UTC)", now=now),
+            datetime(2026, 9, 27, 17, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_dated_form_feb_29_past_in_leap_year_returns_none_not_raises(self) -> None:
+        """T-4173: a past "Feb 29" in a leap year rolls to next year, which
+        has no Feb 29; the docstring's never-raises contract means None
+        (unparsed), not a ValueError out of the cap classifier."""
+        now = datetime(2028, 3, 1, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertIsNone(
+            _parse_claude_mid_session_cap_reset_at("Resets Feb 29, 5pm (UTC)", now=now)
+        )
+
+    def test_unparseable_text_returns_none(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertIsNone(_parse_claude_mid_session_cap_reset_at("no reset text here", now=now))
+
+    # -- T-4037 REBOUND Finding 2: day-name reset forms ---------------------
+
+    def test_day_name_bare_form_resolves_to_end_of_day_next_occurrence(self) -> None:
+        # 2026-09-28 is a Monday; "resets Sunday" with no time -> the next
+        # Sunday, end-of-day, per the documented bare-day-name convention
+        # (_resolve_dow_reset: no time given -> 23:59:59 UTC, conservative).
+        now = datetime(2026, 9, 28, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            _parse_claude_mid_session_cap_reset_at(
+                "You've hit your weekly limit · resets Sunday", now=now
+            ),
+            datetime(2026, 10, 4, 23, 59, 59, tzinfo=timezone.utc),
+        )
+
+    def test_day_name_abbreviated_with_time_matches_ho_stop_failure_shape(self) -> None:
+        # Anchor mirrors tools/test_ho_stop_failure.py::test_day_of_week_prefix's
+        # own real capture shape ("resets Mon 12:00am"): 2026-09-27 is a
+        # Sunday; observed at noon -> next day, midnight.
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            _parse_claude_mid_session_cap_reset_at("resets Mon 12:00am", now=now),
+            datetime(2026, 9, 28, 0, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_day_name_same_weekday_already_passed_rolls_to_next_week(self) -> None:
+        now = datetime(2026, 9, 27, 20, 0, 0, tzinfo=timezone.utc)  # Sunday 8pm
+        self.assertEqual(
+            _parse_claude_mid_session_cap_reset_at("resets Sun 3pm", now=now),
+            datetime(2026, 10, 4, 15, 0, 0, tzinfo=timezone.utc),
+        )
+
+    def test_dated_regex_guard_prevents_day_name_swallowing_ambiguous_input(self) -> None:
+        """Before the negative-lookahead guard, a day name followed by a
+        comma-separated day+hour ("Mon 05, 12pm") satisfied the DATED
+        regex's two-number-group shape, captured "Mon" as `month_name`, and
+        `_resolve_dated_reset` silently returned None (no fallback to the
+        day-name path) since "mon" isn't in `_MONTH_ABBR_TO_NUM`. The guard
+        keeps the dated regex from matching at all when the token right after
+        "resets " is a day name, so parsing now falls through to the
+        day-name path instead of being swallowed."""
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)  # Sunday noon
+        result = _parse_claude_mid_session_cap_reset_at("resets Mon 05, 12pm", now=now)
+        self.assertIsNotNone(result)
+        self.assertEqual(result, datetime(2026, 9, 28, 23, 59, 59, tzinfo=timezone.utc))
+
+    def test_dated_form_still_parses_real_month_abbreviations(self) -> None:
+        # Regression guard alongside the above: the negative lookahead must
+        # never exclude a genuine month (disjoint token sets by construction).
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        self.assertEqual(
+            _parse_claude_mid_session_cap_reset_at("Resets Sep 27, 5pm (UTC)", now=now),
+            datetime(2026, 9, 27, 17, 0, 0, tzinfo=timezone.utc),
+        )
+
+
+# ---------------------------------------------------------------------------
 # 6. ClaudeHarnessAdapter — not-abstracted props return dicts (no raise)
 # ---------------------------------------------------------------------------
+
+class TestFullUnlockDefaults(unittest.TestCase):
+    """T-4929: every harness runs fully unlocked; the unix account is the boundary
+    (the operator TG 11733/11741/11742; ORG-031 section (ii) as amended)."""
+
+    def test_codex_defaults_are_full_unlock(self) -> None:
+        adapter = CodexHarnessAdapter("codex")
+        for cfg in (adapter.approval_defaults(), adapter.sandbox_config):
+            self.assertEqual(cfg["sandbox_mode"], "danger-full-access")
+            self.assertEqual(cfg["approval_policy"], "never")
+            self.assertNotIn("sandbox_workspace_write", cfg)
+        self.assertEqual(adapter.approval_defaults()["mcp_tool_approval"], "approve")
+        self.assertIn("bypass-hook-trust", adapter.approval_defaults()["hook_trust"])
+
+    def test_claude_default_is_still_default_mode_pending_followup(self) -> None:
+        # Deliberately pins the CURRENT value: flipping Claude to bypassPermissions
+        # changes every live Claude seat's launch mode and is split into its own
+        # follow-up ticket T-4935. Update this pin there.
+        adapter = ClaudeHarnessAdapter("orchestrator")
+        self.assertEqual(adapter.approval_defaults()["permission_mode"], "bypassPermissions")
+
 
 class TestClaudeNotAbstractedProps(unittest.TestCase):
     def setUp(self) -> None:
@@ -765,15 +1381,12 @@ class TestCodexTranslations(unittest.TestCase):
     def test_approval_defaults_has_sandbox_mode(self) -> None:
         result = self.adapter.approval_defaults()
         self.assertIn("sandbox_mode", result)
-        self.assertEqual(result["sandbox_mode"], "workspace-write")
+        self.assertEqual(result["sandbox_mode"], "danger-full-access")
 
-    def test_approval_defaults_has_network_access(self) -> None:
-        result = self.adapter.approval_defaults()
-        nested = result.get("sandbox_workspace_write", {})
-        self.assertTrue(
-            nested.get("network_access"),
-            "ORG-031 §ii requires network_access=true",
-        )
+    def test_approval_defaults_has_no_workspace_write_table(self) -> None:
+        # danger-full-access has no workspace-write sub-config (T-4929).
+        self.assertNotIn("sandbox_workspace_write", self.adapter.approval_defaults())
+        self.assertNotIn("sandbox_workspace_write", self.adapter.sandbox_config)
 
     def test_spawn_subagent_returns_dict(self) -> None:
         result = self.adapter.spawn_subagent("specialist", {})
@@ -1136,6 +1749,729 @@ class PruneStaleProjectEntriesTest(unittest.TestCase):
             new_text, pruned = _prune_stale_project_entries(text)
             self.assertEqual(pruned, 2)
             self.assertEqual(new_text, expected)
+
+
+class FakeCodexHooks:
+    """Fake ``hooks/list`` modelled on codex-cli 0.147.0 as captured live for T-4395 (throwaway
+    CODEX_HOMEs, real app-server): key = "<realpath(CODEX_HOME)>/config.toml:pre_tool_use:<g>:<h>";
+    currentHash covers the hook definition (the group's matcher and EVERY hook key, e.g.
+    statusMessage) but not the path, comments or position; trustStatus is "untrusted" with no
+    stored hash, "trusted" when the stored trusted_hash equals currentHash, "modified" when it
+    differs; `enabled = false` in the state entry disables it. `real_home` overrides what the
+    non-scratch home reports; each scratch read records the definition it was handed."""
+
+    def __init__(self, real_home: Path | None = None):
+        self.real_home = real_home
+        self.calls: list[tuple[Path, float | None]] = []
+        self.scratch_definitions: list[dict] = []
+        self.scratch_result = "live"  # or None / "raise"
+        self.real_result = "live"  # or None / "raise" / a hash-salt string forcing a mismatch
+        self.on_real_read = None  # optional side effect before a real-home read
+
+    @staticmethod
+    def definition_hash(command: str, timeout, matcher, extra: dict | None = None, salt: str = "") -> str:
+        hook = {"type": "command", "command": command, "timeout": timeout, **(extra or {})}
+        return FakeCodexHooks._hash(hook, matcher, salt)
+
+    @staticmethod
+    def _hash(hook: dict, matcher, salt: str = "") -> str:
+        body = json.dumps([matcher, sorted(hook.items()), salt])
+        return "sha256:" + hashlib.sha256(body.encode()).hexdigest()
+
+    def _is_real(self, codex_home) -> bool:
+        return self.real_home is not None and os.path.realpath(codex_home) == os.path.realpath(self.real_home)
+
+    def __call__(self, executable, *, codex_home, cwd=None, timeout=15.0):
+        self.calls.append((codex_home, timeout))
+        real = self._is_real(codex_home)
+        if real and self.on_real_read:
+            self.on_real_read()
+        mode = self.real_result if real else self.scratch_result
+        if mode is None:
+            return None
+        if mode == "raise":
+            raise RuntimeError("app-server wedged")
+        salt = "" if mode == "live" else mode
+        config = Path(os.path.realpath(codex_home)) / "config.toml"
+        parsed = tomllib.loads((Path(codex_home) / "config.toml").read_text()) if (Path(codex_home) / "config.toml").exists() else {}
+        hooks = parsed.get("hooks") or {}
+        if not real:
+            for group in hooks.get("PreToolUse") or []:
+                self.scratch_definitions.append(group)
+        out = []
+        for g, group in enumerate(hooks.get("PreToolUse") or []):
+            for h, hook in enumerate(group.get("hooks") or []):
+                key = f"{config}:pre_tool_use:{g}:{h}"
+                current = self._hash(hook, group.get("matcher"), salt)
+                state = (hooks.get("state") or {}).get(key) or {}
+                stored = state.get("trusted_hash")
+                trust = "untrusted" if not stored else ("trusted" if stored == current else "modified")
+                out.append({"key": key, "eventName": "preToolUse", "handlerType": "command",
+                            "matcher": group.get("matcher"), "command": hook["command"],
+                            "timeoutSec": hook.get("timeout"), "sourcePath": str(config),
+                            "source": "user", "enabled": state.get("enabled", True), "isManaged": False,
+                            "currentHash": current, "trustStatus": trust})
+        return out
+
+
+class EnsureWorkerGuardHookTest(unittest.TestCase):
+    """T-4166: every codex runtime gets the worker-guard PreToolUse hook wired + trusted.
+    T-4395 / T-4397 A: the block is `python3 -I`, timeout 30, and a stale block is upgraded
+    with its new trusted_hash in ONE write, verified, else restored."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name) / "seat"
+        (self.home / "pantheon-config" / "tools" / "hooks").mkdir(parents=True)
+        (self.home / "pantheon-config" / "tools" / "hooks" / "worker-guard.py").write_text("# guard\n")
+        self.codex_home = self.home / ".codex"
+        self.config = self.codex_home / "config.toml"
+        self.codex = FakeCodexHooks(real_home=self.codex_home)
+        self.cmd = worker_guard_command(self.home)
+        self.legacy_cmd = f"/usr/bin/python3 {self.home}/pantheon-config/tools/hooks/worker-guard.py"
+        self.new_hash = FakeCodexHooks.definition_hash(self.cmd, 30, "Bash|apply_patch")
+        self.old_hash = FakeCodexHooks.definition_hash(self.legacy_cmd, 10, "Bash|apply_patch")
+        # A hermetic fake codex install (npm layout: bin/codex.js + package.json): the T-4428
+        # verified-marker keys on its identity, so tests never depend on the host's codex.
+        self.codex_pkg = Path(self._tmp.name) / "npm" / "@openai" / "codex"
+        (self.codex_pkg / "bin").mkdir(parents=True)
+        (self.codex_pkg / "bin" / "codex.js").write_text("// launcher\n")
+        (self.codex_pkg / "package.json").write_text('{"version": "0.147.0"}\n')
+        self.codex_bin = Path(self._tmp.name) / "codex"
+        self.codex_bin.symlink_to(self.codex_pkg / "bin" / "codex.js")
+        self.writes: list[str] = []
+        real_write = codex_adapter._write_config_preserving_mode
+
+        def spy(path, text):
+            self.writes.append(text)
+            return real_write(path, text)
+
+        patcher = unittest.mock.patch.object(codex_adapter, "_write_config_preserving_mode", spy)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _ensure(self, read=None, **kw):
+        self.stderr = io.StringIO()
+        with contextlib.redirect_stderr(self.stderr):
+            return ensure_worker_guard_hook(self.codex_home, self.home, executable=self.codex_bin,
+                                            read_hooks=read or self.codex, **kw)
+
+    def _real_calls(self):
+        return [c for c, _t in self.codex.calls if Path(c) == self.codex_home]
+
+    def _guard_state(self):
+        parsed = tomllib.loads(self.config.read_text())
+        [group] = [g for g in parsed["hooks"]["PreToolUse"]
+                   if any(h["command"] == self.cmd for h in g["hooks"])]
+        self.assertEqual(group["matcher"], "Bash|apply_patch")
+        return parsed["hooks"].get("state") or {}
+
+    def _legacy_config(self, *, state_extra: str = "", prefix: str = 'model = "x"\n', suffix: str = "",
+                       matcher: str | None = "Bash|apply_patch", hook_extra: str = ""):
+        """A seat as T-4160/T-4166 left it: the pre-T-4395 block (codex-config da8c863) + its trust
+        (the hash codex reports for exactly this definition)."""
+        self.codex_home.mkdir(exist_ok=True)
+        matcher_line = f'matcher = "{matcher}"\n' if matcher is not None else ""
+        extra = tomllib.loads(hook_extra) if hook_extra else {}
+        old_hash = FakeCodexHooks.definition_hash(self.legacy_cmd, 10, matcher, extra)
+        text = (f'{prefix}\n# PreToolUse worker-guard (T-4144 / T-4166): comment\n'
+                f'[[hooks.PreToolUse]]\n{matcher_line}\n[[hooks.PreToolUse.hooks]]\n'
+                f'type = "command"\ncommand = "{self.legacy_cmd}"\n{hook_extra}timeout = 10\n\n'
+                f'[hooks.state."{self.config}:pre_tool_use:0:0"]\n{state_extra}'
+                f'trusted_hash = "{old_hash}"\n{suffix}')
+        self.config.write_text(text)
+        self.config.chmod(0o640)
+        return text
+
+    # --- rendering (T-4395 / T-4397 A) ---
+
+    def test_rendered_block_is_isolated_interpreter_with_timeout_30(self) -> None:
+        block = tomllib.loads(codex_adapter._WORKER_GUARD_BLOCK.format(command=f'"{self.cmd}"'))
+        [group] = block["hooks"]["PreToolUse"]
+        [hook] = group["hooks"]
+        self.assertEqual(hook["timeout"], 30)
+        self.assertEqual(group["matcher"], "Bash|apply_patch")
+        self.assertTrue(self.cmd.startswith("/usr/bin/python3 -I "), self.cmd)
+        # codex_hook_trust_check recognises the guard by this suffix; -I must not break it.
+        self.assertTrue(self.cmd.endswith("/pantheon-config/tools/hooks/worker-guard.py"))
+
+    # --- fresh seat (T-4166, now one write) ---
+
+    def test_fresh_seat_gets_the_guard_wired_and_trusted_in_one_write_0600(self) -> None:
+        self.assertTrue(self._ensure())
+        state = self._guard_state()
+        self.assertEqual(state[f"{self.config}:pre_tool_use:0:0"], {"trusted_hash": self.new_hash})
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self._real_calls(), [], "the hash comes from a scratch home, not the real one")
+
+    def test_second_run_is_a_noop_one_bounded_real_read_no_write(self) -> None:
+        # T-4395 r1: a current block is confirmed with codex itself (so a STALE hash is caught
+        # and repaired), costing one bounded hooks/list on the real home and nothing else.
+        self._ensure()
+        before, self.codex.calls, self.writes = self.config.read_bytes(), [], []
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.codex.calls, [(self.codex_home, codex_adapter._HOOKS_LIST_TIMEOUT_S)])
+        self.assertEqual(self.writes, [])
+
+    def test_existing_content_and_mode_are_preserved(self) -> None:
+        self.codex_home.mkdir()
+        original = 'model = "x"\n\n[projects."/tmp"]\ntrust_level = "trusted"\n'
+        self.config.write_text(original)
+        self.config.chmod(0o664)
+        self._ensure()
+        self.assertTrue(self.config.read_text().startswith(original))
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o664)
+        self.assertEqual(tomllib.loads(self.config.read_text())["model"], "x")
+
+    def test_symlinked_config_stays_a_symlink(self) -> None:
+        # The sibling seeders' write_text writes THROUGH a symlink; the atomic replace must too.
+        self.codex_home.mkdir()
+        real = self.home / "shared-config.toml"
+        real.write_text('model = "x"\n')
+        self.config.symlink_to(real)
+        self._ensure()
+        self.assertTrue(self.config.is_symlink())
+        self.assertIn(self.cmd, real.read_text())
+
+    def test_guard_after_other_pretooluse_groups_gets_its_own_key(self) -> None:
+        self.codex_home.mkdir()
+        self.config.write_text('[[hooks.PreToolUse]]\nmatcher = "x"\n\n[[hooks.PreToolUse.hooks]]\n'
+                               'type = "command"\ncommand = "/bin/true"\n')
+        self._ensure()
+        self.assertEqual(self._guard_state()[f"{self.config}:pre_tool_use:1:0"], {"trusted_hash": self.new_hash})
+
+    def test_unparseable_toml_refuses_and_leaves_the_file_alone(self) -> None:
+        self.codex_home.mkdir()
+        self.config.write_text("[broken\n")
+        with self.assertRaises(RuntimeError):
+            self._ensure()
+        self.assertEqual(self.config.read_text(), "[broken\n")
+
+    def test_app_server_failure_still_wires_the_guard(self) -> None:
+        # Untrusted still RUNS under --dangerously-bypass-hook-trust; parity flags it.
+        self.assertTrue(self._ensure(read=lambda *a, **k: None))
+        self.assertEqual(self._guard_state(), {})
+        self.assertIn("UNTRUSTED", self.stderr.getvalue())
+
+    def test_current_block_with_a_hashless_state_entry_is_trusted_in_place_not_duplicated(self) -> None:
+        self.codex_home.mkdir()
+        self.config.write_text(
+            f'[[hooks.PreToolUse]]\nmatcher = "Bash|apply_patch"\n\n[[hooks.PreToolUse.hooks]]\n'
+            f'type = "command"\ncommand = "{self.cmd}"\ntimeout = 30\n\n'
+            f'[hooks.state."{self.config}:pre_tool_use:0:0"]\nenabled = true\n')
+        self.assertTrue(self._ensure())
+        self.assertEqual(self._guard_state()[f"{self.config}:pre_tool_use:0:0"],
+                         {"enabled": True, "trusted_hash": self.new_hash})
+        self.assertEqual(self.config.read_text().count("[hooks.state."), 1)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_current_block_without_trust_is_trusted_from_the_real_home(self) -> None:
+        self.codex_home.mkdir()
+        self.config.write_text(
+            f'[[hooks.PreToolUse]]\nmatcher = "Bash|apply_patch"\n\n[[hooks.PreToolUse.hooks]]\n'
+            f'type = "command"\ncommand = "{self.cmd}"\ntimeout = 30\n')
+        self.assertTrue(self._ensure())
+        self.assertEqual(self._guard_state()[f"{self.config}:pre_tool_use:0:0"], {"trusted_hash": self.new_hash})
+
+    def test_seat_without_the_guard_script_is_left_untouched(self) -> None:
+        (self.home / "pantheon-config" / "tools" / "hooks" / "worker-guard.py").unlink()
+        self.assertFalse(self._ensure())
+        self.assertFalse(self.config.exists())
+        self.assertEqual(self.codex.calls, [])
+
+    # --- the T-4395 upgrade: stale block + stale trusted_hash ---
+
+    def test_legacy_block_is_upgraded_in_place_with_its_new_hash_in_one_write(self) -> None:
+        original = self._legacy_config(suffix='\n[[hooks.Stop]]\n\n[[hooks.Stop.hooks]]\ntype = "command"\ncommand = "/bin/true"\n')
+        self.assertEqual(self.codex(Path("/usr/bin/codex"), codex_home=self.codex_home)[0]["trustStatus"], "trusted")
+        self.codex.calls = []
+        self.assertTrue(self._ensure())
+        key = f"{self.config}:pre_tool_use:0:0"
+        # exactly ONE write, and it already carries both the new block and the new hash
+        self.assertEqual(len(self.writes), 1)
+        first = tomllib.loads(self.writes[0])
+        hook = first["hooks"]["PreToolUse"][0]["hooks"][0]
+        self.assertEqual((hook["command"], hook["timeout"]), (self.cmd, 30))
+        self.assertEqual(first["hooks"]["state"][key], {"trusted_hash": self.new_hash})
+        # same key, stale hash gone, only the three values changed, mode kept
+        text = self.config.read_text()
+        self.assertNotIn(self.old_hash, text)
+        self.assertEqual(text, original.replace(f'"{self.legacy_cmd}"', f'"{self.cmd}"')
+                         .replace("timeout = 10", "timeout = 30").replace(self.old_hash, self.new_hash))
+        self.assertEqual(self.config.stat().st_mode & 0o777, 0o640)
+        [real] = [h for h in self.codex(Path("/usr/bin/codex"), codex_home=self.codex_home) if h["key"] == key]
+        self.assertEqual((real["trustStatus"], real["currentHash"]), ("trusted", self.new_hash))
+        self.assertIn("UPGRADED", self.stderr.getvalue())
+        self.assertIn("verified", self.stderr.getvalue())
+
+    def test_upgrade_is_idempotent(self) -> None:
+        self._legacy_config()
+        self.assertTrue(self._ensure())
+        before, self.codex.calls, self.writes = self.config.read_bytes(), [], []
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.config.read_bytes(), before)
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self._real_calls(), [self.codex_home])
+        self.assertNotIn("RESTORED", self.stderr.getvalue())
+
+    def test_upgrade_keeps_sibling_state_keys(self) -> None:
+        self._legacy_config(state_extra="enabled = true\n")
+        self.assertTrue(self._ensure())
+        self.assertEqual(self._guard_state()[f"{self.config}:pre_tool_use:0:0"],
+                         {"enabled": True, "trusted_hash": self.new_hash})
+
+    def test_upgrade_of_a_current_command_with_a_stale_timeout(self) -> None:
+        self._legacy_config()
+        self.config.write_text(self.config.read_text().replace(f'"{self.legacy_cmd}"', f'"{self.cmd}"'))
+        self.assertTrue(self._ensure())
+        self.assertEqual(self._guard_state()[f"{self.config}:pre_tool_use:0:0"], {"trusted_hash": self.new_hash})
+        self.assertIn("timeout = 30", self.config.read_text())
+
+    def test_precompute_failure_leaves_the_legacy_guard_untouched(self) -> None:
+        for mode in (None, "raise"):
+            with self.subTest(scratch=mode):
+                original = self._legacy_config()
+                self.codex.scratch_result, self.writes = mode, []
+                self.assertFalse(self._ensure())
+                self.assertEqual(self.config.read_text(), original)
+                self.assertEqual(self.writes, [])
+                self.assertEqual(self._real_calls(), [])
+                self.assertIn("SKIPPED", self.stderr.getvalue())
+
+    def test_unverifiable_upgrade_restores_the_original_bytes(self) -> None:
+        # None = hooks/list failed or TIMED OUT (the reader is bounded); "raise" = it blew up;
+        # a salt = codex reports a different hash, so the new block would read "modified".
+        for mode in (None, "raise", "other-codex-version"):
+            with self.subTest(real=mode):
+                original = self._legacy_config()
+                self.codex.real_result, self.writes = mode, []
+                self.assertFalse(self._ensure())
+                self.assertEqual(self.config.read_text(), original)
+                self.assertEqual(len(self.writes), 2)  # the upgrade, then the restore
+                self.assertEqual(self.writes[1], original)
+                self.assertIn("RESTORED", self.stderr.getvalue())
+
+    def test_every_app_server_read_is_bounded(self) -> None:
+        self._legacy_config()
+        self._ensure()
+        self.assertTrue(self.codex.calls)
+        for _home, timeout in self.codex.calls:
+            self.assertEqual(timeout, codex_adapter._HOOKS_LIST_TIMEOUT_S)
+        self.assertLessEqual(codex_adapter._HOOKS_LIST_TIMEOUT_S, 15.0)
+
+    def test_state_in_an_unrecognised_shape_refuses(self) -> None:
+        self.codex_home.mkdir()
+        original = (f'[[hooks.PreToolUse]]\nmatcher = "Bash|apply_patch"\n\n[[hooks.PreToolUse.hooks]]\n'
+                    f'type = "command"\ncommand = "{self.legacy_cmd}"\ntimeout = 10\n\n'
+                    f'[hooks.state]\n"{self.config}:pre_tool_use:0:0" = {{ trusted_hash = "{self.old_hash}" }}\n')
+        self.config.write_text(original)
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.config.read_text(), original)
+        self.assertIn("REFUSED", self.stderr.getvalue())
+
+    def test_an_edit_that_parses_but_is_not_minimal_is_never_written(self) -> None:
+        # The line edit lands inside a multi-line string (a decoy `timeout =` line, then a line that
+        # looks like a table header): it parses, but not to "only command/timeout/hash changed".
+        self.codex_home.mkdir()
+        original = (f'[[hooks.PreToolUse]]\nmatcher = "Bash|apply_patch"\n\n[[hooks.PreToolUse.hooks]]\n'
+                    f'type = "command"\ncommand = "{self.legacy_cmd}"\nstatusMessage = """\ntimeout = 99\n[x\n"""\n'
+                    f'timeout = 10\n\n[hooks.state."{self.config}:pre_tool_use:0:0"]\n'
+                    f'trusted_hash = "{self.old_hash}"\n')
+        self.config.write_text(original)
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.writes, [], "a non-minimal edit must be refused BEFORE any write")
+        self.assertEqual(self.config.read_text(), original)
+        self.assertIn("REFUSED", self.stderr.getvalue())
+
+    # --- T-4395 r1: the definition codex hashes is the one written ---
+
+    def _assert_trusted_at_first_verify(self):
+        log = self.stderr.getvalue()
+        self.assertIn("verified", log)
+        self.assertNotIn("RESTORED", log)
+        self.assertEqual(len(self.writes), 1)
+
+    def test_precompute_input_equals_the_written_definition(self) -> None:
+        # A future drift between what is hashed and what is written must fail HERE, not open a
+        # "modified" window on a live home.
+        for label, kwargs in (("canonical", {}), ("matcher", {"matcher": "Bash"}),
+                              ("extra-key", {"hook_extra": 'statusMessage = "guarding"\n'})):
+            with self.subTest(case=label):
+                self.codex.scratch_definitions, self.writes = [], []
+                self._legacy_config(**kwargs)
+                self.assertTrue(self._ensure())
+                [hashed] = self.codex.scratch_definitions
+                [written] = tomllib.loads(self.writes[0])["hooks"]["PreToolUse"]
+                self.assertEqual(hashed, written)
+                self._assert_trusted_at_first_verify()
+
+    def test_narrow_legacy_matcher_is_normalized_and_trusted_at_first_verify(self) -> None:
+        self._legacy_config(matcher="Bash")
+        self.assertTrue(self._ensure())
+        self._assert_trusted_at_first_verify()
+        [group] = tomllib.loads(self.config.read_text())["hooks"]["PreToolUse"]
+        self.assertEqual(group["matcher"], "Bash|apply_patch")
+        self.assertTrue(self._status()["ok"])
+
+    def test_missing_matcher_is_inserted(self) -> None:
+        self._legacy_config(matcher=None)
+        self.assertTrue(self._ensure())
+        self._assert_trusted_at_first_verify()
+        self.assertTrue(self._status()["ok"])
+
+    def test_extra_hook_keys_are_kept_and_hashed(self) -> None:
+        self._legacy_config(hook_extra='statusMessage = "guarding"\n')
+        self.assertTrue(self._ensure())
+        self._assert_trusted_at_first_verify()
+        [group] = tomllib.loads(self.config.read_text())["hooks"]["PreToolUse"]
+        self.assertEqual(group["hooks"][0]["statusMessage"], "guarding")
+        self.assertTrue(self._status()["ok"])
+
+    def test_matcher_change_is_refused_when_the_group_holds_other_hooks(self) -> None:
+        # Normalizing the group matcher would silently widen the sibling hook too.
+        original = self._legacy_config(
+            matcher="Bash", hook_extra="", suffix="")
+        original = original.replace(
+            "timeout = 10\n", 'timeout = 10\n\n[[hooks.PreToolUse.hooks]]\ntype = "command"\ncommand = "/bin/true"\n', 1)
+        self.config.write_text(original)
+        self.assertFalse(self._ensure())
+        self.assertEqual((self.config.read_text(), self.writes), (original, []))
+        self.assertIn("REFUSED", self.stderr.getvalue())
+
+    def test_symlinked_codex_home_uses_the_realpath_key(self) -> None:
+        real = self.home / "real-codex"
+        real.mkdir()
+        self.codex_home.symlink_to(real)
+        self._legacy_config()
+        real_key = f"{real / 'config.toml'}:pre_tool_use:0:0"
+        text = self.config.read_text().replace(f'"{self.config}:pre_tool_use:0:0"', f'"{real_key}"')
+        self.config.write_text(text)
+        self.assertEqual(self.codex(Path("/usr/bin/codex"), codex_home=self.codex_home)[0]["trustStatus"], "trusted")
+        self.codex.calls, self.writes = [], []
+        self.assertTrue(self._ensure())
+        self._assert_trusted_at_first_verify()
+        state = tomllib.loads(self.config.read_text())["hooks"]["state"]
+        self.assertEqual(state, {real_key: {"trusted_hash": self.new_hash}})
+        status = self._status()
+        self.assertEqual((status["key"], status["ok"]), (real_key, True))
+
+    def test_symlinked_codex_home_fresh_seat_is_trusted_under_the_realpath_key(self) -> None:
+        real = self.home / "real-codex"
+        real.mkdir()
+        self.codex_home.symlink_to(real)
+        self.assertTrue(self._ensure())
+        self.assertIn(f"{real / 'config.toml'}:pre_tool_use:0:0", self._guard_state())
+        self.assertTrue(self._status()["ok"])
+
+    def test_stale_hash_on_a_current_block_is_repaired_in_one_write(self) -> None:
+        self._ensure()
+        self.config.write_text(self.config.read_text().replace(self.new_hash, "sha256:" + "00" * 32))
+        self.assertEqual(self._status()["trust_status"], "modified")
+        self.writes = []
+        self.assertTrue(self._ensure())
+        self.assertEqual(len(self.writes), 1)
+        self.assertEqual(self._guard_state()[f"{self.config}:pre_tool_use:0:0"], {"trusted_hash": self.new_hash})
+        self.assertIn("REPAIRED stale", self.stderr.getvalue())
+        self.assertTrue(self._status()["ok"])
+
+    def test_restore_is_compare_and_swap(self) -> None:
+        # The verify read fails AND someone rewrote config.toml after our write: leave theirs.
+        self._legacy_config()
+        concurrent = 'model = "someone-else"\n'
+        self.codex.real_result = None
+        self.codex.on_real_read = lambda: self.config.write_text(concurrent)
+        self.assertTrue(self._ensure())
+        self.assertEqual(self.config.read_text(), concurrent)
+        self.assertEqual(len(self.writes), 1, "no restore write over a concurrent edit")
+        self.assertIn("NOT RESTORED", self.stderr.getvalue())
+
+    # --- T-4395 r2 nits ---
+
+    def _current_untrusted(self) -> str:
+        self.codex_home.mkdir(exist_ok=True)
+        text = (f'[[hooks.PreToolUse]]\nmatcher = "Bash|apply_patch"\n\n[[hooks.PreToolUse.hooks]]\n'
+                f'type = "command"\ncommand = "{self.cmd}"\ntimeout = 30\n')
+        self.config.write_text(text)
+        return text
+
+    def test_retrust_is_compare_and_swap_against_the_bytes_read(self) -> None:
+        self._current_untrusted()
+        changed = self.config.read_text() + '\n[projects."/tmp"]\ntrust_level = "trusted"\n'
+        self.codex.on_real_read = lambda: self.config.write_text(changed)
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.config.read_text(), changed)
+        self.assertIn("NOT WRITTEN", self.stderr.getvalue())
+
+    def test_retrust_requires_codex_to_report_our_command_at_the_key(self) -> None:
+        original = self._current_untrusted()
+        swapped = original.replace(self.cmd, "/bin/true")
+        self.codex.on_real_read = lambda: self.config.write_text(swapped)
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.writes, [])
+        self.assertIn("re-trust REFUSED", self.stderr.getvalue())
+
+    def test_unverifiable_current_guard_is_logged(self) -> None:
+        for label, read in (("timeout", lambda *a, **k: None), ("no-hook", lambda *a, **k: [])):
+            with self.subTest(case=label):
+                self._current_untrusted()
+                self.assertFalse(self._ensure(read=read))
+                self.assertIn("[worker-guard-hook]", self.stderr.getvalue())
+                self.assertIn("unverifiable", self.stderr.getvalue())
+
+    def test_upgrade_of_a_disabled_guard_says_so(self) -> None:
+        self._legacy_config(state_extra="enabled = false\n")
+        self.assertTrue(self._ensure())
+        log = self.stderr.getvalue()
+        self.assertIn("verified", log)
+        self.assertIn("DISABLED", log)
+        self.assertFalse(self._status()["ok"])
+
+    def test_status_requires_the_guard_enabled(self) -> None:
+        self._ensure()
+        self.config.write_text(self.config.read_text().rstrip("\n") + "\nenabled = false\n")
+        status = self._status()
+        self.assertEqual((status["trust_status"], status["enabled"], status["ok"]), ("trusted", False, False))
+
+    # --- Recovery's ask (T-4395 r1): ON DISK vs LIVE SESSION ---
+
+    def _fake_proc(self, procs: dict[int, tuple[list[str], dict | None, int]], btime: int = 1000) -> Path:
+        root = Path(self._tmp.name) / "proc"
+        root.mkdir()
+        (root / "stat").write_text(f"cpu  1 2 3\nbtime {btime}\nprocesses 9\n")
+        for pid, (argv, env, start_ticks) in procs.items():
+            d = root / str(pid)
+            d.mkdir()
+            (d / "cmdline").write_bytes(b"\0".join(a.encode() for a in argv) + b"\0")
+            if env is not None:
+                (d / "environ").write_bytes(b"\0".join(f"{k}={v}".encode() for k, v in env.items()) + b"\0")
+            fields = ["S"] + ["0"] * 18 + [str(start_ticks)] + ["0"] * 5
+            (d / "stat").write_text(f"{pid} (node codex) " + " ".join(fields) + "\n")
+        return root
+
+    def test_live_sessions_split_before_and_after_the_config_write(self) -> None:
+        self._ensure()
+        tick = os.sysconf("SC_CLK_TCK")
+        os.utime(self.config, (1050, 1050))
+        proc = self._fake_proc({
+            10: (["node", "/usr/lib/node_modules/@openai/codex/bin/codex.js"], {"CODEX_HOME": str(self.codex_home)}, 10 * tick),
+            11: (["/usr/bin/codex", "resume"], {"CODEX_HOME": str(self.codex_home)}, 100 * tick),
+            12: (["/usr/bin/codex"], {"CODEX_HOME": "/elsewhere/.codex"}, 10 * tick),
+            13: (["python3", "x.py"], {"CODEX_HOME": str(self.codex_home)}, 10 * tick),
+            14: (["codex"], {"HOME": str(self.home)}, 20 * tick),
+            15: (["codex"], None, 10 * tick),
+        })
+        live = worker_guard_hook_status(self.codex_home, self.home, executable=Path("/usr/bin/codex"),
+                                        read_hooks=self.codex, proc_root=proc)["live_sessions"]
+        self.assertTrue(live["measurable"])
+        self.assertEqual(live["config_mtime"], 1050)
+        self.assertEqual({s["pid"]: s["started_before_config_mtime"] for s in live["sessions"]},
+                         {10: True, 11: False, 14: True})
+        self.assertEqual(live["unreadable"], 1)
+
+    def test_live_sessions_unmeasurable_without_proc_and_never_gate_ok(self) -> None:
+        self._ensure()
+        status = worker_guard_hook_status(self.codex_home, self.home, executable=Path("/usr/bin/codex"),
+                                          read_hooks=self.codex, proc_root=Path(self._tmp.name) / "no-proc")
+        self.assertFalse(status["live_sessions"]["measurable"])
+        self.assertTrue(status["ok"], "ok is the ON-DISK verdict only")
+
+    def test_two_stale_guards_are_ambiguous_and_left_alone(self) -> None:
+        original = self._legacy_config()
+        original += (f'\n[[hooks.PreToolUse]]\nmatcher = "Bash|apply_patch"\n\n[[hooks.PreToolUse.hooks]]\n'
+                     f'type = "command"\ncommand = "{self.legacy_cmd}"\ntimeout = 10\n')
+        self.config.write_text(original)
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.config.read_text(), original)
+
+    # --- the rollout verdict (T-4395 item 4) ---
+
+    # --- T-4428: the verified-marker skips the launch read, never a repair ---
+
+    def _marker(self) -> Path:
+        return self.codex_home / codex_adapter._VERIFIED_MARKER_NAME
+
+    def _verified(self) -> None:
+        """A current + trusted home whose last read recorded the marker; calls/writes reset."""
+        self._ensure()  # fresh wire (no real read, no marker)
+        self._ensure()  # the real read says trusted -> marker
+        self.assertTrue(self._marker().is_file())
+        self.codex.calls, self.writes = [], []
+
+    def test_marker_hit_skips_the_hooks_list_read(self) -> None:
+        self._verified()
+        before = self.config.read_bytes()
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.codex.calls, [], "a marker hit makes no hooks/list call")
+        self.assertEqual(self.writes, [])
+        self.assertEqual(self.config.read_bytes(), before)
+
+    def test_trust_marker_false_always_reads(self) -> None:
+        self._verified()
+        self.assertFalse(self._ensure(trust_marker=False))
+        self.assertEqual(self._real_calls(), [self.codex_home])
+
+    def test_config_byte_change_re_reads(self) -> None:
+        self._verified()
+        self.config.write_text(self.config.read_text() + "# a comment, same TOML\n")
+        self.assertFalse(self._ensure())
+        self.assertEqual(self._real_calls(), [self.codex_home])
+        self.codex.calls = []
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.codex.calls, [], "the re-read re-recorded the marker for the new bytes")
+
+    def test_codex_binary_change_re_reads(self) -> None:
+        launcher = self.codex_pkg / "bin" / "codex.js"
+        other = Path(self._tmp.name) / "other-codex"
+        other.write_text("// launcher\n")
+        changes = {
+            "mtime": lambda: os.utime(launcher, ns=(1, 1)),
+            "size": lambda: launcher.write_text("// launcher, bigger\n"),
+            "path": lambda: (self.codex_bin.unlink(), self.codex_bin.symlink_to(other)),
+            "version": lambda: (self.codex_pkg / "package.json").write_text('{"version": "0.148.0"}\n'),
+        }
+        for label, change in changes.items():
+            with self.subTest(change=label):
+                self._marker().unlink(missing_ok=True)
+                self.codex_bin.unlink()
+                self.codex_bin.symlink_to(launcher)
+                self._ensure()
+                self._ensure()
+                self.codex.calls = []
+                self.assertFalse(self._ensure())
+                self.assertEqual(self.codex.calls, [])
+                change()
+                self.assertFalse(self._ensure())
+                self.assertEqual(self._real_calls(), [self.codex_home])
+
+    def test_missing_malformed_or_wrong_key_marker_re_reads(self) -> None:
+        def wrong(field, value):
+            def go():
+                body = json.loads(self._marker().read_text())
+                body[field] = value
+                self._marker().write_text(json.dumps(body))
+            return go
+        cases = {
+            "missing": lambda: self._marker().unlink(),
+            "malformed": lambda: self._marker().write_text("{not json"),
+            "not-a-dict": lambda: self._marker().write_text("[]"),
+            "wrong-key": wrong("key", "/elsewhere/config.toml:pre_tool_use:0:0"),
+            "wrong-config-hash": wrong("config_sha256", "00" * 32),
+            "wrong-version": wrong("version", 0),
+            "unreadable": lambda: (self._marker().unlink(), self._marker().mkdir()),
+        }
+        for label, corrupt in cases.items():
+            with self.subTest(case=label):
+                if self._marker().is_dir():
+                    self._marker().rmdir()
+                self._verified()
+                corrupt()
+                self.assertFalse(self._ensure())
+                self.assertEqual(self._real_calls(), [self.codex_home])
+
+    def test_stale_hash_is_still_repaired_after_a_codex_upgrade(self) -> None:
+        # A codex upgrade changes currentHash for the unchanged definition: the stored hash now
+        # reads "modified". The binary identity moved, so the marker misses and the repair runs.
+        self._verified()
+        self.codex.real_result = "codex-0.148"  # the upgraded codex hashes differently
+        upgraded = FakeCodexHooks.definition_hash(self.cmd, 30, "Bash|apply_patch", salt="codex-0.148")
+        (self.codex_pkg / "package.json").write_text('{"version": "0.148.0"}\n')
+        (self.codex_pkg / "bin" / "codex.js").write_text("// launcher 0.148\n")
+        self.assertTrue(self._ensure())
+        self.assertEqual(self._real_calls(), [self.codex_home])
+        self.assertEqual(len(self.writes), 1)
+        self.assertIn("REPAIRED stale", self.stderr.getvalue())
+        self.assertEqual(self._guard_state()[f"{self.config}:pre_tool_use:0:0"], {"trusted_hash": upgraded})
+        # the repair wrote new bytes: the next launch reads (trusted) and re-records, then skips
+        self.codex.calls = []
+        self.assertFalse(self._ensure())
+        self.assertEqual(self._real_calls(), [self.codex_home])
+        self.codex.calls = []
+        self.assertFalse(self._ensure())
+        self.assertEqual(self.codex.calls, [])
+
+    def test_codex_upgrade_during_the_read_records_no_marker(self) -> None:
+        # r2 (review round 1's probe): the old binary judges "trusted" while an upgrade lands
+        # mid-read. Recording that verdict under the NEW identity would skip the repair the
+        # upgrade needs; the body is taken before the read, so nothing is recorded.
+        self._ensure()  # fresh wire
+        self.codex.on_real_read = lambda: (self.codex_pkg / "package.json").write_text(
+            '{"version": "0.148.0"}\n')
+        self.assertFalse(self._ensure())
+        self.codex.on_real_read = None
+        self.assertFalse(self._marker().exists())
+        self.codex.real_result = "codex-0.148"  # the upgraded codex hashes differently
+        self.codex.calls, self.writes = [], []
+        self.assertTrue(self._ensure())  # the stale-hash repair runs, as without the marker
+        self.assertEqual(self._real_calls(), [self.codex_home])
+        self.assertIn("REPAIRED stale", self.stderr.getvalue())
+
+    def test_no_marker_unless_the_verdict_is_current_and_trusted(self) -> None:
+        cases = {
+            "untrusted (re-trusted by a write)": lambda: self._current_untrusted(),
+            "modified (repaired by a write)": lambda: (self._ensure(), self.config.write_text(
+                self.config.read_text().replace(self.new_hash, "sha256:" + "00" * 32))),
+            "read failed": lambda: (self._ensure(), setattr(self.codex, "real_result", None)),
+            "read raised": lambda: (self._ensure(), setattr(self.codex, "real_result", "raise")),
+            "legacy block upgraded": lambda: self._legacy_config(),
+            "fresh seat": lambda: None,
+        }
+        for label, setup in cases.items():
+            with self.subTest(case=label):
+                self.config.unlink(missing_ok=True)
+                self._marker().unlink(missing_ok=True)
+                self.codex.real_result = "live"
+                setup()
+                self._ensure()
+                self.assertFalse(self._marker().exists())
+
+    def test_no_marker_when_config_changes_during_the_read(self) -> None:
+        self._ensure()
+        self.codex.on_real_read = lambda: self.config.write_text(self.config.read_text() + "# edit\n")
+        self.assertFalse(self._ensure())
+        self.assertFalse(self._marker().exists())
+
+    def test_marker_is_0600_and_leaves_no_temp_file(self) -> None:
+        self._verified()
+        self.assertEqual(self._marker().stat().st_mode & 0o777, 0o600)
+        self.assertEqual(sorted(p.name for p in self.codex_home.iterdir()),
+                         sorted(["config.toml", codex_adapter._VERIFIED_MARKER_NAME]))
+
+    def test_status_never_uses_the_marker(self) -> None:
+        self._verified()
+        self._status()
+        self.assertEqual(self._real_calls(), [self.codex_home])
+
+    def _status(self, read=None):
+        return worker_guard_hook_status(self.codex_home, self.home, executable=Path("/usr/bin/codex"),
+                                        read_hooks=read or self.codex)
+
+    def test_status_before_and_after_the_upgrade(self) -> None:
+        self._legacy_config()
+        before = self._status()
+        self.assertEqual((before["block_current"], before["legacy_present"], before["ok"]), (False, True, False))
+        self._ensure()
+        after = self._status()
+        self.assertEqual(after["key"], f"{self.config}:pre_tool_use:0:0")
+        self.assertEqual((after["block_current"], after["legacy_present"], after["trust_status"],
+                          after["hash_matches"], after["measurable"], after["ok"]),
+                         (True, False, "trusted", True, True, True))
+        self.assertEqual(after["stored_hash"], self.new_hash)
+
+    def test_status_flags_a_modified_guard(self) -> None:
+        self._ensure()
+        self.codex.real_result = "other-codex-version"
+        status = self._status()
+        self.assertEqual((status["trust_status"], status["hash_matches"], status["ok"]), ("modified", False, False))
+
+    def test_status_is_unmeasurable_when_the_app_server_read_fails(self) -> None:
+        self._ensure()
+        self.codex.real_result = None
+        status = self._status()
+        self.assertEqual((status["measurable"], status["ok"], status["trust_status"]), (False, False, None))
 
 
 class GcStaleProjectTrustEntriesTest(unittest.TestCase):
@@ -1549,6 +2885,269 @@ class EnsureModelMigrationPromptsHiddenTest(unittest.TestCase):
             modified = ensure_model_migration_prompts_hidden(codex_home)
             self.assertFalse(modified)
             self.assertEqual(config_path.read_bytes(), before)
+
+
+class ClaudeCompletionTranscriptPending(unittest.TestCase):
+    """T-4151: a statusline transcript that is well-formed and confined but not
+    usable YET (absent, or over the byte cap) keeps the probe WAITING. Only a
+    transcript that can never become valid is terminal operational-readiness.
+    Before this, all of them were terminal: specialist 2026-09-28T13:34Z was torn
+    down on its first sample."""
+
+    MARKER = "PANTHEON_PROVIDER_COMPLETION_t4151"
+
+    def _assess(self, transcript_value, *, setup=None):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / "account"
+            projects = account_home / ".claude" / "projects"
+            (projects / "p").mkdir(parents=True)
+            state_dir = root / "state" / "specialist" / "runtime-controller"
+            statusline = state_dir / "quota" / "claude-statusline.json"
+            statusline.parent.mkdir(parents=True)
+            adapter = ClaudeHarnessAdapter("orchestrator", claude_home=account_home)
+            probe = adapter.prepare_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                persona="specialist",
+                account_home=account_home,
+                state_dir=state_dir,
+                pane_baseline=_post_start_sample("ready\n❯ \n", 0),
+                submitted_at=datetime(2026, 9, 28, 13, 34, 5, tzinfo=timezone.utc),
+                nonce_marker=self.MARKER,
+                nonce_sha256=hashlib.sha256(self.MARKER.encode("utf-8")).hexdigest(),
+            )
+            assert probe is not None
+            value = transcript_value(root, projects) if callable(transcript_value) else transcript_value
+            if setup is not None:
+                setup(root, projects)
+            statusline.write_text(json.dumps({
+                "schema": "pantheon-claude-statusline-quota/v1",
+                "observed_at": "2026-09-28T13:34:10Z",
+                "session_id": "fresh",
+                "transcript_path": value,
+                "rate_limits": {"ok": True},
+            }), encoding="utf-8")
+            return adapter.assess_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                probe=probe,
+                samples=(_post_start_sample("ready changed\n❯ \n", 1),),
+            )
+
+    def test_not_yet_created_transcript_keeps_waiting(self):
+        a = self._assess(lambda root, projects: str(projects / "p" / "fresh.jsonl"))
+        self.assertEqual((a.status, a.cause), ("unknown", "provider-completion-waiting"))
+
+    def test_missing_project_dir_keeps_waiting(self):
+        a = self._assess(lambda root, projects: str(projects / "new-slug" / "fresh.jsonl"))
+        self.assertEqual((a.status, a.cause), ("unknown", "provider-completion-waiting"))
+
+    def test_over_cap_transcript_keeps_waiting_without_reading_it(self):
+        def big(root, projects):
+            path = projects / "p" / "old-long-session.jsonl"
+            with path.open("wb") as fh:  # sparse: size over the cap, nothing to read
+                fh.truncate(2 * 1024 * 1024 + 1)
+        a = self._assess(lambda root, projects: str(projects / "p" / "old-long-session.jsonl"),
+                         setup=big)
+        self.assertEqual((a.status, a.cause), ("unknown", "provider-completion-waiting"))
+
+    def test_never_valid_transcripts_stay_terminal(self):
+        def outside(root, projects):
+            (root / "elsewhere.jsonl").write_text("", encoding="utf-8")
+
+        def symlink(root, projects):
+            (root / "target.jsonl").write_text("", encoding="utf-8")
+            (projects / "p" / "link.jsonl").symlink_to(root / "target.jsonl")
+
+        def directory(root, projects):
+            (projects / "p" / "dir.jsonl").mkdir()
+
+        cases = {
+            "relative": ("p/fresh.jsonl", None),
+            "escape": (lambda root, projects: str(root / "elsewhere.jsonl"), outside),
+            "symlink-out": (lambda root, projects: str(projects / "p" / "link.jsonl"), symlink),
+            "directory": (lambda root, projects: str(projects / "p" / "dir.jsonl"), directory),
+        }
+        for name, (value, setup) in cases.items():
+            with self.subTest(name):
+                a = self._assess(value, setup=setup)
+                self.assertEqual((a.status, a.cause),
+                                 ("operational-readiness", "provider-completion-transcript-invalid"))
+
+
+class ClaudeCompletionFreshSessionProfile(unittest.TestCase):
+    """T-4452: a fresh session's transcript is read from offset 0, so the probe
+    also reads Claude Code's boot attachments. T-3026 attempt 3 (recovery,
+    2026-09-30 15:50Z) was torn down with provider-completion-transcript-malformed:
+    line 15, the type=attachment/instructions entry carrying CLAUDE.md and
+    memory, was 70,631 bytes, over the old 64 KiB per-line cap. The whole
+    transcript was 166,083 bytes, close to the old 256 KiB delta cap.
+
+    The fixture keeps that line-size profile and Claude Code's key order. The
+    top-level "type" comes AFTER "attachment" and "message", so a prefix peek
+    would read a nested "type" first. That is why an over-cap line is skipped
+    whole, not peeked at."""
+
+    MARKER = "PANTHEON_PROVIDER_COMPLETION_t4452"
+    # (top-level type, attachment type, bytes incl. newline) of 581c4d40.jsonl
+    # lines 0-20, as measured: everything written before the probe reply.
+    BOOT_PROFILE = (
+        ("mode", None, 83), ("permission-mode", None, 105), ("atis-latch", None, 83),
+        ("file-history-snapshot", None, 236), ("attachment", "hook_success", 1517),
+        ("attachment", "hook_success", 26643), ("attachment", "hook_success", 6870),
+        ("user", None, 721), ("attachment", "environment", 1509), ("attachment", "model", 833),
+        ("attachment", "deferred_tools_delta", 4470), ("attachment", "agent_listing_delta", 6040),
+        ("attachment", "mcp_instructions_delta", 7847), ("attachment", "skill_listing", 23912),
+        ("attachment", "total_tokens_reminder", 601), ("attachment", "instructions", 70631),
+        ("attachment", "session_context", 2952), ("attachment", "date", 575),
+        ("attachment", "credential_org", 505), ("attachment", "remote_session_change", 1308),
+        ("attachment", "prompt_snapshot", 7682),
+    )
+
+    @staticmethod
+    def _line(top_type, attachment_type, size):
+        """One JSONL line of exactly `size` bytes (newline included) in Claude
+        Code's key order."""
+        if attachment_type is None:
+            obj = {"type": top_type, "pad": ""}
+        else:
+            obj = {"parentUuid": None, "isSidechain": False,
+                   "attachment": {"type": attachment_type, "content": ""},
+                   "type": top_type, "uuid": "u"}
+        base = len(json.dumps(obj)) + 1
+        assert size >= base, (top_type, size)
+        if attachment_type is None:
+            obj["pad"] = "x" * (size - base)
+        else:
+            obj["attachment"]["content"] = "x" * (size - base)
+        line = json.dumps(obj) + "\n"
+        assert len(line) == size
+        return line
+
+    @classmethod
+    def _assistant(cls, text, *, pad=0):
+        return json.dumps({
+            "parentUuid": "p", "isSidechain": False,
+            "message": {"role": "assistant",
+                        "content": [{"type": "thinking", "thinking": "t" * pad},
+                                    {"type": "text", "text": text}]},
+            "type": "assistant", "uuid": "a",
+        }) + "\n"
+
+    def _assess(self, body):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account_home = root / "account"
+            project = account_home / ".claude" / "projects" / "-home-claude-fallback-pantheon-config"
+            project.mkdir(parents=True)
+            old = account_home / ".claude" / "projects" / "old.jsonl"
+            old.write_text(self._assistant("old turn"), encoding="utf-8")
+            state_dir = root / "state" / "recovery" / "runtime-controller"
+            statusline = state_dir / "quota" / "claude-statusline.json"
+            statusline.parent.mkdir(parents=True)
+            statusline.write_text(json.dumps({
+                "schema": "pantheon-claude-statusline-quota/v1",
+                "observed_at": "2026-09-30T15:50:30Z",
+                "session_id": "old",
+                "transcript_path": str(old),
+                "rate_limits": {"ok": True},
+            }), encoding="utf-8")
+            adapter = ClaudeHarnessAdapter("orchestrator", claude_home=account_home)
+            probe = adapter.prepare_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                persona="recovery",
+                account_home=account_home,
+                state_dir=state_dir,
+                pane_baseline=_post_start_sample("ready\n❯ \n", 0),
+                submitted_at=datetime(2026, 9, 30, 15, 50, 50, tzinfo=timezone.utc),
+                nonce_marker=self.MARKER,
+                nonce_sha256=hashlib.sha256(self.MARKER.encode("utf-8")).hexdigest(),
+            )
+            assert probe is not None
+            fresh = project / "581c4d40.jsonl"
+            fresh.write_text(body, encoding="utf-8")
+            statusline.write_text(json.dumps({
+                "schema": "pantheon-claude-statusline-quota/v1",
+                "observed_at": "2026-09-30T15:50:58Z",
+                "session_id": "581c4d40",
+                "transcript_path": str(fresh),
+                "rate_limits": {"ok": True},
+            }), encoding="utf-8")
+            return adapter.assess_interactive_provider_completion(
+                harness="claude",
+                profile="interactive-subscription",
+                probe=probe,
+                samples=(_post_start_sample("ready changed\n❯ \n", 1),),
+            )
+
+    def _boot(self):
+        return "".join(self._line(*row) for row in self.BOOT_PROFILE)
+
+    def test_attempt3_boot_profile_is_the_measured_one(self):
+        boot = self._boot()
+        self.assertEqual(len(boot.encode("utf-8")), 165123)
+        self.assertEqual(max(len(line) + 1 for line in boot.splitlines()), 70631)
+
+    def test_attempt3_boot_then_reply_completes(self):
+        a = self._assess(self._boot() + self._assistant(self.MARKER))
+        self.assertEqual((a.status, a.cause), ("provider-completed", None))
+        self.assertEqual(a.assistant_event_count, 1)
+
+    def test_attempt3_boot_before_reply_keeps_waiting(self):
+        a = self._assess(self._boot())
+        self.assertEqual((a.status, a.cause), ("unknown", "provider-completion-waiting"))
+
+    def _resized(self, **sizes):
+        return "".join(self._line(top, kind, sizes.get(kind, size))
+                       for top, kind, size in self.BOOT_PROFILE)
+
+    def test_larger_boot_payloads_still_complete(self):
+        # Orchestrator's instructions attachment is larger than recovery's. The last case
+        # puts a fresh session's whole delta just under the 2 MiB file cap.
+        cases = {
+            "instructions 70 KB": {"instructions": 70_000},
+            "instructions 150 KB": {"instructions": 150_000},
+            "instructions 400 KB": {"instructions": 400_000},
+            "delta near the cap": {"instructions": 1_000_000, "skill_listing": 900_000},
+        }
+        for name, sizes in cases.items():
+            with self.subTest(name):
+                body = self._resized(**sizes) + self._assistant(self.MARKER)
+                if name == "delta near the cap":
+                    self.assertGreater(len(body), 2 * 1024 * 1024 - 150_000)
+                    self.assertLessEqual(len(body), claude_adapter._MAX_TRANSCRIPT_BYTES)
+                a = self._assess(body)
+                self.assertEqual((a.status, a.cause), ("provider-completed", None))
+
+    def test_an_over_cap_line_is_skipped_not_malformed(self):
+        # The cap is on the line without its newline.
+        huge = self._line("attachment", "instructions", claude_adapter._MAX_JSONL_LINE_BYTES + 2)
+        a = self._assess(huge + self._assistant(self.MARKER))
+        self.assertEqual((a.status, a.cause), ("provider-completed", None))
+
+    def test_a_large_reply_line_under_the_cap_is_parsed(self):
+        # An xhigh-effort reply can carry a big thinking block. A 200 KB reply
+        # line is under the cap, so it is parsed and its nonce counts.
+        reply = self._assistant(self.MARKER, pad=200_000)
+        self.assertLess(len(reply), claude_adapter._MAX_JSONL_LINE_BYTES)
+        a = self._assess(self._boot() + reply)
+        self.assertEqual((a.status, a.cause), ("provider-completed", None))
+
+    def test_a_nonce_inside_an_over_cap_line_is_never_accepted(self):
+        # Skipping can only MISS a reply, never pass one: an assistant line over
+        # the cap is not parsed, so its nonce doesn't count.
+        huge = self._assistant(self.MARKER, pad=claude_adapter._MAX_JSONL_LINE_BYTES)
+        self.assertGreater(len(huge), claude_adapter._MAX_JSONL_LINE_BYTES)
+        a = self._assess(self._boot() + huge)
+        self.assertEqual((a.status, a.cause), ("unknown", "provider-completion-waiting"))
+        self.assertEqual(a.assistant_event_count, 0)
+
+    def test_an_undecodable_line_is_still_malformed(self):
+        a = self._assess(self._boot() + "{not json\n" + self._assistant(self.MARKER))
+        self.assertEqual((a.status, a.cause),
+                         ("operational-readiness", "provider-completion-transcript-malformed"))
 
 
 if __name__ == "__main__":

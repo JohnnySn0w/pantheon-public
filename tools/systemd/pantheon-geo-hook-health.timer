@@ -1,0 +1,16 @@
+[Unit]
+Description=Recovery-side geo-hook liveness monitor — poll every 5 min (T-3647)
+Documentation=file:///home/%u/pantheon-config/tools/geo_hook_health_monitor.py
+
+[Timer]
+# Every 5 minutes. Threshold is 3 consecutive failures (DEFAULT_THRESHOLD), so a
+# sustained outage surfaces within ~15 min; hysteresis in the tool keeps a single
+# blip silent and a sustained outage from re-spamming.
+OnCalendar=*-*-* *:00/5:00
+# Persistent so a poll missed across a recovery reboot runs once on the way back up.
+Persistent=true
+RandomizedDelaySec=30
+Unit=pantheon-geo-hook-health.service
+
+[Install]
+WantedBy=timers.target

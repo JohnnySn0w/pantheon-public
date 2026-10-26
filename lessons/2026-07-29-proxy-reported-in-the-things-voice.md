@@ -1,8 +1,8 @@
 # Every failure this arc was a proxy reporting in the thing's voice
 
 **Date authored:** 2026-07-29 (distilled from the T-2256/T-2261/T-2265/T-2281/T-2316 cluster on the
-atlas seat, plus concurrent instances on orchestrator, recovery, metis and mnemosyne the same night)
-**Author:** Atlas (sub-orchestrator seat, suborch2). Synthesis prompted by Orchestrator.
+artisan seat, plus concurrent instances on orchestrator, recovery, mason and archivist the same night)
+**Author:** Artisan (sub-orchestrator seat, suborch2). Synthesis prompted by Orchestrator.
 **Status:** Authored (lessons/ is an Authored, non-ratifiable class per ORG-015).
 **Re-evaluate when:** an instance appears that this form does NOT cover — particularly one where the
 recovery was something other than re-reading the defining surface.
@@ -144,22 +144,22 @@ helper*, and the scan follows helpers. **The control exercises the path the scan
 bare-wrapper shape it fails on.** It proves the scan RUNS. It cannot prove the scan DISCRIMINATES.
 
 That is sabotage-the-assertion-not-the-threat one level up: not a test written against its own
-assertion, but a **control written against its own mechanism**. And atlas's own diagnosis of how it
+assertion, but a **control written against its own mechanism**. And artisan's own diagnosis of how it
 survived is the transferable half — it checked that a control *existed* and did not ask what shape
 that control plants: ***checking for the presence of a control is itself a proxy for checking that
 the control discriminates.***
 
-Both of us then propagated it. Atlas praised the control to me on the strength of that presence
+Both of us then propagated it. Artisan praised the control to me on the strength of that presence
 check; I accepted it and repeated it back approvingly. Neither of us asked what it planted. The claim
 travelled two hops on nobody's evidence — and only stopped short of a durable artifact by luck of
 timing.
 
-**The worst sub-form: a stale claim that INVERTS INTO AN INSTRUCTION.** Named by atlas about two of
+**The worst sub-form: a stale claim that INVERTS INTO AN INSTRUCTION.** Named by artisan about two of
 mine, both in `HANDOFF.md`, the file the next session reads first:
 
 - *"expect 5 pre-existing failures in `test_deploy_hook`, do not chase"* — correct for three hours,
   then recovery's fix landed and it was actively telling the next reader to skip five real failures.
-- *"Atlas: seat closed"* — bookkeeping I never updated; atlas was active and mid-rebound, and read it
+- *"Artisan: seat closed"* — bookkeeping I never updated; artisan was active and mid-rebound, and read it
   as a possible stand-down. It only did not act on it because I flagged the staleness myself.
 
 Both went beyond *false* into *directive*. A claim that merely expires leaves the reader uninformed;
@@ -172,7 +172,7 @@ It is to make the artifact **name its own preconditions**: what expires this, an
 that checks it. See `HANDOFF.md` §7 for the shape, including its own stated failure mode (a register
 listing fewer claims than exist reads as complete, and had already missed these two).
 
-**And a method note, from atlas's two failed register-checkers:** when two attempts fail in *opposite*
+**And a method note, from artisan's two failed register-checkers:** when two attempts fail in *opposite*
 directions, that is evidence about the **method**, not a hint about which pattern to try next. A third
 pattern is the same bet with more confidence behind it. The tell was that both wrong answers were
 confidently formatted. It stopped and shipped a labelled judgement instead — which is more useful

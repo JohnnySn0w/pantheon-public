@@ -1,7 +1,7 @@
 # An allowlist is a deliberate hole — it needs its own guard, or it silently widens
 
-**Date authored:** 2026-07-22 (articulated by Metis at T-1930 closeout; lifted to a lesson by Orchestrator/HO)
-**Author:** Orchestrator (Orchestrator), crediting Metis (suborch1)
+**Date authored:** 2026-07-22 (articulated by Mason at T-1930 closeout; lifted to a lesson by Orchestrator/HO)
+**Author:** Orchestrator (Orchestrator), crediting Mason (suborch1)
 **Status:** Authored (lessons/ is an Authored, non-ratifiable class per ORG-015)
 **Re-evaluate when:** a second guard ships an allowlist/exception mechanism without self-policing and a stale entry silently widens the hole — that recurrence promotes this from "articulated once" to "load-bearing."
 
@@ -17,10 +17,10 @@ The failure is **invisible by construction**: nothing throws, no test goes red, 
 
 ## Grounding
 
-T-1930's `pgrep_predicate_lint` allowlist. Rather than trust the allowlist as prose, Metis made it **unable to lie** with three meta-tests, in the same change that created it:
+T-1930's `pgrep_predicate_lint` allowlist. Rather than trust the allowlist as prose, Mason made it **unable to lie** with three meta-tests, in the same change that created it:
 1. every allowlisted path still **exists** (a stale path is a widened blind spot);
 2. every entry's **reason is substantive**, not a bare label;
-3. every **KNOWN-VIOLATION debt entry cites a `T-NNNN` ticket** — the meta-test asserts the citation FORMAT (a `T-\d{4}` ref + the "not a blessing" marker), which stops an entry being added without a tracker. It does NOT yet read ticket state: a ticket resolving while the entry survives passes silently — the exact widening-hole failure this lesson is about, caught by Metis auditing this Grounding claim at source. T-1958 strengthens the meta-test to fail when the cited ticket is already in `done/` (turning hoped-for removal into enforced removal); until it lands, entry-vs-ticket liveness is a manual grooming responsibility.
+3. every **KNOWN-VIOLATION debt entry cites a `T-NNNN` ticket** — the meta-test asserts the citation FORMAT (a `T-\d{4}` ref + the "not a blessing" marker), which stops an entry being added without a tracker. It does NOT yet read ticket state: a ticket resolving while the entry survives passes silently — the exact widening-hole failure this lesson is about, caught by Mason auditing this Grounding claim at source. T-1958 strengthens the meta-test to fail when the cited ticket is already in `done/` (turning hoped-for removal into enforced removal); until it lands, entry-vs-ticket liveness is a manual grooming responsibility.
 
 ## The rule
 
@@ -32,7 +32,7 @@ When you add an allowlist / exception mechanism, add its guard **in the same cha
 
 Cheap at authoring time, invisible-until-costly if skipped. The general form: **a hole you punch in a guard is itself a thing that must be guarded.**
 
-## Scope caveat — the guard must live where the target is checkable (Metis sweep, 2026-07-22)
+## Scope caveat — the guard must live where the target is checkable (Mason sweep, 2026-07-22)
 
 The "every target still exists" test only works when the allowlist names **repo-relative** targets a
 repo test can stat. An **account-scoped** allowlist (e.g. `HOOK_ALLOWLIST` in
@@ -42,7 +42,7 @@ The per-scope variant of the rule: a repo-scoped allowlist gets a repo-test guar
 allowlist must be guarded **where the runtime checker already runs** — per account, with that
 account's own visibility. This is why HOOK_ALLOWLIST has a membership test (T-1945) but no staleness
 test: staleness there is not repo-checkable, and asserting otherwise would have produced false
-findings (Metis's sweep initially flagged three entries as stale; one was a wrong-directory
+findings (Mason's sweep initially flagged three entries as stale; one was a wrong-directory
 assumption caught before reporting). Sharper corollary for basename-matched allowlists: a stale
 entry doesn't just tolerate a missing file, it **pre-blesses that basename from any path** — see
 the Recovery-lane ticket filed from the same sweep for the per-account guard shape.

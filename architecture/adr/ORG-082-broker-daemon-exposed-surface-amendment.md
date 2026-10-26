@@ -21,7 +21,7 @@ no_registry_row_waiver: "Decision-level ADR amending ORG-052's acceptance surfac
 
 ## Intent
 
-Preserve the ratified [[ORG-052]] safety posture while making its acceptance surface consistent with the germination-engine's tri-context isolate model. [[ORG-052]] acceptance 32 currently reads as "a disposable host converges and rolls back account/group/ACL/mailbox-directory/system-unit/D-Bus-policy actions exclusively from a registered manifest revision" — with the natural reading that those substrate operations run *through the broker daemon*. [[ORG-080]] F2 tightens that: substrate ops execute only through the bootstrap in-process root path (a supervised operator-run leg), never through the broker daemon's exposed runtime surface. This ADR files that tightening explicitly rather than allowing [[ORG-080]] to call [[ORG-052]] "merely called, not amended" — which Cairn's T-3261 BLOCK-5 review correctly flagged as false.
+Preserve the ratified [[ORG-052]] safety posture while making its acceptance surface consistent with the germination-engine's tri-context isolate model. [[ORG-052]] acceptance 32 currently reads as "a disposable host converges and rolls back account/group/ACL/mailbox-directory/system-unit/D-Bus-policy actions exclusively from a registered manifest revision" — with the natural reading that those substrate operations run *through the broker daemon*. [[ORG-080]] F2 tightens that: substrate ops execute only through the bootstrap in-process root path (a supervised operator-run leg), never through the broker daemon's exposed runtime surface. This ADR files that tightening explicitly rather than allowing [[ORG-080]] to call [[ORG-052]] "merely called, not amended" — which Consultant's T-3261 BLOCK-5 review correctly flagged as false.
 
 ## Context
 
@@ -137,24 +137,15 @@ The rest of §Bootstrap and self-amendment boundary — including the self-amend
 - Whether individual substrate operations gain their own per-family enable-flags on the bootstrap path (per [[ORG-052]] Unit 8's per-capability decision pattern) or converge as one family bundle. Lean: per-family, matching Unit 8.
 - Whether the same-registry-digest gate extends to the credential broker's operation registry ([[ORG-051]]) or stays scoped to the host-capability broker. Not for this ADR — flagged when [[ORG-051]] adopts the germination-engine contract.
 
-**Open questions:**
-- ~~The exact typed-error shape the daemon returns on a refused substrate invocation.~~ **CLOSED.** See §2 for the finalized `pantheon-broker-error/v1` schema.
-
 ## Build plan
 
-Under [[T-2667]] tranche (b)–(c), sequenced with [[ORG-080]]'s engine skeleton + host-substrate component:
-
-1. Land this ADR + the [[ORG-080]] + [[ORG-081]] + [[ORG-068]]-amend bundle together (operator-ratify).
-2. Wire the SHA-256 op-registry digest capture into the germination-engine's `SimulatedHostBackend` load path.
-3. Wire the same digest capture into the broker daemon's load path.
-4. Extend [[ORG-052]]'s disposable-host acceptance ([[ORG-080]] §Build plan (c) + [[ORG-052]] gate 32) to capture both digests and assert equality + subset + substrate-refusal per gate 32a.
-5. Extend the daemon's method-table registration to structurally exclude the substrate families (§1) — an assertion at daemon start, not a filter at call time.
+Under [[T-2667]] tranche (b)-(c), sequenced with [[ORG-080]]'s engine skeleton + host-substrate component. The step sequence (digest capture in both load paths, disposable-host acceptance extension, structural method-table exclusion) is in `notes/2026-10-08-org-082-build-plan-relocated.md`.
 
 ## DECISIONS
 
 *Letters (D-A, D-B, …) are this ADR's local decisions; the rulebook's D1, D2, … in `rulebook/directives.md` do not collide; letters do not collide with [[ORG-080]] / [[ORG-081]]'s local D-* series.*
 
-- **D-A. File the amendment as a companion ADR rather than in-lining it in [[ORG-080]] F2.** [[ORG-080]] F2's claim that [[ORG-052]] is "merely called, not amended" was false; Cairn T-3261 BLOCK-5 correctly refused. Filing an explicit amendment ADR is the honest audit-chain move: the operator ratifies the tightening in its own line item rather than approving a bundle whose F2 prose quietly restricts a ratified surface. **justified-via P4 (audit-chain traceability), [[ORG-052]] ratified surface, Cairn T-3261 BLOCK-5.**
+- **D-A. File the amendment as a companion ADR rather than in-lining it in [[ORG-080]] F2.** [[ORG-080]] F2's claim that [[ORG-052]] is "merely called, not amended" was false; Consultant T-3261 BLOCK-5 correctly refused. Filing an explicit amendment ADR is the honest audit-chain move: the operator ratifies the tightening in its own line item rather than approving a bundle whose F2 prose quietly restricts a ratified surface. **justified-via P4 (audit-chain traceability), [[ORG-052]] ratified surface, Consultant T-3261 BLOCK-5.**
 - **D-B. Substrate families are structurally absent from the daemon's method table, not filtered at call time.** Structural method-table exclusion removes substrate capability from the daemon's declared invocation surface and eliminates that dispatcher route; a call-time filter would be evadable by any code path that skips the filter. It does not by itself prove a fully-compromised daemon cannot reach shared privileged implementation through another internal channel — a shared library, a helper's method table — see R3 for the follow-on gate that would close that surface. **justified-via P1 (structural over procedural), [[ORG-063]] ruling 2 (isolates), [[ORG-052]] gate 36's shape (self-amendment refusal is structural).**
 - **D-C. Gate 32a is a new gate id (not a renumber of gate 32); gate 32's evidence stands, its invocation-context clause is amended.** No existing [[ORG-052]] gate id changes text or renumbers, matching [[ORG-068]]'s no-renumber discipline for E-ids. **justified-via P4, [[ORG-068]] element-id discipline as precedent.**
 - **D-D. Same-registry-digest is SHA-256 of the loaded op-registry blob, captured at each context's load time.** Not a per-op-family digest, not a per-method digest — one digest of the whole registry, equality-checked between contexts. Simpler to test, harder to spoof, matches the "one registry" claim's coarseness. **justified-via P1, [[ORG-081]] D-9's `contract_digest` pattern as precedent.**
@@ -168,9 +159,4 @@ Under [[T-2667]] tranche (b)–(c), sequenced with [[ORG-080]]'s engine skeleton
 
 ## Revision history
 
-Fold arc across 14 rounds, all 2026-08-26. Each round appears as a git commit on `main`; the sequence is preserved there for audit. High-level shape:
-
-- **v1–v6** — Substantive amendment rounds through Cairn's ORG-041 spec-review: substrate-family list expanded to the full ratified [[ORG-052]] gate 32 set including mailbox-directory and linger (v3); ratified 7-method contract vs family dispatch table split, refusal fixture path corrected from `Apply` to `Plan`, D-Bus error names + payload signature + adapter mapping finalized (v4); D-Bus error names moved into the ratified versioned `org.pantheon.HostBroker1.*` namespace (v5); §2a expected-runtime-subset wrapper reshaped to the sole-oracle helper's required top-level `component:` mapping, `computed_at_manifest_revision` dropped from the digest (v6).
-- **v7–v13** — Status-only bumps for bundle-version alignment with [[ORG-080]]'s fold arc through Cairn's REBOUND rounds (v11 landed a body-line version-label fix per Cairn v10 FIX-SOON-2; other bumps carried no ORG-082 semantic change). The substantive work landed on [[ORG-080]] (T-3269 v7 BLOCKs, T-3270 v8/v9 BLOCKs, T-3272 v10 CARVE, T-3284 v11/v12/v13 architectural REBOUND folds).
-- **v14 — the operator editorial pass** (TG 8604): stripped revision-history/process scaffolding across all three bundle ADRs; frontmatter status collapsed to one sentence; per-line "vN (T-NNNN BLOCK-K):" prose annotations retired; per-fold signature blocks consolidated into this section. No semantic change to §1 substrate-family list, §2 gate 32a shape / D-Bus wire mapping, §2a wrapper computation, or decisions.
-- **v15 — the operator's external-reviewer final-review pass** (TG 8609). One ORG-082 fix: D-B narrowed from "a method table that never registers the family is not [bypassable]" — which overclaimed against the ADR's own threat model — to "structural method-table exclusion removes substrate capability from the daemon's declared invocation surface and eliminates that dispatcher route; does not by itself prove a fully-compromised daemon cannot reach shared privileged implementation through another internal channel — see R3 for the follow-on gate." The architectural decision (structural exclusion over call-time filter) stands unchanged; only the security claim is made honest. No change to §1 substrate-family list, §2 gate 32a shape, or §2a wrapper.
+The v1-v15 fold arc (all 2026-08-26; Consultant ORG-041 rounds, the operator editorial pass TG 8604, final-review pass TG 8609) is in `notes/2026-10-08-org-082-review-history.md`; each round is a commit on `main`.

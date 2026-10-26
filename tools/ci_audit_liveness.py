@@ -1,7 +1,8 @@
 """tools/ci_audit_liveness.py — alert when the origin-side byte-sequence audit STOPS RUNNING (T-2440).
 
 THE FAILURE THIS EXISTS FOR, measured: 2026-07-30 -> 08-02, pve2 left the tailnet and took the
-only self-hosted runner with it. The HERMES discipline audit — CLAUDE.md's Option A, the layer
+only self-hosted runner of the time with it (today it would take both, suite and light: T-4355).
+The HERMES discipline audit — CLAUDE.md's Option A, the layer
 covering a hookless clone or a `--no-verify` push — did not execute on origin for two days and
 NOTHING SAID SO. Not one alert. The outage produced no red runs because it produced no runs.
 
@@ -95,7 +96,9 @@ FIVE TIP VERDICTS:
                    normal and silent; above it, it is a real backlog and ALERTS.
     NOT_DISPATCHED no run exists for that sha at all. Below a short grace this is just GitHub
                    lag; above it, GitHub never created the run — a DIFFERENT fault from a backlog
-                   and one no amount of runner health will fix. ALERT.
+                   and one no amount of runner health will fix. ALERT — but only after one
+                   re-query a few seconds later is still empty (T-4652: GitHub's head_sha filter
+                   has returned an empty list for a run that existed).
     UNKNOWN        could not measure (gh missing, unauthenticated, workflow renamed, API error).
                    ALERTS, same discipline as signal 1: unmeasurable is not green.
 
@@ -114,6 +117,7 @@ import re
 import subprocess
 import sys
 import time
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -130,6 +134,11 @@ PVE_HOST = "pve2"                    # ssh alias; the IP lives in ~/.ssh/config
 RUNNER_CT = "202"                    # LXC on pve2 that holds the runner (NOT the host itself)
 RUNNER_UNIT = ("actions.runner.example-org-pantheon-config"
                ".pve2-pantheon-config.service")
+# T-4355: the audit runs on the LIGHT runner (runs-on: light), and on the suite runner too
+# if it also carries the label. Read both journals; parse_success_epoch takes the max, so
+# the merged, interleaved output is fine. A unit that does not exist adds no lines.
+RUNNER_UNITS = (RUNNER_UNIT,
+                "actions.runner.example-org-pantheon-config.pve2-pantheon-config-light.service")
 # The runner's own success line. Matched on the JOB NAME because the workflow's display name is
 # what the runner logs; if the workflow job is renamed this stops matching and the monitor goes
 # UNKNOWN (loud), rather than silently reporting OK forever on a job that no longer exists.
@@ -155,6 +164,16 @@ GH_TIMEOUT = 60
 DEFAULT_PENDING_SECS = int(os.environ.get("PANTHEON_CI_AUDIT_PENDING_SECS", str(4 * 3600)))
 # How long we allow for GitHub to CREATE the run at all. Normally seconds; 15m is pure slack.
 DEFAULT_DISPATCH_GRACE_SECS = int(os.environ.get("PANTHEON_CI_AUDIT_DISPATCH_GRACE_SECS", str(900)))
+# T-5001: on main the audit runs on a */15 schedule (and workflow_dispatch), not per push, so the
+# tip almost never has a run of its own. Coverage is then judged by the WATERMARK: the newest
+# successful main run whose head contains the tip. How long the oldest unaudited commit may wait
+# before that is a fault: GitHub delays scheduled runs under load and sometimes drops one, so this
+# is sized well above the 15 min cadence (orchestrator, T-5001 design check).
+DEFAULT_SCHEDULE_GRACE_SECS = int(os.environ.get("PANTHEON_CI_AUDIT_SCHEDULE_GRACE_SECS", str(3600)))
+# T-4652: an empty per-sha answer past the grace is asked ONCE more after this pause before it may
+# alert. On 2026-10-05 12:38Z GitHub's head_sha filter returned an empty list (rc 0) for a run
+# that existed and had concluded success; the same query 2m later found it. 0 disables the re-query.
+DEFAULT_REQUERY_DELAY_SECS = int(os.environ.get("PANTHEON_CI_AUDIT_REQUERY_DELAY_SECS", "15"))
 
 _DEFAULT_STATE_DIR = Path.home() / ".local" / "state" / "pantheon"
 _STATE_NAME = "ci-audit-liveness.json"
@@ -166,6 +185,9 @@ _TIP_STATE_NAME = "ci-audit-tip-coverage.json"
 _TIP_DISABLE_NAME = "ci-audit-tip-coverage.disabled"
 
 OK, STALE, HOST_DOWN, UNKNOWN, DISABLED = "OK", "STALE", "HOST_DOWN", "UNKNOWN", "DISABLED"
+# T-5385: pve2 did not answer, but neither does anything else: THIS host is off the tailnet.
+# Not an alerting verdict; tailnet_self sends the one "swarm off tailnet" alert instead.
+OFF_TAILNET = "OFF_TAILNET"
 ALERTING = (STALE, HOST_DOWN, UNKNOWN)
 
 COVERED, AUDIT_FAILED, PENDING, NOT_DISPATCHED = (
@@ -218,10 +240,21 @@ class Ops:
             return False            # ssh timing out IS the host being unreachable, for our purpose
         return r.returncode == 0
 
+    def off_tailnet(self) -> str | None:
+        """THIS host's tailscale BackendState when definitely not Running, else None (T-5385)."""
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from tools import tailnet_self
+        return tailnet_self.off_tailnet()
+
+    def report_off_tailnet(self, state: str, detail: str) -> None:
+        from tools import tailnet_self
+        tailnet_self.report_off_tailnet("ci-audit-liveness", state, detail=detail)
+
     # -- signal 2: when did the audit last actually run? -------------------
     def journal_text(self) -> str | None:
         """Raw runner journal, or None if it could not be read (-> UNKNOWN, never OK)."""
-        remote = (f"pct exec {RUNNER_CT} -- journalctl -u {RUNNER_UNIT} "
+        units = " ".join(f"-u {u}" for u in RUNNER_UNITS)
+        remote = (f"pct exec {RUNNER_CT} -- journalctl {units} "
                   f"--since '{JOURNAL_WINDOW}' --no-pager -o cat")
         try:
             r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
@@ -297,6 +330,93 @@ class Ops:
             return None
         return runs
 
+    # -- signal 2c: was the tip's cancelled run SUPERSEDED? (T-4199 N2) -----
+    def audit_runs_created_after(self, since_epoch: int, *, exclude_sha: str) -> list[dict] | None:
+        """Audit runs on main's push ref created at/after `since_epoch` for a DIFFERENT commit than
+        `exclude_sha`, or None if the read failed (the caller then keeps the alert).
+
+        hermes-audit carries a concurrency group (T-4182), so a newer push cancels the older
+        PENDING run and the newer run's watermark range covers the cancelled commit. Such a run is
+        the evidence that a cancelled tip run was superseded rather than lost.
+
+        ⚠️ AN EXISTENCE CHECK, so it leans on GitHub's SERVER-SIDE `created=` filter, never a
+        bounded listing that merely might not include the newer run (see audit_runs_for_sha: that
+        windowing trap is why it is a filter and not a `--limit` scan). Any non-empty answer is
+        decisive, so per_page truncation cannot turn a real newer run into a false "none". An empty
+        list is a real answer (nothing newer); only a failed call is None."""
+        since = datetime.fromtimestamp(since_epoch, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        created = urllib.parse.quote(f">={since}", safe="")
+        endpoint = (f"repos/{GH_REPO}/actions/workflows/{AUDIT_WORKFLOW_FILE}/runs"
+                    f"?branch=main&event=push&created={created}&per_page=100")
+        try:
+            r = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True,
+                               timeout=GH_TIMEOUT)
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if r.returncode != 0:
+            return None
+        try:
+            data = json.loads(r.stdout)
+        except ValueError:
+            return None
+        runs = data.get("workflow_runs") if isinstance(data, dict) else None
+        if not isinstance(runs, list):
+            return None
+        return [run for run in runs if isinstance(run, dict) and run.get("head_sha") != exclude_sha]
+
+    # -- signal 2d: does a scheduled run's watermark cover the tip? (T-5001) --
+    def watermark_coverage(self, tip_sha: str) -> dict | None:
+        """{"covered_by": run|None, "oldest_unaudited_epoch": int|None}, or None if unmeasurable.
+
+        Lists the NEWEST successful audit runs on main (any event). That is a bounded read, and
+        here it is the right one: the question is "what is the newest success", which is
+        exactly the first page of successes. It is NOT a queue read, so the oldest-first trap
+        in audit_runs_for_sha does not apply. hermes-audit scans base..head from its own
+        watermark (ci_watermark_base), so a successful run whose head CONTAINS the tip has
+        scanned the tip. If none does, the newest success that is an ancestor of the tip is the
+        watermark, and the oldest commit after it is the one that has waited longest."""
+        endpoint = (f"repos/{GH_REPO}/actions/workflows/{AUDIT_WORKFLOW_FILE}/runs"
+                    f"?branch=main&status=success&per_page=20")
+        try:
+            r = subprocess.run(["gh", "api", endpoint], capture_output=True, text=True,
+                               timeout=GH_TIMEOUT)
+            if r.returncode != 0:
+                return None
+            runs = json.loads(r.stdout).get("workflow_runs")
+        except (subprocess.TimeoutExpired, OSError, ValueError, AttributeError):
+            return None
+        if not isinstance(runs, list):
+            return None
+
+        def is_ancestor(a: str, b: str) -> bool | None:
+            try:
+                res = subprocess.run(["git", "-C", str(self.repo), "merge-base", "--is-ancestor",
+                                      a, b], capture_output=True, text=True, timeout=60)
+            except (subprocess.TimeoutExpired, OSError):
+                return None
+            return {0: True, 1: False}.get(res.returncode)
+
+        heads = [run for run in runs if isinstance(run, dict)
+                 and re.fullmatch(r"[0-9a-f]{40}", str(run.get("head_sha", "")))]
+        for run in heads:
+            got = is_ancestor(tip_sha, run["head_sha"])
+            if got is None:
+                return None
+            if got:
+                return {"covered_by": run, "oldest_unaudited_epoch": None}
+        for run in heads:
+            if is_ancestor(run["head_sha"], tip_sha):
+                try:
+                    res = subprocess.run(["git", "-C", str(self.repo), "log", "--reverse",
+                                          "--format=%ct", f"{run['head_sha']}..{tip_sha}"],
+                                         capture_output=True, text=True, timeout=60)
+                    first = res.stdout.split()[0] if res.returncode == 0 else None
+                    return {"covered_by": None,
+                            "oldest_unaudited_epoch": int(first) if first else None}
+                except (subprocess.TimeoutExpired, OSError, ValueError, IndexError):
+                    return None
+        return {"covered_by": None, "oldest_unaudited_epoch": None}
+
     def alert(self, msg: str, vocab: str, agent: str = AGENT) -> None:
         try:
             sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -307,6 +427,9 @@ class Ops:
 
     def now(self) -> int:
         return int(time.time())
+
+    def sleep(self, secs: int) -> None:
+        time.sleep(secs)
 
 
 def _read_json(path: Path) -> dict:
@@ -361,6 +484,16 @@ def check_once(*, ops: Ops | None = None, state_dir: Path | None = None,
 
     reachable = ops.host_reachable()
     if reachable is False:
+        off = ops.off_tailnet()
+        if off:
+            if not dry_run:
+                ops.report_off_tailnet(off, f"{PVE_HOST} does not answer ssh")
+            return _finish(state_dir, {
+                "verdict": OFF_TAILNET,
+                "detail": (f"{PVE_HOST} does not answer ssh, but this host's own tailscale reads "
+                           f"{off}: the fault is here, not on {PVE_HOST} (T-5385)."),
+                "last_success": None, "last_commit": None, "alerted": False},
+                now, ops, cooldown_secs, dry_run)
         return _finish(state_dir, {
             "verdict": HOST_DOWN,
             "detail": (f"{PVE_HOST} does not answer ssh. The runner is ON that host (LXC "
@@ -449,14 +582,26 @@ def _parse_iso_z(value: str | None) -> int | None:
 def classify_tip_coverage(runs: list[dict], *, now: int, tip_sha: str,
                           commit_epoch: int | None,
                           pending_secs: int = DEFAULT_PENDING_SECS,
-                          dispatch_grace_secs: int = DEFAULT_DISPATCH_GRACE_SECS) -> dict:
+                          dispatch_grace_secs: int = DEFAULT_DISPATCH_GRACE_SECS,
+                          newer_runs: list[dict] | None = None) -> dict:
     """Pure decision over the tip sha's audit runs. Returns {verdict, detail, should_alert}.
 
     PRECEDENCE — success > terminal-non-success > in-flight > none — and the middle one is the
     only debatable step, so: if a run for this sha already concluded red and a re-run is queued,
     we report the RED. A terminal negative on the tip is actionable NOW, the re-run does not undo
     it, and the next fire reports COVERED the moment the re-run succeeds. Biasing toward speaking
-    is the right error here; the failure this whole file exists for was a silence."""
+    is the right error here; the failure this whole file exists for was a silence.
+
+    ONE EXCEPTION, and it is deliberately narrow (T-4199 N2): a tip whose ONLY non-success runs
+    are `cancelled` AND for which `newer_runs` (audit runs on the same ref created after it, for a
+    different commit) is non-empty was SUPERSEDED, not lost. The concurrency group (T-4182)
+    cancels the older pending run when a newer push lands, and the newer run's watermark range
+    walks back over the cancelled commit. That reads as PENDING and does not alert; the next fire
+    evaluates whatever the tip is by then, and a stuck newer run alerts as ITS tip. A `failure`,
+    `timed_out`, `startup_failure` etc. is never downgraded, whatever ran after it: those are red
+    on this commit's own content or infrastructure. `newer_runs=None` (not asked, or the query
+    failed) and `[]` (asked, nothing newer: e.g. a manual cancel of the newest run) both keep the
+    alert."""
     short = tip_sha[:9]
     succeeded = [r for r in runs if r.get("conclusion") == "success"]
     if succeeded:
@@ -469,6 +614,14 @@ def classify_tip_coverage(runs: list[dict], *, now: int, tip_sha: str,
                            f"actually on main.")}
 
     bad = [r for r in runs if r.get("conclusion") in _TERMINAL_NON_SUCCESS]
+    if bad and newer_runs and all(r.get("conclusion") == "cancelled" for r in bad):
+        newest = newer_runs[0]
+        url = newest.get("html_url") or f"run {newest.get('id')}"
+        return {"verdict": PENDING, "should_alert": False,
+                "detail": (f"the audit for origin/main tip {short} was CANCELLED, but a newer audit "
+                           f"run exists on main ({url}) — it was superseded by a later push, and "
+                           f"that run's watermark range covers this commit. Not a fault; the next "
+                           f"fire evaluates the new tip.")}
     if bad:
         concl = bad[0].get("conclusion")
         url = bad[0].get("html_url") or f"run {bad[0].get('id')}"
@@ -510,10 +663,44 @@ def classify_tip_coverage(runs: list[dict], *, now: int, tip_sha: str,
                           f"file itself is the thing to check, not the runner."))}
 
 
+def classify_watermark(wm: dict, *, now: int, tip_sha: str,
+                       schedule_grace_secs: int = DEFAULT_SCHEDULE_GRACE_SECS) -> dict:
+    """Pure decision when the tip has no run of its own (T-5001: scheduled audit on main)."""
+    short = tip_sha[:9]
+    run = wm.get("covered_by")
+    if run:
+        url = run.get("html_url") or f"run {run.get('id')}"
+        return {"verdict": COVERED, "should_alert": False,
+                "detail": (f"origin/main tip {short} HAS been audited: a successful "
+                           f"{AUDIT_WORKFLOW_FILE} run ({run.get('event')}) on main has a head that "
+                           f"contains it, and the audit scans from its watermark, so its range "
+                           f"covered the tip. {url}")}
+    oldest = wm.get("oldest_unaudited_epoch")
+    if oldest is None:
+        return {"verdict": NOT_DISPATCHED, "should_alert": True,
+                "detail": (f"origin/main tip {short} is not covered, and none of the newest "
+                           f"successful {AUDIT_WORKFLOW_FILE} runs on main is an ancestor of it, so "
+                           f"there is no watermark to measure from. Check the */15 schedule and "
+                           f"the last runs.")}
+    waited = now - oldest
+    over = waited > schedule_grace_secs
+    return {"verdict": PENDING if not over else NOT_DISPATCHED, "should_alert": over,
+            "detail": (f"origin/main tip {short} is NOT YET audited: the oldest commit after the "
+                       f"last successful audit landed {_dur(waited)} ago"
+                       + (f", past the {_dur(schedule_grace_secs)} grace. The scheduled audit is "
+                          f"not running (or keeps failing): check the {AUDIT_WORKFLOW_FILE} "
+                          f"schedule runs on main."
+                          if over else
+                          f" (inside the {_dur(schedule_grace_secs)} grace for the */15 "
+                          f"schedule)."))}
+
+
 def check_tip_once(*, ops: Ops | None = None, state_dir: Path | None = None,
                    pending_secs: int = DEFAULT_PENDING_SECS,
                    dispatch_grace_secs: int = DEFAULT_DISPATCH_GRACE_SECS,
                    cooldown_secs: int = DEFAULT_COOLDOWN_SECS,
+                   requery_delay_secs: int = DEFAULT_REQUERY_DELAY_SECS,
+                   schedule_grace_secs: int = DEFAULT_SCHEDULE_GRACE_SECS,
                    dry_run: bool = False) -> dict:
     """One tip-coverage probe. Returns {verdict, detail, tip_sha, alerted}."""
     ops = ops or Ops()
@@ -549,10 +736,49 @@ def check_tip_once(*, ops: Ops | None = None, state_dir: Path | None = None,
             now, ops, cooldown_secs, dry_run,
             state_name=_TIP_STATE_NAME, agent=TIP_AGENT, label="ci-audit-tip-coverage")
 
-    decided = classify_tip_coverage(runs, now=now, tip_sha=tip_sha,
-                                    commit_epoch=ops.origin_last_commit_epoch(),
-                                    pending_secs=pending_secs,
-                                    dispatch_grace_secs=dispatch_grace_secs)
+    commit_epoch = ops.origin_last_commit_epoch()
+
+    def decide(runs: list[dict], now: int) -> dict:
+        # T-4199 N2: only when the tip has no success and every non-success run is `cancelled` is
+        # the "was it superseded?" question worth a second GitHub call (the covered case pays none).
+        newer_runs = None
+        covered = any(r.get("conclusion") == "success" for r in runs)
+        terminal = [r for r in runs if r.get("conclusion") in _TERMINAL_NON_SUCCESS]
+        if not covered and terminal and all(r.get("conclusion") == "cancelled" for r in terminal):
+            since = max((e for e in (_parse_iso_z(r.get("created_at")) for r in terminal)
+                         if e is not None), default=None)
+            if since is not None:
+                newer_runs = ops.audit_runs_created_after(since, exclude_sha=tip_sha)
+        return classify_tip_coverage(runs, now=now, tip_sha=tip_sha, commit_epoch=commit_epoch,
+                                     pending_secs=pending_secs,
+                                     dispatch_grace_secs=dispatch_grace_secs,
+                                     newer_runs=newer_runs)
+
+    decided = decide(runs, now)
+    # T-5001: no run for the tip itself is the NORMAL state once main is audited on a schedule,
+    # so before NOT_DISPATCHED may stand, ask whether a scheduled run's watermark covers the tip.
+    # An unmeasurable answer (None) leaves the per-sha verdict exactly as it was.
+    if decided["verdict"] == NOT_DISPATCHED:
+        wm = ops.watermark_coverage(tip_sha)
+        if wm is not None:
+            decided = classify_watermark(wm, now=now, tip_sha=tip_sha,
+                                         schedule_grace_secs=schedule_grace_secs)
+    # T-4652: an empty answer that would ALERT is asked once more first. Only a re-query that FINDS
+    # runs changes the verdict; still-empty confirms it, and a failed re-query keeps the alert
+    # (the first answer was a successful read, and this file fails toward speaking).
+    if decided["verdict"] == NOT_DISPATCHED and decided["should_alert"] and requery_delay_secs > 0:
+        ops.sleep(requery_delay_secs)
+        again = ops.audit_runs_for_sha(tip_sha)
+        if again:
+            now = ops.now()
+            decided = decide(again, now)
+            decided["detail"] += (f" (the first query returned no run; a re-query "
+                                  f"{requery_delay_secs}s later found {len(again)})")
+        else:
+            decided["detail"] += (f" Confirmed by a re-query {requery_delay_secs}s later."
+                                  if again == [] else
+                                  f" (a re-query {requery_delay_secs}s later FAILED, so this "
+                                  f"rests on the first answer alone.)")
     return _finish(state_dir, {**decided, "tip_sha": tip_sha, "alerted": False},
                    now, ops, cooldown_secs, dry_run,
                    state_name=_TIP_STATE_NAME, agent=TIP_AGENT, label="ci-audit-tip-coverage")

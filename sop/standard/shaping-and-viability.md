@@ -1,6 +1,6 @@
 # SOP — Shaping and viability pass
 
-**Ratified 2026-09-06 by the operator via Telegram 9047** as part of the ORG-089 landing bundle. Emanates from [[ORG-089]] (deference heuristic + appetite circuit breaker); the how-to companion the drafter opens when the pass fires. Cairn's ORG-041 planning-phase review checklist points at this SOP.
+**Ratified 2026-09-06 by the operator via Telegram 9047** as part of the ORG-089 landing bundle. Emanates from [[ORG-089]] (deference heuristic + appetite circuit breaker); the how-to companion the drafter opens when the pass fires. Consultant's ORG-041 planning-phase review checklist points at this SOP.
 
 ## When it fires
 
@@ -54,9 +54,10 @@ See [[ORG-089]] itself as the worked example — it dogfoods both fields.
 ## Composition with existing surfaces
 
 - **Trust-posture §Act-vs-park** carries the SURFACE-mode trigger rule (this SOP amends into the policy at ORG-089 landing).
-- **ORG-041 §Amendment 2026-09-06** carries Cairn's review checklist for the RECORD fields (populated + not boilerplate + coherent with the ADR's actual claims).
+- **ORG-041 §Amendment 2026-09-06** carries Consultant's review checklist for the RECORD fields (populated + not boilerplate + coherent with the ADR's actual claims).
 - **ORG-021 §Substates** carries the ticket-tier field shape (`appetite:` + `bet_ref:` + `substate: appetite-overrun` + `substate: dropped`).
 - **`tools/ticket_grooming.py`** carries the two grooming checks (completeness + overrun); overrun is calibration-gated per ORG-089 §Decision.4d.
+- **Clarifying diagnostic:** `knowledge/episodic/2026-09-12-problem-shape-identification/README.md` §Complexity — the "right layer? / rabbithole detection / solution complexity per layer" lens is the self-check this SOP operationalizes at appetite-scoring time; the operator's own framing that maps to the appetite integer + "not worth X, halt if Y" ceiling. Specialist's 2026-09-12 in-practice measurement identified Complexity as the least-operationalized lens fleet-wide, so this SOP is the highest-value insertion point (T-3656).
 
 ## Re-evaluate when
 

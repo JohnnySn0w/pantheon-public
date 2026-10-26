@@ -8,6 +8,17 @@ rendered artifacts may now be stale -- a ratified rulebook/SOP change should
 always be followed by a manual re-render (RATIFY-POINT-2: manual trigger,
 not automated, to avoid a merge-race rendering inconsistent orientation).
 
+Also covers the SOP-skill stamps (T-4465): tools/persona_orientation/
+sop-skill-bindings.yaml, written by render.py from sop-skills.yaml, in the same
+record format. check_sop_skills() is the SOP-skills-only slice that the CI test
+(tools/test_persona_orientation_sop_skills.py) gates on.
+
+Scope: REPO-level only. The stamps are committed, so once any one seat
+re-renders and pushes, every other clone at that HEAD reads FRESH here even
+if its own ~/.claude/skills/pantheon-* artifacts were never re-rendered
+(T-3997). Per-seat artifact freshness is `render.py --check`, run as that
+seat's user.
+
 Exit codes:
     0 -- all sources fresh (or nothing to check)
     2 -- at least one source has drifted, or source-bindings.yaml is missing
@@ -56,13 +67,14 @@ def current_blob(root: Path, rel_path: str) -> str | None:
         return None
 
 
-def check(root: Path) -> dict:
-    """Returns a report dict: {"status": "fresh"|"stale"|"missing-bindings",
-    "drifted": [...], "checked": N}."""
-    bindings = load_bindings(root)
-    if bindings is None:
-        return {"status": "missing-bindings", "drifted": [], "checked": 0}
+# Kept equal to render.SOP_SKILLS_MANIFEST / render.SOP_SKILL_BINDINGS (a test pins
+# the pair); duplicated because this file also runs as a script, where importing
+# render through the tools package is not available.
+SOP_SKILLS_MANIFEST = "tools/persona_orientation/sop-skills.yaml"
+SOP_SKILL_BINDINGS = "tools/persona_orientation/sop-skill-bindings.yaml"
 
+
+def _drift(root: Path, bindings: dict) -> list[dict]:
     drifted = []
     for rel_path, stamp in bindings.items():
         blob_now = current_blob(root, rel_path)
@@ -71,9 +83,84 @@ def check(root: Path) -> dict:
             drifted.append({"path": rel_path, "reason": "source file no longer resolves at HEAD"})
         elif blob_now != stamped_blob:
             drifted.append({"path": rel_path, "reason": "blob changed", "stamped": stamped_blob, "current": blob_now})
+    return drifted
+
+
+def _render_module():
+    try:
+        from tools.persona_orientation import render
+    except ImportError:  # run as a script: render.py is a sibling
+        import render
+    return render
+
+
+def check_orientation_stamps(root: Path) -> list[dict]:
+    """T-4743: drift entries where the stamp set and the manifest disagree, mirroring
+    check_sop_skills' no-stamp / retired-entry checks. The expected set is exactly what
+    render.py would stamp (every non-inline source the manifest + role-deltas pull in),
+    so a section added to the manifest but never rendered fails closed here. No manifest
+    in the repo -> nothing to check."""
+    if not (root / "rulebook" / "persona-orientation" / "manifest.yaml").exists():
+        return []
+    bindings = load_bindings(root)
+    if bindings is None:
+        return []
+    try:
+        declared = set(_render_module().render_all(root)[1])
+    except (OSError, KeyError, ValueError, subprocess.CalledProcessError) as exc:
+        return [{"path": "rulebook/persona-orientation/manifest.yaml",
+                 "reason": f"manifest does not render: {type(exc).__name__}: {exc}"}]
+    drifted = []
+    for rel_path in sorted(declared - set(bindings)):
+        drifted.append({"path": rel_path, "reason": "no stamp recorded for this manifest entry (run render.py)"})
+    for rel_path in sorted(set(bindings) - declared):
+        drifted.append({"path": rel_path, "reason": "stamp for a source the manifest no longer names (run render.py)"})
+    return drifted
+
+
+def check_sop_skills(root: Path) -> dict:
+    """Freshness of the SOP-skill stamps (T-4465) alone: {"status": "fresh"|"stale"|
+    "missing-bindings"|"not-configured", "drifted": [...], "checked": N}. Beyond
+    the blob comparison it fails closed on a manifest entry with no stamp (added,
+    never rendered) and on a stamp whose SOP the manifest no longer names."""
+    manifest_path = root / SOP_SKILLS_MANIFEST
+    if not manifest_path.exists():
+        return {"status": "not-configured", "drifted": [], "checked": 0}
+    bindings_path = root / SOP_SKILL_BINDINGS
+    if not bindings_path.exists():
+        return {"status": "missing-bindings", "drifted": [], "checked": 0}
+    with open(bindings_path, encoding="utf-8") as f:
+        bindings = yaml.safe_load(f) or {}
+    with open(manifest_path, encoding="utf-8") as f:
+        declared = {e["sop"] for e in (yaml.safe_load(f) or {}).get("skills") or []}
+
+    drifted = _drift(root, bindings)
+    for rel_path in sorted(declared - set(bindings)):
+        drifted.append({"path": rel_path, "reason": "no stamp recorded for this manifest entry (run render.py)"})
+    for rel_path in sorted(set(bindings) - declared):
+        drifted.append({"path": rel_path, "reason": "stamp for an SOP the manifest no longer names (run render.py)"})
+    return {"status": "stale" if drifted else "fresh", "drifted": drifted, "checked": len(bindings)}
+
+
+def check(root: Path) -> dict:
+    """Returns a report dict: {"status": "fresh"|"stale"|"missing-bindings",
+    "drifted": [...], "checked": N}. Covers the persona-orientation stamps and,
+    when the repo has an SOP-skills manifest, the SOP-skill stamps."""
+    bindings = load_bindings(root)
+    if bindings is None:
+        return {"status": "missing-bindings", "drifted": [], "checked": 0}
+
+    drifted = _drift(root, bindings) + check_orientation_stamps(root)
+    checked = len(bindings)
+
+    sop = check_sop_skills(root)
+    if sop["status"] == "missing-bindings":
+        return {"status": "missing-bindings", "drifted": [], "checked": 0}
+    drifted += sop["drifted"]
+    checked += sop["checked"]
 
     status = "stale" if drifted else "fresh"
-    return {"status": status, "drifted": drifted, "checked": len(bindings)}
+    return {"status": status, "drifted": drifted, "checked": checked}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -90,9 +177,11 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(report, indent=2, sort_keys=True))
     else:
         if report["status"] == "missing-bindings":
-            print("No source-bindings.yaml found -- run `render.py` at least once first.", file=sys.stderr)
+            print("No source-bindings.yaml (or sop-skill-bindings.yaml, when an SOP-skills manifest exists) "
+                  "found -- run `render.py` at least once first.", file=sys.stderr)
         elif report["status"] == "fresh":
             print(f"OK -- {report['checked']} source binding(s) fresh.")
+            print("(repo-level stamps only; per-seat artifacts: render.py --check)")
         else:
             print(f"STALE -- {len(report['drifted'])} of {report['checked']} source binding(s) drifted:", file=sys.stderr)
             for item in report["drifted"]:

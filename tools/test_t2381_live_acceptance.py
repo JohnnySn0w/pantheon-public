@@ -37,9 +37,9 @@ class FixtureSafetyTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp.cleanup()
 
-    def test_fixture_persona_cannot_alias_cairn(self) -> None:
+    def test_fixture_persona_cannot_alias_consultant(self) -> None:
         with self.assertRaisesRegex(FixtureRefused, "exactly"):
-            marker_document(FIXTURE_ACCOUNT, "cairn", "20260802T000000Z")
+            marker_document(FIXTURE_ACCOUNT, "consultant", "20260802T000000Z")
 
     def test_cleanup_refuses_missing_or_mismatched_markers(self) -> None:
         controller = self.root / "controller"

@@ -58,10 +58,14 @@ def _run_hook(
 ) -> subprocess.CompletedProcess:
     """Run the hook script with the given event JSON on stdin.
 
-    Overrides PANTHEON_STATE_DIR so output lands in a tempdir.
+    Overrides PANTHEON_STATE_DIR so output lands in a tempdir, and defaults the
+    /tmp mirror into that same tempdir. The real mirror is a shared cross-user
+    path: writing it from a test publishes a false HO-limit signal, and another
+    account's leftover copy (sticky /tmp) breaks this suite (T-4161).
     """
     env = os.environ.copy()
     env["PANTHEON_STATE_DIR"] = state_dir
+    env["PANTHEON_TMP_MIRROR_OVERRIDE"] = os.path.join(state_dir, "tmp_mirror.json")
     if extra_env:
         env.update(extra_env)
     return subprocess.run(
@@ -333,14 +337,19 @@ class TestTmpMirror(unittest.TestCase):
     so subprocess-level tests can control it without mock.patch.
     """
 
-    def setUp(self) -> None:
-        # Clean up any leftover mirror file from a previous test run.
-        if _TMP_MIRROR_DEFAULT.exists():
-            _TMP_MIRROR_DEFAULT.unlink()
+    # No setUp/tearDown touching _TMP_MIRROR_DEFAULT: every run here redirects the
+    # mirror, and unlinking the real path either deletes a live signal or, when
+    # another account owns it, raises PermissionError (T-4161).
 
-    def tearDown(self) -> None:
-        if _TMP_MIRROR_DEFAULT.exists():
-            _TMP_MIRROR_DEFAULT.unlink()
+    def test_default_run_never_targets_real_mirror(self) -> None:
+        """_run_hook with no explicit mirror writes it inside state_dir, not /tmp."""
+        before = _TMP_MIRROR_DEFAULT.stat().st_mtime_ns if _TMP_MIRROR_DEFAULT.exists() else None
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = _run_hook(_rate_limit_event(), tmpdir)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((Path(tmpdir) / "tmp_mirror.json").exists())
+        after = _TMP_MIRROR_DEFAULT.stat().st_mtime_ns if _TMP_MIRROR_DEFAULT.exists() else None
+        self.assertEqual(before, after, "a test run must never write the real /tmp mirror")
 
     def _run_with_mirror_override(
         self,

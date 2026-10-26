@@ -26,7 +26,7 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTANCE_YAML = REPO_ROOT / "instance.yaml"
 
-EXPECTED_MODEL = "claude-opus-4-8"
+EXPECTED_MODEL = "claude-opus-5-5"
 EXPECTED_CHANNELS = "plugin:telegram@claude-plugins-official"
 EXPECTED_SESSION = "claude-research-bot"
 
@@ -36,8 +36,10 @@ class SpecialistLaunchShapeTest(unittest.TestCase):
         data = yaml.safe_load(INSTANCE_YAML.read_text(encoding="utf-8"))
         self.specialist = data["harness_runtime"]["roles"]["specialist"]
 
-    def test_model_is_opus_4_8(self) -> None:
-        # the operator fleet-4-8 ruling (TG7190): specialist pinned to opus-4-8, off opus-5.
+    def test_model_is_opus_5_5(self) -> None:
+        # T-4526 (the operator TG 7988, 2026-10-04): "can you get specialist onto opus
+        # 5.5?" Reverses T-4021 (TG 3304, opus 4.8). Effort stays xhigh per
+        # the T-3084 fleet-effort-policy.
         self.assertEqual(self.specialist["claude"]["model"], EXPECTED_MODEL)
 
     def test_channels_is_telegram_plugin(self) -> None:
@@ -45,36 +47,38 @@ class SpecialistLaunchShapeTest(unittest.TestCase):
             self.specialist["claude"]["native"].get("channels"), EXPECTED_CHANNELS
         )
 
-    def test_permission_mode_is_default(self) -> None:
-        self.assertEqual(self.specialist["claude"]["native"].get("permission_mode"), "default")
+    def test_permission_mode_is_bypass(self) -> None:
+        self.assertEqual(self.specialist["claude"]["native"].get("permission_mode"), "bypassPermissions")
 
     def test_tmux_session_is_claude_research_bot(self) -> None:
         self.assertEqual(self.specialist["tmux"]["session"], EXPECTED_SESSION)
 
     def test_post_start_carries_arm_pane_log_before_recovery_boot_kick(self) -> None:
-        # Ordering matches the LIVE recovery block exactly (arm_pane_log
-        # first, recovery_boot_kick second with background:true) -- not the
-        # dispatch brief's directional snippet, which had them reversed. See
-        # DECISIONS.
+        # Ordering: arm_pane_log first; the T-4092/T-2629 telegram getUpdates-409
+        # never-give-up re-assert second (foreground, idempotent + fail-open);
+        # recovery_boot_kick last with background:true. (arm_pane_log stays before
+        # recovery_boot_kick -- the 409 re-assert was inserted between them.)
         post_start = self.specialist["post_start"]
-        self.assertEqual(len(post_start), 2)
+        self.assertEqual(len(post_start), 3)
         self.assertIn("arm_pane_log.sh", post_start[0]["command"][0])
         self.assertNotIn("background", post_start[0])
-        self.assertIn("recovery_boot_kick.sh", post_start[1]["command"][0])
-        self.assertTrue(post_start[1]["background"])
+        self.assertIn("telegram_poller_409_patch.sh", post_start[1]["command"][0])
+        self.assertNotIn("background", post_start[1])
+        self.assertIn("recovery_boot_kick.sh", post_start[2]["command"][0])
+        self.assertTrue(post_start[2]["background"])
 
     def test_codex_quota_failover_fallback(self) -> None:
         # T-2927 (operator-directed, TG 7797/7844) SUPERSEDES the original T-2633
         # decision that specialist gets no codex fallback. With GEPA bulk rollouts
         # eating Max-sub quota, every claude-only consume-plane seat (specialist/
-        # specialist, sub-orchestrator-1/metis, sub-orchestrator-2/atlas) now carries a
+        # specialist, sub-orchestrator-1/mason, sub-orchestrator-2/artisan) now carries a
         # codex quota-failover fallback so the quota gate has a swap target.
         self.assertEqual(
             self.specialist.get("fallbacks"), ["codex/interactive-chatgpt"]
         )
         codex = self.specialist["codex"]
         self.assertEqual(codex["profile"], "interactive-chatgpt")
-        self.assertEqual(codex["model"], "gpt-5.5")
+        self.assertEqual(codex["model"], "gpt-5.6-sol")
         overrides = codex["native"]["config_overrides"]
         self.assertEqual(overrides["approval_policy"], "never")
         self.assertEqual(overrides["model_reasoning_effort"], "high")

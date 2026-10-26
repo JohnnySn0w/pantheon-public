@@ -104,7 +104,7 @@ Echo's rulebook/principles.md (B4 in flight) restarts as **cohesive emanation, n
 
 **Open after this ADR:**
 - Whether Pantheon should also adopt explicit "constraints" as a third element (named operational constraints that directives emanate from when no principle parent exists). Currently handled informally — the directive's "emanates from" field can name a constraint directly. Promote to first-class only if the constraint set grows enough to warrant.
-- Cascade order for Echo: B4 implementer needs to be re-dispatched with the new framing brief. Will happen in the same orchestrator turn as this ADR's commit.
+- Finished one-shot follow-ups (the Echo cascade order) are in `notes/2026-10-08-org-002-review-history.md`.
 
 ## Related
 

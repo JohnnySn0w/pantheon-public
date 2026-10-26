@@ -13,12 +13,12 @@ the same kernel:
     {build the 10-field ORG-001 entry} -> current_write_target(ledger_dir, now)
     -> ensure_segment_dir(target) -> open("a") + json.dumps + "\n"
 
-…and had drifted: `activity_digest.write_ledger_entry` and
-`watch_runner.write_actuation_ledger` emit `json.dumps(entry)` (no key sort),
-`session_reset_reconcile.append_to_ledger` emits `json.dumps(e, sort_keys=True)`,
-and watch_runner's entry OMITTED the `cost_usd`/`parent_id`/`supersedes`
-provenance fields (8 of 10). This module is the single canonical implementation
-the three writers route through.
+…and had drifted: `activity_digest.write_ledger_entry` (writer since retired,
+T-4289) and `watch_runner.write_actuation_ledger` emitted `json.dumps(entry)`
+(no key sort), `session_reset_reconcile.append_to_ledger` emitted
+`json.dumps(e, sort_keys=True)`, and watch_runner's entry OMITTED the
+`cost_usd`/`parent_id`/`supersedes` provenance fields (8 of 10). This module is
+the single canonical implementation the remaining writers route through.
 
 Design (kept deliberately thin so it doesn't leak caller specifics):
   * `build_ledger_entry` is a pure field-assembler — it enforces the full
@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
-from tools.ledger_shard import current_write_target, ensure_segment_dir
+from tools.ledger_shard import check_new_entry, current_write_target, ensure_segment_dir
 
 # Canonical ORG-001 field order. build_ledger_entry emits exactly these keys;
 # serialization is sort_keys=True so on-disk order is deterministic regardless.
@@ -71,6 +71,8 @@ def build_ledger_entry(
     cost_usd: float | None = None,
     parent_id: str | None = None,
     supersedes: str | None = None,
+    executor: str | None = None,
+    decided_at: str | None = None,
 ) -> dict[str, Any]:
     """Build one canonical ORG-001 ledger entry (all 10 fields present).
 
@@ -79,8 +81,12 @@ def build_ledger_entry(
     so callers can pass any iterable without aliasing. Optional provenance
     fields (`cost_usd`, `parent_id`, `supersedes`) default to None and are
     ALWAYS present — this is what closes watch_runner's prior 8-field gap.
+
+    T-4737: `executor` (the writer's seat slot) and `decided_at` (an earlier
+    decision time; `ts` stays the write time) are ORG-001's optional fields,
+    included only when given.
     """
-    return {
+    entry: dict[str, Any] = {
         "id": entry_id,
         "ts": ts,
         "agent": agent,
@@ -92,6 +98,11 @@ def build_ledger_entry(
         "parent_id": parent_id,
         "supersedes": supersedes,
     }
+    if executor is not None:
+        entry["executor"] = executor
+    if decided_at is not None:
+        entry["decided_at"] = decided_at
+    return entry
 
 
 def append_ledger_entries(
@@ -116,6 +127,9 @@ def append_ledger_entries(
     target = shard if shard is not None else current_write_target(
         ledger_dir, now if now is not None else datetime.now(timezone.utc)
     )
+    entries = list(entries)
+    for e in entries:  # T-4734: the same ORG-001 write-path gate as append_entry
+        check_new_entry(e, now)
     ensure_segment_dir(target)
     with target.open("a", encoding="utf-8") as f:
         for e in entries:

@@ -26,20 +26,45 @@
 # byte-identical by construction, so they pass silently; if a symlink is ever
 # replaced by a tampered regular file, cmp catches it.
 #
+# Dormant copies (T-4473): a drifted copy that NO settings file executes, because every
+# registration of that basename points elsewhere (e.g. the clone), is reported as one INFO
+# line, not the alarm. It runs nowhere, so its bytes are not a tamper surface. The
+# decision reuses deploy_hook.py's registration resolver (classify_deployed_copy) and
+# needs positive evidence. A copy registered nowhere, an unreadable settings file, or a
+# resolver failure all keep the full alarm.
+#
 # Scope note (v1): this checks hook SCRIPT content. Detecting REMOVAL of a security
 # hook, or a settings.json downgrade, needs a tracked per-persona expected-hooks
 # manifest — deliberately deferred as a possible fast-follow (see T-1284 DECISIONS).
 #
 # FAIL-OPEN by design: ALWAYS exits 0. A boot-health check must NEVER block or slow
 # a session start. Mirrors handoff-auto-read.sh / verify-startup-boot.sh. Emits on
-# stdout (as additionalContext) ONLY when drift is present; an all-clean run is
-# suppressed as noise.
+# stdout (as additionalContext) ONLY when drift, or a break-glass flag for this
+# account (T-4392 phase 2a), is present; an all-clean run is suppressed as noise.
 
 cat >/dev/null 2>&1 || true   # drain the hook-input JSON (unused)
 
 HOOKS_DIR="$HOME/.claude/hooks"
 CANON_DIR="$HOME/pantheon-config/tools/hooks"
 drift=""
+dormant=""
+
+# T-4473: is a drifted deployed copy DORMANT (provably never executed)? Reuses
+# deploy_hook.py's registration resolver over every settings file a session loads.
+# Prints "DORMANT<TAB>detail" only on positive evidence. Anything else (a registered
+# copy, an unreadable settings file, an import failure, a timeout) prints nothing, so
+# the full alarm stands. tools/ is APPENDED to sys.path so the clone's mailbox.py can
+# never shadow a stdlib module; -B keeps bytecode out of the clone.
+classify_copy() {
+  timeout 5 python3 -B -c '
+import sys
+sys.path.append(sys.argv[1])
+import deploy_hook
+dormant, detail = deploy_hook.classify_deployed_copy(sys.argv[2], sys.argv[3], sys.argv[4])
+if dormant:
+    print("DORMANT\t" + " ".join(detail.split()))
+' "$CANON_DIR/.." "$1" "$HOME" "$(id -un)" 2>/dev/null || true
+}
 
 if [[ -d "$HOOKS_DIR" && -d "$CANON_DIR" ]]; then
   for dep in "$HOOKS_DIR"/*; do
@@ -85,6 +110,11 @@ if [[ -d "$HOOKS_DIR" && -d "$CANON_DIR" ]]; then
     cmp -s "$blob" "$dep" || differs=1
     rm -f "$blob"
     if (( differs )); then
+      cls="$(classify_copy "$base")"
+      if [[ "$cls" == DORMANT$'\t'* ]]; then
+        dormant+="  • ${base}: dormant copy, not executed; ${cls#DORMANT$'\t'}"$'\n'
+        continue
+      fi
       # Name the DIRECTION (T-2195 suggestion 3). Weak evidence — an attacker controls
       # mtime — so it only softens wording and must never suppress the emission.
       dep_mt=$(stat -c %Y "$dep" 2>/dev/null || echo 0)
@@ -110,6 +140,29 @@ if [[ -n "$drift" ]]; then
   out+="  1. Read the deployed file and diff it against ${CANON_DIR}/. Judge the CONTENT: a benign change is legible and matches some open ticket; a tamper is not."$'\n'
   out+="  2. Check whether a peer landed it — ask on the mailbox before reverting. Reverting someone's in-flight deploy is itself a fleet-wide action."$'\n'
   out+="  3. ONLY if the content is unexplained after 0-2: restore the canonical and investigate the persistence vector (Miasma signature — allowlisted path, swapped bytes)."$'\n'
+fi
+if [[ -n "$dormant" ]]; then
+  # T-4473: INFO, not the alarm. No settings file runs these copies, so their bytes are
+  # not a tamper surface. They are leftovers of a hook now registered elsewhere (e.g. the
+  # clone), and they go stale on every canonical change to it.
+  out+="ℹ️ Hook-integrity (T-4473): stale DORMANT deployed copies (not executed; no action needed for this session). Refresh with deploy_hook.py --hook <name>, or delete the copy:"$'\n'
+  out+="${dormant}"
+fi
+
+# T-4392 phase 2a: surface a BREAK-GLASS flag for THIS account (SOFT; never blocks). While a
+# LIVE flag stands, the fail-closed hooks it names FAIL OPEN on their fail-closed paths until
+# it expires, so a session must know. Read-only listing via the helper's own parser (the same
+# checks the hooks apply). PANTHEON_BREAKGLASS_LIST_BASE exists for the smoke test only; the
+# hooks themselves never read it, and Recovery's fleet check (tools/breakglass_watch.py) reads the
+# real base independently.
+bg=""
+if [[ -f "$CANON_DIR/_failclosed.py" ]]; then
+  bg="$(timeout 5 python3 "$CANON_DIR/_failclosed.py" --list --account "$(id -un)" \
+        --base "${PANTHEON_BREAKGLASS_LIST_BASE:-/var/lib/pantheon-breakglass}" 2>/dev/null || true)"
+fi
+if [[ -n "$bg" ]]; then
+  out+="⚠️ BREAK-GLASS flag present for account $(id -un) (T-4392; SOFT warning). A LIVE flag makes the named fail-closed hooks FAIL OPEN on their fail-closed paths (exception/ambiguity/deadline/cap) until expiry; a REJECTED file is ignored by the hooks but should be explained:"$'\n'
+  while IFS= read -r line; do out+="  • ${line}"$'\n'; done <<<"$bg"
 fi
 
 printf '%s' "$out"

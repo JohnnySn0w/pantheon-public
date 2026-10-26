@@ -67,7 +67,7 @@ if [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi
 # tighter the session-name bound, the smaller the blast radius of a bug
 # elsewhere in the caller).
 SESSION_RE='^codex-audit-(weekly-narrow|monthly-integrated)-[0-9]{4}-[0-9]{2}-[0-9]{2}$'
-WORKSPACE_ROOT="${S3STAR_WORKSPACE_ROOT:-/home/the-ancestor/s3star-workspace}"
+WORKSPACE_ROOT="${S3STAR_WORKSPACE_ROOT:-/var/lib/pantheon/s3star-workspace}"
 TMUX_BIN="${S3STAR_TMUX_BIN:-/usr/bin/tmux}"
 
 die() {

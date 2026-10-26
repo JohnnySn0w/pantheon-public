@@ -1319,7 +1319,7 @@ class ArchitectureAtlasViewDeriveVerifyTests(unittest.TestCase):
         )
 
         self.assertIsInstance(v3.nodes[0].projections[0].value, tuple)
-        self.assertEqual(v3.nodes[0].projections[1].value, "role:recovery")
+        self.assertEqual(v3.nodes[0].projections[1].value, "role:head-system-orchestrator")
         self.assertEqual(v4.subject_refs[0].id, self.organ_ref.id)
         self.assertEqual(v4.supporting_refs, (self.stage_ref, self.obligation_ref))
 
@@ -2481,7 +2481,7 @@ class ArchitectureAtlasCommittedFixtureTests(unittest.TestCase):
             "schemas/architecture-atlas-bundle.schema.json",
         ):
             with self.subTest(rel_path=rel_path):
-                self.assertEqual(ci.count(rel_path), 2)
+                self.assertEqual(ci.count(rel_path), 1)  # T-5001: one trigger list (pull_request)
         self.assertNotIn("tools/architecture_atlas.py", ci)
         self.assertNotIn("tools/test_architecture_atlas.py", ci)
         self.assertNotIn("tools/fixtures/architecture_atlas", ci)

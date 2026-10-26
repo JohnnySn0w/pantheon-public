@@ -99,6 +99,19 @@ class ParseLogTests(unittest.TestCase):
         self.assertNotIn("adr/README.md", out)
         self.assertIn("adr/ORG-099-real.md", out)
 
+    def test_template_files_excluded(self):
+        # architecture/rfc/ carries a TEMPLATE.md authoring scaffold — a template
+        # edit is not a ratifiable knowledge change and must not surface in the
+        # digest (excluded by name, dir-agnostically).
+        raw = "\n".join([
+            "C\taaa\t2026-06-13\trfc: tweak template + land RFC-003",
+            "M\tarchitecture/rfc/TEMPLATE.md",
+            "M\tarchitecture/rfc/RFC-003-health-signal-writer-broker.md",
+        ])
+        out = pos.parse_log(raw)
+        self.assertNotIn("architecture/rfc/TEMPLATE.md", out)
+        self.assertIn("architecture/rfc/RFC-003-health-signal-writer-broker.md", out)
+
     def test_empty_log(self):
         self.assertEqual(pos.parse_log(""), {})
 
@@ -140,6 +153,28 @@ class BuildDigestTests(unittest.TestCase):
             out = pos.build_digest(Path(t), changes, since_days=30)
         # rulebook appears before sop (WATCHED order), regardless of dict order.
         self.assertLess(out.index("## rulebook/"), out.index("## sop/"))
+
+    def test_rfc_dir_watched_and_grouped(self):
+        # architecture/rfc/ is a WATCHED tier (ORG-092 design-spec) — an RFC change
+        # must group under its own "## architecture/rfc/" section, between adr and sop.
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "architecture" / "rfc").mkdir(parents=True)
+            (root / "architecture" / "rfc" / "RFC-003.md").write_text(
+                "# RFC-003 — health signal-writer broker\n\nspec body\n")
+            changes = {
+                "architecture/rfc/RFC-003.md": {"hash": "rfc003", "date": "2026-09-12",
+                                                "subject": "land RFC-003", "status": "A"},
+                "architecture/adr/ORG-097.md": {"hash": "org097", "date": "2026-09-12",
+                                                "subject": "adopt", "status": "M"},
+                "sop/z.md": {"hash": "sopz", "date": "2026-09-12", "subject": "s", "status": "M"},
+            }
+            out = pos.build_digest(root, changes, since_days=30)
+        self.assertIn("## architecture/rfc/", out)
+        self.assertIn("[RFC-003 — health signal-writer broker](../architecture/rfc/RFC-003.md)", out)
+        # WATCHED order: adr before rfc before sop.
+        self.assertLess(out.index("## architecture/adr/"), out.index("## architecture/rfc/"))
+        self.assertLess(out.index("## architecture/rfc/"), out.index("## sop/"))
 
 
 class RelLinkTests(unittest.TestCase):
@@ -355,6 +390,29 @@ class FindAuthorityMarkersTests(unittest.TestCase):
         self.assertEqual(m.msg_ids, frozenset({"4664"}))
         self.assertEqual(m.ticket_refs, frozenset({"T-1584"}))
 
+    def test_rfc_ratification_marker_scanned(self):
+        # architecture/rfc/ is now a marker glob (RFCs are Ratify-required, ORG-092):
+        # a ratified RFC line with an anchor is corroboration-checked like an ADR.
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "architecture" / "rfc").mkdir(parents=True)
+            (root / "architecture" / "rfc" / "RFC-009.md").write_text(
+                "**Status:** Ratified 2026-09-10 by the operator (T-9009, msg_5001).\n")
+            markers = pos.find_authority_markers(root)
+        self.assertEqual(len(markers), 1)
+        self.assertEqual(markers[0].rel_path, "architecture/rfc/RFC-009.md")
+        self.assertEqual(markers[0].ticket_refs, frozenset({"T-9009"}))
+
+    def test_draft_rfc_status_not_a_marker(self):
+        # A Draft RFC status ("Draft ... by Recovery", no ratifi+operator) must NOT be
+        # read as a ratification claim — else every in-flight RFC false-warns.
+        with tempfile.TemporaryDirectory() as t:
+            root = Path(t)
+            (root / "architecture" / "rfc").mkdir(parents=True)
+            (root / "architecture" / "rfc" / "RFC-003.md").write_text(
+                "**Status:** Draft 2026-09-12 by Recovery — awaiting R2 re-review.\n")
+            self.assertEqual(pos.find_authority_markers(root), [])
+
     def test_deterministic_sort_order(self):
         with tempfile.TemporaryDirectory() as t:
             root = Path(t)
@@ -369,7 +427,7 @@ class FindAuthorityMarkersTests(unittest.TestCase):
         self.assertEqual([m.rel_path for m in first], ["architecture/adr/A.md", "architecture/adr/B.md"])
 
 
-def _write_ledger_entry(ledger_dir: Path, ts: str, rationale: str, links: list[dict]) -> None:
+def _write_ledger_entry(ledger_dir: Path, ts: str, rationale: str, links: list[dict], **extra) -> None:
     # Directory name is arbitrary — iter_ledger_entry_files only requires
     # <dirname>/<dirname>.jsonl; a hash keeps repeated calls in one test from
     # colliding by timestamp-derived name collision.
@@ -380,7 +438,7 @@ def _write_ledger_entry(ledger_dir: Path, ts: str, rationale: str, links: list[d
         "action": "test_entry", "agent": "orchestrator", "cost_usd": None,
         "id": f"{ts}-test", "justifies_via": ["P4"], "links": links,
         "parent_id": None, "rationale": rationale, "summary": "", "supersedes": None,
-        "ts": ts,
+        "ts": ts, **extra,
     }
     with shard.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
@@ -466,6 +524,61 @@ class AuthorityCorroborationWarningsTests(unittest.TestCase):
                 [{"ref": "T-9004", "type": "ticket"}])
             warnings = pos.authority_corroboration_warnings(root)
         self.assertEqual(warnings, [])
+
+    def test_retroactive_capture_event_date_corroborates_ticket_ref(self):
+        # T-3309: a backfill written months later keeps its honest ts but declares the
+        # event it records; the ticket-ref window is measured from that event_date.
+        with tempfile.TemporaryDirectory() as t:
+            root = self._root_with_marker(
+                t, "Ratified 2026-06-01 by the operator (T-9010, ticket-UI verdict 12:00:00Z)")
+            _write_ledger_entry(
+                root / "ledger", "2026-10-26T00:00:00Z", "retroactive capture of T-9010",
+                [{"ref": "T-9010", "type": "ticket"}],
+                retroactive_capture=True, event_date="2026-06-01")
+            warnings = pos.authority_corroboration_warnings(root)
+        self.assertEqual(warnings, [])
+
+    def test_event_date_without_retroactive_flag_is_ignored(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = self._root_with_marker(
+                t, "Ratified 2026-06-01 by the operator (T-9011, ticket-UI verdict 12:00:00Z)")
+            _write_ledger_entry(
+                root / "ledger", "2026-10-26T00:00:00Z", "mentions T-9011",
+                [{"ref": "T-9011", "type": "ticket"}], event_date="2026-06-01")
+            warnings = pos.authority_corroboration_warnings(root)
+        self.assertEqual(len(warnings), 1)
+
+    def test_malformed_event_date_falls_back_to_ts(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = self._root_with_marker(
+                t, "Ratified 2026-06-01 by the operator (T-9012, ticket-UI verdict 12:00:00Z)")
+            _write_ledger_entry(
+                root / "ledger", "2026-10-26T00:00:00Z", "retroactive capture of T-9012",
+                [{"ref": "T-9012", "type": "ticket"}],
+                retroactive_capture=True, event_date="June 1st")
+            warnings = pos.authority_corroboration_warnings(root)
+        self.assertEqual(len(warnings), 1)
+
+    def test_ratifiable_and_pending_lines_are_not_markers(self):
+        # T-3309: ORG-021's `ratifiable_files` enum line and ORG-080's
+        # "pending the operator's ratification" notes claim no ratification.
+        with tempfile.TemporaryDirectory() as t:
+            root = self._root_with_marker(
+                t,
+                "- intent: ratify if `ratifiable_files` present (T-0465, shipped 2026-05-19, operator queue)\n"
+                "Drafted 2026-10-17 under T-2667. All of it is pending the operator's ratification.\n"
+                "Note (2026-10-17, T-5074): HO-accepted, pending the operator's ratification with A-8.\n"
+                "Drafted 2026-10-17 (T-2667). It changes no ratified decision. Until the operator ratifies, HO calls govern.")
+            warnings = pos.authority_corroboration_warnings(root)
+        self.assertEqual(warnings, [])
+
+    def test_mixed_ratified_and_pending_line_stays_a_marker(self):
+        with tempfile.TemporaryDirectory() as t:
+            root = self._root_with_marker(
+                t, "Ratified 2026-08-26 by the operator (T-9013); A-3 is pending the operator ratification.")
+            warnings = pos.authority_corroboration_warnings(root)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("T-9013", warnings[0])
 
     def test_never_raises_no_markers_no_ledger(self):
         with tempfile.TemporaryDirectory() as t:

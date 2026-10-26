@@ -20,7 +20,7 @@ The tests are green at authoring time and green at review time BY CONSTRUCTION �
 still pre-fix during both. The red only manifests after the merge lands, i.e. after every check
 that normally catches a bad change has already passed. The only catch points are (a) noticing the
 temporal assumption while writing, or (b) re-verifying on the MERGED tree before declaring the
-arc closed — which is how the live instance was caught (T-1961 follow-up, 2026-07-23: Metis ran
+arc closed — which is how the live instance was caught (T-1961 follow-up, 2026-07-23: Mason ran
 the suite on merged main as her resolve-time green-check instead of assuming; 2F; fix was
 skip-when-superseded, PR #108).
 

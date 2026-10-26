@@ -69,7 +69,7 @@ the hook fires at the boundary, writes an artifact, exits; a
 
 ### session_reset_log — reset-event recorder
 - `tools/session_reset_log.py` (hook-driven event log).
-- Records session-reset-class events; consumer: `session_reset_reconcile` ([Scheduled/Reconciler](scheduled.md)) lands them in the ledger. (A Recorder whose consumer is scheduled — the chain pattern is the same.)
+- Records session-reset-class events as forensic JSONL. Its never-installed ledger reconciler was retired by T-4288 after 4.5 months showed no production consumer depended on the derived entries.
 
 ---
 

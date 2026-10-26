@@ -775,7 +775,7 @@ class GeneratedArtifactsAndCanonicalTests(unittest.TestCase):
                 "binding:harness-adapters-claude",
                 "binding:harness-adapters-codex",
                 "binding:operator-relationship-operator",
-                "binding:exocortex-mnemosyne",
+                "binding:exocortex-archivist",
             },
         )
         # A read-only inventory cannot certify every required facet, so no binding is live.
@@ -849,7 +849,8 @@ class GeneratedArtifactsAndCanonicalTests(unittest.TestCase):
     def test_ci_paths_cover_organism_and_all_schemas(self) -> None:
         repo_root = Path(__file__).resolve().parents[1]
         ci = (repo_root / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
-        self.assertGreaterEqual(ci.count("'organism/**'"), 2)
+        # T-5001: one path list (pull_request); ci.yml no longer has a push trigger.
+        self.assertGreaterEqual(ci.count("'organism/**'"), 1)
         for filename in (
             "organism-record.schema.json",
             "organ-contract.schema.json",
@@ -858,7 +859,7 @@ class GeneratedArtifactsAndCanonicalTests(unittest.TestCase):
             "organ-evidence-ref.schema.json",
             "external-surface.schema.json",
         ):
-            self.assertGreaterEqual(ci.count(f"'schemas/{filename}'"), 2)
+            self.assertGreaterEqual(ci.count(f"'schemas/{filename}'"), 1)
 
 
 if __name__ == "__main__":

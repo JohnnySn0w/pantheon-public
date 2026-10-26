@@ -17,6 +17,8 @@ The fine-grained PAT lacks the permission `gh run watch` needs to read check-run
 
 Observed alongside: `gh pr checks`, `commits/<sha>/check-runs`, and `commits/<sha>/status` all return `403 Resource not accessible by personal access token` under the same PAT. The PAT can read **run-level** metadata but not check/annotation detail.
 
+**Exit code varies; neither value is the run's result.** 2026-06-24 it exited 0 (reads as a false pass). 2026-09-27 (pantheon-config PR #474, Orchestrator) it exited **1** with `failed to get annotations: HTTP 403`, while the run was still `in_progress` and later concluded `success`. That reads as a false failure. Treat any `gh run watch` exit under this PAT as "watch aborted", never as a CI verdict.
+
 ## Fix — poll run status instead of watching
 
 Don't trust `gh run watch` exit codes under this PAT. Poll the run's top-level status (which the PAT *can* read) until `completed`, then check `conclusion`:

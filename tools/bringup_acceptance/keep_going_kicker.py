@@ -26,7 +26,7 @@ seam, don't test live systemd" precedent.
 FRAMING (HO-ratified 2026-08-05, this ticket's transition log): a seat's
 keep-going kicker not currently firing is NOT presumed a defect. RECOVERY is
 deliberately quiet this session (post-restart harness work) -- expected,
-not a regression. METIS/ATLAS are on-demand subagent personas, not among
+not a regression. MASON/ARTISAN are on-demand subagent personas, not among
 the four standing daemons (orchestrator/specialist/recovery/codex), so an unarmed timer is
 plausibly BY DESIGN. :data:`FLEET_FIRING_FRAMING` carries that context
 per seat. This module's own pass/fail verdict is proven iff the DEDUPE/
@@ -54,6 +54,7 @@ import os
 from pathlib import Path
 from typing import Any, Callable, Literal, Mapping
 
+from tools import agent_role_map
 from tools import keep_going
 from tools import mailbox
 from tools.bringup_acceptance import restore as restore_mod
@@ -75,8 +76,9 @@ MODULE_ID = "keep-going-kicker"
 # The real hub this module must NEVER write to -- same constant/guard shape as
 # mailbox_roundtrip.py's own _REAL_HUB_DEFAULT (independent module-level
 # constant, not shared, per that module's own DECISIONS on not coupling
-# private state between sibling modules).
-_REAL_HUB_DEFAULT = Path("/home/the-ancestor/mailbox")
+# private state between sibling modules). Value: instance.yaml mailbox.hub via
+# agent_role_map (T-4096), so the guard follows the real hub across ORG-087.
+_REAL_HUB_DEFAULT = Path(agent_role_map.mailbox_hub())
 
 
 # ---------------------------------------------------------------------------
@@ -241,11 +243,11 @@ FLEET_FIRING_RAW: tuple[RawFiringObservation, ...] = (
         state_file={"last_nudge_ts": 1785812644, "consecutive_ineffective": 0, "cycles_since_nudge": 0},
     ),
     RawFiringObservation(
-        agent="metis", timer_active_state="inactive", timer_unit_file_state="disabled",
+        agent="mason", timer_active_state="inactive", timer_unit_file_state="disabled",
         timer_last_trigger=None, state_file_present=False, state_file=None,
     ),
     RawFiringObservation(
-        agent="atlas", timer_active_state="inactive", timer_unit_file_state="disabled",
+        agent="artisan", timer_active_state="inactive", timer_unit_file_state="disabled",
         timer_last_trigger=None, state_file_present=False, state_file=None,
     ),
 )
@@ -261,14 +263,14 @@ FLEET_FIRING_FRAMING: Mapping[str, str] = {
         "(post-restart harness work); this is the expected quiet-state, not a "
         "regression. Re-observe once recovery resumes standing duty."
     ),
-    "metis": (
-        "not-firing-observed, PLAUSIBLY ON-DEMAND BY DESIGN -- metis is an on-demand "
+    "mason": (
+        "not-firing-observed, PLAUSIBLY ON-DEMAND BY DESIGN -- mason is an on-demand "
         "subagent seat, not among the four standing daemons (orchestrator/specialist/recovery/codex); "
         "an on-demand seat may not need a standing continuation timer. Not asserted "
         "broken, and not re-armed by this module."
     ),
-    "atlas": (
-        "not-firing-observed, PLAUSIBLY ON-DEMAND BY DESIGN -- atlas is an on-demand "
+    "artisan": (
+        "not-firing-observed, PLAUSIBLY ON-DEMAND BY DESIGN -- artisan is an on-demand "
         "subagent seat, not among the four standing daemons (orchestrator/specialist/recovery/codex); "
         "an on-demand seat may not need a standing continuation timer. Not asserted "
         "broken, and not re-armed by this module."

@@ -1,0 +1,15 @@
+[Unit]
+Description=Headless claude -p billing canary (T-4634) — fail when a headless subscription call is refused as API-credit-billed or /usage stops saying subscription
+Documentation=file:///home/%u/pantheon-config/knowledge/episodic/2026-09-21-billing-quota-anomaly-cluster.md
+After=network-online.target
+Wants=network-online.target
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/tmp
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/headless_billing_canary.py
+StandardOutput=journal
+StandardError=journal
+TimeoutStartSec=10min

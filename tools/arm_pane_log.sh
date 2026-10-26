@@ -47,12 +47,21 @@ if [[ "$piped" == "1" ]]; then
   exit 0
 fi
 
-# Per-line wall-clock prefix; fflush so the log tails live. The awk holds the
-# file's INODE for the life of the tap — the Chronicle archive step gzip-copies
-# then unlinks the file, so post-archive restart chatter goes harmlessly to the
-# unlinked inode and the next session's tap opens a fresh file here.
-if tmux pipe-pane -o -t "$PANE" \
-    'awk "{print strftime(\"[%Y-%m-%d %H:%M:%S] \") \$0; fflush()}" >> '"$LOG_FILE" 2>/dev/null; then
+# The reader (pane_log_tap.py, T-4460) stamps each output burst when it arrives,
+# splits the TUI's CR/cursor-move drawing into lines, and flushes per burst so
+# the log tails live. It opens the file once and holds its INODE for the life of
+# the tap — the Chronicle archive step gzip-copies then unlinks the file, so
+# post-archive restart chatter goes harmlessly to the unlinked inode and the
+# next session's tap opens a fresh file here.
+HERE="$(cd "$(dirname "$0")" && pwd)"
+PY="$(command -v python3 2>/dev/null)" || { log "python3 not found (non-fatal)"; exit 0; }
+printf -v TAP_CMD 'exec %q -u %q %q' "$PY" "$HERE/pane_log_tap.py" "$LOG_FILE"
+# tmux expands pipe-pane's shell-command as a FORMAT, and that runs strftime over
+# it: an unescaped %Y would be frozen at arm time (the T-4460 bug in the old awk
+# tap). Escape % and # so the command reaches /bin/sh byte-for-byte.
+TAP_CMD="${TAP_CMD//\%/%%}"
+TAP_CMD="${TAP_CMD//\#/##}"
+if tmux pipe-pane -o -t "$PANE" "$TAP_CMD" 2>/dev/null; then
   log "armed: $PANE -> $LOG_FILE"
 else
   log "pipe-pane failed for $PANE (non-fatal)"

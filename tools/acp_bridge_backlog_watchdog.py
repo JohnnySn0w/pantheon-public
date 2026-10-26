@@ -3,7 +3,7 @@
 (T-1633 Unit 2, ORG-031).
 
 Detects messages piling up UNCONSUMED in a piloted agent's Path-A hub inbox
-(/home/the-ancestor/mailbox/<agent>/new) — the signature of a dead, stuck, or
+(<live hub>/<agent>/new, /home/post-office/mailbox) — the signature of a dead, stuck, or
 quiesced tools/acp_bridge.py bridge process — and alerts, so a silent bridge
 failure doesn't strand mail (tools/mailbox.py's own durability guarantee is
 that a message just sits in new/ forever if nothing drains it; this is the
@@ -36,6 +36,8 @@ from pathlib import Path
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tools.agent_role_map import mailbox_hub  # noqa: E402  (T-4096: hub from instance.yaml)
+
 # Tunable (env-overridable) thresholds.
 COUNT_WARN = int(os.environ.get("PANTHEON_ACP_BACKLOG_COUNT_WARN", "20"))
 AGE_WARN_SECONDS = int(os.environ.get("PANTHEON_ACP_BACKLOG_AGE_WARN_SECONDS", str(30 * 60)))
@@ -43,7 +45,7 @@ ALERT_COOLDOWN_SECONDS = int(
     os.environ.get("PANTHEON_ACP_BACKLOG_ALERT_COOLDOWN_SECONDS", str(30 * 60))
 )
 
-MAILBOX_HUB = Path(os.environ.get("PANTHEON_MAILBOX_HUB", "/home/the-ancestor/mailbox"))
+MAILBOX_HUB = Path(os.environ.get("PANTHEON_MAILBOX_HUB") or mailbox_hub())
 
 # T-3473: auto-clear provably-resolved DLQ leftovers instead of re-alerting until a
 # human hand-moves them. DARK-SHIP default-off (same supervised-first-fire pattern as

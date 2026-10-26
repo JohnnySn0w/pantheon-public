@@ -29,7 +29,7 @@
 #                          [--at-boot] [--pane <target>] [--timeout <sec>] [--json] [-h]
 #   --at-boot: SessionStart-hook mode (T-1099) — self-call that skips the pane
 #              check (pane unsettled mid-boot) + de-wedge (no-self-inject), runs
-#              only the SOFT C4/C6/C7/C8 guards, and always exits 0.
+#              only the SOFT C4/C6/C7/C8/C10 guards, and always exits 0.
 
 set -uo pipefail
 
@@ -45,11 +45,11 @@ set -uo pipefail
 # Byte-identical to handoff_and_restart.sh's constant by design; change both together.
 VERIFY_PATTERN='(╭(─)+╮|(─){20,})'
 IDLE_SENTINEL='❯'
-DIALOG_EXCLUDE='Enter to confirm|Esc to cancel'
+DIALOG_EXCLUDE='Enter to confirm|Esc to cancel|Yes, set auto mode as my default permission mode'
 BOOT_DIALOG_SENTINEL='I am using this for local development'
 # T-2210: a SECOND boot modal exists (Claude Code v2.1.220) — 'Try the new
 # fullscreen renderer?' with options '1. Yes, try it' / '2. Not now'. It wedged
-# exocortex/mnemosyne after the operator's droplet restart on 2026-07-28.
+# exocortex/archivist after the operator's droplet restart on 2026-07-28.
 #
 # ⚠️ IT IS DISMISSED WITH 2, NOT 1, AND THAT IS THE WHOLE REASON IT IS A SEPARATE
 # CONSTANT. For the dev-channels dialog option 1 is the benign acknowledgement.
@@ -64,8 +64,23 @@ BOOT_DISMISS_DENYLIST='Do you want to (proceed|make this edit|overwrite|create|d
 # Liveness tokens (T-0716 _bottom_region_shows_live_input): if the live bottom
 # region shows these and no dialog footer, the loop is working/idle and a
 # sentinel elsewhere is scrollback text, not a foreground wedge.
-LIVENESS_SENTINELS='esc to interrupt|\? for shortcuts|ctrl\+t to hide tasks'
+# T-4020: the shift-tab MODE footer ("⏸ manual mode on", "plan mode on",
+# "accept edits on", "bypass permissions on") is a DURABLE idle indicator — it
+# renders only at the live, idle input box — whereas the "? for shortcuts" hint
+# ROTATES with other tips ("· ← for agents", "· ctrl+t to hide tasks"), so a
+# manual-mode idle pane whose hint had cycled away read as a false WEDGE (specialist
+# 2026-09-25). Key on the mode footer too. Safe-direction: a pane mid-frozen-work
+# shows the spinner "esc to interrupt", not an idle mode footer, so this never
+# masks the TUI-alive-but-jsonl-frozen wedge this check exists to catch.
+LIVENESS_SENTINELS='esc to interrupt|\? for shortcuts|ctrl\+t to hide tasks|(manual mode|plan mode|accept edits|bypass permissions) on'
 BOTTOM_REGION_LINES=6
+# T-5465: Codex's idle composer has no Claude frame or ❯ sentinel. Require the
+# prompt AND its durable model/worktree/git footer in the live bottom region.
+# These are deliberately separate from the Claude constants above, whose byte
+# equality with handoff_and_restart.sh is guarded by the smoke suite.
+CODEX_IDLE_PROMPT='^[[:space:]]*›([[:space:]]|$)'
+CODEX_IDLE_FOOTER='^[[:space:]]*[[:alnum:]._-]+[[:space:]]+[[:alnum:]._-]+[[:space:]]+·[[:space:]]+[^[:space:]]+[[:space:]]+·[[:space:]]+.+[[:space:]]+\[[^]]+\][[:space:]]*$'
+CODEX_DIALOG_EXCLUDE='Press enter to confirm|esc to cancel|Would you like to run'
 
 # --- per-agent facts (single explicit source; mirrors _AGENT_HEALTH_CONFIG +
 # DRAIN_AGENT_CONFIG). NO silent auto-detect beyond the $USER->agent table. ---
@@ -75,19 +90,26 @@ BOTTOM_REGION_LINES=6
 # mailbox_wake.AGENT_PANE (the fullest existing source) rather than re-derived,
 # and the services MEASURED per account rather than assumed.
 declare -A AGENT_USER=( [recovery]=claude-fallback [orchestrator]=claude [specialist]=claude-research \
-                        [mnemosyne]=exocortex [metis]=suborch1 [atlas]=suborch2 [codex]=codex )
+                        [archivist]=exocortex [mason]=suborch1 [artisan]=suborch2 [codex]=codex )
 declare -A AGENT_PANE=( [recovery]=claude-telegram-bot-fallback:0 [orchestrator]=claude-telegram-bot:0 [specialist]=claude-research-bot:0 \
-                        [mnemosyne]=claude-telegram-bot-exocortex:0 [metis]=suborch1-main:0 [atlas]=suborch2-main:0 [codex]=codex-session )
-# ⚠️ metis and atlas have NO session-owning unit — measured: their tmux sessions
+                        [archivist]=claude-telegram-bot-exocortex:0 [mason]=suborch1-main:0 [artisan]=suborch2-main:0 [codex]=codex-session )
+# ⚠️ mason and artisan have NO session-owning unit — measured: their tmux sessions
 # are created directly, and `systemctl --user list-units` shows only per-task
 # units (inbox-consumer@, keep-going@), nothing that owns the session. The entry
 # is deliberately EMPTY and service_check SKIPS with a stated reason. Inventing a
 # plausible name here would produce a permanent "not active (got 'unknown')"
 # warning about a unit that was never supposed to exist.
 declare -A AGENT_SERVICE=( [recovery]=claude-telegram-fallback.service [orchestrator]=claude-telegram.service [specialist]=claude-telegram-research.service \
-                           [mnemosyne]=claude-telegram-exocortex.service [metis]= [atlas]= [codex]=codex-daemon.service )
+                           [archivist]=claude-telegram-exocortex.service [mason]= [artisan]= [codex]=codex-daemon.service )
+# T-5299: which seats run the Telegram plugin (and so have a poller child to find).
+# This is NOT derivable from AGENT_SERVICE: a control-plane seat gets a session unit from
+# restart-target whether or not it has a bot, and artisan (mailbox-first, no bot) has one
+# since its cutover. Keying the poller probe on the unit made artisan read "comms-dark" and
+# poller_escalate kill its healthy session. Unknown seat -> 0 -> NOT_APPLICABLE -> never
+# escalates (an unlisted seat must be added here deliberately to be poller-checked).
+declare -A AGENT_TELEGRAM=( [recovery]=1 [orchestrator]=1 [specialist]=1 [archivist]=1 [mason]=0 [artisan]=0 [codex]=0 )
 declare -A AGENT_HOME=( [recovery]=/home/claude-fallback [orchestrator]=/home/claude [specialist]=/home/claude-research \
-                        [mnemosyne]=/home/exocortex [metis]=/home/suborch1 [atlas]=/home/suborch2 [codex]=/home/codex )
+                        [archivist]=/home/exocortex [mason]=/home/suborch1 [artisan]=/home/suborch2 [codex]=/home/codex )
 # ⚠️ HARNESS. Every pane sentinel in this file — the idle '❯', the boot dialogs,
 # the liveness tokens — describes CLAUDE CODE's TUI. codex runs a different
 # harness with a different screen, so matching those patterns against its pane is
@@ -117,7 +139,7 @@ while (( $# )); do
     # --at-boot (T-1099): the reflexive SessionStart self-call. The pane is NOT
     # settled mid-boot, so C1-C3 pane_check is SKIPPED (would false-positive
     # rc=7). Implies --self + --no-dewedge (NEVER send-keys into our own pane —
-    # T-0559 no-self-inject). Only the SOFT guards run (C4/C6/C7/C8); RC stays 0.
+    # T-0559 no-self-inject). Only the SOFT guards run (C4/C6/C7/C8/C10); RC stays 0.
     --at-boot)    AT_BOOT=1; SELF_MODE="1"; DEWEDGE=0; shift ;;
     --pane)       PANE_OVERRIDE="${2:-}"; shift 2 ;;
     --timeout)    CAPTURE_TIMEOUT="${2:-15}"; shift 2 ;;
@@ -151,6 +173,21 @@ NOTES=()
 warn() { WARNINGS+=("$1"); }
 note() { NOTES+=("$1"); }
 
+# T-4159: a restart-bound seat's session-owning unit and supervisor come from
+# instance.yaml (agent_role_map.py restart-target), overriding the static map
+# above. On a control-plane seat (specialist today; recovery/orchestrator after their T-3650
+# hand-move) the unit that tracks the pane is pantheon-runtime-controller@<p>
+# and the bespoke claude-telegram*.service is retired: checking it is a false
+# WARN, and restarting it would resurrect a second supervisor. Fail-open: a
+# persona with no restart binding (mason/artisan/codex) keeps its static entry.
+AGENT_SUPERVISOR="bespoke"
+ROLE_MAP="${PANTHEON_AGENT_ROLE_MAP:-$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/agent_role_map.py}"
+if _rt="$(timeout 10 python3 "$ROLE_MAP" restart-target "$AGENT" 2>/dev/null)"; then
+  _su="$(sed -n 's/^SESSION_UNIT=//p' <<<"$_rt")"
+  [[ -n "$_su" ]] && AGENT_SERVICE[$AGENT]="$_su"
+  [[ "$(sed -n 's/^SUPERVISOR=//p' <<<"$_rt")" == "control-plane" ]] && AGENT_SUPERVISOR="control-plane"
+fi
+
 # Capture the target pane. Self → direct; cross-account → sudo -n -u + XDG.
 # Returns 0 + pane on stdout, or non-zero on capture failure (caller treats as SOFT).
 capture_pane() {
@@ -179,9 +216,24 @@ pane_is_idle() {
     && ! printf '%s' "$pane" | grep -Eq "$DIALOG_EXCLUDE"
 }
 
+# Codex control-plane runtime (and the dedicated Codex seat): recognize only a
+# complete live composer. A prompt-like glyph in output or an old footer in
+# scrollback is insufficient, and modal text in the same bottom region is a
+# hard veto. Everything else continues through the fail-closed path.
+codex_pane_is_idle() {
+  local pane="$1" bottom
+  [[ "$AGENT_SUPERVISOR" == "control-plane" || "${AGENT_HARNESS[$AGENT]:-}" == "codex" ]] || return 1
+  # capture-pane -e preserves SGR colour/style sequences; remove those before
+  # applying line-anchored structural patterns.
+  bottom="$(printf '%s\n' "$pane" | sed $'s/\033\\[[0-9;]*m//g' | grep -v '^[[:space:]]*$' | tail -n "$BOTTOM_REGION_LINES")"
+  printf '%s\n' "$bottom" | grep -Eq "$CODEX_IDLE_PROMPT" \
+    && printf '%s\n' "$bottom" | grep -Eq "$CODEX_IDLE_FOOTER" \
+    && ! printf '%s\n' "$bottom" | grep -Eq "$DIALOG_EXCLUDE|$CODEX_DIALOG_EXCLUDE"
+}
+
 # --- T-2345: an idle pane is NOT a reachable agent. ---
 #
-# MEASURED 2026-07-28 recovering mnemosyne: a session blocked on a boot modal never
+# MEASURED 2026-07-28 recovering archivist: a session blocked on a boot modal never
 # initialises the telegram plugin, AND THE PLUGIN DOES NOT RETRY once the modal
 # clears. After the dialog was dismissed the pane went idle and looked perfectly
 # healthy — with no `bun ... telegram/<ver> start` child and no `bun server.ts`
@@ -200,16 +252,16 @@ pane_is_idle() {
 # Tri-state on purpose (T-2307 rule): "could not ask" is not "absent". ABSENT is
 # actionable and fails the check; UNKNOWN must not claim health and must not cry wolf.
 POLLER_PRESENT="PRESENT"; POLLER_ABSENT="ABSENT"; POLLER_UNKNOWN="UNKNOWN"
-POLLER_NA="NOT_APPLICABLE"   # seat has no telegram plugin by design (metis/atlas)
+POLLER_NA="NOT_APPLICABLE"   # seat has no telegram plugin by design (mason/artisan)
 
 poller_child_state() {
-  # Seats with no telegram plugin have no poller BY DESIGN — metis and atlas launch
+  # Seats with no telegram plugin have no poller BY DESIGN — mason and artisan launch
   # bare (verified: runner=0 server=0 on both, against runner=1 server=1 on orchestrator,
-  # specialist and mnemosyne). Reporting them ABSENT would be a permanent false alarm on
+  # specialist and archivist). Reporting them ABSENT would be a permanent false alarm on
   # a correct configuration, which is how a check gets muted. The telegram seats are
   # exactly the ones with a telegram session unit; codex never reaches here (the
   # harness guard refuses before the de-wedge).
-  if [[ -z "${AGENT_SERVICE[$AGENT]:-}" ]]; then echo "$POLLER_NA"; return; fi
+  if [[ -z "${AGENT_SERVICE[$AGENT]:-}" || "${AGENT_TELEGRAM[$AGENT]:-0}" != 1 ]]; then echo "$POLLER_NA"; return; fi
   # Both halves must be present: the plugin runner and its bun server child. The
   # 2026-07-28 case had NEITHER, but a half-started pair is equally not-reachable.
   #
@@ -279,6 +331,18 @@ poller_escalate() {
     warn "poller absent and $AGENT has NO session-owning unit (T-2210) — escalation UNAVAILABLE, reporting rather than attempting"
     return 1
   fi
+  if [[ "$AGENT_SUPERVISOR" == "control-plane" ]]; then
+    # T-4159: restarting the runtime controller would just re-ATTACH to the same
+    # live pane (T-4101), so the poller stays dead. Killing the session is the
+    # control-plane cycle: the controller's blocking wait returns, Restart=always
+    # relaunches. (That relaunch gets no post_start boot kick yet: T-3650 F1.)
+    local sess="${AGENT_PANE[$AGENT]%%:*}"
+    note "poller child absent after de-wedge — killing control-plane session $sess so ${AGENT_SERVICE[$AGENT]} relaunches it [T-2345/T-4159]"
+    timeout 30 sudo -n -u "$AGENT_UNIX_USER" bash -c \
+      "XDG_RUNTIME_DIR=/run/user/\$(id -u) tmux kill-session -t '$sess'" 2>/dev/null || {
+        warn "control-plane session kill of $sess failed"; return 1; }
+    return 0
+  fi
   note "poller child absent after de-wedge — cycling ${AGENT_SERVICE[$AGENT]} (the only thing that respawns it) [T-2345]"
   timeout 30 sudo -n -u "$AGENT_UNIX_USER" bash -c \
     "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user restart '${AGENT_SERVICE[$AGENT]}'" 2>/dev/null || {
@@ -295,7 +359,7 @@ pane_check() {
     PANE_VERDICT="uncheckable"
     return
   fi
-  if pane_is_idle "$pane" || bottom_shows_live_input "$pane"; then
+  if pane_is_idle "$pane" || bottom_shows_live_input "$pane" || codex_pane_is_idle "$pane"; then
     PANE_VERDICT="ok"; return
   fi
   # Not idle: is this the dismissable boot dialog (and nothing dangerous co-present)?
@@ -318,7 +382,7 @@ sentinels describe Claude Code only, so it will not guess at a dismissal (fail-c
     fi
     sleep 1
     local after
-    if after="$(capture_pane)" && { pane_is_idle "$after" || bottom_shows_live_input "$after"; }; then
+    if after="$(capture_pane)" && { pane_is_idle "$after" || bottom_shows_live_input "$after" || codex_pane_is_idle "$after"; }; then
       note "boot dialog dismissed; pane now idle"
       # T-2345: the pane recovering is NOT the agent being reachable. The plugin
       # does not retry after a modal clears, so this is exactly where a comms-dark
@@ -328,7 +392,7 @@ sentinels describe Claude Code only, so it will not guess at a dismissal (fail-c
           note "telegram poller child present — agent is actually reachable"
           PANE_VERDICT="ok"; return ;;
         "$POLLER_NA")
-          note "no telegram poller expected for $AGENT (no session unit) — pane recovery is the whole check here"
+          note "no telegram poller expected for $AGENT (no telegram plugin / no session unit) — pane recovery is the whole check here"
           PANE_VERDICT="ok"; return ;;
         "$POLLER_ABSENT")
           warn "pane is idle but the telegram poller child is ABSENT — agent is COMMS-DARK behind a healthy-looking prompt (T-2345)"
@@ -388,6 +452,8 @@ service_check() {
     note "no session-owning service for $AGENT — skipping (its tmux session is not unit-managed)"
     return
   fi
+  [[ "$AGENT_SUPERVISOR" == "control-plane" ]] && \
+    note "session supervisor for $AGENT: ${AGENT_SERVICE[$AGENT]} (control-plane per instance.yaml) [T-4159]"
   [[ "$SELF_MODE" == "1" ]] && return
   st="$(timeout 5 sudo -n -u "$AGENT_UNIX_USER" bash -c "XDG_RUNTIME_DIR=/run/user/\$(id -u) systemctl --user is-active '${AGENT_SERVICE[$AGENT]}'" 2>/dev/null || true)"
   [[ "$st" == "active" ]] || warn "service ${AGENT_SERVICE[$AGENT]} not active (got '${st:-unknown}') (SOFT)"
@@ -426,6 +492,12 @@ githooks_check() {
   if [[ "$SELF_MODE" == "1" ]]; then
     hp="$(git -C "$repo" config --get core.hooksPath 2>/dev/null || true)"
   else
+    # T-5223: an unset key and a refused sudo both exit 1, so probe sudo first;
+    # without the grant the read is UNKNOWN, not a false "hooks are OFF".
+    if ! timeout 5 sudo -n -u "$AGENT_UNIX_USER" true 2>/dev/null; then
+      note "git hooks UNKNOWN: cannot read $AGENT_UNIX_USER's core.hooksPath cross-account (no sudo -n -u grant)"
+      return
+    fi
     hp="$(timeout 5 sudo -n -u "$AGENT_UNIX_USER" bash -c "git -C '$repo' config --get core.hooksPath" 2>/dev/null || true)"
   fi
   if [[ "$hp" == ".githooks" || "$hp" == */.githooks ]]; then
@@ -484,6 +556,23 @@ monitor_dropins_check() {
   fi
 }
 
+# --- C10: break-glass flag (SOFT; T-4392 phase 2a). While a LIVE flag stands for this
+# account, the fail-closed hooks it names FAIL OPEN on their fail-closed paths until it
+# expires; surface it at every boot. The base is world-readable (root:root 0755), so the
+# listing needs no sudo even cross-account. Read-only, via the helper's own parser (the same
+# checks the hooks apply). PANTHEON_BREAKGLASS_LIST_BASE is a test seam only (like
+# PANTHEON_VERIFY_PROC_ROOT); the hooks never read it.
+breakglass_check() {
+  local helper line out
+  helper="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/hooks/_failclosed.py"
+  [[ -f "$helper" ]] || return
+  out="$(timeout 5 python3 "$helper" --list --account "$AGENT_UNIX_USER" \
+         --base "${PANTHEON_BREAKGLASS_LIST_BASE:-/var/lib/pantheon-breakglass}" 2>/dev/null || true)"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && warn "BREAK-GLASS flag for ${AGENT_UNIX_USER}: ${line} — a LIVE flag makes the named fail-closed hooks FAIL OPEN until expiry (SOFT) [T-4392]"
+  done <<<"$out"
+}
+
 if (( AT_BOOT )); then
   note "at-boot mode: pane check skipped (pane not settled mid-boot); SOFT guards only, no de-wedge"
 else
@@ -495,6 +584,7 @@ handoff_check
 githooks_check
 timers_check
 monitor_dropins_check
+breakglass_check
 
 # --- report ---
 RC=0

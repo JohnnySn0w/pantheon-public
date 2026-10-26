@@ -1,0 +1,51 @@
+{
+  "schema": "pantheon-fixture-provenance/v1",
+  "ticket": "T-5005",
+  "note": "H0 captures (T-5005) against Hermes Agent v0.22.0, commit e06df9c2eae6901f4c88f464e0ae6e753c0428b8 (codeload tarball sha256 d219fb6a579545e2e3a0673d34c4915212ac577690b942195ec261319683a5ad), run as a probe account with every model request sent to a local stub endpoint; no DeepSeek API key existed. Redacted for the public mirror: the probe account's home path is replaced by /home/seat-account and the host name read back by the read_file tool probe by host0. Session ids and timestamps are as captured.",
+  "redactions": [
+    "probe account home path -> /home/seat-account",
+    "host name in the read_file tool_result -> host0 (same byte length)"
+  ],
+  "fixtures": {
+    "success.jsonl": {
+      "provenance": "h0-captured (hermes v0.22.0 e06df9c2, local stub endpoint)",
+      "source": "h0/stream_ok.jsonl: chat --format stream-json, one turn. Carries the non-JSON stdout line Hermes prints when it normalizes the deepseek-chat alias to deepseek-flash."
+    },
+    "tools.jsonl": {
+      "provenance": "h0-captured (hermes v0.22.0 e06df9c2, local stub endpoint)",
+      "source": "h0/turns/mode_tool/stdout.jsonl: one read_file tool call (tool_use, tool_result) then text and result"
+    },
+    "interrupted.jsonl": {
+      "provenance": "h0-captured (hermes v0.22.0 e06df9c2, local stub endpoint)",
+      "source": "h0/turns/mode_503/stdout.jsonl: the stub served HTTP 503, Hermes retried past 116s, and an outer `timeout 120` SIGTERM ended it as result exit_code 130, error Interrupted (wrapper rc 124)"
+    },
+    "balance_402.jsonl": {
+      "provenance": "h0-captured, stub-derived error body",
+      "source": "h0/turns/mode_402/stdout.jsonl: the stub returned HTTP 402 with DeepSeek's documented Insufficient Balance body"
+    },
+    "rate_limit_429.jsonl": {
+      "provenance": "h0-captured, stub-derived error body",
+      "source": "h0/turns/mode_429/stdout.jsonl: the stub returned HTTP 429 with DeepSeek's documented rate-limit body (3 attempts)"
+    },
+    "auth_401.jsonl": {
+      "provenance": "h0-captured, stub-derived error body",
+      "source": "h0/turns/mode_401/stdout.jsonl: the stub returned HTTP 401 with DeepSeek's documented Authentication Fails body"
+    },
+    "pane_idle.txt": {
+      "provenance": "h0-captured (hermes v0.22.0 e06df9c2, local stub endpoint)",
+      "source": "h0/tui/classic2/01_idle.txt: classic interactive UI at idle (tmux capture-pane)"
+    },
+    "pane_busy.txt": {
+      "provenance": "h0-captured (hermes v0.22.0 e06df9c2, local stub endpoint)",
+      "source": "h0/tui/classic2/03_busy.txt: classic interactive UI mid-turn"
+    },
+    "pane_balance_402.txt": {
+      "provenance": "h0-captured, stub-derived error body",
+      "source": "h0/tui/classic2/06_402.txt: classic interactive UI after a turn the stub answered with HTTP 402"
+    },
+    "default_config_leaves.txt": {
+      "provenance": "h0-captured (hermes v0.22.0 e06df9c2, read-only import of hermes_cli.config_defaults)",
+      "source": "h0/default_config_leaves.txt: every DEFAULT_CONFIG leaf as 'dotted.path = json-value' (939 lines), dumped as the probe account. Upstream shipped defaults only; no host, account or secret data (the dashboard auth fields are empty-string defaults)."
+    }
+  }
+}

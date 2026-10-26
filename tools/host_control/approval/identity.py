@@ -36,10 +36,17 @@ class ApproverResolver:
     def subject_for_uid(self, uid: object) -> str | None:
         if not isinstance(uid, int) or isinstance(uid, bool) or uid < 0:
             return None
+        # T-2919 Q4: a HUMAN-decision-source approver has no Reviewer
+        # standing at all. Its only path is the provider-authenticated
+        # HumanIngress; its policy uid is the ingress uid, which must never
+        # open reviews or request cards. The harness registration gate
+        # (host_mcp_registration.is_policy_approver) delegates here, so
+        # generation and server share this one predicate.
         candidates = [
             subject
-            for subject in self._policy.approvers
-            if self._policy.subject_uids.get(subject) == uid
+            for subject, entry in self._policy.approvers.items()
+            if entry.decision_source == "agent"
+            and self._policy.subject_uids.get(subject) == uid
         ]
         if len(candidates) == 1:
             return candidates[0]

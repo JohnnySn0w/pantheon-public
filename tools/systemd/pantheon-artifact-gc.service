@@ -11,7 +11,6 @@ OnFailure=pantheon-unit-failure-alert@%n.service
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
 # --apply is required for the tool to actually remove+commit; a bare invocation
 # is report-only by design. Conservative 30d grace + scope-guarded commit.
 ExecStart=/usr/bin/python3 %h/pantheon-config/tools/artifact_gc.py --apply

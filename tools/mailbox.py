@@ -139,7 +139,7 @@ _VALID_SEVERITIES = frozenset({"normal", "urgent"})
 # BUILD-NOT-ACTIVATE KILL SWITCH. `severity="urgent"` is NOT hypothetical-future-only
 # by the time this lands — five live producers already use it (this module's own
 # _alert_owner DLQ path, credential_expiry_monitor, disk_usage_monitor,
-# ancestor_consume, unit_failure_alert), and mailbox_wake's timer sweep is ALREADY
+# the since-removed ancestor_consume, unit_failure_alert), and mailbox_wake's timer sweep is ALREADY
 # running fleet-wide for every persona. So every Phase-2 side effect below (rate-limit
 # bookkeeping, the .urgent_pending marker, mailbox_wake's debounce-bypass) is gated by
 # this ONE flag, default OFF, so merging this file changes ZERO live behavior. With the
@@ -241,8 +241,8 @@ def _write_urgent_marker(inbox: Path, sender: str, subject, name: str) -> None:
 # reply_inbox), an unvalidated value is a path-injection sink — traversal or an odd
 # charset would create directories outside the mailbox tree. Constrain every caller AT
 # THE SINK (send) to an absolute, traversal-free, safe-charset path. This is the
-# defense-in-depth root guard ancestor_consume's payload-level _safe_inbox check (this
-# same shape, applied earlier) layers on top of (T-0906).
+# defense-in-depth root guard (T-0906). Its original payload-level layer,
+# ancestor_consume's _safe_inbox check, was removed with that module (T-4741 #835).
 _INBOX_RE = re.compile(r"/[A-Za-z0-9/._-]+\Z")
 
 
@@ -257,6 +257,26 @@ class MailboxNotFound(FileNotFoundError):
     (OSError, ValueError, TypeError) tuple several producers use) — they
     catch this for free, with zero code changes at those call sites.
     """
+
+
+def _alias_hint(inbox: Path) -> str:
+    """T-4311: when a missing inbox is named by a persona ALIAS (consultant), name the
+    canonical box that does exist (codex). Only a hint in the error: send() never
+    redirects, since delivering to a path other than the one given would move the
+    trust boundary (T-2216). agent_role_map is imported lazily, as for the hub
+    (see _manifest_hub), and any failure means no hint."""
+    try:
+        try:
+            from tools.agent_role_map import PERSONA_ALIASES
+        except ImportError:  # bare run with cwd=tools/
+            from agent_role_map import PERSONA_ALIASES
+        canonical = PERSONA_ALIASES.get(inbox.name)
+        if canonical and canonical != inbox.name and exists(inbox.with_name(canonical)):
+            return (f"; {inbox.name} is an alias of {canonical}, whose mailbox is "
+                    f"{inbox.with_name(canonical)}")
+    except Exception:  # noqa: BLE001 - a hint must never mask the real error
+        pass
+    return ""
 
 
 def is_safe_inbox(path) -> bool:
@@ -338,7 +358,7 @@ def sender_session() -> str | None:
 
     WHAT THIS EXISTS FOR. `sender` is derived from $USER, so two CONCURRENT
     sessions of one persona are one name to the recipient. That is not
-    hypothetical: over 2026-07-28 17:58Z-18:41Z mnemosyne received five
+    hypothetical: over 2026-07-28 17:58Z-18:41Z archivist received five
     messages signed `specialist` from two concurrent claude-research sessions with
     DIFFERENT TOOL CAPABILITIES, treated them as one correspondent, and acted
     on a diagram review whose visual claims the other session then retracted.
@@ -347,7 +367,7 @@ def sender_session() -> str | None:
 
     WHY NOT THE PID, which was the obvious cheap candidate and is already in
     the maildir filename `<ts_ns>.<pid>.<seq>.<sender>`: MEASURED over the 76
-    specialist-signed messages in mnemosyne's cur/, there are 76 DISTINCT PIDS.
+    specialist-signed messages in archivist's cur/, there are 76 DISTINCT PIDS.
     Sends go through a fresh short-lived process each time, so the pid is
     per-SEND. Surfacing it would manufacture 76 apparent correspondents out of
     one name — worse than one name, because it looks like a discriminator and
@@ -533,9 +553,9 @@ def send(recipient_inbox, payload, sender: str, *, subject: str | None = None,
         provision(inbox)
     elif not exists(inbox):
         raise MailboxNotFound(
-            f"recipient inbox {inbox} does not exist (pass provision_if_missing=True "
-            "to create it, or call provision() explicitly at a deliberate "
-            "onboarding/seed site)"
+            f"recipient inbox {inbox} does not exist{_alias_hint(inbox)} (pass "
+            "provision_if_missing=True to create it, or call provision() explicitly "
+            "at a deliberate onboarding/seed site)"
         )
 
     # Urgent Phase 2 (T-1641), flag-gated (see urgent_phase2_enabled() above): a
@@ -622,6 +642,17 @@ def send(recipient_inbox, payload, sender: str, *, subject: str | None = None,
 _SENT_LEDGER = Path.home() / ".local" / "state" / "pantheon" / "sent.jsonl"
 
 
+def _manifest_hub() -> str:
+    """instance.yaml's mailbox.hub via agent_role_map (T-4096). Imported LAZILY: this
+    is the fleet's leaf transport library (codex bwrap, the a2a venv, bare cwd=tools/
+    runs all import it), so it keeps agent_role_map off its module import path."""
+    try:
+        from tools.agent_role_map import mailbox_hub
+    except ImportError:  # bare run with cwd=tools/
+        from agent_role_map import mailbox_hub
+    return mailbox_hub()
+
+
 def _ledger_target(inbox: Path) -> Path | None:
     """Where to append for a delivery to `inbox`, or None to skip. Call-time.
 
@@ -649,10 +680,10 @@ def _ledger_target(inbox: Path) -> Path | None:
     if override:
         return Path(override)
     try:
-        hub = Path(os.environ.get("PANTHEON_MAILBOX_HUB", "/home/the-ancestor/mailbox"))
+        hub = Path(os.environ.get("PANTHEON_MAILBOX_HUB") or _manifest_hub())
         if inbox.resolve().parent != hub.resolve():
             return None          # not a real hub delivery — a fixture, not a send
-    except OSError:
+    except (OSError, ImportError):
         return None              # cannot tell where it went -> do not claim we sent it
     return _SENT_LEDGER
 
@@ -669,7 +700,7 @@ def _record_sent(inbox: Path, record: dict, name: str) -> None:
 
     Append-only, one JSON object per line, opened O_APPEND so concurrent senders on
     one account interleave whole lines rather than corrupting each other — the
-    two-executor case (specialist, mnemosyne) is the normal case here, not an edge.
+    two-executor case (specialist, archivist) is the normal case here, not an edge.
     """
     target = _ledger_target(inbox)
     if target is None:
@@ -724,7 +755,7 @@ def _dlq_attempts_path(inbox: Path, name: str) -> Path:
 #                    retried ~60x into the seat's context in ~74 minutes. Its
 #                    .attempts/ dir was EMPTY, which positively confirms the
 #                    exemption: never counted, therefore never bounded.
-#   mnemosyne (T-2384): the same quarantine at her seat left one mailbox-dlq
+#   archivist (T-2384): the same quarantine at her seat left one mailbox-dlq
 #                    message parked in new/, so the waker read exactly 1 unread
 #                    and re-kicked. 242 consecutive wakes across three days, all
 #                    saying "1". Every one of them was TRUE.
@@ -1135,7 +1166,7 @@ def _record_ack(inbox: Path, name: str, label: str | None) -> None:
     second is routine for a manual drain and says NOTHING about a bridge's
     per-message cost. Until the actor is recorded, no ack-density statistic from
     these maildirs is attributable to any consumer, by any seat — which is the
-    precise claim mnemosyne could not make, and could not refute, from ctimes.
+    precise claim archivist could not make, and could not refute, from ctimes.
 
     Never able to fail an ack: the message is already in cur/ when this runs, and
     losing a bookkeeping line is a far smaller harm than turning a completed ack
@@ -1239,7 +1270,7 @@ def _process(src_dir: Path, cur: Path, handler, *, inbox: Path,
             _clear_backoff(inbox, name)  # T-2386: success ends the retry history
             _record_ack(inbox, name, label)   # T-2266: WHO acked, not just when
         except FileNotFoundError:
-            # T-2279 (mnemosyne): the message is GONE because the other drain path
+            # T-2279 (archivist): the message is GONE because the other drain path
             # already acked it. That is the EXPECTED outcome of concurrent drain,
             # not a failure — and concurrent drain is the feature (T-2259 exists so
             # an idle main seat can take the queue instead of waiting on a long ACP
@@ -1511,7 +1542,7 @@ if __name__ == "__main__":  # pragma: no cover
         "mailbox.py is a LIBRARY and has no CLI.\n"
         "Import it instead:\n"
         "  python3 -c \"import sys; sys.path.insert(0,'/home/claude/pantheon-config/tools'); \"\\\n"
-        "            \"import mailbox; print(mailbox.send('/home/the-ancestor/mailbox/<to>', \"\\\n"
+        "            \"import mailbox; print(mailbox.send('/home/post-office/mailbox/<to>', \"\\\n"
         "            \"sender='<from>', subject='...', payload='...'))\"\n"
         "Use the ABSOLUTE tools path — a relative one silently imports Python's stdlib mailbox."
     )

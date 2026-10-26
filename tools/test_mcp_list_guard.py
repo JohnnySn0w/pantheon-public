@@ -7,7 +7,13 @@ load it via importlib to unit-test its core decision functions.
 
 from __future__ import annotations
 
+import ast
+import contextlib
 import importlib.util
+import random
+import re
+import signal
+import statistics
 import time
 import unittest
 from pathlib import Path
@@ -16,6 +22,35 @@ _HOOK_PATH = Path(__file__).resolve().parent / "hooks" / "mcp-list-guard.py"
 _spec = importlib.util.spec_from_file_location("mcp_list_guard", _HOOK_PATH)
 guard = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(guard)
+
+
+def _doubling_ratio(run_n, run_2n, repeats=9, clock=time.thread_time):
+    """Time `run_n()` then `run_2n()` back-to-back, `repeats` times, on `clock`.
+
+    T-4230: the default clock is CPU time of the calling thread, NOT wall time. A
+    loaded host steals wall clock unpredictably (measured over 30 runs at 17x
+    contention, the wall-clock median-of-9 ratio ranged 1.46..4.02 against a 3.0
+    bound; the CPU-time one ranged 2.01..2.30). CPU time is not advanced while the
+    scan is preempted, and this scan is pure-Python compute, so it is the honest
+    measure of the algorithm's work.
+
+    Returns (median of the per-repeat t(2N)/t(N) ratios, best t(2N) seen). Measuring
+    N and 2N microseconds apart cancels a slowly-varying ambient load level; the
+    median discards the minority of repeats where a stall landed inside one scan but
+    not the other.
+    """
+    ratios = []
+    best_2n = float("inf")
+    for _ in range(repeats):
+        start = clock()
+        run_n()
+        t_n = clock() - start
+        start = clock()
+        run_2n()
+        t_2n = clock() - start
+        ratios.append(t_2n / t_n)
+        best_2n = min(best_2n, t_2n)
+    return statistics.median(ratios), best_2n
 
 
 class CommandMatchTest(unittest.TestCase):
@@ -344,53 +379,129 @@ class TestHeredocBodiesAreData(unittest.TestCase):
         candidates, e.g. C++ `std::cout << "x" << y;` lines echoed/cat'd
         in a command. Measured pre-fix: 8000 `echo "nX << TX"` lines
         (174 KB) = 12s; 800 C++ lines = 0.5s. Fixed via an O(n) terminator
-        index built once + O(log n) bisect lookup per tag. 0.5s below is a
-        loaded-box-safe ceiling, not tight -- the O(n) version runs in a
-        few ms.
+        index built once + O(log n) bisect lookup per tag.
+
+        T-4118: the assertion is a SCALING RATIO, not a wall-clock budget.
+        The old `assertLess(elapsed, 0.5s)` false-failed under `pytest -n
+        auto` contention (the scan itself runs in tens of ms; a loaded box
+        just stole the wall clock). Complexity, not wall time, is what this
+        test exists to guard, so we time the scan at N and 2N false
+        candidates and assert the DOUBLING RATIO stays below a linear bound.
+        A linear (O(n log n)) scan gives t(2N)/t(N) ~ 2; the pre-fix
+        quadratic per-tag lookup gives ~4.
+
+        The ratio is made load-insensitive by measuring N and 2N
+        BACK-TO-BACK inside each repeat and taking the MEDIAN of the
+        per-repeat ratios. A per-repeat ratio cancels the ambient load
+        level -- both scans were slowed by the same factor microseconds
+        apart -- and the median discards the minority of repeats where a
+        preemption landed inside one scan but not the other (in either
+        direction). Min-of-ratios was rejected: it is linear-safe but
+        ALSO suppresses the quadratic signal (under load-16 a real
+        quadratic variant's min-ratio fell to 2.05, below the bound), so
+        it hides the regression this test exists to catch. Measured on a
+        load-14 box, median-of-9-ratios: linear impl 1.87-2.25, quadratic
+        variant 3.47-3.92 -- 3.0 separates them with ~0.75 margin either
+        side. The absolute ceiling below is kept ONLY as a hang guard,
+        deliberately generous, never the primary signal; a
+        deliberately-reintroduced quadratic terminator lookup fails BOTH
+        the ratio and the ceiling (verified under T-4118).
+
+        T-4230: the median-of-9 WALL-clock ratio still flaked on a heavily
+        loaded box (over 30 runs at 17x CPU contention it ranged 1.46..4.02,
+        crossing the 3.0 bound). The measurement is now CPU time
+        (`time.thread_time`) via `_doubling_ratio`, which a preemption cannot
+        inflate: 2.01..2.30 over the same 30 runs. Same bound, same median-of-9
+        back-to-back design; the quadratic variant is re-verified to fail it
+        (see DoublingRatioHarnessT4230 for the permanent harness self-check).
         """
-        budget_seconds = 0.5
+        # `echo "n{i} << T{i}"` = one `<<"literal"`-shaped FALSE heredoc
+        # candidate per line -> one terminator lookup per line, which is
+        # exactly the per-candidate work the quadratic bug multiplied by n.
+        def build(n_false_candidates):
+            lines = "\n".join(
+                f'echo "n{i} << T{i}"' for i in range(n_false_candidates)
+            )
+            return lines + "\ntimeout 45 claude mcp list"
 
-        false_candidate_lines = "\n".join(
-            f'echo "n{i} << T{i}"' for i in range(8000)
-        )
-        cmd_many_quoted_shifts = false_candidate_lines + "\ntimeout 45 claude mcp list"
-        start = time.perf_counter()
-        result = guard.command_targets_mcp_list(cmd_many_quoted_shifts)
-        elapsed = time.perf_counter() - start
-        self.assertTrue(result)
+        n = 3000
+        cmd_n = build(n)
+        cmd_2n = build(2 * n)
+
+        def scan(cmd):
+            # Positive control: the invocation after the false candidates is
+            # still seen at both sizes -- the scan is doing real work, not
+            # short-circuiting to a trivially-fast constant.
+            def run():
+                self.assertTrue(guard.command_targets_mcp_list(cmd))
+            return run
+
+        median_ratio, best_2n = _doubling_ratio(scan(cmd_n), scan(cmd_2n))
+
+        # PRIMARY signal: doubling the input at most ~doubles the work.
         self.assertLess(
-            elapsed, budget_seconds,
-            f"8000-line quoted-<< scan took {elapsed:.3f}s (budget {budget_seconds}s)"
+            median_ratio, 3.0,
+            f"heredoc terminator scan looks super-linear: median "
+            f"t(2N)/t(N)={median_ratio:.2f} (CPU time, 9 repeats) -- a "
+            f"quadratic per-candidate terminator lookup lands near 4.",
         )
 
+        # SECONDARY hang guard ONLY (never the primary signal), in CPU seconds so
+        # host load cannot trip it: even the best-case largest scan finishes far
+        # under a ceiling. The linear scan costs tens of ms of CPU; a truly
+        # quadratic one blows past this on a corpus this size (measured ~7.8-9.7s),
+        # so the ceiling independently catches the regression too.
+        self.assertLess(
+            best_2n, 5.0,
+            f"largest heredoc scan took {best_2n:.2f}s CPU -- over the 5s hang ceiling",
+        )
+
+        # Positive control (correctness, not timing): the SAME kind of
+        # false-candidate body, but genuinely INSIDE a terminated heredoc,
+        # is skipped wholesale via one bisect lookup, and the invocation
+        # after the terminator is still found.
         cpp_lines = "\n".join(
             f'std::cout << "line {i}" << x;' for i in range(1600)
         )
-        cmd_cpp_outside_heredoc = cpp_lines + "\ntimeout 45 claude mcp list"
-        start = time.perf_counter()
-        result = guard.command_targets_mcp_list(cmd_cpp_outside_heredoc)
-        elapsed = time.perf_counter() - start
-        self.assertTrue(result)
-        self.assertLess(
-            elapsed, budget_seconds,
-            f"1600-line C++ scan took {elapsed:.3f}s (budget {budget_seconds}s)"
-        )
-
-        # Positive control: the SAME C++ body, but genuinely INSIDE a
-        # terminated heredoc -- the whole body is skipped via one bisect
-        # lookup rather than scanned line-by-line, so this must be at
-        # least as fast as the untouched-body case above.
         cmd_cpp_inside_heredoc = (
             "cat <<'SRC'\n" + cpp_lines + "\nSRC\nclaude mcp list"
         )
-        start = time.perf_counter()
-        result = guard.command_targets_mcp_list(cmd_cpp_inside_heredoc)
-        elapsed = time.perf_counter() - start
-        self.assertTrue(result)
-        self.assertLess(
-            elapsed, budget_seconds,
-            f"heredoc-wrapped C++ scan took {elapsed:.3f}s (budget {budget_seconds}s)"
-        )
+        self.assertTrue(guard.command_targets_mcp_list(cmd_cpp_inside_heredoc))
+
+
+def _burn(iterations):
+    """Pure-Python CPU work whose cost is proportional to `iterations`."""
+    x = 0
+    for i in range(iterations):
+        x += i
+    return x
+
+
+class DoublingRatioHarnessT4230(unittest.TestCase):
+    """T-4230: proves the doubling-ratio measurement itself, independent of the hook,
+    so the linearity test cannot be silently neutered by a later edit to the harness.
+
+    The linearity test's bound (3.0) is only meaningful if (a) the harness really
+    separates linear from quadratic work and (b) it is immune to a host stall that
+    lands inside one scan and not the other -- the wall-clock harness was not, which
+    is what made the linearity test flake on a loaded box (T-4230)."""
+
+    def test_separates_linear_from_quadratic_work(self):
+        linear, _ = _doubling_ratio(lambda: _burn(100_000), lambda: _burn(200_000))
+        quadratic, _ = _doubling_ratio(lambda: _burn(100_000), lambda: _burn(400_000))
+        self.assertLess(linear, 3.0, f"linear work measured {linear:.2f}")
+        self.assertGreater(quadratic, 3.0, f"quadratic work measured {quadratic:.2f}")
+
+    def test_a_stall_outside_the_cpu_does_not_move_the_ratio(self):
+        # Stand-in for the host preempting the scan (17x contention): every 2N run
+        # also sleeps 150ms of WALL time and burns no extra CPU. A wall-clock
+        # harness reads ~30 here; a CPU-time harness must still read ~2.
+        def stalled_2n():
+            _burn(200_000)
+            time.sleep(0.15)
+
+        ratio, _ = _doubling_ratio(lambda: _burn(100_000), stalled_2n, repeats=5)
+        self.assertLess(ratio, 3.0, f"harness measured wall time, not CPU time: {ratio:.2f}")
 
 
 class TestQuotedDoubleAngleProseNeverOpensAHeredoc(unittest.TestCase):
@@ -415,6 +526,208 @@ class TestQuotedDoubleAngleProseNeverOpensAHeredoc(unittest.TestCase):
         for cmd in cmds:
             with self.subTest(cmd=cmd):
                 self.assertTrue(guard.command_targets_mcp_list(cmd))
+
+
+# T-4392 phase 2b: the pre-fix command-position regex, kept VERBATIM as the
+# differential oracle. The hook now computes the same match sequence with a
+# linear scanner (`_claude_invocation_args`); this regex is super-linear
+# (quadratic on newline runs, exponential on `timeout -1 -1 ...`), so it is
+# only ever run on the short inputs below.
+_OLD_WRAPPER_ARG = r"(?:-\S*|-?\d+(?:\.\d+)?[smhd]?|[A-Z][A-Z0-9_]*)"
+_OLD_WRAPPER = (
+    r"(?:[^\s=]*/)?"
+    r"(?:command|exec|nohup|setsid|timeout|time|nice|env|stdbuf|ionice|chrt)"
+    r"(?:\s+" + _OLD_WRAPPER_ARG + r")*"
+)
+_OLD_ENV_ASSIGN = r"[A-Za-z_][A-Za-z0-9_]*=[^\s;&|`\n()]*"
+_OLD_CLAUDE_CMD_RE = re.compile(
+    r"(?:^|[;&|`\n(])\s*"
+    r"(?:(?:" + _OLD_WRAPPER + r"|" + _OLD_ENV_ASSIGN + r")\s+)*"
+    r"(?:[^\s=]*/)?claude(?=\s|[;&|`)\n]|$)"
+    r"([^;&|`\n]*)"
+)
+
+
+def _old_args(stripped):
+    return [m.group(1) or "" for m in _OLD_CLAUDE_CMD_RE.finditer(stripped)]
+
+
+def _old_verdict(command):
+    """command_targets_mcp_list as it was before T-4392, on the oracle regex."""
+    if not command:
+        return False
+    stripped = guard._SUBST_RE.sub(
+        ";", guard._QUOTED_RE.sub(" ", guard._strip_heredoc_bodies(command)))
+    for args in _old_args(stripped):
+        if guard._SAFE_ARGS_RE.search(args):
+            continue
+        if guard._PRINT_RE.search(args) and guard._SAFE_MODE_RE.search(args):
+            continue
+        return True
+    return False
+
+
+def _existing_test_commands():
+    """Every string literal in this file that looks like a shell command -- the
+    corpus the existing behavioural tests pin."""
+    tree = ast.parse(Path(__file__).read_text(encoding="utf-8"))
+    out = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value:
+            out.add(node.value)
+    return sorted(out)
+
+
+_FUZZ_WORDS = (
+    "claude", "/usr/bin/claude", "claude-bot-supervise.sh", "a/claude", "x/claude;",
+    "claude;x", "(claude", "a;claude", "/home/claude", "HOME=/home/claude", "FOO=a;b",
+    "command", "exec", "nohup", "setsid", "timeout", "time", "nice", "env", "stdbuf",
+    "ionice", "chrt", "/usr/bin/env", "-x/env", "-x/claude", "a=b/env", "envx",
+    "A=1", "a=1", "_=", "X=/claude", "--print", "-p", "--safe-mode", "--version",
+    "--help", "-h", "-n", "5", "-5", "1.5m", "KILL", "FOO", "ls", "mcp", "list", "-",
+)
+_FUZZ_SEPS = (";", "&", "|", "`", "\n", "(", ")", " ", "  ", "\t", " ; ", " && ",
+              "\n ", " ", "\x1c", "$(")
+
+
+def _fuzz_commands(seed=4392, count=4000):
+    rng = random.Random(seed)
+    for _ in range(count):
+        parts = []
+        for _ in range(rng.randint(1, 10)):
+            parts.append(rng.choice(_FUZZ_WORDS))
+            parts.append(rng.choice(_FUZZ_SEPS) if rng.random() < 0.35 else " ")
+        if rng.random() < 0.5:
+            parts.pop()
+        yield "".join(parts)
+
+
+class TestLinearScannerMatchesOldRegexT4392(unittest.TestCase):
+    """T-4392 phase 2b: the linear scanner must compute EXACTLY what the old
+    regex computed -- the same (args) sequence, hence the same verdict -- on
+    every input. Differential against the verbatim old regex above."""
+
+    def _assert_same(self, cmd):
+        stripped = guard._SUBST_RE.sub(
+            ";", guard._QUOTED_RE.sub(" ", guard._strip_heredoc_bodies(cmd)))
+        self.assertEqual(list(guard._claude_invocation_args(stripped)),
+                         _old_args(stripped), repr(cmd))
+        # raw (un-normalised) text too: the scanner mirrors the regex on ANY string
+        self.assertEqual(list(guard._claude_invocation_args(cmd)), _old_args(cmd), repr(cmd))
+        self.assertEqual(guard.command_targets_mcp_list(cmd), _old_verdict(cmd), repr(cmd))
+
+    def test_existing_corpus(self):
+        corpus = _existing_test_commands()
+        self.assertGreater(len(corpus), 100)
+        for cmd in corpus:
+            if len(cmd) <= 400:  # the oracle is slow on the big linearity inputs
+                self._assert_same(cmd)
+
+    def test_seeded_fuzz(self):
+        start = time.thread_time()
+        n = 0
+        denies = 0
+        for cmd in _fuzz_commands():
+            self._assert_same(cmd)
+            n += 1
+            denies += guard.command_targets_mcp_list(cmd)
+        self.assertEqual(n, 4000)
+        # the corpus must exercise both verdicts, not just one side
+        self.assertGreater(denies, 400)
+        self.assertLess(n - denies, n - 400)
+        self.assertLess(time.thread_time() - start, 5.0)
+
+
+_LINEAR_BOUND_S = 1.0
+_HARD_STOP_S = 10
+# The doubling-ratio test runs 3 repeats at two sizes (~0.5s CPU in all) under ONE
+# hard stop; on a heavily contended CI runner that is several seconds of wall clock,
+# so it gets more headroom. The stop only turns a hang into a failure, and the CPU-time
+# ratio and bound still decide pass/fail.
+_RATIO_HARD_STOP_S = 30
+
+
+@contextlib.contextmanager
+def _hard_stop(label, seconds=_HARD_STOP_S):
+    """SIGALRM wall-clock hard stop: a super-linear regression FAILS instead of
+    hanging the suite (the regex engine checks signals, so this interrupts it)."""
+    def _hang(signum, frame):  # pragma: no cover - only on a regression
+        raise AssertionError(f"hung past {seconds}s wall clock: {label!r}")
+
+    old = signal.signal(signal.SIGALRM, _hang)
+    signal.alarm(seconds)
+    try:
+        yield
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
+
+
+def _cpu_bounded(test, fn, *args, label=""):
+    """fn(*args), asserting under _LINEAR_BOUND_S of CPU time (time.thread_time,
+    load-insensitive), under the hard stop (tools/test_worker_guard.py style)."""
+    with _hard_stop(label):
+        start = time.thread_time()
+        result = fn(*args)
+        elapsed = time.thread_time() - start
+    test.assertLess(elapsed, _LINEAR_BOUND_S, f"{label!r} took {elapsed:.3f}s CPU")
+    return result
+
+
+class TestCommandPositionScanIsLinearT4392(unittest.TestCase):
+    """T-4392 phase 2b: this hook runs on EVERY Bash call on the seats, so its
+    cost must be linear in the command length. Pre-fix, `"\\n"*N` cost 3.3s CPU at
+    4 KB (quadratic: each newline a fresh command position rescanning the rest)
+    and `"timeout " + "-1 "*22` (74 bytes) cost 6.4s (exponential: `-1` matches
+    two wrapper-arg alternatives). Each shape below runs at 64 KiB well under
+    1s CPU, and doubling N at most ~doubles the work."""
+
+    SIZE = 64 * 1024
+    # A non-invoking `claude` mention: the scanner short-circuits on text with no
+    # `claude` at all, so the False shapes carry one to force the full scan.
+    MENTION = " ls /home/claude"
+
+    # (prefix, unit, suffix, expected verdict at every size)
+    SHAPES = (
+        ("", "\n", MENTION, False),
+        ("", "a=1\n", MENTION, False),
+        ("", "; ", MENTION, False),
+        ("", "env ", "claude", True),
+        ("", "A=1 ", MENTION, False),
+        ("", "A=1 ", "claude", True),
+        ("", "\n ", MENTION, False),
+        ("", ";a", MENTION, False),
+        ("", "(/", MENTION, False),
+        ("timeout ", "-1 ", MENTION, False),        # exponential pre-fix
+        ("timeout ", "-x/timeout ", MENTION, False),
+        ("", "timeout -1 ", "claude", True),
+    )
+
+    @staticmethod
+    def _build(prefix, unit, suffix, size):
+        return prefix + unit * (size // len(unit)) + suffix
+
+    def test_each_shape_is_fast_at_64k(self):
+        for prefix, unit, suffix, verdict in self.SHAPES:
+            cmd = self._build(prefix, unit, suffix, self.SIZE)
+            with self.subTest(unit=unit, suffix=suffix):
+                got = _cpu_bounded(self, guard.command_targets_mcp_list, cmd,
+                                   label=f"{prefix!r}+{unit!r}*N+{suffix!r}")
+                self.assertEqual(got, verdict)
+
+    def test_doubling_ratio_is_linear(self):
+        for prefix, unit, suffix, _ in self.SHAPES:
+            cmd_n = self._build(prefix, unit, suffix, self.SIZE // 2)
+            cmd_2n = self._build(prefix, unit, suffix, self.SIZE)
+            with self.subTest(unit=unit, suffix=suffix):
+                with _hard_stop(unit, _RATIO_HARD_STOP_S):
+                    ratio, best_2n = _doubling_ratio(
+                        lambda: guard.command_targets_mcp_list(cmd_n),
+                        lambda: guard.command_targets_mcp_list(cmd_2n),
+                        repeats=3,
+                    )
+                self.assertLess(ratio, 3.0, f"{unit!r}: t(2N)/t(N)={ratio:.2f}")
+                self.assertLess(best_2n, _LINEAR_BOUND_S)
 
 
 if __name__ == "__main__":

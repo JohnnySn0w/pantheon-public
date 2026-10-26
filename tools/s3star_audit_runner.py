@@ -59,13 +59,16 @@ Modes (default-safe contract, mirrors ``tools/watch_runner.py``):
         No side effects.
 
     python3 tools/s3star_audit_runner.py --file-dispatch-ticket [--slot SLOT] [--force] [--auto-dispatch]
-        Prod mode. File ONE target=orchestrator dispatch ticket per due (or named)
+        Prod mode. File ONE target=role:engineering_orchestrator dispatch ticket per due (or named)
         slot, embedding the brief + supervised hand-off instructions.
         --auto-dispatch raises a clear not-implemented error instead of running.
 
     python3 tools/s3star_audit_runner.py --land-findings --slot SLOT --findings-file PATH
         Prod mode. Parse a findings file Codex/the operator wrote, file one
-        ticket per finding to the domain owner (never target=codex).
+        ticket per finding to the domain owner (never target=codex). T-4314: the
+        file must end with the closing sentinel `s3star-audit-end: findings=N`
+        (N = its `## Finding` sections); a missing/mismatched sentinel is rc 1
+        with nothing filed, so a truncated run cannot land as a clean audit.
 
     python3 tools/s3star_audit_runner.py --launch-audit --slot SLOT [--date YYYY-MM-DD]
         Prod mode (T-1604). HO-run: spawn the dedicated codex-audit session,
@@ -180,10 +183,11 @@ WRAPPER_PATH = os.environ.get("S3STAR_TMUX_WRAPPER", "/usr/local/bin/pantheon-s3
 # profile misbehaves in the TUI.
 AUDIT_PROFILE = "s3star-audit-p2"
 #
-# AUDIT_WORKSPACE_ROOT is owned the-ancestor:veneration, setgid (2770).
-# Codex (uid in group veneration) writes here as its one writable root under
-# the profile; the runner (claude, also in group veneration — confirmed via
-# `id`) both writes the runtime snapshot here directly and reads back
+# AUDIT_WORKSPACE_ROOT is claude:pantheon-mailbox, setgid (2770), under the shared
+# /var/lib/pantheon (T-5514 moved it off /home/the-ancestor before that account is
+# retired; earlier comments named the-ancestor:veneration). Codex (in group
+# pantheon-mailbox) writes here as its one writable root under the profile; the
+# runner (claude, also in pantheon-mailbox) both writes the runtime snapshot here directly and reads back
 # whatever codex wrote, with no cross-account ACL grant needed in either
 # direction. This deliberately replaces the T-1599-era convention of putting
 # findings/snapshot artifacts under STATE_DIR (~/.local/state/pantheon/...,
@@ -191,7 +195,11 @@ AUDIT_PROFILE = "s3star-audit-p2"
 # which would have made a live dispatch's find-the-findings-file step fail
 # structurally. STATE_DIR remains exactly where it was for state.json + the
 # runner's own log; only the per-cycle findings/snapshot artifacts move.
-AUDIT_WORKSPACE_ROOT = Path("/home/the-ancestor/s3star-workspace")
+AUDIT_WORKSPACE_ROOT = Path("/var/lib/pantheon/s3star-workspace")
+# T-4928: Recovery-captured per-seat evidence (tools/s3star_seat_evidence.py). The audit
+# session runs as codex, which lost its cross-account sudo (TG 11733), so other
+# accounts' user managers and transcript inventories reach the auditor only here.
+SEAT_EVIDENCE_LATEST = AUDIT_WORKSPACE_ROOT / "seat-evidence" / "latest"
 
 # The exact launch line dispatch instructions must name: cd into the shared
 # workspace (so relative "your findings output file" language in the brief
@@ -591,7 +599,7 @@ criteria):
 ```
 test -w /home/codex/pantheon-config
 test -w /home/codex/codex-config
-test -w /home/the-ancestor/mailbox/orchestrator
+test -w {_SNAPSHOT_MAILBOX_HUB}/orchestrator
 ```
 """
 
@@ -976,6 +984,13 @@ _TICKET_ID_RE = re.compile(r"^id:\s*(\S+)", re.MULTILINE)
 _TICKET_TITLE_RE = re.compile(r"^# (.+)$", re.MULTILINE)
 _RETEST_NOT_EXTRACTABLE = "criteria not machine-extractable - read the ticket"
 
+# T-3849 (remediates T-2795 Codex FAIL, defect 2): retest_status values that
+# are a STRUCTURAL closure marker regardless of which state directory the
+# ticket file happens to sit in. Shared between find_open_retest_tickets'
+# uniform exclusion check below and (by cross-reference in its own
+# docstring) record_retest_verdict's cross-invocation replay guard.
+_CLOSED_RETEST_STATUSES = frozenset({"verified", "overridden"})
+
 
 @dataclass
 class OpenRetest:
@@ -1060,9 +1075,31 @@ def find_open_retest_tickets(tickets_root: Path) -> list[OpenRetest]:
     Codex's brief). The scan itself still never raises or blanks the
     whole section -- one bad ticket file is simply dropped, same
     "unattended path must not break" contract as before.
+
+    T-3849 (remediates T-2795 Codex FAIL, defect 2): a `retest_status` of
+    `verified` or `overridden` (`_CLOSED_RETEST_STATUSES`) is a STRUCTURAL
+    closure marker, and closure does not depend on which state directory
+    holds the ticket file. T-2795/T-2796 themselves stayed in inbox/ past
+    their PASS verdict for an unrelated governance-ambiguity reason
+    (2026-09-13) -- the pre-fix code only ever checked `retest_status` for
+    done/, so those two already-verified findings kept getting
+    re-enumerated as "open" every cycle, forcing wasted Codex
+    re-verifications. The closed-status check below now runs for
+    inbox/active exactly as it already implicitly did for done/ (verified/
+    overridden were never "pending" either, so done/'s pre-fix gate always
+    excluded them too).
+
+    The done/-only "missing field means legacy-closed" fallback (previous
+    paragraph) stays a done/-only rule and is NOT folded into the uniform
+    closed-status check: a MISSING field means the opposite thing in
+    inbox/active. `file_finding`/`build_finding_ticket_bodies` never write
+    `retest_status` at filing time, so an inbox/active finding with no
+    field yet is simply un-verdicted -- not closed. Collapsing that into
+    the done/-only fallback would silently drop every freshly-filed
+    finding from its own first audit cycle.
     """
     retests: list[OpenRetest] = []
-    for state, gate_on_status in (("inbox", False), ("active", False), ("done", True)):
+    for state, is_done in (("inbox", False), ("active", False), ("done", True)):
         state_dir = tickets_root / state
         if not state_dir.exists():
             continue
@@ -1077,8 +1114,11 @@ def find_open_retest_tickets(tickets_root: Path) -> list[OpenRetest]:
                 fields, _body = _ticket_mod.parse_front_matter(text)
             except _ticket_mod.TicketError:
                 continue
-            if gate_on_status and fields.get("retest_status") != "pending":
-                continue
+            status = fields.get("retest_status")
+            if status in _CLOSED_RETEST_STATUSES:
+                continue  # structural closure marker -- regardless of directory
+            if is_done and status != "pending":
+                continue  # done/-only: legacy missing-field-means-closed fallback
             flagged = "authorship-flagged" in (fields.get("labels") or [])
             retests.append(
                 OpenRetest(
@@ -1175,6 +1215,33 @@ verdict with:
 """
 
 
+def _seat_evidence_section(latest: Path) -> str:
+    """T-4928: point the auditor at Recovery's per-seat bundle, or say plainly that it is
+    absent. Never silent: without it the auditor has no cross-account channel."""
+    manifest = latest / "MANIFEST.md"
+    try:
+        head = manifest.read_text(encoding="utf-8")[:400]
+    except OSError:
+        return (
+            "\n### Per-seat evidence (Recovery-captured): ABSENT this cycle\n"
+            f"`{manifest}` is missing or unreadable. You have no cross-account channel "
+            "this cycle (the codex account has no sudo): other seats' user units, timers "
+            "and transcript inventories are absence-of-channel, not absence-of-thing. "
+            "Say so in any finding that would need them.\n"
+        )
+    gen = next((ln.split(":", 1)[1].strip() for ln in head.splitlines()
+                if ln.startswith("generated_at:")), "unknown")
+    return (
+        "\n### Per-seat evidence (Recovery-captured)\n"
+        f"Manifest: `{manifest}` (generated_at {gen}). Each fleet account's "
+        "`systemctl --user` units, timers and failed units, plus an INVENTORY (path, "
+        "bytes, mtime; never content) of its session transcripts, captured by Recovery as "
+        "that account. Cite it as Recovery-captured evidence; Recovery is an audited seat too. "
+        "For a transcript excerpt, put the path and line range in a finding's "
+        "reproduction and Recovery returns a reviewed excerpt.\n"
+    )
+
+
 def compose_audit_brief(
     slot: AuditSlot,
     today: date,
@@ -1224,6 +1291,7 @@ def compose_audit_brief(
     snapshot_section = ""
     if snapshot_path is not None:
         manifest_path = manifest_path_for(snapshot_path)
+        seat_section = _seat_evidence_section(SEAT_EVIDENCE_LATEST)
         snapshot_section = f"""
 ## Runtime evidence snapshot (runner-narrated)
 {_SNAPSHOT_CAVEAT}
@@ -1241,7 +1309,7 @@ Per-artifact evidence bundle + hashes: `{manifest_path}` (one immutable file
 per capture, each sha256'd, plus a Limits section naming what this channel
 structurally cannot see -- absence there means absence-of-channel, not
 absence-of-thing).
-
+{seat_section}
 ## Methodology — in-sandbox observations are namespace-relative, not host truth
 Your own sandbox is a bwrap user namespace: uids/gids it cannot map render as
 the kernel overflow ids 65534 (`nobody`/`nogroup`). In-sandbox ownership and
@@ -1331,6 +1399,27 @@ section entirely if you found nothing actionable this cycle — do not invent
 findings to fill a quota, per the severity-inflation / checklist-theater
 guardrails).
 
+Use the word "finding" in a markdown heading
+ONLY for the `## Finding <n>: <title>` sections. Any other heading containing
+it (e.g. `## No findings this cycle`) is read as a malformed finding and fails
+the run; for a clean cycle write a heading such as `## Result` followed by
+plain prose.
+
+End the file with a closing sentinel as the LAST line of the file. It is a plain
+line of text, NOT inside a code fence: write it bare, with no code-fence line
+before or after it (a closing fence after it counts as content after the
+sentinel and fails the run). Exactly this shape, where N is the number of
+`## Finding <n>: <title>` sections you wrote (0 for a clean cycle):
+
+{_CLOSING_SENTINEL_TEMPLATE}
+
+Write it exactly once, on its own line after a blank line, only after every
+finding is complete, and do not quote it anywhere else in the file.
+Nothing may follow it. The runner refuses a findings file that lacks the
+sentinel, whose N does not match the number of `## Finding` sections, or that
+has content after it, and files nothing from it -- so a run that is cut off
+before this line can never be mistaken for a clean cycle.
+
 Begin.
 """
 
@@ -1364,6 +1453,7 @@ def build_dispatch_ticket_bodies(
     slot: AuditSlot, today: date, brief: str, findings_path: Path
 ) -> tuple[str, str]:
     session = codex_audit_session_name(slot.slug, today)
+    verdicts_path = run_workspace_dir(slot.slug, today) / "verdicts.jsonl"
     ask = (
         f"S3* audit dispatch due: {slot.slug} ({slot.cadence}) for {today.isoformat()}. "
         f"SUPERVISED DISPATCH (T-1604 mechanism): run `python3 tools/s3star_audit_runner.py "
@@ -1371,9 +1461,31 @@ def build_dispatch_ticket_bodies(
         f"dedicated `{session}` tmux session (never the supervisor-managed "
         f"`{STANDING_WORKER_SESSION}`), writes a fresh brief into the run workspace, and "
         f"launches the profiled auditor (`codex --profile {AUDIT_PROFILE}`) reading it. "
-        f"Observe the run, confirm Codex's findings landed at `{findings_path}`, then file "
-        f"the per-finding tickets by running: `python3 tools/s3star_audit_runner.py "
-        f"--land-findings --slot {slot.slug} --findings-file {findings_path}`. Finally tear "
+        f"Observe the run. Land findings and verdicts only after the Codex process has "
+        f"EXITED in the `{session}` pane, not when `{findings_path}` first appears: Codex "
+        f"can rewrite its output files after first writing them (T-4307: on 2026-09-28 "
+        f"verdicts.jsonl was rewritten ~40s after it first appeared, so retest verdicts "
+        f"landed twice). Gate on the Codex PROCESS, not the tmux session: when Codex exits "
+        f"the pane drops back to a shell prompt but the session stays alive until "
+        f"--teardown-audit, so it will never disappear on its own. Codex has exited when "
+        f"`pgrep -u {CODEX_AUDIT_USER} -af 'codex --profile {AUDIT_PROFILE}'` prints "
+        f"nothing. "
+        f"Once it has exited, file the per-finding tickets by running: "
+        f"`python3 tools/s3star_audit_runner.py --land-findings --slot {slot.slug} "
+        f"--findings-file {findings_path}` (a complete audit -- one ending in its closing "
+        f"sentinel -- with zero findings lands clean, rc 0, filed 0). "
+        f"rc 1 means the cycle is NOT clean; read the printed problem lines. "
+        f"A missing sentinel, or an N that does not match the number of "
+        f"`## Finding` sections, means the run was truncated or crashed. "
+        f"A duplicated sentinel, or content after it, means the file was "
+        f"rewritten or appended to after sealing. "
+        f"Nothing was filed in any of these cases. Re-run the audit. "
+        f"A shape problem in a sealed file files the parseable findings and returns "
+        f"rc 1 on every re-land by design. Hand-file the rest instead of looping. "
+        f"Either way, do not close the dispatch ticket as a clean cycle. "
+        f"Then, if the brief carries an Open re-tests section, land the "
+        f"retest verdicts by running: `python3 tools/s3star_audit_runner.py "
+        f"--land-verdicts --slot {slot.slug} --verdicts-file {verdicts_path}`. Finally tear "
         f"the session down with `python3 tools/s3star_audit_runner.py --teardown-audit "
         f"--slot {slot.slug} --date {today.isoformat()}`."
     )
@@ -1423,7 +1535,7 @@ def file_dispatch_ticket(
         str(ticket_bin),
         "file",
         "--requester", "orchestrator",
-        "--target", "orchestrator",
+        "--target", "role:engineering_orchestrator",
         "--title", f"S3* audit dispatch — {slot.slug} {today.isoformat()}",
         "--labels", "s3star-audit,audit-dispatch",
         "--project-id", "null",
@@ -1448,11 +1560,16 @@ FINDINGS_MIN_BYTES = 200
 
 def _findings_file_is_structured(text: str) -> bool:
     """True iff `text` has a leading frontmatter block with non-empty `slot:`
-    and `date:` keys, plus at least one `## Finding` heading in the body.
-    Mirrors the *pattern* tools/watch_runner.py's `_report_is_structured` uses
-    (frontmatter + heading check) — a new function because the finding-artifact
+    and `date:` keys. Mirrors the *pattern* tools/watch_runner.py's
+    `_report_is_structured` uses — a new function because the finding-artifact
     frontmatter schema (slot/date/auditor) differs from the watch-report schema
     (surface/headline).
+
+    T-4307: a `## Finding` heading is NOT required. `compose_audit_brief` tells
+    the auditor to omit the finding sections entirely when nothing is
+    actionable, so a valid zero-finding cycle is a legitimate, complete
+    artifact ("the auditor found nothing"). Whether headings that ARE present
+    actually parse is `land_findings`' concern, not this structural check's.
     """
     m = re.match(r"^---\n(.*?)\n---", text, flags=re.DOTALL)
     if not m:
@@ -1460,20 +1577,123 @@ def _findings_file_is_structured(text: str) -> bool:
     fm_lines = m.group(1).splitlines()
     has_slot = any(re.match(r"\s*slot\s*:\s*\S", line) for line in fm_lines)
     has_date = any(re.match(r"\s*date\s*:\s*\S", line) for line in fm_lines)
-    if not (has_slot and has_date):
-        return False
-    return bool(re.search(r"^## Finding\b", text, flags=re.MULTILINE))
+    return has_slot and has_date
 
 
 def findings_landed_ok(path: Path) -> bool:
     """Structural completion check: exists, at least FINDINGS_MIN_BYTES, and
-    has the required frontmatter + `## Finding` heading structure.
+    has the required slot/date frontmatter. Zero `## Finding` sections is
+    valid (T-4307: a clean audit cycle).
     """
     if not path.exists():
         return False
     if path.stat().st_size < FINDINGS_MIN_BYTES:
         return False
     return _findings_file_is_structured(path.read_text(encoding="utf-8"))
+
+
+# T-4314: the closing sentinel. Without one, a Codex run that crashed or was cut
+# off after the frontmatter and preamble is byte-for-byte indistinguishable from
+# a genuinely clean zero-finding audit (T-4307 made that shape rc 0). The auditor
+# is told (compose_audit_brief) to write `s3star-audit-end: findings=N` as the
+# file's LAST line, N = the number of `## Finding` sections it wrote (0 = clean).
+#
+# Deliberately a plain line, NOT the `## End of findings (N findings)` heading
+# the ticket first floated: any heading containing "finding" trips
+# `_FINDING_NEAR_MISS_LINE_RE` (and contradicts the brief's "no such heading in
+# a clean file" rule), so a heading sentinel would need an exemption in the very
+# guard that protects against silent loss. `key=value` also makes a whole
+# workspace auditable with one grep.
+_CLOSING_SENTINEL_TOKEN = "s3star-audit-end:"
+_CLOSING_SENTINEL_TEMPLATE = f"{_CLOSING_SENTINEL_TOKEN} findings=N"
+# Matched against a whole stripped line. Horizontal whitespace around `:`/`=` is
+# tolerated (formatting slop is not a crash); token, key and case are exact.
+# T-4368: N is 1-6 ASCII digits. `[0-9]`, not `\d`: `\d` also matches Unicode
+# digits, which `int()` then parses, so a fullwidth one would seal a
+# one-finding file. The cap keeps `int()` below CPython's 4300-digit
+# string-conversion limit: an oversized N is not a valid sentinel, so it lands
+# in the ordinary "malformed sentinel" problem (rc 1, logged) instead of a
+# ValueError traceback. 6 digits is far beyond the 30-finding cap.
+_CLOSING_SENTINEL_RE = re.compile(
+    re.escape(_CLOSING_SENTINEL_TOKEN) + r"[ \t]*findings[ \t]*=[ \t]*([0-9]{1,6})"
+)
+# T-4368: how much of a sentinel-like line the "malformed" problem quotes back.
+_SENTINEL_QUOTE_MAX = 80
+
+
+def _split_closing_sentinel(text: str) -> tuple[str, list[str]]:
+    """Check `text`'s closing sentinel. Returns `(body, problems)`. Pure.
+
+    `body` is `text` with every valid sentinel line removed -- what
+    `parse_findings` and `_findings_shape_problems` must see, because a
+    sentinel on the line right after the last `- **Field:**` bullet would
+    otherwise be folded into that field's value and filed inside a ticket.
+
+    `problems` is empty iff the file carries exactly ONE valid sentinel, as its
+    last non-blank line, whose N equals the number of strict `## Finding`
+    headings (`_FINDING_HEADING_RE` -- the parser's own split constant, so the
+    sentinel and the parser cannot disagree about what a finding section is;
+    malformed and over-cap blocks have their own guard line in
+    `_findings_shape_problems` and are deliberately not double-reported here).
+    Every non-empty result is a reason `land_findings` must file NOTHING:
+
+      * none      -- the run was truncated or crashed before finishing;
+      * >1        -- ambiguous which one closes the file (a concatenated or
+                     re-appended rewrite, or a quoted example);
+      * content after it -- uncounted content (the file was rewritten or
+                     appended to after it "finished"); ignoring it would
+                     silently drop findings;
+      * N != headings -- cut off mid-way, or hand-edited.
+    """
+    lines = text.split("\n")
+    valid = [i for i, ln in enumerate(lines) if _CLOSING_SENTINEL_RE.fullmatch(ln.strip())]
+    drop = set(valid)
+    body = "\n".join(ln for i, ln in enumerate(lines) if i not in drop)
+    problems: list[str] = []
+
+    if not valid:
+        looks_like = [ln.strip() for ln in lines if _CLOSING_SENTINEL_TOKEN in ln]
+        msg = (
+            f"no closing sentinel '{_CLOSING_SENTINEL_TEMPLATE}' as the file's last line: "
+            f"the audit run was most likely truncated or crashed before finishing, so "
+            f"this file is not a complete audit (and is NOT a clean cycle). Files "
+            f"written before T-4314 have no sentinel and are not accepted."
+        )
+        if looks_like:
+            # Bounded per line: an oversized N would otherwise be echoed whole
+            # into stderr and the runner log.
+            shown = ", ".join(
+                repr(ln if len(ln) <= _SENTINEL_QUOTE_MAX else ln[:_SENTINEL_QUOTE_MAX] + "...")
+                for ln in looks_like[:3]
+            )
+            msg += f" Sentinel-like line(s) present but malformed: {shown}."
+        problems.append(msg)
+        return body, problems
+
+    if len(valid) > 1:
+        problems.append(
+            f"{len(valid)} closing sentinels found; exactly one is required, as the "
+            f"file's last line (a re-appended rewrite or a quoted example?)"
+        )
+        return body, problems
+
+    idx = valid[0]
+    trailing = [ln.strip() for ln in lines[idx + 1:] if ln.strip()]
+    if trailing:
+        problems.append(
+            f"{len(trailing)} non-blank line(s) follow the closing sentinel (first: "
+            f"{trailing[0][:80]!r}); the sentinel must be the file's last line -- "
+            f"content after it is uncounted (file rewritten or appended to after the "
+            f"run finished?)"
+        )
+    claimed = int(_CLOSING_SENTINEL_RE.fullmatch(lines[idx].strip()).group(1))
+    actual = len(_FINDING_HEADING_RE.findall(body))
+    if claimed != actual:
+        problems.append(
+            f"closing sentinel claims {claimed} finding(s) but the file has {actual} "
+            f"'## Finding' heading(s) (run cut off mid-way, or file hand-edited)"
+        )
+    return body, problems
 
 
 @dataclass
@@ -1493,6 +1713,13 @@ class Finding:
 
 
 _FIELD_RE = re.compile(r"^-\s+\*\*([^:*]+):\*\*\s*(.*)$")
+
+# The ONE strict finding-heading shape (`## Finding <n>: <title>`), shared by
+# `parse_findings` (which splits on it) and `land_findings`' shape guards (which
+# count it), so the parser and the guards cannot drift apart. One capture group:
+# the heading text after `## `, so `.split()` yields
+# [preamble, header1, block1, header2, block2, ...].
+_FINDING_HEADING_RE = re.compile(r"^## (Finding\b[^\n]*)$", flags=re.MULTILINE)
 
 # Maps the lowercased bullet label (as required by compose_audit_brief's
 # instructions to Codex) to the Finding dataclass attribute name.
@@ -1521,8 +1748,8 @@ def parse_findings(text: str) -> list[Finding]:
     stderr note — never crash (this runs unattended). Mirrors
     tools/watch_runner.py's parse_followups tolerance for malformed input.
     """
-    headers = re.findall(r"^## (Finding\b[^\n]*)$", text, flags=re.MULTILINE)
-    blocks = re.split(r"^## Finding\b[^\n]*$", text, flags=re.MULTILINE)[1:]
+    parts = _FINDING_HEADING_RE.split(text)
+    headers, blocks = parts[1::2], parts[2::2]
 
     findings: list[Finding] = []
     for header, block in zip(headers, blocks):
@@ -1579,7 +1806,8 @@ def parse_findings(text: str) -> list[Finding]:
 _OWNER_ALIASES: dict[str, str] = {
     # Orchestrator's domain (ORG-027 §1: org + delivery + infra — the head domain).
     "orchestrator": "orchestrator",
-    "orchestrator": "orchestrator",
+    "orchestrator": "orchestrator",             # orchestrator's OLD (pre-ORG-100) audit-id, kept for continuity
+    "head_engineering_orchestrator": "orchestrator", # ORG-100 (T-3814) forward audit-id for orchestrator
     "ho": "orchestrator",
     "org": "orchestrator",
     "delivery": "orchestrator",
@@ -1593,11 +1821,13 @@ _OWNER_ALIASES: dict[str, str] = {
     "audit-chain": "orchestrator",
     # Specialist's domain (ORG-027 §1: research + watch).
     "specialist": "specialist",
-    "specialist": "specialist",
+    "head_research_orchestrator": "specialist",   # T-3807 forward audit-id
+    "specialist": "specialist",                  # legacy audit-id, retained (D1, P4 audit-continuity)
     "research": "specialist",
     "watch": "specialist",
     # Recovery's domain (ORG-027 §1: recovery + ticket-ops).
     "recovery": "recovery",
+    "head_system_orchestrator": "recovery",       # ORG-100 (T-3814) forward audit-id for recovery
     "recovery": "recovery",
     "ticket-ops": "recovery",
     "tickets": "recovery",
@@ -1606,12 +1836,38 @@ _OWNER_ALIASES: dict[str, str] = {
     "operator": "operator",
     # Codex never owns remediation of its own audit findings.
     "codex": "orchestrator",
+    # ORG-100 (T-3814): the new role-class audit-ids for codex + archivist resolve
+    # to their OWNER the SAME WAY their persona names already do in THIS table — NOT
+    # to the persona itself. head_auditor (codex's forward id) -> orchestrator, mirroring the
+    # codex -> orchestrator no-self-closure invariant above (codex must never be routed
+    # remediation of its own findings). head_memory_orchestrator (archivist's forward
+    # id) -> orchestrator, mirroring resolve_owner("archivist") == _DEFAULT_OWNER (orchestrator):
+    # archivist is not a remediation owner in the ORG-027 §1 domain table (mailbox-
+    # first, not a ticket-ops seat), so remediation stays in Orchestrator's head domain.
+    # (This is the deliberate exception to D-d's generic persona-arrow mapping, which
+    # holds for ticket_lint's resolve_persona normalization but would break this
+    # table's owner invariant.)
+    "head_auditor": "orchestrator",
+    "head_memory_orchestrator": "orchestrator",
 }
 _DEFAULT_OWNER = "orchestrator"
 
 
 def resolve_owner(owner_text: str) -> str:
     return _OWNER_ALIASES.get(owner_text.strip().lower(), _DEFAULT_OWNER)
+
+
+def owner_target(owner: str) -> str:
+    """Ticket `--target` for a resolved domain owner (T-5239 / ORG-088: role-only).
+
+    The owner TABLE stays persona-keyed (it is domain knowledge, not routing); only the
+    value handed to `ticket.py file --target` is translated to the owner's pool role.
+    `operator` passes through."""
+    if owner == "operator":
+        return owner
+    from tools.agent_role_map import persona_pool_role
+    role = persona_pool_role(owner)
+    return f"role:{role}" if role else f"role:{persona_pool_role(_DEFAULT_OWNER)}"
 
 
 # ---------------------------------------------------------------------------
@@ -1739,7 +1995,7 @@ def file_finding(
         str(ticket_bin),
         "file",
         "--requester", "orchestrator",
-        "--target", owner,
+        "--target", owner_target(owner),
         "--title", f"S3* audit finding {finding.finding_id}: {finding.title}"[:120],
         "--labels", ",".join(labels),
         "--project-id", "null",
@@ -1855,6 +2111,35 @@ def record_retest_verdict(
     is in (an override can legitimately close a finding before it reaches
     done/, e.g. a false positive) — only ticket.py claim/resolve move
     directories.
+
+    T-3849 (remediates T-2795 Codex FAIL, defect 1): refuses (TicketError,
+    BEFORE any mutation) a CROSS-INVOCATION REPLAY against a ticket that
+    already carries a structural `retest_status` closure marker
+    (`_CLOSED_RETEST_STATUSES`) -- this is the guard `land_verdicts`'
+    per-entry open-set check and duplicate-in-artifact check don't cover,
+    because both of those only look WITHIN a single invocation's own
+    artifact; nothing previously stopped two SEPARATE invocations (e.g.
+    the same workspace verdicts.jsonl landed twice) from each independently
+    flipping the same ticket, as T-2795's own 24-second-apart double-PASS
+    landing showed. Two cases:
+      - already `overridden` -> refuses ANY new call (pass/fail/partial/
+        override alike). An override is a terminal administrative closure
+        (P4 traceability) -- nothing after it silently re-writes the
+        record, including a second override.
+      - already `verified` AND the new call is verdict="pass" -> refuses
+        (a verified-to-verified re-write with no new evidence is exactly
+        the untraceable-duplicate-closure shape ORG-038 exists to prevent).
+        A `fail`/`partial` re-verdict on an already-`verified` ticket stays
+        LEGAL and lands normally, downgrading retest_status back to
+        `pending` -- that downgrade path is the entire point of
+        independent re-test: a next-cycle FAIL must be able to re-open a
+        prior PASS. `override=True` on an already-`verified` ticket also
+        stays legal (out of scope for this guard -- only the pass-replay
+        case is blocked; overriding a verified finding is a distinct,
+        unblocked administrative action).
+    This check runs before the authorship-flagged eligibility check below:
+    a ticket's own state-legitimacy is checked first, independent of which
+    principal is attempting the call.
     """
     has_verdict = verdict is not None
     if has_verdict == override:
@@ -1890,6 +2175,24 @@ def record_retest_verdict(
             f"(missing {_FINDING_MARKER_PREFIX!r} marker)"
         )
     fields, body = _ticket_mod.parse_front_matter(text)
+    old_fields = _ticket_mod._fm_snapshot(fields)  # T-4760: explicit old for the registry check
+
+    current_status = fields.get("retest_status")
+    if current_status == "overridden":
+        raise _ticket_mod.TicketError(
+            f"record_retest_verdict: {ticket_id} already retest_status: "
+            f"overridden -- refusing further verdict (P4 traceability: "
+            f"terminal administrative closure, never silently re-written "
+            f"by a later call); ticket left untouched"
+        )
+    if current_status == "verified" and has_verdict and verdict == "pass":
+        raise _ticket_mod.TicketError(
+            f"record_retest_verdict: {ticket_id} already retest_status: "
+            f"verified -- refusing duplicate PASS replay (P4 traceability: "
+            f"cross-invocation replay guard, T-3849); ticket left "
+            f"untouched. A fail/partial re-verdict can still legitimately "
+            f"reopen this finding for re-test (retest_status -> pending)."
+        )
 
     if "authorship-flagged" in (fields.get("labels") or []):
         resolved_principal = (
@@ -1908,7 +2211,7 @@ def record_retest_verdict(
     actor = _ticket_mod._actor()
     detail = f"{verdict_label}: {note}"
     body = _ticket_mod.append_transition(body, actor, "retest-verdict-recorded", detail)
-    new_text = _ticket_mod._build_ticket_text(fields, body)
+    new_text = _ticket_mod._build_ticket_text(fields, body, old_fields=old_fields)
 
     with git_mutation_lock(label=f"s3star record-retest-verdict {ticket_id}"):
         # Mirrors ticket.py cmd_block's contract: frontmatter edit + transition
@@ -1982,6 +2285,68 @@ def push_claude_tier_queue(*, cwd: Path = REPO_ROOT) -> str | None:
     return msg_id
 
 
+# T-4307: shape guards that keep a real finding from vanishing into a "clean"
+# rc 0 once the structural check stopped requiring a `## Finding` heading.
+# Both are deliberately broader than `_FINDING_HEADING_RE` (loud false positive
+# > silent loss) and change only land_findings' return code + message, never
+# what gets filed.
+#
+# Any markdown heading line (1-6 '#', optional leading indent) whose text
+# mentions "finding", any case -- minus the strict headings -- is a near-miss:
+# `### Finding 1`, `# Finding 1`, `## finding 1`, `## Findings`, `## Finding1`,
+# `##Finding 1`, ` ## Finding 1`, `## 1. Finding: t`.
+_FINDING_NEAR_MISS_LINE_RE = re.compile(
+    r"^[ \t]*#{1,6}[^\n]*finding[^\n]*$", flags=re.MULTILINE | re.IGNORECASE
+)
+# The one required bullet every real finding block carries; catches shapes with
+# no heading line to match at all (`**Finding 1: t**`, `## F-1: t`).
+_SEVERITY_BULLET_RE = re.compile(
+    r"^[ \t]*-[ \t]+\*\*severity:\*\*", flags=re.MULTILINE | re.IGNORECASE
+)
+
+
+def _findings_shape_problems(text: str, parsed: int) -> list[str]:
+    """One human-readable line per way `text` looks like it carries findings
+    that `parse_findings` (which returned `parsed` records) did NOT turn into
+    tickets. Empty list = the file is consistent: either a genuinely clean
+    cycle or every finding parsed. Pure function.
+    """
+    problems: list[str] = []
+    strict = len(_FINDING_HEADING_RE.findall(text))
+    if strict and not parsed:
+        problems.append(
+            f"{strict} '## Finding' heading(s) but none parsed "
+            f"(malformed auditor output, not a clean cycle)"
+        )
+    elif strict > parsed:
+        problems.append(
+            f"only {parsed} of {strict} '## Finding' block(s) parsed "
+            f"(the rest were malformed or over the {_FINDING_SOFT_CAP}-finding cap); "
+            f"parseable ones were still filed"
+        )
+    near = [
+        ln.strip() for ln in _FINDING_NEAR_MISS_LINE_RE.findall(text)
+        if not _FINDING_HEADING_RE.match(ln)
+    ]
+    if near:
+        shown = ", ".join(repr(ln) for ln in near[:3])
+        problems.append(
+            f"{len(near)} near-miss finding heading(s) not recognised as "
+            f"'## Finding <n>: <title>' ({shown}); a real finding may not have been filed"
+        )
+    severity_bullets = len(_SEVERITY_BULLET_RE.findall(text))
+    # T-4314 (T-4307 round-2 scope item 5): only when the bullets outnumber the
+    # strict headings too. Bullets that merely match the headings are already
+    # explained by the "only P of S parsed" line above (one cause, one line --
+    # an over-cap file used to emit both).
+    if severity_bullets > max(parsed, strict):
+        problems.append(
+            f"{severity_bullets} '- **Severity:**' bullet(s) but only {parsed} finding(s) "
+            f"parsed; a real finding may not have been filed"
+        )
+    return problems
+
+
 def land_findings(
     slot_slug: str,
     findings_path: Path,
@@ -1990,7 +2355,32 @@ def land_findings(
     cwd: Path = REPO_ROOT,
 ) -> int:
     """Parse `findings_path`, file one ticket per finding. Returns 1 if the
-    findings artifact fails the structural check or any filing errors, else 0.
+    findings artifact fails the structural check, any filing errors, or the
+    shape guards (`_findings_shape_problems`) say a real finding may not have
+    been filed; else 0.
+
+    T-4307: a structurally valid file that carries NO finding-shaped content is
+    a clean audit cycle -- it files nothing, logs "filed 0, skipped 0, errored
+    0", and returns 0. That is deliberately distinct from a file that looks
+    like it carries findings the parser did not turn into tickets ("the audit
+    broke"): headings present but none parsed, only some blocks parsed (the
+    parseable ones are still filed), a near-miss heading such as `### Finding`,
+    or more `- **Severity:**` bullets than parsed findings. Those all return 1
+    rather than passing silently as if the auditor had found nothing. The
+    guards change only the return code and a stderr/runner-log line -- never
+    what gets filed.
+
+    T-4314: "no finding-shaped content" is only a CLEAN cycle when the file is
+    also SEALED -- its last line is the closing sentinel `s3star-audit-end:
+    findings=N` with N matching the file's `## Finding` headings (see
+    `_split_closing_sentinel`). Otherwise a run cut off after the frontmatter
+    and preamble would land as clean. A sentinel problem (missing, N mismatch,
+    content after it, more than one) is fail-closed: rc 1, NOTHING filed, no
+    queue push -- distinct from the T-4307 shape problems above, which apply
+    only inside a correctly sealed file. There is deliberately no legacy path:
+    files from before T-4314 carry no sentinel and are rejected (they were all
+    landed under the older rule; re-landing one today would also duplicate its
+    tickets, since markers key on the landing date).
 
     T-2801: also pushes the claude-tier verification queue (see
     `push_claude_tier_queue`) after filing -- this is the one prod-mode step
@@ -2008,7 +2398,31 @@ def land_findings(
         return 1
 
     text = findings_path.read_text(encoding="utf-8")
-    findings = parse_findings(text)
+
+    # T-4314: closing-sentinel check runs BEFORE any parsing or filing and
+    # short-circuits. FAIL-CLOSED (Orchestrator ruling on the T-4314 plan, Q2): a
+    # sentinel problem means the run is incomplete or untrustworthy as a WHOLE
+    # (a truncated file's last "parseable" finding may itself be cut short), and
+    # partial filing followed by a re-run that lands on a later day would file
+    # duplicates, since finding markers are keyed on the landing date. Like the
+    # not-landed-ok return above, nothing else runs -- no push either.
+    body, sentinel_problems = _split_closing_sentinel(text)
+    if sentinel_problems:
+        tag = f"[s3star] land-findings {slot_slug}:{today.isoformat()}"
+        for problem in sentinel_problems:
+            msg = f"{findings_path}: {problem}"
+            print(msg, file=sys.stderr)
+            _append_runner_log(f"{tag}: {msg}")
+        summary = (
+            f"{findings_path}: closing-sentinel check failed -- nothing filed "
+            f"(run incomplete or untrustworthy; re-run the audit)"
+        )
+        print(summary, file=sys.stderr)
+        _append_runner_log(f"{tag}: {summary}")
+        return 1
+
+    findings = parse_findings(body)
+    problems = _findings_shape_problems(body, len(findings))
     filed = 0
     skipped = 0
     errored = 0
@@ -2027,10 +2441,14 @@ def land_findings(
         f"[s3star] land-findings {slot_slug}:{today.isoformat()}: "
         f"filed {filed}, skipped {skipped}, errored {errored}"
     )
+    for problem in problems:
+        msg = f"{findings_path}: {problem}"
+        print(msg, file=sys.stderr)
+        _append_runner_log(f"[s3star] land-findings {slot_slug}:{today.isoformat()}: {msg}")
 
     push_claude_tier_queue(cwd=cwd)
 
-    return 1 if errored else 0
+    return 1 if (errored or problems) else 0
 
 
 # ---------------------------------------------------------------------------

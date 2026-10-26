@@ -1,0 +1,12 @@
+# T-4420: fire echo-status-export.service every 2 minutes.
+[Unit]
+Description=Echo read-only status export every 2 minutes (T-4420)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=15s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

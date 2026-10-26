@@ -1,0 +1,20 @@
+[Unit]
+Description=Pantheon nightly-CI watch — hourly read of the latest scheduled CI run (T-4402)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# HOURLY, ALL DAY, at :17 (clear of the other hourly minute slots in this directory: :37, :40,
+# :50, :52 and the every-5 / every-15 grids; the seat's own slots are ours to keep distinct). Not a
+# 13-21Z window: GitHub creates the 09:00Z scheduled run 4-6h late (observed 12:33Z-17:27Z), so a
+# window would need to be wider than the lateness it is guarding, and the dead-schedule check
+# (no run created in 36h) is valid at any hour. The period only bounds how late the news is: a
+# red run reaches orchestrator within an hour of concluding. Cost is one to three `gh api` calls per fire.
+OnCalendar=*-*-* *:17:00
+# Catch up after a reboot: a probe missed across downtime is exactly when the nightly may have
+# failed unseen (same reasoning as the ci-audit family).
+Persistent=true
+RandomizedDelaySec=120
+Unit=pantheon-ci-nightly-watch.service
+
+[Install]
+WantedBy=timers.target

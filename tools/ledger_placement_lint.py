@@ -58,11 +58,17 @@ from pathlib import Path
 _TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOLS_DIR not in sys.path:
     sys.path.insert(0, _TOOLS_DIR)
+# Repo root too, so `tools.` imports resolve when this file runs as a script
+# (the pre-push hook invokes `python3 tools/ledger_placement_lint.py`).
+_REPO_ROOT = os.path.dirname(_TOOLS_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 from ledger_shard import (  # noqa: E402
     LEGACY_LEDGER_FILENAME,
     entry_ts,
     segment_for_ts,
 )
+from tools.hermes_diff_scan import iter_added_lines  # noqa: E402  (shared framing, T-4202)
 
 # A shard segment id is `<ISO-year>-W<NN>` (e.g. 2026-W31).
 _SEG_RE = re.compile(r"^\d{4}-W\d{2}$")
@@ -165,6 +171,17 @@ def lint_staged_validity(repo_root: str | Path | None = None) -> list[dict]:
     frozen historical state. Mirrors `lint_range`'s added-lines-only diff
     scan, applied to the staged diff instead of a commit range.
 
+    Renames (T-4451): one `git diff --cached -M` over the whole `ledger`
+    pathspec, each added line attributed to its file by the diff's own `+++`
+    header. Git pairs a renamed shard with its source INSIDE that pathspec, so a
+    pure rename adds no lines (a pre-existing bad line is never re-flagged -- the
+    ledger groomer must not be false-blocked) and a rename plus an edit yields
+    only the lines the edit added, reported under the DESTINATION path. A file
+    moved in from outside `ledger/` has no source in the pathspec, so git shows a
+    new file and every line is judged. (The earlier per-file `--diff-filter=ACM`
+    loop skipped R entirely, and naively adding R to it while scoping the diff to
+    the destination path would have read a pure rename as all-added.)
+
     Fail-open: any `git` invocation failing (bad repo_root, non-git dir,
     detached/corrupt state) yields `[]` for that step rather than raising --
     a validity guard must never brick a commit on its own account.
@@ -176,24 +193,38 @@ def lint_staged_validity(repo_root: str | Path | None = None) -> list[dict]:
         )
         repo_root = r.stdout.strip() or "."
     out: list[dict] = []
-    names = _git(repo_root, "diff", "--cached", "--name-only",
-                 "--diff-filter=ACM", "--", "ledger")
-    if names.returncode != 0:
+    # `--src-prefix=a/ --dst-prefix=b/` are pinned, like `-M`: the attribution below
+    # reads the `+++ b/<path>` header, and a seat's diff.mnemonicPrefix (`i/`),
+    # diff.noprefix or diff.dstPrefix would otherwise hand it a path that is not
+    # `ledger/...` -- the line is silently skipped, turning the guard off. The explicit
+    # flags override all three config keys. `--no-ext-diff --no-textconv` (T-4487) are
+    # pinned for the same reason: this parses the patch BODY, and a seat's
+    # `diff.external` or a `.gitattributes` textconv driver would replace it with a body
+    # holding no added lines, so an invalid line would never be judged.
+    d = subprocess.run(
+        ["git", "-C", str(repo_root), "diff", "--cached", "-M", "--text",
+         "--no-ext-diff", "--no-textconv",
+         "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "--unified=0",
+         "--diff-filter=ACMR", "--", "ledger"],
+        capture_output=True, check=False,
+    )
+    if d.returncode != 0:
         return out
-    for rel in names.stdout.splitlines():
-        rel = rel.strip()
-        if not rel or not _is_ledger_jsonl_path(rel):
+    for ev in iter_added_lines(d.stdout):
+        rel = ev.path
+        if rel is None or not _is_ledger_jsonl_path(rel):
             continue
-        d = _git(repo_root, "diff", "--cached", "--unified=0", "--", rel)
-        if d.returncode != 0:
-            continue
-        for dl in d.stdout.splitlines():
-            # added content lines only (skip the "+++ b/..." file header)
-            if dl.startswith("+") and not dl.startswith("+++"):
-                v = check_entry_validity(dl[1:])
-                if v:
-                    v["path"] = rel
-                    out.append(v)
+        raw = ev.text
+        try:
+            v = check_entry_validity(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            # JSON text must be UTF-8 (RFC 8259 §8.1): a line that is not
+            # is invalid, reported, never skipped (T-4202).
+            v = {"line": raw.decode("utf-8", "replace"),
+                 "error": "not valid UTF-8"}
+        if v:
+            v["path"] = rel
+            out.append(v)
     return out
 
 
@@ -210,7 +241,10 @@ def _scan_shard(shard: Path, seg: str) -> list[dict]:
     """Scan one shard file's lines for placement misplacements, given the
     segment id its path resolved to (`shard_segment` already validated it)."""
     out: list[dict] = []
-    for line in shard.read_text().splitlines():
+    # Split on the newline only (T-4202): str.splitlines() also breaks on a
+    # raw U+2028 / U+0085 / form feed inside a valid JSONL line, leaving two
+    # unparseable halves whose placement then goes unjudged.
+    for line in shard.read_bytes().decode("utf-8", "replace").split("\n"):
         m = check_entry(seg, line)
         if m:
             out.append(m)
@@ -290,6 +324,36 @@ def _git(repo_root: str | Path, *args: str) -> subprocess.CompletedProcess:
     )
 
 
+def _added_lines(repo_root: str | Path, *diff_args: str) -> list[bytes]:
+    """Return the raw content of every line ADDED in `git diff --unified=0
+    <diff_args>`, one `bytes` per added line (T-4202). Each caller decodes:
+    the validity path reports a non-UTF-8 line as invalid (JSON text must be
+    UTF-8), the placement path decodes with errors="replace" and lets
+    `check_entry` judge.
+
+    The shared helper for `lint_staged_validity` and `lint_range`. The diff is
+    read as bytes (`--text`, `text=False`) and framed by the shared structural
+    parser (`hermes_diff_scan.iter_added_lines`): hunk-count tracked, split on
+    the newline byte only. So an added line whose content starts `++` (it
+    renders `+++`) is still checked, and a valid JSONL line holding a raw
+    U+2028 / U+0085 / form feed stays one line. The source is a two-endpoint
+    `git diff`; combined (`@@@`) diffs are never read here.
+
+    Fail-open on the tool's own account, like every other step of this
+    module: a failed `git` call yields `[]`. No added line is ever dropped.
+    """
+    # `--no-ext-diff --no-textconv` (T-4487): the parser reads the patch body, which a
+    # seat's `diff.external` or a textconv driver would replace.
+    d = subprocess.run(
+        ["git", "-C", str(repo_root), "diff", "--text", "--no-ext-diff",
+         "--no-textconv", "--no-color", "--unified=0", *diff_args],
+        capture_output=True, check=False,
+    )
+    if d.returncode != 0:
+        return []
+    return [ev.text for ev in iter_added_lines(d.stdout)]
+
+
 def lint_range(base: str, tip: str, repo_root: str | Path | None = None) -> list[dict]:
     """Scan only the ledger entries ADDED between `base` and `tip`.
 
@@ -314,15 +378,10 @@ def lint_range(base: str, tip: str, repo_root: str | Path | None = None) -> list
         seg = shard_segment(rel) if rel else None
         if seg is None:
             continue
-        d = _git(repo_root, "diff", "--unified=0", f"{base}..{tip}", "--", rel)
-        if d.returncode != 0:
-            continue
-        for dl in d.stdout.splitlines():
-            # added content lines only (skip the "+++ b/..." file header)
-            if dl.startswith("+") and not dl.startswith("+++"):
-                m = check_entry(seg, dl[1:])
-                if m:
-                    out.append(m)
+        for raw in _added_lines(repo_root, f"{base}..{tip}", "--", rel):
+            m = check_entry(seg, raw.decode("utf-8", "replace"))
+            if m:
+                out.append(m)
     return out
 
 

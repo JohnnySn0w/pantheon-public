@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import fcntl
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -286,7 +289,7 @@ class PersonaBindingTests(unittest.TestCase):
             persona="orchestrator",
             destination="codex/interactive-chatgpt",
         )
-        self.assertEqual(primary.role, "orchestrator")
+        self.assertEqual(primary.role, "head-engineering-orchestrator")
         self.assertEqual(primary.configured_harness, "claude")
         self.assertEqual(primary.selected_harness, "claude")
         self.assertEqual(primary.launch.harness, "claude")
@@ -1241,6 +1244,197 @@ class ConsumePolicySkipCounter(unittest.TestCase):
             streak = captured["consume"]["policy_skip_streak"]
             self.assertEqual(streak["count"], 1)
             self.assertIn("since", streak)
+
+
+class RelaunchWindowExhaustion(unittest.TestCase):
+    """T-4137: RuntimeViabilityExhausted during a control-plane restart (the
+    handoff_and_restart.sh flock is held) soft-defers with exit 5; with no
+    restart in flight it still raises (exit 1, OnFailure pages)."""
+
+    def _lock(self, tmp: Path, *, age: float = 5.0) -> Path:
+        path = tmp / "handoff_and_restart_specialist.lock"
+        path.write_text("", encoding="utf-8")
+        t = time.time() - age
+        os.utime(path, (t, t))
+        return path
+
+    def _proc_locks_for(self, tmp: Path, path: Path, *, waiter: bool = False) -> Path:
+        st = os.stat(path)
+        dev = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}:{st.st_ino}"
+        arrow = " ->" if waiter else ""
+        locks = tmp / ("locks-waiter" if waiter else "locks")
+        locks.write_text(
+            f"1: POSIX  ADVISORY  WRITE 99 00:00:1 0 EOF\n"
+            f"2:{arrow} FLOCK  ADVISORY  WRITE 4242 {dev} 0 EOF\n",
+            encoding="utf-8",
+        )
+        return locks
+
+    def test_held_fresh_own_lock_is_a_relaunch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            path = self._lock(tmp)
+            got = persona_bringup.relaunch_in_progress(
+                "specialist", proc_locks=self._proc_locks_for(tmp, path), lock_paths=[path]
+            )
+            self.assertIsNotNone(got)
+            self.assertEqual(got["lock_path"], str(path))
+
+    def test_real_kernel_flock_is_detected(self) -> None:
+        # Hold a genuine flock and read the REAL /proc/locks: pins the parser to
+        # the kernel's actual format, not just to our fixture of it. Skips only
+        # where /proc/locks is unreadable (restricted proc); where it IS
+        # readable, a missed lock is a real parser regression and must fail.
+        if not os.access("/proc/locks", os.R_OK):
+            self.skipTest("/proc/locks not readable here")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._lock(Path(tmp))
+            with open(path, "w") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)
+                self.assertIsNotNone(
+                    persona_bringup.relaunch_in_progress("specialist", lock_paths=[path])
+                )
+            self.assertIsNone(persona_bringup.relaunch_in_progress("specialist", lock_paths=[path]))
+
+    def test_unheld_waiter_stale_or_foreign_lock_is_not_a_relaunch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            path = self._lock(tmp)
+            empty = tmp / "empty"
+            empty.write_text("", encoding="utf-8")
+            waiter = self._proc_locks_for(tmp, path, waiter=True)
+            locks = self._proc_locks_for(tmp, path)
+            for kwargs in (
+                {"proc_locks": empty},  # nobody holds it
+                {"proc_locks": waiter},  # a waiter holds nothing
+                {"proc_locks": locks, "uid": os.getuid() + 1},  # not this account's file
+                {  # held past the script's own wall-clock cap: a leak
+                    "proc_locks": locks,
+                    "now": time.time() + persona_bringup.RELAUNCH_LOCK_MAX_AGE_SECONDS + 60,
+                },
+            ):
+                with self.subTest(kwargs=sorted(kwargs)):
+                    self.assertIsNone(
+                        persona_bringup.relaunch_in_progress("specialist", lock_paths=[path], **kwargs)
+                    )
+
+    def _run_consume_exhausted(self, state_dir: Path, relaunch, captured: dict) -> int:
+        report = types.SimpleNamespace(observations=[types.SimpleNamespace(status="ok")])
+        binding = types.SimpleNamespace(
+            persona="specialist", launch=types.SimpleNamespace(mode="interactive")
+        )
+        with mock.patch.object(persona_bringup, "load_binding", return_value=binding), \
+            mock.patch.object(
+                persona_bringup, "select_recorded_runtime_binding", return_value=binding
+            ), \
+            mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+            mock.patch.object(persona_bringup, "build_adapter", return_value=mock.Mock()), \
+            mock.patch.object(persona_bringup, "first_fallback_binding", return_value=None), \
+            mock.patch.object(persona_bringup, "runtime_reference", return_value="same"), \
+            mock.patch.object(
+                persona_bringup, "configured_runtime_bindings", return_value=[]
+            ), \
+            mock.patch.object(
+                persona_bringup,
+                "wake_persistent_runtime",
+                side_effect=runtime_controller.RuntimeViabilityExhausted(
+                    "no viable runtime candidates for specialist"
+                ),
+            ), \
+            mock.patch.object(persona_bringup, "relaunch_in_progress", return_value=relaunch), \
+            mock.patch.object(persona_bringup, "_print_json", side_effect=captured.update):
+            return persona_bringup.main(
+                ["consume", "--persona", "specialist", "--state-dir", str(state_dir)]
+            )
+
+    def test_exhaustion_inside_relaunch_window_soft_defers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            sd = Path(tmp)
+            captured: dict = {}
+            evidence = {"lock_path": "/tmp/handoff_and_restart_specialist.lock", "lock_age_seconds": "212"}
+            self.assertEqual(self._run_consume_exhausted(sd, evidence, captured), 5)
+            self.assertEqual(captured["consume"]["skipped"], "relaunch_window_exhausted")
+            self.assertEqual(captured["consume"]["relaunch"], evidence)
+            self.assertEqual(load_policy_skip(sd, "specialist")["reason"], "relaunch_window_exhausted")
+
+    def test_exhaustion_with_no_relaunch_still_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(runtime_controller.RuntimeViabilityExhausted):
+                self._run_consume_exhausted(Path(tmp), None, {})
+
+    # --- T-5285: every candidate held + exhaustion is a deliberate hold, not a dead seat ---
+
+    def _bindings(self):
+        mk = lambda h, pr: types.SimpleNamespace(
+            persona="specialist", launch=types.SimpleNamespace(harness=h, profile=pr, mode="interactive")
+        )
+        return [mk("claude", "interactive-subscription"), mk("codex", "interactive-chatgpt")]
+
+    def _run_held(self, sd: Path, holds, captured: dict, *, relaunch=None) -> int:
+        bindings = self._bindings()
+        report = types.SimpleNamespace(observations=[types.SimpleNamespace(status="ok")])
+        with mock.patch.object(persona_bringup, "load_binding", return_value=bindings[0]), \
+            mock.patch.object(
+                persona_bringup, "select_recorded_runtime_binding", return_value=bindings[0]
+            ), \
+            mock.patch.object(persona_bringup, "diagnose_persona", return_value=report), \
+            mock.patch.object(persona_bringup, "build_adapter", return_value=mock.Mock()), \
+            mock.patch.object(persona_bringup, "first_fallback_binding", return_value=None), \
+            mock.patch.object(persona_bringup, "_seat_in_maintenance", return_value=False), \
+            mock.patch.object(
+                persona_bringup, "configured_runtime_bindings", return_value=tuple(bindings)
+            ), \
+            mock.patch.object(
+                persona_bringup,
+                "wake_persistent_runtime",
+                side_effect=runtime_controller.RuntimeViabilityExhausted(
+                    "no viable runtime candidates for specialist"
+                ),
+            ), \
+            mock.patch.object(runtime_controller, "load_holds", return_value=holds), \
+            mock.patch.object(persona_bringup, "relaunch_in_progress", return_value=relaunch), \
+            mock.patch.object(persona_bringup, "_print_json", side_effect=captured.update):
+            return persona_bringup.main(
+                ["consume", "--persona", "specialist", "--state-dir", str(sd)]
+            )
+
+    def test_exhaustion_all_candidates_held_soft_skips_T5285(self) -> None:
+        holds = {"claude/interactive-subscription": {}, "codex/interactive-chatgpt": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            captured: dict = {}
+            self.assertEqual(self._run_held(Path(tmp), holds, captured), 5)
+            self.assertEqual(captured["consume"]["skipped"], "all_runtimes_held")
+            self.assertEqual(load_policy_skip(Path(tmp), "specialist")["reason"], "all_runtimes_held")
+
+    def test_exhaustion_with_one_unheld_candidate_still_raises_T5285(self) -> None:
+        holds = {"claude/interactive-subscription": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(runtime_controller.RuntimeViabilityExhausted):
+                self._run_held(Path(tmp), holds, {})
+
+    def test_exhaustion_with_no_holds_still_raises_T5285(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(runtime_controller.RuntimeViabilityExhausted):
+                self._run_held(Path(tmp), {}, {})
+
+    def test_exhaustion_with_malformed_holds_still_raises_T5285(self) -> None:
+        # _FailClosedHolds reads every runtime as held; that must NOT quiet a dead seat.
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(runtime_controller.RuntimeViabilityExhausted):
+                self._run_held(Path(tmp), runtime_controller._FailClosedHolds("bad json"), {})
+
+    def test_holds_load_fault_still_raises_T5285(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            bindings = self._bindings()
+            with mock.patch.object(runtime_controller, "load_holds", side_effect=OSError("x")):
+                self.assertFalse(persona_bringup.all_runtimes_held("specialist", bindings, Path(tmp)))
+
+    def test_all_held_wins_over_relaunch_window_T5285(self) -> None:
+        holds = {"claude/interactive-subscription": {}, "codex/interactive-chatgpt": {}}
+        with tempfile.TemporaryDirectory() as tmp:
+            captured: dict = {}
+            self.assertEqual(self._run_held(Path(tmp), holds, captured, relaunch={"x": "1"}), 5)
+            self.assertEqual(captured["consume"]["skipped"], "all_runtimes_held")
 
 
 if __name__ == "__main__":

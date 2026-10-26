@@ -82,7 +82,7 @@ Amendments H, I, J on `sop/standard/testing-depth-and-scope.md` extract to metho
 
 - `architecture/engineering-practices/2026-07-28-falsification-must-be-run.md` (Amendment H)
 - `architecture/engineering-practices/2026-08-27-full-sweep-merged-tree-before-landing.md` (Amendment I)
-- `architecture/engineering-practices/2026-09-06-mutation-testing-gate.md` (Amendment J — folds T-3341's ruling + metis's deployment conditions + `tools/mutation_gate.py` graduation)
+- `architecture/engineering-practices/2026-09-06-mutation-testing-gate.md` (Amendment J — folds T-3341's ruling + mason's deployment conditions + `tools/mutation_gate.py` graduation)
 
 The SOP body's Amendment H/I/J sections retire to one-line pointers into `architecture/engineering-practices/`. Amendments A-D (real procedure changes) stay in the SOP body — they legitimately earned their ratify.
 
@@ -119,4 +119,4 @@ T-3455 (Amendment J ratify), T-3466 (SPLIT proposal for testing-depth-and-scope)
 
 - **`sop/standard/` audit follow-through (T-3465):** the audit surfaced testing-depth-and-scope + ticket-flow as SPLIT candidates. Under the methodology tier, testing-depth-and-scope's split need dissolves (methodology extraction handles it). ticket-flow's split need persists (it's genuinely architecture-half + procedure-half, not methodology). Handle post-ratify per-artifact.
 - **Do amendments retire in one pass or incrementally?** Preferred: incrementally, opt-in per SOP as HO does cleanup work. No forced migration pass on all existing amended SOPs.
-- **Does mnemosyne have her own methodology surface?** She's the second head with her own directory tree. Same shape applies (architecture/engineering-practices/ under her own repo/notes surface) — but this ADR's scope is the pantheon-config tree.
+- **Does archivist have her own methodology surface?** She's the second head with her own directory tree. Same shape applies (architecture/engineering-practices/ under her own repo/notes surface) — but this ADR's scope is the pantheon-config tree.

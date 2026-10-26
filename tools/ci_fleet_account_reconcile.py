@@ -76,7 +76,14 @@ _RESERVED_UIDS = {
     "exocortex": 6004,
     "suborch1": 6005,
     "suborch2": 6006,
-    "the-ancestor": 6007,
+    # 6007 was the-ancestor (retired, ORG-087 sec. 4 step 4 / T-3421): left unassigned, do NOT
+    # reuse. The desired set derives from the manifest (fleet_accounts()), so dropping the entry
+    # cannot raise a false "unmapped account"; --check never inspects accounts outside the manifest.
+    # T-4884 B6: Watchman's account. CI-fixture uid only (the live host's real uid is
+    # whatever B7's useradd assigns, as for every other seat). NOT 6008/6009: on CT202
+    # those are held by the runner accounts runner-pc / runner-pcl (verified by --check
+    # during the B7 runbook research), and the reconciler would CONFLICT. 6010 was free.
+    "codex-fallback": 6010,
 }
 
 HOME_ROOT = "/home"

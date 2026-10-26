@@ -3,7 +3,7 @@ aliases: [ORG-051]
 title: Secret and authentication lifecycle for Pantheon hosts
 status: Ratified 2026-07-30 by the operator (Telegram 275)
 date: 2026-07-30
-author: Codex (Cairn)
+author: Codex (Consultant)
 relates: ORG-039, ORG-046, ORG-047, ORG-050
 build_disposition: needs-build
 scoping_ticket: T-2828
@@ -130,4 +130,4 @@ order are follow-up implementation decisions.
 
 ## Follow-up reviews
 
-- **Cairn (Codex) skeptical review — 2026-08-20** at [`knowledge/episodic/2026-08-20-cairn-authbroker-review/report.md`](../knowledge/episodic/2026-08-20-cairn-authbroker-review/report.md). Verdict: sound direction, incomplete security boundary. The ratified reference-contract + rotation/revoke + broker discipline in this ADR are affirmed; the current `credential_broker.py` host-file implementation is characterized as a validator + same-process descriptor registry — NOT yet a production credential broker (no authenticated cross-process transport, server-derived identity, or crash-consistent lease state). Ten recommendations bound to T-2870's acceptance surface via the 2026-08-27 fold annotation on that ticket. Non-normative; the ratified decisions above stand.
+- **Consultant (Codex) skeptical review — 2026-08-20** at [`knowledge/episodic/2026-08-20-consultant-authbroker-review/report.md`](../knowledge/episodic/2026-08-20-consultant-authbroker-review/report.md). Verdict: sound direction, incomplete security boundary. The ratified reference-contract + rotation/revoke + broker discipline in this ADR are affirmed; the current `credential_broker.py` host-file implementation is characterized as a validator + same-process descriptor registry — NOT yet a production credential broker (no authenticated cross-process transport, server-derived identity, or crash-consistent lease state). Ten recommendations bound to T-2870's acceptance surface via the 2026-08-27 fold annotation on that ticket. Non-normative; the ratified decisions above stand.

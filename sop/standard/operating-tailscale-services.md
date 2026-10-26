@@ -48,7 +48,7 @@ If `--json` confirms the `Services` block is empty/missing, restore via the cano
 
 ```bash
 # From Recovery, when the operator can't be reached:
-python3 tools/ticket.py file --requester operator --target orchestrator \
+python3 tools/ticket.py file --requester operator --target role:head_engineering_orchestrator \
   --title "Restore Tailscale Serve mappings (svc:kino + svc:dashboard)" \
   --ask "[the two canonical commands + acceptance criteria]"
 ```

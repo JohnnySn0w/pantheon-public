@@ -35,9 +35,9 @@ The wrapper executes 7 steps (each is also the script's exit code on failure —
 4. **Poll mtime until it changes** (HO ack-via-write — the structural witness, not a flag-file). Default ACK timeout: 600s (10min — wide enough for a substantive HANDOFF write).
 5. **`systemctl restart <unit>`** — drains the old session, brings up the fresh one.
 6. **`systemctl is-active` fast-fail** — poll until active or timeout (default 60s).
-7. **Capture target pane + grep for steady-state sentinel.** Default sentinel: BOTH `(╭─+╮|─{20,})` (Claude Code prompt frame) AND `\? for shortcuts|ctrl\+t to hide tasks` (idle marker per T-0172). Both must match for steady-state declared.
+7. **Capture target pane + grep for steady-state sentinel.** A three-way conjunction (T-0528): the prompt frame `(╭(─)+╮|(─){20,})` AND the `❯` cursor match, AND `DIALOG_EXCLUDE` does NOT (the confirm footers, plus the auto-mode startup prompt's option line since T-4646). All three must hold for steady-state.
 
-**Post-step-7 kick (T-0172, default-on):** A canned directive is injected into the fresh pane to trigger first-turn action — read HANDOFF.md + post a status snapshot to the operator's Telegram. Disable via `--no-kick`.
+**Post-step-7 kick (T-0172, default-on):** A canned directive is injected into the fresh pane to trigger first-turn action — read HANDOFF.md + post a status snapshot to the operator's Telegram. Disable via `--no-kick`. Since T-4646 the kick refuses to paste or press Enter into a pane that is not at a composer (`send_keys_submit` exit 3) and does not re-fire; the restart then reports a failed kick.
 
 ## Common failure modes
 
@@ -45,7 +45,7 @@ The wrapper executes 7 steps (each is also the script's exit code on failure —
 
 - **`systemctl restart` failed (exit 5/6).** Service unit broken — check `journalctl -u <unit> --since '5 min ago'`. Often: a misconfigured hook in `~/.claude/settings.json`, a missing dependency, or an environment-file path that disappeared. Fix the unit, re-run.
 
-- **Sentinel mismatch (exit 7).** Restart succeeded but the fresh pane never reached the steady-state shape. Common causes: (a) Claude Code at a confirmation dialog (e.g., "trust this folder?"); (b) startup hook printing un-bordered output that shifts the prompt frame; (c) MCP eviction during startup. Diagnostic: capture the pane manually + visually inspect. Fix the underlying state, re-run from step 5.
+- **Sentinel mismatch (exit 7).** Restart succeeded but the fresh pane never reached the steady-state shape. Common causes: (a) Claude Code at a confirmation dialog (e.g., "trust this folder?"), or the footerless "Make auto mode your default permission mode?" startup prompt (answer **No** by hand, not Esc; a user-settings `permissions.defaultMode` pin is what arms it, see `bugs/claude-code-auto-mode-default-nudge-restart-kick-enter-accepts-yes.md`); (b) startup hook printing un-bordered output that shifts the prompt frame; (c) MCP eviction during startup. Diagnostic: capture the pane manually + visually inspect. Fix the underlying state, re-run from step 5.
 
 - **HO mid-cycle when T-0184 monitor fires.** Auto-restart fires regardless of HO's current work; the in-progress dispatch chain is interrupted. The HANDOFF.md HO writes captures what was inflight, but a worker dispatch may need re-issuing in the fresh session. Fresh-HO reads the latest ledger entry first to confirm state.
 
@@ -62,7 +62,7 @@ The wrapper executes 7 steps (each is also the script's exit code on failure —
 
 - **Source / scripts:** `tools/handoff_and_restart.sh` (the wrapper — primary source; `--help` for full flag list); `tools/context_fill_monitor.py` (T-0184 — fires this wrapper on context decay); systemd unit templates per T-0189 (per-agent monitors).
 - **Principles + directives:** P1 (architecture over policy — the wrapper exists to replace ~5min of manual broker dance per restart with one structural command); D1 (the operator's bandwidth — the load-bearing why); D8 (HO self-discipline — fresh-HO reads latest ledger entry post-restart per the discipline).
-- **CLAUDE.md sections:** §Auto-resume on Max-window cap-hits (defines the boundary against which this runbook sits); §Recovery context (Recovery's role in restart-firing); §Auto-restart-on-decay (T-0184 LIVE rule pinned at HO-level).
+- **CLAUDE.md sections:** §Cap-hits on the control plane (ho_resumer retired; the runtime controller owns cap-hits, which defines the boundary against which this runbook sits); §Recovery context (Recovery's role in restart-firing); §Auto-restart-on-decay (T-0184 LIVE rule pinned at HO-level).
 - **ADRs:** ORG-009 (kino PWA — long-term home for some operator triggers; some restart shapes will eventually surface there).
 - **Tickets:** T-0008 (the wrapper's original deliverable, 2026-04-XX); T-0172 (post-step-7 kick + sentinel-regex tightening — currently retargeted to Recovery); T-0184 (auto-restart-on-decay monitor — Orchestrator-target initial); T-0179 (multi-agent extension — Orchestrator + Recovery + Specialist); T-0189 (per-agent monitor systemd template); T-0197 (this SOP's authoring ticket).
 - **Telegram refs:** msg_876 (T-0160 ratification of the standard-bucket extension scope); msg_1169 (autonomy expansion + work-indefinitely posture context — auto-restart-on-decay is what makes "work indefinitely" structurally safe); msg_1174 (work-indefinitely posture activation explicit).

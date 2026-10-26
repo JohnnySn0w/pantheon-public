@@ -45,14 +45,7 @@ generic privilege grant.
 
 The navigator is a logical organ with a small, stable interface:
 
-```text
-capability.search(query, constraints, context_budget) -> bounded candidates
-capability.describe(capability_id, requested_detail) -> contract slice
-capability.plan(capability_id, typed_input, bounded_purpose) -> effect summary/handle
-capability.invoke(plan_or_handle) -> typed result/receipt
-capability.status(handle) -> lifecycle state
-capability.cancel(handle) -> accepted/refused + receipt
-```
+Its operations are search (bounded candidates), describe (a contract slice), plan (an effect summary or handle), invoke (a typed result and receipt), status, and cancel. The signature sketch is in `notes/2026-10-08-org-059-navigator-interface-relocated.md`.
 
 Harnesses may access this through MCP because most support it natively. The
 underlying capability may be MCP, D-Bus, A2A, mailbox, HTTP, local library, or a

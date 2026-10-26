@@ -85,10 +85,6 @@ WRITE, so they carry the full
 - `tools/ticket_lint.py` · `pantheon-ticket-lint.{service,timer}` · hourly @ :20.
 - Auto-fixes malformed frontmatter; flags dependency cycles + stale-done-deps (T-0975). Run `--dry-run` after batch gating (memory `feedback_check_parent_and_cycles_before_gating`). Can false-flag via a cross-repo resolution bug — verify the checker before retargeting (memory `feedback_improper_tickets_retarget_to_originator`).
 
-### session_reset_reconcile — ledger gap reconciler
-- `tools/session_reset_reconcile.py` · `pantheon-session-reset-reconcile.{service,timer}` · daily 00:30.
-- Lands ledger entries for session-reset events not yet recorded (feeds off `session_reset_log.py`).
-
 ### spine_index_groom — spine-README index regenerator
 - `tools/spine_index_groom.py` · `pantheon-spine-index-groom.{service,timer}` · daily 12:30 UTC.
 - Regenerates sentinel-region index blocks in spine READMEs ([marker/sentinel-debounce](cross-cutting-patterns.md#marker--sentinel-debounce) reference implementation); reconciles INDEX/SPINE against the ledger shards. Manual invocation now **requires a mode flag** (`--commit-prod` / `--dry-run`).
@@ -102,9 +98,8 @@ legitimate deliberate human-facing rollup — don't smuggle alerts into them (al
 via `route_failure_alert`). **Emit proof-of-life even on an empty cycle** so silence is
 diagnostic.
 
-### activity_digest — 5-hourly system pulse to the operator
-- `tools/activity_digest.py` · `pantheon-activity-digest.{service,timer}` · every 5 h (00,05,10,15,20:00 UTC).
-- The fleet's cycle pulse; reads cycle data (`cycle_stats.py` is the ledger-metrics read-tool).
+### activity_digest — RETIRED (2026-09-29, T-4289)
+- Was the 5-hourly status pulse to the operator; removed as status-only under T-4200 (action-only Telegram).
 
 ### watch_digest — daily watch-loop digest
 - `tools/watch_digest.py` · `pantheon-watch-digest.{service,timer}` · daily 18:00 UTC. **Specialist.**

@@ -5,6 +5,8 @@ domain: pantheon, sendmessage, team-routing
 ---
 
 
+**RETIRED 2026-09-14 — Claude Code 2.1.178 removed `TeamCreate`/`TeamDelete` (T-1281, 2026-06-22).** The system-address vs personal-name distinction below rests on `TeamCreate` pre-allocating the `team-lead@<team>` slot; in the implicit-team model, teammates are `Agent(name=...)` and the name IS the address — there is no separate "system address" any more, and `SendMessage(to=<name>)` always routes to that live agent. Kept as-is (per T-1281's "keep-as-historical" disposition) to document past mechanics; the current-harness dispatch pattern is what the checklist below carries.
+
 > **Superseded as load-bearing by** [`sop/standard/team-orchestrator-dispatch-checklist.md`](../sop/standard/team-orchestrator-dispatch-checklist.md) — the live dispatch guidance these symptoms taught now lives in that checklist (ORG-012 supersedure-trail, T-0833 D-1). This entry remains the recorded symptom + diagnosis; act on the checklist for current guidance.
 
 ## Symptom

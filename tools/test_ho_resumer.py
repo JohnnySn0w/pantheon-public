@@ -403,8 +403,10 @@ class TestMainImminentFire(unittest.TestCase):
             self.assertEqual(call_args[0], fake_claude)
             self.assertEqual(call_args[1], "--resume")
             self.assertEqual(call_args[2], session_id)
-            self.assertEqual(call_args[3], "-p")
-            self.assertEqual(call_args[4], RESUMER_PROMPT)
+            # T-4935: same bypassPermissions unlock as the seats.
+            self.assertEqual(call_args[3:5], ["--permission-mode", "bypassPermissions"])
+            self.assertEqual(call_args[5], "-p")
+            self.assertEqual(call_args[6], RESUMER_PROMPT)
 
     def test_state_file_rotated_after_fire(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -587,6 +589,19 @@ class TestMainImminentFire(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+class _FrozenClock:
+    """Stand-in for the resumer's `time` module with time() pinned (T-5322)."""
+
+    def __init__(self, now: int) -> None:
+        self._now = float(now)
+
+    def time(self) -> float:
+        return self._now
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
 class TestFireWindowEdge(unittest.TestCase):
     """resets_at + 90s is exactly at 'now' → should fire (edge is inclusive)."""
 
@@ -622,8 +637,11 @@ class TestFireWindowEdge(unittest.TestCase):
 
             with patch.dict(os.environ, {"PANTHEON_STATE_DIR": tmp}):
                 with patch("tools.ho_resumer._ho_already_running", return_value=False):
-                    with patch("subprocess.run") as mock_sub:
-                        result = resumer.main()
+                    # T-5322: pin the resumer's clock to `now`; on a loaded runner a
+                    # second can pass before main() reads time and cross the edge.
+                    with patch.object(resumer, "time", _FrozenClock(now)):
+                        with patch("subprocess.run") as mock_sub:
+                            result = resumer.main()
 
             self.assertEqual(result, 0)
             self.assertFalse(mock_sub.called)

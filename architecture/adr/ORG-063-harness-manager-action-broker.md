@@ -34,7 +34,7 @@ Surfaced by the T-2633 specialist control-plane cutover: specialist reached full
 
 **1. Harness runs unblocked (per-harness).** Every seat launches with its harness's no-prompt/full-auto setting so it never wedges. This is a **per-harness mapping, not a single flag** — a thin adapter (the ORG-031 `harness_adapter`) maps a neutral "full-auto" intent onto each harness's actual controls:
   - **Claude:** `--permission-mode bypassPermissions`.
-  - **Codex:** `approval_policy: never` — **and note codex additionally runs its own OS sandbox** (`sandbox_mode: workspace-write`, bubblewrap-enforced) that restricts writes to enumerated `writable_roots` and gates network **regardless of the approval setting**. That sandbox is an **added layer we keep**, not something the unblock removes; codex separates approval (when it prompts) from sandbox (what the OS allows), plus per-MCP-tool approval and hook-trust — so "unblock codex" is several settings, not one switch. (Verified vs `tools/harness_adapter/codex.py` + `knowledge/watch/reports/2026-07-07/codex-cli-sandbox-profiles-spec.md` + `codex doctor`.)
+  - **Codex:** `approval_policy: never` — **and note codex additionally runs its own OS sandbox** (`sandbox_mode: workspace-write`, bubblewrap-enforced) that restricts writes to enumerated `writable_roots` and gates network **regardless of the approval setting**. *(Amended 2026-10-12, the operator TG 11733/11737: codex runs `sandbox_mode: danger-full-access` by design. The harness sandbox is NOT a layer we keep, because permissions operate at the unix-user level, not the harness level; see §2.)* Originally: that sandbox was described as an added layer we keep, not something the unblock removes; codex separates approval (when it prompts) from sandbox (what the OS allows), plus per-MCP-tool approval and hook-trust — so "unblock codex" is several settings, not one switch. (Verified vs `tools/harness_adapter/codex.py` + `knowledge/watch/reports/2026-07-07/codex-cli-sandbox-profiles-spec.md` + `codex doctor`.)
 
   **Load-bearing distinction (the operator, TG 7614–7615):** unblocking the harness drops the harness **prompt** layer ONLY. It does **not** grant OS power. A fully-unblocked seat can still only do what its UID is granted — the flag stops the prompting; the UID is still the wall.
 
@@ -56,6 +56,7 @@ This posture is *implemented by* subsystems that each already have their own ADR
 
 - **Action Broker** → **ORG-052** (harness-neutral host-capability broker with MCP adapters over system D-Bus). Layer 3's "brokers gate sensitive stuff."
 - **Harness Manager** — the "how a seat runs" umbrella (`persona_installer`, `runtime_controller`, `persona_bringup`, `harness_adapter`, `instance.yaml`) — is itself an umbrella over subsystems already covered by **ORG-031** (harness-abstraction adapter + generalized daemon-onboarding), **ORG-050** (security/identity contract for installer + bringup), and **ORG-051** (secret & authentication lifecycle). Layer 1's full-auto-flag mapping is a thin addition to the ORG-031 `harness_adapter`; it is not a new subsystem.
+- **Germination engine** → **[[ORG-080]]** (Ratified 2026-08-26). The apex lifecycle composer that installs, configures, updates and removes every component, including the Harness Manager, which it composes as the `harness-manager` component. The engine holds no capability of its own ([[ORG-080]] D-B), so ruling 2's isolates stand: substrate ops run on the bootstrap in-process root path and runtime ops through the Action Broker ([[ORG-082]]).
 - **Scheduler** — the "when things run" isolate — → **ORG-064**. Peeled out of the prior draft's §Scheduler; unaffected by this rewrite.
 
 ## the operator's rulings (carried forward — TG 7234 + 7255 + 7614)
@@ -94,3 +95,14 @@ This posture is *implemented by* subsystems that each already have their own ADR
 - The UID-cordon audit completes — its findings may reshape the posture's stopgap→end-state sequencing.
 - The Action Broker (ORG-052) reaches implementation — this posture's stopgap retires into it.
 - The operator dispositions the §OPEN-1 modular-invariants/health-interface relocation.
+
+## Amendment — 2026-10-09 (re-eval of ORG-063:S2, T-4741)
+
+**Approved by the operator via Telegram 11611 ("1. ok"), in reply to Orchestrator's amendment request.** This updates the text to a decision that was already ratified. It adds nothing new, and the trigger text above (ORG-063:S2) is left as ratified.
+
+The second re-evaluate trigger says the posture's stopgap "retires into" the Action Broker. That was true when written, but [[ORG-082]] (ratified 2026-08-26, TG 8612) has since split where the stopgap retires to:
+
+- **Substrate operations** (account create/retire, allowlisted-group membership, sudoers fragments, system units, mailbox ACLs) retire into the **bootstrap in-process root path**. That is a supervised, operator-run leg. These operations are structurally absent from the broker daemon's method table ([[ORG-082]] §1, D-B).
+- **Runtime brokered host actions** still retire into the Action Broker ([[ORG-052]]), which exposes only the reviewed runtime subset ([[ORG-082]] gate 32a).
+
+Read S2 as firing when **both** destinations reach implementation. The posture itself does not change: full-perms harnesses, with the UID/OS boundary as the cordon.

@@ -297,9 +297,16 @@ def run_probe(
             str(statusline_path),
         )
     )
+    # T-4742: the probe runs as the persona's own account, so it inherits the user
+    # settings' telegram plugin. That plugin's server.ts SIGTERMs whatever poller
+    # bot.pid names on start and deletes bot.pid on exit, so loading it here kills
+    # the live session's comms. A one-turn ping needs no plugins.
     _atomic_json(
         settings_path,
-        {"statusLine": {"type": "command", "command": command}},
+        {
+            "statusLine": {"type": "command", "command": command},
+            "enabledPlugins": {"telegram@claude-plugins-official": False},
+        },
     )
     baseline_statusline_sha256: str | None = None
 
@@ -338,7 +345,11 @@ def run_probe(
     observed: Mapping[str, Any] | None = None
     pong_observed = False
     try:
-        startup_deadline = monotonic() + min(20.0, timeout_seconds / 3)
+        # T-5144: Claude 2.1.302 can spend more than 20 seconds rendering
+        # startup diagnostics before it exposes the interactive input frame.
+        # Keep this bounded independently of the post-submit evidence timeout,
+        # but allow the observed 24-second healthy startup to complete.
+        startup_deadline = monotonic() + min(45.0, timeout_seconds / 2)
         while monotonic() < startup_deadline:
             capture = _run(
                 runner,
@@ -361,12 +372,17 @@ def run_probe(
                 # before submission so startup bytes cannot satisfy the turn.
                 baseline_statusline_sha256 = _sha256_file(statusline_path)
                 submission_boundary = now()
+                # T-4369: the probe is the FIRST paste into a TUI that has only just
+                # booted, which renders late (~3s at load ~12, vs ~0.1-0.5s later).
+                # Gate the first Enter on the render, as the runtime controller does.
                 submit = _run(
                     runner,
                     (
                         str(submit_helper),
                         "--harness",
                         "claude-code",
+                        "--render-wait",
+                        "8",
                         tmux_target,
                         PROMPT,
                     ),

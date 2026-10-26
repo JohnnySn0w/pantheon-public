@@ -10,7 +10,7 @@ domain: "pantheon, instance.yaml, agent_role_map, fleet-monitor bindings, guard 
 
 ```
 FAIL: test_binding_fallback_never_contradicts_instance_yaml (tools.test_instance_role_grants.TestBindingFallbackStaysInSync...)
-AssertionError: {'specialist': ({'account': 'claude-research', ...}, {..., 'expected_policy_skip': 'runtime_viability_blocked'}), 'metis': ({'account': 'suborch1'}, {'account': 'suborch1', 'expected_policy_skip': 'runtime_viability_blocked'})} != {}
+AssertionError: {'specialist': ({'account': 'claude-research', ...}, {..., 'expected_policy_skip': 'runtime_viability_blocked'}), 'mason': ({'account': 'suborch1'}, {'account': 'suborch1', 'expected_policy_skip': 'runtime_viability_blocked'})} != {}
 : monitor-binding fallback disagrees with instance.yaml ... The fleet monitor config would then depend on whether the manifest loaded. Keep _FALLBACK_PERSONA_TO_BINDING in sync ...
 ```
 

@@ -1175,9 +1175,9 @@ def observe_runtime_state(
                 "Claude runtime must have exactly one explicit --permission-mode"
             )
         mode_index = mode_positions[0]
-        if mode_index + 1 >= len(argv) or argv[mode_index + 1] != "default":
+        if mode_index + 1 >= len(argv) or argv[mode_index + 1] != "bypassPermissions":
             raise AcceptanceRefused(
-                "Claude runtime permission mode is not explicit default"
+                "Claude runtime permission mode is not explicit bypassPermissions"
             )
     return recorder.append(
         "runtime_state",

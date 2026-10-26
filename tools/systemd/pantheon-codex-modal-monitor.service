@@ -9,7 +9,6 @@ OnFailure=pantheon-unit-failure-alert@%n.service
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
-Environment=PANTHEON_TELEGRAM_ENV=%h/.claude/channels/telegram/pantheon.env
 # Alert-only: captures codex-session (sudo -nu codex) and, on the model-switch
 # modal, routes a failure alert to Recovery (route_failure_alert). NEVER sends keys
 # into codex — Recovery does the Esc-dismiss (keeping the current model). Cooldown-gated.

@@ -80,13 +80,20 @@ EOF
 # the fix forward instead of reverting it). Overridable via T2629_TARGETS
 # (newline-separated absolute paths) for the regression test; production leaves
 # it unset and uses the live plugin globs.
+#
+# T-4092: the globs are rooted at the SEAT's home, not hardcoded to claude-fallback.
+# The 409 give-up lives in the shared upstream plugin, so every telegram seat needs
+# this. Usage: telegram_poller_409_patch.sh [seat-home]  (default: $HOME). Run it AS
+# the seat account (the plugin files are that account's): from its own supervise
+# script, or cross-account via `sudo -u <acct> bash -c '<this script>'`.
+SEAT_HOME="${1:-$HOME}"
 targets=()
 if [ -n "${T2629_TARGETS:-}" ]; then
   while IFS= read -r f; do [ -n "$f" ] && targets+=("$f"); done <<< "$T2629_TARGETS"
 else
   while IFS= read -r f; do targets+=("$f"); done < <(
-    ls /home/claude-fallback/.claude/plugins/cache/claude-plugins-official/telegram/*/server.ts 2>/dev/null
-    ls /home/claude-fallback/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram/server.ts 2>/dev/null
+    ls "$SEAT_HOME"/.claude/plugins/cache/claude-plugins-official/telegram/*/server.ts 2>/dev/null
+    ls "$SEAT_HOME"/.claude/plugins/marketplaces/claude-plugins-official/external_plugins/telegram/server.ts 2>/dev/null
   )
 fi
 

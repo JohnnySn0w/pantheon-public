@@ -22,7 +22,7 @@ Environment=PATH=/usr/local/bin:/usr/bin:/bin
 # No `sg` wrapper: this touches only git and its own state file under
 # ~/.local/state/pantheon/. It does not read the mailbox hub, so it needs no
 # supplementary group. `git fetch` uses the file-based IdentityFile in
-# ~/.ssh/config (github-pantheon-config alias) and was verified to work with
+# ~/.ssh/config (github.com alias) and was verified to work with
 # SSH_AUTH_SOCK unset — a systemd user unit has no agent.
 ExecStart=/usr/bin/python3 %h/pantheon-config/tools/hermes_local_audit.py
 

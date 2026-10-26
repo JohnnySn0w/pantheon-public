@@ -100,11 +100,15 @@ def _clear(marker: Path) -> None:
 
 
 def _emit(context: str) -> None:
-    """Emit a non-blocking PreToolUse context injection and exit 0."""
+    """Emit a non-blocking PreToolUse context injection and exit 0.
+
+    No permissionDecision (T-4650): additionalContext alone reaches Claude and the call
+    continues through the normal permission flow. An "allow" here approved whichever
+    tool call the nudge happened to land on, past the permission prompt and, in auto
+    mode, the classifier, and how it combines with another hook's deny is undocumented."""
     print(json.dumps({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
             "additionalContext": context,
         }
     }))

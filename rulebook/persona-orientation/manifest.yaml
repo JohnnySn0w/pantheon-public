@@ -88,9 +88,16 @@ base_layer:
           label: shaping-and-viability
           # ORG-089 §Landing bundle Surface 5b (Ratified 2026-09-06 via TG 9047):
           # every non-vault ADR drafter runs the viability pass in RECORD-mode
-          # + surfaces reserved-set material-change results to the operator. Cairn's
+          # + surfaces reserved-set material-change results to the operator. Consultant's
           # ORG-041 review checklist points at this SOP for RECORD-field
           # verification.
+        - path: sop/standard/applying-the-threat-model.md
+          heading: "## When it fires"
+          label: threat-model
+          # T-5288: ORG-105 (Ratified 2026-10-20, the operator TG 12174) must be present
+          # wherever a security or privacy finding is raised or rated (§6; TG 12164).
+          # ORG-105 §4 is a list item with no heading to extract, so this sources the
+          # SOP that applies it.
 
     - id: discovery_checklist
       extract: inline
@@ -112,6 +119,18 @@ base_layer:
            teammates in a prior turn, check inbox mtimes against role
            thresholds (orchestrator 30min / implementer 15min / reviewer
            5min).
+
+    - id: shared_repos
+      extract: inline
+      body: |
+        Fleet-shared repos besides pantheon-config (every seat has a clone):
+
+        - Hardware inventory: `~/pantheon-inventory` (Forgejo
+          `pantheon/pantheon-inventory`; fleet read and write, the operator TG
+          10401). One file per device under `devices/`. Read it before
+          answering a hardware question; update the device's file when
+          something changes (`git pull --rebase` before pushing). Run
+          `python3 tools/list.py` there for a table.
 
     - id: agents_claude_constraints
       extract: inline
@@ -149,20 +168,25 @@ base_layer:
 
 roles:
   - id: implementer
-    delta_sections: [plan_first, testing_depth, code_size_norms_body, five_phase_signatures_first]
+    delta_sections: [plan_first, testing_depth, code_size_norms_body, five_phase_signatures_first, worktree_stash_hygiene]
     tool_scope: [read, edit, write, bash, grep, glob]
     forbidden_tools: [telegram_reply, mailbox_send_to_operator]
   - id: reviewer
-    delta_sections: [preimplementation, codex_spec_review, three_methodologies]
+    delta_sections: [preimplementation, codex_spec_review, review_methodologies]
     tool_scope: [read, grep, glob, bash]
     forbidden_tools: [edit, write, telegram_reply, mailbox_send_to_operator]
   - id: project_orchestrator
     delta_sections: [team_checklist, brief_construction, worker_silence_liveness, chain_of_justification]
     tool_scope: [read, edit, write, bash, grep, glob, agent_dispatch]
     forbidden_tools: [telegram_reply]
-  - id: orchestrator
+  - id: head_engineering_orchestrator
     delta_sections: [autonomy_calibration, ticket_routing, retask_discipline, user_message_closeout, ho_absent_operator]
     tool_scope: [all]
+  - id: engineering_orchestrator
+    # mason + artisan (T-2892). No operator-facing channel (ORG-043): upward comms go to orchestrator.
+    delta_sections: [standing_rules, autonomy_calibration, ticket_routing, push_merge_boundary]
+    tool_scope: [all]
+    forbidden_tools: [telegram_reply, mailbox_send_to_operator]
   - id: research
     delta_sections: [research_standards, filing_convention, isolation, a2a_shape]
     tool_scope: [read, write, webfetch, websearch, bash, grep, glob]
@@ -170,15 +194,15 @@ roles:
   - id: recovery
     delta_sections: [restart_pattern, auto_resume, cross_account_ops, error_handling]
     tool_scope: [all]
-  - id: cairn_worker
+  - id: consultant_worker
     delta_sections: [bounded_worker_boundary, s3star_authorship_transfer_rule]
     tool_scope: [read, edit, write, bash, grep, glob]
     # Phase 5 gate on T-3333 ruling — do not populate delta content yet.
-  - id: cairn_reviewer
-    delta_sections: [s3star_assurance_charter, three_methodologies, no_authorship_of_reviewed_artifact]
+  - id: consultant_reviewer
+    delta_sections: [s3star_assurance_charter, review_methodologies, no_authorship_of_reviewed_artifact]
     tool_scope: [read, grep, glob, bash]
     # Phase 5 gate on T-3333 ruling — do not populate delta content yet.
-  - id: cairn_temp_backup_orchestrator
+  - id: consultant_temp_backup_orchestrator
     delta_sections: [temp_activation_boundary, no_standing_authority]
     tool_scope: [all]
     activation: explicit_only

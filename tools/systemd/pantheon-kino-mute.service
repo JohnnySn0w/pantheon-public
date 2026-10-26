@@ -1,0 +1,13 @@
+# kino Health mute toggle, Recovery side (T-5397): validate kino's requests and apply them
+# through notify_policy (strict writes, T-5396). Exits non-zero only when the mute
+# registry is unreadable; a refused request is reported to kino in status.json.
+[Unit]
+Description=kino mute dropbox apply (T-5397)
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+# The live registry is Recovery-owned at /var/lib/pantheon/notify-mute/notify_mute.json.
+# Keep sg for the kino dropbox's shared-group access posture (T-1015/T-5397).
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/kino_mute_dropbox.py apply --refresh"

@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon pve2 backup freshness — daily 10:00 UTC, after the 02:30/03:40 local jobs (T-4998)
+
+[Timer]
+OnCalendar=*-*-* 10:00:00 UTC
+Persistent=true
+RandomizedDelaySec=5min
+Unit=pantheon-pve2-backup-freshness.service
+
+[Install]
+WantedBy=timers.target

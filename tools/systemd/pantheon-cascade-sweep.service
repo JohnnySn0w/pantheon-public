@@ -1,0 +1,35 @@
+[Unit]
+Description=Pantheon ORG-013 cascade sweep — level-triggered reconcile of stale depends_on (T-4186)
+Documentation=file:///home/%u/pantheon-config/tools/cascade_sweep.py
+After=network-online.target
+Wants=network-online.target
+
+# Silent-failure guard (T-1868, repo-templated per T-1928): on failure, wake Recovery via the ORG-026 mailbox.
+# The sweep exits non-zero ONLY for a genuine failure to converge (pull/push failure, a wedged clone,
+# a cascade that claimed success but left the tid stale). A busy lock or a seat checkout that is
+# momentarily on a non-main branch is DEFERRED to the next tick and exits 0, so a transient never
+# pages -- but the 8th CONSECUTIVE deferred run (~2h at */15, T-4220) exits 1 too, naming the reason
+# and the count, so a sweep stuck behind a permanent deferral cannot stay quiet.
+# A timer that stops FIRING starts no run to fail; pantheon-consumer-liveness (on claude-fallback)
+# watches that, via ExecMainExitTimestamp, against a 60 min max-silence (T-4220).
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+
+# ⚠️ ONE SEAT ONLY — the `claude` seat (orchestrator's checkout, where pushes to main are proven). The sweep
+# pushes with that seat's own git credential: no deploy key, no token, nothing new (T-4186 replaced
+# the cascade-on-merge Action, whose read-only GITHUB_TOKEN could never push to protect-main).
+# Two seats running it would only race each other harmlessly (idempotent, push-with-rebase), not help.
+#
+# Writes go through `ticket.py cascade` itself (checkout guard, git_mutation_lock, pre-pull, README
+# rebuild, byte-sequence guard, push_with_retry) — never a hand-edit of ticket frontmatter.
+# Read-only preview:  python3 tools/cascade_sweep.py --check
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/cascade_sweep.py
+StandardOutput=journal
+StandardError=journal
+# Normal run: ~1s to scan ~330 tickets, plus one lock+pull+push per stale tid (0 in steady state).
+# The cap is 25 tids per run, each bounded by the 30s lock timeout and the push retries.
+TimeoutStartSec=5min

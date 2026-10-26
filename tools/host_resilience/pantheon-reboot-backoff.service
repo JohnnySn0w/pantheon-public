@@ -1,0 +1,17 @@
+[Unit]
+Description=Pantheon reboot-loop backoff (T-5237): count boots in the last hour, lengthen kernel.panic, hold the watchdog on a loop
+Documentation=file:///home/claude/pantheon-config/tools/host_resilience/pantheon_reboot_backoff.py
+# After systemd-sysctl so our kernel.panic is the last writer; before multi-user so the backoff
+# is in place before anything the watchdog or a panic could interrupt.
+After=local-fs.target systemd-sysctl.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /usr/local/sbin/pantheon_reboot_backoff.py backoff
+TimeoutStartSec=90
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

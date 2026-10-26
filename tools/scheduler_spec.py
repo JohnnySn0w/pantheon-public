@@ -17,9 +17,11 @@ exec spec for a net-new schedule with no hand-authored template yet), `on_failur
 ("standard" wires `pantheon-unit-failure-alert@%n.service`, "none" wires nothing —
 the ORG-020/T-2178 precedent for root/system units that user-scoped alerting cannot
 see), `owner` (steward persona), `serves` (one-line why), and optionally `system`
-(the ORG-068 coverage-matrix row this entry's cadence realizes — OPTIONAL-WITH-WARN:
-absence is recorded in `Spec.warnings`, never a load error, because not every
-schedule maps cleanly onto one of the 11 matrix rows).
+(the ORG-081 registry id, i.e. the registry/systems.yaml row, this entry's cadence
+realizes; the ORG-068 matrix is now rendered from that registry. Legacy human titles
+are accepted only as ORG-081 D-13 aliases. OPTIONAL-WITH-WARN: absence is recorded in
+`Spec.warnings`, never a load error, because not every schedule maps cleanly onto one
+registry row).
 
 `persona` is deliberately NOT a settable field on a per-persona entry — it is
 DERIVED from the filename (`schedules/specialist.yaml` → persona "specialist"). Letting it
@@ -284,7 +286,7 @@ def _parse_entry(
     system = raw.get("system")
     if not system:
         warnings.append(
-            f"{source_file}: entry '{name}' has no 'system' (ORG-068 coverage-matrix row) set "
+            f"{source_file}: entry '{name}' has no 'system' (ORG-081 registry id) set "
             f"— optional-with-warn per ORG-064 §1a"
         )
     unit = _parse_unit_payload(raw["unit"], source_file=source_file, name=name, template_dir=template_dir)

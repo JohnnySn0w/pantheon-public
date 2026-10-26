@@ -59,6 +59,10 @@ The Bash command string then contains only the file path (`/tmp/scratch/report.t
 
 **Not a fix**: `python3 <<'EOF' ... EOF` — depending on how the guard tokenizes, the heredoc body may or may not be scanned. Test-mode-only recommendation; verify per-invocation whether the guard fires.
 
+## Further instance (2026-10-18, hygiene arc T-4551)
+
+During the governance-doc hygiene arc, a project-orchestrator and its implementer saw the guard block read-only Bash commands. Those commands named rulebook or ADR paths only as `grep`/`sed -n` operands, and one blocked call redirected its output to a scratch file. A `<ts>` placeholder inside a grep pattern also tripped it, read as a redirect. The workaround was the same: the Read tool for reads, and the Write tool to a scratchpad path for output. This is still the accepted over-fit cost noted under Related. Nothing was filed for it.
+
 ## Recovery
 
 If the guard already fired and blocked the call, the operation didn't happen — no cleanup needed. Just re-do the call with one of the fixes above. If the blocked-call was time-critical (mailbox delivery, dispatch response), the caller may see the delay as silence — coordinate via SendMessage from the orchestrator side to catch it fast.

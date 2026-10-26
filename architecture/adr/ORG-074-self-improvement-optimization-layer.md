@@ -88,3 +88,16 @@ Pantheon already runs a learning loop — the scheduled comb: retro walks, throu
 
 ## Relationship to the unified memory/knowledge program
 Spine: **ORG-058**. Substrate + eval: **ORG-062** (PMB-1) + `eval-set-t2107`. Graph/provenance: **ORG-065**. Foundations: **ORG-017 / ORG-035**. Sibling application: **ORG-073** (info-flow **retrieval/injection**). This ADR is the **learning** facet; none of these are silos.
+
+## Amendment — 2026-10-09 (re-eval of ORG-074:R1, T-4741)
+
+**Approved by the operator via Telegram 11611 / 11615.** He asked for a structural fix in place of a judgment-call gate ("is there a possible structural fix there?" → "sure"). The R1 trigger and the E1–E3 element texts are left as ratified.
+
+**Evidence that fired R1:** the T-2809 GEPA persona PoC was NO-GO / overfit. Train improved from 0.269 to 0.481, but the holdout fell from 0.264 to 0.071 (n=14). The winning candidates improved their score by dropping a required behavior (the "escalate" option) rather than by doing the work better. The sequencing edge above ("mutate the work, never the test") protects the fitness *artifacts*. It does not stop a candidate from shaping the *prompt* toward what the scorer rewards.
+
+**Two structural gates, required on every candidate before it can be proposed for human review.** They are mechanisms, not reviewer judgment:
+
+1. **Locked regions.** The prompt under optimization declares its editable sections. Required behaviors live in locked sections: escalation paths, refusal and safety clauses, and output-contract fields. The optimizer may only rewrite the editable sections. A candidate whose locked-section text differs from the base, byte for byte, is rejected automatically before scoring.
+2. **Blind acceptance scorer.** The scorer the optimizer climbs is not the scorer that accepts. Acceptance uses a separate scorer and holdout set that are never exposed to the optimization loop: not in its traces, not in its reflection prompts, and not in its feedback. A candidate ships for human review only if it shows no regression on the blind scorer. Like every fitness artifact, the blind scorer is mutation-protected and is changed only by ratification.
+
+The human gate stays as the last step; these two gates filter what reaches it. Applies to the GEPA and ACE PoCs and to any wider adoption (E1–E3).

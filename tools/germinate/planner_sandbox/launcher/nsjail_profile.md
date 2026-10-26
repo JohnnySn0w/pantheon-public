@@ -1,6 +1,6 @@
 # nsjail fallback equivalence table (documentary only)
 
-Per `adr/ORG-080-germination-engine.md` Component contract (L109-111): "On a
+Per `architecture/adr/ORG-080-germination-engine.md` Component contract (L109-111): "On a
 system without systemd-user available, an in-process **nsjail** fallback...
 the exact nsjail equivalence table is checked in at
 `tools/germinate/planner_sandbox/nsjail_profile.md`."

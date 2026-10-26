@@ -347,14 +347,14 @@ def _fallback_authority_current(
 # ---------------------------------------------------------------------------
 
 # Maps a tools/fleet_health.py agent name to its T-3187 organ binding. Sub-
-# orchestrator seats (metis/atlas) carry no top-level organ binding and are
+# orchestrator seats (mason/artisan) carry no top-level organ binding and are
 # intentionally absent. Callers may override for a different fleet shape.
 DEFAULT_AGENT_TO_BINDING: Mapping[str, str] = {
     "orchestrator": "binding:pantheon-executive-orchestrator",
     "recovery": "binding:recovery-homeostasis-recovery",
     "specialist": "binding:intelligence-research-specialist",
     "codex": "binding:harness-adapters-codex",
-    "mnemosyne": "binding:exocortex-mnemosyne",
+    "archivist": "binding:exocortex-archivist",
 }
 
 _FLEET_STATUS_TO_RESULT: Mapping[str, str] = {"OK": "pass", "FAIL": "fail"}
@@ -408,7 +408,7 @@ def evidence_from_fleet_health(
             "evidence_kind": "probe",
             "canonical_ref": canonical_ref,
             "sha256": sha256,
-            "observer_ref": "role:recovery",
+            "observer_ref": "role:head-system-orchestrator",
             "observed_at": observed_at,
             "fresh_until": fresh_until,
             "result": result,

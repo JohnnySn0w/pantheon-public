@@ -2,23 +2,19 @@
 aliases: [ORG-044]
 id: ORG-044
 title: Pantheon→Exocortex knowledge write-back — the digest-altitude rule
-status: Ratified 2026-07-22 by the operator — drafted 2026-07-21 by Mnemosyne at the operator's directive (TG 97/98)
+status: Ratified 2026-07-22 by the operator — drafted 2026-07-21 by Archivist at the operator's directive (TG 97/98)
 date: 2026-07-21
 build_disposition: no-build-needed
 ---
 
 # ORG-044 — Pantheon→Exocortex knowledge write-back: the digest-altitude rule
 
-**Status:** **Ratified 2026-07-22 by the operator.** **Autonomous** — drafted 2026-07-21 by Mnemosyne (second head, personal/creative
-hemisphere) at the operator's explicit directive ("put this in adr format. we're going to formalize
-this" — TG 97; "could be your first ratify ticket" — TG 98). The decision content itself is
-The operator's, stated conversationally (TG 91/93) and sharpened jointly (TG 94); this ADR is the
-formalization. Ratification flips this to **Ratified**.
+**Status:** **Ratified 2026-07-22 by the operator.** The decision content is the operator's (TG 91/93/94); Archivist drafted the ADR at his directive (TG 97/98). Drafting provenance: `notes/2026-10-08-org-044-review-history.md`.
 
-**Ticket:** the ratify ticket referencing this file (filed same day, requester mnemosyne,
+**Ticket:** the ratify ticket referencing this file (filed same day, requester archivist,
 target operator). **Related:** [[ORG-042]] (two-hemisphere topology — this ADR defines a
 knowledge seam between the hemispheres), [[ORG-026]] (mailbox — transport is out of scope
-here), exocortex-side design memos (mnemosyne memory: `system-three-layer-vision.md`,
+here), exocortex-side design memos (archivist memory: `system-three-layer-vision.md`,
 `exocortex-journal-direction.md`).
 
 ## Context
@@ -68,6 +64,6 @@ Adopt the **digest-altitude rule** for all pantheon→exo knowledge write-back:
   rule rather than retrofitting it) — the design-early/retrofit-awkward asymmetry was the
   reason to formalize tonight.
 - Open follow-ons, deliberately out of scope: the Echo→exo ingestion contract
-  (transcripts/speakers/retention — joint Orchestrator/Mnemosyne design when Echo solidifies) and
+  (transcripts/speakers/retention — joint Orchestrator/Archivist design when Echo solidifies) and
   agent identity for pantheon→exo MCP access (tailscale-identity direction already forming
   from MCP v0 testing).

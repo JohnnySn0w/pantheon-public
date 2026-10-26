@@ -28,6 +28,6 @@ This is the SOP's Layer-1 failure mode made concrete: `sop/standard/dispatch-and
 ## Cross-references
 
 - **Owning SOP:** [`sop/standard/dispatch-and-wait-liveness.md`](../sop/standard/dispatch-and-wait-liveness.md) §Layer 1 — arms a self-wakeup (`ScheduleWakeup`) when you dispatch-and-wait. This lesson is the concrete failure instance of that layer not being followed; the `run_in_background:true` rule here is the same Layer-1 principle at the Bash-tool tier.
-- Backing ADR: [`adr/ORG-037-team-coordination-liveness.md`](../adr/ORG-037-team-coordination-liveness.md) (the liveness layers).
+- Backing ADR: [`architecture/adr/ORG-037-team-coordination-liveness.md`](../architecture/adr/ORG-037-team-coordination-liveness.md) (the liveness layers).
 - Memory pin: `feedback_watchdogs_must_be_harness_tracked`.
 - Directives: P1 (structural over vigilance), P7 (cheap self-wakeup over a stalled wait).

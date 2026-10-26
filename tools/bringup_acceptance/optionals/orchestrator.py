@@ -257,11 +257,11 @@ def _declare_orchestrator_only(module_id: str, tier: Tier, target: TargetInvento
 
 
 # ---------------------------------------------------------------------------
-# ThothHoResumerModule -- tools/ho_resumer.py + its systemd units.
+# OrchestratorHoResumerModule -- tools/ho_resumer.py + its systemd units.
 # ---------------------------------------------------------------------------
 
 
-class ThothHoResumerModule:
+class OrchestratorHoResumerModule:
     id = RESUMER_MODULE_ID
     tier: Tier = "optional"
 
@@ -361,11 +361,11 @@ class ThothHoResumerModule:
 
 
 # ---------------------------------------------------------------------------
-# ThothStopFailureHookModule -- wiring + producer/consumer schema contract.
+# OrchestratorStopFailureHookModule -- wiring + producer/consumer schema contract.
 # ---------------------------------------------------------------------------
 
 
-class ThothStopFailureHookModule:
+class OrchestratorStopFailureHookModule:
     id = STOP_FAILURE_MODULE_ID
     tier: Tier = "optional"
 
@@ -460,4 +460,4 @@ class ThothStopFailureHookModule:
 
 
 def build_optional_modules() -> tuple[AcceptanceModule, ...]:
-    return (ThothHoResumerModule(), ThothStopFailureHookModule())
+    return (OrchestratorHoResumerModule(), OrchestratorStopFailureHookModule())

@@ -1,0 +1,85 @@
+{
+  "action_authority_ref": null,
+  "audience": "self",
+  "canonical_source_ref": {
+    "object_id": "obj-1",
+    "observed_at": "2026-08-01T00:00:00Z",
+    "source_digest": "sha256:sd-1",
+    "source_revision": "srev-1",
+    "source_system": "echo",
+    "verifier": "echo-sig"
+  },
+  "claim_trust": [
+    {
+      "adjudication_receipt_ref": "R-1",
+      "claim_id": "c1",
+      "contradicting_evidence_refs": [],
+      "contributing_evidence_refs": [
+        "e1",
+        "e2"
+      ],
+      "effective_trust_floor": "reviewed",
+      "inherited_trust_floor": "untrusted"
+    }
+  ],
+  "confidence": 0.5,
+  "confidence_kind": "inferred",
+  "contradicting_refs": [],
+  "correction_policy": "supersede",
+  "created_at": "2026-08-01T00:00:00Z",
+  "effective_trust_floor": "reviewed",
+  "forgetting_policy": "remove-derived",
+  "inherited_trust_floor": "untrusted",
+  "last_consolidated_at": null,
+  "lifecycle_state": "RETAINED_DERIVED",
+  "memory_class": "semantic",
+  "memory_id": "m-1",
+  "observed_at": "2026-08-01T00:00:00Z",
+  "owner": "operator",
+  "payload_digest": "sha256:pd-1",
+  "payload_ref": "payload://m-1",
+  "policy_revision": "rev-2026-08-30",
+  "privacy_class": "internal",
+  "retention_until": null,
+  "retrieval_authority": "self",
+  "source_integrity": [
+    {
+      "evidence_ref": "e1",
+      "evidence_role": "support",
+      "integrity_label": "reviewed",
+      "source_digest": "sha256:sd-e1",
+      "source_revision": "srev-1",
+      "trust_policy_digest": "sha256:policy-lattice-digest",
+      "trust_policy_ref": "P-lattice",
+      "trust_policy_revision": "rev-2026-08-30"
+    },
+    {
+      "evidence_ref": "e2",
+      "evidence_role": "support",
+      "integrity_label": "untrusted",
+      "source_digest": "sha256:sd-e2",
+      "source_revision": "srev-2",
+      "trust_policy_digest": "sha256:policy-lattice-digest",
+      "trust_policy_ref": "P-lattice",
+      "trust_policy_revision": "rev-2026-08-30"
+    }
+  ],
+  "subjects": [
+    "operator"
+  ],
+  "superseded_by": [],
+  "supersedes": [],
+  "supporting_refs": [
+    "e1",
+    "e2"
+  ],
+  "trust_adjudication_receipt_refs": [
+    "R-1"
+  ],
+  "trust_policy_digest": "sha256:policy-lattice-digest",
+  "trust_policy_ref": "P-lattice",
+  "trust_policy_revision": "rev-2026-08-30",
+  "valid_from": "2026-08-01T00:00:00Z",
+  "valid_to": null,
+  "version_id": "v-1"
+}

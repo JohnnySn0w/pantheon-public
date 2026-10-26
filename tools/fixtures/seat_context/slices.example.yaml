@@ -1,0 +1,22 @@
+# tools/fixtures/seat_context/slices.example.yaml — SCHEMA fixture for
+# seat_context_bundle (T-4065). This is an EXAMPLE illustrating the slice-file
+# schema + a fixture for the tests; it is NOT the real slice content.
+#
+# The real, hand-curated slice file (rulebook/seat-context/slices.yaml) is
+# orchestrator-authored (ORG-075 D2) and is NOT shipped by this tool. The pin filenames
+# below are illustrative placeholders, not live pins.
+#
+# Schema:
+#   slices:
+#     <slice-name>:
+#       pins: [<pin-filename.md>, ...]   # required, list of strings
+#       description: <str>               # optional
+slices:
+  engineering_orchestrator:
+    description: HO context an engineering-orchestrator seat needs for HO-level handoffs.
+    pins:
+      - persona-has-two-decoupled-audit-identity-axes.md
+      - run-ticket-py-ops-only-on-main-not-a-feature-branch.md
+  minimal:
+    pins:
+      - persona-has-two-decoupled-audit-identity-axes.md

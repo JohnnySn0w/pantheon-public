@@ -43,9 +43,18 @@ class MailboxWritableRoot:
     path: Path
 
 
+def _refuse_double_slash(path: Path) -> None:
+    # "//"-prefixed paths survive normpath unchanged (POSIX) and pathlib
+    # anchors them at "//", but the kernel opens them as "/": refused (T-4963)
+    if str(path).startswith("//"):
+        raise MailboxWritableRootError(f"mailbox path must not start with '//': {path}")
+
+
 def _rooted(root: Path, absolute: Path) -> Path:
     if not absolute.is_absolute():
         raise MailboxWritableRootError(f"mailbox root must be absolute: {absolute}")
+    _refuse_double_slash(absolute)
+    _refuse_double_slash(root)
     if root == Path("/"):
         return absolute
     return root / absolute.relative_to("/")
@@ -175,6 +184,7 @@ def resolve_mailbox_writable_roots(
 def verify_maildir_writable_root(path: Path) -> Mapping[str, str]:
     if not path.is_absolute():
         raise MailboxWritableRootError("mailbox writable root must be absolute")
+    _refuse_double_slash(path)
     _reject_symlink_components(path, stop_at=Path(path.anchor))
     if os.path.islink(path):
         raise MailboxWritableRootError("mailbox writable root must not be a symlink")

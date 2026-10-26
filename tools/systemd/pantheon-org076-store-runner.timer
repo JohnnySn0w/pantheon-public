@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon ORG-076 single-store runner -- every 5 min (T-4720 / BT3a; ships dark, recovery enables at first-fire)
+Documentation=file://%h/.local/state/pantheon/org076/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Unit=pantheon-org076-store-runner.service
+
+[Install]
+WantedBy=timers.target

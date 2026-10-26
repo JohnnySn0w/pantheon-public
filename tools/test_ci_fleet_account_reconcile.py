@@ -46,7 +46,7 @@ RUNNER = E("runner", 1000)
 class DesiredSet(unittest.TestCase):
     def test_eight_accounts_pinned_uids_no_dups(self):
         specs = r.desired_accounts()
-        self.assertEqual(len(specs), 8)
+        self.assertEqual(len(specs), 8)  # T-4884 B6: + codex-fallback; T-3421: - the-ancestor
         by_name = {s.name: s.uid for s in specs}
         self.assertEqual(by_name["claude-fallback"], 1001)   # test contract
         self.assertEqual(by_name["claude-research"], 1002)   # test contract
@@ -68,7 +68,7 @@ class DesiredSet(unittest.TestCase):
             "exocortex": 6004,
             "suborch1": 6005,
             "suborch2": 6006,
-            "the-ancestor": 6007,
+            "codex-fallback": 6010,   # T-4884 B6 (6008/6009 held by CT202 runner-pc/runner-pcl)
         })
 
     def test_unmapped_fleet_account_raises(self):
@@ -148,7 +148,7 @@ class ApplyBoundaries(unittest.TestCase):
         ops = FakeOps([RUNNER])
         results, code = r.reconcile(ops=ops, apply=True)
         self.assertEqual(code, 0)
-        self.assertEqual(len(ops.created), 8)
+        self.assertEqual(len(ops.created), 8)  # T-4884 B6: + codex-fallback; T-3421: - the-ancestor
         self.assertNotIn("runner", [s.name for s in ops.created])  # never the runner
         # Re-apply is idempotent: everything now OK, nothing created.
         results2, code2 = r.reconcile(ops=ops, apply=True)

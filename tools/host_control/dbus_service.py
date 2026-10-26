@@ -41,8 +41,10 @@ from tools.host_control.contracts import (
     RegistryError,
     SubjectContext,
 )
+from tools.host_control.execution_source import BrokerExecutionSource
 from tools.host_control.operations import OperationService
 from tools.host_control.planner import HostPlanService
+from tools.host_control.ratelimit import BrokerRateLimits
 from tools.host_control.registry import SeatRegistry
 
 try:  # pragma: no cover - exercised implicitly on every import
@@ -59,10 +61,13 @@ class ApprovalStatusSource(Protocol):
 
     Same shape discipline as ``ExecutorPort`` (AB-1) and
     ``PlanMetadataSource`` (AB-2): it is handed no journal, no
-    connection, and no callback — the real implementation lands in
-    T-2913 as a D-Bus client of ``HostApproval1.Consumer``, and fakes
-    supply it in tests. ``subject`` is the SERVER-derived caller
-    (bus uid through the registry), never caller-asserted.
+    connection, and no callback. The real implementation is
+    ``tools.host_control.approval_client.ApprovalConsumerClient`` (T-2917
+    5a; deferred there from T-2913 by its OQ6 disposition), a D-Bus
+    client of ``HostApproval1.Consumer`` that also binds the handle to
+    the calling subject; fakes supply it in tests. ``subject`` is the
+    SERVER-derived caller (bus uid through the registry), never
+    caller-asserted.
 
     Raises ``ApprovalUnavailable`` when no approval authority is
     reachable — fail closed, consistent with the AB-2 outage posture.
@@ -75,10 +80,21 @@ class ApprovalStatusSource(Protocol):
     ) -> tuple[str, str]: ...
 
 
+class OperationSubmitter(Protocol):
+    """The broker-internal ``OperationDriver`` seam (T-2917 5b): handlers
+    only enqueue a durable operation handle; the driver thread does every
+    blocking authorize/dispatch/collect step off the main loop."""
+
+    failure: str | None
+
+    def submit(self, operation_handle: str) -> None: ...
+
+
 class UnavailableApprovalStatus:
-    """Shipped default: the approval authority does not exist until
-    T-2913 lands its service, so ``ApprovalGet`` fails closed with the
-    bounded ``ApprovalUnavailable`` wire error."""
+    """Fail-closed fallback for a broker wired WITHOUT an approval
+    authority (e.g. a test driver, or before the T-2920 entrypoint
+    configures ``ApprovalConsumerClient``): ``ApprovalGet`` fails closed
+    with the bounded ``ApprovalUnavailable`` wire error."""
 
     def approval_status(
         self,
@@ -100,8 +116,10 @@ if DBUS_AVAILABLE:
 
     class HostBroker1Object(dbus.service.Object):
         """One object at ``/org/pantheon/HostBroker1`` exporting the
-        seven-method public ``Manager`` interface and the two-method
-        uid-restricted ``ApprovalSource`` interface. No signals, no
+        seven-method public ``Manager`` interface, the two-method
+        uid-restricted ``ApprovalSource`` interface, and the one-method
+        target-seat-restricted ``ExecutionSource`` interface (T-2917 5a,
+        ORG-052 section 3). No signals, no
         properties (ORG-052 §4: clients poll ``OperationGet``; evidence
         cannot leak through a broadcast channel)."""
 
@@ -115,6 +133,9 @@ if DBUS_AVAILABLE:
             approval_source: BrokerApprovalSource,
             approval_status: ApprovalStatusSource,
             approval_uid: int,
+            rate_limits: BrokerRateLimits | None = None,
+            execution_source: BrokerExecutionSource | None = None,
+            driver: OperationSubmitter | None = None,
         ) -> None:
             super().__init__(connection, wire.OBJECT_PATH)
             self._registry = registry
@@ -123,6 +144,24 @@ if DBUS_AVAILABLE:
             self._approval_source = approval_source
             self._approval_status = approval_status
             self._approval_uid = int(approval_uid)
+            # T-2917 ruling i1: always on; tests may inject specs/clock.
+            self._rate_limits = (
+                rate_limits if rate_limits is not None else BrokerRateLimits()
+            )
+            # None until the executor wiring (T-2917 5b / T-2920 entrypoint):
+            # OperationSpec then refuses Unsupported after the uid gate.
+            self._execution_source = execution_source
+            # None keeps the 5a behaviour (Apply/Rollback PREPARE-only,
+            # Verify Unsupported); the T-2920 entrypoint wires the driver.
+            self._driver = driver
+            # ORG-082 steps 3 + 5 (T-2918): the plan composer was built by the
+            # daemon load (load_daemon_runtime), which captured the op-registry
+            # digest and asserted the substrate-free dispatch table; a start
+            # that would expose a substrate family never reaches this line.
+            runtime = plan_service.runtime
+            self.loaded_op_registry_digest = runtime.loaded_op_registry_digest
+            self.dispatch_table = runtime.dispatch_table
+            self.startup_record = runtime.startup_record()
 
         # ------------------------------------------------------------
         # transport-boundary identity (uniform, before any domain call)
@@ -153,6 +192,18 @@ if DBUS_AVAILABLE:
                 raise _wire_error(PolicyDenied("subject_denied")) from exc
             return uid
 
+        def _manager_call(self, sender: str | None, method: str) -> int:
+            """Identity FIRST (an unregistered uid gets the authorization
+            refusal, never RateLimited), then the per-uid budget, then the
+            caller may make its one domain call (T-2917 ruling i1)."""
+
+            uid = self._manager_subject(sender)
+            try:
+                self._rate_limits.check(uid, method)
+            except Exception as exc:
+                raise _wire_error(exc) from exc
+            return uid
+
         def _approval_caller(self, sender: str | None) -> int:
             # In-code uid restriction for the internal interface: bus
             # policy is defence in depth, never the perimeter (locked
@@ -161,6 +212,16 @@ if DBUS_AVAILABLE:
             if uid != self._approval_uid:
                 raise _wire_error(PolicyDenied("subject_denied"))
             return uid
+
+        def _require_live_driver(self) -> None:
+            """Review n2: with a dead driver, refuse BEFORE prepare so no
+            PREPARED record is written that nothing will drive."""
+
+            if self._driver is not None and getattr(self._driver, "failure", None):
+                raise dbus.exceptions.DBusException(
+                    "operation driver unavailable",
+                    name=wire.FAILED_ERROR,
+                )
 
         @contextmanager
         def _mapped_errors(self) -> Iterator[None]:
@@ -182,7 +243,7 @@ if DBUS_AVAILABLE:
             sender_keyword="sender",
         )
         def Capabilities(self, sender: str | None = None) -> tuple[str, str]:
-            uid = self._manager_subject(sender)
+            uid = self._manager_call(sender, "Capabilities")
             with self._mapped_errors():
                 result = self._plan_service.capabilities(uid)
                 return (
@@ -203,7 +264,7 @@ if DBUS_AVAILABLE:
             idempotency_key: str,
             sender: str | None = None,
         ) -> tuple[str, str, str]:
-            uid = self._manager_subject(sender)
+            uid = self._manager_call(sender, "Plan")
             with self._mapped_errors():
                 result = self._plan_service.plan(
                     uid,
@@ -231,11 +292,18 @@ if DBUS_AVAILABLE:
             approval_handle: str,
             sender: str | None = None,
         ) -> str:
-            uid = self._manager_subject(sender)
+            uid = self._manager_call(sender, "Apply")
+            self._require_live_driver()
             with self._mapped_errors():
-                # PREPARE-only in this unit (locked input N4): the
-                # authorize step needs the approval service (T-2913) and
-                # dispatch needs the executor (T-2917).
+                if self._driver is not None:
+                    # Ruling B4: refuse (Unsupported) a plan holding a
+                    # class this revision cannot execute BEFORE prepare,
+                    # so no record is written and no grant can bind.
+                    self._operation_service.require_apply_implemented(
+                        uid,
+                        str(plan_handle),
+                        str(plan_digest),
+                    )
                 record, _replayed = self._operation_service.prepare_apply(
                     uid,
                     str(plan_handle),
@@ -243,6 +311,8 @@ if DBUS_AVAILABLE:
                     str(idempotency_key),
                     str(approval_handle),
                 )
+                if self._driver is not None:
+                    self._driver.submit(record.operation_handle)
                 return record.operation_handle
 
         @dbus.service.method(
@@ -258,29 +328,26 @@ if DBUS_AVAILABLE:
             idempotency_key: str,
             sender: str | None = None,
         ) -> str:
-            # Exposed but refusing (locked input N2): the method MUST
-            # introspect as part of the ratified seven while T-2917 owns
-            # the verify path. Identity first, so an unregistered uid
-            # still gets the authorization refusal, not Unsupported.
-            self._manager_subject(sender)
-            try:
-                self._operation_service.prepare_verify(
-                    str(seat_id),
-                    str(plan_handle),
-                    str(idempotency_key),
-                )
-            except HostControlError as exc:
-                raise dbus.exceptions.DBusException(
-                    str(exc)[:200],
-                    name=wire.UNSUPPORTED_ERROR,
-                ) from exc
-            except Exception as exc:
-                raise _wire_error(exc) from exc
-            # prepare_verify never returns today; if a future domain
-            # change makes it return, the transport still refuses until
-            # T-2917 deliberately rewires this handler.
+            # Identity first, so an unregistered uid still gets the
+            # authorization refusal, not Unsupported.
+            uid = self._manager_call(sender, "Verify")
+            self._require_live_driver()
+            if self._driver is not None:
+                # T-2917 5b: the real verify path (policy-authorized,
+                # read-only; rulings B2/B3).
+                with self._mapped_errors():
+                    record, _replayed = self._operation_service.prepare_verify(
+                        uid,
+                        str(seat_id),
+                        str(plan_handle),
+                        str(idempotency_key),
+                    )
+                    self._driver.submit(record.operation_handle)
+                    return record.operation_handle
+            # Without a driver: exposed but refusing (locked input N2),
+            # and the domain is never touched.
             raise dbus.exceptions.DBusException(
-                "verify is unsupported in this broker revision",
+                "verify needs the executor driver (T-2917); not wired in this broker",
                 name=wire.UNSUPPORTED_ERROR,
             )
 
@@ -297,15 +364,26 @@ if DBUS_AVAILABLE:
             approval_handle: str,
             sender: str | None = None,
         ) -> str:
-            uid = self._manager_subject(sender)
+            uid = self._manager_call(sender, "Rollback")
+            self._require_live_driver()
             with self._mapped_errors():
-                # PREPARE-only in this unit (locked input N4).
+                if self._driver is not None:
+                    # T-2917 5d.2 (ruling T-2917:D15): the Apply pattern.
+                    # Ruling B4 first: refuse (Unsupported) BEFORE prepare,
+                    # so no record is written and no grant can bind.
+                    self._operation_service.require_rollback_implemented(
+                        uid,
+                        str(receipt_handle),
+                    )
+                # Without a driver: PREPARE-only (T-2912 locked input N4).
                 record, _replayed = self._operation_service.prepare_rollback(
                     uid,
                     str(receipt_handle),
                     str(idempotency_key),
                     str(approval_handle),
                 )
+                if self._driver is not None:
+                    self._driver.submit(record.operation_handle)
                 return record.operation_handle
 
         @dbus.service.method(
@@ -319,13 +397,19 @@ if DBUS_AVAILABLE:
             operation_handle: str,
             sender: str | None = None,
         ) -> tuple[str, str]:
-            uid = self._manager_subject(sender)
+            uid = self._manager_call(sender, "OperationGet")
             with self._mapped_errors():
                 record = self._operation_service.get_operation(
                     uid,
                     str(operation_handle),
                 )
-                return (record.state, wire.operation_json(record))
+                return (
+                    record.state,
+                    wire.operation_json(
+                        record,
+                        compensation_handle=self._operation_service.compensation_handle(record),
+                    ),
+                )
 
         @dbus.service.method(
             wire.MANAGER_INTERFACE,
@@ -338,7 +422,7 @@ if DBUS_AVAILABLE:
             approval_handle: str,
             sender: str | None = None,
         ) -> tuple[str, str]:
-            uid = self._manager_subject(sender)
+            uid = self._manager_call(sender, "ApprovalGet")
             with self._mapped_errors():
                 subject = self._registry.subject_for_uid(uid)
                 state, summary = self._approval_status.approval_status(
@@ -385,4 +469,37 @@ if DBUS_AVAILABLE:
                 return self._approval_source.plan_summary(
                     str(plan_handle),
                     str(expected_digest),
+                )
+
+        # ------------------------------------------------------------
+        # org.pantheon.HostBroker1.ExecutionSource — registered seat
+        # executors ONLY, and only for their own target seat (T-2917 5a)
+        # ------------------------------------------------------------
+
+        @dbus.service.method(
+            wire.EXECUTION_SOURCE_INTERFACE,
+            in_signature="ss",
+            out_signature="ssss",
+            sender_keyword="sender",
+        )
+        def OperationSpec(
+            self,
+            operation_handle: str,
+            expected_operation_digest: str,
+            sender: str | None = None,
+        ) -> tuple[str, str, str, str]:
+            # Transport gate: a registered seat uid (the executor runs as
+            # its seat's uid); the domain then requires that uid to be the
+            # registry uid of the operation's TARGET seat.
+            uid = self._manager_subject(sender)
+            if self._execution_source is None:
+                raise dbus.exceptions.DBusException(
+                    "execution source is not configured",
+                    name=wire.UNSUPPORTED_ERROR,
+                )
+            with self._mapped_errors():
+                return self._execution_source.operation_spec(
+                    uid,
+                    str(operation_handle),
+                    str(expected_operation_digest),
                 )

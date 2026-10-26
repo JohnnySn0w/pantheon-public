@@ -1,0 +1,44 @@
+# T-4420: read-only Echo status export (claude account, systemd --user).
+# Install: see README.md in this directory. Canonical copy lives in
+# pantheon-config tools/echo-status-export/; the installed copies in
+# ~/.config/systemd/user/ and ~/.local/lib/echo-status-export/ are not
+# version-controlled and change only on an explicit re-install.
+[Unit]
+Description=Echo read-only status export to /var/lib/pantheon/echo-evidence/status (T-4420)
+Documentation=file:%h/pantheon-config/tools/echo-status-export/README.md
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/echo-status-export.env
+ExecStart=/usr/bin/python3 %h/.local/lib/echo-status-export/echo_status_export.py
+# Worst case: systemctl show 10 s + journal read killed at 75 s +
+# status reply capped at 20 s (ECHO_STATUS_TIMEOUT_S is clamped to 20) = 105 s,
+# leaving 15 s for writes and startup margin (T-4727).
+TimeoutStartSec=120
+Nice=10
+# Hardening in a --user manager (systemd 255).
+#
+# Effective here: NoNewPrivileges= and the seccomp-based options
+# (RestrictAddressFamilies=, RestrictSUIDSGID=, LockPersonality=).
+#
+# Best-effort and INERT on this host: PrivateTmp=, ProtectSystem=,
+# ProtectHome=, ReadWritePaths=, ProtectKernelTunables=,
+# ProtectControlGroups=. In a --user manager they need an unprivileged user
+# mount namespace, which kernel.apparmor_restrict_unprivileged_userns=1
+# blocks, so systemd skips them. They are kept because they activate if the
+# host policy changes; do not rely on them for isolation today.
+#
+# The export subdir is created by the script (mode 2750, setgid group
+# inherited from the pantheon-shared parent). RestrictSUIDSGID= refuses a
+# chmod that sets setgid, which is fine: mkdir under a setgid dir already
+# inherits it.
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
+LockPersonality=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/pantheon/echo-evidence
+ProtectHome=read-only
+ProtectKernelTunables=yes
+ProtectControlGroups=yes

@@ -5,6 +5,7 @@ import hashlib
 import json
 import multiprocessing
 import os
+import queue as queue_module
 import stat
 from pathlib import Path
 from types import SimpleNamespace
@@ -15,6 +16,7 @@ import pytest
 RUN_KEY = "run-a"
 OP_A = "op-a"
 OP_B = "op-b"
+WORKER_RESULT_TIMEOUT_SECONDS = 60
 
 
 def _wal_api() -> SimpleNamespace:
@@ -322,9 +324,27 @@ def test_record_lock_two_process_append_has_no_lost_update(tmp_path: Path):
     ]
     for process in processes:
         process.start()
-    results = [queue.get(timeout=10) for _ in processes]
-    for process in processes:
-        process.join(timeout=10)
+    # Spawn plus lock contention can exceed 10s on a loaded CI runner (T-4507):
+    # wait generously, and on timeout fail with process state, not a bare Empty.
+    results = []
+    try:
+        for _ in processes:
+            try:
+                results.append(queue.get(timeout=WORKER_RESULT_TIMEOUT_SECONDS))
+            except queue_module.Empty:
+                state = [(p.pid, p.is_alive(), p.exitcode) for p in processes]
+                pytest.fail(
+                    f"append worker produced no result within {WORKER_RESULT_TIMEOUT_SECONDS}s; "
+                    f"results so far {results!r}; (pid, alive, exitcode) {state!r}"
+                )
+        for process in processes:
+            process.join(timeout=WORKER_RESULT_TIMEOUT_SECONDS)
+            assert process.exitcode == 0, (process.pid, process.exitcode)
+    finally:
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=5)
 
     assert results == [("ok", OP_A), ("ok", OP_B)] or results == [("ok", OP_B), ("ok", OP_A)]
     reopened = _open_store(api, tmp_path)

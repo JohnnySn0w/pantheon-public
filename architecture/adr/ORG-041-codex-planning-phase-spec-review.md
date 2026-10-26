@@ -40,7 +40,7 @@ Spec/planning artifacts (ADRs, project specs, arc plans) have until now gone HO-
 
 ## Amendment 2026-09-06 — RECORD-mode viability-question checklist (Ratified via [[ORG-089]] TG 9047)
 
-Per [[ORG-089]] §Decision.1-2 (deference heuristic + appetite circuit breaker, Ratified 2026-09-06 by the operator via Telegram 9047): every non-vault ADR under this review loop carries populated `appetite:` frontmatter + §Appetite + §Riskiest assumption body sections (RECORD-mode, unconditional). Cairn's ORG-041 review adds the three viability questions to the adversarial planning-phase checklist:
+Per [[ORG-089]] §Decision.1-2 (deference heuristic + appetite circuit breaker, Ratified 2026-09-06 by the operator via Telegram 9047): every non-vault ADR under this review loop carries populated `appetite:` frontmatter + §Appetite + §Riskiest assumption body sections (RECORD-mode, unconditional). Consultant's ORG-041 review adds the three viability questions to the adversarial planning-phase checklist:
 
 1. **Riskiest assumption + cheap test** — what unknown would kill the bet, and how cheaply can it be probed before commit?
 2. **Appetite / is-this-worth-it-now** — what depth and mechanism is warranted right now, measured against outcome value, strategic alignment, and reversibility (per `knowledge/episodic/2026-09-05-deference-heuristic-proposal/appetite-scale.md`).
@@ -48,7 +48,7 @@ Per [[ORG-089]] §Decision.1-2 (deference heuristic + appetite circuit breaker, 
 
 **SURFACE-mode** (§ORG-089 §Decision.1) fires only for directives on the D3 reserved set; SURFACE routes results to the operator via the ratification-ticket surface, unchanged from the pre-amendment flow.
 
-Cairn's review checklist verifies: fields populated (§Appetite + §Riskiest assumption present + `appetite:` frontmatter integer 1-10); the three questions substantively answered (not boilerplate); pass-outcome coherent with the ADR's actual claims. Empty/boilerplate fields on a ratified non-vault ADR trip the grooming-completeness check ([[ORG-089]] §Surface 4a-completeness).
+Consultant's review checklist verifies: fields populated (§Appetite + §Riskiest assumption present + `appetite:` frontmatter integer 1-10); the three questions substantively answered (not boilerplate); pass-outcome coherent with the ADR's actual claims. Empty/boilerplate fields on a ratified non-vault ADR trip the grooming-completeness check ([[ORG-089]] §Surface 4a-completeness).
 
 Scope-of-critique bounds for the ORG-041 review lane itself are followed up separately in T-3439 (reviewer-anchors sibling arc to ORG-089).
 

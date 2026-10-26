@@ -179,9 +179,9 @@ verify_bwrap() {
 # Wedge 2: approval_policy / sandbox (codex config.toml)
 # ---------------------------------------------------------------------------
 # codex default approval_policy is "on-request" which wedges every tool call
-# in an unattended daemon.  Must be set to "never" with workspace-write
-# sandbox (network_access=true) — live-verified on the codex daemon
-# (ORG-031 §ii).  This function is idempotent: checks before inserting.
+# in an unattended daemon.  Must be set to "never" with
+# danger-full-access sandbox — HC full-unlock default (ORG-031 §(ii) as
+# amended; the operator TG 11733/11742, T-4929).  This function is idempotent: checks before inserting.
 fix_approval() {
     local cfg
     cfg="$(target_home)/.codex/config.toml"
@@ -204,16 +204,8 @@ fix_approval() {
     if grep -q '^sandbox_mode' "$cfg" 2>/dev/null; then
         info "fix_approval: sandbox_mode already set (skipping)"
     else
-        info "fix_approval: inserting sandbox_mode=workspace-write ..."
-        run_cmd bash -c "printf 'sandbox_mode = \"workspace-write\"\n' >> \"$cfg\""
-    fi
-
-    # [sandbox_workspace_write] network_access = true
-    if grep -q '^\[sandbox_workspace_write\]' "$cfg" 2>/dev/null; then
-        info "fix_approval: [sandbox_workspace_write] table already present (skipping)"
-    else
-        info "fix_approval: inserting [sandbox_workspace_write] table ..."
-        run_cmd bash -c "printf '\n[sandbox_workspace_write]\nnetwork_access = true\n' >> \"$cfg\""
+        info "fix_approval: inserting sandbox_mode=danger-full-access ..."
+        run_cmd bash -c "printf 'sandbox_mode = \"danger-full-access\"\n' >> \"$cfg\""
     fi
 
     info "fix_approval: done"
@@ -230,16 +222,10 @@ verify_approval() {
         fail_check "approval_policy=never not found in $cfg" || pass=0
     fi
 
-    if grep -q 'sandbox_mode.*workspace-write' "$cfg" 2>/dev/null; then
-        ok "sandbox_mode=workspace-write present"
+    if grep -q 'sandbox_mode.*danger-full-access' "$cfg" 2>/dev/null; then
+        ok "sandbox_mode=danger-full-access present"
     else
-        fail_check "sandbox_mode=workspace-write not found in $cfg" || pass=0
-    fi
-
-    if grep -q 'network_access.*true' "$cfg" 2>/dev/null; then
-        ok "network_access=true present"
-    else
-        fail_check "network_access=true not found in $cfg" || pass=0
+        fail_check "sandbox_mode=danger-full-access not found in $cfg" || pass=0
     fi
 
     return $((1 - pass))

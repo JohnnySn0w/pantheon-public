@@ -1,0 +1,12 @@
+# STAGED TEMPLATE (T-2917, ORG-052 Unit 5b) - D-Bus system-service
+# activation file. Nothing in this unit installs it; T-2920 renders one per
+# registered seat (substituting @SEAT_UID@, @SEAT_ACCOUNT@ and @SEAT_ID@ from
+# the root-owned seat registry) into
+# /usr/share/dbus-1/system-services/org.pantheon.HostExecutor1.U<uid>.service.
+# Activation is delegated to systemd (Exec=/bin/false is the documented
+# placeholder for SystemdService activation). Names PROVISIONAL (ruling i3/i5).
+[D-BUS Service]
+Name=org.pantheon.HostExecutor1.U@SEAT_UID@
+Exec=/bin/false
+User=@SEAT_ACCOUNT@
+SystemdService=pantheon-host-executor@@SEAT_ID@.service

@@ -56,7 +56,7 @@ The operator endorsed the two-tier direction on 2026-09-06 (TG 6767/6768 via rec
 
 - **Custody:** OFFLINE root, operator-chosen storage medium + location (operator-reserved off-doc for the fleet-canonical instance; per-operator-chosen for external seeds).
 - **Rotation cadence:** QUARTERLY, MANUAL CEREMONY. Rotation is scheduled + audited (governance event, [[ORG-070]] D3 evidence trail).
-- **Compromise-recovery path:** rotate root offline → republish new key in the `did:web:snowis.me` document (single propagation point; counterparties re-resolve on next handshake) → revoke every delegated key chained to the old root via the deny-list mechanism (§3) and StatusList2021 flip (§4) for any VCs delegated-issued under it. Identity CONTINUES across rotation (this is the tier's differentiator).
+- **Compromise-recovery path:** rotate root offline → republish new key in the `did:web:your-domain.example` document (single propagation point; counterparties re-resolve on next handshake) → revoke every delegated key chained to the old root via the deny-list mechanism (§3) and StatusList2021 flip (§4) for any VCs delegated-issued under it. Identity CONTINUES across rotation (this is the tier's differentiator).
 - **Recovery latency:** bounded by counterparty `did.json` cache TTL (§5, 300s / 5min); a hardened-tier root rotation propagates in minutes, not days.
 - **Blast radius on hardened root compromise:** total federation impersonation until the recovery path completes — the crown-jewel identity. Everything downstream reduces to this event; the recovery path is normative + tested + drilled (see §Consequences).
 

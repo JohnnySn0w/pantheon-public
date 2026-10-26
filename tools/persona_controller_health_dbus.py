@@ -33,6 +33,9 @@ monitor -- F4, T-2969 REBOUND):
     | LastFailureClass       | s      | failure class of the most recent recorded runtime death, or "" |
     | NextCooldownExpiryTs   | s      | ISO8601 of the earliest cooldown expiry across non-held runtimes, or "" |
     | Holds                  | as     | sorted list of held runtime refs                          |
+    | ModalPresent           | b      | T-4047: mid-session-cap CONFIRMED present (read_mid_session_cap_state) |
+    | ModalKind              | s      | "session-limit" \\| "weekly-limit" \\| "opus-limit" \\| "monthly-spend-limit", or "" |
+    | ModalResetAt           | s      | ISO8601 reset instant PARSED from the pane, or "" if unparsed/absent |
 
     Read modes: `Get(interface, name)` / `GetAll(interface)` for pull
     (fresh state on every call -- SS88, never cached); subscribe to the
@@ -74,6 +77,16 @@ PERSONA_CONTROLLER_PROPERTIES: Final[tuple[str, ...]] = (
     "LastFailureClass",
     "NextCooldownExpiryTs",
     "Holds",
+    "ModalPresent",
+    "ModalKind",
+    "ModalResetAt",
+    # ORG-106 L4a (T-5527): additive seat-state publication, APPENDED after the nine.
+    "SeatState",
+    "SeatStateSources",
+    "SeatStateOwner",
+    "SeatStateReason",
+    "SeatStateExpires",
+    "SeatStateFault",
 )
 PERSONA_CONTROLLER_PROPERTY_SIGNATURES: Final[dict[str, str]] = {
     "ActiveRuntime": "s",
@@ -82,7 +95,77 @@ PERSONA_CONTROLLER_PROPERTY_SIGNATURES: Final[dict[str, str]] = {
     "LastFailureClass": "s",
     "NextCooldownExpiryTs": "s",
     "Holds": "as",
+    "ModalPresent": "b",
+    "ModalKind": "s",
+    "ModalResetAt": "s",
+    "SeatState": "s",
+    "SeatStateSources": "as",
+    "SeatStateOwner": "s",
+    "SeatStateReason": "s",
+    "SeatStateExpires": "s",
+    "SeatStateFault": "s",
 }
+
+#: T-5137: the pantheon-health/v1 leg, APPENDED after the nine above when
+#: `PANTHEON_PERSONA_HEALTH_LEG=on` (default off). Same append-only growth rule as
+#: `tools.host_control.health`; names are bound as literals by the T-5395 collector.
+#: Kept as separate tables so the flag-off surface is byte-identical by construction.
+HEALTH_LEG_PROPERTIES: Final[tuple[str, ...]] = (
+    "ContractRevision",
+    "Status",
+    "Subcomponents",
+    "Reasons",
+    "Revisions",
+    "InvariantListRef",
+    "SecurityDrift",
+)
+HEALTH_LEG_SIGNATURES: Final[dict[str, str]] = {
+    "ContractRevision": "s",
+    "Status": "s",
+    "Subcomponents": "a{ss}",
+    "Reasons": "a{ss}",
+    "Revisions": "a{ss}",
+    "InvariantListRef": "s",
+    "SecurityDrift": "b",
+}
+
+
+def seat_state_properties(persona: str, *, state_root=None, effective_fn=None) -> dict[str, object]:
+    """ORG-106 L4a: the six SeatState* property values for *persona*.
+
+    Pure (no dbus). The controller runs as the seat, so the default reader is
+    `seat_state.effective` (direct read, honouring *state_root*). FAIL-OPEN: any reader
+    exception yields state "active" with SeatStateFault naming the exception class, so
+    a broken record can never take the whole health payload down."""
+    try:
+        if effective_fn is None:
+            from tools import seat_state
+
+            effective_fn = lambda p: seat_state.effective(p, state_root=state_root)  # noqa: E731
+        e = effective_fn(persona)
+        return {
+            "SeatState": e.state,
+            "SeatStateSources": list(e.sources),
+            "SeatStateOwner": e.owner or "",
+            "SeatStateReason": e.reason or "",
+            "SeatStateExpires": e.expires or "",
+            "SeatStateFault": e.fault or "",
+        }
+    except Exception as exc:  # noqa: BLE001 - fail-open
+        return {
+            "SeatState": "active",
+            "SeatStateSources": [],
+            "SeatStateOwner": "",
+            "SeatStateReason": "",
+            "SeatStateExpires": "",
+            "SeatStateFault": f"seat-state: {type(exc).__name__}",
+        }
+
+
+def _signatures(health_leg: bool) -> dict[str, str]:
+    if health_leg:
+        return {**PERSONA_CONTROLLER_PROPERTY_SIGNATURES, **HEALTH_LEG_SIGNATURES}
+    return PERSONA_CONTROLLER_PROPERTY_SIGNATURES
 
 
 class HealthPropertiesProvider(Protocol):
@@ -97,20 +180,21 @@ def object_path_for(persona: str) -> str:
     return f"/org/pantheon/PersonaController/{persona}"
 
 
-def persona_controller_interface_xml() -> str:
+def persona_controller_interface_xml(health_leg: bool = False) -> str:
     lines = [f'  <interface name="{PERSONA_CONTROLLER_INTERFACE}">']
-    for name in PERSONA_CONTROLLER_PROPERTIES:
-        signature = PERSONA_CONTROLLER_PROPERTY_SIGNATURES[name]
+    names = PERSONA_CONTROLLER_PROPERTIES + (HEALTH_LEG_PROPERTIES if health_leg else ())
+    for name in names:
+        signature = _signatures(health_leg)[name]
         lines.append(f'    <property name="{name}" type="{signature}" access="read"/>')
     lines.append("  </interface>")
     return "\n".join(lines) + "\n"
 
 
-def add_persona_controller_introspection(xml: str) -> str:
+def add_persona_controller_introspection(xml: str, health_leg: bool = False) -> str:
     marker = "</node>"
     if marker not in xml:
         raise ValueError("dbus introspection XML has no closing node")
-    return xml.replace(marker, persona_controller_interface_xml() + marker, 1)
+    return xml.replace(marker, persona_controller_interface_xml(health_leg) + marker, 1)
 
 
 if DBUS_AVAILABLE:
@@ -121,11 +205,17 @@ if DBUS_AVAILABLE:
         )
 
     def _marshal_value(name: str, value: object) -> object:
-        signature = PERSONA_CONTROLLER_PROPERTY_SIGNATURES[name]
+        signature = _signatures(True)[name]
         if signature == "s":
             return dbus.String(str(value), variant_level=1)
         if signature == "as":
             return dbus.Array([str(item) for item in value], signature="s", variant_level=1)
+        if signature == "b":
+            return dbus.Boolean(bool(value), variant_level=1)
+        if signature == "a{ss}":
+            return dbus.Dictionary(
+                {str(k): str(v) for k, v in dict(value).items()}, signature="ss", variant_level=1
+            )
         raise AssertionError(f"unhandled persona-controller signature {signature}")
 
     def _marshal_properties(payload: dict[str, object]) -> "dbus.Dictionary":
@@ -148,9 +238,11 @@ if DBUS_AVAILABLE:
             object_path: str,
             provider: HealthPropertiesProvider,
             bus_name_handle: "dbus.service.BusName | None" = None,
+            health_leg: bool = False,
         ) -> None:
             super().__init__(connection, object_path)
             self._provider = provider
+            self._health_leg = health_leg
             # `dbus.service.BusName.__del__` releases the well-known name
             # on garbage collection -- holding the handle here (not just
             # in `start_service`'s local scope) keeps the name claimed
@@ -165,7 +257,7 @@ if DBUS_AVAILABLE:
             if str(interface_name) != PERSONA_CONTROLLER_INTERFACE:
                 raise _invalid_property("unknown persona-controller interface")
             name = str(property_name)
-            if name not in PERSONA_CONTROLLER_PROPERTY_SIGNATURES:
+            if name not in _signatures(self._health_leg):
                 raise _invalid_property("unknown persona-controller property")
             payload = self._provider()
             return _marshal_value(name, payload[name])
@@ -199,7 +291,7 @@ if DBUS_AVAILABLE:
             self, object_path: str, connection: "dbus.bus.BusConnection"
         ) -> str:
             return add_persona_controller_introspection(
-                super().Introspect(object_path, connection)
+                super().Introspect(object_path, connection), self._health_leg
             )
 
     _mainloop_lock = threading.Lock()
@@ -228,7 +320,7 @@ if DBUS_AVAILABLE:
             _mainloop_started = True
 
     def start_service(
-        persona: str, provider: HealthPropertiesProvider
+        persona: str, provider: HealthPropertiesProvider, health_leg: bool = False
     ) -> "PersonaController1Object":
         """Registers `org.pantheon.PersonaController.<persona>` on the
         session bus and exports the health object. Raises on failure (no
@@ -245,4 +337,5 @@ if DBUS_AVAILABLE:
             object_path=object_path_for(persona),
             provider=provider,
             bus_name_handle=bus_name_handle,
+            health_leg=health_leg,
         )

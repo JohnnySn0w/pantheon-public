@@ -1,0 +1,163 @@
+# tools/systemd/expected-units.yaml — which user units each seat is EXPECTED to carry (T-4232).
+#
+# Read by tools/systemd_drift_sweep.py (Recovery, daily). For every persona below, the sweep
+# checks that persona's account's ~/.config/systemd/user and raises MISSING_EXPECTED (an
+# alert, routed to Recovery triage) when a listed unit is:
+#   - ABSENT: no installed unit file (for an instance `foo@bar.timer`, the template
+#     `foo@.timer` or the literal instance file must be installed), or
+#   - DISABLED: `enabled: true` but the unit name is not an entry in any `*.wants/` dir.
+# `enabled: false` means presence-only (it does NOT mean "must be disabled"): use it for
+# timer-driven oneshot services and for templates that are enabled per instance.
+#
+# Schema: persona -> list of {unit: <name>, enabled: true|false}. Personas are resolved to
+# OS accounts via tools/agent_role_map.py (instance.yaml), never hard-coded here.
+#
+# Validation is FAIL-CLOSED: an unknown persona, a unit with no template in tools/systemd/,
+# a bad key, or unparseable YAML makes the sweep alert MANIFEST_UNKNOWN; it never reads as
+# "nothing expected". tools/test_systemd_drift_sweep.py loads this file in the suite, so
+# removing a unit template without editing this list in the same change goes red.
+#
+# Removing an entry is a lifecycle decision (ORG-068): retire the unit and delete its line
+# in the same PR. Detect + alert only — the sweep never installs or enables anything.
+#
+# Scope today (T-4232 D-4): the orchestrator seat's (claude) HO timers and recovery's
+# (claude-fallback) units, per the seat headings in tools/systemd/README.md and unit-file
+# comments. Other seats are not listed yet.
+
+orchestrator:
+  # ORG-013 cascade sweep (T-4186)
+  - {unit: pantheon-cascade-sweep.timer, enabled: true}
+  - {unit: pantheon-cascade-sweep.service, enabled: false}
+  # pantheon-hermes-local-audit.{timer,service} (T-2392 stand-in): NOT expected — RETIRED
+  # per orchestrator ruling 2026-09-29 (T-4232 live dry-run): no unit files on claude since
+  # ~2026-08-03 and its README retire condition (tip-coverage COVERED) is met.
+  # Fleet clone-currency check (T-2798)
+  - {unit: pantheon-fleet-clone-currency.timer, enabled: true}
+  - {unit: pantheon-fleet-clone-currency.service, enabled: false}
+  # Echo-corpus obligation lint (T-3495)
+  - {unit: pantheon-echo-lint.timer, enabled: true}
+  - {unit: pantheon-echo-lint.service, enabled: false}
+  # Shared echo cargo target prune, weekly (T-4852)
+  - {unit: pantheon-echo-target-prune.timer, enabled: true}
+  - {unit: pantheon-echo-target-prune.service, enabled: false}
+  # CI-audit tip coverage: "THIS UNIT BELONGS ON THE `claude` SEAT AND ONLY THERE" (T-2440)
+  - {unit: pantheon-ci-audit-tip-coverage.timer, enabled: true}
+  - {unit: pantheon-ci-audit-tip-coverage.service, enabled: false}
+  # hermes-audit dispatch (T-5354): gh workflow_dispatch, so claude-seat only. GitHub's cron is hours late.
+  - {unit: pantheon-hermes-audit-dispatch.timer, enabled: true}
+  - {unit: pantheon-hermes-audit-dispatch.service, enabled: false}
+  # Nightly-CI red-run watch (T-4402): reads GitHub via gh, so claude-seat only. A watcher that
+  # is merged but not enabled is the exact silent failure it exists to end.
+  - {unit: pantheon-ci-nightly-watch.timer, enabled: true}
+  - {unit: pantheon-ci-nightly-watch.service, enabled: false}
+  # Decision-register sweep (T-5015 phase 2): reads the orchestrator seat's own session jsonls, so claude-seat only.
+  - {unit: pantheon-decision-sweep.timer, enabled: true}
+  - {unit: pantheon-decision-sweep.service, enabled: false}
+  # Throughline trigger (T-5015 phase 3): weekly; files one HO ticket when the register gained rows.
+  - {unit: pantheon-decision-throughline.timer, enabled: true}
+  - {unit: pantheon-decision-throughline.service, enabled: false}
+
+recovery:
+  # pantheon-session-reset-reconcile.{timer,service}: NOT expected — RETIRED
+  # (T-4288). The timer was never installed; producer JSONL remains forensic
+  # and the retained utility is supervised one-shot only.
+  # Ticket grooming
+  - {unit: pantheon-grooming.timer, enabled: true}
+  - {unit: pantheon-grooming.service, enabled: false}
+  # S3* per-seat evidence for the codex-run auditor (T-4928)
+  - {unit: pantheon-s3star-seat-evidence.timer, enabled: true}
+  - {unit: pantheon-s3star-seat-evidence.service, enabled: false}
+  # pve2 backup freshness (T-4998)
+  - {unit: pantheon-pve2-backup-freshness.timer, enabled: true}
+  - {unit: pantheon-pve2-backup-freshness.service, enabled: false}
+  # pve2 disk health (T-4997)
+  - {unit: pantheon-pve2-disk-health.timer, enabled: true}
+  - {unit: pantheon-pve2-disk-health.service, enabled: false}
+  # pve2 heat (T-5309)
+  - {unit: pantheon-pve2-heat.timer, enabled: true}
+  - {unit: pantheon-pve2-heat.service, enabled: false}
+  # Seat-parity self-repair (T-3798)
+  - {unit: pantheon-parity-remediate.timer, enabled: true}
+  - {unit: pantheon-parity-remediate.service, enabled: false}
+  # Unit-failure alert: OnFailure= target, never enabled itself (T-1868)
+  - {unit: pantheon-unit-failure-alert@.service, enabled: false}
+  # Mirror drift-sweep section (T-1994, T-2213, T-2157, T-2217)
+  - {unit: pantheon-resource-sampler.timer, enabled: true}
+  - {unit: pantheon-resource-sampler.service, enabled: false}
+  - {unit: pantheon-mail-staleness.timer, enabled: true}
+  - {unit: pantheon-mail-staleness.service, enabled: false}
+  - {unit: pantheon-forgejo-mirror-verify.timer, enabled: true}
+  - {unit: pantheon-forgejo-mirror-verify.service, enabled: false}
+  - {unit: pantheon-mirror-drift.timer, enabled: true}
+  - {unit: pantheon-mirror-drift.service, enabled: false}
+  # Suite-health soak filer
+  - {unit: pantheon-soak-filer.timer, enabled: true}
+  - {unit: pantheon-soak-filer.service, enabled: false}
+  # Well-trod pathing stats (T-1811)
+  - {unit: pantheon-welltrod.timer, enabled: true}
+  - {unit: pantheon-welltrod.service, enabled: false}
+  - {unit: pantheon-mailbox-traffic.timer, enabled: true}
+  - {unit: pantheon-mailbox-traffic.service, enabled: false}
+  # Channel-liveness monitor section
+  - {unit: pantheon-channel-liveness.timer, enabled: true}
+  - {unit: pantheon-channel-liveness.service, enabled: false}
+  # pantheon-ancestor-liveness.{timer,service}: NOT expected — RETIRED. The operator ruled the
+  # the-ancestor session decommissioned; recovery ran `disable --now` on the timer (T-2214,
+  # 2026-07-28). The unit files and tools/ancestor_liveness_monitor.py were deleted from
+  # the repo in T-3421. Do not re-add; installed copies on recovery are not an expectation.
+  - {unit: pantheon-credential-expiry.timer, enabled: true}
+  - {unit: pantheon-credential-expiry.service, enabled: false}
+  # priority-list-health is recovery's by design (ORG-078 §4: repair target = Recovery; T-3020 BT4
+  # reads the invoking account's own health log; unit comment "Recovery's own ticket.py
+  # invocation cadence ... is a sufficient fleet-wide proxy"). No record of it being
+  # installed on recovery, nor of a decision not to: a REAL GAP, kept expected (T-4232).
+  - {unit: pantheon-priority-list-health.timer, enabled: true}
+  - {unit: pantheon-priority-list-health.service, enabled: false}
+  - {unit: pantheon-activity-monitor-drift-check.timer, enabled: true}
+  - {unit: pantheon-activity-monitor-drift-check.service, enabled: false}
+  - {unit: pantheon-disk-usage.timer, enabled: true}
+  - {unit: pantheon-disk-usage.service, enabled: false}
+  - {unit: pantheon-memory-snapshot-coverage.timer, enabled: true}
+  - {unit: pantheon-memory-snapshot-coverage.service, enabled: false}
+  - {unit: pantheon-geo-hook-health.timer, enabled: true}
+  - {unit: pantheon-geo-hook-health.service, enabled: false}
+  - {unit: pantheon-worktree-sweeper.timer, enabled: true}
+  - {unit: pantheon-worktree-sweeper.service, enabled: false}
+  # Telegram bun-child watchdog (T-1456)
+  - {unit: recovery-telegram-child-watchdog.timer, enabled: true}
+  - {unit: recovery-telegram-child-watchdog.service, enabled: false}
+  # Harness-modal wedge monitors (T-1366, T-2553)
+  - {unit: pantheon-codex-modal-monitor.timer, enabled: true}
+  - {unit: pantheon-codex-modal-monitor.service, enabled: false}
+  - {unit: pantheon-unknown-dialog-monitor.timer, enabled: true}
+  - {unit: pantheon-unknown-dialog-monitor.service, enabled: false}
+  # Spine-index grooming
+  - {unit: pantheon-spine-index-groom.timer, enabled: true}
+  - {unit: pantheon-spine-index-groom.service, enabled: false}
+  # pantheon-activity-digest.{timer,service}: NOT expected — RETIRED (T-4289). Its
+  # non-empty 5-hourly pulse was status-only, not an operator action item (T-4200; recovery and
+  # orchestrator rulings 2026-09-29); the tool and its unit templates were removed.
+  # CI-audit liveness detector (T-2440)
+  - {unit: pantheon-ci-audit-liveness.timer, enabled: true}
+  - {unit: pantheon-ci-audit-liveness.service, enabled: false}
+  # Delivery reachability sweep (T-2232)
+  - {unit: pantheon-delivery-reachability.timer, enabled: true}
+  - {unit: pantheon-delivery-reachability.service, enabled: false}
+  # Seat-parity audit (T-3750)
+  - {unit: pantheon-parity-audit.timer, enabled: true}
+  - {unit: pantheon-parity-audit.service, enabled: false}
+  # Cross-account systemd-drift sweep (T-2444) — this check's own host
+  - {unit: pantheon-systemd-drift-sweep.timer, enabled: true}
+  - {unit: pantheon-systemd-drift-sweep.service, enabled: false}
+  # Consumer-liveness monitor (T-2605)
+  - {unit: pantheon-consumer-liveness.timer, enabled: true}
+  - {unit: pantheon-consumer-liveness.service, enabled: false}
+  # Context-fill + activity monitors + ticket-lint install block (T-0783)
+  - {unit: pantheon-ticket-lint.timer, enabled: true}
+  - {unit: pantheon-ticket-lint.service, enabled: false}
+  - {unit: pantheon-context-fill-monitor@.service, enabled: false}
+  - {unit: pantheon-context-fill-monitor@orchestrator.timer, enabled: true}
+  - {unit: pantheon-context-fill-monitor@specialist.timer, enabled: true}
+  - {unit: pantheon-context-fill-monitor@recovery.timer, enabled: true}
+  - {unit: pantheon-activity-monitor@.service, enabled: false}
+  - {unit: pantheon-activity-monitor@orchestrator.timer, enabled: true}

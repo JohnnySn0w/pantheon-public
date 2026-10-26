@@ -62,14 +62,23 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
-FORGE = "https://git.snowis.me"
+FORGE = "https://git.your-self-hosted-git.example"
 ORG = "github-mirror"
+# T-4690: name the identity in the url. Since T-4051 ~/.git-credentials-forgejo holds two
+# git.your-self-hosted-git.example identities and git-credential-store answers with the FIRST match, which is
+# pantheon-fleet (reads pantheon-config only). Every other mirror then read "not found",
+# so this verifier reported UNKNOWN=50 every night from at least 2026-10-02, with exit 0.
+MIRROR_USER = "pantheon-mirror"
+PAGE = 50  # Forgejo's maximum page size
+MAX_PAGES = 40  # 2000 repos; a pager that never returns a short page must not loop forever
 UPSTREAM = "https://github.com/example-org/{repo}.git"
 TOKEN_FILE = "~/.forgejo-mirror.token"
 # T-2694: the least-privilege Contents:read GitHub PAT (key=value form). Used ONLY
@@ -169,6 +178,35 @@ def parse_interval(text: str) -> int:
     return total
 
 
+_CRED_USER_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+_MAX_CRED_FILE_BYTES = 64 * 1024
+
+
+def store_password(path: str, host: str, user: str) -> str | None:
+    """The password for `user`@`host` in a git-credentials store file, or None.
+
+    T-5067: the store helper answers with the FIRST line matching the host once git drops the
+    URL's username after a 401, and `git credential approve` reorders the file. So reading
+    through the helper made the identity depend on line order. Here the line is picked by
+    host AND username, whatever its position."""
+    try:
+        with open(path, "rb") as fh:
+            raw = fh.read(_MAX_CRED_FILE_BYTES + 1)
+    except OSError:
+        return None
+    if len(raw) > _MAX_CRED_FILE_BYTES:
+        return None
+    for line in raw.decode("utf-8", "replace").splitlines():
+        try:
+            parts = urllib.parse.urlsplit(line.strip())
+        except ValueError:
+            continue
+        if (parts.hostname == host and parts.username is not None and parts.password
+                and urllib.parse.unquote(parts.username) == user):
+            return urllib.parse.unquote(parts.password)
+    return None
+
+
 def ref_set(url: str, *, token: str | None = None, pat: str | None = None,
             run=subprocess.run) -> set[str] | None:
     """Full ref set via ls-remote. None means UNREADABLE — never an empty set.
@@ -181,10 +219,24 @@ def ref_set(url: str, *, token: str | None = None, pat: str | None = None,
     cmd = ["git"]
     env = None
     if token:
-        cmd += ["-c", f"credential.helper=store --file={token}"]
+        # T-5067: name the credential explicitly instead of asking the store helper, whose
+        # answer depends on line order. Reset every inherited helper (the global list and
+        # ~/.gitconfig's host-scoped credential.https://git.your-self-hosted-git.example.helper), then set a
+        # host-scoped one that echoes the URL's user and reads the password from env (never argv).
+        parts = urllib.parse.urlsplit(url)
+        user = urllib.parse.unquote(parts.username or "")
+        if not parts.hostname or not _CRED_USER_RE.fullmatch(user):
+            return None
+        password = store_password(token, parts.hostname, user)
+        if password is None:
+            return None
+        scope = f"credential.{parts.scheme}://{parts.hostname}.helper"
+        env = {**os.environ, "PANTHEON_FORGE_PW": password, "GIT_TERMINAL_PROMPT": "0"}
+        cmd += ["-c", "credential.helper=", "-c", f"{scope}=",
+                "-c", f'{scope}=!f() {{ echo username={user}; echo "password=$PANTHEON_FORGE_PW"; }}; f']
     if pat:
         # Reset any inherited helper for this host, then set our env-reading one.
-        env = {**os.environ, "PANTHEON_GH_PAT": pat}
+        env = {**(env or os.environ), "PANTHEON_GH_PAT": pat}
         cmd += [
             "-c", "credential.https://github.com.helper=",
             "-c", ("credential.https://github.com.helper=!f() { echo username=x-access-token; "
@@ -383,7 +435,17 @@ def main(argv=None) -> int:
         return 64
 
     try:
-        repos = _api(f"/orgs/{ORG}/repos?limit=200", token)
+        # T-4690: Forgejo caps a page at 50 whatever `limit` asks for, so `limit=200` silently
+        # saw only the first 50 repos. Page until a short (or empty) page.
+        repos, page = [], 1
+        while True:
+            batch = _api(f"/orgs/{ORG}/repos?limit={PAGE}&page={page}", token) or []
+            repos += batch
+            if len(batch) < PAGE:
+                break
+            if page >= MAX_PAGES:
+                raise ValueError(f"org pager passed {MAX_PAGES} pages without a short page")
+            page += 1
     except (urllib.error.URLError, OSError, ValueError) as e:
         print(f"forge API unreachable: {e}", file=sys.stderr)
         return 65
@@ -404,7 +466,7 @@ def main(argv=None) -> int:
         # Public upstreams ls-remote anonymously; private ones need the PAT.
         up = ref_set(UPSTREAM.format(repo=name),
                      pat=gh_pat if repo.get("private") else None)
-        mir = ref_set(f"{FORGE}/{ORG}/{name}.git", token=cred)
+        mir = ref_set(f"https://{MIRROR_USER}@{FORGE.split('://', 1)[1]}/{ORG}/{name}.git", token=cred)
         # T-2881: only a PUBLIC mirror can be an exposure — skip the GitHub
         # metadata GET for private mirrors (a private mirror is safe regardless of
         # upstream visibility, and it saves an API call per private repo).
@@ -421,7 +483,9 @@ def main(argv=None) -> int:
         elif name in prev_state:
             new_state[name] = prev_state[name]
         results.append({"repo": name, "verdict": verdict, "detail": detail})
-        if verdict in (DRIFT, STALE, HOLLOW, EXPOSED):
+        if verdict in (DRIFT, STALE, HOLLOW, EXPOSED) or detail.endswith(": mirror unreadable"):
+            # T-4690: an unreadable MIRROR is our own credential/forge failing, so the check is
+            # blind: loud, not UNKNOWN-and-exit-0. (An unreadable UPSTREAM stays benign UNKNOWN.)
             bad += 1
         if not (args.quiet_ok and verdict == OK):
             print(f"  {verdict:<7} {detail}")

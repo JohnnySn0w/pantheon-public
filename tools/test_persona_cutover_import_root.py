@@ -228,7 +228,7 @@ class PersonaCutoverImportRootCase(unittest.TestCase):
                 """\
                 #!/usr/bin/env bash
                 if [[ "$*" == *"comm="* ]]; then echo claude; exit 0; fi
-                if [[ "$*" == *"args="* ]]; then echo '/home/x/.npm-global/bin/claude --channels telegram --model gpt-5 --permission-mode default'; exit 0; fi
+                if [[ "$*" == *"args="* ]]; then echo '/home/x/.npm-global/bin/claude --channels telegram --model gpt-5 --permission-mode bypassPermissions'; exit 0; fi
                 echo 1
                 exit 0
                 """

@@ -5,7 +5,7 @@
 # knows that is NOT derivable from the repos (D10). Both were single-copy with
 # no VCS and no snapshot — a bad sed or a disk event loses them silently, and
 # nothing surfaces it until a future session goes looking for a fact that had
-# quietly stopped existing. Sister to T-2233 (mnemosyne's seat, same finding).
+# quietly stopped existing. Sister to T-2233 (archivist's seat, same finding).
 #
 # SHAPE: mirrors exocortex-data-snapshot.service — the proven, tiny mechanism —
 # but snapshots COPIES into a dedicated repo rather than git-init'ing the live
@@ -30,7 +30,7 @@ MEMORY_DIR="${PANTHEON_MEMORY_DIR:-$HOME/.claude/projects/-home-claude/memory}"
 HANDOFF="${PANTHEON_HANDOFF:-$HOME/HANDOFF.md}"
 CONTINUITY_DIR="${PANTHEON_CONTINUITY_DIR:-$HOME/.local/state/pantheon/continuity}"
 # T-2736: not every memory-bearing seat has a HANDOFF.md. Sub-orchestrators
-# atlas/metis carry accumulated memory but no HANDOFF, so a hard "HANDOFF
+# artisan/mason carry accumulated memory but no HANDOFF, so a hard "HANDOFF
 # MISSING -> exit 3" leaves their single-copy memory UNPROTECTED — the exact
 # silent-loss risk this guard exists to close. REQUIRE_HANDOFF makes the HANDOFF
 # leg opt-OUT, explicitly per seat (NOT auto-detected from absence): the default

@@ -86,6 +86,13 @@ class TestParseVerdict(unittest.TestCase):
     def test_lowercase_mentions_do_not_count(self):
         self.assertIsNone(scorer.parse_verdict("i would approve or rebound depending on context"))
 
+    def test_escalate_recognized_and_ambiguity_rule(self):
+        # ESCALATE is the third recognized verdict (T-3837 v2). Zero-or-multiple → None.
+        self.assertEqual(scorer.parse_verdict("ESCALATE: this touches an ADR surface."), "ESCALATE")
+        self.assertIsNone(scorer.parse_verdict("normally I'd APPROVE but this is close to ESCALATE."))
+        self.assertIsNone(scorer.parse_verdict("REBOUND or ESCALATE, either fits."))
+        self.assertIsNone(scorer.parse_verdict("APPROVE, REBOUND, or ESCALATE — any works."))
+
 
 class TestDeterministicCategoryHit(unittest.TestCase):
     def test_hits_when_majority_of_keyword_tokens_present(self):
@@ -201,6 +208,87 @@ class TestScoreIsClippedToUnitInterval(unittest.TestCase):
         case = _case(POSITIVE_CASE)
         result = scorer.score_rollout(case, "REBOUND: the retry loop has no bound on attempts, unbounded retry loop confirmed.")
         self.assertLessEqual(result.score, 1.0)
+
+
+CLEAN_APPROVE_CASE = {
+    "case_id": "T-9104",
+    "class": "clean_approve_control",
+    "split": "train",
+    "source_ticket": "T-9104",
+    "source_path": "tickets/done/T-9104.md",
+    "provenance": {"requester": "x", "target": "y", "labels": [], "round": None},
+    "review_material": {"ask_summary": "s", "diff_ref": {"repo": None, "sha": None}, "review_kind": "diff"},
+    "expected": {
+        "verdict": "APPROVE",
+        "findings": [],
+        "must_not_flag": [
+            {"category": "irrelevant-style-nit", "description": "GOLD brace style"},
+            {"category": "premature-abstraction-alarm", "description": "GOLD not worth flagging"},
+        ],
+    },
+    "curation": {"classification_rationale": "r", "spot_read": True},
+}
+
+
+class TestF1FindingsComponent(unittest.TestCase):
+    """T-3837 v2: the F1 component replaces v1's pure-recall term. Precision teeth
+    matter — over-flagging a clean-APPROVE case now zeroes F1 rather than merely
+    subtracting the fixed must_not_flag penalty."""
+
+    def test_clean_approve_no_flags_gets_full_f1(self):
+        case = _case(CLEAN_APPROVE_CASE)
+        result = scorer.score_rollout(case, "APPROVE: no issues found.")
+        self.assertTrue(result.verdict_correct)
+        self.assertEqual(result.wrongly_flagged_categories, ())
+        # verdict 0.45 + F1 (1.0) * 0.55 = 1.0
+        self.assertAlmostEqual(result.score, 1.0, places=6)
+        self.assertIsNotNone(result.breakdown)
+        self.assertAlmostEqual(result.breakdown.findings_f1, 1.0, places=6)
+
+    def test_clean_approve_with_must_not_flag_hit_zeroes_f1(self):
+        # No expected findings, one must_not_flag hit → precision=0/(0+1)=0, recall=1, F1=0.
+        # verdict 0.45 + F1 (0) * 0.55 - 0.25 = 0.20.
+        case = _case(CLEAN_APPROVE_CASE)
+        result = scorer.score_rollout(case, "APPROVE, but I'd note this is an irrelevant style nit.")
+        self.assertTrue(result.verdict_correct)
+        self.assertIn("irrelevant-style-nit", result.wrongly_flagged_categories)
+        self.assertIsNotNone(result.breakdown)
+        self.assertAlmostEqual(result.breakdown.findings_f1, 0.0, places=6)
+        self.assertAlmostEqual(result.breakdown.findings_precision, 0.0, places=6)
+        self.assertAlmostEqual(result.breakdown.findings_recall, 1.0, places=6)
+        self.assertAlmostEqual(result.score, 0.20, places=6)
+
+    def test_all_caught_no_false_flags_full_f1(self):
+        case = _case(POSITIVE_CASE)
+        result = scorer.score_rollout(case, "REBOUND: the retry loop has no bound on attempts.")
+        self.assertIsNotNone(result.breakdown)
+        self.assertAlmostEqual(result.breakdown.findings_f1, 1.0, places=6)
+        self.assertAlmostEqual(result.score, 1.0, places=6)
+
+    def test_mixed_case_yields_expected_f1(self):
+        # 1 caught, 0 missed, 1 wrongly_flagged → P=0.5, R=1.0, F1=2/3.
+        case = _case(MIXED_CASE)
+        review = "REBOUND: the retry loop has no bound on attempts. Also irrelevant style nit."
+        result = scorer.score_rollout(case, review)
+        self.assertIsNotNone(result.breakdown)
+        self.assertAlmostEqual(result.breakdown.findings_precision, 0.5, places=6)
+        self.assertAlmostEqual(result.breakdown.findings_recall, 1.0, places=6)
+        self.assertAlmostEqual(result.breakdown.findings_f1, 2.0 / 3.0, places=6)
+        # verdict 0.45 + F1(2/3)*0.55 - 0.25 must_not_flag = 0.45 + 0.3667 - 0.25 = 0.5667
+        self.assertAlmostEqual(result.score, 0.45 + 0.55 * (2.0 / 3.0) - 0.25, places=6)
+
+
+class TestScoreBreakdown(unittest.TestCase):
+    def test_breakdown_populated_on_success(self):
+        case = _case(MIXED_CASE)
+        result = scorer.score_rollout(case, "REBOUND: retry loop has no bound.")
+        self.assertIsNotNone(result.breakdown)
+        b = result.breakdown
+        self.assertEqual(b.verdict_match, 1.0)
+        self.assertEqual(b.must_not_flag_hits, 0)
+        self.assertAlmostEqual(b.findings_recall, 1.0, places=6)
+        self.assertAlmostEqual(b.findings_precision, 1.0, places=6)
+        self.assertAlmostEqual(b.findings_f1, 1.0, places=6)
 
 
 if __name__ == "__main__":

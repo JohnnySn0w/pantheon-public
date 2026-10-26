@@ -5,7 +5,7 @@ THE GAP THIS CLOSES: T-2424 gave each memory-bearing seat a daily snapshot timer
 that git-commits its memory dir (+ HANDOFF) into a local history repo, so a bad
 sed or a disk event is recoverable instead of a silent single-copy loss. But a
 one-time INSTALL does not prevent a timer that later silently STOPS. The T-1871
-audit found exactly that: mnemosyne's snapshot had quietly rotted since ~2026-07-29
+audit found exactly that: archivist's snapshot had quietly rotted since ~2026-07-29
 (~12 days) and nobody noticed until someone went looking. A stopped snapshot timer
 reads as healthy to every process check (the account is up, the agent is up) — the
 only witness is that the snapshots stopped landing. This monitor makes that a
@@ -16,7 +16,7 @@ the obvious check — "alert if the newest snapshot COMMIT is older than N days"
 FALSE-ALARMS on idle seats. The snapshot scripts commit only when the memory dir
 actually changed (`git diff --cached --quiet` guards the commit), so a healthy
 timer on a quiet seat produces NO commit and the repo HEAD legitimately ages. Live
-proof: mnemosyne's in-place memory git HEAD was 13 days old while its hourly
+proof: archivist's in-place memory git HEAD was 13 days old while its hourly
 snapshot timer was firing perfectly (last fire 44min prior) — the seat simply had
 not changed its memory since 07-29. Paging on that is noise, and noise trains
 alert-blindness. So the AUTHORITATIVE signal is snapshot-TIMER health (is the
@@ -72,11 +72,9 @@ if __package__ in (None, ""):
 # Covered seats: the memory-bearing accounts with a snapshot mechanism. Each maps
 # to (unix user, snapshot timer unit, corroboration repo). Two mechanisms exist:
 #   - pantheon-agent-state-snapshot.timer → commits COPIES into a dedicated
-#     ~/.local/state/pantheon/agent-state-history repo (recovery/orchestrator/specialist/atlas/metis).
-#   - mnemosyne-state-snapshot.timer → commits mnemosyne's memory dir IN PLACE
+#     ~/.local/state/pantheon/agent-state-history repo (recovery/orchestrator/specialist/artisan/mason).
+#   - archivist-state-snapshot.timer → commits archivist's memory dir IN PLACE
 #     (exocortex; hourly). Its corroboration repo is that live memory .git.
-# the-ancestor is intentionally EXCLUDED: it carries no persistent memory-snapshot
-# mechanism (no agent-state-history repo, no snapshot timer) — verified 2026-08-11.
 # codex is excluded (separate substrate, no Claude-side memory snapshot).
 COVERED_SEATS: dict[str, dict] = {
     "recovery": {
@@ -94,19 +92,19 @@ COVERED_SEATS: dict[str, dict] = {
         "timer": "pantheon-agent-state-snapshot.timer",
         "repo": "/home/claude-research/.local/state/pantheon/agent-state-history",
     },
-    "atlas": {
+    "artisan": {
         "user": "suborch2",
         "timer": "pantheon-agent-state-snapshot.timer",
         "repo": "/home/suborch2/.local/state/pantheon/agent-state-history",
     },
-    "metis": {
+    "mason": {
         "user": "suborch1",
         "timer": "pantheon-agent-state-snapshot.timer",
         "repo": "/home/suborch1/.local/state/pantheon/agent-state-history",
     },
-    "mnemosyne": {
+    "archivist": {
         "user": "exocortex",
-        "timer": "mnemosyne-state-snapshot.timer",
+        "timer": "archivist-state-snapshot.timer",
         # In-place-git design (ORG-042 observation seat): the live memory dir is
         # itself the git repo the snapshot service commits. Check its HEAD.
         "repo": "/home/exocortex/.claude/projects/-home-exocortex/memory",

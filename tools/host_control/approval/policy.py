@@ -500,6 +500,84 @@ class PolicyApproverAuthorizer:
             policy_revision=self._policy.revision,
         )
 
+    def may_decide_human(
+        self,
+        human_subject: str,
+        review: ReviewRecord,
+        chain_participants: frozenset[str],
+    ) -> PolicyVerdict:
+        """Authorize a PROVIDER-AUTHENTICATED human decision (T-2919).
+
+        ``human_subject`` is never a caller argument: the service derives
+        it from the bus-attested ingress uid through the root-owned
+        ``HumanIngressRegistration``. The same separation-of-duty and
+        roster/seat checks as the agent path apply; the routing differs:
+        the roster entry's permitted source must be ``human`` (an agent
+        entry can never be reached through the ingress), and a human
+        decision may satisfy any family its entry grants, including the
+        human-gated ones."""
+
+        common = self._authorize_common(
+            human_subject,
+            owner=review.plan_owner,
+            performer=review.performer,
+            target_seat_id=review.target_seat_id,
+            families=tuple(review.operation_families),
+        )
+        if not common.allowed:
+            return common
+        approver_uid = self._policy.uid_of(human_subject)
+        if review.handoff is not None:
+            handoff = self._check_requester_and_chain(
+                human_subject,
+                approver_uid,
+                review.handoff.request_plan_owner,
+                chain_participants,
+            )
+            if not handoff.allowed:
+                return handoff
+        for family in review.operation_families:
+            if self._policy.required_class(family) is None:
+                return _denied("unknown_operation_family")
+        entry = self._policy.approvers[human_subject]
+        if entry.decision_source != "human":
+            return _denied("source_not_permitted")
+        max_ttl = min(
+            entry.grants[family].max_ttl
+            for family in review.operation_families
+        )
+        return _authorized(
+            max_ttl=max_ttl,
+            policy_revision=self._policy.revision,
+        )
+
+    def agent_approvers_on_uid(self, uid: int) -> tuple[str, ...]:
+        """Agent-source approver subjects whose trust domain is ``uid``
+        (the service refuses a human ingress uid that has any: the
+        network-facing uid must never gain Reviewer standing)."""
+
+        return tuple(
+            sorted(
+                subject
+                for subject, entry in self._policy.approvers.items()
+                if entry.decision_source == "agent"
+                and self._policy.subject_uids.get(subject) == uid
+            )
+        )
+
+    def subject_uid(self, subject: str) -> int | None:
+        """Policy trust-domain uid of a subject (the service's
+        construction-time human-ingress cross-check, T-2919)."""
+
+        return self._policy.uid_of(subject)
+
+    def may_withdraw(self, subject: str) -> PolicyVerdict:
+        """Withdrawing a pending human card is a revoker power (Q6)."""
+
+        if subject not in self._policy.revokers:
+            return _denied("revoke_not_permitted")
+        return _authorized()
+
     def may_revoke(self, subject: str, grant: GrantRecord) -> PolicyVerdict:
         if subject not in self._policy.revokers:
             return _denied("revoke_not_permitted")

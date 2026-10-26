@@ -31,10 +31,18 @@ Schema (`mirror-published-state.yaml`):
         published_at: <iso8601>|null               # when record-published ran
         published_mirror_head: <sha>|null          # informational (audit only)
         published_by: <persona>|null
+        published_payload_tree: <tree sha>|null    # generator pairs (T-4768 PR5): the
+                                                   # published payload tree; the sweep
+                                                   # compares build(HEAD)'s tree to it
+        rebased_from:                              # set by rebase-anchor only
+          source_head: <sha>|null                  # the anchor before the rebase
+          at: <iso8601>
+          match: exact|allowlisted                 # how build(anchor) met the tree
         staged_bundle:                             # null when nothing staged
           source_head_at_build: <sha>
           built_at: <iso8601>
           bundle_path: <str>|null                  # informational
+          payload_tree: <tree sha>|null            # generator pairs: the staged tree
 
 Slugs are STABLE, role-based (T-0915 rename tolerance): claude-harness-mirror,
 codex-harness-mirror, pwa-release-mirror, pantheon-public-mirror. They are the join
@@ -42,15 +50,24 @@ key between this state and the static `mirror-drift-pairs.yaml`.
 
 CLI:
     python3 tools/mirror_state.py record-published <slug> --source-head <sha> \
-        [--mirror-head <sha>] [--by orchestrator]
+        [--mirror-head <sha>] [--by orchestrator] [--payload-tree <tree>]
     python3 tools/mirror_state.py record-staged <slug> --source-head <sha> \
-        [--bundle-path <path>]
+        [--bundle-path <path>] [--payload-tree <tree>]
+    python3 tools/mirror_state.py rebase-anchor <slug> --source-head <sha> \
+        --payload-tree <tree> [--match exact|allowlisted]
     python3 tools/mirror_state.py clear-staged <slug>
     python3 tools/mirror_state.py get <slug>        # print one pair's state (json)
     python3 tools/mirror_state.py show               # print whole state (yaml)
 
 `record-published` clears a staged bundle whose `source_head_at_build` matches the
-just-published `--source-head` (the staged bundle became the published anchor).
+just-published `--source-head`, or whose `payload_tree` matches the just-published
+`--payload-tree` (the staged bundle became the published anchor).
+
+`rebase-anchor` (T-4768 PR5) moves a generator pair's anchor to the pantheon-config
+sha whose build reproduces the published payload tree (found by
+`mirror_drift_sweep.py --rebase-anchor`). It is NOT a publish: published_at,
+published_mirror_head and published_by are left unchanged, and the old anchor is
+kept in `rebased_from`.
 
 No git, no network, no ticket-filing — this is pure local state. The sweep and
 the systemd units are separate. Tests: `python3 -m unittest tools.test_mirror_state`.
@@ -193,6 +210,7 @@ def record_published(
     *,
     mirror_head: str | None = None,
     by: str | None = None,
+    payload_tree: str | None = None,
     now_iso: str | None = None,
 ) -> dict[str, Any]:
     """Record that `slug` was published from SOURCE head `source_head`.
@@ -206,13 +224,24 @@ def record_published(
     source_head = _validate_sha(source_head)
     if mirror_head is not None:
         mirror_head = _validate_sha(mirror_head)
+    if payload_tree is not None:
+        payload_tree = _validate_sha(payload_tree)
     entry = get_pair(state, slug)
     entry["source_head_at_last_publish"] = source_head
     entry["published_at"] = now_iso or _now_iso()
     entry["published_mirror_head"] = mirror_head
     entry["published_by"] = by
+    if payload_tree is not None or "published_payload_tree" in entry:
+        # A generator-pair publish without --payload-tree must not leave the OLD
+        # tree next to the new anchor: null it (the sweep reports coverage_gap).
+        entry["published_payload_tree"] = payload_tree
+    # A real publish supersedes any earlier anchor rebase.
+    entry.pop("rebased_from", None)
     staged = entry.get("staged_bundle")
-    if isinstance(staged, dict) and staged.get("source_head_at_build") == source_head:
+    if isinstance(staged, dict) and (
+        staged.get("source_head_at_build") == source_head
+        or (payload_tree is not None and staged.get("payload_tree") == payload_tree)
+    ):
         entry["staged_bundle"] = None
     return entry
 
@@ -223,6 +252,7 @@ def record_staged(
     source_head: str,
     *,
     bundle_path: str | None = None,
+    payload_tree: str | None = None,
     now_iso: str | None = None,
 ) -> dict[str, Any]:
     """Record that a refresh bundle for `slug` was BUILT from SOURCE head
@@ -234,12 +264,52 @@ def record_staged(
     """
     _validate_slug(slug)
     source_head = _validate_sha(source_head)
+    if payload_tree is not None:
+        payload_tree = _validate_sha(payload_tree)
     entry = get_pair(state, slug)
     entry["staged_bundle"] = {
         "source_head_at_build": source_head,
         "built_at": now_iso or _now_iso(),
         "bundle_path": bundle_path,
     }
+    if payload_tree is not None:
+        entry["staged_bundle"]["payload_tree"] = payload_tree
+    return entry
+
+
+ANCHOR_MATCHES = ("exact", "allowlisted")
+
+
+def rebase_anchor(
+    state: dict[str, Any],
+    slug: str,
+    source_head: str,
+    payload_tree: str,
+    *,
+    match: str = "exact",
+    now_iso: str | None = None,
+) -> dict[str, Any]:
+    """Move `slug`'s drift anchor to `source_head` without recording a publish.
+
+    For a generator pair (T-4768 PR5) the anchor is the pantheon-config sha whose
+    build reproduces the published payload tree, `exact`ly or through the
+    manifest's acceptance allowlist (`allowlisted`). published_at,
+    published_mirror_head and published_by are deliberately untouched: nothing
+    was published. The previous anchor is kept in `rebased_from` for audit.
+    """
+    _validate_slug(slug)
+    source_head = _validate_sha(source_head)
+    payload_tree = _validate_sha(payload_tree)
+    if match not in ANCHOR_MATCHES:
+        raise MirrorStateError(f"--match must be one of {', '.join(ANCHOR_MATCHES)}")
+    entry = get_pair(state, slug)
+    entry["rebased_from"] = {
+        "source_head": entry.get("source_head_at_last_publish"),
+        "at": now_iso or _now_iso(),
+        "match": match,
+    }
+    entry["source_head_at_last_publish"] = source_head
+    entry["published_payload_tree"] = payload_tree
     return entry
 
 
@@ -270,11 +340,23 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--source-head", required=True, help="SOURCE sha the mirror was built from")
     sp.add_argument("--mirror-head", default=None, help="published mirror sha (informational)")
     sp.add_argument("--by", default=None, help="publishing persona (e.g. orchestrator)")
+    sp.add_argument("--payload-tree", default=None,
+                    help="published payload tree sha (generator pairs, T-4768)")
 
     ss = sub.add_parser("record-staged", help="record a built-and-delivered bundle")
     ss.add_argument("slug")
     ss.add_argument("--source-head", required=True, help="SOURCE sha the bundle was built from")
     ss.add_argument("--bundle-path", default=None, help="path to the staged bundle (informational)")
+    ss.add_argument("--payload-tree", default=None,
+                    help="payload tree sha of the staged build (generator pairs, T-4768)")
+
+    sr = sub.add_parser("rebase-anchor",
+                        help="move a generator pair's anchor (not a publish; T-4768 PR5)")
+    sr.add_argument("slug")
+    sr.add_argument("--source-head", required=True,
+                    help="pantheon-config sha whose build reproduces the published tree")
+    sr.add_argument("--payload-tree", required=True, help="the published payload tree sha")
+    sr.add_argument("--match", default="exact", choices=ANCHOR_MATCHES)
 
     sc = sub.add_parser("clear-staged", help="clear a staged bundle (abandoned/superseded)")
     sc.add_argument("slug")
@@ -295,12 +377,20 @@ def main(argv: list[str] | None = None) -> int:
             entry = record_published(
                 state, args.slug, args.source_head,
                 mirror_head=args.mirror_head, by=args.by,
+                payload_tree=args.payload_tree,
             )
             save_state(state, path)
             print(json.dumps({args.slug: entry}, indent=2, sort_keys=True))
         elif args.cmd == "record-staged":
             entry = record_staged(
                 state, args.slug, args.source_head, bundle_path=args.bundle_path,
+                payload_tree=args.payload_tree,
+            )
+            save_state(state, path)
+            print(json.dumps({args.slug: entry}, indent=2, sort_keys=True))
+        elif args.cmd == "rebase-anchor":
+            entry = rebase_anchor(
+                state, args.slug, args.source_head, args.payload_tree, match=args.match,
             )
             save_state(state, path)
             print(json.dumps({args.slug: entry}, indent=2, sort_keys=True))

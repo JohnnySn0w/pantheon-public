@@ -30,10 +30,15 @@ def _write_ticket(
     parent_ticket: str | None = None,
     ask: str = "",
     context: str = "",
+    project_id: str | None = None,
+    nearest_intent_ref: str | None = None,
 ) -> Path:
     """Write a well-formed ticket file for tests. Local copy of
     test_ticket.py's `_write_ticket` extended with `parent_ticket` support
-    (needed for parent-chain backfill-audit tests)."""
+    (needed for parent-chain backfill-audit tests), and with `project_id` /
+    `nearest_intent_ref` (T-4090: needed for the label-remove justification
+    guard tests; both stay absent from frontmatter -- not merely null --
+    when not passed, matching every other pre-T-4090 caller unchanged)."""
     fm_lines = [
         "---",
         f"id: {tid}",
@@ -44,6 +49,10 @@ def _write_ticket(
         f"parent_ticket: {parent_ticket}" if parent_ticket else "parent_ticket: null",
         f"depends_on: [{', '.join(depends_on)}]" if depends_on else "depends_on: []",
     ]
+    if project_id is not None:
+        fm_lines.append(f"project_id: {project_id}")
+    if nearest_intent_ref is not None:
+        fm_lines.append(f"nearest_intent_ref: {nearest_intent_ref}")
     if labels:
         fm_lines.append(f"labels: [{', '.join(labels)}]")
     fm_lines.append("---")
@@ -206,6 +215,76 @@ class TestLabelRemove(_LabelTestBase):
         self.assertIn("org-065", body)
         staged_paths = self.mock_commit.call_args[0][0]
         self.assertEqual(staged_paths, [path])
+
+    def test_remove_refused_when_it_would_unjustify_project_id(self) -> None:
+        """T-4090: the label is the ONLY thing justifying this ticket's
+        project_id (no nearest_intent_ref chain) -- removing it must be
+        refused, not silently land an unjustified project_id (T-4080)."""
+        path = self._seed(
+            "T-9015", "active",
+            project_id="alpha-project", labels=["alpha-project", "concordance"],
+        )
+        with self.assertRaises(ticket.TicketError) as ctx:
+            ticket.cmd_label_remove(self._args("T-9015", ["alpha-project"]))
+        self.assertIn("T-9015", str(ctx.exception))
+        self.assertIn("alpha-project", str(ctx.exception))
+        self.mock_commit.assert_not_called()
+        fields, _body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields["labels"], ["alpha-project", "concordance"])
+
+    def test_remove_allowed_when_project_id_remains_justified(self) -> None:
+        """Companion true-negative: project_id is justified via a
+        ticket:-chain hop to a same-project parent, not via the label being
+        removed -- removal must succeed normally."""
+        self._seed("T-9016", "active", project_id="alpha-project", labels=["alpha-project"])
+        path = self._seed(
+            "T-9017", "active",
+            project_id="alpha-project", nearest_intent_ref="ticket:T-9016",
+            labels=["concordance"],
+        )
+        rc = ticket.cmd_label_remove(self._args("T-9017", ["concordance"]))
+        self.assertEqual(rc, 0)
+        self.mock_commit.assert_called_once()
+        fields, _body = ticket.parse_front_matter(path.read_text(encoding="utf-8"))
+        self.assertEqual(fields.get("labels"), [])
+
+
+class TestRefuseIfLabelRemovalUnjustifiesProject(_LabelTestBase):
+    """T-4090 REBOUND-1 finding 1: unit coverage for the helper itself,
+    called directly rather than through `cmd_label_remove` -- that command
+    independently refuses ALL label removals on `done/` tickets before this
+    guard is ever reached (a separate, pre-existing check), so the
+    done-state early return promised by this helper's docstring can only be
+    observed by exercising the helper in isolation."""
+
+    def test_done_state_exempt_from_project_id_justification_refusal(self) -> None:
+        """(a) A done-state candidate that would otherwise leave project_id
+        unjustified must NOT raise -- mirrors ticket_purpose.py's
+        validate_intent_link done-state exemption ("historic closure remains
+        readable and quiet")."""
+        new_fields = {
+            "project_id": "alpha-project",
+            "labels": ["concordance"],  # the justifying label already gone
+            "nearest_intent_ref": None,
+            "state": "done",
+        }
+        # Must not raise.
+        ticket._refuse_if_label_removal_unjustifies_project("T-9018", new_fields)
+
+    def test_non_done_state_still_refuses(self) -> None:
+        """(b) Companion true-negative: the identical shape on a non-done
+        ticket still refuses -- the done-state early return must not widen
+        beyond `state == "done"`."""
+        new_fields = {
+            "project_id": "alpha-project",
+            "labels": ["concordance"],
+            "nearest_intent_ref": None,
+            "state": "active",
+        }
+        with self.assertRaises(ticket.TicketError) as ctx:
+            ticket._refuse_if_label_removal_unjustifies_project("T-9019", new_fields)
+        self.assertIn("T-9019", str(ctx.exception))
+        self.assertIn("alpha-project", str(ctx.exception))
 
 
 class TestLabelList(_LabelTestBase):

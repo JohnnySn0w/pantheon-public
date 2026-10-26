@@ -79,11 +79,18 @@ Subagents don't see the dispatcher's conversation. Every dispatch brief MUST inc
 - **Scope:** specific files / specific question / specific ticket id
 - **Context:** why this work exists; cross-references to related tickets; concrete failure-evidence
 - **Constraints:** what NOT to touch (hand-curated docs, orthogonal areas, scope creep)
+- **Delegation invariants:** local authority boundaries, sensitive operations that require stop/escalation, and independent verification requirements
 - **Acceptance bar:** what "done" looks like; D11 wet-run gates if applicable
 - **DECISIONS requirement:** every non-obvious call must justifies-via P/D-id (per chain-of-justification rule in `~/CLAUDE.md`)
 - **Plan-first directive** (D6): return plan as first message; await HO approval; no code before approval
 - **HERMES byte-sequence escape rule:** in any prose referencing the trigger, escape the period (`HERMES\.md`)
 - **5-phase signatures-first sequence** (msg_2371; ratified 2026-05-26): plan → signatures+docstrings → tests → code → smoke+wet-run+ship. Surface phases in the report even if collapsed inline for small changes.
+
+Delegation invariant checklist, kept short:
+
+- **Authority boundary:** what the worker may decide/do, what must return to the dispatcher or operator, and which repos/accounts/surfaces are off limits.
+- **Sensitive operations:** spend, secrets/credentials, access grants, external messages, live-service changes, destructive operations, and cross-seat actions are stop-and-report unless the brief explicitly authorizes them.
+- **Independent verification:** material claims and externally visible effects need fresh evidence gathered by the worker; if not independently verified, label the gap instead of passing it upward as fact.
 
 For parallel dispatches: each brief is independently self-contained. Don't cross-reference between dispatches' briefs — the subagents can't see each other.
 

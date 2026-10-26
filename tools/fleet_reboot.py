@@ -54,6 +54,10 @@ try:
     import fleet_health
 except Exception:  # noqa: BLE001
     fleet_health = None
+try:
+    import agent_role_map
+except Exception:  # noqa: BLE001
+    agent_role_map = None
 
 # Repo root (this file lives in <repo>/tools/). handoff_and_restart.sh is its sibling.
 import os
@@ -125,13 +129,30 @@ def _run(argv: list[str], *, timeout: int = 900) -> tuple[int | None, str]:
         return None, f"{type(e).__name__}: {e}"
 
 
+def _restart_identity(agent: str, cfg: dict) -> tuple[str, str]:
+    """(service, supervisor) for the handoff-pause call (T-4159).
+
+    Resolved from instance.yaml via agent_role_map.restart_target, so a seat that
+    moved to the control plane (specialist; recovery/orchestrator after T-3650) is named by its
+    persona-consume unit with --supervisor control-plane, not by the retired
+    bespoke unit left in FLEET below. --no-restart stops before the restart step,
+    so this only fixes what the pause records and validates; the static entry is
+    the fallback when resolution fails."""
+    try:
+        target = agent_role_map.restart_target(agent)
+        return target["service"], target["supervisor"]
+    except Exception:  # noqa: BLE001 - agent_role_map absent or persona unbound
+        return cfg["service"], "bespoke"
+
+
 def quiesce_handoff_pause(agent: str, cfg: dict, *, run=_run, dry_run: bool) -> dict:
     """Cross-account `handoff_and_restart.sh --no-restart` for a claude agent."""
+    service, supervisor = _restart_identity(agent, cfg)
     inner = (
         f"XDG_RUNTIME_DIR=/run/user/$(id -u) {_HANDOFF_SCRIPT} "
-        f"--service {cfg['service']} --mode {cfg['mode']} "
+        f"--service {service} --mode {cfg['mode']} "
         f"--target-pane {cfg['pane']} --handoff-file {cfg['handoff_file']} "
-        f"--no-restart"
+        f"--supervisor {supervisor} --no-restart"
     )
     argv = ["sudo", "-n", "-u", cfg["user"], "bash", "-lc", inner]
     if dry_run:
@@ -175,17 +196,24 @@ def quiesce_driver(agent: str, cfg: dict, *, chronicle_archive, dry_run: bool) -
 
 
 def chronicle_archive_handoff(handoff_file: str, *, run=_run) -> tuple[bool, str]:
-    """Best-effort Chronicle archive of a handoff (Recovery's own clone). Non-fatal."""
-    script = os.path.join(_TOOLS_DIR, "chronicle.py")
-    home = os.path.expanduser("~")
+    """Best-effort Chronicle archive of a handoff (Recovery's own clone). Non-fatal.
+
+    T-5016: through the session-end duty, not chronicle.py directly. The session
+    is not ending yet (the reboot ends it), so the record is written now and its
+    pane log is attached by the controller's first start after the reboot, under
+    the same session claim: one record, not a fleet_reboot entry plus a second
+    one at the next start."""
+    script = os.path.join(_TOOLS_DIR, "session_chronicle.py")
     argv = [
-        "python3", script, "archive",
+        "python3", script, "session-end",
         "--handoff-file", handoff_file,
-        "--reason", "fleet_reboot",
-        "--projects-dir", os.path.join(home, ".claude", "projects"),
+        "--cause", "fleet-reboot",
+        "--defer-pane-log", "--certain",
+        "--entrypoint", "fleet_reboot",
     ]
     rc, out = run(argv)
-    return (rc == 0), out.strip()[-300:]
+    ok = rc == 0 and '"status": "ok"' in (out or "")
+    return ok, out.strip()[-300:]
 
 
 def trigger_reboot(*, run=_run, dry_run: bool) -> dict:

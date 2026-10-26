@@ -3,16 +3,21 @@
 from __future__ import annotations
 
 import atexit
+import contextlib
 import dataclasses
 import base64
 import functools
 import hashlib
+import io
 import json
 import os
+import pwd
+import re
 import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -23,12 +28,13 @@ from unittest.mock import patch
 import yaml
 
 from tools import codex_telegram_bridge
+from tools import agent_role_map as _arm
+from tools import persona_installer as _pim
 from tools import runtime_controller as rc
 from tools import t2611_recovery_persona_apply as persona_apply
 from tools.agent_role_map import instance_binding, resolve_instance_role
 from tools.persona_bringup import (
     load_binding,
-    quota_check_personas,
     quota_check_supported,
 )
 from tools.persona_installer import (
@@ -76,9 +82,68 @@ from tools.persona_installer import (
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def _fixture_hub(root: Path) -> Path:
+    """The mailbox hub inside a fixture root, derived from instance.yaml (T-2693:
+    fixtures that hardcoded /home/the-ancestor/mailbox broke on the hub move)."""
+    return root / _arm.mailbox_hub().lstrip("/")
+
+
 R10_ORCHESTRATOR_CODEX_COMMIT = "f803cddfe27d4d1b9b5fd9c547ef33de0a8186c6"
 R10_ORCHESTRATOR_CODEX_SHA256 = "36f0d5eb9ff0bcd6396bd82e658fa68fd49d46b1d7415186943a357a865cc688"
 TEST_INVOCATION_ID = "a" * 32
+
+
+_UNSET = object()
+
+
+def _with_roots(context, *roots):
+    """An ExecutionContext carrying allowed roots (T-4837), for tests that call a
+    LocalHostBackend directly instead of going through PersonaInstaller.apply."""
+    return dataclasses.replace(context, allowed_roots=tuple(str(item) for item in roots))
+
+
+class ManifestPinnedInstaller(PersonaInstaller):
+    """Test fixture (T-4837): a PersonaInstaller that remembers the manifest of
+    its most recent ``plan()`` call and supplies it to apply/stage_disabled/
+    activate_staged unless a test passes ``manifest=`` explicitly (including
+    ``manifest=None``, which the gate must refuse). Production code has no such
+    default: callers must hand the trusted manifest in."""
+
+    _last_manifest = None
+
+    def plan(self, manifest, *args, **kwargs):
+        self._last_manifest = manifest
+        built = super().plan(manifest, *args, **kwargs)
+        self.__dict__.setdefault("_plans_by_digest", {})[built.digest] = built
+        return built
+
+    def rollback(self, receipt, *args, plan=_UNSET, manifest=_UNSET, **kwargs):
+        # T-4848: rollback needs the receipt's plan; look it up by digest.
+        if plan is _UNSET:
+            plan = self.__dict__.get("_plans_by_digest", {}).get(receipt.plan_digest)
+        return super().rollback(receipt, *args, plan=plan, manifest=self._pin(manifest), **kwargs)
+
+    def _pin(self, manifest):
+        return self._last_manifest if manifest is _UNSET else manifest
+
+    def apply(self, *args, manifest=_UNSET, **kwargs):
+        return super().apply(*args, manifest=self._pin(manifest), **kwargs)
+
+    def stage_disabled(self, *args, manifest=_UNSET, **kwargs):
+        return super().stage_disabled(*args, manifest=self._pin(manifest), **kwargs)
+
+    def activate_staged(self, *args, manifest=_UNSET, **kwargs):
+        return super().activate_staged(*args, manifest=self._pin(manifest), **kwargs)
+
+
+def _is_periodic_seat_timer(unit: str) -> bool:
+    try:
+        _pim._seat_timer_template_unit(unit)
+    except OperationFailed:
+        return False
+    return not unit.startswith("pantheon-persona-consume@")
 
 
 class LocalHostStageBackend(LocalHostBackend):
@@ -88,6 +153,9 @@ class LocalHostStageBackend(LocalHostBackend):
         self.timeouts: list[tuple[tuple[str, ...], float | None]] = []
         self.stale_unit_show_sequence: list[str] = []
         self.stale_unit_show_count = 0
+        # T-5471: the dry-run preflight now reads the unit too, so the scripted stale
+        # state advances on a SUCCESSFUL reset-failed (a state machine), not per read.
+        self.stale_unit_reset_count = 0
         self.service_show_sequence: list[str] = []
         self.service_show_count = 0
         self.mcp_add_calls: list[tuple[list[str], str]] = []
@@ -140,16 +208,38 @@ class LocalHostStageBackend(LocalHostBackend):
         path.write_text(json.dumps(document), encoding="utf-8")
         return subprocess.CompletedProcess(["claude"], 0, "removed", "")
 
+    def _unit_fire_bootstrap_blocker(self, operation):  # type: ignore[override]
+        """T-5471: these fixtures model a ready host (no maintenance, trust set, no residue);
+        the real gates are exercised in test_persona_installer_converge."""
+        return None
+
+    def _bootstrap_fire_pending(self, timer):  # type: ignore[override]
+        """T-5473: these fixtures pre-seed the fire's own output (the viability receipt dir) before
+        activation, so the residue quarantine must not run against them; it is exercised for real
+        in test_persona_installer_phase_q."""
+        return False
+
     def _run(self, argv, *, timeout=None):  # type: ignore[override]
         command = tuple(str(item) for item in argv)
         self.commands.append(command)
         self.timeouts.append((command, timeout))
+        if command[:3] == ("systemctl", "--user", "reset-failed") and command[3:4] and command[3].startswith(
+            "pantheon-persona-consume@"
+        ):
+            self.stale_unit_reset_count += 1
         if command[:4] == ("systemctl", "--user", "show", "codex-telegram-poller.service"):
             return subprocess.CompletedProcess(command, 0, "ActiveState=inactive\nMainPID=0\n", "")
         if (
             command[:4] == ("systemctl", "--user", "show", "pantheon-persona-consume@orchestrator.timer")
             or command[:4] == ("systemctl", "--user", "show", "pantheon-persona-consume@recovery.timer")
         ):
+            properties = set(command[4:])
+            if "NextElapseUSecRealtime" in properties or "NextElapseUSecMonotonic" in properties:
+                return subprocess.CompletedProcess(command, 0, "ActiveState=active\nSubState=waiting\nNextElapseUSecRealtime=Sat 2026-08-15 04:00:00 UTC\nNextElapseUSecMonotonic=12345\n", "")
+            return subprocess.CompletedProcess(command, 0, "LoadState=loaded\nUnitFileState=disabled\nActiveState=inactive\nSubState=dead\n", "")
+        if command[:3] == ("systemctl", "--user", "show") and len(command) > 3 and _is_periodic_seat_timer(command[3]):
+            # T-5447: the seat-core periodic timers (quota, inbox-consumer, keep-going,
+            # mailbox-wake, restart-drain): loaded + disabled, then armed + waiting.
             properties = set(command[4:])
             if "NextElapseUSecRealtime" in properties or "NextElapseUSecMonotonic" in properties:
                 return subprocess.CompletedProcess(command, 0, "ActiveState=active\nSubState=waiting\nNextElapseUSecRealtime=Sat 2026-08-15 04:00:00 UTC\nNextElapseUSecMonotonic=12345\n", "")
@@ -163,7 +253,7 @@ class LocalHostStageBackend(LocalHostBackend):
                 return subprocess.CompletedProcess(command, 0, "LoadState=not-found\nUnitFileState=not-found\nActiveState=inactive\nSubState=dead\n", "")
             if "LoadState" in properties:
                 if self.stale_unit_show_sequence:
-                    index = min(self.stale_unit_show_count, len(self.stale_unit_show_sequence) - 1)
+                    index = min(self.stale_unit_reset_count, len(self.stale_unit_show_sequence) - 1)
                     self.stale_unit_show_count += 1
                     return subprocess.CompletedProcess(command, 0, self.stale_unit_show_sequence[index], "")
                 self.stale_unit_show_count += 1
@@ -183,6 +273,15 @@ class LocalHostStageBackend(LocalHostBackend):
                 return subprocess.CompletedProcess(command, 0, f"InvocationID={TEST_INVOCATION_ID}\n", "")
             if "ActiveState" in properties and "Result" in properties and "ExecMainStatus" in properties:
                 return subprocess.CompletedProcess(command, 0, "ActiveState=inactive\nResult=success\nExecMainStatus=0\n", "")
+        if command[:3] == ("systemctl", "--user", "show") and len(command) > 3 and command[3].startswith(
+            "pantheon-runtime-controller@"
+        ):
+            # T-5448: loaded + disabled, then (observe) active/running, stable pid, 0 restarts.
+            if "NRestarts" in set(command[4:]):
+                return subprocess.CompletedProcess(
+                    command, 0, "ActiveState=active\nSubState=running\nMainPID=4242\nNRestarts=0\n", ""
+                )
+            return subprocess.CompletedProcess(command, 0, "LoadState=loaded\nUnitFileState=disabled\nActiveState=inactive\nSubState=dead\n", "")
         if command[:3] == ("systemctl", "--user", "show-environment"):
             return subprocess.CompletedProcess(command, 0, "PATH=/usr/bin\n", "")
         if command[:3] == ("systemctl", "--user", "is-enabled"):
@@ -196,6 +295,12 @@ class LocalHostStageBackend(LocalHostBackend):
         if len(command) >= 4 and command[0] == "git" and command[2] == "cat-file":
             return subprocess.CompletedProcess(command, 0, "", "")
         return subprocess.CompletedProcess(command, 0, "", "")
+
+    def _observe_sleep(self, seconds):  # type: ignore[override]
+        return None
+
+    def _controller_viability(self, operation):  # type: ignore[override]
+        return {"initial_viability_selected": operation.desired["expect_selected"], "initial_viability_ok": "true"}
 
     def preflight(self, operation) -> PreflightResult:  # type: ignore[override]
         if operation.kind == "harness-check":
@@ -397,6 +502,28 @@ class LegacyConvergedTimerBackend(LocalHostStageBackend):
         return None
 
 
+def _seed_shell_box(account_home: Path) -> None:
+    """T-5454: the seat clone's shell-box wrapper, an operator prerequisite. The local
+    backend refuses to point CLAUDE_CODE_SHELL_PREFIX at a wrapper it cannot exec."""
+    script = account_home / "pantheon-config" / "tools" / "oom" / "pantheon-shell-box.sh"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("#!/bin/sh\n", encoding="utf-8")
+    script.chmod(0o755)
+
+
+def assert_sim_host_restored(case: unittest.TestCase, backend: Any) -> None:
+    """After a rollback the simulated host holds nothing except T-5454's settings.json:
+    the shell-box op edits that file in place, so rollback removes only its own env key
+    and leaves the file and an (empty) env object (it never deletes a file it created)."""
+    rest = {}
+    for target, entry in backend.entries.items():
+        if target.endswith("/.claude/settings.json"):
+            case.assertEqual(json.loads(base64.b64decode(entry["content_b64"])), {"env": {}})
+        else:
+            rest[target] = entry
+    case.assertEqual(rest, {})
+
+
 def _manifest_dict(*, second_persona: bool = False) -> dict:
     roles: dict[str, dict] = {
         "recovery": {
@@ -406,8 +533,8 @@ def _manifest_dict(*, second_persona: bool = False) -> dict:
         }
     }
     if second_persona:
-        roles["peer-daemon-cairn"] = {
-            "persona": "cairn",
+        roles["peer-daemon-consultant"] = {
+            "persona": "consultant",
             "account": "codex",
             "harness": "codex",
         }
@@ -448,79 +575,64 @@ def _manifest_dict(*, second_persona: bool = False) -> dict:
     }
 
 
-_CODEX_CONFIG_FIXTURE_REPO_URL = "https://github.com/example-org/codex-config.git"
 _codex_config_fixture_root: str | None = None
 
 
+def _materialize_pinned_codex_config(target: str) -> None:
+    """Make ``target`` a git repository checked out at the bridge pin, fetched
+    from THIS repo's history (T-4763).
+
+    ORG-091 C1 (T-4755) imported codex-config into harness/codex/ with its
+    history. Since T-4790 (C4b-3) the pin is a pantheon-config commit whose
+    harness/codex tree holds the deploy paths, so only that one commit is
+    fetched (--depth 1: the pin's history would be all of pantheon-config).
+    Needs the pin object in this checkout (CI uses fetch-depth 0); a shallow
+    clone without it fails loudly instead of skipping."""
+    enclosing = subprocess.run(
+        ("git", "-C", str(REPO_ROOT), "rev-parse", "--show-toplevel"),
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    pin = codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_REVISION
+    for argv in (
+        ("git", "init", "--quiet", target),
+        ("git", "-C", target, "fetch", "--quiet", "--no-tags", "--depth", "1", enclosing,
+         f"{pin}:refs/tags/codex-config-pin"),
+        ("git", "-C", target, "-c", "advice.detachedHead=false", "checkout", "--quiet",
+         "--detach", "refs/tags/codex-config-pin"),
+    ):
+        result = subprocess.run(argv, capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"T-4763 codex-config fixture: {' '.join(argv[:4])} failed: "
+                f"{(result.stderr or result.stdout).strip()}"
+            )
+
+
 def _ensure_codex_config_fixture() -> str:
-    """Lazily clone codex-config into a per-process /tmp dir on first use
-    (memoized — one clone serves every ``InstallerCase`` method that needs
-    it) so codex-telegram-bridge tests can read the pinned source content
-    without needing UID=codex's cross-partition /home/codex/codex-config
-    access (T-3109; retires the T-3563 slice A / T-3547 skip guards this
-    replaced). Lazy rather than a ``setUpModule`` eager clone so a clone
-    failure (e.g. no network) only fails the tests that opted in via
-    ``_with_codex_config_fixture``, not all 153 tests in this module.
+    """Lazily materialize codex-config at the bridge pin into a per-process
+    /tmp repo on first use (memoized: one repo serves every ``InstallerCase``
+    method that needs it), so codex-telegram-bridge tests can read the pinned
+    source content without UID=codex's /home/codex/codex-config (T-3109).
 
-    Full clone, not ``--depth=1``: the pinned revision
-    (``codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_REVISION``) is often
-    behind the default branch's current HEAD, so a shallow clone of only
-    the latest commit does not contain it — verified empirically
-    2026-09-10 (``git rev-parse <pin>^{commit}`` fails against a
-    ``--depth=1`` clone of that date's HEAD). A full clone is still small
-    (~1.3MB) and fast (<1s).
-
-    T-3613: if ``CODEX_CONFIG_READ_PAT`` is set (the CI runner's Actions
-    secret, a fine-grained read-only PAT on example-org/codex-config), the
-    clone URL is built as ``https://x-access-token:<PAT>@github.com/...``
-    (GitHub's documented PAT-over-HTTPS-basic-auth shape) instead of the
-    unauth URL that resolves via ``gh auth git-credential`` on dev seats.
-    With the PAT wired, a clone failure is a real infrastructure problem —
-    raise ``RuntimeError`` (fail loudly) rather than degrading to SKIP. The
-    PAT-unset path is unchanged from T-3109: SKIP on clone failure, since
-    that's still legitimate for unauth CI and a fresh dev clone without
-    ``gh auth`` set up yet."""
+    T-4763: the source is this repo's own history (see
+    ``_materialize_pinned_codex_config``), not a clone of the private
+    codex-config repo, so the T-3613 read-PAT clone path and
+    the T-3109/T-4123 unauth SKIP are gone: the ~48 opted-in tests always run.
+    A failure is a broken checkout and raises; the mkdtemp'd dir is removed on
+    that path (T-4123: the atexit rmtree does not fire in pytest -n auto
+    workers), and nothing is memoized, so the next caller retries."""
     global _codex_config_fixture_root
     if _codex_config_fixture_root is None:
         target = tempfile.mkdtemp(prefix="pantheon-codex-config-fixture-")
         # Belt-and-braces cleanup (also removed in tearDownModule; rmtree here
         # keeps the tempfile-hygiene lint's scope-local cleanup-signal check
-        # happy and covers the case where the module tear-down never runs, e.g.
-        # if the process exits before this fixture is used again).
+        # happy and covers the case where the module tear-down never runs).
         atexit.register(shutil.rmtree, target, ignore_errors=True)
-        pat = os.environ.get("CODEX_CONFIG_READ_PAT")
-        clone_url = (
-            f"https://x-access-token:{pat}@github.com/example-org/codex-config.git"
-            if pat
-            else _CODEX_CONFIG_FIXTURE_REPO_URL
-        )
-        result = subprocess.run(
-            ("git", "clone", clone_url, target),
-            capture_output=True,
-            text=True,
-        )
-        if result.returncode != 0:
-            error_text = (result.stderr or result.stdout).strip()
-            if pat:
-                # Belt-and-braces: current git versions don't echo credentials
-                # in `fatal:` text, but never surface the raw token in a
-                # RuntimeError message / CI log regardless of git's behavior.
-                error_text = error_text.replace(pat, "<redacted>")
-                raise RuntimeError(
-                    "T-3613 codex-config fixture clone failed despite "
-                    f"CODEX_CONFIG_READ_PAT being set: {error_text}"
-                )
-            # T-3109: codex-config is a PRIVATE repo — a seat without an
-            # authenticated gh CLI, a cross-repo PAT in the git credential
-            # helper, or CODEX_CONFIG_READ_PAT hits "could not read Username
-            # for 'https://github.com'". Degrade to SKIP rather than FAIL:
-            # this is still best-effort on an unauth seat (unauth CI without
-            # the T-3613 secret wired, or a fresh dev clone before `gh auth`
-            # is set up) — the pre-T-3109 behaviour was skip-when-unreachable
-            # and this preserves that for the unauth case.
-            raise unittest.SkipTest(
-                f"T-3109 codex-config fixture clone unreachable: {error_text}"
-            )
+        try:
+            _materialize_pinned_codex_config(target)
+        except BaseException:
+            shutil.rmtree(target, ignore_errors=True)
+            raise
         _codex_config_fixture_root = target
     return _codex_config_fixture_root
 
@@ -541,7 +653,7 @@ def _with_codex_config_fixture(test_method):
     (a plain mutable dict nested inside the frozen ``Manifest`` dataclass —
     safe to rewrite in place, never reassigning the frozen field itself)
     rewritten to the /tmp clone from ``_ensure_codex_config_fixture``
-    instead of the production ``/home/codex/codex-config`` path.
+    instead of the production ``/home/codex/pantheon-config`` path (T-4770).
 
     Scoped per-test rather than class- or module-wide so tests that assert
     on the literal prod path in a *planned* payload (e.g.
@@ -571,87 +683,66 @@ def _with_codex_config_fixture(test_method):
     return wrapper
 
 
-class CodexConfigFixturePatCase(unittest.TestCase):
-    """T-3613: ``_ensure_codex_config_fixture``'s ``CODEX_CONFIG_READ_PAT``
-    branch — clone-URL shape, RuntimeError-vs-SkipTest error-type selection,
-    and the token-leak guard. Lives near the helper (not inside
-    ``InstallerCase``, which is ~4000 lines and consumes this fixture only
-    indirectly via ``@_with_codex_config_fixture``) so a reviewer checking
-    this helper's own behavior doesn't have to search the whole file.
-
-    Mocks ``subprocess.run`` — no real network clone. Real ``tempfile.mkdtemp``
-    is used (cheap; the existing ``atexit.register`` cleanup in the function
-    under test already handles hygiene on both the pass and fail paths, so no
-    extra per-test cleanup is needed here). setUp/tearDown save+restore the
-    module's memoized ``_codex_config_fixture_root`` global so this class
-    doesn't collide with the ~48 ``@_with_codex_config_fixture``-decorated
-    tests elsewhere in this module that populate it for real."""
+class CodexConfigFixtureCase(unittest.TestCase):
+    """T-4763: ``_ensure_codex_config_fixture`` materializes codex-config at the
+    bridge pin from this repo's history, with no credential and no skip path.
+    setUp/tearDown save+restore the memoized global so this class does not
+    collide with the ~48 ``@_with_codex_config_fixture`` tests."""
 
     def setUp(self) -> None:
         module = sys.modules[__name__]
         self._saved_fixture_root = module._codex_config_fixture_root
         module._codex_config_fixture_root = None
-        self._env_patch = patch.dict(os.environ, {}, clear=False)
-        self._env_patch.start()
-        os.environ.pop("CODEX_CONFIG_READ_PAT", None)
 
     def tearDown(self) -> None:
-        self._env_patch.stop()
         module = sys.modules[__name__]
+        if module._codex_config_fixture_root not in (None, self._saved_fixture_root):
+            shutil.rmtree(module._codex_config_fixture_root, ignore_errors=True)
         module._codex_config_fixture_root = self._saved_fixture_root
 
-    def test_pat_set_success_builds_authenticated_clone_url(self) -> None:
-        os.environ["CODEX_CONFIG_READ_PAT"] = "test-pat-value-abc123"
-        with patch("tools.test_persona_installer.subprocess.run") as mock_run:
-            mock_run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
-            result = _ensure_codex_config_fixture()
-        clone_url = mock_run.call_args[0][0][2]
-        self.assertEqual(
-            clone_url,
-            "https://x-access-token:test-pat-value-abc123@github.com/example-org/codex-config.git",
+    def test_fixture_is_a_checkout_at_the_pin_holding_the_source_paths(self) -> None:
+        root = _ensure_codex_config_fixture()
+        self.assertIs(root, _ensure_codex_config_fixture())  # memoized
+        head = subprocess.run(("git", "-C", root, "rev-parse", "HEAD"),
+                              capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(head, codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_REVISION)
+        # The bridge's own pin check accepts it as a source repo (T-4770 removed the
+        # dead HEAD-equals-pin check; the object check is the one the bridge uses).
+        codex_telegram_bridge.verify_git_object_at_pin(
+            Path(root),
+            codex_telegram_bridge.CodexTelegramSource(
+                codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_REPO,
+                codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_REVISION,
+                codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_PATHS,
+                dict(codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_SHA256),
+            ),
         )
-        self.assertTrue(result)
-
-    def test_pat_unset_success_uses_unauth_url(self) -> None:
-        with patch("tools.test_persona_installer.subprocess.run") as mock_run:
-            mock_run.return_value = SimpleNamespace(returncode=0, stdout="", stderr="")
-            _ensure_codex_config_fixture()
-        clone_url = mock_run.call_args[0][0][2]
-        self.assertEqual(clone_url, _CODEX_CONFIG_FIXTURE_REPO_URL)
-
-    def test_pat_unset_failure_raises_skiptest(self) -> None:
-        with patch("tools.test_persona_installer.subprocess.run") as mock_run:
-            mock_run.return_value = SimpleNamespace(
-                returncode=1, stdout="", stderr="could not read Username for 'https://github.com'"
+        for relative in codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_PATHS:
+            self.assertTrue(
+                (Path(root) / codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_SUBDIR / relative).is_file(),
+                relative,
             )
-            with self.assertRaises(unittest.SkipTest):
-                _ensure_codex_config_fixture()
 
-    def test_pat_set_failure_raises_runtimeerror(self) -> None:
-        os.environ["CODEX_CONFIG_READ_PAT"] = "test-pat-value-abc123"
-        with patch("tools.test_persona_installer.subprocess.run") as mock_run:
-            mock_run.return_value = SimpleNamespace(
-                returncode=1, stdout="", stderr="fatal: repository not found"
-            )
-            with self.assertRaises(RuntimeError):
-                _ensure_codex_config_fixture()
-
-    def test_pat_set_failure_does_not_leak_token(self) -> None:
-        pat = "ghp_topsecrettoken1234567890"
-        os.environ["CODEX_CONFIG_READ_PAT"] = pat
-        with patch("tools.test_persona_installer.subprocess.run") as mock_run:
-            # Worst case: git's fatal text echoes the failed URL verbatim,
-            # which would embed the token if we didn't scrub it.
-            mock_run.return_value = SimpleNamespace(
-                returncode=1,
-                stdout="",
-                stderr=f"fatal: could not clone https://x-access-token:{pat}@github.com/example-org/codex-config.git",
-            )
+    def test_failure_raises_and_removes_the_mkdtemp_dir(self) -> None:
+        target = tempfile.mkdtemp(prefix="pantheon-codex-config-fixture-")
+        self.addCleanup(shutil.rmtree, target, ignore_errors=True)
+        with patch("tools.test_persona_installer.tempfile.mkdtemp", return_value=target), \
+             patch("tools.test_persona_installer.subprocess.run") as mock_run:
+            mock_run.side_effect = [
+                SimpleNamespace(returncode=0, stdout=str(REPO_ROOT) + "\n", stderr=""),
+                SimpleNamespace(returncode=128, stdout="", stderr="fatal: bad object"),
+            ]
             with self.assertRaises(RuntimeError) as ctx:
                 _ensure_codex_config_fixture()
-        message = str(ctx.exception)
-        self.assertNotIn(pat, message)
-        self.assertIn("<redacted>", message)
+        self.assertIn("bad object", str(ctx.exception))
+        self.assertFalse(os.path.isdir(target), "a failed materialize must not leak its dir")
+        self.assertIsNone(sys.modules[__name__]._codex_config_fixture_root)
+
+    def test_no_credential_or_private_clone_path_remains(self) -> None:
+        src = Path(__file__).read_text(encoding="utf-8")
+        pat_name = "CODEX_CONFIG" + "_READ_PAT"
+        self.assertNotIn(pat_name, src)
+        self.assertNotIn("github.com/" + "example-org/codex-config", src)
 
 
 class InstallerCase(unittest.TestCase):
@@ -661,7 +752,7 @@ class InstallerCase(unittest.TestCase):
         self.manifest_path = self.root / "instance.yaml"
         self.write_manifest(_manifest_dict(second_persona=True))
         self.manifest = Manifest.load(self.manifest_path)
-        self.installer = PersonaInstaller(REPO_ROOT)
+        self.installer = ManifestPinnedInstaller(REPO_ROOT)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -677,12 +768,13 @@ class InstallerCase(unittest.TestCase):
         data["persona_installer"]["codex_telegram_bridge"] = {
             "schema": "pantheon-codex-telegram-bridge/v1",
             "source": {
-                "repo": "codex-config",
+                "repo": "pantheon-config",
                 "revision": codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_REVISION,
+                "subdir": codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_SUBDIR,
                 "paths": list(codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_PATHS),
                 "sha256": dict(codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_SHA256),
             },
-            "operator_chat_id": 456474197,
+            "operator_chat_id": 424242424,
             "personas": {
                 "specialist": {
                     "account": "claude-research",
@@ -785,7 +877,7 @@ approval_mode = "approve"
             capabilities = frozenset()
         return ActorContext(
             uid=1000,
-            persona="cairn",
+            persona="consultant",
             role="installer",
             instance=plan.instance,
             capabilities=capabilities,
@@ -805,11 +897,12 @@ approval_mode = "approve"
         root = self.root / name
         account_home = root / "home" / "claude"
         account_home.mkdir(parents=True)
+        _seed_shell_box(account_home)
         (account_home / ".local" / "lib").mkdir(parents=True)
         (account_home / "CLAUDE.md").write_text("Orchestrator brief fixture\n", encoding="utf-8")
         for mailbox_persona in ("orchestrator", "codex"):
             for subdir in ("tmp", "new", "cur"):
-                (root / "home" / "the-ancestor" / "mailbox" / mailbox_persona / subdir).mkdir(parents=True)
+                (_fixture_hub(root) / mailbox_persona / subdir).mkdir(parents=True)
         manifest = Manifest.load(REPO_ROOT / "instance.yaml")
         plan = self.installer.plan(
             manifest,
@@ -819,12 +912,13 @@ approval_mode = "approve"
         )
         archive = self.operation(plan, "codex-telegram.source-archive")
         source = codex_telegram_bridge.CodexTelegramSource(
-            "codex-config",
+            codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_REPO,
             archive.desired["revision"],
             tuple(json.loads(archive.desired["paths"])),
             dict(json.loads(archive.desired["sha256"])),
             owner_account=archive.desired.get("source_account") or None,
             source_root=Path(archive.desired["source_root"]),
+            subdir=archive.desired.get("source_subdir", ""),
         )
         codex_telegram_bridge.create_verified_source_archive(
             Path(archive.desired["source_root"]),
@@ -846,11 +940,12 @@ approval_mode = "approve"
         root = self.root / name
         account_home = root / "home" / "claude"
         account_home.mkdir(parents=True)
+        _seed_shell_box(account_home)
         (account_home / ".local" / "lib").mkdir(parents=True)
         (account_home / "CLAUDE.md").write_text("Orchestrator brief fixture\n", encoding="utf-8")
         for mailbox_persona in ("orchestrator", "codex"):
             for subdir in ("tmp", "new", "cur"):
-                (root / "home" / "the-ancestor" / "mailbox" / mailbox_persona / subdir).mkdir(parents=True)
+                (_fixture_hub(root) / mailbox_persona / subdir).mkdir(parents=True)
         manifest = Manifest.load(REPO_ROOT / "instance.yaml")
         plan = self.installer.plan(
             manifest,
@@ -1149,10 +1244,10 @@ approval_mode = "approve"
     def test_versioned_manifest_preserves_roles_consumers(self) -> None:
         manifest = Manifest.load(REPO_ROOT / "instance.yaml")
         self.assertGreaterEqual(manifest.version, 2)
-        self.assertEqual(resolve_instance_role("recovery"), "recovery")
+        self.assertEqual(resolve_instance_role("recovery"), "head-system-orchestrator")
         self.assertEqual(instance_binding("recovery")["account"], "claude-fallback")
         runtime = load_binding(REPO_ROOT / "instance.yaml", "recovery")
-        self.assertEqual(runtime.role, "recovery")
+        self.assertEqual(runtime.role, "head-system-orchestrator")
         self.assertEqual(runtime.account, "claude-fallback")
         from tools import context_fill_monitor, restart_drain, ticket
 
@@ -1162,44 +1257,43 @@ approval_mode = "approve"
         )
         self.assertEqual(
             restart_drain.DRAIN_AGENT_CONFIG["recovery"]["restart_service"],
-            # T-2684 (reverted T-3082, 2026-08-23): recovery is NOT control-
-            # plane-supervised pre-T-3026 — restart_service stays the RAW
-            # bespoke unit (T-3026 will re-derive to the consume unit once
-            # the interactive-session cutover lands).
-            "claude-telegram-fallback.service",
+            # T-3026 (2026-09-29): recovery is control-plane-supervised, so
+            # restart_service is DERIVED to the consume unit (pre-cutover,
+            # T-2684 reverted T-3082, 2026-08-23, this was the RAW bespoke
+            # claude-telegram-fallback.service).
+            "pantheon-persona-consume@recovery.service",
         )
         self.assertIn("recovery", ticket._valid_target_values())
         self.assertIn("codex", ticket._valid_target_values())
 
-    def test_quota_cadence_manifest_default_and_allowlist(self) -> None:
+    def test_quota_cadence_manifest_default_and_no_allowlist(self) -> None:
         manifest = Manifest.load(REPO_ROOT / "instance.yaml")
         quota = manifest.installer["quota_check"]
         self.assertEqual(quota["cadence_minutes"], 30)
         self.assertGreater(quota["randomized_delay_seconds"], 0)
-        self.assertEqual(
-            quota_check_personas(REPO_ROOT / "instance.yaml"),
-            frozenset({"specialist", "recovery"}),
-        )
+        self.assertNotIn("personas", quota)  # T-5446: allowlist retired
         orchestrator = load_binding(REPO_ROOT / "instance.yaml", "orchestrator")
         supported, reason = quota_check_supported(
             orchestrator,
             manifest_path=REPO_ROOT / "instance.yaml",
         )
-        self.assertFalse(supported)
-        self.assertEqual(reason, "persona-not-allowlisted")
+        self.assertTrue(supported)  # T-5446: orchestrator has a manifest fallback; no allowlist
+        self.assertEqual(reason, "supported")
 
     def test_quota_systemd_units_disabled_first_and_randomized(self) -> None:
         plan = self.plan()
         quota_timer = self.operation(plan, "quota.timer-unit")
         self.assertIn("OnUnitInactiveSec=30min", quota_timer.desired["content"])
         self.assertIn("RandomizedDelaySec=300s", quota_timer.desired["content"])
+        # Disabled-first, but the supervised manual `enable --now` must work:
+        # a template without [Install] is "static" and refuses enable (T-4729).
+        self.assertIn("[Install]\nWantedBy=timers.target", quota_timer.desired["content"])
         self.assertNotIn("timer-enable", [item.kind for item in plan.operations if item.operation_id.startswith("quota.")])
 
         raw = _manifest_dict()
         raw["persona_installer"]["quota_check"] = {
             "cadence_minutes": 17,
             "randomized_delay_seconds": 45,
-            "personas": ["specialist", "recovery"],
             "service_template": "tools/systemd/pantheon-persona-quota@.service",
             "timer_template": "tools/systemd/pantheon-persona-quota@.timer",
         }
@@ -1234,11 +1328,83 @@ approval_mode = "approve"
         self.assertEqual(disabled.desired["enabled"], "disabled")
         self.assertEqual(disabled.desired["environment_file"], "forbidden")
         payload = json.dumps(plan.to_dict(), sort_keys=True)
-        self.assertIn("/home/codex/codex-config", payload)
+        # T-4770: the bridge archive's build locator is the pantheon-config clone.
+        self.assertIn("/home/codex/pantheon-config", payload)
+        archive = self.operation(plan, "codex-telegram.source-archive")
+        self.assertEqual(archive.desired["source_root"], "/home/codex/pantheon-config")
+        self.assertEqual(archive.desired["source_subdir"], "harness/codex")
+        self.assertNotIn('"source_root": "/home/codex/codex-config"', payload)
+        rebuilt = _pim._bridge_binding_from_operation(archive).source
+        self.assertEqual(rebuilt.repo, "pantheon-config")
+        self.assertEqual(rebuilt.source_root, Path("/home/codex/pantheon-config"))
+        self.assertEqual(rebuilt.subdir, "harness/codex")
+        self.assertEqual(codex_telegram_bridge.source_repo_root(rebuilt), Path("/home/codex/pantheon-config"))
+        bad = dataclasses.replace(archive, desired={**archive.desired, "source_subdir": "../escape"})
+        with self.assertRaisesRegex(_pim.OperationFailed, "clean relative path"):
+            _pim._bridge_binding_from_operation(bad)
         self.assertIn(".claude/channels/telegram/.env", payload)
         self.assertIn(".codex/AGENTS.md", payload)
         self.assertNotIn("TELEGRAM_BOT_TOKEN", payload)
         self.assertNotIn("EnvironmentFile", unit.desired["content"])
+
+    def test_bridge_source_from_operation_carries_subdir_into_preflight_source_check(self) -> None:
+        """T-4790 (orchestrator HARD): ``_bridge_source_from_operation`` itself carries the
+        operation's source_subdir, so the preflight / execute source-check (which
+        rebuild the source without going through the binding) see the pinned
+        harness/codex prefix, and the preflight verify_archive passes on an
+        archive built from that rebuilt source."""
+        manifest = Manifest.load(REPO_ROOT / "instance.yaml")
+        plan = self.installer.plan(manifest, "orchestrator", harness_override="claude", root=self.root / "projection")
+        archive = self.operation(plan, "codex-telegram.source-archive")
+        self.assertEqual(archive.kind, "codex-telegram-source-check")
+        self.assertEqual(archive.desired["source_subdir"], "harness/codex")
+
+        source = _pim._bridge_source_from_operation(archive)
+        self.assertEqual(source.subdir, "harness/codex")
+        self.assertEqual(source.object_path("run_poller.py"), "harness/codex/run_poller.py")
+        self.assertEqual(_pim._bridge_binding_from_operation(archive).source.subdir, "harness/codex")
+
+        # Build the archive from the operation-rebuilt source, as the source-check does.
+        tar_path = self.root / "bridge-source.tar"
+        receipt = codex_telegram_bridge.create_verified_source_archive(REPO_ROOT, tar_path, source)
+        self.assertEqual(dict(receipt.file_sha256), dict(codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_SHA256))
+        self.assertEqual(
+            sorted(tarfile.open(tar_path).getnames()),
+            sorted(codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_PATHS),
+        )
+        # Hermetic (T-4790 rebound): LocalHostBackend.preflight probes the user
+        # systemd manager (`systemctl --user`) for every operation, and the CI runner
+        # has no user bus. Stub only that probe, as the stage-backend fakes in this
+        # file do; the source-check branch under test runs for real. verify_archive
+        # checks unprefixed members, so the subdir fix is discriminated by the
+        # source-level and archive assertions above and the refusals below.
+        manager_ok = patch.object(
+            LocalHostBackend,
+            "_manager_ready",
+            return_value=PreflightResult(True, "active", "test user manager reachable"),
+        )
+        rooted = dataclasses.replace(
+            archive,
+            desired={**archive.desired, "archive_path": str(tar_path)},
+            provenance={**archive.provenance, "install_root": "/"},
+            # The local backend preflights only inside the target account.
+            owner=pwd.getpwuid(os.geteuid()).pw_name,
+        )
+        with manager_ok:
+            result = LocalHostBackend().preflight(rooted)
+        self.assertTrue(result.ok, result.detail)
+        self.assertEqual(result.classification, "source-archive")
+
+        # An operation that drops the subdir is not the approved pin.
+        for subdir in ("", "harness"):
+            with self.subTest(subdir=subdir):
+                unpinned = dataclasses.replace(rooted, desired={**rooted.desired, "source_subdir": subdir})
+                with self.assertRaisesRegex(_pim.OperationFailed, "subdir is not approved"):
+                    _pim._bridge_source_from_operation(unpinned)
+                with manager_ok:
+                    refused = LocalHostBackend().preflight(unpinned)
+                self.assertFalse(refused.ok)
+                self.assertIn("subdir is not approved", refused.detail)
 
     def test_installer_brief_check_uses_resolved_persona_brief_ref_in_rooted_fixture(self) -> None:
         manifest = Manifest.load(REPO_ROOT / "instance.yaml")
@@ -1278,7 +1444,7 @@ approval_mode = "approve"
         install = self.operation(plan, "codex-standing-instructions.install")
         target_check = self.operation(plan, "codex-standing-instructions.target-check")
         override_check = self.operation(plan, "codex-standing-instructions.override-check")
-        self.assertEqual(source_check.desired["identity"], "orchestrator")
+        self.assertEqual(source_check.desired["identity"], "head-engineering-orchestrator")
         self.assertEqual(source_check.desired["source"], "pinned-rules/orchestrator-codex.md")
         self.assertEqual(
             source_check.desired["source_commit"],
@@ -1304,13 +1470,13 @@ approval_mode = "approve"
             override_target=Path("/home/claude/.codex/AGENTS.override.md"),
             override_must_be_absent=True,
             forbidden_source_paths=(Path("/home/codex/codex-config/AGENTS.md"),),
-            identity="orchestrator",
+            identity="head-engineering-orchestrator",
             canonical_source_of_truth="/home/claude/CLAUDE.md",
         )
         with self.assertRaises(ManifestError):
             _read_verified_standing_instructions(forbidden, repo_root=REPO_ROOT)
 
-    def test_orchestrator_codex_standing_instructions_pin_cairn_r10_object_and_sha(self) -> None:
+    def test_orchestrator_codex_standing_instructions_pin_consultant_r10_object_and_sha(self) -> None:
         manifest = Manifest.load(REPO_ROOT / "instance.yaml")
         reference = codex_standing_instructions_reference(manifest, "orchestrator")
         self.assertIsNotNone(reference)
@@ -1430,6 +1596,735 @@ approval_mode = "approve"
         self.assertEqual(backend.entries, {})
         self.assertEqual(backend.events, [])
 
+    # T-4803 / ORG-050 required installer gate: leakage scan of rendered output.
+    @staticmethod
+    def _fake_secrets() -> dict:
+        # Built by concatenation so no contiguous secret-shaped literal is committed.
+        return {
+            "telegram-bot-token": "1234567" + "890:" + "AAF" + "x" * 32,
+            "api-key-prefix": "gh" + "p_" + "A1b2C3d4" * 3,
+            "pem-private-key": "-----BEGIN " + "RSA PRIVATE" + " KEY-----",
+        }
+
+    def _tainted_plan(self, secret: str):
+        plan = self.plan()
+        target = next(
+            op for op in plan.operations if isinstance(op.desired.get("content"), str)
+        )
+        tainted = dataclasses.replace(
+            target,
+            desired={**target.desired, "content": target.desired["content"] + "\n# " + secret + "\n"},
+        )
+        operations = tuple(
+            tainted if op.operation_id == target.operation_id else op
+            for op in plan.operations
+        )
+        payload = {k: getattr(plan, k) for k in (
+            "schema", "manifest_version", "instance", "role", "persona", "account",
+            "configured_harness", "selected_harness", "root", "operator_actions", "provenance")}
+        return target.operation_id, _pim.InstallPlan.create(operations=operations, **payload)
+
+    def test_apply_refuses_secret_shaped_rendered_content(self) -> None:
+        for name, secret in self._fake_secrets().items():
+            with self.subTest(pattern=name):
+                op_id, plan = self._tainted_plan(secret)
+                backend = SimulatedHostBackend()
+                report = self.installer.apply(plan, plan.digest, backend, self.actor(plan))
+                self.assertEqual(report.status, "refused")
+                self.assertEqual(backend.entries, {})
+                self.assertEqual(backend.events, [])
+                message = " ".join(report.errors)
+                self.assertIn(op_id, message)
+                self.assertIn(name, message)
+                self.assertNotIn(secret, message)
+                self.assertNotIn(secret, repr(report))
+
+    def test_clean_plan_has_no_leakage_hits_and_applies(self) -> None:
+        for persona, harness in (("recovery", None), ("recovery", "codex"), ("consultant", None)):
+            plan = self.plan(persona, harness)
+            self.assertEqual(_pim._leakage_scan(plan), {})
+        self.enable_codex_telegram_bridge_manifest()
+        for persona in ("recovery", "consultant"):
+            self.assertEqual(_pim._leakage_scan(self.plan(persona, "codex")), {})
+        _, report = self.apply(self.plan())
+        self.assertIn(report.status, {"applied", "noop"})
+
+    def _plan_with_desired(self, extra):
+        plan = self.plan()
+        target = plan.operations[0]
+        patched = dataclasses.replace(target, desired={**target.desired, **extra})
+        return target.operation_id, dataclasses.replace(
+            plan, operations=(patched,) + plan.operations[1:]
+        )
+
+    def test_leakage_scan_walks_nested_structures(self) -> None:
+        secret = self._fake_secrets()["api-key-prefix"]
+        shapes = {
+            "dict-list-dict": {"outer": [{"inner": secret}]},
+            "tuple-in-dict": {"outer": {"mid": ("clean", secret)}},
+            "list-list-dict": {"outer": [[{"k": secret}]]},
+            "dict-key": {"outer": {secret: "clean"}},
+        }
+        for label, extra in shapes.items():
+            with self.subTest(shape=label):
+                op_id, plan = self._plan_with_desired(extra)
+                hits = _pim._leakage_scan(plan)
+                self.assertEqual(hits, {op_id: ("api-key-prefix",)})
+                self.assertNotIn(secret, repr(hits))
+
+    def test_leakage_scan_passes_clean_nested_data(self) -> None:
+        _, plan = self._plan_with_desired(
+            {"outer": [{"inner": ["clean", ("deeper", {"k": "v"})]}], "n": 3}
+        )
+        self.assertEqual(_pim._leakage_scan(plan), {})
+
+    # ---- ORG-050 gate 1: target-path containment -------------------------
+
+    def _plan_with_target(self, kind: str, target: str):
+        plan = self.plan()
+        victim = next(op for op in plan.operations if op.kind == kind)
+        patched = dataclasses.replace(victim, target=target)
+        operations = tuple(
+            patched if op.operation_id == victim.operation_id else op
+            for op in plan.operations
+        )
+        return victim.operation_id, _pim.InstallPlan.create(
+            operations=operations,
+            **{k: getattr(plan, k) for k in (
+                "schema", "manifest_version", "instance", "role", "persona",
+                "account", "configured_harness", "selected_harness", "root",
+                "operator_actions", "provenance")},
+        )
+
+    def test_apply_refuses_dotdot_target(self) -> None:
+        plan0 = self.plan()
+        home = next(op.target for op in plan0.operations if op.kind == "mkdir")
+        op_id, plan = self._plan_with_target("mkdir", home + "/../../etc/evil")
+        backend = SimulatedHostBackend()
+        report = self.installer.apply(plan, plan.digest, backend, self.actor(plan))
+        self.assertEqual(report.status, "refused")
+        self.assertEqual(backend.entries, {})
+        self.assertIn("target path", " ".join(report.errors))
+        self.assertIn(op_id, " ".join(report.errors))
+
+    def test_apply_refuses_out_of_root_target(self) -> None:
+        op_id, plan = self._plan_with_target("atomic-write", "/etc/cron.d/evil")
+        backend = SimulatedHostBackend()
+        report = self.installer.apply(plan, plan.digest, backend, self.actor(plan))
+        self.assertEqual(report.status, "refused")
+        self.assertEqual(backend.entries, {})
+        self.assertIn("outside allowed roots", " ".join(report.errors))
+
+    def test_apply_refuses_plan_without_declared_target_roots(self) -> None:
+        plan = self.plan()
+        provenance = {k: v for k, v in plan.provenance.items() if k != "allowed_target_roots"}
+        stripped = _pim.InstallPlan.create(
+            operations=plan.operations,
+            provenance=provenance,
+            **{k: getattr(plan, k) for k in (
+                "schema", "manifest_version", "instance", "role", "persona",
+                "account", "configured_harness", "selected_harness", "root",
+                "operator_actions")},
+        )
+        report = self.installer.apply(
+            stripped, stripped.digest, SimulatedHostBackend(), self.actor(stripped)
+        )
+        self.assertEqual(report.status, "refused")
+
+    def _plan_with_roots(self, mutate):
+        plan = self.plan()
+        roots = plan.provenance["allowed_target_roots"].split(",")
+        new_roots = mutate(roots, plan)
+        return _pim.InstallPlan.create(
+            operations=plan.operations,
+            provenance={**plan.provenance, "allowed_target_roots": ",".join(new_roots)},
+            **{k: getattr(plan, k) for k in (
+                "schema", "manifest_version", "instance", "role", "persona",
+                "account", "configured_harness", "selected_harness", "root",
+                "operator_actions")},
+        )
+
+    def test_apply_refuses_self_declared_overbroad_or_foreign_roots(self) -> None:
+        cases = {
+            "slash": lambda r, p: r + ["/"],
+            "home-parent": lambda r, p: r + [str(Path(p.root) / "home")],
+            "plan-root": lambda r, p: r + [p.root],
+            "outside-plan-root": lambda r, p: r + ["/etc"],
+            "relative": lambda r, p: r + ["home/x"],
+            "dotdot": lambda r, p: r + [p.root + "/home/../etc"],
+            "missing-home": lambda r, p: [x for x in r if not x.endswith("/home/" + p.account)],
+        }
+        for label, mutate in cases.items():
+            with self.subTest(case=label):
+                plan = self._plan_with_roots(mutate)
+                backend = SimulatedHostBackend()
+                report = self.installer.apply(plan, plan.digest, backend, self.actor(plan))
+                self.assertEqual(report.status, "refused")
+                self.assertIn("target path check", " ".join(report.errors))
+                self.assertEqual(backend.entries, {})
+
+    def test_apply_refuses_empty_or_malformed_account(self) -> None:
+        # T-4837 item 3: an empty account makes home resolve to <root>/home, so a
+        # declared <root>/home root would otherwise pass the ancestor check.
+        for account in ("", "a/b", "..", "x..y", "/etc"):
+            with self.subTest(account=account):
+                base = self.plan()
+                roots = base.provenance["allowed_target_roots"].split(",")
+                plan = _pim.InstallPlan.create(
+                    operations=base.operations,
+                    provenance={
+                        **base.provenance,
+                        "allowed_target_roots": ",".join(
+                            [str(Path(base.root) / "home" / account), roots[1]]
+                        ),
+                    },
+                    **{k: (account if k == "account" else getattr(base, k)) for k in (
+                        "schema", "manifest_version", "instance", "role", "persona",
+                        "account", "configured_harness", "selected_harness", "root",
+                        "operator_actions")},
+                )
+                backend = SimulatedHostBackend()
+                report = self.installer.apply(plan, plan.digest, backend, self.actor(plan))
+                self.assertEqual(report.status, "refused")
+                self.assertIn("plan account", " ".join(report.errors))
+                self.assertEqual(backend.entries, {})
+
+    def test_apply_refuses_none_manifest_fail_closed(self) -> None:
+        # T-4837 item 2: no trusted manifest, no apply; never skip the pin.
+        plan = self.plan()
+        for method in ("apply", "stage_disabled"):
+            with self.subTest(method=method):
+                backend = SimulatedHostBackend()
+                report = getattr(self.installer, method)(
+                    plan, plan.digest, backend, self.actor(plan), manifest=None
+                )
+                self.assertEqual(report.status, "refused")
+                self.assertIn("no trusted manifest", " ".join(report.errors))
+                self.assertEqual(backend.entries, {})
+        backend = SimulatedHostBackend()
+        report = self.installer.activate_staged(
+            plan, plan.digest, None, backend, self.actor(plan), manifest=None
+        )
+        self.assertEqual(report.status, "refused")
+        self.assertIn("no trusted manifest", " ".join(report.errors))
+
+    def test_apply_refuses_declared_roots_that_differ_from_manifest(self) -> None:
+        # Structurally valid (inside the plan root, not an ancestor of home) but
+        # not what the manifest derives: e.g. another account's home added as an extra root.
+        plan = self._plan_with_roots(
+            lambda r, p: r + [str(Path(p.root) / "home" / "someone-else")]
+        )
+        backend = SimulatedHostBackend()
+        report = self.installer.apply(plan, plan.digest, backend, self.actor(plan))
+        self.assertEqual(report.status, "refused")
+        self.assertIn("differ from the manifest-derived roots", " ".join(report.errors))
+        self.assertEqual(backend.entries, {})
+
+    def test_stored_plan_applied_against_different_manifest_is_refused(self) -> None:
+        plan = self.plan()
+        other = _manifest_dict(second_persona=True)
+        other["persona_installer"]["mailbox"]["hub"] = "/srv/other-hub"
+        self.write_manifest(other)
+        other_manifest = Manifest.load(self.manifest_path)
+        report = self.installer.apply(
+            plan, plan.digest, SimulatedHostBackend(), self.actor(plan), manifest=other_manifest
+        )
+        self.assertEqual(report.status, "refused")
+        self.assertIn("differ from the manifest-derived roots", " ".join(report.errors))
+
+    def test_apply_with_matching_manifest_still_applies(self) -> None:
+        plan = self.plan()
+        report = self.installer.apply(
+            plan, plan.digest, SimulatedHostBackend(), self.actor(plan), manifest=self.manifest
+        )
+        self.assertIn(report.status, {"applied", "noop"}, report.errors)
+
+    def _containment_op(self, target: Path, kind: str = "atomic-write"):
+        return _pim.InstallOperation(
+            operation_id="test.containment",
+            layer=0,
+            kind=kind,
+            target=str(target),
+            precondition={},
+            desired={"content": "x\n", "mode": "0644"},
+            inverse=None,
+            privilege="unprivileged",
+            owner="tester",
+            provenance={},
+        )
+
+    def test_local_backend_refuses_symlinked_dir_escaping_allowed_root(self) -> None:
+        # T-4837 item 1: lexically inside the home, really outside it.
+        home = self.root / "cont-home"
+        outside = self.root / "cont-outside"
+        home.mkdir()
+        outside.mkdir()
+        (home / "link").symlink_to(outside, target_is_directory=True)
+        context = _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, home)
+        for kind, target in (
+            ("atomic-write", home / "link" / "evil.txt"),
+            ("mkdir", home / "link" / "sub" / "evil-dir"),
+        ):
+            with self.subTest(kind=kind):
+                with self.assertRaises(OperationFailed) as caught:
+                    LocalHostBackend().execute(self._containment_op(target, kind), context)
+                self.assertIn("outside allowed roots", str(caught.exception))
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_local_backend_allows_normal_nested_path_and_final_symlink_replace(self) -> None:
+        home = self.root / "cont-ok-home"
+        (home / "a" / "b").mkdir(parents=True)
+        context = _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, home)
+        target = home / "a" / "b" / "file.txt"
+        mutation, _ = LocalHostBackend().execute(self._containment_op(target), context)
+        self.assertTrue(mutation.changed)
+        self.assertEqual(target.read_text(encoding="utf-8"), "x\n")
+        # A symlink as the FINAL component is replaced (os.replace), not followed.
+        elsewhere = self.root / "cont-elsewhere.txt"
+        elsewhere.write_text("keep\n", encoding="utf-8")
+        link = home / "a" / "link.txt"
+        link.symlink_to(elsewhere)
+        LocalHostBackend().execute(self._containment_op(link), context)
+        self.assertFalse(link.is_symlink())
+        self.assertEqual(elsewhere.read_text(encoding="utf-8"), "keep\n")
+
+    def test_local_backend_fails_closed_without_allowed_roots(self) -> None:
+        home = self.root / "cont-noroots"
+        home.mkdir()
+        with self.assertRaises(OperationFailed) as caught:
+            LocalHostBackend().execute(
+                self._containment_op(home / "f.txt"), EXECUTION_CONTEXT_ALL_IN_ONE
+            )
+        self.assertIn("no allowed roots", str(caught.exception))
+        self.assertFalse((home / "f.txt").exists())
+
+    # ---- T-4848: rollback-path containment, rollback pin, desired paths ----
+
+    def _rollback_mutation(self, kind, target, before):
+        return _pim.MutationRecord(
+            operation_id="test.rollback", kind=kind, target=str(target), owner="tester",
+            changed=True, before=before, after_fingerprint="x",
+        )
+
+    def test_rollback_mutation_refuses_symlink_escape_on_restore_and_unlink(self) -> None:
+        home = self.root / "rb-home"
+        outside = self.root / "rb-outside"
+        home.mkdir()
+        outside.mkdir()
+        (home / "link").symlink_to(outside, target_is_directory=True)
+        victim = outside / "victim.txt"
+        victim.write_text("keep\n", encoding="utf-8")
+        restore = self._rollback_mutation(
+            "atomic-write", home / "link" / "evil.txt",
+            {"state": "file", "mode": "0644",
+             "content_b64": base64.b64encode(b"pwned\n").decode("ascii")},
+        )
+        unlink = self._rollback_mutation("atomic-write", home / "link" / "victim.txt", {"state": "absent"})
+        for label, mutation in (("restore", restore), ("unlink", unlink)):
+            with self.subTest(case=label):
+                with self.assertRaises(OperationFailed) as caught:
+                    LocalHostBackend().rollback_mutation(mutation, allowed_roots=(str(home),))
+                self.assertIn("outside allowed roots", str(caught.exception))
+        self.assertEqual(sorted(p.name for p in outside.iterdir()), ["victim.txt"])
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep\n")
+
+    def test_rollback_mutation_fails_closed_without_allowed_roots(self) -> None:
+        home = self.root / "rb-noroots"
+        home.mkdir()
+        target = home / "f.txt"
+        target.write_text("new\n", encoding="utf-8")
+        mutation = self._rollback_mutation("atomic-write", target, {"state": "absent"})
+        with self.assertRaises(OperationFailed) as caught:
+            LocalHostBackend().rollback_mutation(mutation)
+        self.assertIn("no allowed roots", str(caught.exception))
+        self.assertTrue(target.exists())
+
+    def test_rollback_mutation_refuses_tampered_receipt_paths(self) -> None:
+        home = self.root / "rb-tamper"
+        outside = self.root / "rb-tamper-out"
+        home.mkdir()
+        outside.mkdir()
+        (outside / "wants").mkdir()
+        evil = outside / "wants" / "x.timer"
+        evil.symlink_to("/nonexistent")
+        mutation = self._rollback_mutation(
+            "timer-enable", "x.timer",
+            {"state": "disabled", "enablement_link_path": str(evil),
+             "canonical_template_path": str(home / "t")},
+        )
+        with self.assertRaises(OperationFailed) as caught:
+            LocalHostBackend().rollback_mutation(mutation, allowed_roots=(str(home),))
+        self.assertIn("outside allowed roots", str(caught.exception))
+        self.assertTrue(evil.is_symlink())
+
+    def test_rollback_mutation_allows_contained_restore(self) -> None:
+        home = self.root / "rb-ok"
+        home.mkdir()
+        target = home / "f.txt"
+        target.write_text("new\n", encoding="utf-8")
+        LocalHostBackend().rollback_mutation(
+            self._rollback_mutation("atomic-write", target,
+                {"state": "file", "mode": "0644",
+                 "content_b64": base64.b64encode(b"old\n").decode("ascii")}),
+            allowed_roots=(str(home),),
+        )
+        self.assertEqual(target.read_text(encoding="utf-8"), "old\n")
+
+    def _applied_recovery(self):
+        plan = self.plan()
+        backend = SimulatedHostBackend()
+        applied = self.installer.apply(plan, plan.digest, backend, self.actor(plan))
+        self.assertEqual(applied.status, "applied", applied.errors)
+        return plan, backend, applied.receipt
+
+    def _other_manifest(self) -> Manifest:
+        data = _manifest_dict(second_persona=True)
+        data["persona_installer"]["mailbox"]["hub"] = "/srv/other-hub"
+        path = self.root / "other-instance.yaml"
+        path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
+        return Manifest.load(path)
+
+    def test_installer_rollback_refuses_without_plan_or_manifest_or_on_mismatch(self) -> None:
+        plan, backend, receipt = self._applied_recovery()
+        cases = {
+            "no-plan": dict(plan=None, manifest=self.manifest),
+            "no-manifest": dict(plan=plan, manifest=None),
+            "mismatched-manifest": dict(plan=plan, manifest=self._other_manifest()),
+        }
+        for label, kwargs in cases.items():
+            with self.subTest(case=label):
+                report = self.installer.rollback(receipt, backend, self.actor(plan), **kwargs)
+                self.assertEqual(report.status, "refused", report)
+                self.assertFalse(report.break_glass)
+                self.assertTrue(backend.entries)  # nothing was rolled back
+        other_plan = self.installer.plan(self.manifest, "consultant", root=self.root / "elsewhere")
+        report = self.installer.rollback(
+            receipt, backend, self.actor(plan), plan=other_plan, manifest=self.manifest
+        )
+        self.assertEqual(report.status, "refused")
+        self.assertIn("digest", " ".join(report.errors))
+
+    def test_installer_rollback_with_pinned_manifest_succeeds(self) -> None:
+        plan, backend, receipt = self._applied_recovery()
+        report = self.installer.rollback(
+            receipt, backend, self.actor(plan), plan=plan, manifest=self.manifest
+        )
+        self.assertEqual(report.status, "rolled-back", report)
+        assert_sim_host_restored(self, backend)
+
+    def test_break_glass_rollback_is_loud_flagged_and_keeps_manifest_free_checks(self) -> None:
+        plan, backend, receipt = self._applied_recovery()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            report = self.installer.rollback(
+                receipt, backend, self.actor(plan), plan=plan, manifest=None, break_glass=True
+            )
+        self.assertEqual(report.status, "rolled-back", report)
+        self.assertTrue(report.break_glass)
+        self.assertIn("BREAK-GLASS: rollback without manifest pin", stderr.getvalue())
+        assert_sim_host_restored(self, backend)
+
+    def test_break_glass_still_refuses_structurally_bad_roots_and_digest_mismatch(self) -> None:
+        plan, backend, receipt = self._applied_recovery()
+        bad = self._plan_with_roots(lambda r, p: r + ["/"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            report = self.installer.rollback(
+                dataclasses.replace(receipt, plan_digest=bad.digest),
+                backend, self.actor(plan), plan=bad, manifest=None, break_glass=True,
+            )
+            self.assertEqual(report.status, "refused", report)
+            self.assertIn("target path check", " ".join(report.errors))
+            other_plan = self.installer.plan(self.manifest, "consultant", root=self.root / "elsewhere")
+            report = self.installer.rollback(
+                receipt, backend, self.actor(plan), plan=other_plan, manifest=None, break_glass=True
+            )
+        self.assertEqual(report.status, "refused")
+        self.assertTrue(backend.entries)
+
+    def _stage_recovery(self, stamp: str):
+        backend = SimulatedHostBackend()
+        code, summary = persona_apply.stage_disabled(
+            self.manifest_path, "recovery", "claude", REPO_ROOT, stamp,
+            backend=backend, root=self.root / "projection",
+        )
+        self.assertEqual(code, 0, summary)
+        return backend, self.root / "projection" / "home" / "claude-fallback"
+
+    def test_rollback_staged_refuses_none_or_mismatched_manifest(self) -> None:
+        backend, account_home = self._stage_recovery("stamp-t4848-pin")
+        before_entries = dict(backend.entries)
+        for label, kwargs in (
+            ("none", dict(manifest=None)),
+            ("default", dict()),
+            ("mismatched", dict(manifest=self._other_manifest())),
+        ):
+            with self.subTest(case=label):
+                code, summary = persona_apply.rollback_staged(
+                    "recovery", "stamp-t4848-pin", account_home, backend=backend, **kwargs
+                )
+                self.assertNotEqual(code, 0, summary)
+                self.assertIn("ROLLBACK_STAGED_STATUS=refused", summary)
+                self.assertEqual(backend.entries, before_entries)
+
+    def test_rollback_staged_with_manifest_or_break_glass_succeeds(self) -> None:
+        backend, account_home = self._stage_recovery("stamp-t4848-ok")
+        code, summary = persona_apply.rollback_staged(
+            "recovery", "stamp-t4848-ok", account_home, backend=backend, manifest=self.manifest
+        )
+        self.assertEqual(code, 0, summary)
+        self.assertNotIn("BREAK_GLASS=true", summary)
+        backend2, account_home2 = self._stage_recovery("stamp-t4848-bg")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code, summary = persona_apply.rollback_staged(
+                "recovery", "stamp-t4848-bg", account_home2, backend=backend2, break_glass=True
+            )
+        self.assertEqual(code, 0, summary)
+        self.assertIn("BREAK_GLASS=true", summary)
+        self.assertIn("BREAK-GLASS: rollback without manifest pin", stderr.getvalue())
+        checkpoint = persona_apply._checkpoint_path_from_home(account_home2, "recovery", "stamp-t4848-bg")
+        raw = json.loads(checkpoint.read_text(encoding="utf-8"))
+        self.assertIs(raw["rollback"]["break_glass"], True)
+
+    def test_rollback_staged_break_glass_refuses_root_declared_checkpoint_plan(self) -> None:
+        backend, account_home = self._stage_recovery("stamp-t4848-badroots")
+        checkpoint = persona_apply._checkpoint_path_from_home(account_home, "recovery", "stamp-t4848-badroots")
+        raw = json.loads(checkpoint.read_text(encoding="utf-8"))
+        plan = _pim.InstallPlan.from_dict(raw["plan"])
+        roots = plan.provenance["allowed_target_roots"].split(",") + ["/"]
+        bad = _pim.InstallPlan.create(
+            operations=plan.operations,
+            provenance={**plan.provenance, "allowed_target_roots": ",".join(roots)},
+            **{k: getattr(plan, k) for k in (
+                "schema", "manifest_version", "instance", "role", "persona", "account",
+                "configured_harness", "selected_harness", "root", "operator_actions")},
+        )
+        raw["plan"] = bad.to_dict()
+        raw["receipt"]["plan_digest"] = bad.digest
+        checkpoint.write_text(json.dumps(raw), encoding="utf-8")
+        before_entries = dict(backend.entries)
+        with contextlib.redirect_stderr(io.StringIO()):
+            code, summary = persona_apply.rollback_staged(
+                "recovery", "stamp-t4848-badroots", account_home, backend=backend, break_glass=True
+            )
+        self.assertNotEqual(code, 0, summary)
+        self.assertIn("ROLLBACK_STAGED_STATUS=refused", summary)
+        self.assertEqual(backend.entries, before_entries)
+
+    def test_rollback_staged_cli_manifest_and_break_glass_are_exclusive_and_required(self) -> None:
+        base = ["rollback-staged", "--persona", "recovery", "--stamp", "s", "--account-home", "/x"]
+        for extra in ([], ["--manifest", "/m.yaml", "--break-glass-no-manifest"]):
+            with self.subTest(extra=extra), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as caught:
+                    persona_apply.main(base + extra)
+                self.assertEqual(caught.exception.code, 2)
+
+    def test_check_manifest_subcommand_exit_codes(self) -> None:
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(persona_apply.main(["check-manifest", "--manifest", str(self.manifest_path)]), 0)
+        broken = self.root / "broken.yaml"
+        broken.write_text("not: [a manifest\n", encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as caught:
+            persona_apply.main(["check-manifest", "--manifest", str(broken)])
+        self.assertNotEqual(caught.exception.code, 0)
+
+    def test_local_backend_refuses_desired_path_symlink_escape(self) -> None:
+        home = self.root / "dp-home"
+        outside = self.root / "dp-outside"
+        home.mkdir()
+        outside.mkdir()
+        (home / "link").symlink_to(outside, target_is_directory=True)
+        context = _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, home)
+        esc = str(home / "link" / "x")
+        cases = {
+            "timer-enable": ("timer-enable", "t.timer", {"enablement_link_path": esc,
+                "canonical_template_path": str(home / "t")}),
+            "absence-check": ("timer-enablement-absence-check", str(home / "l"),
+                {"timer": "t.timer", "enablement_link_path": str(home / "l"),
+                 "canonical_template_path": esc}),
+            "mailbox-probe": ("mailbox-probe", str(home / "mb"),
+                {"receive_tmp": str(home / "mb" / "tmp"), "send_tmp": str(home / "link" / "tmp")}),
+            "claude-mcp-home": ("claude-mcp-server-registration", str(home / ".claude.json"),
+                {"home": str(home / "link"), "config_path": str(home / ".claude.json")}),
+            "codex-release-root": ("codex-telegram-source-check", str(home / "cur"),
+                {"release_root": str(home / "link" / "rel"), "state_dir": str(home / "s"),
+                 "account_home": str(home)}),
+        }
+        for label, (kind, target, desired) in cases.items():
+            with self.subTest(case=label):
+                op = dataclasses.replace(
+                    self._containment_op(Path(target), kind), target=target, desired=desired
+                )
+                with self.assertRaises(OperationFailed) as caught:
+                    LocalHostBackend().execute(op, context)
+                self.assertIn("desired.", str(caught.exception))
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_every_absolute_desired_path_in_real_plans_is_covered_and_contained(self) -> None:
+        manifest = Manifest.load(REPO_ROOT / "instance.yaml")
+        personas = sorted({role["persona"] for role in manifest.roles.values()})
+        uncovered: set[tuple[str, str, str]] = set()
+        for persona in personas:
+            for harness in (None, "claude", "codex"):
+                try:
+                    plan = self.installer.plan(
+                        manifest, persona, harness_override=harness, root=self.root / "real"
+                    )
+                except _pim.ManifestError:
+                    continue
+                roots = _pim._plan_allowed_roots(plan)
+                for op in plan.operations:
+                    self.assertIsNone(_pim._desired_path_refusal(op, roots), op.operation_id)
+                    covered = {k for k, _m in _pim._DESIRED_PATH_FIELDS.get(op.kind, ())}
+                    for key, value in op.desired.items():
+                        if key in covered or key in _pim._READONLY_DESIRED_PATH_FIELDS:
+                            continue
+                        if any(part.startswith("/") for part in str(value).split(",")):
+                            uncovered.add((op.kind, key, str(value)[:60]))
+        self.assertEqual(uncovered, set())
+
+    def test_local_store_receipt_refuses_receipt_dir_escape(self) -> None:
+        plan = self.plan()
+        outside = self.root / "rc-outside"
+        outside.mkdir()
+        bad = dataclasses.replace(
+            plan, provenance={**plan.provenance, "receipt_dir": str(outside)}
+        )
+        receipt = self.installer._make_apply_receipt(
+            plan, self.actor(plan), receipt_id="r1", phase="complete", mutations=(), evidence=()
+        )
+        with self.assertRaises(OperationFailed) as caught:
+            # T-2917 5a: receipt persistence moved off the backend into
+            # FileReceiptStore; the containment refusal is unchanged.
+            _pim.FileReceiptStore().store_receipt(bad, receipt)
+        self.assertIn("receipt_dir", str(caught.exception))
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_clean_home_dry_run_ignores_out_of_scope_operations(self) -> None:
+        plan = self.plan()
+        victim = plan.operations[0]
+        staged = dataclasses.replace(victim, execution_scope="staged-cutover")
+        scoped = dataclasses.replace(plan, operations=(staged,) + plan.operations[1:])
+        with patch.object(
+            _pim, "_clean_home_dry_run_backend",
+            lambda: SimulatedHostBackend(unavailable_kinds=(victim.kind,)),
+        ):
+            # Every op sharing victim.kind would fail if replayed; only the
+            # staged-cutover one is excluded, so restrict to a kind-unique check.
+            only_staged = dataclasses.replace(scoped, operations=(staged,))
+            _pim._clean_home_dry_run(only_staged)  # all-scope: nothing in scope
+            with self.assertRaises(_pim.PlanRefused):
+                _pim._clean_home_dry_run(
+                    only_staged, frozenset({"all", "staged-cutover"})
+                )
+
+    def test_real_manifest_plans_pass_target_containment(self) -> None:
+        manifest = Manifest.load(REPO_ROOT / "instance.yaml")
+        personas = sorted({role["persona"] for role in manifest.roles.values()})
+        self.assertGreaterEqual(len(personas), 5)
+        for persona in personas:
+            for harness in (None, "claude", "codex"):
+                with self.subTest(persona=persona, harness=harness):
+                    try:
+                        plan = self.installer.plan(
+                            manifest, persona, harness_override=harness,
+                            root=self.root / "real",
+                        )
+                    except _pim.ManifestError:
+                        continue  # harness not valid for this persona
+                    self.assertTrue(plan.provenance["allowed_target_roots"])
+
+    # ---- ORG-050 gate 5: clean-home dry-run -------------------------------
+
+    def test_apply_refuses_when_clean_home_dry_run_fails(self) -> None:
+        plan = self.plan()
+        real = SimulatedHostBackend()
+        with patch.object(
+            _pim, "_clean_home_dry_run_backend",
+            lambda: SimulatedHostBackend(unavailable_kinds=("mkdir",)),
+        ):
+            report = self.installer.apply(plan, plan.digest, real, self.actor(plan))
+        self.assertEqual(report.status, "refused")
+        self.assertIn("clean-home dry-run", " ".join(report.errors))
+        self.assertEqual(real.entries, {})
+        self.assertEqual(real.events, [])
+
+    def test_clean_home_dry_run_uses_fresh_backend_not_live_state(self) -> None:
+        plan = self.plan()
+        live = SimulatedHostBackend()
+        # Live home holds an installer-unknown file at a write target; a copy of
+        # live state would see a conflict, a clean home must not.
+        target = next(op.target for op in plan.operations if op.kind == "atomic-write")
+        live.seed_file(target, "user-owned content\n")
+        created: list[SimulatedHostBackend] = []
+
+        def factory():
+            backend = SimulatedHostBackend()
+            created.append(backend)
+            return backend
+
+        with patch.object(_pim, "_clean_home_dry_run_backend", factory):
+            _pim._clean_home_dry_run(plan)
+        self.assertEqual(len(created), 1)
+        self.assertIsNot(created[0], live)
+        self.assertEqual(live.entries[target]["state"], "file")
+
+    def test_clean_home_dry_run_never_touches_real_filesystem(self) -> None:
+        plan = self.plan()
+
+        def boom(*args, **kwargs):
+            raise AssertionError("dry-run touched the real filesystem/host")
+
+        with patch.object(Path, "write_text", boom), patch.object(
+            Path, "write_bytes", boom
+        ), patch.object(Path, "mkdir", boom), patch.object(
+            os, "replace", boom
+        ), patch.object(os, "makedirs", boom), patch.object(
+            subprocess, "run", boom
+        ), patch.object(subprocess, "Popen", boom):
+            _pim._clean_home_dry_run(plan)
+
+    # ---- ORG-050 gate 6: audit record names source, actor, host, harness, result
+
+    def test_receipt_names_source_actor_host_harness_and_result(self) -> None:
+        plan = self.plan()
+        backend, report = self.apply(plan)
+        receipt = report.receipt
+        self.assertEqual(receipt.phase, "complete")
+        self.assertEqual(receipt.harness, plan.selected_harness)
+        self.assertEqual(receipt.source, plan.provenance["source_revision"])
+        self.assertTrue(receipt.host)
+        self.assertEqual(receipt.actor["persona"], "consultant")
+        roundtrip = ApplyReceipt.from_dict(receipt.to_dict())
+        self.assertEqual(roundtrip, receipt)
+
+    def test_old_shape_receipt_without_audit_fields_still_loads(self) -> None:
+        plan = self.plan()
+        _, report = self.apply(plan)
+        raw = dict(report.receipt.to_dict())
+        for key in ("host", "harness", "source"):
+            raw.pop(key)
+        loaded = ApplyReceipt.from_dict(raw)
+        self.assertEqual((loaded.host, loaded.harness, loaded.source), ("", "", ""))
+        self.assertEqual(loaded.receipt_id, report.receipt.receipt_id)
+
+    def test_plan_surfaces_leakage_without_echoing_secret(self) -> None:
+        secret = self._fake_secrets()["telegram-bot-token"]
+        real_read_text = Path.read_text
+
+        def tainted_read_text(path, *args, **kwargs):
+            text = real_read_text(path, *args, **kwargs)
+            if path.name == "pantheon-persona-consume@.service":
+                text += "\n# " + secret + "\n"
+            return text
+
+        with patch.object(Path, "read_text", tainted_read_text):
+            with self.assertRaises(_pim.PlanRefused) as ctx:
+                self.plan()
+        self.assertIn("telegram-bot-token", str(ctx.exception))
+        self.assertIn("leakage scan", str(ctx.exception))
+        self.assertNotIn(secret, str(ctx.exception))
+
     def test_plan_digest_mismatch_refuses_before_mutation(self) -> None:
         plan = self.plan()
         backend = SimulatedHostBackend()
@@ -1471,7 +2366,7 @@ approval_mode = "approve"
         )
         self.assertEqual(report.status, "failed")
         self.assertGreater(report.changed, 0)
-        self.assertEqual(backend.entries, {})
+        assert_sim_host_restored(self, backend)
         self.assertTrue(all("restored" in item for item in report.rollback))
 
     def test_rollback_refuses_post_apply_drift(self) -> None:
@@ -1658,6 +2553,29 @@ approval_mode = "approve"
         self.assertEqual(report.provenance["persona"], "recovery")
         self.assertEqual(report.provenance["instance"], "test-instance")
 
+    def test_verify_is_non_mutating(self) -> None:
+        plan = self.plan()
+        backend, _ = self.apply(plan)
+        before = (json.dumps(backend.entries, sort_keys=True), list(backend.events))
+        self.installer.verify(plan, backend)
+        after = (json.dumps(backend.entries, sort_keys=True), list(backend.events))
+        self.assertEqual(before, after)
+
+    def test_generated_units_are_attributable_to_instance_role_persona(self) -> None:
+        plan = self.plan()
+        units = [op for op in plan.operations if op.kind == "user-unit-install"]
+        self.assertTrue(units)
+        for op in units:
+            with self.subTest(op=op.operation_id):
+                banner = op.desired["content"].split("\n", 2)[:2]
+                self.assertEqual(banner[0], f"# {MANAGED_MARKER}")
+                for token in (
+                    f"instance={plan.instance}",
+                    f"role={plan.role}",
+                    f"persona={plan.persona}",
+                ):
+                    self.assertIn(token, banner[1])
+
     def test_converged_enabled_all_in_one_apply_returns_noop(self) -> None:
         plan = self.plan()
         backend, first = self.apply(plan)
@@ -1685,7 +2603,7 @@ approval_mode = "approve"
     def test_all_in_one_fresh_timer_enable_issues_enable_command(self) -> None:
         root, plan, backend = self.orchestrator_local_stage_fixture("r30-all-in-one-fresh")
         for subdir in ("tmp", "new", "cur"):
-            (root / "home" / "the-ancestor" / "mailbox" / "recovery" / subdir).mkdir(parents=True, exist_ok=True)
+            (_fixture_hub(root) / "recovery" / subdir).mkdir(parents=True, exist_ok=True)
         self.write_invocation_viability_receipt(plan)
         report = self.installer.apply(plan, plan.digest, backend, self.actor(plan))
         self.assertEqual(report.status, "applied", report.errors)
@@ -1709,7 +2627,7 @@ approval_mode = "approve"
     def test_staged_fresh_timer_enable_issues_enable_command_and_records_exact_link(self) -> None:
         root, plan, backend = self.orchestrator_local_stage_fixture("r30-staged-fresh")
         for subdir in ("tmp", "new", "cur"):
-            (root / "home" / "the-ancestor" / "mailbox" / "recovery" / subdir).mkdir(parents=True, exist_ok=True)
+            (_fixture_hub(root) / "recovery" / subdir).mkdir(parents=True, exist_ok=True)
         self.write_invocation_viability_receipt(plan)
         staged = self.installer.stage_disabled(plan, plan.digest, backend, self.actor(plan))
         self.assertEqual(staged.status, "applied", staged.errors)
@@ -1762,7 +2680,7 @@ approval_mode = "approve"
         all_backend = ContextRecordingBackend()
         all_report = self.installer.apply(plan, plan.digest, all_backend, self.actor(plan))
         self.assertEqual(all_report.status, "applied", all_report.errors)
-        self.assertEqual(all_backend.timer_contexts, [EXECUTION_CONTEXT_ALL_IN_ONE])
+        self.assertEqual([c.workflow for c in all_backend.timer_contexts], ["all-in-one"])
 
         staged_backend = ContextRecordingBackend()
         staged = self.installer.stage_disabled(plan, plan.digest, staged_backend, self.actor(plan))
@@ -1770,7 +2688,7 @@ approval_mode = "approve"
         assert staged.receipt is not None
         activated = self.installer.activate_staged(plan, plan.digest, staged.receipt, staged_backend, self.actor(plan))
         self.assertEqual(activated.status, "applied", activated.errors)
-        self.assertEqual(staged_backend.timer_contexts, [EXECUTION_CONTEXT_STAGED_ACTIVATE])
+        self.assertEqual([c.workflow for c in staged_backend.timer_contexts], ["staged-activate"])
 
     def test_successful_rollback_disables_owned_timer_and_restores_files(self) -> None:
         plan = self.plan()
@@ -1783,7 +2701,7 @@ approval_mode = "approve"
         )
         self.assertEqual(report.status, "rolled-back")
         self.assertFalse(backend.timer_enabled)
-        self.assertEqual(backend.entries, {})
+        assert_sim_host_restored(self, backend)
 
     def test_staged_receipt_precedes_activation_and_recovers_crash(self) -> None:
         class CrashAfterTimerEnable(SimulatedHostBackend):
@@ -1872,7 +2790,7 @@ approval_mode = "approve"
         )
         self.assertEqual(recovered.status, "rolled-back")
         self.assertFalse(backend.timer_enabled)
-        self.assertEqual(backend.entries, {})
+        assert_sim_host_restored(self, backend)
 
     def test_stage_disabled_apply_cannot_start_runtime_or_receiver(self) -> None:
         manifest = Manifest.load(REPO_ROOT / "instance.yaml")
@@ -1940,13 +2858,10 @@ approval_mode = "approve"
         self.assertNotIn("connective.stale-unit-failure-reset", backend.events)
         self.assertNotIn("connective.service-unit", backend.events)
         self.assertNotIn("quota.service-unit", backend.events)
+        # T-5471: the dry-run/stage preflight now READS the unit (read-only show) so its
+        # verdict matches execute; what must not happen at stage is a reset.
         self.assertFalse(
-            any(
-                command[:4] == ("systemctl", "--user", "show", "pantheon-persona-consume@orchestrator.service")
-                and "-p" in command
-                and "LoadState" in command
-                for command in backend.commands
-            ),
+            any(command[:3] == ("systemctl", "--user", "reset-failed") for command in backend.commands),
             backend.commands,
         )
 
@@ -2016,15 +2931,11 @@ approval_mode = "approve"
         backend.stale_unit_show_sequence = [
             self.stale_unit_failed_show(load_state="loaded"),
         ]
+        # T-5471: the refusal is now predicted by the stage/dry-run preflight, before any mutation.
         staged = self.installer.stage_disabled(plan, plan.digest, backend, self.actor(plan))
-        self.assertIsNotNone(staged.receipt, staged.errors)
-        assert staged.receipt is not None
-        activation_start = len(backend.commands)
-        report = self.installer.activate_staged(plan, plan.digest, staged.receipt, backend, self.actor(plan))
-        self.assertEqual(report.status, "failed")
-        self.assertIn("pre-existing loaded service", report.errors[0])
-        commands = self.activation_commands(backend, activation_start)
-        self.assert_no_later_activation_systemctl(commands)
+        self.assertEqual(staged.status, "refused")
+        self.assertIn("pre-existing loaded service", staged.errors[0])
+        self.assert_no_later_activation_systemctl(list(backend.commands))
         self.assertFalse((root / "home" / "claude" / ".config" / "systemd" / "user" / "pantheon-persona-consume@.service").exists())
 
     @_with_codex_config_fixture
@@ -2038,13 +2949,10 @@ approval_mode = "approve"
             with self.subTest(label=label):
                 _root, plan, backend = self.orchestrator_local_stage_fixture(f"r27-active-{label}")
                 backend.stale_unit_show_sequence = [stale_show]
+                # T-5471: predicted at stage/dry-run preflight, before any mutation
                 staged = self.installer.stage_disabled(plan, plan.digest, backend, self.actor(plan))
-                self.assertIsNotNone(staged.receipt, staged.errors)
-                assert staged.receipt is not None
-                activation_start = len(backend.commands)
-                report = self.installer.activate_staged(plan, plan.digest, staged.receipt, backend, self.actor(plan))
-                self.assertEqual(report.status, "failed")
-                self.assert_no_later_activation_systemctl(self.activation_commands(backend, activation_start))
+                self.assertEqual(staged.status, "refused")
+                self.assert_no_later_activation_systemctl(list(backend.commands))
 
     @_with_codex_config_fixture
     def test_stale_unit_failure_reset_refuses_malformed_or_ambiguous_show_before_activation_mutation(self) -> None:
@@ -2072,13 +2980,10 @@ approval_mode = "approve"
             with self.subTest(label=label):
                 _root, plan, backend = self.orchestrator_local_stage_fixture(f"r27-malformed-{label}")
                 backend.stale_unit_show_sequence = [stale_show]
+                # T-5471: predicted at stage/dry-run preflight, before any mutation
                 staged = self.installer.stage_disabled(plan, plan.digest, backend, self.actor(plan))
-                self.assertIsNotNone(staged.receipt, staged.errors)
-                assert staged.receipt is not None
-                activation_start = len(backend.commands)
-                report = self.installer.activate_staged(plan, plan.digest, staged.receipt, backend, self.actor(plan))
-                self.assertEqual(report.status, "failed")
-                commands = self.activation_commands(backend, activation_start)
+                self.assertEqual(staged.status, "refused")
+                commands = list(backend.commands)
                 self.assertNotIn(
                     ("systemctl", "--user", "reset-failed", "pantheon-persona-consume@orchestrator.service"),
                     commands,
@@ -2182,9 +3087,9 @@ approval_mode = "approve"
         self.assertEqual(report.status, "failed")
         self.assertIsNotNone(report.receipt)
         self.assertIn("rollback:connective.service-unit", backend.events)
-        self.assertEqual(backend.entries, {})
+        assert_sim_host_restored(self, backend)
 
-    def test_pre_activation_rollback_staged_uses_checkpoint_without_manifest(self) -> None:
+    def test_pre_activation_rollback_staged_uses_checkpoint_with_pinned_manifest(self) -> None:
         backend = SimulatedHostBackend()
         exit_code, summary = persona_apply.stage_disabled(
             self.manifest_path,
@@ -2202,6 +3107,7 @@ approval_mode = "approve"
             "stamp-r5",
             account_home,
             backend=backend,
+            manifest=self.manifest,
         )
         self.assertEqual(rollback_code, 0, rollback_summary)
         self.assertIn("ROLLBACK_STAGED_STATUS=rolled-back", rollback_summary)
@@ -2454,6 +3360,79 @@ approval_mode = "approve"
         self.assertNotEqual(mutation.target, archive.desired["archive_path"])
         self.assertEqual(mutation.after_fingerprint, _snapshot_fingerprint(_symlink_snapshot(binding.current_release)))
 
+    def test_t5068_plan_codex_telegram_archive_dir_override_moves_archive_path(self) -> None:
+        root = self.root / "t5068-plan"
+        manifest = Manifest.load(REPO_ROOT / "instance.yaml")
+        default = self.operation(
+            self.installer.plan(manifest, "orchestrator", harness_override="claude", root=root),
+            "codex-telegram.source-archive",
+        )
+        staging = Path("/private-staging.xyz")
+        plan = self.installer.plan(
+            manifest, "orchestrator", harness_override="claude", root=root, codex_telegram_archive_dir=staging
+        )
+        archive = self.operation(plan, "codex-telegram.source-archive")
+        name = f"codex-telegram-orchestrator-{archive.desired['revision']}.tar"
+        self.assertEqual(Path(archive.desired["archive_path"]), root / "private-staging.xyz" / name)
+        self.assertNotEqual(archive.desired["archive_path"], default.desired["archive_path"])
+        with self.assertRaises(ManifestError):
+            self.installer.plan(
+                manifest, "orchestrator", harness_override="claude", root=root, codex_telegram_archive_dir=Path("relative")
+            )
+
+    @_with_codex_config_fixture
+    def test_t5068_stage_disabled_override_then_check_and_activate_derive_dir_from_checkpoint(self) -> None:
+        root = self.root / "t5068-stage"
+        account_home = root / "home" / "claude"
+        account_home.mkdir(parents=True)
+        _seed_shell_box(account_home)
+        (account_home / ".local" / "lib").mkdir(parents=True)
+        (account_home / "CLAUDE.md").write_text("Orchestrator brief fixture\n", encoding="utf-8")
+        for mailbox_persona in ("orchestrator", "codex"):
+            for subdir in ("tmp", "new", "cur"):
+                (_fixture_hub(root) / mailbox_persona / subdir).mkdir(parents=True)
+        staging = root / "private-staging.xyz"
+        staging.mkdir()
+        manifest = Manifest.load(REPO_ROOT / "instance.yaml")
+        plan = self.installer.plan(
+            manifest, "orchestrator", harness_override="claude", root=root, codex_telegram_archive_dir=Path("/private-staging.xyz")
+        )
+        archive = self.operation(plan, "codex-telegram.source-archive")
+        source = codex_telegram_bridge.CodexTelegramSource(
+            codex_telegram_bridge.CODEX_TELEGRAM_SOURCE_REPO,
+            archive.desired["revision"],
+            tuple(json.loads(archive.desired["paths"])),
+            dict(json.loads(archive.desired["sha256"])),
+            owner_account=archive.desired.get("source_account") or None,
+            source_root=Path(archive.desired["source_root"]),
+            subdir=archive.desired.get("source_subdir", ""),
+        )
+        codex_telegram_bridge.create_verified_source_archive(
+            Path(archive.desired["source_root"]), Path(archive.desired["archive_path"]), source
+        )
+        backend = LocalHostStageBackend()
+        exit_code, summary = persona_apply.stage_disabled(
+            REPO_ROOT / "instance.yaml", "orchestrator", "claude", REPO_ROOT, "stamp-t5068",
+            backend=backend, root=root, archive_dir=Path("/private-staging.xyz"),
+        )
+        self.assertEqual(exit_code, 0, summary)
+        # check-staged / activate-staged take no override: the dir comes from the checkpoint plan.
+        ok, message = persona_apply.check_staged(
+            REPO_ROOT / "instance.yaml", "orchestrator", "claude", REPO_ROOT, "stamp-t5068",
+            backend=backend, root=root,
+        )
+        self.assertTrue(ok, message)
+
+    def test_t5068_apply_cli_stage_disabled_accepts_archive_dir_flag(self) -> None:
+        with patch.object(persona_apply, "stage_disabled", return_value=(0, "ok")) as stage:
+            with patch("builtins.print"):
+                rc = persona_apply.main([
+                    "stage-disabled", "--manifest", "m.yaml", "--persona", "orchestrator", "--harness", "claude",
+                    "--repo-root", "r", "--stamp", "s", "--codex-telegram-archive-dir", "/stage.abc",
+                ])
+        self.assertEqual(rc, 0)
+        self.assertEqual(stage.call_args.kwargs["archive_dir"], Path("/stage.abc"))
+
     @_with_codex_config_fixture
     def test_orchestrator_staged_source_archive_input_or_release_pointer_drift_fails_before_activation(self) -> None:
         for mode in ("pointer-drift", "pointer-delete", "archive-tamper", "archive-delete"):
@@ -2526,6 +3505,7 @@ approval_mode = "approve"
             "stamp-r14-rollback",
             root / "home" / "claude",
             backend=backend,
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertEqual(rollback_code, 0, rollback_summary)
         self.assertEqual(os.readlink(current), str(old_release))
@@ -2543,6 +3523,7 @@ approval_mode = "approve"
             "stamp-r14-rollback-drift",
             drift_root / "home" / "claude",
             backend=drift_backend,
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertNotEqual(refused_code, 0, refused_summary)
         self.assertIn("release pointer changed after apply", refused_summary)
@@ -2559,8 +3540,8 @@ approval_mode = "approve"
         self.assertEqual(
             [operation.target for operation in root_checks],
             [
-                str(root / "home" / "the-ancestor" / "mailbox" / "orchestrator"),
-                str(root / "home" / "the-ancestor" / "mailbox" / "codex"),
+                str(_fixture_hub(root) / "orchestrator"),
+                str(_fixture_hub(root) / "codex"),
             ],
         )
         self.assertTrue(all(operation.desired["harness"] == "codex" for operation in root_checks))
@@ -2568,7 +3549,7 @@ approval_mode = "approve"
         first_root_check = min(plan.operations.index(operation) for operation in root_checks)
         self.assertLess(first_root_check, activation_index)
 
-        (root / "home" / "the-ancestor" / "mailbox" / "codex" / "cur").rmdir()
+        (_fixture_hub(root) / "codex" / "cur").rmdir()
         report = self.installer.stage_disabled(plan, plan.digest, backend, self.actor(plan))
         self.assertEqual(report.status, "refused")
         self.assertIn("mailbox-writable-root.codex.1", "; ".join(report.errors))
@@ -2579,7 +3560,7 @@ approval_mode = "approve"
         root, plan, backend = self.orchestrator_local_stage_fixture("r22-capture")
         self.write_invocation_viability_receipt(plan)
         unit_fire = self.operation(plan, "connective.unit-fire")
-        mutation, evidence = backend.execute(unit_fire, EXECUTION_CONTEXT_STAGED_ACTIVATE)
+        mutation, evidence = backend.execute(unit_fire, _with_roots(EXECUTION_CONTEXT_STAGED_ACTIVATE, self.root))
         self.assertFalse(mutation.changed)
         self.assertTrue(evidence.ok, evidence.detail)
         self.assertEqual(evidence.evidence["pre_enqueue_active_state"], "inactive")
@@ -2649,7 +3630,7 @@ approval_mode = "approve"
                 backend = LocalHostStageBackend()
                 backend.service_show_sequence = list(sequence)
                 with self.assertRaises(OperationFailed):
-                    backend.execute(unit_fire, EXECUTION_CONTEXT_STAGED_ACTIVATE)
+                    backend.execute(unit_fire, _with_roots(EXECUTION_CONTEXT_STAGED_ACTIVATE, self.root))
                 starts = [command for command in backend.commands if command[:3] == ("systemctl", "--user", "start")]
                 if label in {"pre-existing-active", "pending-job"}:
                     self.assertEqual(starts, [], backend.commands)
@@ -2685,7 +3666,7 @@ approval_mode = "approve"
 
         timeout_backend = CaptureTimeoutBackend()
         with self.assertRaises(OperationFailed) as raised:
-            timeout_backend.execute(unit_fire, EXECUTION_CONTEXT_STAGED_ACTIVATE)
+            timeout_backend.execute(unit_fire, _with_roots(EXECUTION_CONTEXT_STAGED_ACTIVATE, self.root))
         self.assertIn("state-unavailable", str(raised.exception))
         self.assertEqual(
             [
@@ -2721,20 +3702,20 @@ approval_mode = "approve"
                 return self.now
 
             def _unit_fire_sleep(self, seconds: float) -> None:  # type: ignore[override]
-                self.now = 1258.0
+                self.now = 1268.0  # T-3650 commit A: orchestrator's budget grew 318 -> 328
 
         _root, plan, _backend = self.orchestrator_local_stage_fixture("r22-timeout")
         self.write_invocation_viability_receipt(plan)
         backend = TimeoutBackend()
-        backend.now = 1317.9
-        remaining = backend._remaining_timeout_seconds(1318.0)
+        backend.now = 1327.9
+        remaining = backend._remaining_timeout_seconds(1328.0)
         self.assertGreater(remaining, 0)
         self.assertLessEqual(remaining, 0.1)
         backend.now = 1000.0
         with self.assertRaises(OperationFailed) as raised:
             backend.execute(
                 self.operation(plan, "connective.unit-fire"),
-                EXECUTION_CONTEXT_STAGED_ACTIVATE,
+                _with_roots(EXECUTION_CONTEXT_STAGED_ACTIVATE, *_pim._plan_allowed_roots(plan)),
             )
         self.assertIn("completion-timeout", str(raised.exception))
         self.assertTrue(any(command[:3] == ("systemctl", "--user", "stop") for command in backend.commands))
@@ -2895,9 +3876,11 @@ approval_mode = "approve"
     def test_activate_staged_unit_fire_uses_runtime_viability_timeout_not_default_command_timeout(self) -> None:
         root, plan, backend = self.orchestrator_local_stage_fixture("r19-timeout")
         unit_fire = self.operation(plan, "connective.unit-fire")
-        self.assertEqual(unit_fire.desired["unit_fire_timeout_seconds"], "318")
+        # T-3650 commit A added orchestrator's 409 post_start: post_start_count 2 -> 3, and the
+        # budget grows by 2 candidates x the per-post_start constant (318 -> 328).
+        self.assertEqual(unit_fire.desired["unit_fire_timeout_seconds"], "328")
         self.assertEqual(unit_fire.desired["unit_fire_timeout_candidate_count"], "2")
-        self.assertEqual(unit_fire.desired["unit_fire_timeout_post_start_count"], "2")
+        self.assertEqual(unit_fire.desired["unit_fire_timeout_post_start_count"], "3")
         self.assertTrue(plan.validate_digest())
         service_template = (REPO_ROOT / "tools" / "systemd" / "pantheon-persona-consume@.service").read_text(encoding="utf-8")
         self.assertIn("TimeoutStartSec=30min", service_template)
@@ -2926,7 +3909,7 @@ approval_mode = "approve"
         ]
         self.assertEqual(len(start_timeouts), 1)
         self.assertGreater(start_timeouts[0], 257)
-        self.assertLessEqual(start_timeouts[0], 258)
+        self.assertLessEqual(start_timeouts[0], 268)  # T-3650 commit A: budget 318 -> 328
 
         bad_cases = {
             "missing-seconds": {"drop": ("unit_fire_timeout_seconds",)},
@@ -2976,7 +3959,7 @@ approval_mode = "approve"
                     desired=desired,
                 )
                 with self.assertRaises(OperationFailed):
-                    bad_backend.execute(bad_operation, EXECUTION_CONTEXT_STAGED_ACTIVATE)
+                    bad_backend.execute(bad_operation, _with_roots(EXECUTION_CONTEXT_STAGED_ACTIVATE, self.root))
                 self.assertFalse(
                     any(
                         command[:3] == ("systemctl", "--user", "is-enabled")
@@ -3193,6 +4176,7 @@ approval_mode = "approve"
             stamp,
             self.root / "projection-r19-timeout" / "home" / "claude-fallback",
             backend=backend,
+            manifest=self.manifest,
         )
         self.assertEqual(rollback_code, 0, rollback_summary)
         self.assertIn("ROLLBACK_STAGED_STATUS=noop", rollback_summary)
@@ -3940,7 +4924,7 @@ approval_mode = "approve"
         self.write_consume_timer_link(root, str(self.consume_timer_link_paths(root)[1]))
         operation = self.operation(plan, "connective.timer-enablement-absent")
         backend = LegacyConvergedTimerBackend()
-        mutation, evidence = backend.execute(operation, EXECUTION_CONTEXT_STAGE_PREFIX)
+        mutation, evidence = backend.execute(operation, _with_roots(EXECUTION_CONTEXT_STAGE_PREFIX, self.root))
         self.assertTrue(evidence.ok, evidence.detail)
         self.assertEqual(evidence.evidence.get("historical_boundary_absent"), "true")
         self.assertFalse(mutation.changed)
@@ -4264,6 +5248,7 @@ approval_mode = "approve"
             "stamp-r29-stop-not-loaded",
             root / "home" / "claude",
             backend=StopNotLoadedBackend(),
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertEqual(code, 0, summary)
         self.assertFalse(link.exists() or link.is_symlink())
@@ -4299,6 +5284,7 @@ approval_mode = "approve"
                     f"stamp-r29-stop-{label}",
                     root / "home" / "claude",
                     backend=RefusingBackend(),
+                    manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
                 )
                 self.assertNotEqual(code, 0, summary)
                 self.assertTrue(link.is_symlink())
@@ -4311,18 +5297,19 @@ approval_mode = "approve"
         self.rewrite_staged_checkpoint_timer_mutation(root, "stamp-r29-owned-order", mutation)
 
         class OrderBackend(LocalHostStageBackend):
-            def rollback_mutation(self, item):  # type: ignore[override]
+            def rollback_mutation(self, item, **kwargs):  # type: ignore[override]
                 if item.operation_id == "connective.timer-unit":
                     self.commands.append(("assert-link-absent-before-template-removal",))
                     if link.exists() or link.is_symlink():
                         raise OperationFailed("enablement link still exists before timer template removal")
-                return super().rollback_mutation(item)
+                return super().rollback_mutation(item, **kwargs)
 
         code, summary = persona_apply.rollback_staged(
             "orchestrator",
             "stamp-r29-owned-order",
             root / "home" / "claude",
             backend=OrderBackend(),
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertEqual(code, 0, summary)
         self.assertFalse(link.exists() or link.is_symlink())
@@ -4338,6 +5325,7 @@ approval_mode = "approve"
             "stamp-r29-remove-link",
             root / "home" / "claude",
             backend=LocalHostStageBackend(),
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertEqual(code, 0, summary)
         self.assertFalse(link.exists() or link.is_symlink())
@@ -4353,6 +5341,7 @@ approval_mode = "approve"
             "stamp-r29-no-reactivation",
             root / "home" / "claude",
             backend=LocalHostStageBackend(),
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertEqual(code, 0, summary)
         self.assertFalse(link.exists() or link.is_symlink())
@@ -4374,6 +5363,7 @@ approval_mode = "approve"
             "stamp-r29-staged-intent",
             root / "home" / "claude",
             backend=LocalHostStageBackend(),
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertEqual(code, 0, summary)
         self.assertTrue(link.is_symlink())
@@ -4501,6 +5491,7 @@ approval_mode = "approve"
             "stamp-r28-active-refuse",
             root / "home" / "claude",
             backend=backend,
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertNotEqual(rollback_code, 0, rollback_summary)
         self.assertIn("ROLLBACK_STAGED_STATUS=failed", rollback_summary)
@@ -4579,6 +5570,7 @@ approval_mode = "approve"
             "stamp-r28-active-success",
             root / "home" / "claude",
             backend=backend,
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertEqual(rollback_code, 0, rollback_summary)
         self.assertIn("ROLLBACK_STAGED_STATUS=rolled-back", rollback_summary)
@@ -4642,6 +5634,7 @@ approval_mode = "approve"
             "stamp-r28-partial-retry",
             root / "home" / "claude",
             backend=first,
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertNotEqual(first_code, 0, first_summary)
         self.assertIn("ROLLBACK_STAGED_STATUS=failed", first_summary)
@@ -4654,6 +5647,7 @@ approval_mode = "approve"
             "stamp-r28-partial-retry",
             root / "home" / "claude",
             backend=retry,
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertEqual(retry_code, 0, retry_summary)
         self.assertIn("ROLLBACK_STAGED_STATUS=rolled-back", retry_summary)
@@ -4661,8 +5655,14 @@ approval_mode = "approve"
     def test_same_stamp_failed_activation_rollback_preserves_single_receiver_restart_order(self) -> None:
         script = REPO_ROOT / "tools" / "persona_rollback.sh"
 
-        def run_case(*, helper_ok: bool) -> tuple[int, str, list[str]]:
-            sandbox = self.root / ("rollback-ok" if helper_ok else "rollback-fail")
+        def run_case(
+            *, helper_ok: bool, manifest: str = "absent", extra_args: tuple[str, ...] = ()
+        ) -> tuple[int, str, list[str]]:
+            sandbox = self.root / (
+                ("rollback-ok" if helper_ok else "rollback-fail")
+                + ("" if manifest == "absent" else f"-{manifest}")
+                + ("-forced" if extra_args else "")
+            )
             fakebin = sandbox / "bin"
             home = sandbox / "home" / "claude"
             runtime = sandbox / "run"
@@ -4680,6 +5680,8 @@ approval_mode = "approve"
             helper = home / "pantheon-config" / "tools" / "t2611_recovery_persona_apply.py"
             helper.parent.mkdir(parents=True, exist_ok=True)
             helper.write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+            if manifest != "absent":
+                (home / "pantheon-config" / "instance.yaml").write_text("fixture\n", encoding="utf-8")
 
             (fakebin / "python3").write_text(
                 "#!/usr/bin/env bash\n"
@@ -4707,7 +5709,13 @@ approval_mode = "approve"
                 "ENV\n"
                 "    exit 0 ;;\n"
                 "  *t2611_recovery_persona_apply.py)\n"
-                "    echo rollback-staged >> \"$LOG\"\n"
+                "    echo \"helper-args:${*:2}\" >> \"$LOG\"\n"
+                + (
+                    "    if [[ \"${2:-}\" == check-manifest ]]; then exit 0; fi\n"
+                    if manifest == "loads"
+                    else "    if [[ \"${2:-}\" == check-manifest ]]; then exit 1; fi\n"
+                )
+                + "    echo rollback-staged >> \"$LOG\"\n"
                 + (
                     "    echo 'ROLLBACK_STAGED_STATUS=noop RESTORED=0 ROLLBACK_ERRORS=[]'\n    exit 0 ;;\n"
                     if helper_ok
@@ -4757,7 +5765,7 @@ approval_mode = "approve"
             env = os.environ.copy()
             env["PATH"] = f"{fakebin}:{env.get('PATH', '')}"
             proc = subprocess.run(
-                ["bash", str(script), "--persona", "orchestrator", "--stamp", "stamp-r19", "--unit-file", str(sandbox / "unit.service"), "--execute"],
+                ["bash", str(script), "--persona", "orchestrator", "--stamp", "stamp-r19", "--unit-file", str(sandbox / "unit.service"), "--execute", *extra_args],
                 check=False,
                 capture_output=True,
                 text=True,
@@ -4778,6 +5786,51 @@ approval_mode = "approve"
         self.assertLess(checkpoint, predecessor_enable)
         self.assertLess(predecessor_enable, predecessor_restart)
         self.assertIn("confirmed: codex-telegram-poller.service inactive/not-found before bespoke restart", ok_output)
+
+        # T-4848: no readable manifest -> explicit, loud break-glass.
+        self.assertIn("BREAK-GLASS", ok_output)
+        self.assertTrue(any(
+            e.startswith("helper-args:rollback-staged") and "--break-glass-no-manifest" in e
+            and "--manifest" not in e.replace("--break-glass-no-manifest", "")
+            for e in ok_events
+        ), ok_events)
+        pinned_rc, pinned_output, pinned_events = run_case(helper_ok=True, manifest="loads")
+        self.assertEqual(pinned_rc, 0, pinned_output)
+        self.assertNotIn("BREAK-GLASS", pinned_output)
+        self.assertTrue(any(
+            e.startswith("helper-args:rollback-staged") and "--manifest " in e
+            and "--break-glass-no-manifest" not in e
+            for e in pinned_events
+        ), pinned_events)
+        broken_rc, broken_output, broken_events = run_case(helper_ok=True, manifest="broken")
+        self.assertEqual(broken_rc, 0, broken_output)
+        self.assertIn("BREAK-GLASS", broken_output)
+        self.assertTrue(any(
+            e.startswith("helper-args:rollback-staged") and "--break-glass-no-manifest" in e
+            for e in broken_events
+        ), broken_events)
+
+        # T-4848 rebound: a manifest that loads but disagrees -> the pin refuses and
+        # the die message names the explicit flag; no automatic fallback.
+        mismatch_rc, mismatch_output, mismatch_events = run_case(helper_ok=False, manifest="loads")
+        self.assertNotEqual(mismatch_rc, 0, mismatch_output)
+        self.assertIn("--execute --break-glass-no-manifest", mismatch_output)
+        self.assertIn("drift", mismatch_output)  # the refusal reason is printed
+        self.assertNotIn("BREAK-GLASS: --break-glass-no-manifest given", mismatch_output)
+        self.assertEqual(
+            [e for e in mismatch_events if e.startswith("helper-args:rollback-staged")
+             and "--break-glass-no-manifest" in e], [])
+        self.assertNotIn("systemctl:--user restart claude-telegram.service", mismatch_events)
+        # The flag forces break-glass args even though the manifest loads.
+        forced_rc, forced_output, forced_events = run_case(
+            helper_ok=True, manifest="loads", extra_args=("--break-glass-no-manifest",)
+        )
+        self.assertEqual(forced_rc, 0, forced_output)
+        self.assertIn("BREAK-GLASS", forced_output)
+        self.assertTrue(any(
+            e.startswith("helper-args:rollback-staged") and "--break-glass-no-manifest" in e
+            and "--manifest " not in e for e in forced_events), forced_events)
+        self.assertFalse(any(e.startswith("helper-args:check-manifest") for e in forced_events))
 
         fail_rc, fail_output, fail_events = run_case(helper_ok=False)
         self.assertNotEqual(fail_rc, 0, fail_output)
@@ -5154,7 +6207,8 @@ approval_mode = "approve"
              patch.object(rc, "_start_runtime", side_effect=mutate_startup), \
              patch.object(rc, "_verify_started_runtime", return_value=None), \
              patch.object(hcr, "_wait_for_codex_ready", return_value="╭───╮\n›\n"), \
-             patch.object(hcr, "_teardown_disposable_tmux_context", return_value=[]):
+             patch.object(hcr, "_teardown_disposable_tmux_context", return_value=[]), \
+             patch.object(hcr, "converge_worker_guard_hook"):  # T-5317: fake binding, no codex binary
             hcr.run_codex_ready_bringup(work_root=work_root, account="claude")
 
         self.assertEqual(_snapshot_fingerprint(_snapshot(config_path)), staged_fingerprint)
@@ -5163,6 +6217,7 @@ approval_mode = "approve"
             "stamp-r25-acceptance-config",
             root / "home" / "claude",
             backend=backend,
+            manifest=Manifest.load(REPO_ROOT / "instance.yaml"),
         )
         self.assertEqual(rollback_code, 0, rollback_summary)
 
@@ -5176,7 +6231,7 @@ approval_mode = "approve"
         backend.seed_file(operation.target, prior)
         prior_fingerprint = backend.entries[operation.target]["fingerprint"]
 
-        mutation, _observed = backend.execute(operation, EXECUTION_CONTEXT_ALL_IN_ONE)
+        mutation, _observed = backend.execute(operation, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertTrue(mutation.changed)
         self.assertNotEqual(backend.entries[operation.target]["fingerprint"], prior_fingerprint)
         self.assertTrue(backend.can_rollback(mutation).ok)
@@ -5268,15 +6323,15 @@ approval_mode = "approve"
 
     def test_second_persona_disposable_codex_seat_has_no_persona_branch(self) -> None:
         recovery = self.plan("recovery", "codex")
-        cairn = self.plan("cairn")
-        self.assertEqual(cairn.selected_harness, "codex")
-        self.assertEqual(cairn.account, "codex")
+        consultant = self.plan("consultant")
+        self.assertEqual(consultant.selected_harness, "codex")
+        self.assertEqual(consultant.account, "codex")
         recovery_service = self.operation(recovery, "connective.service-unit").desired["content"]
-        cairn_service = self.operation(cairn, "connective.service-unit").desired["content"]
+        consultant_service = self.operation(consultant, "connective.service-unit").desired["content"]
         recovery_body = "\n".join(recovery_service.splitlines()[2:])
-        cairn_body = "\n".join(cairn_service.splitlines()[2:])
-        self.assertEqual(recovery_body, cairn_body)
-        self.assertNotIn("recovery", cairn_body.lower())
+        consultant_body = "\n".join(consultant_service.splitlines()[2:])
+        self.assertEqual(recovery_body, consultant_body)
+        self.assertNotIn("recovery", consultant_body.lower())
 
     def test_codex_telegram_mcp_preflight_accepts_additive_tools_policy(self) -> None:
         operation = self.codex_telegram_mcp_operation()
@@ -5292,7 +6347,7 @@ approval_mode = "approve"
         original = self.additive_mcp_registration(operation)
         backend.seed_file(operation.target, original, "0600")
         before = dict(backend.entries[operation.target])
-        mutation, evidence = backend.execute(operation, EXECUTION_CONTEXT_ALL_IN_ONE)
+        mutation, evidence = backend.execute(operation, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertFalse(mutation.changed)
         self.assertTrue(evidence.ok)
         self.assertEqual(backend.entries[operation.target], before)
@@ -5303,7 +6358,7 @@ approval_mode = "approve"
         original = self.additive_mcp_registration(operation)
         config.write_text(original, encoding="utf-8")
         local_operation = dataclasses.replace(operation, target=str(config))
-        mutation, evidence = LocalHostBackend().execute(local_operation, EXECUTION_CONTEXT_ALL_IN_ONE)
+        mutation, evidence = LocalHostBackend().execute(local_operation, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertFalse(mutation.changed)
         self.assertTrue(evidence.ok)
         self.assertEqual(mutation.before["appended_suffix"], "")
@@ -5319,14 +6374,14 @@ approval_mode = "approve"
         self.assertEqual(result.classification, "conflicting")
         before = dict(backend.entries[operation.target])
         with self.assertRaises(OperationFailed):
-            backend.execute(operation, EXECUTION_CONTEXT_ALL_IN_ONE)
+            backend.execute(operation, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertEqual(backend.entries[operation.target], before)
 
         config = self.root / "local-config-bad.toml"
         config.write_text(bad, encoding="utf-8")
         local_operation = dataclasses.replace(operation, target=str(config))
         with self.assertRaises(OperationFailed):
-            LocalHostBackend().execute(local_operation, EXECUTION_CONTEXT_ALL_IN_ONE)
+            LocalHostBackend().execute(local_operation, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertEqual(config.read_text(encoding="utf-8"), bad)
 
     def test_fixture_only_proof_cannot_satisfy_live_acceptance(self) -> None:
@@ -5438,7 +6493,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
     def _write_manifest(self, block) -> Manifest:
         data = _manifest_dict()
         data["roles"]["sub-orchestrator-2"] = {
-            "persona": "atlas",
+            "persona": "artisan",
             "account": "suborch2",
             "harness": "claude-code",
         }
@@ -5449,11 +6504,11 @@ class ClaudeMcpServerCase(unittest.TestCase):
         )
         return Manifest.load(self.manifest_path)
 
-    def _atlas_block(self, server=None):
+    def _artisan_block(self, server=None):
         return {
             "schema": CLAUDE_MCP_SERVERS_SCHEMA,
             "personas": {
-                "atlas": {
+                "artisan": {
                     "account": "suborch2",
                     "scope": "user",
                     "servers": {"mailbox": server or _claude_mcp_server_cfg()},
@@ -5462,8 +6517,8 @@ class ClaudeMcpServerCase(unittest.TestCase):
         }
 
     def _ops(self, server=None):
-        manifest = self._write_manifest(self._atlas_block(server))
-        plan = self.installer.plan(manifest, "atlas", root=self.root / "proj")
+        manifest = self._write_manifest(self._artisan_block(server))
+        plan = self.installer.plan(manifest, "artisan", root=self.root / "proj")
         check = next(
             op for op in plan.operations if op.operation_id == "claude-mcp.check.mailbox"
         )
@@ -5498,7 +6553,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
         block = {
             "schema": CLAUDE_MCP_SERVERS_SCHEMA,
             "personas": {
-                "atlas": {
+                "artisan": {
                     "account": "suborch2",
                     "scope": "user",
                     "servers": {"rogue-server": _claude_mcp_server_cfg()},
@@ -5510,11 +6565,11 @@ class ClaudeMcpServerCase(unittest.TestCase):
         self.assertIn("allowlist", str(ctx.exception))
 
     def test_allowlist_rejects_persona_not_allowlisted_for_server(self) -> None:
-        # pantheon-mcp-codex is allowlisted only for orchestrator, not atlas.
+        # pantheon-mcp-codex is allowlisted only for orchestrator, not artisan.
         block = {
             "schema": CLAUDE_MCP_SERVERS_SCHEMA,
             "personas": {
-                "atlas": {
+                "artisan": {
                     "account": "suborch2",
                     "scope": "user",
                     "servers": {"pantheon-mcp-codex": _claude_mcp_server_cfg()},
@@ -5525,7 +6580,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
             parse_claude_mcp_block(block)
 
     def test_parser_rejects_inline_secret_env_key(self) -> None:
-        block = self._atlas_block(
+        block = self._artisan_block(
             _claude_mcp_server_cfg(env={"API_KEY": "sk-leaked"})
         )
         with self.assertRaises(ManifestError) as ctx:
@@ -5533,18 +6588,18 @@ class ClaudeMcpServerCase(unittest.TestCase):
         self.assertIn("credential", str(ctx.exception))
 
     def test_parser_rejects_non_user_scope(self) -> None:
-        block = self._atlas_block()
-        block["personas"]["atlas"]["scope"] = "project"
+        block = self._artisan_block()
+        block["personas"]["artisan"]["scope"] = "project"
         with self.assertRaises(ManifestError):
             parse_claude_mcp_block(block)
 
     def test_parser_rejects_non_stdio_type(self) -> None:
-        block = self._atlas_block(_claude_mcp_server_cfg(type="http"))
+        block = self._artisan_block(_claude_mcp_server_cfg(type="http"))
         with self.assertRaises(ManifestError):
             parse_claude_mcp_block(block)
 
     def test_parser_rejects_unknown_schema(self) -> None:
-        block = self._atlas_block()
+        block = self._artisan_block()
         block["schema"] = "wrong/v9"
         with self.assertRaises(ManifestError):
             parse_claude_mcp_block(block)
@@ -5555,7 +6610,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
                 {
                     "schema": CLAUDE_MCP_SERVERS_SCHEMA,
                     "personas": {
-                        "atlas": {
+                        "artisan": {
                             "account": "suborch2",
                             "scope": "user",
                             "servers": {"rogue": _claude_mcp_server_cfg()},
@@ -5565,11 +6620,11 @@ class ClaudeMcpServerCase(unittest.TestCase):
             )
 
     def test_account_mismatch_raises_at_plan_time(self) -> None:
-        block = self._atlas_block()
-        block["personas"]["atlas"]["account"] = "wrong-account"
+        block = self._artisan_block()
+        block["personas"]["artisan"]["account"] = "wrong-account"
         manifest = self._write_manifest(block)
         with self.assertRaises(ManifestError) as ctx:
-            self.installer.plan(manifest, "atlas", root=self.root / "proj")
+            self.installer.plan(manifest, "artisan", root=self.root / "proj")
         self.assertIn("does not match bound account", str(ctx.exception))
 
     def test_real_instance_manifest_parses(self) -> None:
@@ -5577,7 +6632,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
         parsed = parse_claude_mcp_block(manifest.installer["claude_mcp_servers"])
         self.assertEqual(parsed["orchestrator"]["account"], "claude")
         self.assertIn("pantheon-mcp-codex", parsed["orchestrator"]["servers"])
-        self.assertEqual(sorted(parsed["atlas"]["servers"]), ["mailbox"])
+        self.assertEqual(sorted(parsed["artisan"]["servers"]), ["mailbox"])
 
     # --- check op (read-only audit) ---------------------------------------
 
@@ -5613,7 +6668,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
         check, _ = self._ops()
         backend = SimulatedHostBackend()
         before_entries = dict(backend.entries)
-        mutation, _ = backend.execute(check, EXECUTION_CONTEXT_ALL_IN_ONE)
+        mutation, _ = backend.execute(check, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertFalse(mutation.changed)
         self.assertEqual(backend.entries, before_entries)
 
@@ -5622,7 +6677,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
     def test_register_backfills_empty_surface(self) -> None:
         _, register = self._ops()
         backend = SimulatedHostBackend()
-        mutation, evidence = backend.execute(register, EXECUTION_CONTEXT_ALL_IN_ONE)
+        mutation, evidence = backend.execute(register, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertTrue(mutation.changed)
         self.assertTrue(evidence.ok)
         servers = json.loads(
@@ -5633,9 +6688,9 @@ class ClaudeMcpServerCase(unittest.TestCase):
     def test_register_is_idempotent(self) -> None:
         _, register = self._ops()
         backend = SimulatedHostBackend()
-        first, _ = backend.execute(register, EXECUTION_CONTEXT_ALL_IN_ONE)
+        first, _ = backend.execute(register, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertTrue(first.changed)
-        second, _ = backend.execute(register, EXECUTION_CONTEXT_ALL_IN_ONE)
+        second, _ = backend.execute(register, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertFalse(second.changed)
 
     def test_register_fails_closed_on_conflict(self) -> None:
@@ -5647,7 +6702,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
             {"mailbox": _claude_mcp_server_cfg(command="/usr/bin/evil")},
         )
         with self.assertRaises(OperationFailed):
-            backend.execute(register, EXECUTION_CONTEXT_ALL_IN_ONE)
+            backend.execute(register, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
 
     def test_register_preflight_refuses_conflict(self) -> None:
         _, register = self._ops()
@@ -5664,7 +6719,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
     def test_register_rollback_removes_added_server(self) -> None:
         _, register = self._ops()
         backend = SimulatedHostBackend()
-        mutation, _ = backend.execute(register, EXECUTION_CONTEXT_ALL_IN_ONE)
+        mutation, _ = backend.execute(register, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertTrue(mutation.changed)
         can = backend.can_rollback(mutation)
         self.assertTrue(can.ok)
@@ -5694,7 +6749,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
         target = Path(register.target)
         target.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
         backend = _CapturingClaudeMcpBackend()
-        mutation, evidence = backend.execute(register, EXECUTION_CONTEXT_ALL_IN_ONE)
+        mutation, evidence = backend.execute(register, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertTrue(mutation.changed)
         self.assertTrue(evidence.ok)
         self.assertEqual(len(backend.add_calls), 1)
@@ -5713,7 +6768,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
             encoding="utf-8",
         )
         backend = _CapturingClaudeMcpBackend()
-        mutation, _ = backend.execute(register, EXECUTION_CONTEXT_ALL_IN_ONE)
+        mutation, _ = backend.execute(register, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertFalse(mutation.changed)
         self.assertEqual(backend.add_calls, [])
 
@@ -5728,7 +6783,7 @@ class ClaudeMcpServerCase(unittest.TestCase):
         )
         backend = _CapturingClaudeMcpBackend()
         with self.assertRaises(OperationFailed):
-            backend.execute(register, EXECUTION_CONTEXT_ALL_IN_ONE)
+            backend.execute(register, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
         self.assertEqual(backend.add_calls, [])
 
     def test_live_register_rollback_shells_out_remove(self) -> None:
@@ -5737,8 +6792,8 @@ class ClaudeMcpServerCase(unittest.TestCase):
         target = Path(register.target)
         target.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
         backend = _CapturingClaudeMcpBackend()
-        mutation, _ = backend.execute(register, EXECUTION_CONTEXT_ALL_IN_ONE)
-        backend.rollback_mutation(mutation)
+        mutation, _ = backend.execute(register, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
+        backend.rollback_mutation(mutation, allowed_roots=(str(self.root),))
         self.assertEqual(len(backend.remove_calls), 1)
         name, home, scope = backend.remove_calls[0]
         self.assertEqual(name, "mailbox")
@@ -5754,7 +6809,419 @@ class ClaudeMcpServerCase(unittest.TestCase):
         )
         backend = _CapturingClaudeMcpBackend(fail_add=True)
         with self.assertRaises(OperationFailed):
-            backend.execute(register, EXECUTION_CONTEXT_ALL_IN_ONE)
+            backend.execute(register, _with_roots(EXECUTION_CONTEXT_ALL_IN_ONE, self.root))
+
+
+class ManifestDocumentCacheCase(unittest.TestCase):
+    """T-3637 purpose, T-4298 mechanism: `_manifest_document` parses instance.yaml
+    once per distinct file CONTENT (agent_role_map's content-keyed cache).
+
+    Pins the PURPOSE the T-3637 cache exists for (repeat calls against unchanged
+    content must NOT re-parse; that is what keeps the fixture-heavy suite
+    tractable) and the freshness it must never trade away: any content change is
+    re-parsed, including a same-size rewrite inside one mtime tick, which the old
+    (path, mtime_ns, size) key served stale (57/200 reproduced, T-4298). Also
+    pins the ManifestError mapping: missing / unreadable / malformed ->
+    "<path>: cannot reload manifest document: <exc>"; non-mapping ->
+    "<path>: root must be a mapping"; invalid UTF-8 propagates uncaught.
+    """
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.root = Path(self.temp.name)
+        self.addCleanup(self.temp.cleanup)
+        self.addCleanup(self._drop_cache_entries)
+
+    def _drop_cache_entries(self) -> None:
+        prefix = os.path.abspath(self.root) + os.sep
+        for key in [k for k in _arm._MANIFEST_CACHE if k.startswith(prefix)]:
+            _arm._MANIFEST_CACHE.pop(key, None)
+
+    @staticmethod
+    def _write_manifest(path: Path, instance_id: str = "test") -> None:
+        path.write_text(
+            f"manifest_version: 2\ninstance:\n  id: {instance_id}\nroles:\n  worker:\n    persona: p\n"
+            "    account: p\n    harness: claude\n"
+            "persona_installer:\n  schema: pantheon-persona-install/v1\n"
+            "  security:\n    credential_mode: references-only\n    prohibit_auth_copy: true\n",
+            encoding="utf-8",
+        )
+
+    def _make_manifest(self, path: Path) -> Manifest:
+        # We only need the .path attribute for `_manifest_document`; construct
+        # a Manifest by hand rather than round-tripping through Manifest.load
+        # (which is fine but slower — this test focuses on the parse cache).
+        return Manifest(path=path, version=2, instance_id="test", installer={}, roles={})
+
+    def _counting_yaml_load(self):
+        # yaml.load is the parse entry point on both paths (yaml.safe_load calls
+        # it; agent_role_map._parse_manifest calls it directly), so counting it
+        # is an honest parse count whatever loader class is in use.
+        calls = {"n": 0}
+        real_load = yaml.load
+
+        def counting(*args, **kwargs):
+            calls["n"] += 1
+            return real_load(*args, **kwargs)
+
+        return calls, patch.object(yaml, "load", counting)
+
+    def test_repeat_call_same_content_parses_once(self) -> None:
+        path = self.root / "instance.yaml"
+        self._write_manifest(path)
+        manifest = self._make_manifest(path)
+        calls, patcher = self._counting_yaml_load()
+        with patcher:
+            docs = [_pim._manifest_document(manifest) for _ in range(5)]
+        self.assertEqual(calls["n"], 1, "5 calls on unchanged content must parse once")
+        for doc in docs[1:]:
+            self.assertIs(doc, docs[0])
+
+    def test_content_change_reparses(self) -> None:
+        path = self.root / "instance.yaml"
+        self._write_manifest(path, instance_id="first")
+        manifest = self._make_manifest(path)
+        calls, patcher = self._counting_yaml_load()
+        with patcher:
+            first = _pim._manifest_document(manifest)
+            self._write_manifest(path, instance_id="second-longer")
+            second = _pim._manifest_document(manifest)
+            again = _pim._manifest_document(manifest)
+        self.assertEqual(first["instance"]["id"], "first")
+        self.assertEqual(second["instance"]["id"], "second-longer")
+        self.assertIs(again, second)
+        self.assertEqual(calls["n"], 2, "one parse per distinct content")
+
+    def test_same_size_rewrite_with_pinned_mtime_is_observed(self) -> None:
+        # Deterministic form of the race below: same size AND the mtime restored
+        # via os.utime, so a (path, mtime_ns, size) key cannot see the change on
+        # any run; only a content key can.
+        path = self.root / "instance.yaml"
+        manifest = self._make_manifest(path)
+        self._write_manifest(path, instance_id="aaaa")
+        st = path.stat()
+        self.assertEqual(_pim._manifest_document(manifest)["instance"]["id"], "aaaa")
+        self._write_manifest(path, instance_id="bbbb")
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        after = path.stat()
+        self.assertEqual((after.st_size, after.st_mtime_ns), (st.st_size, st.st_mtime_ns))
+        self.assertEqual(_pim._manifest_document(manifest)["instance"]["id"], "bbbb")
+
+    def test_same_size_rewrite_race_never_stale(self) -> None:
+        # T-4298 regression: back-to-back same-size rewrites, NO utime. The old
+        # (path, mtime_ns, size) key served the previous document whenever both
+        # writes landed in one mtime tick (57/200 stale reproduced).
+        # A tiny document keeps the parse between the two writes short, so the
+        # writes routinely share an mtime tick (the old key went stale ~160/400).
+        path = self.root / "instance.yaml"
+        manifest = self._make_manifest(path)
+        stale = 0
+        for _ in range(200):
+            path.write_text("instance:\n  id: aaaa\n", encoding="utf-8")
+            if _pim._manifest_document(manifest)["instance"]["id"] != "aaaa":
+                stale += 1
+            path.write_text("instance:\n  id: bbbb\n", encoding="utf-8")
+            if _pim._manifest_document(manifest)["instance"]["id"] != "bbbb":
+                stale += 1
+        self.assertEqual(stale, 0, f"{stale}/400 stale reads after a same-size rewrite")
+
+    def test_different_paths_do_not_share_cache_entries(self) -> None:
+        path_a = self.root / "a.yaml"
+        path_b = self.root / "b.yaml"
+        self._write_manifest(path_a, instance_id="alpha")
+        self._write_manifest(path_b, instance_id="beta")
+        first = _pim._manifest_document(self._make_manifest(path_a))
+        second = _pim._manifest_document(self._make_manifest(path_b))
+        self.assertEqual(first["instance"]["id"], "alpha")
+        self.assertEqual(second["instance"]["id"], "beta")
+        self.assertIsNot(first, second)
+
+    def test_missing_file_raises_manifest_error(self) -> None:
+        missing = self.root / "does-not-exist.yaml"
+        manifest = self._make_manifest(missing)
+        with self.assertRaises(_pim.ManifestError) as cm:
+            _pim._manifest_document(manifest)
+        self.assertRegex(
+            str(cm.exception),
+            rf"^{re.escape(str(missing))}: cannot reload manifest document: \[Errno 2\] ",
+        )
+        self.assertIsInstance(cm.exception.__cause__, FileNotFoundError)
+
+    def test_unreadable_malformed_and_non_mapping_error_mapping(self) -> None:
+        path = self.root / "instance.yaml"
+        manifest = self._make_manifest(path)
+        path.mkdir()  # unreadable: IsADirectoryError
+        with self.assertRaises(_pim.ManifestError) as cm:
+            _pim._manifest_document(manifest)
+        self.assertTrue(str(cm.exception).startswith(f"{path}: cannot reload manifest document: "))
+        self.assertIsInstance(cm.exception.__cause__, OSError)
+        path.rmdir()
+        path.write_text("roles: [1, 2\n", encoding="utf-8")
+        with self.assertRaises(_pim.ManifestError) as cm:
+            _pim._manifest_document(manifest)
+        self.assertTrue(str(cm.exception).startswith(f"{path}: cannot reload manifest document: "))
+        self.assertIsInstance(cm.exception.__cause__, yaml.YAMLError)
+        for content in ("", "- a\n", "just a scalar\n"):
+            with self.subTest(content=content):
+                path.write_text(content, encoding="utf-8")
+                with self.assertRaises(_pim.ManifestError) as cm:
+                    _pim._manifest_document(manifest)
+                self.assertEqual(str(cm.exception), f"{path}: root must be a mapping")
+
+    def test_invalid_utf8_propagates_unicode_decode_error(self) -> None:
+        path = self.root / "instance.yaml"
+        path.write_bytes(b"instance: \xff\xfe\n")
+        with self.assertRaises(UnicodeDecodeError):
+            _pim._manifest_document(self._make_manifest(path))
+
+    def test_shared_document_is_not_mutated_by_install_readers(self) -> None:
+        # _manifest_document returns the SHARED cached object (as the T-3637
+        # cache did); its in-module readers only read it. Exercise them and
+        # prove the cache is unchanged.
+        import copy
+
+        path = self.root / "instance.yaml"
+        path.write_text(
+            "harness_runtime:\n  roles:\n    worker:\n      fallbacks: [codex/gpt]\n"
+            "      post_start: [a, b]\n      claude:\n        profile: default\n",
+            encoding="utf-8",
+        )
+        manifest = self._make_manifest(path)
+        binding = _pim.PersonaBinding(role="worker", persona="p", account="p", configured_harness="claude")
+        before = copy.deepcopy(_pim._manifest_document(manifest))
+        _pim._runtime_candidate_refs_for_install(manifest, binding, "claude")
+        _pim._post_start_command_count(manifest, binding)
+        self.assertEqual(_pim._manifest_document(manifest), before)
+
+
+class RoleRuntimeReferencesParseRoutingT4298Case(unittest.TestCase):
+    """T-4298: `_role_runtime_references` parses via agent_role_map's content-keyed
+    cache instead of an uncached safe_load. Pins the PRE-routing contract: missing /
+    unreadable / malformed / non-mapping -> empty frozenset; invalid UTF-8 raises
+    UnicodeDecodeError (uncaught, as before); per-call freshness (a same-size,
+    same-mtime edit is observed); the shared cached document is never mutated.
+    `_manifest_document` shares the same cache (see ManifestDocumentCacheCase)."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.path = Path(self.temp.name) / "instance.yaml"
+        self.manifest = Manifest(path=self.path, version=2, instance_id="t", installer={}, roles={})
+        self.binding = _pim.PersonaBinding(role="worker", persona="p", account="p", configured_harness="claude")
+
+    def _write(self, fallback: str) -> None:
+        self.path.write_text(
+            "harness_runtime:\n  roles:\n    worker:\n      fallbacks:\n"
+            f"        - {fallback}/gpt\n        - 7\n",
+            encoding="utf-8",
+        )
+
+    def _refs(self) -> frozenset[str]:
+        return _pim._role_runtime_references(self.manifest, self.binding)
+
+    def test_failure_inputs_yield_empty(self) -> None:
+        self.assertEqual(self._refs(), frozenset())  # missing (OSError)
+        for label, content in {
+            "malformed (YAMLError)": b"harness_runtime: [1\n",
+            "empty (None)": b"",
+            "non-mapping top level": b"- a\n",
+            "non-mapping runtime": b"harness_runtime: x\n",
+            "role absent": b"harness_runtime:\n  roles:\n    other: {}\n",
+            "fallbacks not a list": b"harness_runtime:\n  roles:\n    worker:\n      fallbacks: codex/x\n",
+        }.items():
+            with self.subTest(label):
+                self.path.write_bytes(content)
+                self.assertEqual(self._refs(), frozenset())
+        self.path.unlink()
+        self.path.mkdir()  # unreadable: IsADirectoryError (OSError)
+        self.assertEqual(self._refs(), frozenset())
+
+    def test_invalid_utf8_still_raises_unicode_decode_error(self) -> None:
+        self.path.write_bytes(b"harness_runtime: \xff\xfe\n")
+        with self.assertRaises(UnicodeDecodeError):
+            self._refs()
+
+    def test_edit_between_calls_observed_same_size_same_mtime(self) -> None:
+        self._write("codex")
+        st = self.path.stat()
+        self.assertEqual(self._refs(), frozenset({"codex/gpt"}))
+        self._write("claud")  # same byte length as "codex"
+        os.utime(self.path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(self.path.stat().st_size, st.st_size)
+        self.assertEqual(self._refs(), frozenset({"claud/gpt"}))
+
+    def test_routed_through_cache_and_never_mutates(self) -> None:
+        import copy
+
+        self._write("codex")
+        with patch.object(_pim.yaml, "safe_load", side_effect=AssertionError("safe_load must not run")):
+            self.assertEqual(self._refs(), frozenset({"codex/gpt"}))
+        before = copy.deepcopy(_arm._parse_manifest(self.path))
+        self._refs()
+        self.assertEqual(_arm._parse_manifest(self.path), before)
+
+
+# Captured from the PRE-split LocalHostBackend.store_receipt at base
+# d46efa800 (T-2917 5a); the split must reproduce these bytes exactly.
+_GOLDEN_RECEIPT_TEXT = (
+    '{\n  "account": "acct",\n  "actor": {\n    "capabilities": "a,b",\n'
+    '    "instance": "i",\n    "persona": "p",\n    "role": "r",\n'
+    '    "uid": "1001"\n  },\n  "created_at": "2026-10-10T00:00:00Z",\n'
+    '  "evidence": [\n    {\n      "detail": "ok",\n      "evidence": {\n'
+    '        "k": "v"\n      },\n      "kind": "mkdir",\n      "layer": 1,\n'
+    '      "ok": true,\n      "operation_id": "op1"\n    }\n  ],\n'
+    '  "harness": "claude",\n  "host": "h",\n  "instance": "inst",\n'
+    '  "mutations": [\n    {\n      "after_fingerprint": "fp",\n'
+    '      "before": {\n        "state": "absent"\n      },\n'
+    '      "changed": true,\n      "kind": "mkdir",\n'
+    '      "operation_id": "op1",\n      "owner": "acct",\n'
+    '      "target": "/x"\n    }\n  ],\n  "persona": "golden-persona",\n'
+    '  "phase": "complete",\n'
+    '  "plan_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",\n'
+    '  "receipt_id": "golden-0001",\n  "role": "role-x",\n'
+    '  "schema": "pantheon-persona-install-receipt/v1",\n  "source": "s"\n}\n'
+)
+_GOLDEN_RECEIPT_SHA256 = "568be556229dd9c018db35143cfdfbe20e3b39eaea222f7f710967461cf21d28"
+
+
+class _RecordingReceiptSink:
+    def __init__(self) -> None:
+        self.phases: list[str] = []
+
+    def store_receipt(self, plan, receipt) -> None:
+        self.phases.append(receipt.phase)
+
+
+class HostBackendReceiptSplitT2917Case(unittest.TestCase):
+    """ORG-052 Unit 5a (T-2917): receipt persistence is split off HostBackend."""
+
+    setUp = InstallerCase.setUp
+    tearDown = InstallerCase.tearDown
+    write_manifest = InstallerCase.write_manifest
+    plan = InstallerCase.plan
+    actor = InstallerCase.actor
+
+    def _golden_receipt(self) -> ApplyReceipt:
+        return ApplyReceipt(
+            schema=_pim.RECEIPT_SCHEMA,
+            receipt_id="golden-0001",
+            phase="complete",
+            plan_digest="a" * 64,
+            instance="inst",
+            persona="golden-persona",
+            role="role-x",
+            account="acct",
+            actor={"uid": "1001", "persona": "p", "role": "r", "instance": "i", "capabilities": "a,b"},
+            mutations=(MutationRecord("op1", "mkdir", "/x", "acct", True, {"state": "absent"}, "fp"),),
+            evidence=(OperationEvidence("op1", 1, "mkdir", True, "ok", {"k": "v"}),),
+            created_at="2026-10-10T00:00:00Z",
+            host="h",
+            harness="claude",
+            source="s",
+        )
+
+    def test_file_receipt_store_bytes_are_golden(self) -> None:
+        receipt_dir = self.root / "receipts"
+        receipt_dir.mkdir()
+        plan = SimpleNamespace(
+            provenance={
+                "receipt_dir": str(receipt_dir),
+                _pim.ALLOWED_TARGET_ROOTS_KEY: str(self.root),
+            }
+        )
+        _pim.FileReceiptStore().store_receipt(plan, self._golden_receipt())
+        path = receipt_dir / "golden-0001.json"
+        self.assertEqual(path.read_text(encoding="utf-8"), _GOLDEN_RECEIPT_TEXT)
+        self.assertEqual(hashlib.sha256(path.read_bytes()).hexdigest(), _GOLDEN_RECEIPT_SHA256)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(sorted(item.name for item in receipt_dir.iterdir()), ["golden-0001.json"])
+
+    def test_no_host_backend_owns_receipt_persistence(self) -> None:
+        self.assertNotIn("store_receipt", vars(_pim.HostBackend))
+        for backend_type in (LocalHostBackend, SimulatedHostBackend):
+            with self.subTest(backend=backend_type.__name__):
+                self.assertFalse(hasattr(backend_type, "store_receipt"))
+        self.assertIn("store_receipt", vars(_pim.ReceiptSink))
+
+    def test_default_receipt_sink_is_closed_per_backend_type(self) -> None:
+        simulated = SimulatedHostBackend()
+        self.assertIs(_pim.default_receipt_sink(simulated), simulated.receipt_sink)
+        self.assertIsInstance(_pim.default_receipt_sink(LocalHostBackend()), _pim.FileReceiptStore)
+        with self.assertRaises(_pim.InstallerError):
+            _pim.default_receipt_sink(object())
+
+    def test_explicit_sink_receives_receipts_instead_of_the_default(self) -> None:
+        plan = self.plan()
+        backend = SimulatedHostBackend()
+        sink = _RecordingReceiptSink()
+        report = self.installer.apply(plan, plan.digest, backend, self.actor(plan), receipt_sink=sink)
+        self.assertEqual(report.status, "applied")
+        self.assertEqual(sink.phases, ["staged", "complete"])
+        self.assertEqual(backend.receipts, {})
+        self.assertNotIn("receipt:staged", backend.events)
+
+    def test_default_simulated_sink_keeps_receipt_event_ordering(self) -> None:
+        plan = self.plan()
+        backend = SimulatedHostBackend()
+        report = self.installer.apply(plan, plan.digest, backend, self.actor(plan))
+        self.assertEqual(report.status, "applied")
+        self.assertEqual(backend.receipt_events, ["receipt:staged", "receipt:complete"])
+        self.assertEqual(len(backend.receipts), 1)
+        self.assertEqual(backend.events[-1], "receipt:complete")
+
+    def test_failed_apply_routes_failed_receipt_to_the_sink(self) -> None:
+        plan = self.plan()
+        activation = next(op for op in plan.operations if op.kind in _pim.ACTIVATION_OPERATION_KINDS)
+        backend = SimulatedHostBackend(fail_operation=activation.operation_id)
+        sink = _RecordingReceiptSink()
+        report = self.installer.apply(plan, plan.digest, backend, self.actor(plan), receipt_sink=sink)
+        self.assertEqual(report.status, "failed")
+        self.assertEqual(sink.phases, ["staged", "failed"])
+        self.assertEqual(backend.receipts, {})
+
+
+# --- T-4963: a '//'-prefixed path survives normpath (POSIX) and is refused ---
+
+
+def test_t4963_lexically_normalize_absolute_refuses_double_slash(tmp_path):
+    import pytest
+
+    with pytest.raises(_pim.OperationFailed):
+        _pim._lexically_normalize_absolute(Path("/" + str(tmp_path) + "/x"))
+
+
+def test_t4963_lexically_normalize_absolute_still_folds(tmp_path):
+    # 3+ leading slashes collapse to one under normpath and stay accepted.
+    assert _pim._lexically_normalize_absolute(Path("//" + str(tmp_path) + "/x")) == tmp_path / "x"
+    assert _pim._lexically_normalize_absolute(tmp_path / "a" / ".." / "b") == tmp_path / "b"
+
+
+def test_t4963_timer_paths_from_desired_refuses_double_slash(tmp_path):
+    import pytest
+
+    timer = "pantheon-persona-consume@t4963.timer"
+    home = "/" + str(tmp_path)  # '//tmp/...': the kernel opens it as tmp_path
+    template = f"{home}/.config/systemd/user/pantheon-persona-consume@.timer"
+    link = f"{home}/.config/systemd/user/timers.target.wants/{timer}"
+    op = SimpleNamespace(
+        kind="timer-enablement-absence-check",
+        target=link,
+        desired={"timer": timer, "canonical_template_path": template, "enablement_link_path": link},
+    )
+    with pytest.raises(_pim.OperationFailed):
+        _pim.LocalHostBackend._timer_enablement_paths_from_desired(None, op)
+
+
+def test_t4963_declared_roots_refuse_double_slash():
+    # Path("//") != Path("/"), so the '/'-root refusal alone let '//' through
+    # whenever plan.root is '/' (the production shape).
+    plan = SimpleNamespace(account="acct", root="/")
+    assert _pim._declared_roots_problem(plan, ["/home/acct"]) is None
+    assert "'//'" in _pim._declared_roots_problem(plan, ["/home/acct", "//"])
+    assert "'//'" in _pim._declared_roots_problem(plan, ["/home/acct", "//etc"])
+    assert "'//'" in _pim._declared_roots_problem(plan, ["//home/acct"])
+    rooted = SimpleNamespace(account="acct", root="//")
+    assert "'//'" in _pim._declared_roots_problem(rooted, ["//home/acct"])
 
 
 if __name__ == "__main__":

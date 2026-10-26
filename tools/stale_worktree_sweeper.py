@@ -10,11 +10,13 @@ disk monitor (T-1324 part a) alerts after the fact; this sweeps the cause.
 It is CONSERVATIVE by construction — it removes a worktree only when ALL hold:
   1. it is NOT the repo's main/canonical checkout;
   2. its path is a throwaway location (default: under /tmp);
-  3. its tracked working tree is CLEAN (no uncommitted changes — `git status
-     --porcelain` empty over tracked files; build artifacts under a gitignored
-     `target/` don't count);
-  4. its HEAD is an ANCESTOR of origin/main (i.e. fully merged) OR its branch is
-     gone — so removing it can never lose unmerged work.
+  3. its working tree is CLEAN: no uncommitted tracked changes AND no untracked,
+     non-ignored files (`git status --porcelain --untracked-files=normal` empty;
+     build artifacts under a gitignored `target/` don't count, but notes or a
+     half-written new file do — T-4675);
+  4. its HEAD is an ANCESTOR of origin/main (i.e. fully merged), OR (T-4674, squash
+     merges) merging HEAD into origin/main would change nothing, so its content is
+     already in main — so removing it can never lose unmerged work.
 
 T-2616 (2026-08-06): a worktree younger than PANTHEON_WORKTREE_MIN_AGE_MIN minutes
 (default 60) is EXEMPT even when 3+4 both hold — a freshly pre-staged agent
@@ -49,6 +51,9 @@ REPOS = [
     ("claude", "/home/claude/pantheon-config"),
     ("claude-research", "/home/claude-research/pantheon-config"),
     ("claude-fallback", "/home/claude-fallback/pantheon-config"),
+    # T-4674: pantheon-pwa clones spawn /tmp agent and review worktrees too.
+    ("claude", "/home/claude/pantheon-pwa"),
+    ("claude-fallback", "/home/claude-fallback/work/pantheon-pwa"),
 ]
 
 # A worktree is "throwaway" (eligible) only if its path starts with one of these.
@@ -170,12 +175,14 @@ def classify(user: str, repo: str, wt: dict) -> tuple[bool, str]:
         )
     elif age_min < MIN_AGE_MIN:
         return False, f"too young ({age_min:.1f}m < {MIN_AGE_MIN:.0f}m threshold)"
-    # Guard 3: tracked working tree must be clean (run git IN the worktree path).
-    st = _run(user, ["git", "-C", path, "status", "--porcelain"])
+    # Guard 3: working tree must be clean (run git IN the worktree path). Untracked
+    # non-ignored files count as dirty; ask for them explicitly (T-4675) so a
+    # `status.showUntrackedFiles=no` config can't silently make scratch sweepable.
+    st = _run(user, ["git", "-C", path, "status", "--porcelain", "--untracked-files=normal"])
     if st.returncode != 0:
         return False, f"status failed (rc={st.returncode})"
     if st.stdout.strip():
-        return False, "dirty (uncommitted tracked changes)"
+        return False, "dirty (uncommitted changes or untracked files)"
     # Guard 4: HEAD merged into origin/main (ancestor) OR branch gone.
     head = wt.get("head")
     if not head:
@@ -183,10 +190,27 @@ def classify(user: str, repo: str, wt: dict) -> tuple[bool, str]:
     anc = _run(user, ["git", "-C", path, "merge-base", "--is-ancestor", head, "origin/main"])
     if anc.returncode == 0:
         return True, "merged (HEAD is ancestor of origin/main)"
-    # Not an ancestor → has commits not in main. Only safe if the branch is GONE
-    # (deleted) AND those commits are still unreachable-from-main → we do NOT remove
-    # (could lose work). Conservative: keep it, surface for human review.
-    return False, "UNMERGED (HEAD not in origin/main) — keep for review"
+    # T-4674: a SQUASH-merged branch is never an ancestor of main, so the test above kept
+    # every post-squash agent/<ticket> worktree forever (pantheon-config squash-merges by
+    # default). Squash-safe test: merging HEAD into origin/main changes nothing, i.e. the
+    # clean merge result IS origin/main's own tree, so all of HEAD's content is already in
+    # main. Extra work after the squash yields a different tree; a conflict (main later
+    # rewrote the same lines) exits non-zero. Both keep the worktree: fail toward keeping.
+    if _content_in_origin_main(user, path, head):
+        return True, "merged (squash: merging HEAD into origin/main changes nothing)"
+    # Has content not in main → could lose work. Conservative: keep, surface for review.
+    return False, "UNMERGED (HEAD's content not in origin/main) — keep for review"
+
+
+def _content_in_origin_main(user: str, path: str, head: str) -> bool:
+    """True iff `git merge-tree --write-tree origin/main <head>` merges cleanly to exactly
+    origin/main's tree (git >= 2.38). Any error or conflict → False (keep)."""
+    mt = _run(user, ["git", "-C", path, "merge-tree", "--write-tree", "origin/main", head])
+    if mt.returncode != 0 or not mt.stdout.strip():
+        return False
+    merged_tree = mt.stdout.split()[0]
+    main_tree = _run(user, ["git", "-C", path, "rev-parse", "origin/main^{tree}"])
+    return main_tree.returncode == 0 and merged_tree == main_tree.stdout.strip()
 
 
 def heal_stale_gc_log(user: str, repo: str, *, clean: bool) -> str | None:

@@ -35,11 +35,17 @@ References:
 from __future__ import annotations
 
 import argparse
+import copy
+import hashlib
 import json
+import os
 import re
 import sys
+import tempfile
 import tomllib
 from collections.abc import Iterable
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -62,6 +68,8 @@ from tools.harness_adapter.types import (
     HarnessSurfaceDescriptors,
     HookCapability,
     InboundRequest,
+    PostStartAssessment,
+    PostStartPaneSample,
     McpDescriptor,
     MemoryDescriptor,
     RoleDescriptor,
@@ -80,8 +88,89 @@ from tools.harness_permission_posture import (
 )
 from tools.harness_adapter.provider_quota import (
     CodexAppServerQuotaObserver,
+    read_codex_app_server_hooks,
     read_codex_app_server_rate_limits,
 )
+
+
+# ---------------------------------------------------------------------------
+# T-4862: codex usage-limit banner classifier.
+#
+# Codex has no structural cap signal in its TUI, only the rendered banner
+# "You've hit your usage limit ... try again at Oct 14th 4:13 AM".
+# The parsed instant is a HINT for when to look again, never a trusted reset.
+#
+# Residual risk (accepted, bounded -- same posture as the claude T-4047
+# decision): the banner is matched only inside the pane's BOTTOM REGION
+# (trailing _CODEX_CAP_BOTTOM_LINES lines), and the mid-session caller
+# additionally requires two consecutive samples with an identical
+# render-span hash. Prose that quotes the banner verbatim as the LAST lines of
+# the pane, across two polls, can still classify; a quote followed by further
+# output cannot. Post-start classification is baseline-diffed, so a banner
+# already in scrollback at launch does not classify.
+# ---------------------------------------------------------------------------
+_CODEX_CAP_BOTTOM_LINES = 20
+_CODEX_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_CODEX_CAP_RE = re.compile(r"you['\u2019]ve hit your usage limit", re.IGNORECASE)
+_CODEX_RESET_RE = re.compile(
+    r"try again at\s+([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?(?:,?\s*(\d{4}))?,?\s+"
+    r"(\d{1,2}):(\d{2})\s*([AaPp][Mm])",
+    re.IGNORECASE,
+)
+_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), start=1)}
+
+
+@dataclass(frozen=True)
+class CodexUsageLimit:
+    cap_kind: str
+    reset_at: datetime | None
+    reset_source: str | None
+    render_span_sha256: str
+
+
+def _codex_bottom_region(text: str) -> str:
+    normalized = _CODEX_ANSI_RE.sub("", text).replace("\r", "").rstrip()
+    return "\n".join(normalized.splitlines()[-_CODEX_CAP_BOTTOM_LINES:])
+
+
+def _parse_codex_reset(region: str, *, now: datetime, tz: tzinfo | None) -> datetime | None:
+    match = _CODEX_RESET_RE.search(region)
+    if match is None:
+        return None
+    month = _MONTHS.get(match.group(1)[:3].lower())
+    if month is None:
+        return None
+    zone = tz or datetime.now().astimezone().tzinfo or timezone.utc
+    try:
+        hour12 = int(match.group(4))
+        if not 1 <= hour12 <= 12:
+            return None
+        hour = hour12 % 12 + (12 if match.group(6).lower() == "pm" else 0)
+        day, minute = int(match.group(2)), int(match.group(5))
+        year = int(match.group(3)) if match.group(3) else now.astimezone(zone).year
+        candidate = datetime(year, month, day, hour, minute, tzinfo=zone)
+        if not match.group(3) and candidate < now - timedelta(days=1):
+            candidate = datetime(year + 1, month, day, hour, minute, tzinfo=zone)
+    except (ValueError, OverflowError):
+        return None
+    return candidate.astimezone(timezone.utc)
+
+
+def classify_codex_usage_limit(text: str, *, now: datetime, tz: tzinfo | None = None) -> CodexUsageLimit | None:
+    """Classify a pane sample as a codex usage-limit banner, or None."""
+    if not text:
+        return None
+    region = _codex_bottom_region(text)
+    if _CODEX_CAP_RE.search(region) is None:
+        return None
+    reset_at = _parse_codex_reset(region, now=now, tz=tz)
+    return CodexUsageLimit(
+        cap_kind="usage-limit",
+        reset_at=reset_at,
+        reset_source="parsed" if reset_at is not None else None,
+        render_span_sha256=hashlib.sha256(region.encode("utf-8")).hexdigest(),
+    )
 
 
 class CodexHarnessAdapter(PantheonHarnessAdapter):
@@ -412,6 +501,45 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
             },
         )
 
+    def assess_post_start_readiness(
+        self,
+        *,
+        harness: str,
+        profile: str,
+        baseline: PostStartPaneSample,
+        samples: Iterable[PostStartPaneSample],
+        now: datetime | None = None,
+    ) -> PostStartAssessment:
+        """T-4862: fail closed on a codex usage-limit banner that appeared AFTER
+        launch (baseline-diffed); otherwise defer to the generic assessment."""
+        sample_tuple = tuple(samples)
+        resolved_now = now if now is not None else datetime.now(timezone.utc)
+        baseline_hit = classify_codex_usage_limit(baseline.text, now=resolved_now)
+        for sample in sample_tuple:
+            if sample.sha256 == baseline.sha256:
+                continue
+            hit = classify_codex_usage_limit(sample.text, now=resolved_now)
+            if hit is None or (baseline_hit is not None and hit.render_span_sha256 == baseline_hit.render_span_sha256):
+                continue
+            return PostStartAssessment(
+                schema="pantheon-harness-post-start-assessment/v1",
+                harness=harness,
+                profile=profile,
+                status="subscription-cap",
+                cause="codex-usage-limit-banner",
+                pattern_id="codex-usage-limit-banner",
+                baseline_sha256=baseline.sha256,
+                capture_count=len(sample_tuple),
+                changed_capture_indices=tuple(
+                    item.capture_index for item in sample_tuple if item.sha256 != baseline.sha256
+                ),
+                cap_kind=hit.cap_kind,
+                reset_at=hit.reset_at,
+            )
+        return super().assess_post_start_readiness(
+            harness=harness, profile=profile, baseline=baseline, samples=sample_tuple, now=now
+        )
+
     def quota_observer(self, state_dir: Path) -> CodexAppServerQuotaObserver:
         del state_dir
         profile = self.launch.profile if self.launch else "legacy"
@@ -654,7 +782,10 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
           (1) approval_policy="never" — silences model-generated *shell/command*
               prompts ONLY. ``trust_level`` alone does NOT silence prompts
               (live-proven, Recovery harvest §B2 + §3).
-          (2) sandbox_mode="workspace-write" + network_access=true — ORG-031 §ii.
+          (2) sandbox_mode="danger-full-access" — ORG-031 §(ii) as amended
+              (the operator TG 11733/11741/11742, T-4929): every harness runs fully
+              unlocked; the unix account is the security boundary, not the
+              harness sandbox. No workspace-write sub-config applies.
           (3) [mcp_servers.<srv>.tools.<tool>] approval_mode="approve" — a SEPARATE
               per-MCP-tool gate, INDEPENDENT of approval_policy. Live find
               2026-06-09 (T-1033): under approval_policy="never", a freshly-
@@ -667,19 +798,15 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
         requirements.toml, or --dangerously-bypass-hook-trust).  Pre-answered
         at bringup per the wedge-bypass script.
 
-        Shape (ORG-031 §ii ratified config + the per-tool MCP gate):
+        Shape (ORG-031 §(ii) as amended + the per-tool MCP gate):
             {"approval_policy": "never",
-             "sandbox_mode": "workspace-write",
-             "sandbox_workspace_write": {"network_access": True},
+             "sandbox_mode": "danger-full-access",
              "mcp_tool_approval": "approve",  # per [mcp_servers.*.tools.*]
              "hook_trust": "--dangerously-bypass-hook-trust"}
         """
         return {
             "approval_policy": "never",
-            "sandbox_mode": "workspace-write",
-            "sandbox_workspace_write": {
-                "network_access": True,
-            },
+            "sandbox_mode": "danger-full-access",
             # Per-MCP-tool gate, independent of approval_policy (T-1033 live find):
             # set [mcp_servers.<srv>.tools.<tool>] approval_mode="approve" per tool.
             "mcp_tool_approval": "approve",
@@ -692,26 +819,25 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
 
     @property
     def sandbox_config(self) -> dict[str, Any]:
-        """Codex sandbox and approval policy config (ORG-031 §ii, live-verified).
+        """Codex sandbox and approval policy config (ORG-031 §(ii) as amended).
 
-        approval_policy × sandbox_mode (2 orthogonal axes) +
-        sandbox_workspace_write.{writable_roots, network_access}.
+        approval_policy × sandbox_mode (2 orthogonal axes). Full-unlock default
+        per the operator TG 11733/11742 (T-4929); see HarnessAdapter.approval_defaults
+        for the principle. ``sandbox_workspace_write`` only applies to
+        workspace-write and is not part of the default.
 
-        Ratified config (ORG-031 §ii):
+        Ratified config:
             approval_policy="never"
-            sandbox_mode="workspace-write"
-            [sandbox_workspace_write]
-            network_access=true
+            sandbox_mode="danger-full-access"
 
         Backup of pre-unattended config at: ~/.codex/config.toml.bak.preunattended
         """
         return {
             "harness": "codex",
             "approval_policy": "never",
-            "sandbox_mode": "workspace-write",
-            "sandbox_workspace_write": {"network_access": True},
+            "sandbox_mode": "danger-full-access",
             "config_backup": "~/.codex/config.toml.bak.preunattended",
-            "ratified_by": "ORG-031 §ii",
+            "ratified_by": "ORG-031 §(ii) as amended; the operator TG 11733/11742",
         }
 
     @property
@@ -1323,6 +1449,710 @@ def ensure_model_migration_prompts_hidden(
     return True
 
 
+WORKER_GUARD_MATCHER = "Bash|apply_patch"
+# T-4395: Codex FAILS OPEN on a hook timeout (T-4321's live test), so this must sit well above
+# the guard's own fail-closed clock (worker_guard_impl.DECIDE_DEADLINE_S, T-4389): the guard's
+# deny then always wins the race. tools/test_worker_guard_shim.py pins the margin.
+WORKER_GUARD_TIMEOUT_S = 30
+# Bound on every app-server hooks/list this module runs, so a wedged app-server cannot hang a
+# codex launch (prepare_codex_launch, reached from runtime_controller._start_runtime through
+# CodexIntegration.prepare_launch, calls ensure_worker_guard_hook before launch; T-5011 PR-A).
+_HOOKS_LIST_TIMEOUT_S = 15.0
+
+
+def worker_guard_command(account_home: Path) -> str:
+    """The PreToolUse worker-guard command for a seat (codex-config snippet).
+
+    ``-I`` (T-4397 part A): an isolated interpreter ignores PYTHON* env vars and the user
+    site-packages, so a worker-written usercustomize/sitecustomize/.pth cannot run before the
+    guard. Decision-identical to the plain invocation (T-4395 smoke: 1040 payloads, 0 diffs).
+    """
+    return f"/usr/bin/python3 -I {account_home}/pantheon-config/tools/hooks/worker-guard.py"
+
+
+def _legacy_worker_guard_commands(account_home: Path) -> tuple[str, ...]:
+    """Earlier canonical guard commands (codex-config da8c863, T-4144/T-4160/T-4166), upgraded in place."""
+    return (f"/usr/bin/python3 {account_home}/pantheon-config/tools/hooks/worker-guard.py",)
+
+
+_WORKER_GUARD_BLOCK = """
+# PreToolUse worker-guard (T-4144 / T-4166): the fleet's SUBAGENT denies on this
+# seat's codex runtime. codex 0.147 ships multi_agent default-on and sets agent_type
+# only on a spawned subagent's tool calls, so the main loop is never restricted.
+# Seeded by tools.harness_adapter.codex.ensure_worker_guard_hook; source of truth is
+# codex-config templates/config.toml.snippet. python3 -I (T-4397 A); timeout 30 sits
+# above the guard's own fail-closed deadline, since a codex hook timeout fails open (T-4395).
+[[hooks.PreToolUse]]
+matcher = "Bash|apply_patch"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = {command}
+timeout = 30
+"""
+
+
+def _worker_guard_log(message: str) -> None:
+    """Loud, greppable trail on stderr (the controller's log) for every upgrade/restore (T-4395)."""
+    print(f"[worker-guard-hook] {message}", file=sys.stderr, flush=True)
+
+
+def _guard_positions(parsed: dict[str, Any], command: str) -> list[tuple[int, int]]:
+    """(group, hook) indices of `command` under [[hooks.PreToolUse]]: codex's key suffix."""
+    groups = (parsed.get("hooks") or {}).get("PreToolUse") or []
+    return [
+        (g, h)
+        for g, group in enumerate(groups if isinstance(groups, list) else [])
+        for h, hook in enumerate((group or {}).get("hooks") or [])
+        if isinstance(hook, dict) and hook.get("command") == command
+    ]
+
+
+def _guard_hook(parsed: dict[str, Any], pos: tuple[int, int]) -> tuple[dict[str, Any], dict[str, Any]]:
+    group = parsed["hooks"]["PreToolUse"][pos[0]]
+    return group, group["hooks"][pos[1]]
+
+
+def _key_config_path(codex_home: Path) -> Path:
+    """The config path inside codex's hook keys: the REALPATH of CODEX_HOME + "/config.toml".
+
+    Live-verified on codex-cli 0.147 (T-4395 r1): a symlinked CODEX_HOME is resolved, a
+    symlinked config.toml itself is not.
+    """
+    return Path(os.path.realpath(codex_home)) / "config.toml"
+
+
+def _guard_key(codex_home: Path, pos: tuple[int, int]) -> str:
+    """codex's hook key: position-based, NOT derived from the command (live-verified)."""
+    return f"{_key_config_path(codex_home)}:pre_tool_use:{pos[0]}:{pos[1]}"
+
+
+def _guard_definition_current(parsed: dict[str, Any], pos: tuple[int, int], command: str) -> bool:
+    group, hook = _guard_hook(parsed, pos)
+    return (hook.get("command") == command and hook.get("type") == "command"
+            and hook.get("timeout") == WORKER_GUARD_TIMEOUT_S
+            and group.get("matcher") == WORKER_GUARD_MATCHER)
+
+
+def _stored_trusted_hash(parsed: dict[str, Any], key: str) -> str | None:
+    entry = ((parsed.get("hooks") or {}).get("state") or {}).get(key)
+    value = entry.get("trusted_hash") if isinstance(entry, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
+def _toml_inline(value: Any) -> str | None:
+    if isinstance(value, (str, bool, int, float)):
+        return _toml_scalar(value)
+    if isinstance(value, list):
+        items = [_toml_inline(v) for v in value]
+        return None if any(i is None for i in items) else "[" + ", ".join(items) + "]"
+    return None
+
+
+def _toml_key(key: str) -> str:
+    return key if re.fullmatch(r"[A-Za-z0-9_-]+", key) else _toml_scalar(key)
+
+
+def _guard_definition_toml(parsed: dict[str, Any], pos: tuple[int, int]) -> str | None:
+    """A standalone config holding EXACTLY the guard's definition as it sits in `parsed`: its
+    group's own keys (the matcher) and the guard hook with every key verbatim (T-4395 r1: codex's
+    currentHash covers the matcher and any extra hook key, e.g. statusMessage). Sibling hooks of
+    the group are left out (the hash is per hook). None when a value can't be rendered exactly;
+    the round-trip below proves the rendering."""
+    group, hook = _guard_hook(parsed, pos)
+    group_keys = {k: v for k, v in group.items() if k != "hooks"}
+    lines = ["[[hooks.PreToolUse]]"]
+    for table, items in ((None, group_keys), ("[[hooks.PreToolUse.hooks]]", hook)):
+        if table:
+            lines += ["", table]
+        for k, v in items.items():
+            rendered = _toml_inline(v)
+            if rendered is None:
+                return None
+            lines.append(f"{_toml_key(k)} = {rendered}")
+    text = "\n".join(lines) + "\n"
+    [rt_group] = tomllib.loads(text)["hooks"]["PreToolUse"]
+    rt_hooks = rt_group.pop("hooks")
+    return text if (rt_group, rt_hooks) == (group_keys, [hook]) else None
+
+
+def _precompute_guard_hash(definition: str, command: str, *, executable: Path, account_home: Path,
+                           read_hooks) -> str | None:
+    """codex's currentHash for `definition` (the EXACT guard definition about to be written),
+    read from a SCRATCH CODEX_HOME (T-4395).
+
+    Live-verified on codex-cli 0.147.0: the hash covers the hook definition (command, timeout,
+    matcher, any extra hook key), not the config path, comments or the hook's position, so a
+    scratch home holding that same definition yields the hash the real home will report.
+    Reading it first lets the block and its trusted_hash land in ONE write: never a window in
+    which the real home holds an untrusted/"modified" guard (codex skips those without
+    --dangerously-bypass-hook-trust, i.e. fails open). None on any failure.
+    """
+    with tempfile.TemporaryDirectory(prefix="codex-wg-hash-") as tmp:
+        scratch = Path(tmp)
+        (scratch / "config.toml").write_text(definition, encoding="utf-8")
+        try:
+            hooks = read_hooks(executable, codex_home=scratch, cwd=account_home,
+                               timeout=_HOOKS_LIST_TIMEOUT_S)
+        except Exception as exc:  # noqa: BLE001 - best-effort read, never fatal to a launch
+            _worker_guard_log(f"hash precompute failed: {exc!r}")
+            return None
+        prefix = f"{_key_config_path(scratch)}:pre_tool_use:"
+        matches = [
+            h for h in hooks or []
+            if h.get("command") == command and h.get("eventName") == "preToolUse"
+            and str(h.get("key") or "").startswith(prefix)
+        ]
+    digest = matches[0].get("currentHash") if len(matches) == 1 else None
+    return digest if isinstance(digest, str) and digest.startswith("sha256:") else None
+
+
+def _table_bounds(lines: list[str], index: int) -> tuple[int, int]:
+    """[start, end) of the TOML table holding line `index`: from its header to the next header."""
+    start = index
+    while start > 0 and not lines[start].lstrip().startswith("["):
+        start -= 1
+    end = index + 1
+    while end < len(lines) and not lines[end].lstrip().startswith("["):
+        end += 1
+    return start, end
+
+
+def _key_line(line: str, name: str) -> Any:
+    """The value of a one-line `name = value` TOML pair, or None when `line` isn't one."""
+    if not re.match(rf"\s*{re.escape(name)}\s*=", line):
+        return None
+    try:
+        return tomllib.loads(line.strip()).get(name)
+    except tomllib.TOMLDecodeError:
+        return None
+
+
+def _set_line(lines: list[str], start: int, end: int, name: str, value: Any, *, after: int) -> bool:
+    """Replace the single `name = ...` line in lines[start:end], or insert one after `after`."""
+    hits = [i for i in range(start, end) if _key_line(lines[i], name) is not None]
+    if len(hits) > 1:
+        return False
+    indent = re.match(r"\s*", lines[hits[0] if hits else after]).group(0) if hits else ""
+    new = f"{indent}{name} = {_toml_scalar(value)}\n"
+    if hits:
+        lines[hits[0]] = new
+    else:
+        lines.insert(after + 1, new)
+    return True
+
+
+def _rewrite_guard_definition(
+    text: str, parsed: dict[str, Any], pos: tuple[int, int], old_command: str, command: str,
+) -> str | None:
+    """The config text with the guard at `pos` rewritten IN PLACE (same key) to the canonical
+    command, timeout and matcher (T-4395 r1: a narrower matcher is a weaker guard, so it is
+    normalized), every other key kept. None unless the result parses to exactly the original
+    document with only those values changed. A matcher change is refused when the group holds
+    other hooks too (it would silently widen them)."""
+    group, _hook = _guard_hook(parsed, pos)
+    if group.get("matcher") != WORKER_GUARD_MATCHER and len(group.get("hooks") or []) != 1:
+        return None
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    cmd_lines = [i for i, line in enumerate(lines) if _key_line(line, "command") == old_command]
+    if len(cmd_lines) != 1:
+        return None
+    ci = cmd_lines[0]
+    start, end = _table_bounds(lines, ci)
+    indent = re.match(r"\s*", lines[ci]).group(0)
+    lines[ci] = f"{indent}command = {_toml_scalar(command)}\n"
+    if not _set_line(lines, start, end, "timeout", WORKER_GUARD_TIMEOUT_S, after=ci):
+        return None
+    group_headers = [i for i in range(start - 1, -1, -1) if lines[i].strip() == "[[hooks.PreToolUse]]"]
+    if not group_headers:
+        return None
+    gh = group_headers[0]
+    _gs, ge = _table_bounds(lines, gh)
+    if not _set_line(lines, gh + 1, ge, "matcher", WORKER_GUARD_MATCHER, after=gh):
+        return None
+    new_text = "".join(lines)
+    expected = copy.deepcopy(parsed)
+    exp_group, exp_hook = _guard_hook(expected, pos)
+    exp_hook["command"] = command
+    exp_hook["timeout"] = WORKER_GUARD_TIMEOUT_S
+    exp_group["matcher"] = WORKER_GUARD_MATCHER
+    try:
+        return new_text if tomllib.loads(new_text) == expected else None
+    except tomllib.TOMLDecodeError:
+        return None
+
+
+def _set_trusted_hash(text: str, parsed: dict[str, Any], key: str, digest: str) -> str | None:
+    """`text` with state[key].trusted_hash = digest (replacing any stale one, keeping sibling
+    keys), or None unless that is provably the ONLY change."""
+    lines = text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    header = f"[hooks.state.{_toml_scalar(key)}]"
+    headers = [i for i, line in enumerate(lines) if line.strip() == header]
+    if len(headers) > 1:
+        return None
+    if headers:
+        hs, he = _table_bounds(lines, headers[0])
+        if not _set_line(lines, hs + 1, he, "trusted_hash", digest, after=hs):
+            return None
+        new_text = "".join(lines)
+    else:
+        new_text = "".join(lines).rstrip("\n") + f"\n\n{header}\ntrusted_hash = {_toml_scalar(digest)}\n"
+    expected = copy.deepcopy(parsed)
+    expected.setdefault("hooks", {}).setdefault("state", {}).setdefault(key, {})["trusted_hash"] = digest
+    try:
+        return new_text if tomllib.loads(new_text) == expected else None
+    except tomllib.TOMLDecodeError:
+        return None
+
+
+# T-4428: a verified-marker in CODEX_HOME lets a launch skip the real home's hooks/list (median
+# 1.47s, up to _HOOKS_LIST_TIMEOUT_S on a wedged app-server) when NOTHING codex's trust verdict
+# depends on has changed since a hooks/list last said "current + trusted": config.toml's exact
+# bytes (the definition AND its [hooks.state] trusted_hash), the realpath key, and the codex
+# binary (a codex upgrade can change currentHash, turning a stored hash "modified"). It is only
+# ever a reason to SKIP THE READ; any mismatch, a missing/unreadable/malformed marker or an
+# exception falls back to the read, and so to the unchanged trust/repair logic.
+_VERIFIED_MARKER_NAME = ".pantheon-worker-guard-verified.json"
+_VERIFIED_MARKER_VERSION = 1
+
+
+def _codex_binary_identity(executable: Path) -> dict[str, Any]:
+    """Stat-only identity of the codex install (no subprocess). ctime_ns and the inode move on
+    ANY replacement even if an installer preserves mtime; for the npm layout (bin/codex.js, a thin
+    launcher whose bytes can outlive a version) the package.json holding the version and the
+    pinned native-binary versions is hashed too. Raises when the executable can't be stat'ed."""
+    real = os.path.realpath(executable)
+    st = os.stat(real)
+    identity: dict[str, Any] = {
+        "path": str(executable), "realpath": real, "dev": st.st_dev, "ino": st.st_ino,
+        "size": st.st_size, "mtime_ns": st.st_mtime_ns, "ctime_ns": st.st_ctime_ns,
+    }
+    package_json = Path(real).parent.parent / "package.json"
+    if package_json.is_file():
+        identity["package_json_sha256"] = hashlib.sha256(package_json.read_bytes()).hexdigest()
+    return identity
+
+
+def _verified_marker_body(codex_home: Path, key: str, command: str, config_bytes: bytes,
+                          executable: Path) -> dict[str, Any]:
+    return {
+        "version": _VERIFIED_MARKER_VERSION,
+        "key": key,
+        "command": command,
+        "config_sha256": hashlib.sha256(config_bytes).hexdigest(),
+        "codex": _codex_binary_identity(executable),
+    }
+
+
+def _verified_marker_hit(codex_home: Path, key: str, command: str, *, executable: Path) -> bool:
+    """True only when the marker matches the CURRENT config bytes, key, command and binary."""
+    try:
+        config_bytes = (codex_home / "config.toml").read_bytes()
+        expected = _verified_marker_body(codex_home, key, command, config_bytes, executable)
+        stored = json.loads((codex_home / _VERIFIED_MARKER_NAME).read_text(encoding="utf-8"))
+        return stored == expected
+    except Exception:  # noqa: BLE001 - missing/unreadable/malformed: no hit, read instead
+        return False
+
+
+def _write_verified_marker(codex_home: Path, body: dict[str, Any]) -> None:
+    """Atomic (temp + rename), 0600. Best-effort: a failure only costs the next launch a read."""
+    tmp_name = None
+    try:
+        directory = Path(os.path.realpath(codex_home))
+        fd, tmp_name = tempfile.mkstemp(prefix=f"{_VERIFIED_MARKER_NAME}.", suffix=".tmp",
+                                        dir=directory)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(body, handle, sort_keys=True)
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, directory / _VERIFIED_MARKER_NAME)
+        tmp_name = None
+    except Exception as exc:  # noqa: BLE001 - never fatal to a launch
+        _worker_guard_log(f"{codex_home}: verified-marker not written: {exc!r}")
+    finally:
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+
+
+def _read_real_guard(codex_home: Path, account_home: Path, key: str, *, executable: Path, read_hooks):
+    """The real home's hooks/list entry for `key` ({} if absent); None if the read failed or timed out."""
+    try:
+        hooks = read_hooks(executable, codex_home=codex_home, cwd=account_home,
+                           timeout=_HOOKS_LIST_TIMEOUT_S)
+    except Exception as exc:  # noqa: BLE001 - treated as "could not read"
+        _worker_guard_log(f"hooks/list on {codex_home} raised {exc!r}")
+        return None
+    if hooks is None:
+        return None
+    return next((h for h in hooks if h.get("key") == key), {})
+
+
+def ensure_worker_guard_hook(
+    codex_home: Path,
+    account_home: Path,
+    *,
+    executable: Path,
+    read_hooks=read_codex_app_server_hooks,
+    trust_marker: bool = True,
+) -> bool:
+    """Idempotently wire, UPGRADE and trust the worker-guard PreToolUse hook in ``config.toml``
+    (T-4166; upgrade path T-4395 / T-4397 part A).
+
+    Every seat with a codex runtime needs it (T-4160): codex 0.147 ships multi_agent
+    default-on, so without the hook a failover can spawn codex subagents that hold nothing
+    back. Skipped entirely when the seat's clone has no worker-guard.py (a PreToolUse hook whose
+    script is missing could fail every main-loop tool call). Refuses (raises) on a config.toml
+    it cannot parse. Hook keys use the REALPATH of CODEX_HOME, as codex does. Cases:
+
+    * CURRENT guard (this command, timeout 30, matcher Bash|apply_patch): the real home's
+      hooks/list (bounded) is asked; trusted -> no-op. Untrusted or "modified" (a stale hash):
+      codex's own currentHash for the definition ON DISK is written as trusted_hash, the only
+      change, in one write. T-4428: a "current + trusted" verdict records a verified-marker
+      (sha256 of config.toml's bytes + key + command + codex binary identity); while all of those
+      are unchanged the hooks/list read is skipped (``trust_marker=False`` always reads). A codex
+      upgrade changes the binary identity, so a stale hash it causes is still read and repaired.
+    * STALE guard (the pre-T-4395 command, or a stale timeout/matcher): rewritten IN PLACE (so
+      its position-based key is unchanged) to the canonical command/timeout/matcher, every other
+      key kept. The new hash is precomputed in a scratch CODEX_HOME holding EXACTLY that
+      rewritten definition (the hash covers only the definition), then the definition AND its
+      trusted_hash land in ONE atomic write. Codex never sees an untrusted/"modified" guard:
+      no fail-open window. After the write the real home is re-read (bounded); unless it
+      reports the guard trusted under that hash, the ORIGINAL bytes are restored, but only if
+      the file still holds what was written (compare-and-swap; a concurrent edit is left alone
+      and logged). A failed precompute, or an edit that isn't provably minimal, leaves the
+      file untouched.
+    * NO guard: the canonical block is appended with its precomputed trusted_hash in one write;
+      if the hash can't be read the block is still wired (T-4166 best-effort: an untrusted hook
+      runs under this adapter's --dangerously-bypass-hook-trust launch, and the parity axis
+      codex-worker-guard-hook-trusted flags it).
+
+    Every upgrade/repair/restore/refusal is logged to stderr. Returns True iff ``config.toml``
+    was left modified.
+    """
+    if not (account_home / "pantheon-config" / "tools" / "hooks" / "worker-guard.py").is_file():
+        return False
+    config_path = codex_home / "config.toml"
+    command = worker_guard_command(account_home)
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    try:
+        parsed = tomllib.loads(text) if text.strip() else {}
+    except tomllib.TOMLDecodeError as exc:
+        raise RuntimeError(
+            f"codex config.toml at {config_path} is not valid TOML -- refusing to "
+            "blind-insert the worker-guard hook into unparseable content"
+        ) from exc
+    positions = [
+        (pos, cmd)
+        for cmd in (command, *_legacy_worker_guard_commands(account_home))
+        for pos in _guard_positions(parsed, cmd)
+    ]
+    current = [pos for pos, _cmd in positions if _guard_definition_current(parsed, pos, command)]
+    if current:
+        return _trust_current_guard(codex_home, account_home, config_path, text, parsed, current[0],
+                                    executable=executable, read_hooks=read_hooks,
+                                    trust_marker=trust_marker)
+    if positions:
+        if len(positions) != 1:
+            _worker_guard_log(f"{config_path}: {len(positions)} stale worker-guard hooks; refusing "
+                              "to upgrade an ambiguous config (left untouched)")
+            return False
+        (pos, old_command), = positions
+        return _upgrade_guard(codex_home, account_home, config_path, text, parsed, pos, old_command,
+                              command, executable=executable, read_hooks=read_hooks)
+    wired = (text.rstrip("\n") + "\n" if text.strip() else "") + _WORKER_GUARD_BLOCK.format(
+        command=_toml_scalar(command)
+    )
+    wired_parsed = tomllib.loads(wired)
+    (pos,) = _guard_positions(wired_parsed, command)
+    definition = _guard_definition_toml(wired_parsed, pos)
+    digest = definition and _precompute_guard_hash(definition, command, executable=executable,
+                                                   account_home=account_home, read_hooks=read_hooks)
+    trusted = digest and _set_trusted_hash(wired, wired_parsed, _guard_key(codex_home, pos), digest)
+    _write_config_preserving_mode(config_path, trusted or wired)
+    _worker_guard_log(f"{config_path}: wired the worker-guard "
+                      + ("with its trusted_hash" if trusted else "UNTRUSTED (hash unreadable)"))
+    return True
+
+
+def _trust_current_guard(codex_home, account_home, config_path, text, parsed, pos, *,
+                         executable, read_hooks, trust_marker: bool = True) -> bool:
+    """A current definition: no-op when codex reports it trusted; otherwise (untrusted, or a
+    STALE hash reading "modified") write codex's currentHash for the on-disk definition as its
+    trusted_hash, the only change, in one write (T-4395 r1). The reported entry must be OUR
+    command, and the write is a compare-and-swap against the bytes read at the start (r2), so a
+    config edited between the read and the app-server call is never re-trusted blind."""
+    key = _guard_key(codex_home, pos)
+    command = _guard_hook(parsed, pos)[1]["command"]
+    if trust_marker and _verified_marker_hit(codex_home, key, command, executable=executable):
+        return False  # T-4428: nothing the verdict depends on changed since codex said trusted
+    try:
+        bytes_before = config_path.read_bytes()
+    except OSError:
+        bytes_before = None
+    # The marker body (the binary identity included) is taken BEFORE the read: a verdict from
+    # the old binary must never be recorded under an upgraded one's identity (T-4428 r2).
+    body_before = None
+    if bytes_before is not None:
+        try:
+            body_before = _verified_marker_body(codex_home, key, command, bytes_before, executable)
+        except Exception:  # noqa: BLE001 - no body: no marker, the next launch reads
+            body_before = None
+    guard = _read_real_guard(codex_home, account_home, key, executable=executable, read_hooks=read_hooks)
+    if not guard:
+        _worker_guard_log(f"{config_path}: unverifiable, hooks/list "
+                          + ("failed or timed out" if guard is None else f"reported no hook at {key}")
+                          + "; left as is")
+        return False
+    if guard.get("command") != command:
+        _worker_guard_log(f"{config_path}: re-trust REFUSED, codex reports {guard.get('command')!r} at "
+                          f"{key}, not the guard (config changed under us?)")
+        return False
+    if guard.get("trustStatus") == "trusted":
+        # Record the verdict only for the bytes AND binary codex actually judged: config bytes
+        # and binary identity unchanged across the read, and still what this run parsed.
+        if (body_before is not None and _file_holds(config_path, text)
+                and _file_bytes(config_path) == bytes_before):
+            try:
+                body_after = _verified_marker_body(codex_home, key, command, bytes_before, executable)
+            except Exception:  # noqa: BLE001
+                body_after = None
+            if body_after == body_before:
+                _write_verified_marker(codex_home, body_before)
+        return False
+    digest = guard.get("currentHash")
+    if not (isinstance(digest, str) and digest.startswith("sha256:")):
+        return False
+    new_text = _set_trusted_hash(text, parsed, key, digest)
+    if new_text is None:
+        _worker_guard_log(f"{config_path}: re-trust REFUSED, no provably minimal edit of {key}")
+        return False
+    if not _file_holds(config_path, text):
+        _worker_guard_log(f"{config_path}: re-trust NOT WRITTEN, config.toml changed since it was "
+                          "read (concurrent edit?); left as found")
+        return False
+    stale = _stored_trusted_hash(parsed, key)
+    _write_config_preserving_mode(config_path, new_text)
+    _worker_guard_log(f"{config_path}: {'REPAIRED stale' if stale else 'TRUSTED'} {key} "
+                      f"(was {guard.get('trustStatus')}), trusted_hash {stale} -> {digest}")
+    return True
+
+
+def _file_holds(config_path: Path, expected: str) -> bool:
+    try:
+        return config_path.read_text(encoding="utf-8") == expected
+    except FileNotFoundError:
+        return expected == ""
+    except OSError:
+        return False
+
+
+def _file_bytes(config_path: Path) -> bytes | None:
+    try:
+        return config_path.read_bytes()
+    except OSError:
+        return None
+
+
+def _restore_if_unchanged(config_path: Path, written: str, original: str) -> bool:
+    """Compare-and-swap restore: only when the file still holds exactly what we wrote."""
+    if not _file_holds(config_path, written):
+        _worker_guard_log(f"{config_path}: NOT RESTORED, config.toml changed since the upgrade "
+                          "write (concurrent edit?); left as found -- check it by hand")
+        return False
+    _write_config_preserving_mode(config_path, original)
+    return True
+
+
+def _upgrade_guard(codex_home, account_home, config_path, text, parsed, pos, old_command, command, *,
+                   executable, read_hooks) -> bool:
+    """One-write upgrade of a stale guard + its trusted_hash, verified, else restored (T-4395)."""
+    key = _guard_key(codex_home, pos)
+    rewritten = _rewrite_guard_definition(text, parsed, pos, old_command, command)
+    if rewritten is None:
+        _worker_guard_log(f"{config_path}: upgrade REFUSED, no provably minimal in-place edit of "
+                          f"{key}; left untouched")
+        return False
+    rewritten_parsed = tomllib.loads(rewritten)
+    definition = _guard_definition_toml(rewritten_parsed, pos)
+    digest = definition and _precompute_guard_hash(definition, command, executable=executable,
+                                                   account_home=account_home, read_hooks=read_hooks)
+    if not digest:
+        _worker_guard_log(f"{config_path}: upgrade SKIPPED, new hash unreadable; the existing "
+                          "guard is left untouched")
+        return False
+    new_text = _set_trusted_hash(rewritten, rewritten_parsed, key, digest)
+    if new_text is None:
+        _worker_guard_log(f"{config_path}: upgrade REFUSED, no provably minimal state edit of "
+                          f"{key}; left untouched")
+        return False
+    old_hash = _stored_trusted_hash(parsed, key)
+    _write_config_preserving_mode(config_path, new_text)
+    _worker_guard_log(f"{config_path}: UPGRADED {key} to {command!r} timeout "
+                      f"{WORKER_GUARD_TIMEOUT_S} matcher {WORKER_GUARD_MATCHER!r}, trusted_hash "
+                      f"{old_hash} -> {digest}")
+    guard = _read_real_guard(codex_home, account_home, key, executable=executable,
+                             read_hooks=read_hooks)
+    if guard and guard.get("trustStatus") == "trusted" and guard.get("currentHash") == digest:
+        _worker_guard_log(f"{config_path}: verified {key} trusted under {digest}")
+        if guard.get("enabled") is False:
+            _worker_guard_log(f"{config_path}: WARNING {key} is DISABLED (enabled = false in its "
+                              "state entry): trusted but it will NOT run -- fail-open until re-enabled")
+        return True
+    reason = "hooks/list failed or timed out" if guard is None else (
+        f"trust={guard.get('trustStatus')} hash={guard.get('currentHash')}")
+    if _restore_if_unchanged(config_path, new_text, text):
+        _worker_guard_log(f"{config_path}: RESTORED the original config, could not verify the "
+                          f"upgraded guard ({reason}); the previous guard is back in force")
+        return False
+    return True
+
+
+def _is_codex_process(argv: list[str]) -> bool:
+    heads = [os.path.basename(a) for a in argv[:2]]
+    return (any(h in ("codex", "codex.js") for h in heads)
+            or any("/@openai/codex/" in a for a in argv[:2]))
+
+
+def live_codex_sessions(codex_home: Path, *, proc_root: Path = Path("/proc")) -> dict[str, Any]:
+    """Running codex processes of THIS account whose CODEX_HOME resolves to `codex_home`, each
+    marked as started before or after config.toml's mtime (Recovery, T-4395 r1).
+
+    A codex session keeps the hooks + trust it read at startup, so a home can be current ON DISK
+    while a session started before the upgrade still runs the old block. Read-only and
+    best-effort from /proc: process start = boot time + starttime ticks; a process whose
+    environ/stat can't be read is counted in ``unreadable``. ``measurable`` is False when
+    /proc itself can't be listed. Informational only: it never gates ``ok``.
+    """
+    config = Path(os.path.realpath(codex_home)) / "config.toml"
+    want = os.path.realpath(codex_home)
+    try:
+        mtime = config.stat().st_mtime
+    except OSError:
+        mtime = None
+    try:
+        btime = next(int(line.split()[1]) for line in (proc_root / "stat").read_text().splitlines()
+                     if line.startswith("btime "))
+        entries = [p for p in proc_root.iterdir() if p.name.isdigit()]
+    except (OSError, StopIteration, ValueError, IndexError):
+        return {"measurable": False, "config_mtime": mtime, "sessions": [], "unreadable": 0}
+    ticks = os.sysconf("SC_CLK_TCK")
+    uid = os.getuid()
+    sessions: list[dict[str, Any]] = []
+    unreadable = 0
+    for entry in sorted(entries, key=lambda p: int(p.name)):
+        try:
+            if entry.stat().st_uid != uid:
+                continue
+            argv = [a for a in (entry / "cmdline").read_bytes().decode("utf-8", "replace").split("\0") if a]
+            if not _is_codex_process(argv):
+                continue
+        except OSError:
+            continue  # exited, or not ours: not a session of this account
+        try:
+            env = dict(
+                kv.split("=", 1) for kv in (entry / "environ").read_bytes().decode("utf-8", "replace").split("\0")
+                if "=" in kv
+            )
+            stat = (entry / "stat").read_text()
+            start_ticks = int(stat[stat.rindex(")") + 2:].split()[19])
+        except (OSError, ValueError, IndexError):
+            unreadable += 1
+            continue
+        home = env.get("CODEX_HOME") or os.path.join(env.get("HOME", ""), ".codex")
+        if os.path.realpath(home) != want:
+            continue
+        started = btime + start_ticks / ticks
+        sessions.append({
+            "pid": int(entry.name),
+            "argv0": argv[0] if argv else "",
+            "started_at": started,
+            "started_before_config_mtime": None if mtime is None else started < mtime,
+        })
+    return {"measurable": True, "config_mtime": mtime, "sessions": sessions, "unreadable": unreadable}
+
+
+def worker_guard_hook_status(
+    codex_home: Path,
+    account_home: Path,
+    *,
+    executable: Path,
+    read_hooks=read_codex_app_server_hooks,
+    proc_root: Path = Path("/proc"),
+) -> dict[str, Any]:
+    """Per-home rollout verdict for Recovery (T-4395): is the block current, enabled and codex-trusted?
+
+    ``block_current``: a guard with this seat's current command, timeout 30 and the canonical
+    matcher. ``hash_matches``: its stored trusted_hash equals codex's own currentHash.
+    ``enabled``: codex's view (a disabled guard never runs, i.e. fails open). ``measurable`` is
+    False when the app-server read failed (trust fields are then None). ``ok`` needs all of it,
+    trustStatus "trusted", and no leftover legacy guard. That is the ON-DISK verdict;
+    ``live_sessions`` (informational, never part of ``ok``) says which running codex sessions
+    of this home started before the config's last write and so still run their startup snapshot.
+    """
+    config_path = codex_home / "config.toml"
+    command = worker_guard_command(account_home)
+    try:
+        text = config_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        text = ""
+    parsed = tomllib.loads(text) if text.strip() else {}
+    positions = _guard_positions(parsed, command)
+    legacy = [pos for cmd in _legacy_worker_guard_commands(account_home)
+              for pos in _guard_positions(parsed, cmd)]
+    pos = positions[0] if positions else None
+    key = _guard_key(codex_home, pos) if pos else None
+    block_current = bool(pos) and _guard_definition_current(parsed, pos, command)
+    stored = _stored_trusted_hash(parsed, key) if key else None
+    guard = _read_real_guard(codex_home, account_home, key, executable=executable,
+                             read_hooks=read_hooks) if key else None
+    measurable = not key or guard is not None
+    trust = (guard or {}).get("trustStatus")
+    current_hash = (guard or {}).get("currentHash")
+    enabled = (guard or {}).get("enabled") if guard else None
+    hash_matches = bool(stored) and stored == current_hash
+    return {
+        "config_path": str(config_path),
+        "key": key,
+        "command": command,
+        "block_current": block_current,
+        "legacy_present": bool(legacy),
+        "stored_hash": stored,
+        "current_hash": current_hash,
+        "trust_status": trust,
+        "enabled": enabled,
+        "hash_matches": hash_matches,
+        "measurable": measurable,
+        "ok": (block_current and trust == "trusted" and enabled is True and hash_matches
+               and not legacy),
+        # ON DISK above; LIVE below (informational: a session keeps its startup snapshot).
+        "live_sessions": live_codex_sessions(codex_home, proc_root=proc_root),
+    }
+
+
+def _write_config_preserving_mode(config_path: Path, text: str) -> None:
+    """Atomic replace; keeps an existing file's mode, creates a new one 0600 (it can hold
+    MCP env and per-project trust). Writes through a symlink, as the siblings' write_text does."""
+    config_path = Path(os.path.realpath(config_path))
+    mode = (config_path.stat().st_mode & 0o777) if config_path.exists() else 0o600
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = config_path.with_name(f".{config_path.name}.t4166.tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    os.chmod(tmp, mode)
+    os.replace(tmp, config_path)
+
+
 def _find_upward(cwd: Path, filename: str) -> Path | None:
     current = cwd.resolve()
     while True:
@@ -1332,6 +2162,38 @@ def _find_upward(cwd: Path, filename: str) -> Path | None:
         if current.parent == current:
             return None
         current = current.parent
+
+
+def prepare_codex_launch(binding: Any, *, cwd: Path) -> None:
+    """Seed a codex runtime's config before its interactive launch (T-5011 PR-A).
+
+    Moved verbatim out of ``runtime_controller._start_runtime`` (T-4924 plan
+    §2.4), same order and arguments. The home is ``binding.account_home /
+    ".codex"``, NEVER an adapter's ``codex_home``: that is what the controller
+    always seeded, and the two differ on the codex seat (its manifest
+    ``codex_home`` is the account home itself).
+    """
+    codex_home = binding.account_home / ".codex"
+    # TRUST modal -> config, never a keystroke (T-2594). cwd is the ACTUAL
+    # resolved launch cwd, never a hardcoded guess -- see
+    # ensure_project_trusted's own docstring.
+    ensure_project_trusted(codex_home, cwd)
+    # Update-picker/banner suppression (T-2597 wedges #2/#3) -- same
+    # config-seed path as the trust fix above.
+    ensure_update_check_disabled(codex_home)
+    # Model-migration prompt suppression for known-hideable active
+    # presets (T-2597 wedge #4) -- see ensure_model_migration_prompts_
+    # hidden's own docstring for the documented residual gap.
+    ensure_model_migration_prompts_hidden(codex_home)
+    # T-4166: codex 0.147 ships multi_agent default-on, so every codex runtime
+    # (the codex seat and each Claude seat's fallback) gets the worker-guard
+    # PreToolUse hook wired + trusted before launch -- see
+    # ensure_worker_guard_hook's own docstring.
+    ensure_worker_guard_hook(
+        codex_home,
+        binding.account_home,
+        executable=Path(binding.launch.executable),
+    )
 
 
 if __name__ == "__main__":

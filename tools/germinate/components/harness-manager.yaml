@@ -1,0 +1,59 @@
+# harness-manager component contract (ORG-080 §2, §5; T-5090, germination tranche GF1).
+#
+# The UNPRIVILEGED half only:
+# * verify: ONE invariant_list_ref (ORG-080 A-6) resolving ORG-079 V1-V19, the
+#   ORG-099 HARD axes, and the ORG-080 §6 monitor invariants, held in
+#   harness-manager.invariants.yaml (CURRENT, Recovery-approved, D15) and evaluated by
+#   harness_manager_verify.py. Unwired into the engine's `verify` (T-5135).
+# * configure sub-op (b), the harness-runtime swap: plan_configure in
+#   harness-manager.py, an adapter over persona_bringup.operator_target_swap /
+#   runtime_controller._operator_target_swap_resolved; ops run only through the
+#   SIMULATED handler in harness-manager_handlers.py.
+# * the PersonaController1 emitter binding: the emitter block below is bound to the
+#   same list. The live emitter (tools/persona_controller_health_dbus.py) reports
+#   against it behind a dark flag (T-5137); sourcing the remaining facts is T-5404.
+#
+# DEFERRED to GF2 (T-5091), declared absent so the engine refuses them
+# (leg-not-declared): install / remove (with decommission), configure sub-op (a)
+# (supervisor cutover, hence no `supervisor` desired key), update, repair, the
+# root privilege list, the necessary external interactions and the other §2 gates.
+#
+# The authority-transfer gate is independent-agent class as in ORG-080 §2. Grant
+# consumption is deferred in the engine (seam gap S2), so applying a real swap
+# refuses (grant-required) before any mutation: the swap lands dark.
+component:
+  id: harness-manager
+  steward: orchestrator
+  version: 1
+  planner_kind: python
+  contract_digest: sha256:df43a9d698f9e305d1f2ccbf033cf832919654cda2bf52be5cda7ae246a657eb
+  handlers_digest: sha256:3844d3c9140727cdd1c9fd36dd441d2bae9fbc051d47029b333fa0977da8e509
+  depends_on: [host-substrate, mailbox, action-broker, credential-broker]
+  scopes: [system, seat]
+  desired_schema:
+    harness: {enum: [claude, codex]}
+  invariant_list_id: org.pantheon.persona-stack/v1
+  invariant_list_digest: sha256:4aee6d6777b7f6dd273ea77fa8f88de1f8e61a2f7d33755f34b27ba8cfabd4e4
+  privilege:
+    seat: [harness.transition-stage, harness.receiver-handoff, harness.runtime-replace, harness.transition-commit]
+  legs:
+    configure: plan_configure
+    verify:
+      invariant_list_ref: org.pantheon.persona-stack/v1@sha256:4aee6d6777b7f6dd273ea77fa8f88de1f8e61a2f7d33755f34b27ba8cfabd4e4
+  gates:
+    - id: authority-transfer
+      irreversible: true
+      rollback: receiver-restore
+      approval:
+        class: independent-agent
+        grant_source: action-broker-approval-registry
+        binds: [actor, performer, target, operation, plan_digest, scope, policy_revision, expiry]
+  receipts:
+    schema: pantheon-receipt/v1
+  emitter:
+    bus: session
+    interface: org.pantheon.PersonaController1
+    invariant_list_ref: org.pantheon.persona-stack/v1@sha256:4aee6d6777b7f6dd273ea77fa8f88de1f8e61a2f7d33755f34b27ba8cfabd4e4
+    reports:
+      states: [ready, degraded, unhealthy, not_configured, suppressed]
+    collector_attachment: required

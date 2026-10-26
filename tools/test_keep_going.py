@@ -8,7 +8,10 @@ flag (T-1827 R1: specialist rides mailbox.send(), everyone else stays on send-ke
 Pane/ledger I/O is stubbed — no live tmux, no real ledger, isolated state dir. The
 real mailbox.send() unit tests use a tmp-dir inbox only — NEVER the real hub.
 """
+import contextlib
 import fcntl
+import io
+import json
 import os
 import sys
 import tempfile
@@ -22,9 +25,32 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import keep_going as kg  # noqa: E402
 import mailbox  # noqa: E402
 
+
+_ORIG_SEAT_HOLD = kg._seat_hold
+
+
+def setUpModule():
+    # ORG-106 L2: hermetic against the host's real seat-state / maintenance / OOM hold
+    # (and the cross-account read for other-account seats). Seat-hold tests pass
+    # do_seat_hold or patch the seat_state readers themselves.
+    global _SEAT_HOLD_PATCH
+    _SEAT_HOLD_PATCH = mock.patch.object(kg, "_seat_hold", lambda agent: None)
+    _SEAT_HOLD_PATCH.start()
+    # T-4510: hermetic against a host whose real fleet-usage dir holds a >=95% reading:
+    # a nonexistent dir makes the usage gate fail open, so every pre-T-4510 test is
+    # unchanged. The T-4510 class points the dir at its own temp readings.
+    global _FLEET_ENV_PATCH
+    _FLEET_ENV_PATCH = mock.patch.dict(
+        os.environ, {"PANTHEON_FLEET_USAGE_DIR": "/nonexistent/pantheon-fleet-usage-hermetic"})
+    _FLEET_ENV_PATCH.start()
+
+
+def tearDownModule():
+    _SEAT_HOLD_PATCH.stop()
+    _FLEET_ENV_PATCH.stop()
+
 IDLE_PANE = "\n".join([
-    "│ > some earlier output", "╭───────────────╮", "│ ❯             │",
-    "╰───────────────╯", "  ? for shortcuts",
+    "● some earlier output", "─" * 80, "❯ ", "─" * 80, "  ? for shortcuts",
 ])
 BUSY_PANE = "\n".join([
     "│ working on the thing…", "✻ Thinking…", "  ⎿  running tool",
@@ -44,7 +70,9 @@ class IdleGateTest(unittest.TestCase):
         self.assertIs(kg.is_idle_at_prompt(BUSY_PANE), False)
 
     def test_modal_is_not_nudgeable(self):
-        self.assertIs(kg.is_idle_at_prompt(MODAL_PANE), False)
+        # T-5435: the canonical classifier reads a modal as UNKNOWN (None), not False.
+        # Either way it is not True, and run() skips both.
+        self.assertIsNot(kg.is_idle_at_prompt(MODAL_PANE), True)
 
     def test_empty_capture_inconclusive(self):
         self.assertIsNone(kg.is_idle_at_prompt(""))
@@ -54,12 +82,13 @@ class IdleGateTest(unittest.TestCase):
         self.assertIsNone(kg.is_idle_at_prompt("just some\nrandom lines\nno sentinels"))
 
     def test_idle_with_hidden_task_list_footer(self):
-        # Regression (2026-06-28): orchestrator keeps a hidden task list, so its idle
-        # footer reads "ctrl+t to show tasks" — NOT "? for shortcuts". This must
-        # read as idle, or keep_going skips it forever (the weekly-cap-reset gap).
+        # Regression (2026-06-28): orchestrator keeps a hidden task list, so its idle footer
+        # carries "ctrl+t to show tasks". T-5435: now judged by the canonical classifier,
+        # which needs the mode indicator (every seat has one) plus known hints.
+        R = "─" * 80
         pane = "\n".join([
-            "│ > earlier output", "╭───────────────╮", "│ ❯             │",
-            "╰───────────────╯", "  ctrl+t to show tasks · ← for agents · new task? /clear to save 120.3k tokens",
+            "● earlier output", R, "❯ ", R,
+            "  ⏵⏵ bypass permissions on (shift+tab to cycle) · ctrl+t to show tasks",
         ])
         self.assertIs(kg.is_idle_at_prompt(pane), True)
 
@@ -74,6 +103,58 @@ class IdleGateTest(unittest.TestCase):
         # busy must win (never interrupt active generation).
         pane = "? for shortcuts\nworking…\nesc to interrupt"
         self.assertIs(kg.is_idle_at_prompt(pane), False)
+
+
+RULE = "─" * 80
+BYPASS_FOOTER = "  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+
+
+def _bypass_pane(footer=BYPASS_FOOTER, above=()):
+    return "\n".join(["● earlier output", *above, RULE, "❯ ", RULE, footer])
+
+
+class BypassModeIdleTest(unittest.TestCase):
+    """T-5435: bypass-permissions mode shows no '? for shortcuts' / 'ctrl+t' hint, so the
+    old private hint list read every idle seat as inconclusive and keep_going never nudged.
+    Classification is delegated to inbox_consumer.pane_idle_state (nudge caller)."""
+
+    def test_idle_bypass_footer_is_nudgeable(self):
+        self.assertIs(kg.is_idle_at_prompt(_bypass_pane()), True)
+
+    def test_bypass_footer_while_generating_is_not_nudgeable(self):
+        pane = _bypass_pane(
+            footer=BYPASS_FOOTER + " · esc to interrupt", above=("✻ Thinking…",))
+        self.assertIs(kg.is_idle_at_prompt(pane), False)
+
+    def test_modal_footer_is_not_nudgeable(self):
+        pane = _bypass_pane(footer="  Enter to confirm · Esc to cancel")
+        self.assertIsNot(kg.is_idle_at_prompt(pane), True)
+
+    def test_turn_ended_with_running_background_agent_is_not_nudgeable(self):
+        # state B: main turn ended, a background agent still runs -> nudge must wait.
+        fx = Path(__file__).resolve().parent / "testdata" / "orchestrator_turn_ended_bg_agents_pane.txt"
+        self.assertIsNot(kg.is_idle_at_prompt(fx.read_text()), True)
+
+    def test_dim_prompt_suggestion_ansi_capture_is_still_idle(self):
+        # capture-pane -e: a DIM suggestion in the composer is ghost text, not input.
+        pane = "\n".join(["● out", RULE, "❯ \x1b[2mrun the tests\x1b[0m", RULE, BYPASS_FOOTER])
+        self.assertIs(kg.is_idle_at_prompt(pane), True)
+
+    def test_is_generating_ignores_escape_only_lines(self):
+        pane = "\n".join(["✻ Working…", "  esc to interrupt", "\x1b[0m", "\x1b[0m", "\x1b[0m",
+                          "\x1b[0m", "\x1b[0m", "\x1b[0m"])
+        self.assertTrue(kg.is_generating(pane))
+
+    def test_capture_pane_requests_ansi_attributes(self):
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(argv)
+            return mock.Mock(returncode=0, stdout="x")
+
+        with mock.patch.object(kg.subprocess, "run", fake_run):
+            kg.capture_pane("%1", kg.getpass.getuser())
+        self.assertIn("capture-pane -t %1 -p -e", calls[0][-1])
 
 
 class RunTest(unittest.TestCase):
@@ -129,7 +210,9 @@ class RunTest(unittest.TestCase):
         self.assertEqual(self.injected, [])
 
     def test_failed_inject_returns_nonzero(self):
-        rc = kg.run("recovery", do_capture=self._cap(IDLE_PANE), do_inject=self._inject_fail, **self.kw)
+        # An idle pane on every T-4432 re-check is still a failure (sleep stubbed).
+        rc = kg.run("recovery", do_capture=self._cap(IDLE_PANE), do_inject=self._inject_fail,
+                    do_sleep=lambda s: None, **self.kw)
         self.assertEqual(rc, 8)
 
     def test_unknown_agent_rejected(self):
@@ -171,6 +254,66 @@ class RunTest(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertEqual(len(sent), 1, f"{agent} must nudge when parked")
             self.assertEqual(sent[0][0], pane, f"{agent} routed to wrong pane")
+
+
+class SeatHoldTest(unittest.TestCase):
+    """ORG-106 L2 (T-5525): a seat with intake blocked is not nudged, and costs no pane
+    capture. Q1: maintenance and the OOM hold are honoured too (keep_going had no hold)."""
+
+    def _state(self, **kw):
+        from tools import seat_state as ss
+        return ss.Contribution(**kw)
+
+    def _run(self, **readers):
+        """run() with the REAL _seat_hold over patched seat_state source readers."""
+        from tools import seat_state as ss
+        captured = []
+        injected = []
+        none = ss.Contribution()
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        with mock.patch.object(kg, "_seat_hold", _ORIG_SEAT_HOLD), \
+                mock.patch("tools.seat_state._read_seat_state", return_value=readers.get("record", none)), \
+                mock.patch("tools.seat_state._read_seat_state_cross", return_value=readers.get("record", none)), \
+                mock.patch("tools.seat_state._read_maintenance", return_value=readers.get("maint", none)), \
+                mock.patch("tools.seat_state._read_oom", return_value=readers.get("oom", none)), \
+                mock.patch.dict(os.environ, {"PANTHEON_STATE_DIR": tmp.name}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = kg.run("recovery", do_capture=lambda pt, uu: captured.append(1) or IDLE_PANE,
+                            do_inject=lambda pt, p: injected.append(p) or True,
+                            do_work_ts=lambda cfg: None, do_session_id=lambda cfg: None,
+                            do_cap_check=lambda *a, **k: False)
+        return rc, captured, injected, buf.getvalue()
+
+    def test_active_seat_nudged(self):
+        rc, cap, inj, _ = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(inj), 1)
+
+    def test_paused_record_no_capture_no_nudge(self):
+        c = self._state(source="seat-state", state="paused-intake", intake_blocked=True)
+        rc, cap, inj, out = self._run(record=c)
+        self.assertEqual((rc, cap, inj), (0, [], []))
+        self.assertIn("seat-state", out)
+
+    def test_maintenance_now_honoured(self):
+        c = self._state(source="maintenance", intake_blocked=True, remediation_vetoed=True)
+        rc, cap, inj, out = self._run(maint=c)
+        self.assertEqual((rc, cap, inj), (0, [], []))
+        self.assertIn("maintenance", out)
+
+    def test_oom_hold_now_honoured(self):
+        c = self._state(source="oom-hold", intake_blocked=True, launch_blocked=True)
+        rc, cap, inj, out = self._run(oom=c)
+        self.assertEqual((rc, cap, inj), (0, [], []))
+        self.assertIn("oom-hold", out)
+
+    def test_reader_fault_fails_open(self):
+        rc, cap, inj, _ = self._run(record=self._state(fault="seat-state: boom"))
+        self.assertEqual(len(inj), 1)
+        with mock.patch("tools.seat_state.effective_for", side_effect=RuntimeError("x")):
+            self.assertIsNone(_ORIG_SEAT_HOLD("recovery"))
 
 
 class DecideNudgeTest(unittest.TestCase):
@@ -349,12 +492,18 @@ class AdaptiveRunTest(unittest.TestCase):
 
 
 class DeliveryModeTest(unittest.TestCase):
-    """T-1827 R1: per-agent delivery flag. specialist rides mailbox.send(); every other
+    """Per-agent delivery flag. A "mailbox" agent rides mailbox.send(); every other
     agent (and any agent absent from the map) stays on the byte-identical send-keys
     path. Both do_inject and do_mailbox_send are stubbed — no live tmux, no real
-    mailbox I/O here (see MailboxDeliveryUnitTest for the real mailbox.send() path)."""
+    mailbox I/O here (see MailboxDeliveryUnitTest for the real mailbox.send() path).
+    T-3832 (2026-09-20): specialist consolidated to send-keys, so keep_going no longer
+    has a real mailbox agent; setUp forces specialist into mailbox mode as a fixture so
+    these tests keep exercising the mailbox-delivery mechanism."""
 
     def setUp(self):
+        self._orig_dm = dict(kg.DELIVERY_MODE)
+        kg.DELIVERY_MODE["specialist"] = "mailbox"
+        self.addCleanup(lambda: (kg.DELIVERY_MODE.clear(), kg.DELIVERY_MODE.update(self._orig_dm)))
         self.injected = []
         self.mailbox_sent = []
         self._tmp = tempfile.TemporaryDirectory()
@@ -428,6 +577,92 @@ class DeliveryModeTest(unittest.TestCase):
         rc = kg.run("specialist", do_capture=self._cap(IDLE_PANE), do_inject=self._inject_ok,
                     do_mailbox_send=lambda agent, prompt, **kw: False, **self.kw)
         self.assertEqual(rc, 8)
+
+
+class RecheckAfterFailedNudgeTest(unittest.TestCase):
+    """T-4432: a send-keys nudge that send_keys_submit reports unconfirmed, on a pane that
+    is GENERATING by a re-check, landed (the idle->busy race, T-3554). It must not page
+    via exit 8. Idle, unknown or MODAL on every re-check is still a failure, and mailbox
+    delivery has no pane race, so it keeps exit 8 without re-reading."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        os.environ["PANTHEON_STATE_DIR"] = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+        self.addCleanup(lambda: os.environ.pop("PANTHEON_STATE_DIR", None))
+        self.captures, self.sleeps, self.injected = [], [], []
+        self.kw = dict(do_work_ts=lambda cfg: None, do_session_id=lambda cfg: None,
+                       do_cap_check=lambda *a, **k: False, do_sleep=self.sleeps.append)
+
+    def _seq(self, *panes):
+        """The first capture is the decide-time read; the rest are the re-checks. The
+        last pane repeats if the code reads more often than the test scripted."""
+        it = iter(panes)
+        def cap(pt, uu):
+            p = next(it, panes[-1])
+            self.captures.append(p)
+            return p
+        return cap
+
+    def _inject_fail(self, pt, prompt):
+        self.injected.append(prompt)
+        return False
+
+    def test_generating_on_a_later_recheck_means_landed(self):
+        rc = kg.run("recovery", do_capture=self._seq(IDLE_PANE, IDLE_PANE, BUSY_PANE),
+                    do_inject=self._inject_fail, **self.kw)
+        self.assertEqual(rc, 0, "a nudge that started a turn is not a unit failure")
+        self.assertEqual(len(self.injected), 1, "never re-inject on the soft path")
+        self.assertEqual(len(self.captures), 3, "stop re-reading at the first generating sample")
+        self.assertEqual(self.sleeps, [kg.RECHECK_INTERVAL_SECS])
+        self.assertFalse(kg._state_path("recovery").exists(),
+                         "the soft path must not persist backoff state (failed-send rule)")
+
+    def test_legacy_mode_gets_the_same_recheck(self):
+        rc = kg.run("recovery", do_capture=self._seq(IDLE_PANE, BUSY_PANE),
+                    do_inject=self._inject_fail, adaptive=False, **self.kw)
+        self.assertEqual(rc, 0)
+
+    def test_idle_on_every_recheck_is_still_a_failure(self):
+        rc = kg.run("recovery", do_capture=self._seq(IDLE_PANE), do_inject=self._inject_fail, **self.kw)
+        self.assertEqual(rc, 8)
+        self.assertEqual(len(self.captures), 1 + kg.RECHECK_SAMPLES)
+        self.assertEqual(len(self.sleeps), kg.RECHECK_SAMPLES - 1)
+
+    def test_modal_after_a_failed_nudge_is_still_a_failure(self):
+        # is_idle_at_prompt() reads a modal as False (not idle). The re-check must not
+        # mistake that for "busy": a modal right after a nudge is a real wedge.
+        rc = kg.run("recovery", do_capture=self._seq(IDLE_PANE, MODAL_PANE),
+                    do_inject=self._inject_fail, **self.kw)
+        self.assertEqual(rc, 8)
+
+    def test_uncapturable_or_unknown_rechecks_are_still_a_failure(self):
+        for later in (None, "noise\nnoise"):
+            self.captures.clear()
+            rc = kg.run("recovery", do_capture=self._seq(IDLE_PANE, later),
+                        do_inject=self._inject_fail, **self.kw)
+            self.assertEqual(rc, 8, repr(later))
+
+    def test_mailbox_delivery_failure_does_not_reread_the_pane(self):
+        # No seat is in mailbox mode today (specialist moved to send-keys, T-3832), so pin the
+        # mode here. do_inject is stubbed as well: an unstubbed send-keys path would type
+        # into the real pane of whichever seat runs this suite.
+        with mock.patch.dict(kg.DELIVERY_MODE, {"specialist": "mailbox"}):
+            rc = kg.run("specialist", do_capture=self._seq(IDLE_PANE, BUSY_PANE),
+                        do_inject=self._inject_fail,
+                        do_mailbox_send=lambda agent, prompt, **kw: False, **self.kw)
+        self.assertEqual(rc, 8)
+        self.assertEqual(self.injected, [], "mailbox mode never uses send-keys")
+        self.assertEqual(len(self.captures), 1, "mailbox mode has no pane race to re-check")
+
+    def test_is_generating_is_narrower_than_not_idle(self):
+        self.assertTrue(kg.is_generating(BUSY_PANE))
+        self.assertFalse(kg.is_generating(MODAL_PANE))
+        self.assertFalse(kg.is_generating(IDLE_PANE))
+        self.assertFalse(kg.is_generating(""))
+        # Only the live bottom region counts: an old "esc to interrupt" scrolled far
+        # above an idle prompt is not generation.
+        self.assertFalse(kg.is_generating("esc to interrupt\n" + "\n".join(["x"] * 10) + "\n" + IDLE_PANE))
 
 
 class CapSkipTest(unittest.TestCase):
@@ -622,7 +857,7 @@ class HasQueuedWorkTest(unittest.TestCase):
         for d in ("inbox", "active", "done"):
             (self.root / "tickets" / d).mkdir(parents=True)
         self.cfg = {"pantheon_config_path": str(self.root),
-                    "ticket_targets": frozenset({"atlas"})}
+                    "ticket_targets": frozenset({"artisan"})}
 
     def _write(self, state_dir, tid, target):
         (self.root / "tickets" / state_dir / f"{tid}.md").write_text(
@@ -633,11 +868,11 @@ class HasQueuedWorkTest(unittest.TestCase):
         self.assertFalse(kg.has_queued_work(self.cfg))
 
     def test_inbox_ticket_for_agent_is_true(self):
-        self._write("inbox", "T-0001", "atlas")
+        self._write("inbox", "T-0001", "artisan")
         self.assertTrue(kg.has_queued_work(self.cfg))
 
     def test_active_ticket_counts_this_is_the_parked_mid_arc_case(self):
-        self._write("active", "T-0002", "atlas")
+        self._write("active", "T-0002", "artisan")
         self.assertTrue(kg.has_queued_work(self.cfg),
                         "a claimed-but-unfinished ticket IS the T-1926 failure state")
 
@@ -647,7 +882,7 @@ class HasQueuedWorkTest(unittest.TestCase):
         self.assertFalse(kg.has_queued_work(self.cfg))
 
     def test_done_tickets_do_not_count(self):
-        self._write("done", "T-0005", "atlas")
+        self._write("done", "T-0005", "artisan")
         self.assertFalse(kg.has_queued_work(self.cfg))
 
     def test_agent_without_ticket_targets_is_false(self):
@@ -657,7 +892,7 @@ class HasQueuedWorkTest(unittest.TestCase):
     def test_missing_tree_is_false_not_an_exception(self):
         """Fail-safe: a detector fault must never invent a queue and pin the floor on."""
         cfg = {"pantheon_config_path": "/nonexistent/path/xyz",
-               "ticket_targets": frozenset({"atlas"})}
+               "ticket_targets": frozenset({"artisan"})}
         self.assertFalse(kg.has_queued_work(cfg))
 
 
@@ -666,7 +901,7 @@ class QueueAwareOptInConfigTest(unittest.TestCase):
 
     def test_only_seats_are_opted_in(self):
         opted = {a for a, c in kg.AGENT_PANE.items() if c.get("queue_aware_backoff")}
-        self.assertEqual(opted, {"metis", "atlas"},
+        self.assertEqual(opted, {"mason", "artisan"},
                          "widening the floor to orchestrator/specialist/recovery is a separate decision; "
                          "it must not arrive as a side effect of an edit here")
 
@@ -693,7 +928,7 @@ class GateAwareQueuedWorkTest(unittest.TestCase):
         for d in ("inbox", "active", "done"):
             (self.root / "tickets" / d).mkdir(parents=True)
         self.cfg = {"pantheon_config_path": str(self.root),
-                    "ticket_targets": frozenset({"atlas"})}
+                    "ticket_targets": frozenset({"artisan"})}
 
     def _write(self, state_dir, tid, target, extra_fm=""):
         (self.root / "tickets" / state_dir / f"{tid}.md").write_text(
@@ -701,38 +936,38 @@ class GateAwareQueuedWorkTest(unittest.TestCase):
             encoding="utf-8")
 
     def test_future_not_before_does_not_count(self):
-        self._write("inbox", "T-0001", "atlas",
+        self._write("inbox", "T-0001", "artisan",
                     "not_before: 2099-01-01T00:00:00Z\n")
         self.assertFalse(kg.has_queued_work(self.cfg))
 
     def test_past_not_before_counts(self):
-        self._write("inbox", "T-0001", "atlas",
+        self._write("inbox", "T-0001", "artisan",
                     "not_before: 2020-01-01T00:00:00Z\n")
         self.assertTrue(kg.has_queued_work(self.cfg))
 
     def test_malformed_not_before_fails_open_and_counts(self):
         # Mirrors inbox_consumer: malformed treated as missing (fail-open).
-        self._write("inbox", "T-0001", "atlas", "not_before: not-a-date\n")
+        self._write("inbox", "T-0001", "artisan", "not_before: not-a-date\n")
         self.assertTrue(kg.has_queued_work(self.cfg))
 
     def test_unmet_dep_does_not_count(self):
-        self._write("inbox", "T-0002", "atlas", "depends_on: [T-0001]\n")
+        self._write("inbox", "T-0002", "artisan", "depends_on: [T-0001]\n")
         self.assertFalse(kg.has_queued_work(self.cfg))
 
     def test_met_dep_counts(self):
-        self._write("done", "T-0001", "atlas")
-        self._write("inbox", "T-0002", "atlas", "depends_on: [T-0001]\n")
+        self._write("done", "T-0001", "artisan")
+        self._write("inbox", "T-0002", "artisan", "depends_on: [T-0001]\n")
         self.assertTrue(kg.has_queued_work(self.cfg))
 
     def test_one_gated_one_clear_counts(self):
-        self._write("inbox", "T-0003", "atlas", "depends_on: [T-9999]\n")
-        self._write("inbox", "T-0004", "atlas")
+        self._write("inbox", "T-0003", "artisan", "depends_on: [T-9999]\n")
+        self._write("inbox", "T-0004", "artisan")
         self.assertTrue(kg.has_queued_work(self.cfg))
 
     def test_gated_active_ticket_does_not_count(self):
         # Gate-filtering applies to active/ too: a deliberately paused arc
         # (calendar/dep-gated while claimed) is work the agent cannot start.
-        self._write("active", "T-0005", "atlas",
+        self._write("active", "T-0005", "artisan",
                     "not_before: 2099-01-01T00:00:00Z\n")
         self.assertFalse(kg.has_queued_work(self.cfg))
 
@@ -773,7 +1008,7 @@ class GateParityWithInboxConsumer(unittest.TestCase):
                     (root / "tickets" / d).mkdir(parents=True)
                 # dep_met fixtures need T-9991 resolved on disk
                 fm_base = ("created: 2026-07-23T00:00:00Z\nrequester: orchestrator\n"
-                           "target: atlas\n")
+                           "target: artisan\n")
                 (root / "tickets" / "done" / "T-9991.md").write_text(
                     f"---\nid: T-9991\n{fm_base}state: done\n---\n\n# t\n")
                 tpath = root / "tickets" / "inbox" / "T-0001.md"
@@ -781,7 +1016,7 @@ class GateParityWithInboxConsumer(unittest.TestCase):
                     f"---\nid: T-0001\n{fm_base}state: inbox\n{fm}---\n\n# t\n")
 
                 kg_verdict = kg._ticket_is_actionable(
-                    tpath, frozenset({"atlas"}), root / "tickets")
+                    tpath, frozenset({"artisan"}), root / "tickets")
 
                 # Consumer side: the REAL classifier, not a copy of it (T-2171).
                 # The previous version re-implemented the classification inline, so
@@ -793,7 +1028,7 @@ class GateParityWithInboxConsumer(unittest.TestCase):
                 # tree; that coupling is the price of testing the real gate.
                 with mock.patch.object(ic, "TICKETS_ROOT", root / "tickets"):
                     try:
-                        ic_verdict = bool(ic.list_eligible_tickets("atlas"))
+                        ic_verdict = bool(ic.list_eligible_tickets("artisan"))
                     except ic.SkipCycle:
                         ic_verdict = False
 
@@ -806,9 +1041,9 @@ class MappedOrExemptCoverageTest(unittest.TestCase):
     """T-2370: every registry persona is nudged (AGENT_PANE) or exempt with a stated
     reason (_NO_KEEP_GOING) — never silently absent.
 
-    The defect this closes is SILENCE. mnemosyne was missing from AGENT_PANE with no
+    The defect this closes is SILENCE. archivist was missing from AGENT_PANE with no
     comment, and nothing in the code could distinguish that from the stale omission
-    that had already left metis's and atlas's heartbeats dead from bringup. Same
+    that had already left mason's and artisan's heartbeats dead from bringup. Same
     mapped-or-exempt shape as mailbox_mcp._NO_MCP_RECIPIENT (T-2285).
     """
 
@@ -925,6 +1160,197 @@ class StateLockTest(unittest.TestCase):
                         do_session_id=lambda cfg: None, do_cap_check=lambda *a, **k: False,
                         now_ts=1000)
         self.assertEqual(rc, 0, "lock unavailable must degrade to unlocked, not fail the nudge")
+
+
+class LedgerTacCmdTest(unittest.TestCase):
+    """T-4517: only <seg>/<seg>.jsonl is a shard; ledger/appetite/ must not crowd out the newest lines."""
+
+    def test_non_shard_subdir_cannot_crowd_out_the_newest_shard(self) -> None:
+        import json
+        import subprocess
+        with tempfile.TemporaryDirectory() as td:
+            ledger = Path(td) / "ledger"
+            (ledger / "2026-W40").mkdir(parents=True)
+            (ledger / "appetite").mkdir()
+            (ledger / "2026-W40" / "2026-W40.jsonl").write_text(json.dumps({"action": "newest"}) + "\n")
+            (ledger / "appetite" / "2026-W40.jsonl").write_text(
+                "".join(json.dumps({"appetite_row": i}) + "\n" for i in range(600)))
+            out = subprocess.run(["bash", "-c", kg._ledger_tac_cmd(td, 500)],
+                                 capture_output=True, text=True, check=False).stdout
+        rows = [json.loads(line) for line in out.splitlines() if line.strip()]
+        self.assertEqual(rows, [{"action": "newest"}])
+
+
+FLEET_NOW = 1791140000            # 2026-10-04T18:53:20Z
+FLEET_SEVEN_RESET = 1791738000    # 2026-10-11T17:00:00Z (observed live on specialist, Orchestrator)
+
+
+class FleetUsageGateT4510(unittest.TestCase):
+    """T-4510: at >=95% of the fleet's shared weekly Max the periodic keep-going nudge
+    pauses and resumes by itself at the reset. The gate rides the EXISTING do_cap_check
+    seam (default cap_or_usage_gate) — no parallel gate in run(). Fails open on every
+    unknown. A hit cap (is_usage_capped) keeps its original behaviour and message."""
+
+    def setUp(self):
+        self.injected = []
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.fleet = Path(self._tmp.name) / "fleet-usage"
+        self.fleet.mkdir()
+        patcher = mock.patch.dict(os.environ, {
+            "PANTHEON_STATE_DIR": str(Path(self._tmp.name) / "state"),
+            "PANTHEON_FLEET_USAGE_DIR": str(self.fleet),
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        # The fall-through (hit-cap) check reads real session jsonl via sudo: stub it.
+        hit = mock.patch.object(kg, "is_usage_capped", return_value=False)
+        self.hit_cap = hit.start()
+        self.addCleanup(hit.stop)
+        self.kw = dict(do_work_ts=lambda cfg: None, do_session_id=lambda cfg: None,
+                       do_capture=lambda pt, uu: IDLE_PANE, do_inject=self._inject_ok)
+
+    def _inject_ok(self, pt, prompt):
+        self.injected.append((pt, prompt))
+        return True
+
+    def _reading(self, pct, *, resets_at=FLEET_SEVEN_RESET, seat="orchestrator", ts=FLEET_NOW - 5):
+        (self.fleet / f"{seat}.json").write_text(json.dumps({
+            "schema": "pantheon-fleet-usage/v1", "ts": ts, "seat": seat,
+            "seven_day": {"used_percentage": pct, "resets_at": resets_at},
+            "five_hour": None}), encoding="utf-8")
+
+    def _run(self, now_ts=FLEET_NOW, **kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = kg.run("recovery", now_ts=now_ts, **{**self.kw, **kw})
+        return rc, buf.getvalue()
+
+    def test_at_99_the_nudge_is_skipped_with_a_reason(self):
+        self._reading(99)
+        rc, out = self._run()
+        self.assertEqual(rc, 0, "a gated skip is harmless, not an error")
+        self.assertEqual(self.injected, [])
+        self.assertIn("fleet usage gate", out)
+        self.assertIn("99", out)
+
+    def test_at_exactly_95_the_nudge_is_skipped(self):
+        self._reading(95)
+        self._run()
+        self.assertEqual(self.injected, [])
+
+    def test_below_95_still_nudges(self):
+        self._reading(94)
+        rc, _ = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.injected), 1)
+
+    def test_integer_percentage_as_observed_live(self):
+        self._reading(97)   # int, as the live payload carries
+        self._run()
+        self.assertEqual(self.injected, [])
+
+    def test_expired_reading_fails_open(self):
+        self._reading(99, resets_at=FLEET_NOW - 1)
+        self._run()
+        self.assertEqual(len(self.injected), 1)
+
+    def test_missing_dir_and_garbage_files_fail_open(self):
+        self._run()
+        self.assertEqual(len(self.injected), 1)
+        (self.fleet / "junk.json").write_text("{{{ not json", encoding="utf-8")
+        with mock.patch.object(kg, "ADAPTIVE", False):
+            self._run()
+        self.assertEqual(len(self.injected), 2)
+
+    def test_logs_once_per_window_not_once_per_tick(self):
+        self._reading(99)
+        outs = [self._run(now_ts=FLEET_NOW + i * 900)[1] for i in range(3)]
+        self.assertIn("fleet usage gate", outs[0])
+        self.assertEqual(outs[1], "")
+        self.assertEqual(outs[2], "")
+        self.assertEqual(self.injected, [])
+
+    def test_a_new_window_logs_again(self):
+        self._reading(99)
+        self.assertIn("fleet usage gate", self._run()[1])
+        self._reading(99, resets_at=FLEET_SEVEN_RESET + 3600)   # a different reset => new window
+        self.assertIn("fleet usage gate", self._run(now_ts=FLEET_NOW + 900)[1])
+
+    def test_gated_skip_does_not_consume_the_backoff_budget(self):
+        self._reading(99)
+        self._run()
+        self.assertEqual(self.injected, [])
+        self._reading(10)     # usage fell (or the window rolled): first nudge is immediate
+        self._run(now_ts=FLEET_NOW + 900)
+        self.assertEqual(len(self.injected), 1)
+
+    def test_nudges_resume_automatically_at_the_reset(self):
+        self._reading(99)
+        self._run(now_ts=FLEET_SEVEN_RESET - 900)
+        self.assertEqual(self.injected, [])
+        self._run(now_ts=FLEET_SEVEN_RESET + 1)     # reading now expired -> fail open
+        self.assertEqual(len(self.injected), 1)
+
+    def test_freshest_reading_across_seats_wins(self):
+        self._reading(99, seat="orchestrator", ts=FLEET_NOW - 1000)
+        self._reading(40, seat="artisan", ts=FLEET_NOW - 5)
+        self._run()
+        self.assertEqual(len(self.injected), 1)
+
+    def test_gate_is_checked_before_the_jsonl_hit_cap_read(self):
+        self._reading(99)
+        self._run()
+        self.hit_cap.assert_not_called()   # cheap file read first; no sudo jsonl scan
+
+    def test_open_gate_falls_through_to_the_hit_cap_check(self):
+        self._reading(10)
+        self.hit_cap.return_value = True
+        rc, out = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.injected, [])
+        self.hit_cap.assert_called_once()
+        self.assertIn("usage/capability cap detected", out)   # original message intact
+
+    def test_gate_exception_fails_open_to_the_hit_cap_check(self):
+        def boom(now):
+            raise RuntimeError("gate bug")
+        got = kg.cap_or_usage_gate(kg.AGENT_PANE["recovery"], "recovery", FLEET_NOW, do_fleet_gate=boom)
+        self.assertFalse(got)
+        self.hit_cap.assert_called_once()
+
+    def test_wrapper_return_shapes(self):
+        cfg = kg.AGENT_PANE["recovery"]
+        self._reading(99)
+        got = kg.cap_or_usage_gate(cfg, "recovery", FLEET_NOW)
+        self.assertTrue(got)
+        self.assertIsNot(got, True)
+        self.assertIn("99", got.reason)
+        self._reading(10)
+        self.assertIs(kg.cap_or_usage_gate(cfg, "recovery", FLEET_NOW), False)
+        self.hit_cap.return_value = True
+        self.assertIs(kg.cap_or_usage_gate(cfg, "recovery", FLEET_NOW), True)
+
+    def test_a_failing_log_marker_does_not_fail_the_unit(self):
+        # should_log_once can raise (Path.home() -> RuntimeError); an unguarded call in run()
+        # would turn a harmless suppression into a unit failure alert. Noisy beats failing.
+        self._reading(99)
+        with mock.patch.object(kg._fug, "should_log_once", side_effect=RuntimeError("no home")):
+            rc, out = self._run()
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.injected, [])
+        self.assertIn("fleet usage gate", out)
+
+    def test_default_seam_is_the_wrapper_not_a_parallel_gate(self):
+        import inspect
+        default = inspect.signature(kg.run).parameters["do_cap_check"].default
+        self.assertIs(default, kg.cap_or_usage_gate)
+
+    def test_kill_switch_env_restores_old_behaviour(self):
+        self._reading(99)
+        with mock.patch.dict(os.environ, {"PANTHEON_USAGE_GATE_ENABLED": "0"}):
+            self._run()
+        self.assertEqual(len(self.injected), 1)
 
 
 if __name__ == "__main__":

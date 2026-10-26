@@ -45,6 +45,8 @@ def _provider(status: str, reason: str = "not ready") -> HealthProvider:
         policy_probe=_ready_probe("policy-r1"),
         approval_reachability_probe=_ready_probe("approval-r1"),
         executor_reachability_probe=_ready_probe("executor-r1"),
+        # T-2917 5d.4: the closed roster gained operation_driver (HO ruling)
+        operation_driver_probe=_ready_probe("operation-driver-r1"),
     )
 
 
@@ -111,6 +113,8 @@ class ProbeFailureTests(unittest.TestCase):
             policy_probe=_ready_probe("policy-r1"),
             approval_reachability_probe=_ready_probe("approval-r1"),
             executor_reachability_probe=_ready_probe("executor-r1"),
+            # T-2917 5d.4: the closed roster gained operation_driver (HO ruling)
+            operation_driver_probe=_ready_probe("operation-driver-r1"),
         )
         payload = serialize_health(provider.snapshot())
         encoded = json.dumps(payload, sort_keys=True)
@@ -213,6 +217,8 @@ class StatelessProviderTests(unittest.TestCase):
             policy_probe=_ready_probe("policy-r1"),
             approval_reachability_probe=_ready_probe("approval-r1"),
             executor_reachability_probe=_ready_probe("executor-r1"),
+            # T-2917 5d.4: the closed roster gained operation_driver (HO ruling)
+            operation_driver_probe=_ready_probe("operation-driver-r1"),
         )
         first = provider.snapshot()
         state.update(status="unhealthy", reason="journal failed")
@@ -267,16 +273,25 @@ class BrokerPackageInventoryTests(unittest.TestCase):
             observed,
             [
                 "__init__.py",
+                "approval_client.py",
                 "approval_source.py",
                 "contracts.py",
                 "dbus_service.py",
+                "driver.py",
+                "envelope.py",
+                "execution_source.py",
+                "executor_client.py",
                 "health.py",
                 "health_dbus.py",
                 "journal.py",
                 "operations.py",
                 "planner.py",
                 "policy.py",
+                "ratelimit.py",
+                "reconciler.py",  # T-2917 5d.2: the broker live-state reconciler
                 "registry.py",
+                "runtime_table.py",  # T-2918: ORG-082 steps 3+5 (daemon load-time table)
+                "self_amendment.py",  # T-2918: ORG-052 gate 36 plan-time refusal
                 "trusted_files.py",
                 "wire.py",
             ],

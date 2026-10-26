@@ -30,8 +30,8 @@ mechanics; its content is the consolidated taxonomy plus the msg-910/912/TG-917 
 
 **Written for external readers** (it propagates to the public seed): each daemon is named with its
 persona on use — the `claude` daemon (persona **Orchestrator**, the Orchestrator / "HO"), `claude-research`
-(**Specialist**), `claude-fallback` (**Recovery**), the `codex` worker-harness (**Cairn**), the sub-orchestrator
-seats `suborch1`/`suborch2` (**Metis**/**Atlas**), the `exocortex` daemon (**Mnemosyne**), and
+(**Specialist**), `claude-fallback` (**Recovery**), the `codex` worker-harness (**Consultant**), the sub-orchestrator
+seats `suborch1`/`suborch2` (**Mason**/**Artisan**), the `exocortex` daemon (**Archivist**), and
 **the-ancestor** (a shared hub host, not an agent).
 
 ## The modeling frame — how to read this ADR (the load-bearing correction)
@@ -92,37 +92,37 @@ operator-initiated) may later move it toward active S1/S2 curation duties — se
 
 ### S1 — Operations (the value-producing units)
 The units that do the primary work; each is itself a **viable system one recursion level down**.
-- **The sub-orchestrator seats** — `suborch1`/`suborch2` (**Metis**/**Atlas**), a horizontally
-  scalable N+ tier under the HO (N per deployment, including N=0). Metis/Atlas are *current instances,
+- **The sub-orchestrator seats** — `suborch1`/`suborch2` (**Mason**/**Artisan**), a horizontally
+  scalable N+ tier under the HO (N per deployment, including N=0). Mason/Artisan are *current instances,
   not the pattern*. Seats are full ledger actors — but **full ledger actor ≠ canonical verification
   anchor** (anchor status follows authorship distribution, not tier membership). (Cite-only; mechanics
   in ORG-043.)
 - **The HO's operational acts** — Orchestrator *when producing*: ADR/doc authorship, ledger entries, dispatch
   execution. (These acts are S1 even though the same persona's orchestration is S3.)
-- **Mnemosyne** (`exocortex`) — an **integral level-0 S1 unit, on par with the seats** (the operator,
-  TG-917: "on par with atlas/metis, just separated for concern reasons"; msg 912: not an exception,
+- **Archivist** (`exocortex`) — an **integral level-0 S1 unit, on par with the seats** (the operator,
+  TG-917: "on par with artisan/mason, just separated for concern reasons"; msg 912: not an exception,
   not "outside," a specialized/optional unit he will "integrate closer" in future). This **retires
   "exception"/"outside" framing org-wide** (corrected on touch, including the T-1921 scope note).
   - *Separation is implementation, not topology:* own unix user (`exocortex`), own private-data domain
     (ORG-042 privacy gates), own operator-facing channel.
-  - *Comms asymmetry, named:* unlike Metis/Atlas (no the operator channel — they route through the HO),
-    Mnemosyne keeps a direct operator channel. "On par" means **on par in VSM level / S1 status — not
+  - *Comms asymmetry, named:* unlike Mason/Artisan (no the operator channel — they route through the HO),
+    Archivist keeps a direct operator channel. "On par" means **on par in VSM level / S1 status — not
     identical in channels or accountability routing.** (Our articulation, not a Beer citation.)
   - *S3-attachment:* the seats' accountability channel (resource bargain, dispatch briefs, merge
-    review) attaches to the HO's S3; **Mnemosyne's attaches directly to the operator** for their
+    review) attaches to the HO's S3; **Archivist's attaches directly to the operator** for their
     domain, by privacy design (routing personal-domain accountability through the HO would defeat the
     ORG-042 separation). So level-0 S1 units partition between two accountability holders — HO for the
     technical seats, operator for the private-domain unit.
-  - *Guardrails on the operator's S3-attachment (codex review, applied):* for Mnemosyne's unit the
+  - *Guardrails on the operator's S3-attachment (codex review, applied):* for Archivist's unit the
     operator deliberately wears S3-attachment and S5 at once. To keep that distinct from the "S5
-    collapsed into S3" pathology, the collapse is **BOUNDED:** **(a)** it applies ONLY to Mnemosyne's
+    collapsed into S3" pathology, the collapse is **BOUNDED:** **(a)** it applies ONLY to Archivist's
     private-domain resource/accountability channel; **(b)** it does NOT generalize to the technical
     seats; **(c)** it does NOT replace the HO's S3 for any Pantheon operation; **(d)** it MUST be
-    re-evaluated if Mnemosyne ever gains Pantheon dispatch, merge, or ledger authority. Any breach of
+    re-evaluated if Archivist ever gains Pantheon dispatch, merge, or ledger authority. Any breach of
     (a)–(c) observed in practice is itself a **pathology signal to surface, not a precedent**.
   - *One-technical-HO invariant SURVIVES* (precision per codex review): the invariant is **one
     technical HO / one Pantheon dispatch authority per instance** — not "one accountability holder."
-    Mnemosyne is not an HO (no dispatch, merge, or ledger-curation role over Pantheon); this places her
+    Archivist is not an HO (no dispatch, merge, or ledger-curation role over Pantheon); this places her
     as S1, not a second S2/S3/S5. One instance, one HO, N+ seats, plus optionally one
     privacy-partitioned specialized unit. ORG-042's "second head / two-hemisphere" language reads
     henceforth as **domain/comms-surface description, not VSM placement.**
@@ -142,7 +142,7 @@ was one). It is how the org *screams* — a low-latency channel distinct from th
 Per the frame's central rule, actors routinely occupy several systems. The load-bearing cases:
 - **Orchestrator (the HO):** **S1** (authorship, ledger, dispatch execution) **+ S3** (orchestration, resource
   allocation, merge authority).
-- **the operator (the operator):** **S5** (policy) **+ bounded S3** for Mnemosyne's private unit (the
+- **the operator (the operator):** **S5** (policy) **+ bounded S3** for Archivist's private unit (the
   guardrailed collapse above).
 - **Codex:** **S1** (dispatched worker, ORG-031 Option-A harness) **+ S3\*** (spec-review auditor).
 - **Recovery:** cross-system by role — **recovery/algedonic-response** (restoring wedged units — the
@@ -151,7 +151,7 @@ Per the frame's central rule, actors routinely occupy several systems. The load-
   (Our articulation; SETTLED — the operator ratified the ADR as written 2026-07-27, accepting this Recovery placement.)
 - **ADRs / the governing docs:** **S1 as authored** (the act of writing) **→ S3 as governance** (once
   ratified and binding) — cross-system *by lifecycle*.
-- **The exocortex / knowledge base:** **S1** (Mnemosyne's operational domain) **+ S2-adjacent**
+- **The exocortex / knowledge base:** **S1** (Archivist's operational domain) **+ S2-adjacent**
   (organizational-memory store).
 
 This is why persona→system 1:1 fails: the systems are functions, and the actors wear several.
@@ -167,7 +167,7 @@ that viability lives in the *balance*, not either pole.
 **Orchestrator, Specialist, Recovery** are the common canonical scope of every deployment narrative and the
 **verification anchor**: claims about org history/structure verify against the three's ledger trail
 first (authorship at 2026-07-23 curation, all shards: Orchestrator/orchestrator 1468, Recovery 233, Specialist
-19, Metis 8, Atlas 1, Mnemosyne 0 — the only set whose authorship verifies end-to-end today). New
+19, Mason 8, Artisan 1, Archivist 0 — the only set whose authorship verifies end-to-end today). New
 seats join via the tiers above; they do not dilute the anchor. **This is an authorship/verification
 property, orthogonal to VSM placement** — the three sit in different systems (Specialist S4; Orchestrator S1+S3;
 Recovery the cross-system recovery/S2-construction/S3\* role), yet share anchor status by authorship
@@ -178,24 +178,35 @@ The **bridge persona** The operator is designing (T-2025 — a new persona over 
 voice-front) is a **future topology change** with its own forthcoming ADR. ORG-045 describes **today's**
 structure and simply does not foreclose it.
 
+**ORG-056 back-reference (added 2026-09-13, T-3185):** **ORG-056** (ratified 2026-08-02) is that
+forthcoming ADR. It fixes the Bridge's canonical **organ-contract placement** — the executive face
+above both hemisphere heads (ORG-056 §§2–3), matching the two-hemisphere structure already named here
+(Orchestrator / Pantheon head + Archivist / personal-creative head) — and itself requires this back-reference
+(ORG-056 Consequences: "ORG-045 needs a back-reference and explicit Bridge placement after this series
+is ratified, but its VSM mapping remains valid"). The placement is a **contract, not an appointment**:
+per ORG-056's own locked acknowledgement, this does not appoint, build, or enable the Bridge. The VSM
+mapping above (the systems S1–S5, the channels, and cross-system occupancy) remains **today's ratified
+structure, unchanged** until the operator's Echo-gated build (T-2025) actually instantiates the Bridge as a
+system-occupying actor.
+
 ## Consequences
 - One ratifiable artifact answers "what IS the multi-instance structure"; digests, seed docs, and the
   multi-instance-discipline note point here instead of triangulating across two ADRs, a notes file,
   and an episodic doc.
-- "Exception" language for Mnemosyne is retired org-wide; corrected on touch.
+- "Exception" language for Archivist is retired org-wide; corrected on touch.
 - The verification-anchor property of the three becomes a stated invariant, explicitly separated from
   VSM placement.
 - The **function→system frame** (cross-system occupancy as the norm) becomes the standing way the org
   reads its own structure — superseding any persona→system 1:1 reading in prior docs (corrected on
   touch).
-- T-1963 item (5) (second-head-as-multiple-seed-instances) is amended by the Mnemosyne-as-S1 placement;
+- T-1963 item (5) (second-head-as-multiple-seed-instances) is amended by the Archivist-as-S1 placement;
   **the operator's ratification of this ADR and of T-1963 are batched as one review.**
-- Seed update after ratification (canonical-three anchor framing, Mnemosyne integral-S1 language, the
+- Seed update after ratification (canonical-three anchor framing, Archivist integral-S1 language, the
   algedonic/S3*/cross-system additions, the new re-evaluate triggers; `vsm-instantiation.md` carries
   the rest).
 
 ## Re-evaluate when
-- The operator's "integrate closer" trigger fires for Mnemosyne.
+- The operator's "integrate closer" trigger fires for Archivist.
 - A fourth persona class emerges that is none of: canonical-three, substrate, privacy-partitioned
   specialized unit, N+ seat.
 - the-ancestor's rebalance trigger resolves (T-1968) — its outcome may move it from substrate toward
@@ -204,6 +215,10 @@ structure and simply does not foreclose it.
   the verification-anchor framing from the then-current counts, do not defend it.
 - The **bridge persona** (T-2025) lands — it changes the metasystem/operator-interface and will need its
   placement stated (in its own ADR, with a back-reference here).
+- (Narrowed 2026-09-13, T-3185) ORG-056 already states the Bridge's organ-contract placement and
+  supplies this back-reference (see "Out of scope" above); the trigger above now narrows to the Bridge
+  actually being **appointed, built, or enabled** — at that point this VSM needs the Bridge added as a
+  system-occupying actor, not merely footnoted.
 - The **algedonic channel** formalizes into dedicated tooling, or a **new channel** (beyond S1–S5 + S2
   substrate + S3* + algedonic) is identified that this mapping doesn't hold.
 
@@ -222,3 +237,6 @@ structure and simply does not foreclose it.
   2026-07-28T03:44:26Z). The batch is complete; both halves stand ratified. Corrected on T-2215 —
   this ADR's last touch was 2026-07-27T22:04:37Z (`f9d7424f9`), 5h40m before T-1963 landed, so the
   "pending" wording above was true when written and outlived its window with no writer in it.
+- **2026-09-13 — Orchestrator adds the ORG-056 back-reference/Bridge-placement pointer** (T-3185, the T-2416
+  Unit A D2-writer amendment) to "Out of scope (deliberately)" + narrows one "Re-evaluate when" trigger.
+  Additive only — the VSM mapping (§§S1–S5, channels, cross-system occupancy) is unchanged.

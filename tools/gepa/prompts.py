@@ -19,6 +19,7 @@ No `gepa` import (see package docstring).
 from __future__ import annotations
 
 from tools.gepa.case_loader import Case
+from tools.ticket import REPO_ROOT
 
 OUTPUT_CONTRACT = (
     "Respond as the reviewer would: open with exactly one of APPROVE, REBOUND, "
@@ -34,6 +35,30 @@ def build_agents_persona_payload(candidate_text: str, *, agent_name: str = "revi
     return build_agents_json(candidate_text, agent_name=agent_name)
 
 
+def _load_narrative(case: Case) -> str | None:
+    """Read the ticket source_path's transition-log narrative for null-diff cases.
+
+    T-3837 v2: null-diff cases (escalate-class, negative_invalid_rebound, some
+    clean_approve) previously had only `ask_summary` — insufficient signal for
+    the reviewer to distinguish escalate from rebound. Reading source_path
+    (relative to REPO_ROOT) gives the executor the same material a human
+    reviewer would have. Returns None on any read failure (path outside repo,
+    missing file, decode error) — narrative is best-effort, never fatal.
+    """
+    if not case.source_path:
+        return None
+    resolved = (REPO_ROOT / case.source_path).resolve()
+    try:
+        repo_root_resolved = REPO_ROOT.resolve()
+        resolved.relative_to(repo_root_resolved)
+    except ValueError:
+        return None
+    try:
+        return resolved.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
 def build_case_task_prompt(case: Case, *, diff_text: str | None, fixed_skills_context: str) -> str:
     """Build the executor's task prompt for one rollout of `case`.
 
@@ -41,10 +66,9 @@ def build_case_task_prompt(case: Case, *, diff_text: str | None, fixed_skills_co
     None for a narrative-only case (no resolvable sha) — matching the
     eval-set README's documented shape ("cases with diff_ref: null are
     narrative-only: the ask_summary plus the ticket's own transition-log
-    text... is the artifact under review"). This function does not itself
-    read `source_path` (that's a caller concern if narrative text beyond
-    ask_summary is desired); it only guarantees `ask_summary` is always
-    present so the task is never empty.
+    text... is the artifact under review"). When `diff_text is None`, the
+    ticket's `source_path` is read and included as `## Narrative` so the
+    executor sees the transition log a human reviewer would have.
     """
     sections = [
         "You are reviewing the following change/decision as the project's reviewer persona.",
@@ -54,10 +78,14 @@ def build_case_task_prompt(case: Case, *, diff_text: str | None, fixed_skills_co
     if diff_text is not None:
         sections.append(f"## Diff\n\n```\n{diff_text}\n```")
     else:
-        sections.append(
-            "## Diff\n\nNo resolvable diff for this case — review the described change on its "
-            "narrative merits (ask_summary above)."
-        )
+        narrative = _load_narrative(case)
+        if narrative is not None:
+            sections.append(f"## Narrative\n\n{narrative}")
+        else:
+            sections.append(
+                "## Diff\n\nNo resolvable diff for this case — review the described change on its "
+                "narrative merits (ask_summary above)."
+            )
     if fixed_skills_context:
         sections.append(f"## Project discipline context (fixed, not part of what you're evaluating)\n\n{fixed_skills_context}")
     sections.append(f"## Output contract\n\n{OUTPUT_CONTRACT}")

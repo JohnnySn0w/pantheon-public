@@ -12,12 +12,16 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from typing import Mapping, Sequence
 from unittest.mock import patch
 
+from tools.bringup_acceptance import hook_emissions as he
 from tools.bringup_acceptance.hook_emissions import (
     BACKLOG_SURFACE_PORTABILITY_FINDING,
     SNAPSHOT_SETTINGS_NOT_VERSION_CONTROLLED_FINDING,
@@ -262,6 +266,147 @@ class ProvePerHookTest(unittest.TestCase):
         self.assertTrue(hook["proof"]["contract_verified"])
         self.assertFalse(hook["proof"]["forced_branch"])
         self.assertEqual(hook["proof"]["portability_finding"], BACKLOG_SURFACE_PORTABILITY_FINDING)
+
+
+class McpListGuardProverRobustnessTest(unittest.TestCase):
+    """T-4412: the mcp-list-guard prover's live-poller stand-in must be OBSERVABLE
+    before the hook is run against it, and an empty emission must explain itself.
+
+    Root cause this pins: ``subprocess.Popen`` returns when the child's exec has
+    closed the errpipe, which the kernel does BEFORE it publishes the new argv
+    (``mm->arg_start/arg_end``). Until then ``/proc/<pid>/cmdline`` reads EMPTY --
+    a window measured at up to ~37 ms under a pinned-CPU load on the fleet VPS,
+    and stretched by exec-time page-ins on a disk-bound CI host. The hook's
+    ``own_poller_live()`` greps that cmdline for ``bun`` + ``server.ts``; on the
+    empty window it returns False (by design: fail-open) and the hook silently
+    ALLOWS, so the prover saw rc 0 / empty stdout where it expected a deny.
+    """
+
+    _HOOK_CMD = f"python3 {_REPO_ROOT / 'tools' / 'hooks' / 'mcp-list-guard.py'}"
+
+    def _prove(self, command: str):
+        with tempfile.TemporaryDirectory() as scratch:
+            return he._prove_mcp_list_guard(command, Path(scratch))
+
+    def test_read_proc_cmdline_reads_a_live_process_and_is_none_for_a_reaped_one(self) -> None:
+        own = he._read_proc_cmdline(os.getpid())
+        self.assertIsInstance(own, str)
+        self.assertTrue(own)
+        self.assertNotIn("\0", own)  # NULs folded to spaces, like own_poller_live()
+        done = subprocess.Popen(["true"])
+        done.wait()
+        self.assertIsNone(he._read_proc_cmdline(done.pid))
+
+    def test_empty_emission_hardstop_carries_diagnostics(self) -> None:
+        # A "hook" that always allows silently (empty stdout, rc 0) but leaves a
+        # marker on stderr -- the exact CI symptom. The HardStop must explain
+        # itself: hook stderr + rc, the stand-in's pid / cmdline / status as read
+        # at that moment, and whether bot.pid existed.
+        command = f"{sys.executable} -c \"import sys; sys.stderr.write('STDERR-MARKER-4412')\""
+        with self.assertRaises(HardStop) as ctx:
+            self._prove(command)
+        message = str(ctx.exception)
+        for needle in (
+            "no parseable emission",
+            "STDERR-MARKER-4412",
+            "hook_rc=0",
+            "bun_probe_server.ts",  # the stand-in's /proc cmdline as read
+            "State:",  # the stand-in's /proc status as read
+            "bot.pid_exists=True",
+            "pid=",
+        ):
+            self.assertIn(needle, message)
+
+    def test_nonzero_exit_hardstop_carries_diagnostics_too(self) -> None:
+        command = (
+            f"{sys.executable} -c \"import os, sys; sys.stderr.write('E-MARKER-4412'); "
+            "sys.exit(3 if os.path.exists(os.path.expanduser('~/.claude/channels/telegram/bot.pid')) else 0)\""
+        )
+        with self.assertRaises(HardStop) as ctx:
+            self._prove(command)
+        message = str(ctx.exception)
+        self.assertIn("exit 3", message)
+        self.assertIn("E-MARKER-4412", message)
+        self.assertIn("bun_probe_server.ts", message)
+
+    def test_hook_only_runs_after_stand_in_cmdline_is_visible(self) -> None:
+        real_read = he._read_proc_cmdline
+        reads: list[int] = []
+
+        # The kernel window (Popen returned, argv not yet published) reads empty or
+        # unreadable; a PARTIAL view (one marker of two) must not count as visible either.
+        window = ["", "bun_probe_server", None]
+
+        def flaky_read(pid: int):
+            reads.append(pid)
+            if len(reads) <= len(window):
+                return window[len(reads) - 1]
+            return real_read(pid)
+
+        reads_at_hook_call: list[int] = []
+        real_run = he._run_hook
+
+        def spy_run(command, **kwargs):
+            reads_at_hook_call.append(len(reads))
+            return real_run(command, **kwargs)
+
+        with patch.object(he, "_read_proc_cmdline", flaky_read), patch.object(he, "_run_hook", spy_run):
+            proof = self._prove(self._HOOK_CMD)
+        self.assertEqual(reads_at_hook_call[0], 0)  # case A: no stand-in exists yet
+        self.assertGreaterEqual(reads_at_hook_call[1], 4)  # case B waited out the whole window
+        self.assertEqual(proof["deny_case"]["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_stand_in_never_visible_is_a_bounded_hardstop_and_the_hook_never_runs(self) -> None:
+        spawned: list[subprocess.Popen] = []
+        real_popen = subprocess.Popen
+
+        def spy_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            spawned.append(proc)
+            return proc
+
+        hook_calls: list[str] = []
+        real_run = he._run_hook
+
+        def spy_run(command, **kwargs):
+            hook_calls.append(command)
+            return real_run(command, **kwargs)
+
+        with (
+            patch.object(he, "_read_proc_cmdline", lambda pid: ""),
+            patch.object(he, "_STAND_IN_READY_TIMEOUT_S", 0.3),
+            patch.object(he, "_STAND_IN_POLL_INTERVAL_S", 0.01),
+            patch.object(he, "_run_hook", spy_run),
+            patch.object(he.subprocess, "Popen", spy_popen),
+        ):
+            started = time.monotonic()
+            with self.assertRaises(HardStop) as ctx:
+                self._prove(self._HOOK_CMD)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5.0)
+        self.assertEqual(len(hook_calls), 1)  # case A only; the hook never saw the invisible stand-in
+        self.assertIn("never showed", str(ctx.exception))
+        stand_in = next(p for p in spawned if p.args[0] == "bun_probe_server.ts")
+        self.assertIsNotNone(stand_in.poll())  # stand-in reaped on the failure path
+
+    def test_stand_in_that_dies_before_becoming_visible_fails_fast(self) -> None:
+        real_popen = subprocess.Popen
+
+        def dying_popen(*args, **kwargs):
+            if kwargs.get("args", [None])[0] == "bun_probe_server.ts":
+                return real_popen(args=["true"], executable="/bin/true")
+            return real_popen(*args, **kwargs)
+
+        with (
+            patch.object(he, "_STAND_IN_READY_TIMEOUT_S", 8.0),
+            patch.object(he.subprocess, "Popen", dying_popen),
+        ):
+            started = time.monotonic()
+            with self.assertRaises(HardStop) as ctx:
+                self._prove(self._HOOK_CMD)
+            elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 4.0)  # noticed the exit; did not sit out the deadline
+        self.assertIn("exited", str(ctx.exception))
 
 
 class OutOfScopeClassificationTest(unittest.TestCase):

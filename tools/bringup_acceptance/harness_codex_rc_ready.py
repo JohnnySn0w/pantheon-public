@@ -86,6 +86,7 @@ from tools import runtime_controller as rc
 from tools.bringup_acceptance.codex_acceptance_config_guard import (
     AcceptanceConfigGuardError,
     ReversibleAcceptanceConfigGuard,
+    converge_worker_guard_hook,
     parse_codex_cli_semver,
 )
 from tools.bringup_acceptance import harness_codex_ready as hcr
@@ -144,7 +145,7 @@ harness_runtime:
         profile: interactive-chatgpt
         model: null
         native:
-          sandbox: workspace-write
+          sandbox: danger-full-access
           config_overrides:
             approval_policy: never
 
@@ -521,6 +522,9 @@ def run_codex_rc_ready_bringup(
                     codex_home=codex_home,
                     project_cwd=acceptance_project_cwd,
                     owner="harness_codex_rc_ready",
+                    # T-5317: the one prepare_codex_launch writer the replay
+                    # can't model; converge it before the snapshot.
+                    converge=lambda: converge_worker_guard_hook(codex_home, binding),
                 )
                 guard.__enter__()
                 if mode == _MODE_REAL_CLI:

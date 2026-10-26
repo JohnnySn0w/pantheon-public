@@ -211,25 +211,24 @@ class TestTombstonePresent(unittest.TestCase):
         self.assertTrue(tombstone.exists(), "Tombstone should remain after failure")
 
     def test_fire_uses_correct_service_for_recovery(self) -> None:
-        """T-2684 (reverted T-3082, 2026-08-23): recovery is NOT control-plane-
-        supervised pre-T-3026 — T-2590 covers only the consume plane; the
-        interactive session still lives on the bespoke claude-telegram-
-        fallback.service, so the drain must invoke THAT unit directly (plain
-        systemctl restart / is-active) and must NOT invoke the oneshot
-        pantheon-persona-consume@recovery.service (it cannot cycle the tmux
-        session) nor pass --supervisor control-plane. T-3026 (interactive-
-        session cutover) flips this back once it lands. Mirrors
-        test_fire_uses_correct_service_for_specialist (T-2658), which stays on
-        the control-plane branch since specialist's interactive session already
-        lives there."""
+        """T-3026 (2026-09-29): recovery is control-plane-supervised — the
+        interactive session moved off the bespoke claude-telegram-
+        fallback.service onto the runtime controller + consume timer, so the
+        drain must invoke pantheon-persona-consume@recovery.service, NOT the
+        retired bespoke unit, and must pass --supervisor control-plane so
+        handoff_and_restart.sh takes the kill-session + scope-liveness branch
+        instead of plain systemctl restart / is-active. Pre-cutover (T-2684
+        reverted T-3082, 2026-08-23) this asserted the opposite, because the
+        oneshot consume unit cannot cycle a bespoke tmux session. Mirrors
+        test_fire_uses_correct_service_for_specialist (T-2658)."""
         _write_tombstone(self.state_dir, "recovery")
         import tools.restart_drain as rd
         with patch("tools.restart_drain.subprocess.run", side_effect=_mock_subprocess_run_success) as mock_run:
             rd.main([])
         combined = " ".join(str(a) for a in mock_run.call_args_list)
-        self.assertIn("claude-telegram-fallback.service", combined)
-        self.assertNotIn("pantheon-persona-consume@recovery.service", combined)
-        self.assertNotIn("--supervisor control-plane", combined)
+        self.assertIn("pantheon-persona-consume@recovery.service", combined)
+        self.assertNotIn("claude-telegram-fallback.service", combined)
+        self.assertIn("--supervisor control-plane", combined)
 
     def test_recovery_fire_does_not_pass_idle_sentinel(self) -> None:
         """Recovery tombstone → NO --idle-sentinel in subprocess args.
@@ -248,26 +247,24 @@ class TestTombstonePresent(unittest.TestCase):
         self.assertNotIn("--idle-sentinel", combined)
 
     def test_fire_uses_correct_service_for_orchestrator(self) -> None:
-        """T-2953 R31 (reverted T-3098, 2026-08-23): orchestrator is NOT control-
-        plane-supervised pre-T-2953 cutover -- the interactive session still
-        lives on the bespoke claude-telegram.service, so the drain must
-        invoke THAT unit directly (plain systemctl restart / is-active) and
-        must NOT invoke the oneshot pantheon-persona-consume@orchestrator.service
-        (it cannot cycle the tmux session) nor pass --supervisor
-        control-plane. T-2953 flips this back once the full cutover lands.
-        Mirrors test_fire_uses_correct_service_for_recovery (T-3082), which
-        stays off the control-plane branch for the identical reason, and
-        test_fire_uses_correct_service_for_specialist (T-2658), which stays ON
-        the control-plane branch since specialist's interactive session already
-        lives there."""
+        """T-2953 (2026-10-24): orchestrator cut over to the control plane; mirrors
+        recovery (T-3026) — the interactive session moved off the bespoke
+        claude-telegram.service onto the runtime controller + consume timer,
+        so the drain must invoke pantheon-persona-consume@orchestrator.service, NOT
+        the retired bespoke unit, and must pass --supervisor control-plane so
+        handoff_and_restart.sh takes the kill-session + scope-liveness branch
+        instead of plain systemctl restart / is-active. Pre-cutover (T-2953
+        R31 reverted T-3098, 2026-08-23) this asserted the opposite, because
+        the oneshot consume unit cannot cycle a bespoke tmux session. Mirrors
+        test_fire_uses_correct_service_for_recovery (T-3026)."""
         _write_tombstone(self.state_dir, "orchestrator")
         import tools.restart_drain as rd
         with patch("tools.restart_drain.subprocess.run", side_effect=_mock_subprocess_run_success) as mock_run:
             rd.main([])
         combined = " ".join(str(a) for a in mock_run.call_args_list)
-        self.assertIn("claude-telegram.service", combined)
-        self.assertNotIn("pantheon-persona-consume@orchestrator.service", combined)
-        self.assertNotIn("--supervisor control-plane", combined)
+        self.assertIn("pantheon-persona-consume@orchestrator.service", combined)
+        self.assertNotIn("claude-telegram.service", combined)
+        self.assertIn("--supervisor control-plane", combined)
 
     def test_fire_uses_correct_service_for_specialist(self) -> None:
         """T-2658: specialist is control-plane-supervised (T-2633 cutover) — the
@@ -286,15 +283,35 @@ class TestTombstonePresent(unittest.TestCase):
         self.assertIn("--supervisor control-plane", combined)
 
     def test_fire_omits_supervisor_flag_for_bespoke_seats(self) -> None:
-        """Bespoke seats still omit --supervisor. Orchestrator is bespoke again
-        pre-T-2953 (T-3098 reverted the premature R31 marking)."""
-        _write_tombstone(self.state_dir, "mnemosyne")
+        """Bespoke seats still omit --supervisor. T-2953 (2026-10-24): orchestrator
+        cut over to the control plane; mirrors recovery (T-3026), so no reference
+        seat is bespoke any more — the branch is exercised with a hand-built
+        bespoke entry (orchestrator's pre-cutover shape: RAW unit, no "supervisor"
+        key) so the omit path stays covered for forks/future bespoke seats."""
+        _write_tombstone(self.state_dir, "orchestrator")
+        import tools.restart_drain as rd
+        bespoke = dict(rd.DRAIN_AGENT_CONFIG["orchestrator"],
+                       restart_service="claude-telegram.service")
+        bespoke.pop("supervisor", None)
+        with patch.object(rd, "DRAIN_AGENT_CONFIG", {"orchestrator": bespoke}), \
+             patch("tools.restart_drain.subprocess.run", side_effect=_mock_subprocess_run_success) as mock_run:
+            rd.main([])
+        combined = " ".join(str(a) for a in mock_run.call_args_list)
+        self.assertNotIn("--supervisor", combined)
+        self.assertIn("claude-telegram.service", combined)
+
+    def test_fire_uses_correct_service_for_archivist(self) -> None:
+        """T-5063: archivist is control-plane-supervised (cut over 2026-10-18),
+        so the drain invokes the consume unit with --supervisor control-plane,
+        never the disabled bespoke claude-telegram-exocortex.service."""
+        _write_tombstone(self.state_dir, "archivist")
         import tools.restart_drain as rd
         with patch("tools.restart_drain.subprocess.run", side_effect=_mock_subprocess_run_success) as mock_run:
             rd.main([])
         combined = " ".join(str(a) for a in mock_run.call_args_list)
-        self.assertNotIn("--supervisor", combined)
-        self.assertIn("claude-telegram-exocortex.service", combined)
+        self.assertIn("pantheon-persona-consume@archivist.service", combined)
+        self.assertNotIn("claude-telegram-exocortex.service", combined)
+        self.assertIn("--supervisor control-plane", combined)
 
 
 # ---------------------------------------------------------------------------
@@ -845,6 +862,30 @@ class TestDetachedLaunch(unittest.TestCase):
             f"Expected --unit=drain-restart-<stem> in {sdr_argv}",
         )
 
+    def test_fire_restart_unit_pages_recovery_on_failure(self) -> None:
+        """T-4834: --collect GCs a failed unit and the tombstone is already gone, so a
+        refused restart (T-4828 exit 3) was silent. The transient unit must carry an
+        OnFailure alert. systemd-run -p does not expand %n: the instance is literal."""
+        calls, side_effect = self._capture_calls()
+        cfg = dict(self.cfg, restart_mode="user")
+        with patch("tools.restart_drain.subprocess.run", side_effect=side_effect):
+            self.rd._fire_restart(cfg, "recovery", skip_ack=False)
+        sdr_argv = [c for c in calls if isinstance(c, list) and "systemd-run" in c][-1]
+        unit = next(a for a in sdr_argv if a.startswith("--unit=")).removeprefix("--unit=")
+        prop = f"OnFailure=pantheon-unit-failure-alert@{unit}.service.service"
+        self.assertIn(prop, sdr_argv)
+        self.assertEqual(sdr_argv[sdr_argv.index(prop) - 1], "-p")
+        self.assertLess(sdr_argv.index(prop), sdr_argv.index("--"), "property must precede the command")
+
+    def test_fire_restart_system_mode_has_no_user_alert_template(self) -> None:
+        # The alert template is a USER unit; a system-mode launch must not reference it.
+        calls, side_effect = self._capture_calls()
+        cfg = dict(self.cfg, restart_mode="system")
+        with patch("tools.restart_drain.subprocess.run", side_effect=side_effect):
+            self.rd._fire_restart(cfg, "recovery", skip_ack=False)
+        sdr_argv = [c for c in calls if isinstance(c, list) and "systemd-run" in c][-1]
+        self.assertFalse(any(a.startswith("OnFailure=") for a in sdr_argv))
+
     def test_fire_restart_inner_carries_skip_ack(self) -> None:
         """The inner bash -c string passed to systemd-run still carries --skip-ack."""
         calls, side_effect = self._capture_calls()
@@ -1238,34 +1279,37 @@ class TestBuildDrainConfig(unittest.TestCase):
     deliberate reference-instance change."""
 
     REFERENCE_LITERALS = {
-        # T-2684 (reverted T-3082, 2026-08-23): recovery is NOT control-plane-
-        # supervised pre-T-3026 — T-2590 covers only the consume plane; the
-        # interactive session still lives on the bespoke claude-telegram-
-        # fallback.service, so restart_service stays that RAW unit (no
-        # consume-unit derivation) and no "supervisor" key is carried —
-        # handoff_and_restart.sh takes the bespoke systemctl-restart branch,
-        # matching the live session host. T-3026 (interactive-session
-        # cutover) re-derives this once it lands.
+        # T-3026 (2026-09-29): recovery is control-plane-supervised (interactive-
+        # session cutover onto the runtime controller + consume timer, as specialist
+        # below) — restart_service is DERIVED to the consume unit (overriding
+        # the retired bespoke restart_service instance.yaml keeps for
+        # documentation) and "supervisor" is carried so handoff_and_restart.sh
+        # takes the kill-session + scope-liveness branch. Pre-cutover (T-2684
+        # reverted T-3082, 2026-08-23) this entry carried the RAW bespoke unit
+        # and no "supervisor" key. Deliberate reference-instance change,
+        # updated together with instance.yaml.
         "recovery": {
-            "restart_service": "claude-telegram-fallback.service", "restart_mode": "user",
+            "restart_service": "pantheon-persona-consume@recovery.service", "restart_mode": "user",
             "restart_target_pane": "claude-telegram-bot-fallback:0",
             "handoff_file": "/home/claude-fallback/HANDOFF.md",
             "restart_bin": "/home/claude-fallback/pantheon-config/tools/handoff_and_restart.sh",
             "restart_lockfile": "/tmp/handoff_and_restart_recovery.lock",
+            "supervisor": "control-plane",
         },
-        # T-2953 R31 (reverted T-3098, 2026-08-23): orchestrator is NOT control-
-        # plane-supervised pre-T-2953 cutover -- the interactive session
-        # still lives on the bespoke claude-telegram.service, so
-        # restart_service stays that RAW unit (no consume-unit derivation)
-        # and no "supervisor" key is carried -- handoff_and_restart.sh takes
-        # the bespoke systemctl-restart branch, matching the live session
-        # host. T-2953's full cutover re-derives this once it lands.
+        # T-2953 (2026-10-24): orchestrator cut over to the control plane; mirrors
+        # recovery (T-3026) — restart_service is DERIVED to the consume unit
+        # (overriding the retired bespoke restart_service instance.yaml keeps
+        # for documentation) and "supervisor" is carried so
+        # handoff_and_restart.sh takes the kill-session + scope-liveness
+        # branch. Pre-cutover (T-2953 R31 reverted T-3098, 2026-08-23) this
+        # entry carried the RAW bespoke unit and no "supervisor" key.
         "orchestrator": {
-            "restart_service": "claude-telegram.service", "restart_mode": "user",
+            "restart_service": "pantheon-persona-consume@orchestrator.service", "restart_mode": "user",
             "restart_target_pane": "claude-telegram-bot:0",
             "handoff_file": "/home/claude/HANDOFF.md",
             "restart_bin": "/home/claude/pantheon-config/tools/handoff_and_restart.sh",
             "restart_lockfile": "/tmp/handoff_and_restart_orchestrator.lock",
+            "supervisor": "control-plane",
         },
         # T-2658: specialist is control-plane-supervised (T-2633 cutover) —
         # restart_service is DERIVED to the consume unit (overriding the
@@ -1281,19 +1325,31 @@ class TestBuildDrainConfig(unittest.TestCase):
             "restart_lockfile": "/tmp/handoff_and_restart_specialist.lock",
             "supervisor": "control-plane",
         },
-        # mnemosyne — T-2370. NOT a reference-instance change: instance.yaml has
+        # archivist — T-2370. NOT a reference-instance change: instance.yaml has
         # granted second-head restart_service since ORG-042, and the drain's own
         # `"restart_service" in binding` predicate always selected it. The former
         # hand-carried `_DRAIN_PERSONAS` tuple was subtracting it back out, so this
         # snapshot recorded the bug as the expectation. Deriving the persona set
         # makes the manifest and the config agree; this entry is what that agreement
         # looks like, not a widening of the reference instance.
-        "mnemosyne": {
-            "restart_service": "claude-telegram-exocortex.service", "restart_mode": "user",
+        # T-5063 (2026-10-18): archivist cut over to the control plane, so (as specialist)
+        # restart_service derives to the consume unit and supervisor is carried.
+        "archivist": {
+            "restart_service": "pantheon-persona-consume@archivist.service", "restart_mode": "user",
             "restart_target_pane": "claude-telegram-bot-exocortex:0",
             "handoff_file": "/home/exocortex/HANDOFF.md",
             "restart_bin": "/home/exocortex/pantheon-config/tools/handoff_and_restart.sh",
-            "restart_lockfile": "/tmp/handoff_and_restart_mnemosyne.lock",
+            "restart_lockfile": "/tmp/handoff_and_restart_archivist.lock",
+            "supervisor": "control-plane",
+        },
+        # T-5299: artisan completed its control-plane cutover (restart binding added).
+        "artisan": {
+            "restart_service": "pantheon-persona-consume@artisan.service", "restart_mode": "user",
+            "restart_target_pane": "suborch2-main:0",
+            "handoff_file": "/home/suborch2/HANDOFF.md",
+            "restart_bin": "/home/suborch2/pantheon-config/tools/handoff_and_restart.sh",
+            "restart_lockfile": "/tmp/handoff_and_restart_artisan.lock",
+            "supervisor": "control-plane",
         },
     }
 
@@ -1317,7 +1373,7 @@ class TestBuildDrainConfig(unittest.TestCase):
         """T-2370 REGRESSION: the drain set is the manifest's restart_service grantees —
         no more, and critically no LESS. This is the assertion the old hand-carried
         `_DRAIN_PERSONAS = ("recovery", "orchestrator", "specialist")` tuple failed: instance.yaml
-        granted restart_service to a fourth role (second-head/mnemosyne) and the tuple
+        granted restart_service to a fourth role (second-head/archivist) and the tuple
         silently subtracted it, so its restart tombstones were quarantined as an
         unknown agent. Re-introducing ANY hand-carried outer list fails here as soon as
         it disagrees with the manifest — which is the only way this defect comes back.
@@ -1329,7 +1385,7 @@ class TestBuildDrainConfig(unittest.TestCase):
             if "restart_service" in arm.instance_binding(p)
         }
         self.assertEqual(set(rd.DRAIN_AGENT_CONFIG), granted)
-        self.assertIn("mnemosyne", rd.DRAIN_AGENT_CONFIG)  # the measured casualty
+        self.assertIn("archivist", rd.DRAIN_AGENT_CONFIG)  # the measured casualty
 
     def test_missing_restart_pane_omits_key_not_none(self) -> None:
         # T-2076 review #4: a binding without restart_pane leaves the key ABSENT

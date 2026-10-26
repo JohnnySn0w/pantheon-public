@@ -240,7 +240,7 @@ class TestEndToEndSubprocess(unittest.TestCase):
         obj = json.loads(out)
         hso = obj["hookSpecificOutput"]
         self.assertEqual(hso["hookEventName"], "PreToolUse")
-        self.assertEqual(hso["permissionDecision"], "allow")
+        self.assertNotIn("permissionDecision", hso)  # T-4650: context only, no approval
         self.assertIn("feedback_ticket", hso["additionalContext"])
         self.assertIn("verify it still applies", hso["additionalContext"])
 

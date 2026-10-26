@@ -1,0 +1,36 @@
+# Unknown-dialog monitor (T-2553). DETECT-ONLY backstop: a claude seat parked on an
+# UNRECOGNISED blocking confirm dialog (an update / NUX / trust "press to continue" dialog
+# appearing mid-run — not the cap modal, not a tool-permission prompt) sits there until a
+# human notices. Every fire captures each fleet seat's pane (Recovery's own pane excluded,
+# T-0559), and alerts Recovery once the SAME seat shows an unknown dialog at the pane bottom on
+# >= 2 consecutive runs, cooldown-gated per seat.
+#
+# NEVER SENDS KEYS: an unknown dialog has no known-safe answer, so recovery stays Recovery's
+# (inspect, or handoff_and_restart). Deliberately separate from pantheon-cap-modal-reaper
+# so the reaper's keystroke surface stays exactly its T-4037-gated Esc.
+#
+# SHIP-DARK: the script is a no-op unless PANTHEON_UNKNOWN_DIALOG_MONITOR_ENABLED=1. Arm by
+# drop-in (Environment=PANTHEON_UNKNOWN_DIALOG_MONITOR_ENABLED=1) once Recovery has acked.
+#
+# Runs on RECOVERY's account (same posture as cap_modal_reaper / context_fill_monitor): pure
+# cross-account pane reads, no LLM/Claude API. Fail-open: always exits 0, so OnFailure only
+# pages on a real unit-level failure (e.g. the interpreter missing).
+[Unit]
+Description=Pantheon unknown-dialog monitor — alert Recovery when a seat is parked on an unrecognised confirm dialog (T-2553); detect-only, never sends keys
+Documentation=file:///home/%u/pantheon-config/tools/unknown_dialog_monitor.py
+
+# Silent-failure guard (T-1868): on failure, wake Recovery via the ORG-026 mailbox.
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/bin/python3 %h/pantheon-config/tools/unknown_dialog_monitor.py
+StandardOutput=journal
+StandardError=journal
+# Five cross-account pane captures at <= 8s each, plus alert routing. Generous headroom.
+TimeoutStartSec=3min
+
+[Install]
+WantedBy=default.target

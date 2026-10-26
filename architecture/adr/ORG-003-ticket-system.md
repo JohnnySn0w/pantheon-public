@@ -91,7 +91,7 @@ What the target needs to know to act on the ask. Pointers to relevant files, com
 |---|---|---|
 | `id` | yes | `T-NNNN`. Globally unique within `tickets/`. Monotonic at filing. |
 | `created` | yes | ISO 8601 UTC. Time of filing, never updated. |
-| `requester` | yes | Controlled vocabulary, same as ledger `agent` field: `orchestrator`, `human:operator`, `recovery`, `specialist`, `worker:implementer`, `worker:reviewer`, `project:<slug>:orchestrator`. |
+| `requester` | yes | Controlled vocabulary: the persona names `tools/ticket.py` accepts and normalizes to (T-0492; role ids and fleet account names are accepted as aliases, and a role id shared by several seats is stored as given), plus `operator`. *Erratum 2026-10-08 (T-4734):* this field was described as sharing the ledger `agent` vocabulary; the two are independent, and the ledger now uses ORG-100 role ids (ORG-001). |
 | `target` | yes | Same vocabulary. The instance/agent expected to claim. May be a class (`worker:implementer`) for "any available worker." |
 | `state` | yes | One of: `inbox`, `active`, `done`. Must match the parent directory. Inconsistency = grooming agent flag. (Note: `blocked` state retired per ORG-019 2026-05-19.) |
 | `parent_ticket` | optional | Ticket ID this descends from (e.g., a re-dispatch of a closed ticket). `null` for roots. |
@@ -133,6 +133,7 @@ Runs as a cron'd dispatch on `claude-fallback`, daily at 12:00 UTC (interleaved 
 - For each stale ticket: appends a transition-log entry with the grooming flag.
 - Auto-commits and auto-pushes per the same pattern as `watch_runner.py` (HERMES guard, narrow scope to `tickets/active/`, plain push, no force).
 - Sends a digest summary via Bot API direct-curl identifying stale tickets, similar to `watch_digest.py`.
+  - *Amended 2026-09-28/29 by T-4200 (the operator TG 3608-3616; precedent msg_1934 `--no-digest`):* the operator Telegram send is **ACTION-ONLY**. It fires only when a finding genuinely needs the operator, and otherwise stays silent. Proof-of-life moves to the git commit, the journal record and `failed_unit_reconcile`, not a send. The full digest still goes to stdout/journal. This overrides the original always-send for the **Telegram surface only**. The same rule applies to the watch digest (`adaptive_finish` already conformed; the activity digest was retired 2026-09-29, T-4289).
 
 Recovery's responsibilities expand to: existing recovery + new grooming. Both responsibilities are cron'd or event-driven; Recovery is otherwise idle. No conflict with the recovery role.
 

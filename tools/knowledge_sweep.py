@@ -26,7 +26,7 @@ not headless. So this script is a *due-detector + ticket-filer*, mirroring
 `watch_runner.py --file-watch-ticket`:
 
   cron `--file-sweep-ticket`
-     → (corpus changed?) → file ONE target=specialist "knowledge sweep dispatch"
+     → (corpus changed?) → file ONE target=role:research_orchestrator "knowledge sweep dispatch"
        ticket whose body carries the **team-SOP dispatch recipe**
        (`sop/standard/team-orchestrator-dispatch-checklist.md`: implicit
        agent-team, lead spawns review workers via the Agent tool with distinct
@@ -457,7 +457,7 @@ def file_sweep_ticket(
     ticket_bin: Path = TICKET_BIN,
     env: dict | None = None,
 ) -> int:
-    """Daily timer entrypoint. Files ONE target=specialist knowledge-sweep-dispatch
+    """Daily timer entrypoint. Files ONE target=role:research_orchestrator knowledge-sweep-dispatch
     ticket iff the corpus changed since the last completed sweep AND no sweep
     dispatch is already pending. Fires NO review subagent. Returns 0 on success /
     nothing-changed / already-pending; 1 on a filing failure.
@@ -512,7 +512,7 @@ def file_sweep_ticket(
         str(ticket_bin),
         "file",
         "--requester", "specialist",
-        "--target", "specialist",
+        "--target", "role:research_orchestrator",
         # NB: no --intent — ticket.py rejects --intent for non-operator targets
         # (it's target=operator-specific). The 2026-06-06 13:00 fire failed on this.
         "--title", title,
@@ -599,7 +599,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--file-sweep-ticket", action="store_true",
         help="DAILY TIMER ENTRYPOINT: if the corpus changed since the last "
-             "completed sweep, file ONE target=specialist knowledge-sweep-dispatch "
+             "completed sweep, file ONE target=role:research_orchestrator knowledge-sweep-dispatch "
              "ticket (carries the team-SOP review recipe). Fires NO subagent. "
              "Idempotent (one pending sweep at a time). Prod-mutating mode.",
     )

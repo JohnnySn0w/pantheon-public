@@ -120,6 +120,62 @@ def run(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
     return result
 
 
+def _rebase_in_progress() -> bool:
+    """A rebase-state dir in REPO (worktree-correct via `rev-parse --git-path`)."""
+    for kind in ("rebase-merge", "rebase-apply"):
+        res = run(["git", "rev-parse", "--git-path", kind], check=False)
+        rel = res.stdout.strip() if res.returncode == 0 else ""
+        if rel and (Path(rel) if os.path.isabs(rel) else REPO / rel).exists():
+            return True
+    return False
+
+
+def push_main() -> None:
+    """`git push origin main` that never strands REPO mid-rebase (T-4388).
+
+    A rebase already in progress is somebody's own: refuse without pushing. The
+    pre-push freshness hook's `git pull --rebase` can stop on a conflict and exit 1
+    without aborting; a rebase that appears during the push is the hook's, so abort
+    it. Raises SyncError on any failure.
+
+    The whole probe/push/clean-up runs under the shared git_mutation_lock: "appeared
+    during the push, so it is the hook's" only holds if no other lock-taking writer
+    can start a rebase in between (T-4388 review). Imported lazily so the module
+    stays importable without tools/ on sys.path."""
+    if str(Path(__file__).resolve().parent.parent) not in sys.path:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from tools._git_utils import GitMutationLockTimeout, git_mutation_lock
+    try:
+        with git_mutation_lock(label="pantheon-config-sync push"):
+            _push_main_locked()
+    except GitMutationLockTimeout as exc:
+        raise SyncError(f"git mutation lock busy; push skipped (the next fire retries): {exc}")
+
+
+def _push_main_locked() -> None:
+    if _rebase_in_progress():
+        raise SyncError("refusing to push: a rebase is already in progress in "
+                        f"{REPO}; finish or abort it by hand")
+    res = run(["git", "push", "origin", "main"], check=False)
+    if res.returncode == 0:
+        # T-4691: ORG-101 dual-write leg only (no failover; this push owns its own
+        # non-ff/rebase handling). Inert unless the manifest marks a writable mirror.
+        from tools._git_utils import mirror_push_after_origin
+        note = mirror_push_after_origin(REPO, "main")
+        if note:
+            print(f"[pantheon-config-sync] {note}", file=sys.stderr)
+        return
+    detail = (res.stderr or res.stdout).strip()
+    if _rebase_in_progress():
+        run(["git", "rebase", "--abort"], check=False)
+        if _rebase_in_progress():
+            raise SyncError(f"push failed; the pre-push freshness rebase conflicted and "
+                            f"`rebase --abort` FAILED; {REPO} is STILL MID-REBASE: {detail}")
+        raise SyncError(f"push failed; the pre-push freshness rebase conflicted and was "
+                        f"aborted (origin moved ahead; the next fire re-syncs): {detail}")
+    raise SyncError(f"git push origin main failed: {detail}")
+
+
 def determine_state() -> tuple[bool, bool]:
     """Return (local_ahead, remote_ahead) for local main vs origin/main.
 
@@ -231,7 +287,7 @@ def main(argv: list[str] | None = None) -> int:
         return 3
     if local_ahead:
         try:
-            run(["git", "push", "origin", "main"])
+            push_main()
             print("sync: push ok")
             _clear_alert_state()
             return 0

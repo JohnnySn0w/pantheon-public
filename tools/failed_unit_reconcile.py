@@ -56,9 +56,9 @@ REPO = pathlib.Path(__file__).resolve().parent.parent
 if str(REPO) not in sys.path:
     sys.path.insert(0, str(REPO))
 
-from tools.agent_role_map import account_persona_map  # noqa: E402
+from tools.agent_role_map import account_persona_map, mailbox_hub  # noqa: E402
 
-RECOVERY_INBOX = pathlib.Path("/home/the-ancestor/mailbox/recovery")
+RECOVERY_INBOX = pathlib.Path(mailbox_hub()) / "recovery"  # T-4096: hub from instance.yaml
 PROBE_TIMEOUT_SECONDS = 20
 
 # Sentinel distinct from both "no failures" and an empty set.

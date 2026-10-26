@@ -1,13 +1,13 @@
 # ACP mailbox-bridge wedge / loop recovery
 
-**Status:** Draft 2026-07-26 (Author: Recovery; filed from the mnemosyne context-wedge + specialist T-2038 cap-loop recurrences. Pending the operator ratification per the sop/remediation per-SOP ratification rule.)
+**Status:** Draft 2026-07-26 (Author: Recovery; filed from the archivist context-wedge + specialist T-2038 cap-loop recurrences. Pending the operator ratification per the sop/remediation per-SOP ratification rule.)
 
 **Amendment adopted 2026-07-28 (Recovery, T-2132)** — verification-step corrections only; the remediation itself was executed verbatim on specialist and worked as written. Added the run-on-your-own-seat pre-flight (transcript mtime as the am-I-resetting-myself discriminator), and rewrote the verify step after measuring that its process check could report a *failed stop that had actually succeeded*. Amendment tier is below the goal-level bar per amended D3, so it is adopted rather than held for a stamp; the base SOP's ratification status above is unchanged by it.
 
 **Amendment adopted 2026-08-18 (Recovery, T-2972)** — added **Class C (auth staleness)** below (failure shape + remediation step 3.5 + a Class-C exception to step 4), from the specialist 2026-08-18 incident: the bridge held a stale token for hours after specialist's OAuth re-login and all ACP delivery silently failed `-32000: Authentication required`. Remediation content only, below the goal-level bar per amended D3 → adopted rather than held; base SOP ratification status above unchanged.
 
 The `pantheon-acp-bridge@<agent>.service` bridge (`tools/acp_bridge.py`) connects a
-seat/keeper (specialist, mnemosyne, …) to its mailbox over a persistent ACP wrapper
+seat/keeper (specialist, archivist, …) to its mailbox over a persistent ACP wrapper
 session. Two distinct failure shapes recur; both look like "the bridge is alive but
 messages aren't getting through."
 
@@ -16,7 +16,7 @@ messages aren't getting through."
 **Class A — session-context wedge ("Prompt is too long").** The persistent ACP
 wrapper session context fills up, so every poll re-attempts the stuck message and
 returns `ACP error -32603: Internal error: Prompt is too long`. The *message* isn't
-too long — the *accumulated session context* is (mnemosyne hit this at wrapper
+too long — the *accumulated session context* is (archivist hit this at wrapper
 iteration ~101k, 2026-07-26). A plain restart does NOT clear it: `_resolve_session()`
 persists a `sessionId` to a state file and does `session/load` (RESUME) on restart,
 so it re-loads the same full-context session and re-wedges.
@@ -49,11 +49,11 @@ read the log file. (This red herring cost a misdiagnosis in T-2038.)
 
 ## Precedent cases
 
-- **mnemosyne, 2026-07-26** — Class A "Prompt too long" loop; recovered by deleting
+- **archivist, 2026-07-26** — Class A "Prompt too long" loop; recovered by deleting
   the state file before restart (the fresh-session path).
 - **specialist, 2026-07-26 (T-2038)** — Class B usage-cap loop; root-caused + fixed
   structurally (transient classification + circuit breaker) and the bridge redeployed.
-- **mnemosyne, T-1830** — earlier redelivery-loop residue in the same stack.
+- **archivist, T-1830** — earlier redelivery-loop residue in the same stack.
 
 ## Recommended remediation
 
@@ -71,7 +71,7 @@ confirm the unit name and the running invocation before acting.
    anything. (Specialist hit exactly this on T-2132 — suspected self, checked mtime, and the
    wedged session had been idle 3.4h while its own was actively writing.)
 0.5. **FALSIFY "wedged" FIRST — is the ACP session simply WORKING?** (Added 2026-07-28 by Recovery
-   after resetting mnemosyne's bridge that was not broken.) A busy bridge and a wedged bridge
+   after resetting archivist's bridge that was not broken.) A busy bridge and a wedged bridge
    look **identical** on every cheap signal, and all of them mislead:
    - `cputimes` near 0 — a blocked-on-`session/prompt` bridge and a healthy idle-polling one
      both consume ~1 CPU-second over an hour. Low CPU is NOT evidence of a wedge.
@@ -167,7 +167,7 @@ pgrep -u <account> -af 'acp_bridge\.py --agent <agent>'     # expect exactly 2
   carrying the pattern without that word still pollutes the count. Scope by `-u <account>`
   instead — it excludes your own shell (different user) *and* other agents' bridges.
 - **An unscoped pattern sees OTHER agents' bridges.** Measured live: 3 procs for specialist
-  and 3 for mnemosyne on the same host.
+  and 3 for archivist on the same host.
 
 **Expect a TREE, not one process. "Exactly one bridge process" is the wrong invariant.**
 The bridge is `sg veneration -c` → `sh -c` → `python3`; user-scoped that is **2** (the
@@ -178,7 +178,7 @@ bridge tree does not hang beneath it — measured, `pstree -p` on the MainPID sh
 `bash---sleep` (the supervisor's poll sleep) while the bridge ran fine on another branch.
 
 Then confirm backlog drains, and **state health explicitly**
-(`feedback_confirm_health_after_touching_live_sessions`).
+(`sop/standard/confirm-health-after-touching-a-live-session.md`).
 
 ## Autonomous-vs-bubble-up D3 placement
 

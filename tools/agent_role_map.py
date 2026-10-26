@@ -3,9 +3,10 @@
 Pantheon uses THREE parallel namespaces:
 
   - Persona names       (canonical for tickets): orchestrator, specialist, recovery
-  - Audit role-ids      (canonical for ledger):  orchestrator, specialist, recovery
-  - Instance role-keys  (portable config axis):  orchestrator, specialist, recovery,
-                                                 peer-daemon-*, sub-orchestrator-1/-2, second-head
+  - Audit role-ids      (canonical for ledger):  head_engineering_orchestrator, head_research_orchestrator, head_system_orchestrator
+                                                 (specialist = specialist's retired audit-id, kept as a legacy alias)
+  - Instance role-keys  (portable config axis):  head-engineering-orchestrator, specialist, head-system-orchestrator,
+                                                 peer-daemon-*, engineering-orchestrator-1/-2, head-memory-orchestrator
 
 Per T-0492/msg_1661: persona names are now the canonical namespace for ticket
 `target:` and `requester:` fields. Audit role-ids remain canonical for ledger
@@ -49,6 +50,9 @@ That doc covers the persona<->AUDIT-role-id table only, not instance role-keys.)
 
 from __future__ import annotations
 
+import hashlib
+import json
+import os
 import re
 from pathlib import Path
 
@@ -58,22 +62,35 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 
 AGENT_ROLE_MAP: dict[str, str] = {
-    "orchestrator": "orchestrator",
-    "specialist": "specialist",
-    "recovery": "recovery",
+    "orchestrator": "head_engineering_orchestrator",
+    # T-3807 (operator-ratified roles vocabulary): specialist's forward audit role-id is
+    # now head_research_orchestrator. `specialist` — the prior audit id — is RETAINED
+    # as a backward-resolving LEGACY INPUT-ALIAS in PERSONA_ALIASES below (D1, P4
+    # audit-continuity): historical [specialist] ledger entries,
+    # resolve_persona("specialist"), and watch_runner --requester specialist must
+    # still resolve to specialist. Forward normalization emits head_research_orchestrator;
+    # the alias only resolves the legacy token backward.
+    "specialist": "head_research_orchestrator",
+    "recovery": "head_system_orchestrator",
     # Peer-daemon harnesses brought into the ticketing loop 2026-06-09 (the operator
     # directive, this thread): codex (ORG-018/ORG-031 codex-CLI pilot — a live,
-    # self-supervised daemon) and the-ancestor (fresh account; full claude-code
-    # bringup pending — see sop/standard/pantheon-bringup.md). Identity audit
-    # role-ids (no separate role-id); persona == account for both, which the
-    # bringup SOP §4 explicitly permits. Registering them here makes them valid
-    # ticket target:/requester: values (_valid_target_values()).
-    "codex": "codex",
-    "the-ancestor": "the-ancestor",
-    # Mnemosyne — the second head (ORG-042 two-hemisphere topology), resident
+    # self-supervised daemon). Registering it here makes it a valid ticket
+    # target:/requester: value (_valid_target_values()). The-ancestor was also
+    # registered then; it was retired (ORG-087 sec. 4 step 4, T-3421) and removed from
+    # every live map here. Historical done tickets still carry `target: the-ancestor`
+    # but done/ is never linted (ticket_lint.STATES_TO_LINT), and no ledger entry
+    # carries it as an agent id, so no legacy alias is needed.
+    # ORG-100 (T-3814) gave codex the ratified role-class audit-id head_auditor
+    # (identity→role normalize).
+    # codex's OLD audit-id IS its persona name, so historical [codex] ledger/tickets
+    # ride persona-name identity passthrough (resolve_persona("codex") -> "codex"
+    # unchanged) — no legacy alias needed (contrast orchestrator, whose old id != persona).
+    "codex": "head_auditor",
+    # Archivist — the second head (ORG-042 two-hemisphere topology), resident
     # on the `exocortex` account (persona ≠ account; account→persona lives in
-    # mailbox_mcp._USER_TO_PERSONA per T-1824). Identity audit role-id per the
-    # codex/the-ancestor precedent: registering the persona makes her a valid
+    # mailbox_mcp._USER_TO_PERSONA per T-1824). ORG-100 (T-3814) gave her the
+    # ratified role-class audit-id head_memory_orchestrator (was an identity
+    # audit-id): registering the persona makes her a valid
     # ticket target:/requester: (SOP §10 step 8); it enables, not obligates —
     # her residency remains mailbox-first per ORG-042. Registered by recovery
     # 2026-07-20 (parity audit, the operator TG 3827).
@@ -82,66 +99,133 @@ AGENT_ROLE_MAP: dict[str, str] = {
     # instance role-key / repos.yaml binding stays deliberately unbound (ORG-042:
     # her config-repo shape is hers + the operator's call)". That was true for about
     # one day and false for the eight after it. She IS bound:
-    #   resolve_instance_role("mnemosyne")           -> second-head
-    #   _FALLBACK_PERSONA_TO_INSTANCE_ROLE           -> second-head  (this file)
-    #   repos.yaml                                    -> 4 second-head grants
+    #   resolve_instance_role("archivist")           -> head-memory-orchestrator
+    #   _FALLBACK_PERSONA_TO_INSTANCE_ROLE           -> head-memory-orchestrator  (this file)
+    #   repos.yaml                                    -> head-memory-orchestrator grants
+    # (role-key renamed from `second-head` by the operator's T-3807 roles vocabulary.)
     # Bound by T-1922 / 7946c56d8 (2026-07-21, example-org); the stale claim was
     # c5b2ddad5 (2026-07-20, recovery).
     #
     # Recorded rather than overwritten, per the instance.yaml header's precedent,
-    # because of WHERE it sat: a reader deciding whether mnemosyne should have a
+    # because of WHERE it sat: a reader deciding whether archivist should have a
     # role-key binding would find a comment calling its absence DELIBERATE, three
     # lines above the map that binds her. A clean edit would leave nothing to warn
     # the next person that this file's prose has drifted from its own data before.
     # The ORG-042 residency point above is kept because it is still true and is
     # the useful half — it is only the binding clause that was wrong.
-    "mnemosyne": "mnemosyne",
-    # Metis + Atlas — sub-orchestrator seats (ORG-043), self-named 2026-07-21,
+    "archivist": "head_memory_orchestrator",
+    # Mason + Artisan — engineering-orchestrator seats (ORG-043), self-named 2026-07-21,
     # resident on suborch1/suborch2 (persona != account; account->persona in
     # mailbox_mcp._USER_TO_PERSONA + ticket._OS_USER_PERSONA per T-1896).
-    # Identity audit role-ids per the mnemosyne precedent; registering makes
-    # them valid ticket target:/requester: values for the retask lane.
-    "metis": "metis",
-    "atlas": "atlas",
+    # ORG-100 (T-3814) gave BOTH the shared ratified role-class audit-id
+    # engineering_orchestrator (were identity audit-ids). The reverse map is
+    # therefore non-injective (engineering_orchestrator -> mason OR artisan):
+    # ACCEPTED by design (two seats, one role-class — operator-ratified). No reverse
+    # owner-alias is registered for it — ENFORCED (T-4044): engineering_orchestrator
+    # is in NON_INJECTIVE_ROLE_IDS and thus EXCLUDED from _ROLE_PERSONA_MAP below, so
+    # resolve_persona() returns it unchanged and ticket.py refuses a bare target of it
+    # (pointing at role:engineering_orchestrator) instead of silently picking artisan.
+    # The legacy [mason]/[artisan] ledger tokens ride persona-name identity passthrough
+    # (their OLD audit-ids ARE their persona names).
+    # Registering makes them valid ticket target:/requester: values for the retask lane.
+    "mason": "engineering_orchestrator",
+    "artisan": "engineering_orchestrator",
+    # Watchman (T-4884 B6): the codex-primary recovery seat on the codex-fallback
+    # account, an ORG-100 §1 REGULAR in Recovery's System domain. Its audit role-id is the
+    # regular role-class system_orchestrator (Recovery holds the head_ id). Single holder
+    # today, so the reverse map stays injective; a second system_orchestrator seat
+    # would make it non-injective exactly as engineering_orchestrator is (T-4044).
+    "watchman": "system_orchestrator",
 }
 
-# Inverse map: audit role-id → persona name (for ticket target/requester normalization).
-# Derived from AGENT_ROLE_MAP; recovery is its own inverse.
-_ROLE_PERSONA_MAP: dict[str, str] = {v: k for k, v in AGENT_ROLE_MAP.items()}
+# T-4044: role-ids mapped by MORE THAN ONE persona (non-injective) — currently
+# `engineering_orchestrator` (mason + artisan, ORG-100/T-3814). A naive
+# `{v: k for k, v in AGENT_ROLE_MAP.items()}` reverse map would silently keep
+# whichever persona was registered LAST (artisan), so `resolve_persona(
+# "engineering_orchestrator")` misrouted to one arbitrary seat, and a bare
+# `--target engineering_orchestrator` normalized to artisan with no warning. These
+# ids have no single canonical persona, so they must NOT be reverse-mapped.
+_ROLE_ID_VALUES: list[str] = list(AGENT_ROLE_MAP.values())
+NON_INJECTIVE_ROLE_IDS: frozenset[str] = frozenset(
+    v for v in _ROLE_ID_VALUES if _ROLE_ID_VALUES.count(v) > 1
+)
+
+# Inverse map: audit role-id → persona name (for ticket target/requester
+# normalization). Derived from AGENT_ROLE_MAP; recovery is its own inverse. Built from
+# INJECTIVE values ONLY (T-4044): a non-injective role-class id is deliberately
+# absent, so `resolve_persona()` returns it UNCHANGED (passthrough) rather than
+# picking an arbitrary seat — callers (ticket.py) refuse a bare non-injective
+# role-class target and point at the ORG-088 `role:<R>` pool form instead.
+_ROLE_PERSONA_MAP: dict[str, str] = {
+    v: k for k, v in AGENT_ROLE_MAP.items() if v not in NON_INJECTIVE_ROLE_IDS
+}
+
+
+def personas_for_role_id(role_id: str) -> list[str]:
+    """The persona seats registered under an audit role-id, sorted. Length > 1
+    iff `role_id in NON_INJECTIVE_ROLE_IDS` (e.g. engineering_orchestrator ->
+    ['artisan', 'mason']). Used to name the seats in a non-injective refusal."""
+    return sorted(k for k, v in AGENT_ROLE_MAP.items() if v == role_id)
 
 
 # ---------------------------------------------------------------------------
 # Persona ALIASES — an alternate NAME for an already-registered persona, not a
 # new identity. Distinct from the audit-role-id ↔ persona axis above: a role-id
-# (orchestrator) and its persona (orchestrator) are two names the map already
+# (head_engineering_orchestrator) and its persona (orchestrator) are two names the map already
 # pairs; an alias is a THIRD kind of name that collapses onto a persona which
 # already owns its role-id + account binding.
 #
-#   cairn → codex : cairn is the SELF-NAME of the codex peer-daemon
-#     (project_cairn_is_codex_persona / reference_cairn_rename_doc_scope). codex
-#     is the OS account + harness/CLI (ORG-018/ORG-031); cairn is the persona it
-#     named itself. A ticket can legitimately carry requester/target: cairn
-#     (e.g. T-3387), so cairn must be a VALID ticket target AND must normalize to
+#   consultant → codex : consultant is the SELF-NAME of the codex peer-daemon
+#     (project_consultant_is_codex_persona / reference_consultant_rename_doc_scope). codex
+#     is the OS account + harness/CLI (ORG-018/ORG-031); consultant is the persona it
+#     named itself. A ticket can legitimately carry requester/target: consultant
+#     (e.g. T-3387), so consultant must be a VALID ticket target AND must normalize to
 #     the codex account EVERYWHERE. Modeled as an alias, NOT an AGENT_ROLE_MAP
 #     entry: codex already holds the audit role-id, instance-role, and account
-#     binding; a parallel `cairn` persona would fork that identity and, lacking
+#     binding; a parallel `consultant` persona would fork that identity and, lacking
 #     an account binding, trip the account-map collision/None guards.
 #     (T-3478: without this, ticket_lint's retarget-to-originator bounce of a
-#     cairn-requested ticket shelled `ticket.py retarget --to cairn`, which
-#     raised `unknown target 'cairn'`, so pantheon-ticket-lint exited 1 hourly.)
+#     consultant-requested ticket shelled `ticket.py retarget --to consultant`, which
+#     raised `unknown target 'consultant'`, so pantheon-ticket-lint exited 1 hourly.)
 #
 # To add an alias: one entry here. It is folded into _valid_target_values() (in
 # ticket.py, via PERSONA_ALIASES keys) and into all three resolve_* functions
 # below (via _dealias), so an alias never survives into a ticket target/
 # requester, a ledger agent-id, or a repos.yaml grants lookup.
 # ---------------------------------------------------------------------------
+#   specialist → specialist : LEGACY INPUT-ALIAS (T-3807, D1). specialist was specialist's
+#     AUDIT role-id before the operator-ratified roles rename made specialist's forward audit
+#     id head_research_orchestrator (AGENT_ROLE_MAP above). It is retained here — not
+#     hard-purged — for P4 audit-continuity: historical ledger entries carry
+#     [specialist], and live consumers still feed the token backward
+#     (resolve_persona("specialist") → specialist, watch_runner --requester specialist,
+#     the s3star_audit_runner reverse map). Modeled as an alias, NOT a resurrected
+#     AGENT_ROLE_MAP entry: specialist already holds the forward audit id, instance-role, and
+#     account binding; a parallel specialist→persona pair would fork that identity.
+#     Forward normalization never EMITS specialist (resolve_role("specialist") →
+#     head_research_orchestrator); the alias only resolves the legacy token when it
+#     arrives as input.
+#   orchestrator → orchestrator : LEGACY INPUT-ALIAS (T-3814, D1 pattern). orchestrator
+#     was orchestrator's AUDIT role-id before the operator-ratified ORG-100 rename made orchestrator's
+#     forward audit id head_engineering_orchestrator (AGENT_ROLE_MAP above). It is retained
+#     here — not hard-purged — for P4 audit-continuity: orchestrator's OLD audit-id is NOT his
+#     persona name (unlike recovery/codex/archivist/mason/artisan, whose old audit-ids ARE their
+#     persona names and so ride persona-name identity passthrough), so without this alias
+#     resolve_persona("orchestrator") would break historical [orchestrator] ledger
+#     entries and tickets. Modeled as an alias, NOT a resurrected AGENT_ROLE_MAP entry: orchestrator
+#     already holds the forward audit id, instance-role, and account binding; a parallel
+#     orchestrator→persona pair would fork that identity. Forward normalization never
+#     EMITS orchestrator (resolve_role("orchestrator") → head_engineering_orchestrator); the
+#     alias only resolves the legacy token when it arrives as input.
 PERSONA_ALIASES: dict[str, str] = {
-    "cairn": "codex",
+    "consultant": "codex",
+    "specialist": "specialist",
+    "orchestrator": "orchestrator",
 }
 
 
 def _dealias(name: str) -> str:
-    """Collapse a persona ALIAS onto its canonical persona (cairn → codex);
+    """Collapse a persona ALIAS onto its canonical persona (consultant → codex);
     every non-alias name passes through unchanged. Applied as the FIRST step of
     the resolve_* functions so an alias is never emitted downstream."""
     return PERSONA_ALIASES.get(name, name)
@@ -170,13 +254,15 @@ def valid_target_values() -> set[str]:
 # enforces the sync (T-1922) — previously the "must stay in sync" line above was a
 # comment with nothing checking it.
 _FALLBACK_PERSONA_TO_INSTANCE_ROLE: dict[str, str] = {
-    "orchestrator": "orchestrator",
+    "orchestrator": "head-engineering-orchestrator",
     "specialist": "specialist",
-    "recovery": "recovery",
-    # ORG-043 seats + ORG-042 second head, bound 2026-07-21 (T-1922).
-    "metis": "sub-orchestrator-1",
-    "atlas": "sub-orchestrator-2",
-    "mnemosyne": "second-head",
+    "recovery": "head-system-orchestrator",
+    # ORG-043 seats + ORG-042 head-memory seat, bound 2026-07-21 (T-1922); role-keys
+    # carry the operator's T-3807 ratified roles vocabulary. Kept in exact sync with
+    # instance.yaml's `roles:` keys (test_instance_role_grants enforces both directions).
+    "mason": "engineering-orchestrator-1",
+    "artisan": "engineering-orchestrator-2",
+    "archivist": "head-memory-orchestrator",
     # Peer daemons (T-2281): role-keys copied from instance.yaml's `roles:` stanza.
     # They were absent here even after T-2256 completed the SIBLING mirror
     # (_FALLBACK_PERSONA_TO_BINDING) to all 8, which left the two mirrors of the
@@ -190,8 +276,82 @@ _FALLBACK_PERSONA_TO_INSTANCE_ROLE: dict[str, str] = {
     # The sync guard checked fallback→manifest but not manifest→fallback; T-2281
     # adds that direction, as T-2256 did for the sibling.
     "codex": "peer-daemon-codex",
-    "the-ancestor": "peer-daemon-the-ancestor",
+    "watchman": "system-orchestrator-1",  # T-4884 B6
 }
+
+
+# ---------------------------------------------------------------------------
+# ONE parse of instance.yaml per process (T-4279).
+#
+# Measured by impl-t4230: this module used to yaml.safe_load the ~50KB manifest
+# THREE times at import with the pure-Python SafeLoader (~0.34s+ CPU), a cost paid
+# by every tool start that imports it (and ~5x per shell-suite SUT run). Two fixes:
+#   1. libyaml's CSafeLoader when PyYAML was built with it, else SafeLoader. Parse
+#      PARITY with SafeLoader is proven on the live instance.yaml by
+#      tools/test_agent_role_map_yaml_cache.py, not assumed.
+#   2. A per-process cache keyed by CONTENT: the file is READ on every call (a
+#      50KB read is microseconds; the parse is the expensive part) and re-parsed
+#      only when its text differs from the cached text. Freshness is therefore
+#      exactly what it was before caching: current_mailbox_hub() (T-2693: a
+#      long-lived MCP server must see a hub move) and the fail-closed membership
+#      projection read (_resolve_membership: "freshness over caching") see every
+#      edit. A stat-identity key (dev/ino/mtime_ns/size) was tried first and
+#      rejected in review: a same-size in-place rewrite within one mtime tick
+#      (e.g. a fixed-length sha256 expected_digest edit) served stale data.
+#
+# SHARED, READ-ONLY result: _parse_manifest() returns the cached object itself,
+# not a copy (a deepcopy costs ~5ms per call, i.e. a large fraction of the libyaml
+# parse it would guard). Every caller is a private loader in this module that only
+# READS the document and builds fresh containers from it; the one loader that hands
+# a sub-mapping out (_load_membership_projection) copies it. Do not mutate the
+# returned object; the cache-integrity test pins that no public accessor leaks it.
+# ---------------------------------------------------------------------------
+
+_MANIFEST_CACHE: dict[str, tuple[str, object]] = {}  # abspath -> (text, parsed)
+
+
+def _yaml_safe_loader_class():
+    """libyaml-backed CSafeLoader when available, else the pure-Python SafeLoader."""
+    import yaml  # lazy import: a missing PyYAML stays a caller-handled error
+
+    return getattr(yaml, "CSafeLoader", None) or yaml.SafeLoader
+
+
+def _parse_manifest(manifest_path: Path) -> object:
+    """Parse *manifest_path* as YAML (safe loader); re-parse only when its text changed.
+
+    Reads the file on EVERY call and compares the text to the cached text, so the
+    result is always what an uncached read+parse would return right now. Raises
+    exactly what the uncached read+parse would (OSError on a missing/unreadable
+    file or a symlink loop, yaml.YAMLError on bad YAML, UnicodeDecodeError), so
+    each caller's existing fail-soft (or fail-closed) handling is unchanged; a
+    failed parse is never cached. The returned object is SHARED with the cache:
+    treat it as read-only."""
+    import yaml  # lazy import
+
+    path = Path(manifest_path)
+    text = path.read_text(encoding="utf-8")
+    # os.path.abspath, NOT Path.resolve(): no filesystem access, so it cannot turn
+    # a symlink-loop OSError into RuntimeError (callers catch OSError). Symlinked
+    # aliases of one file just get separate entries, which is harmless.
+    key = os.path.abspath(path)
+    hit = _MANIFEST_CACHE.get(key)
+    if hit is not None and hit[0] == text:
+        return hit[1]
+    data = yaml.load(text, Loader=_yaml_safe_loader_class())
+    _MANIFEST_CACHE[key] = (text, data)
+    return data
+
+
+def load_instance_document(manifest_path: Path) -> object:
+    """PUBLIC: the parsed YAML document at *manifest_path*, as a private DEEP COPY
+    the caller may mutate or embed freely. Same parse cache + CSafeLoader as the
+    loaders here (T-4279), so a tool that already imported this module pays a
+    ~5ms copy instead of a second full parse. Raises what read+parse would
+    (OSError / yaml.YAMLError / UnicodeDecodeError)."""
+    import copy
+
+    return copy.deepcopy(_parse_manifest(manifest_path))
 
 
 def _load_instance_role_map(manifest_path: Path) -> dict[str, str]:
@@ -202,9 +362,7 @@ def _load_instance_role_map(manifest_path: Path) -> dict[str, str]:
     test environment must not block the entire import chain.
     """
     try:
-        import yaml  # lazy import; matches ticket_lint.py pattern
-
-        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        data = _parse_manifest(manifest_path)  # T-4279: cached, CSafeLoader
         roles = data.get("roles") if isinstance(data, dict) else None
         if not isinstance(roles, dict):
             return dict(_FALLBACK_PERSONA_TO_INSTANCE_ROLE)
@@ -233,21 +391,15 @@ def _load_instance_role_map(manifest_path: Path) -> dict[str, str]:
 # Fallback bindings — the pantheon-vps-0 values, a SYNC MIRROR of instance.yaml's
 # roles (reached only in a manifest-less env, e.g. a test box without a staged
 # instance.yaml). tools/test_instance_role_grants.py enforces the sync. Only the
-# monitored agents carry restart-config; observation-only seats (metis/atlas) have
+# monitored agents carry restart-config; observation-only seats (mason/artisan) have
 # just an account. `restart_pane` is the structured field that replaces parsing the
 # freeform `session:` prose.
 _FALLBACK_PERSONA_TO_BINDING: dict[str, dict] = {
-    # T-2953 R31 (reverted T-3098, 2026-08-23): mirrors instance.yaml
-    # roles.orchestrator's updated comment. `supervisor` stays ABSENT
-    # here pre-T-2953 cutover -- orchestrator's interactive session still lives on
-    # the bespoke claude-telegram.service below, so a control-plane marking
-    # made restart_drain.py / context_fill_monitor.py derive the oneshot
-    # consume unit as the restart target, which cannot cycle that session.
-    # restart_service below is the truthful pre-cutover target. T-2953 (the
-    # full control-plane cutover) re-adds this field as its own completion
-    # step.
+    # T-2953 (2026-10-24): orchestrator cut over to the control plane; mirrors instance.yaml
+    # roles.head-engineering-orchestrator (supervisor only, as recovery; T-5311).
     "orchestrator": {"account": "claude", "restart_service": "claude-telegram.service",
-              "restart_mode": "user", "restart_pane": "claude-telegram-bot:0"},
+              "restart_mode": "user", "restart_pane": "claude-telegram-bot:0",
+              "supervisor": "control-plane"},
     "specialist": {"account": "claude-research", "restart_service": "claude-telegram-research.service",
               "restart_mode": "user", "restart_pane": "claude-research-bot:0",
               # T-2648: mirrors instance.yaml roles.specialist.companion_units
@@ -260,44 +412,33 @@ _FALLBACK_PERSONA_TO_BINDING: dict[str, dict] = {
               # a bespoke systemd unit -- restart_drain.py / context_fill_monitor.py
               # branch the restart mechanism on this, not on restart_service
               # (which stays the RETIRED bespoke unit's documentation value).
-              "supervisor": "control-plane",
-              # T-3210: mirrors instance.yaml roles.specialist.expected_policy_skip
-              # exactly (same exact-dict-equality guard). specialist is expected
-              # not-cut-over (stale 08-14 runtime.json -> every consume fire is
-              # runtime_viability_blocked); fleet_health renders OK+expected
-              # while the seat's coarse skip reason matches this, WARN if it
-              # drifts. Absent here, a manifest-less env would render WARN.
-              "expected_policy_skip": "runtime_viability_blocked"},
-    # T-2684 (reverted T-3082, 2026-08-23): mirrors instance.yaml
-    # roles.recovery's updated comment. `supervisor` stays ABSENT
-    # here pre-T-3026 -- recovery's control-plane cutover (T-2590) moved only
-    # the consume plane; the interactive session still lives on the bespoke
-    # claude-telegram-fallback.service below, so a control-plane marking
-    # made restart_drain.py / context_fill_monitor.py derive the oneshot
-    # consume unit as the restart target, which cannot cycle that session.
-    # restart_service below is the truthful pre-cutover target. T-3026 (the
-    # interactive-session cutover) re-adds this field as its own completion
-    # step.
+              # T-5311: no expected_policy_skip (marker removed; a real block shows WARN).
+              "supervisor": "control-plane"},
+    # T-3026 (2026-09-29): recovery cut over to the control plane; mirrors instance.yaml
+    # roles.head-system-orchestrator (supervisor + expected_policy_skip, as specialist).
     "recovery": {"account": "claude-fallback", "restart_service": "claude-telegram-fallback.service",
-             "restart_mode": "user", "restart_pane": "claude-telegram-bot-fallback:0"},
-    "mnemosyne": {"account": "exocortex", "restart_service": "claude-telegram-exocortex.service",
-                  "restart_mode": "user", "restart_pane": "claude-telegram-bot-exocortex:0"},
-    # T-3210: metis mirrors instance.yaml roles.sub-orchestrator-1.expected_policy_skip
-    # (controller never onboarded metis -> every consume fire is
-    # runtime_viability_blocked; expected not-cut-over). Same guard as specialist above.
-    "metis": {"account": "suborch1", "expected_policy_skip": "runtime_viability_blocked"},
-    # T-3574 (orchestrator ruling (b), 2026-09-08): atlas mirrors instance.yaml
-    # roles.sub-orchestrator-2.expected_policy_skip — atlas is not-cut-over
-    # (controller never onboarded atlas -> initial-viability-state-not-selected;
-    # expected not-cut-over). DELIBERATELY NOT supervisor:control-plane — that
-    # premature marker was reverted twice (T-3098 orchestrator / T-3082 recovery) because it
-    # makes the monitors derive a consume mailbox-drain unit that cannot cycle the
-    # session. Kept in sync with the manifest per Guard D
-    # (test_binding_fallback_never_contradicts_instance_yaml). Same shape as metis.
-    "atlas": {"account": "suborch2", "expected_policy_skip": "runtime_viability_blocked"},
-    # Peer daemons (T-2256): account-only, matching instance.yaml — neither carries
-    # restart-config (codex runs under codex-supervise.sh with Restart=always; the
-    # ancestor is a veneration daemon + mailbox hub, not a monitored session).
+             "restart_mode": "user", "restart_pane": "claude-telegram-bot-fallback:0",
+             "supervisor": "control-plane"},
+    # T-5063: mirrors instance.yaml roles.head-memory-orchestrator (cut over 2026-10-18).
+    "archivist": {"account": "exocortex", "restart_service": "claude-telegram-exocortex.service",
+                  "restart_mode": "user", "restart_pane": "claude-telegram-bot-exocortex:0",
+                  "supervisor": "control-plane"},
+    # T-5311: mason's expected_policy_skip marker removed (its cited cause was stale;
+    # in-window maintenance renders OK via T-5285).
+    "mason": {"account": "suborch1"},
+    # T-3574 (orchestrator ruling (b), 2026-09-08) + T-5299 (2026-10-20): artisan mirrors
+    # instance.yaml roles.engineering-orchestrator-2. T-5299 completed the control-plane
+    # cutover: supervisor + restart binding added (archivist's shape). The earlier premature
+    # marker (reverted T-3098/T-3082) made the monitors derive a consume oneshot that could
+    # not cycle the session; T-4159's --supervisor control-plane kill-first branch fixed that.
+    # restart_service is the real consume unit (documentation value; consumers derive it).
+    # Kept in sync with the manifest per Guard D
+    # (test_binding_fallback_never_contradicts_instance_yaml).
+    "artisan": {"account": "suborch2", "restart_service": "pantheon-persona-consume@artisan.service",
+              "restart_mode": "user", "restart_pane": "suborch2-main:0",
+              "supervisor": "control-plane"},
+    # Peer daemons (T-2256): account-only, matching instance.yaml — codex carries no
+    # restart-config (it runs under codex-supervise.sh with Restart=always).
     # They were absent here until T-2256 even though instance.yaml binds them, which
     # made the FALLBACK a 6-of-8 mirror: harmless while the manifest is present, and
     # a silent under-count of the fleet the moment it is not. The sync guard in
@@ -305,7 +446,10 @@ _FALLBACK_PERSONA_TO_BINDING: dict[str, dict] = {
     # never manifest→fallback (missing keys), so nothing surfaced it — the same
     # one-directional-completeness shape T-2256 exists to close.
     "codex": {"account": "codex"},
-    "the-ancestor": {"account": "the-ancestor"},
+    # T-4884 B6: mirrors instance.yaml roles.system-orchestrator-1 exactly. No
+    # restart_service (no bespoke unit ever existed; see the manifest comment).
+    "watchman": {"account": "codex-fallback", "restart_mode": "user",
+                 "restart_pane": "codex-fallback-main:0", "supervisor": "control-plane"},
 }
 
 # The restart-config keys the monitors consume from a binding (account is separate).
@@ -314,8 +458,10 @@ _FALLBACK_PERSONA_TO_BINDING: dict[str, dict] = {
 # below, no special-casing needed (unlike companion_units, which is list-typed).
 _BINDING_RESTART_KEYS = ("restart_service", "restart_mode", "restart_pane", "supervisor")
 
-# T-3210: matches persona_bringup.py's four coarse policy-skip counter reasons
-# (backoff / runtime_transition / quota_breaker_open / runtime_viability_blocked)
+# T-3210: matches persona_bringup.py's coarse policy-skip counter reasons
+# (backoff / runtime_transition / quota_breaker_open / runtime_viability_blocked /
+# relaunch_window_exhausted, plus T-4179's prior_receiver_blocked, which no seat
+# should ever list as expected)
 # -- a reason-match TOKEN, not a free-text label, and validated (not merely
 # isinstance(str)) at load, unlike _BINDING_RESTART_KEYS' shared plain-string
 # loop below: this key's dict lives in the SAME binding BespokeIdentity.as_env()
@@ -372,8 +518,7 @@ def _load_instance_bindings(manifest_path: Path) -> dict[str, dict]:
     malformed (fail-safe — a missing manifest must not break the monitors'
     import)."""
     try:
-        import yaml  # lazy import; matches the pattern above
-        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        data = _parse_manifest(manifest_path)  # T-4279: cached, CSafeLoader
         roles = data.get("roles") if isinstance(data, dict) else None
         if not isinstance(roles, dict):
             return {p: dict(b) for p, b in _FALLBACK_PERSONA_TO_BINDING.items()}
@@ -424,7 +569,7 @@ def _load_instance_bindings(manifest_path: Path) -> dict[str, dict]:
 # one-canonical-source is the fix, not a more careful copy.
 # ---------------------------------------------------------------------------
 
-_FALLBACK_MAILBOX = {"hub": "/home/the-ancestor/mailbox", "group": "pantheon-mailbox"}
+_FALLBACK_MAILBOX = {"hub": "/home/post-office/mailbox", "group": "pantheon-mailbox"}
 
 
 def _load_instance_mailbox(manifest_path: Path) -> dict[str, str]:
@@ -437,9 +582,7 @@ def _load_instance_mailbox(manifest_path: Path) -> dict[str, str]:
     """
     out = dict(_FALLBACK_MAILBOX)
     try:
-        import yaml  # lazy import; matches _load_instance_role_map
-
-        data = yaml.safe_load(manifest_path.read_text(encoding="utf-8"))
+        data = _parse_manifest(manifest_path)  # T-4279: cached, CSafeLoader
         installer = data.get("persona_installer") if isinstance(data, dict) else None
         mailbox = installer.get("mailbox") if isinstance(installer, dict) else None
         if not isinstance(mailbox, dict):
@@ -470,6 +613,14 @@ _MAILBOX: dict[str, str] = _load_instance_mailbox(_INSTANCE_YAML)
 def mailbox_hub() -> str:
     """Absolute path of the ORG-026 mailbox hub, per instance.yaml."""
     return _MAILBOX["hub"]
+
+
+def current_mailbox_hub() -> str:
+    """mailbox_hub(), re-read from instance.yaml on EVERY call. For long-lived
+    processes: mailbox_hub() is fixed at import, so a server started before a hub
+    move stays bound to the dead path. T-2693: orchestrator's mailbox MCP consume read the
+    retired hub and went silently deaf until its session restarted."""
+    return _load_instance_mailbox(_INSTANCE_YAML)["hub"]
 
 
 def mailbox_group() -> str:
@@ -507,6 +658,45 @@ def control_plane_consume_service(persona: str) -> str:
     check supervisor status, since it has no binding to check against.
     """
     return f"pantheon-persona-consume@{persona}.service"
+
+
+def control_plane_controller_service(persona: str) -> str:
+    """The long-running pantheon-runtime-controller@ unit for *persona* (specialist shape).
+
+    On a control-plane seat this is the unit whose lifecycle tracks the pane
+    (Type=simple, Restart=always: it blocks until the tmux session dies). The
+    consume unit is a 2-minute oneshot and is never is-active between fires, so
+    "is the seat's session supervisor up?" checks must read THIS unit (T-4159)."""
+    return f"pantheon-runtime-controller@{persona}.service"
+
+
+def restart_target(persona: str) -> dict:
+    """How to restart *persona*'s interactive session, derived from its binding (T-4159).
+
+    {"supervisor": "bespoke"|"control-plane", "service", "mode", "pane", "session_unit"}.
+    `service` is what handoff_and_restart.sh / self_restart.sh take as --service:
+    the bespoke restart_service, or on a control-plane seat the persona-consume
+    unit (that script's --supervisor control-plane branch requires it, kills the
+    session first, and the controller relaunches). `session_unit` is the unit
+    whose is-active says the session supervisor is up: the bespoke unit, or the
+    runtime controller. Same derivation as context_fill_monitor's cfm entries, so
+    the shell consumers (recovery_self_restart.sh, verify_startup.sh) can't drift from
+    it. Raises KeyError when the persona has no restart binding: a caller that
+    would fall back to a hardcoded bespoke unit is the exact hazard this replaces."""
+    binding = instance_binding(persona)
+    if "restart_service" not in binding or "restart_pane" not in binding:
+        raise KeyError(f"no restart binding for persona {persona!r}")
+    if binding.get("supervisor") == "control-plane":
+        return {"supervisor": "control-plane",
+                "service": control_plane_consume_service(persona),
+                "mode": binding.get("restart_mode", "user"),
+                "pane": binding["restart_pane"],
+                "session_unit": control_plane_controller_service(persona)}
+    return {"supervisor": "bespoke",
+            "service": binding["restart_service"],
+            "mode": binding.get("restart_mode", "user"),
+            "pane": binding["restart_pane"],
+            "session_unit": binding["restart_service"]}
 
 
 # ---------------------------------------------------------------------------
@@ -549,7 +739,7 @@ def _invert_bindings(bindings: dict[str, dict]) -> tuple[dict[str, str], dict[st
     return resolved, collisions
 
 
-# account → persona (e.g. "exocortex" → "mnemosyne"), and any account claimed by
+# account → persona (e.g. "exocortex" → "archivist"), and any account claimed by
 # more than one persona (must always be empty; pinned by test_agent_role_map_accounts).
 _ACCOUNT_TO_PERSONA, _ACCOUNT_PERSONA_COLLISIONS = _invert_bindings(_PERSONA_TO_BINDING)
 
@@ -571,8 +761,8 @@ def account_persona(account: str) -> str | None:
     Mirrors instance_binding()'s shape (read-only accessor over the manifest-loaded
     map), inverted.
 
-        account_persona("exocortex")  -> "mnemosyne"
-        account_persona("suborch2")   -> "atlas"
+        account_persona("exocortex")  -> "archivist"
+        account_persona("suborch2")   -> "artisan"
         account_persona("codex")      -> "codex"    (persona == account by design)
         account_persona("runner")     -> None
 
@@ -600,41 +790,46 @@ def account_persona(account: str) -> str | None:
 # so Claude Code slugifies their LIVE-session project dir to
 # `-home-<account>-pantheon-config` rather than the plain `-home-<account>`. Membership is
 # the instance ROLE-KEY axis (the portable config axis this module already owns), grounded
-# in instance.yaml's "Consume-plane seats (specialist, recovery, metis, atlas) are woken by the
+# in instance.yaml's "Consume-plane seats (specialist, recovery, mason, artisan) are woken by the
 # consume runtime" (the wake_timer_personas complement). EXCLUDED, each verified against
-# that seat's freshest live jsonl (T-2715): orchestrator (orchestrator — home-cwd
-# claude-telegram.service), second-head (mnemosyne — mailbox-first at the operator's exocortex
-# pane), peer-daemon-* (codex — own sandbox). A future consume seat (e.g. sub-orchestrator-3)
-# joins by adding its role-key here.
-_CONSUME_PLANE_ROLE_KEYS = frozenset({
-    "specialist",          # specialist
-    "recovery",   # recovery
-    "sub-orchestrator-1",  # metis
-    "sub-orchestrator-2",  # atlas
+# that seat's freshest live jsonl (T-2715): head-engineering-orchestrator (orchestrator — home-cwd
+# claude-telegram.service), head-memory-orchestrator (archivist — mailbox-first at the operator's
+# exocortex pane), peer-daemon-* (codex — own sandbox). A future consume seat (e.g.
+# engineering-orchestrator-3) joins by adding its role-key here.
+# Seats NOT marked `supervisor: control-plane` whose live session still launches
+# cwd=<account>/pantheon-config: the bespoke-relaunch engineering orchestrators
+# (mason/artisan, captured launch cwd, T-3829/T-3838).
+_BESPOKE_PANTHEON_CONFIG_CWD_ROLE_KEYS = frozenset({
+    "engineering-orchestrator-1",  # mason
+    "engineering-orchestrator-2",  # artisan
 })
 
 
 def live_session_project_slug(account: str) -> str:
-    """Claude Code's project-dir slug for *account*'s LIVE session (T-2682/T-2687/T-2715).
+    """Claude Code's project-dir slug for *account*'s LIVE session (T-2682/T-2687/T-2715/T-4159).
 
-    Consume-plane seats launch cwd=<account>/pantheon-config via the persona-consume
-    runtime scope (WorkingDirectory=%h/pantheon-config), so Claude Code slugifies their
-    live-session project dir to `-home-<account>-pantheon-config` -- NOT the plain
-    `-home-<account>` a home-cwd seat (the HO; a mailbox-first head) uses. A monitor that
-    reads a seat's live jsonl (context_fill_monitor cap detectors, keep_going's nudge/cap
-    feed, doc_traversal_report's boot-adherence) must watch the dir the session actually
-    writes to, or it reads a stale/other project dir.
+    A control-plane seat launches cwd=<account>/pantheon-config (the runtime scope's
+    WorkingDirectory), so Claude Code slugifies its live-session project dir to
+    `-home-<account>-pantheon-config`, NOT the plain `-home-<account>` a home-cwd bespoke
+    seat uses. A monitor that reads a seat's live jsonl (context_fill_monitor cap
+    detectors, keep_going's nudge/cap feed, doc_traversal_report's boot-adherence) must
+    watch the dir the session actually writes to, or it reads a stale/other project dir.
 
-    Single source of truth (T-2687), keyed on the instance ROLE (consume-plane membership)
-    rather than the binding's `supervisor` field. T-2687 first used supervisor=="control-
-    plane", which is correct for recovery/specialist but MISSES the sub-orchestrator seats
-    (metis/atlas): they are consume-plane (cwd=pantheon-config, verified) yet supervisor is
-    None -- the documented T-2687 gap this closes (T-2715). Keying on the consume-plane role
-    set covers all four seats and any future consume seat; each seat's mapping was verified
-    against its freshest live jsonl dir.
+    T-4159: keyed on the LAUNCH SHAPE, not on role membership. `supervisor: control-plane`
+    (the cutover-completion marker) or a bespoke-relaunch pantheon-config-cwd seat
+    (mason/artisan) -> the -pantheon-config slug; everything else -> home. T-2715's
+    role-membership set listed recovery as consume-plane, which stopped being true when
+    T-3082 reverted recovery to bespoke (2026-08-23): recovery's live jsonl has been in
+    -home-claude-fallback since, and the -pantheon-config dir holds none (checked
+    2026-09-28), so keep_going/doc_traversal read an empty dir for recovery. It also
+    hard-wired orchestrator to home, which a T-3650 hand-move would make wrong. Following
+    the marker makes both flip exactly when commit B lands.
     """
     persona = account_persona(account)
-    if persona and resolve_instance_role(persona) in _CONSUME_PLANE_ROLE_KEYS:
+    if persona and (
+        instance_binding(persona).get("supervisor") == "control-plane"
+        or resolve_instance_role(persona) in _BESPOKE_PANTHEON_CONFIG_CWD_ROLE_KEYS
+    ):
         return f"-home-{account}-pantheon-config"
     return f"-home-{account}"
 
@@ -681,11 +876,11 @@ def resolve_role(persona: str) -> str:
     Identity fallback means unknown persona names pass through unchanged,
     preserving backward compatibility for any agent not yet registered.
 
-    This returns the AUDIT role-id (underscored: orchestrator / specialist / recovery),
+    This returns the AUDIT role-id (underscored: head_engineering_orchestrator / head_research_orchestrator / head_system_orchestrator),
     which is the canonical form for ledger `agent:` fields. Do NOT use this for
     repos.yaml grants lookup — use resolve_instance_role() instead.
 
-    A persona alias (cairn) is collapsed to its canonical persona (codex) first,
+    A persona alias (consultant) is collapsed to its canonical persona (codex) first,
     so an alias never lands in a ledger `agent:` field either.
     """
     persona = _dealias(persona)
@@ -699,12 +894,14 @@ def resolve_persona(role_or_persona: str) -> str:
     `requester:` fields from audit role-ids to persona names on write (T-0492/msg_1661).
 
     Examples:
-        resolve_persona("orchestrator") -> "orchestrator"
-        resolve_persona("specialist")      -> "specialist"
-        resolve_persona("recovery")              -> "recovery"   (identity)
+        resolve_persona("head_engineering_orchestrator") -> "orchestrator"
+        resolve_persona("orchestrator")         -> "orchestrator"  (legacy audit-id alias, T-3814)
+        resolve_persona("head_research_orchestrator")-> "specialist"
+        resolve_persona("specialist")              -> "specialist"  (legacy audit-id alias, D1)
+        resolve_persona("recovery")                      -> "recovery"   (identity)
         resolve_persona("orchestrator")             -> "orchestrator"  (already persona; passthrough)
         resolve_persona("operator")           -> "operator" (not in map; passthrough)
-        resolve_persona("cairn")             -> "codex"   (alias → canonical persona)
+        resolve_persona("consultant")             -> "codex"   (alias → canonical persona)
 
     Identity fallback preserves backward compatibility for unregistered names.
     Ledger `agent:` fields should NOT be passed through this function — they
@@ -718,7 +915,7 @@ def resolve_instance_role(persona_or_audit_role: str) -> str:
     """Return the instance role-key for *persona_or_audit_role*.
 
     Used for repos.yaml grants lookup (ORG-030 Phase 1). Grants are keyed on
-    instance role-keys (orchestrator / specialist / recovery) —
+    instance role-keys (head-engineering-orchestrator / specialist / head-system-orchestrator) —
     the portable axis from ORG-030.
 
     Accepts both persona names AND audit role-ids (normalizes via resolve_persona
@@ -726,20 +923,425 @@ def resolve_instance_role(persona_or_audit_role: str) -> str:
 
     Examples:
         resolve_instance_role("specialist")          -> "specialist"
-        resolve_instance_role("specialist")   -> "specialist"  (audit-id alias)
-        resolve_instance_role("orchestrator")          -> "orchestrator"
-        resolve_instance_role("orchestrator") -> "orchestrator"
-        resolve_instance_role("recovery")           -> "recovery"
+        resolve_instance_role("specialist")   -> "specialist"  (legacy audit-id alias, D1)
+        resolve_instance_role("orchestrator")          -> "head-engineering-orchestrator"
+        resolve_instance_role("head_engineering_orchestrator") -> "head-engineering-orchestrator"
+        resolve_instance_role("recovery")           -> "head-system-orchestrator"
         resolve_instance_role("operator")        -> "operator"  (not in map; passthrough)
 
-        resolve_instance_role("cairn")          -> "peer-daemon-codex"  (alias → codex)
+        resolve_instance_role("consultant")          -> "peer-daemon-codex"  (alias → codex)
 
     Identity fallback preserves behavior for unregistered names.
     """
-    # Step 0: collapse a persona alias (cairn → codex) so it resolves to the
+    # Step 0: collapse a persona alias (consultant → codex) so it resolves to the
     # canonical persona's grants, not an unbound alias name.
     persona_or_audit_role = _dealias(persona_or_audit_role)
-    # Step 1: normalize audit role-id → persona (e.g. specialist → specialist).
+    # Step 1: normalize audit role-id → persona (e.g. head_research_orchestrator → specialist;
+    # the legacy specialist token was already collapsed in step 0 via _dealias).
     persona = _ROLE_PERSONA_MAP.get(persona_or_audit_role, persona_or_audit_role)
     # Step 2: persona → instance role-key.
     return _PERSONA_TO_INSTANCE_ROLE.get(persona, persona)
+
+
+def ledger_identity(persona: str) -> tuple[str, str]:
+    """Return `(agent, executor)` for a ledger entry *persona* writes (ORG-001 as
+    amended 2026-10-08, the operator TG 11474; T-4737): its ORG-100 role id and its
+    instance.yaml seat slot.
+
+        ledger_identity("artisan") -> ("engineering_orchestrator", "engineering-orchestrator-2")
+        ledger_identity("specialist") -> ("head_research_orchestrator", "specialist")
+    """
+    persona = resolve_persona(persona)
+    return resolve_role(persona), resolve_instance_role(persona)
+
+
+def ledger_entry_by(entry: dict, seat: str) -> bool:
+    """Whether ledger *entry* was written by *seat* (a persona, or a legacy ledger
+    agent id such as `orchestrator`).
+
+    Matches both forms of the ledger `agent` field (T-4737):
+
+    - history (before 2026-10-08): `agent` is the seat's legacy id, i.e. *seat*
+      itself, or its persona or role id;
+    - new (ORG-001 as amended): `agent` is the seat's ORG-100 role id. When that
+      role is shared by several seats (NON_INJECTIVE_ROLE_IDS), the entry is the
+      seat's only if `executor` starts with the seat's slot; an entry of a shared
+      role with no executor is attributed to no one.
+    """
+    agent = entry.get("agent")
+    if not isinstance(agent, str) or not agent:
+        return False
+    persona = resolve_persona(seat)
+    role, slot = ledger_identity(persona)
+    if agent in (seat, persona):
+        return True
+    if agent != role:
+        return False
+    if role not in NON_INJECTIVE_ROLE_IDS:
+        return True
+    executor = entry.get("executor")
+    if not isinstance(executor, str) or not executor.strip():
+        return False
+    return executor.split()[0] == slot
+
+
+# ---------------------------------------------------------------------------
+# L3 PersonaRoleMembership reader (ORG-085 L3 / ORG-088 D-2; T-3757).
+#
+# functional_roles(persona) / role_members(role_id) resolve OVER the L3 source
+# (persona_roles.yaml, the SOLE authority for role_ids). This is a READER, not a
+# fourth literal map — ORG-088 D-2: "agent_role_map.py gains a reader over the L3
+# source, not a literal map." role_ids are the L2 functional-role ids of ORG-088
+# D-2, as reshaped by the operator's T-3807 per-persona rename (head_engineering_orchestrator /
+# head_memory_orchestrator / engineering_orchestrator / head_research_orchestrator /
+# head_system_orchestrator / head_auditor; the universal `orchestrator` tier retired),
+# a DISTINCT namespace from the audit-role-ids in AGENT_ROLE_MAP above and from the
+# persona-orientation spawn-role names.
+#
+# TWO POSTURES THAT DO NOT MERGE. The instance.yaml BINDING loaders above are
+# deliberately fail-SAFE (swallow errors, fall back to a hardcoded mirror) so a
+# missing manifest cannot break the fleet import chain. This membership reader is
+# fail-CLOSED per ORG-085 invariants 4 (mirrors are digest-bound; mismatch refuses)
+# + 5 (missing revision/digest is a typed refusal): it RAISES rather than serving
+# stale/unverified membership. A fail-safe fallback here would BE the second
+# authority ORG-085 §253 bans. The two are reconciled by LAZINESS — the reader
+# loads+verifies on CALL, never at import, so a source problem fails only the
+# role-routing path, not every importer of this module.
+# ---------------------------------------------------------------------------
+
+_PERSONA_ROLES_YAML = _MODULE_DIR.parent / "persona_roles.yaml"
+
+_MEMBERSHIP_LIFECYCLES = frozenset({"declared", "deprecated", "retired"})
+
+
+class PersonaRoleMembershipError(Exception):
+    """Base for fail-closed L3 PersonaRoleMembership refusals."""
+
+
+class MembershipSourceMissing(PersonaRoleMembershipError):
+    """The L3 source or the instance.yaml projection block is absent/unreadable."""
+
+
+class MembershipDigestMismatch(PersonaRoleMembershipError):
+    """The L3 source's recomputed digest != the projection's expected_digest
+    (ORG-085 invariant 4: mirrors are digest-bound and mismatches refuse)."""
+
+
+class MembershipStaleRevision(PersonaRoleMembershipError):
+    """The L3 source's source_revision is missing, or != the projection's
+    expected_revision (ORG-085 invariant 5: missing/stale revision is a refusal)."""
+
+
+class MembershipMalformed(PersonaRoleMembershipError):
+    """A persona record is structurally invalid: empty/absent role_ids, a
+    default_role_id not in role_ids, an unknown lifecycle, or wrong types."""
+
+
+def canonical_source_bytes(doc: dict, *, exclude: tuple[str, ...] = ("source_digest",)) -> bytes:
+    """Canonical pre-image for a content digest: the document content EXCLUDING the
+    fields named in *exclude*, as sorted-key compact ensure_ascii JSON. The digest is
+    over PARSED content, so it is invariant to YAML comments/whitespace and binds the
+    semantic content rather than the file layout — two clones with permuted layout
+    compute byte-identical pre-images (the ORG-088 R3-H3 reproducibility property).
+
+    ONE audited serialization (ORG-088 T2 Q4), used by the L3 membership digest
+    contract:
+      - the L3 membership reader below, at the DEFAULT exclude — the bytes are
+        UNCHANGED from the pre-generalization _canonical_membership_bytes, so the
+        persona_roles.yaml seed digest still verifies.
+    (ORG-088 rev-2 / T-3794 retired the second consumer, tools/domain_registry.py,
+    when the operator's Call #1 dropped the DomainRegistry; the `exclude` parameter is
+    kept general but now serves the membership contract alone.)
+
+    Raises MembershipMalformed (not a bare TypeError) when the content is not
+    JSON-serializable (LOW-fix #3) — a typed refusal befitting a fail-closed reader.
+    In practice yaml.safe_load only yields JSON-serializable scalars/containers, so
+    this guard is defensive; it exists so a future non-safe loader cannot leak an
+    untyped TypeError through the digest path."""
+    content = {k: v for k, v in doc.items() if k not in exclude}
+    try:
+        return json.dumps(
+            content, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+        ).encode("utf-8")
+    except TypeError as exc:
+        raise MembershipMalformed(
+            f"source content is not JSON-serializable for the canonical digest: {exc}"
+        ) from exc
+
+
+def _compute_source_digest(doc: dict) -> str:
+    return hashlib.sha256(canonical_source_bytes(doc)).hexdigest()
+
+
+def _load_membership_projection(manifest_path: Path) -> dict:
+    """Return the `role_membership_projection` block (source / expected_revision /
+    expected_digest) from instance.yaml. Fail-CLOSED: absence or malformation raises
+    MembershipSourceMissing — a role-routing consumer must not silently proceed
+    without the binding-layer attestation of the L3 source."""
+    try:
+        data = _parse_manifest(manifest_path)  # T-4279: cached, CSafeLoader
+    except Exception as exc:
+        raise MembershipSourceMissing(
+            f"cannot read manifest {manifest_path}: {exc}"
+        ) from exc
+    projection = data.get("role_membership_projection") if isinstance(data, dict) else None
+    if not isinstance(projection, dict):
+        raise MembershipSourceMissing(
+            f"instance.yaml carries no role_membership_projection block ({manifest_path})"
+        )
+    # Copy: _parse_manifest's document is shared with its cache (T-4279). A
+    # SHALLOW copy is enough only because every projection value (source,
+    # expected_revision, expected_digest) is a scalar; if a nested mapping/list is
+    # ever added to this block, switch to copy.deepcopy.
+    return dict(projection)
+
+
+def _load_membership_source(source_path: Path, projection: dict) -> dict[str, dict]:
+    """Read + verify the L3 source against *projection*, fail-closed. Returns
+    {persona: {"role_ids": frozenset[str], "default_role_id": str, "lifecycle": str}}.
+
+    Order: atomic single read -> parse -> DIGEST check (inv 4) -> REVISION check
+    (inv 5) -> per-persona structural validation. The digest and revision checks
+    gate DISTINCT branches so their falsifiers are independent (T-3757 F1 / F3):
+    removing either check cannot mask the other."""
+    # Atomic single-file read (one read syscall; git updates the file via atomic
+    # rename). A torn/partial read fails the YAML parse or the digest check below,
+    # so it is still fail-closed — no locking primitive is needed for a whole-file
+    # digest over a single source.
+    try:
+        raw = source_path.read_text(encoding="utf-8")
+    except Exception as exc:
+        raise MembershipSourceMissing(
+            f"cannot read L3 membership source {source_path}: {exc}"
+        ) from exc
+    try:
+        import yaml
+
+        doc = yaml.safe_load(raw)
+    except Exception as exc:
+        raise MembershipMalformed(
+            f"L3 membership source is not valid YAML ({source_path}): {exc}"
+        ) from exc
+    if not isinstance(doc, dict):
+        raise MembershipMalformed(f"L3 membership source is not a mapping ({source_path})")
+
+    # inv 4 — integrity: the recomputed digest must equal the pinned expected_digest.
+    expected_digest = projection.get("expected_digest")
+    actual_digest = _compute_source_digest(doc)
+    if not isinstance(expected_digest, str) or actual_digest != expected_digest:
+        raise MembershipDigestMismatch(
+            f"L3 membership digest mismatch: source={actual_digest} "
+            f"projection={expected_digest!r}"
+        )
+
+    # LOW-fix #1 (T-3758): SELF-consistency — the source's OWN source_digest field
+    # must equal the recomputed digest. The projection check above binds the source to
+    # instance.yaml; this binds the source to ITSELF, so a source edited without
+    # recomputing its own source_digest is refused even when the projection happens to
+    # still match (e.g. both left stale together). Mirrors the domain registry's
+    # self-digest gate. MembershipMalformed, not DigestMismatch: a source inconsistent
+    # with its OWN recorded digest is malformed, distinct from a source that disagrees
+    # with the binding-layer projection.
+    own_digest = doc.get("source_digest")
+    if not isinstance(own_digest, str) or own_digest != actual_digest:
+        raise MembershipMalformed(
+            f"L3 membership source_digest self-inconsistent: recorded={own_digest!r} "
+            f"computed={actual_digest}"
+        )
+
+    # inv 5 — freshness: source_revision must be present AND equal expected_revision.
+    source_revision = doc.get("source_revision")
+    expected_revision = projection.get("expected_revision")
+    if source_revision is None or source_revision != expected_revision:
+        raise MembershipStaleRevision(
+            f"L3 membership revision stale/missing: source={source_revision!r} "
+            f"expected={expected_revision!r}"
+        )
+
+    personas = doc.get("personas")
+    if not isinstance(personas, dict):
+        raise MembershipMalformed(f"L3 membership source has no personas mapping ({source_path})")
+    out: dict[str, dict] = {}
+    for persona, record in personas.items():
+        if not isinstance(record, dict):
+            raise MembershipMalformed(f"persona {persona!r} record is not a mapping")
+        role_ids = record.get("role_ids")
+        default_role_id = record.get("default_role_id")
+        lifecycle = record.get("lifecycle")
+        if not (
+            isinstance(role_ids, list)
+            and role_ids
+            and all(isinstance(r, str) and r for r in role_ids)
+        ):
+            raise MembershipMalformed(f"persona {persona!r} has empty/invalid role_ids")
+        if not (isinstance(default_role_id, str) and default_role_id in role_ids):
+            raise MembershipMalformed(
+                f"persona {persona!r} default_role_id {default_role_id!r} "
+                f"not in role_ids {sorted(role_ids)}"
+            )
+        if lifecycle not in _MEMBERSHIP_LIFECYCLES:
+            raise MembershipMalformed(f"persona {persona!r} has invalid lifecycle {lifecycle!r}")
+        out[persona] = {
+            "role_ids": frozenset(role_ids),
+            "default_role_id": default_role_id,
+            "lifecycle": lifecycle,
+        }
+    return out
+
+
+def _resolve_membership(
+    source_path: Path | None = None, manifest_path: Path | None = None
+) -> dict[str, dict]:
+    """Load + verify the L3 membership (LAZY, per-call — freshness over caching for
+    a fail-closed contract; the source is tiny). Paths are injectable for hermetic
+    tests and default to the live tree (_PERSONA_ROLES_YAML / _INSTANCE_YAML,
+    resolved from module globals at call time so tests can repoint them)."""
+    manifest_path = manifest_path or _INSTANCE_YAML
+    projection = _load_membership_projection(manifest_path)
+    if source_path is None:
+        # LOW-fix #2 (T-3758): resolve the projection's DECLARED `source:` path
+        # (relative to the repo root = the manifest's parent) rather than hardcoding
+        # _PERSONA_ROLES_YAML. The projection is the binding-layer statement of WHERE
+        # the L3 source lives; honoring it means a manifest that repoints `source:` is
+        # followed rather than silently overridden by the hardcode. Falls back to the
+        # hardcode only when the field is absent. (An absolute declared path makes the
+        # `manifest_path.parent / declared` join return the absolute path unchanged,
+        # so hermetic tests that pin an absolute source: still resolve correctly.)
+        declared = projection.get("source")
+        source_path = (
+            manifest_path.parent / declared
+            if isinstance(declared, str) and declared
+            else _PERSONA_ROLES_YAML
+        )
+    return _load_membership_source(source_path, projection)
+
+
+def _with_implied(role_ids: frozenset[str]) -> frozenset[str]:
+    """Add the regular role each head role implies (T-4701; the operator TG 11444, 2026-10-07:
+    "roles for heads implicitly are also non head roles"). ORG-100's naming pattern
+    makes a key seat `head_<rest>` and its regulars `<rest>`, so a persona holding
+    `head_engineering_orchestrator` also holds `engineering_orchestrator`, and
+    `head_auditor` also holds `auditor`. Derived from the declared role_ids, NOT a second
+    literal role list: persona_roles.yaml stays the sole authority for what is DECLARED."""
+    implied = {r[len("head_"):] for r in role_ids if r.startswith("head_") and len(r) > len("head_")}
+    return role_ids | frozenset(implied)
+
+
+def functional_roles(persona: str) -> frozenset[str]:
+    """Return the functional role_ids *persona* holds, resolved over the verified L3
+    source. Unknown persona -> empty frozenset (a persona with no declared membership
+    holds no functional roles — a truthful answer, not a source error). Raises
+    PersonaRoleMembershipError (fail-closed) on missing source/projection, digest
+    mismatch, or missing/stale revision."""
+    record = _resolve_membership().get(persona)
+    return _with_implied(record["role_ids"]) if record else frozenset()
+
+
+def role_members(role_id: str) -> frozenset[str]:
+    """Return the personas whose role_ids contains *role_id*, over the same verified
+    L3 source. Unknown role_id -> empty frozenset. Same fail-closed raises on source
+    problems as functional_roles()."""
+    membership = _resolve_membership()
+    return frozenset(p for p, rec in membership.items() if role_id in _with_implied(rec["role_ids"]))
+
+
+def default_functional_role(persona: str) -> str | None:
+    """Return *persona*'s default_role_id (guaranteed in its role_ids by load-time
+    validation), or None if the persona has no declared L3 membership."""
+    record = _resolve_membership().get(persona)
+    return record["default_role_id"] if record else None
+
+
+def known_role_ids() -> frozenset[str]:
+    """Return the union of every declared functional role_id across the verified L3
+    source — the functional-role membership VOCABULARY (ORG-088 Plane-A / T-3761).
+
+    This is the single vocab the unknown-role checks resolve against: the CLI
+    file/retarget WRITE-refusal and ticket_lint's role-target flag (fail-closed), and
+    the list/ready/prime READ-visibility eligibility (degrade-graceful). DERIVED over
+    the SAME already-verified reader as functional_roles/role_members
+    (_resolve_membership) — NOT a second literal role list: persona_roles.yaml is the
+    SOLE authority for role_ids (its header), and a hand-copied vocab here would BE the
+    second authority ORG-085 §253 bans.
+
+    Fail-CLOSED, matching the reader's existing contract (functional_roles' raises): a
+    missing/unverifiable/malformed L3 source RAISES PersonaRoleMembershipError rather
+    than returning an empty set. An empty-set-on-error would be wrong in BOTH
+    directions — it would make every role read as "unknown" (a WRITE surface would
+    refuse everything) AND make the vocab membership check vacuous (a source that
+    merely failed to load would silently accept nothing/everything). The fail
+    DIRECTION is the CALLER's to choose: a WRITE surface lets the raise refuse; a READ
+    surface catches it and degrades to no-eligible-roles."""
+    membership = _resolve_membership()
+    roles: set[str] = set()
+    for record in membership.values():
+        roles |= _with_implied(record["role_ids"])
+    return frozenset(roles)
+
+
+def persona_pool_role(name: str) -> str | None:
+    """Return the REGULAR pool role id a ticket for *name* should be routed to, or None.
+
+    T-5239 / ORG-088 (the operator TG 12076/12077): tickets route by role only, never by
+    persona. This is the ONE place a persona (or audit role-id / alias) is translated
+    to the role pool that replaces it — for every code path that DERIVES a target
+    (auto-spawned review/child tickets, filers) rather than receiving one from a
+    caller. Rule: the persona's default functional role with a leading `head_`
+    stripped (orchestrator/mason/artisan -> engineering_orchestrator, recovery/watchman ->
+    system_orchestrator, archivist -> memory_orchestrator, specialist ->
+    research_orchestrator), matching the 2026-10-19 re-pool. Read from the L3 source
+    (persona_roles.yaml) via default_functional_role — no second role list. Returns
+    None for `operator` and for any name with no declared membership. Raises
+    PersonaRoleMembershipError (fail-closed) on an unverifiable source."""
+    persona = resolve_persona(name)
+    default = default_functional_role(persona)
+    if not default:
+        return None
+    regular = default[len("head_"):] if default.startswith("head_") else default
+    return regular if regular in known_role_ids() else default
+
+
+def pool_roles_for(name: str) -> list[str]:
+    """Role ids a caller may use instead of persona/role-id *name*, recommended first.
+
+    Used to word the typed refusal for a persona `--target`. Empty if none apply."""
+    persona = resolve_persona(name)
+    roles = sorted(functional_roles(persona))
+    pool = persona_pool_role(persona)
+    if pool in roles:
+        roles.remove(pool)
+        roles.insert(0, pool)
+    return roles
+
+
+_SHELL_SAFE_VALUE = re.compile(r"^[A-Za-z0-9@._:/-]+$")
+
+
+def _main(argv: list[str] | None = None) -> int:
+    """`agent_role_map.py restart-target <persona>` -> KEY=VALUE lines for shell callers (T-4159).
+
+    Keys: SUPERVISOR, SERVICE, MODE, PANE, SESSION_UNIT. Exit 2 on an unknown persona,
+    a persona without a restart binding, or a value outside [A-Za-z0-9@._:/-] (the
+    callers read the lines with `read`, never eval, but a malformed manifest value
+    must still refuse rather than reach a systemctl/tmux argv)."""
+    import sys
+    args = sys.argv[1:] if argv is None else argv
+    if len(args) != 2 or args[0] != "restart-target":
+        print("usage: agent_role_map.py restart-target <persona>", file=sys.stderr)
+        return 64
+    try:
+        target = restart_target(args[1])
+    except KeyError as exc:
+        print(f"agent_role_map: {exc.args[0]}", file=sys.stderr)
+        return 2
+    for key in ("supervisor", "service", "mode", "pane", "session_unit"):
+        value = target[key]
+        if not _SHELL_SAFE_VALUE.match(value):
+            print(f"agent_role_map: unsafe {key} value {value!r}", file=sys.stderr)
+            return 2
+        print(f"{key.upper()}={value}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(_main())

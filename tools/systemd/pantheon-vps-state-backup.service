@@ -15,11 +15,18 @@ Wants=network-online.target
 [Service]
 # SYSTEM unit (installed at /etc/systemd/system/, runs as root): the backup
 # reads every account's home state + /etc + the kino DB, which no single agent
-# account can. Canonical script lives in the tracked repo; root runs it in place
-# (claude/HO already holds sudo, so this is not a new privilege boundary). To
-# harden later, cp it to /usr/local/sbin root-owned and point ExecStart there.
+# account can. The canonical script is tracked at tools/vps_state_backup.sh, but
+# root runs a ROOT-OWNED COPY (T-4575): the checkout is claude-writable, so any
+# claude process editing it would otherwise get root at the next run. After a
+# merge that changes the script, reinstall:
+#   sudo install -o root -g root -m 0755 \
+#     /home/claude/pantheon-config/tools/vps_state_backup.sh \
+#     /usr/local/sbin/pantheon-vps-state-backup
+# pantheon-backup-staleness.service (daily, user unit) fails and alerts while the
+# copy is missing, differs, or is not a root-owned, owner-only-writable regular
+# file, so it can't drift past the next daily check.
 Type=oneshot
-ExecStart=/usr/bin/bash /home/claude/pantheon-config/tools/vps_state_backup.sh
+ExecStart=/usr/bin/bash /usr/local/sbin/pantheon-vps-state-backup
 StandardOutput=journal
 StandardError=journal
 TimeoutStartSec=15min

@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Telegram reply gate — Stop hook enforcing "answer the channel you were asked on".
 
-THE FAILURE THIS EXISTS FOR (T-2188, operator-directed via mnemosyne, TG 206/211/212):
+THE FAILURE THIS EXISTS FOR (T-2188, operator-directed via archivist, TG 206/211/212):
 a turn arrives from Telegram, the agent does the work and writes the answer to its
 TRANSCRIPT, and the turn ends. The transcript is invisible to the sender, so from
-The operator's side the agent simply went dark. mnemosyne did this twice in three days
+The operator's side the agent simply went dark. archivist did this twice in three days
 WITH a hard-rule pin in its CLAUDE.md. A pin is a reminder; this is a mechanism.
 
 CONTRACT (verified against code.claude.com/docs/en/hooks 2026-07-28, not assumed):

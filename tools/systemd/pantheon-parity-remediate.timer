@@ -1,0 +1,20 @@
+[Unit]
+Description=Pantheon seat-parity self-repair — Recovery auto-remediates safe mechanical parity breaks (T-3798)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+# SIX-HOURLY, matching the parity-audit cadence it backstops. parity_remediate
+# RE-RUNS the read-only audit in-process (race-free — it never reads a stale
+# report), so it does NOT need to be ordered right after pantheon-parity-audit;
+# it is scheduled 30 min AFTER that timer's slot (audit 01,07,13,19:41 -> here
+# 02,08,14,20:11) purely to keep the two cross-account sudo sweeps from
+# contending, and clear of Recovery's other timers (delivery-reachability :23,
+# grooming 12:00, welltrod 09:20, policy-outflow 12:45). 30-min detect->repair
+# latency replaces the ~5h human-notice latency this closed (T-3798/archivist).
+OnCalendar=*-*-* 02,08,14,20:11:00
+Persistent=true
+RandomizedDelaySec=120
+Unit=pantheon-parity-remediate.service
+
+[Install]
+WantedBy=timers.target

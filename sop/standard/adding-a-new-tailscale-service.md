@@ -92,15 +92,40 @@ Comments start with `#`; blank lines OK. Adding a new service = appending one li
 
 ```bash
 #!/usr/bin/env bash
+# Re-apply Pantheon's Tailscale Serve service-scope mappings on boot.
+# Source-of-truth list lives in /etc/tailscale/services.conf (one line per
+# service: <name>:<backend-port>). Each invocation is idempotent — tailscale
+# treats re-applying an existing mapping as a no-op.
+
 set -euo pipefail
+
 CONF="${1:-/etc/tailscale/services.conf}"
-[[ -r "$CONF" ]] || { echo "missing config: $CONF" >&2; exit 1; }
+
+if [[ ! -r "$CONF" ]]; then
+  echo "missing config: $CONF" >&2
+  exit 1
+fi
+
+# T-0902: wait for tailscaled to reach Running (not NoState) before applying.
+# After=/Requires=tailscaled only waits for the unit to be ACTIVE, not for the
+# backend to be ready; on the 2026-05-29 boot this ran while tailscaled was in
+# NoState and the apply loop failed ('unexpected state: NoState'). Poll up to
+# 60s for BackendState=Running, then proceed best-effort. pipefail-safe via
+# '|| true' so a transient status failure during NoState doesn't abort the script.
+for _ in $(seq 1 30); do
+  state="$(/usr/bin/tailscale status --json 2>/dev/null | python3 -c 'import sys,json;print(json.load(sys.stdin).get("BackendState",""))' 2>/dev/null || true)"
+  [[ "$state" == "Running" ]] && break
+  sleep 2
+done
+
 while IFS=: read -r name port; do
   [[ -z "$name" || "$name" =~ ^# ]] && continue
   echo "applying svc:$name → http://127.0.0.1:$port"
   /usr/bin/tailscale serve --service="svc:$name" --bg --https=443 "http://127.0.0.1:$port"
 done < "$CONF"
 ```
+
+This is the copy installed on the VPS (T-0902) and, since 2026-10-22, CT201 (T-5003). CT201 had been built from an older copy of this block that lacked the wait loop, and its unit failed at every boot with `unexpected state: NoState`.
 
 Install: `sudo install -m 755 -o root -g root <source> /usr/local/sbin/tailscale-serve-restore`.
 
@@ -125,6 +150,20 @@ WantedBy=multi-user.target
 ```
 
 Install + enable: `sudo install -m 644 ... /etc/systemd/system/ && sudo systemctl daemon-reload && sudo systemctl enable --now tailscale-serve-restore.service`.
+
+### `/etc/systemd/system/tailscale-serve-restore.service.d/restart.conf` — retry backstop
+
+```ini
+[Unit]
+StartLimitIntervalSec=120
+StartLimitBurst=4
+
+[Service]
+Restart=on-failure
+RestartSec=10
+```
+
+The wait loop is best-effort: after 60s it applies anyway. If tailscaled is still not Running, the apply fails and this drop-in retries it. The VPS has carried this file since T-0902, and T-5003 added it to CT201. Install it alongside the unit, then `systemctl daemon-reload`.
 
 ## Why this shape (decision rationale)
 

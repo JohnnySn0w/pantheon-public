@@ -47,7 +47,7 @@ Per-agent venue:
   the operator URL/code hop on the peer's own bridge; your session simply holds in the
   modal until the peer pastes the code. Recovery↔orchestrator ran this both directions
   2026-07-20 — it works cleanly.
-- **mnemosyne (exocortex)**: operator-direct (tmux-attach and run /login by hand)
+- **archivist (exocortex)**: operator-direct (tmux-attach and run /login by hand)
   or a peer pane-drive. Do NOT route the interactive flow through the
   telegram-session → mailbox → ACP-session relay: a single runbook turn took
   ~10 min on 2026-07-20 (vs the ~2-3 min the interactive hop needs), the operator
@@ -103,7 +103,7 @@ credential — genuinely above the bar to do unilaterally).
 4. **Verify**: the pane clears the 401 and returns to a normal idle prompt; the
    credential file refreshes (`credential_expiry_monitor --agent <name>` → OK with
    a non-empty refresh token); the agent answers a Telegram ping. Confirm health
-   per `confirm-health-after-touching-live-sessions`.
+   per `sop/standard/confirm-health-after-touching-a-live-session.md`.
    - **Clear the wedge-suppress flag** once the pane is idle + healthy (restores wedge
      protection immediately; it also auto-expires if you forget):
      `python3 ~/pantheon-config/tools/context_fill_monitor.py --agent <name> --clear-suppress`
@@ -176,4 +176,4 @@ matters.
 - `tools/credential_expiry_monitor.py`, `tools/channel_liveness_monitor.py`
 - `sop/remediation/recovery-service-recovery.md`,
   `sop/remediation/telegram-plugin-mcp-drop-recovery.md`
-- `confirm-health-after-touching-live-sessions` (memory)
+- `sop/standard/confirm-health-after-touching-a-live-session.md`

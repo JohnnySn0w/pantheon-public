@@ -1,0 +1,11 @@
+[Unit]
+Description=Pantheon git conformance sweep — daily (ORG-101 §7, T-4690)
+Documentation=file:///home/%u/pantheon-config/tools/systemd/README.md
+
+[Timer]
+OnCalendar=*-*-* 11:30:00 UTC
+Persistent=true
+Unit=pantheon-git-conformance.service
+
+[Install]
+WantedBy=timers.target

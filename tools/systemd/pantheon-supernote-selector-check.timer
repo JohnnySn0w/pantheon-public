@@ -1,0 +1,11 @@
+[Unit]
+Description=SuperNote ingest selector check — daily 05:47 UTC (after the 05:17 UTC gpu-ml ingest backstop)
+Documentation=file:///home/%u/pantheon-config/knowledge/episodic/2026-10-05-t4593-supernote-shared-page-png/note.md
+
+[Timer]
+OnCalendar=*-*-* 05:47:00 UTC
+Persistent=true
+Unit=pantheon-supernote-selector-check.service
+
+[Install]
+WantedBy=timers.target

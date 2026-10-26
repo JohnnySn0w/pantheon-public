@@ -36,6 +36,7 @@ from tools.host_control.contracts import (
     sha256_json,
 )
 from tools.host_control.planner import HostPlanService
+from tools.host_control.ratelimit import BrokerRateLimits
 from tools.test_host_control_dbus_driver import (
     MutableClock,
     build_domain,
@@ -121,6 +122,7 @@ class ErrorNamespaceTests(unittest.TestCase):
             contracts.InvalidTransition: wire.INVALID_TRANSITION_ERROR,
             contracts.ApprovalUnavailable: wire.APPROVAL_UNAVAILABLE_ERROR,
             contracts.RecoveryRefused: wire.RECOVERY_REFUSED_ERROR,
+            contracts.RateLimited: wire.RATE_LIMITED_ERROR,
             RegistryError: wire.REGISTRY_DENIED_ERROR,
             contracts.MigrationRequired: wire.MIGRATION_REQUIRED_ERROR,
             HostControlError: wire.FAILED_ERROR,
@@ -196,6 +198,20 @@ class ErrorNamespaceTests(unittest.TestCase):
         self.assertEqual(wire.error_name_for(exc), wire.FAILED_ERROR)
         self.assertLessEqual(len(wire.error_body_for(exc)), 200)
 
+    def test_journal_busy_resolves_to_failed_via_its_ancestor(self) -> None:
+        # T-4334: journal write-lock contention is a retryable refusal at
+        # the journal boundary, deliberately NOT a new wire name (the
+        # closed namespace is ratified): it resolves through HostControlError
+        # to Failed, and its server-authored message is the bounded body.
+        exc = contracts.JournalBusy(
+            "put_operation_or_replay: journal write lock busy after "
+            "5000 ms (lock contention); nothing was written; retry later"
+        )
+        self.assertEqual(wire.error_name_for(exc), wire.FAILED_ERROR)
+        body = wire.error_body_for(exc)
+        self.assertEqual(body, str(exc))
+        self.assertLessEqual(len(body), 200)
+
     def test_closed_error_namespace_is_versioned_and_exact(self) -> None:
         expected = frozenset(
             f"org.pantheon.HostBroker1.Error.{suffix}"
@@ -212,10 +228,23 @@ class ErrorNamespaceTests(unittest.TestCase):
                 "Failed",
                 "Unsupported",
                 "Internal",
+                # T-2917 5a ruling i1, provisional alongside T-2912 OQ4.
+                "RateLimited",
             )
         )
-        self.assertEqual(wire.CLOSED_ERROR_NAMES, expected)
-        for name in wire.CLOSED_ERROR_NAMES:
+        # T-2918: ORG-082 §2 RATIFIED three names directly in the versioned
+        # interface namespace (no ``.Error`` segment); they join the closed set.
+        ratified_org082 = frozenset(
+            f"org.pantheon.HostBroker1.{suffix}"
+            for suffix in (
+                "SubstrateFamilyNotExposed",
+                "RegistryDigestMismatch",
+                "RuntimeSubsetMismatch",
+            )
+        )
+        self.assertEqual(wire.ORG082_ERROR_NAMES, ratified_org082)
+        self.assertEqual(wire.CLOSED_ERROR_NAMES, expected | ratified_org082)
+        for name in wire.CLOSED_ERROR_NAMES - ratified_org082:
             self.assertTrue(
                 name.startswith("org.pantheon.HostBroker1.Error."),
                 name,
@@ -302,7 +331,7 @@ class ProviderCase(unittest.TestCase):
     """Shared domain fixture for the ApprovalSource provider tests."""
 
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.clock = MutableClock()
         self.fixture = build_domain(
@@ -432,6 +461,9 @@ class ApprovalSourceProviderTests(ProviderCase):
                 "approval_class",
                 "operation_families",
                 "operations",
+                # T-2917 5b ruling B8: the bounded seat-local residue the
+                # approver sees; entries carry no target path
+                "seat_local_residue",
                 "expires_at",
             },
         )
@@ -440,6 +472,8 @@ class ApprovalSourceProviderTests(ProviderCase):
                 set(operation),
                 {"operation_id", "kind", "layer", "privilege"},
             )
+        for entry in raw["seat_local_residue"]:
+            self.assertEqual(set(entry), {"operation_id", "kind", "status"})
         for forbidden in ("uid", "install_root", "account", "executor"):
             self.assertNotIn(forbidden, summary)
 
@@ -594,6 +628,14 @@ RATIFIED_INVENTORY = {
         "ss",
         "ss",
     ),
+    # ORG-052 section 3: ExecutionSource.OperationSpec(operation_handle,
+    # expected_operation_digest) "ss" -> "ssss". The interface NAME is
+    # provisional-pending-ratification (T-2917 5a ruling i3).
+    ("org.pantheon.HostBroker1.ExecutionSource", "OperationSpec"): (
+        ("operation_handle", "expected_operation_digest"),
+        "ss",
+        "ssss",
+    ),
 }
 
 # Identity may NEVER be a caller argument (locked N6 / ORG-052 §2).
@@ -623,7 +665,8 @@ def _exported_methods() -> tuple[dict, dict]:
     The library base class ships its own decorated members (e.g.
     ``Introspect`` on ``org.freedesktop.DBus.Introspectable``) — the
     class-tier shape of substrate finding 5. The exactness assertion is
-    therefore scoped: OUR class defines exactly the ratified nine, and
+    therefore scoped: OUR class defines exactly the ratified ten (nine
+    from T-2912 plus ExecutionSource.OperationSpec, T-2917 5a), and
     every foreign member is a standard org.freedesktop.DBus.* one
     inherited from the base, never defined or overridden by us.
     """
@@ -688,6 +731,11 @@ def _bare_service(**attrs: object) -> object:
     bus cannot produce (e.g. credential-resolution failure)."""
 
     instance = object.__new__(dbus_service.HostBroker1Object)
+    # T-2917 5a: __init__ always installs the per-uid limiter (ruling i1);
+    # a bare instance gets the same default unless a test supplies one.
+    attrs.setdefault("_rate_limits", BrokerRateLimits())
+    # T-2917 5b: no driver by default (5a behaviour).
+    attrs.setdefault("_driver", None)
     for key, value in attrs.items():
         setattr(instance, key, value)
     return instance
@@ -926,7 +974,7 @@ class PrivateBusCase(unittest.TestCase):
         cls.daemon_log = cls._bus_handle.log
         cls.daemon = cls._bus_handle.process
         cls.bus_address = cls._bus_handle.bus_address
-        cls.work = tempfile.TemporaryDirectory(dir=REPO_ROOT)
+        cls.work = tempfile.TemporaryDirectory()
 
         approval_uid = (
             os.getuid()
@@ -1068,7 +1116,12 @@ class ManagerBusTests(PrivateBusCase):
         }
         self.assertEqual(
             pantheon,
-            {wire.MANAGER_INTERFACE, wire.APPROVAL_SOURCE_INTERFACE},
+            {
+                wire.MANAGER_INTERFACE,
+                wire.APPROVAL_SOURCE_INTERFACE,
+                # T-2917 5a (ORG-052 section 3; name provisional, i3)
+                wire.EXECUTION_SOURCE_INTERFACE,
+            },
         )
         # every other interface is a standard bus one (substrate
         # finding 5: Introspectable and friends appear alongside ours)
@@ -1108,6 +1161,10 @@ class ManagerBusTests(PrivateBusCase):
                 "PlanSummary": ("ss", "ss"),
             },
         )
+        self.assertEqual(
+            observed(wire.EXECUTION_SOURCE_INTERFACE),
+            {"OperationSpec": ("ss", "ssss")},
+        )
         # no broadcast signals and no properties on either interface
         # (ORG-052 §4; dbus-python cannot mint a property without
         # explicit machinery neither provider wires, but that was a
@@ -1132,7 +1189,7 @@ class ManagerBusTests(PrivateBusCase):
         operation_handle = self._call(
             "Apply",
             "ssss",
-            (str(handle), str(digest), "bus-apply-1", "approval-x"),
+            (str(handle), str(digest), "bus-apply-1", "ac" * 32),
         )
         state, record_json = self._call(
             "OperationGet",
@@ -1156,7 +1213,7 @@ class ManagerBusTests(PrivateBusCase):
             (
                 self.state["subject_complete_receipt_handle"],
                 "bus-rollback-1",
-                "approval-y",
+                "ad" * 32,
             ),
         )
         state, record_json = self._call(
@@ -1229,7 +1286,7 @@ class ManagerBusTests(PrivateBusCase):
                 self.state["seat_b_plan_handle"],
                 self.state["seat_b_plan_digest"],
                 "bus-steal-1",
-                "approval-z",
+                "ae" * 32,
             ),
         )
         self.assert_wire_error(
@@ -1245,7 +1302,7 @@ class ManagerBusTests(PrivateBusCase):
             (
                 self.state["seat_b_receipt_handle"],
                 "bus-steal-2",
-                "approval-z",
+                "ae" * 32,
             ),
         )
 
@@ -1606,10 +1663,39 @@ class BusPolicyArtifactTests(unittest.TestCase):
             members=MANAGER_MEMBERS,
         )
 
+    def test_executor_seat_template_allows_only_operation_spec(self) -> None:
+        # T-2917 5a: the seat account (its executor's uid) may call exactly
+        # ExecutionSource.OperationSpec. 5b adds exactly one ownership: the
+        # seat's OWN executor name, org.pantheon.HostExecutor1.U<uid>.
+        raw = (
+            DIST / "pantheon-host-executor-seat.conf.template"
+        ).read_text(encoding="utf-8")
+        self.assertIn("@SEAT_ACCOUNT@", raw)
+        self.assertIn("@SEAT_UID@", raw)
+        tree = ElementTree.fromstring(
+            raw.replace("@SEAT_ACCOUNT@", "testseat").replace("@SEAT_UID@", "4242")
+        )
+        policies = _policies(tree)
+        self.assertEqual(set(policies), {("user", "testseat")})
+        policy = policies[("user", "testseat")]
+        owns = [allow for allow in policy.findall("allow") if allow.get("own") is not None]
+        self.assertEqual([allow.get("own") for allow in owns], ["org.pantheon.HostExecutor1.U4242"])
+        self.assertEqual(set(owns[0].attrib), {"own"})
+        for allow in owns:
+            policy.remove(allow)
+        _assert_member_level_allows(
+            self,
+            policy,
+            interface="org.pantheon.HostBroker1.ExecutionSource",
+            members=frozenset(("OperationSpec",)),
+        )
+
     def test_no_wildcards_anywhere_in_staged_policies(self) -> None:
         for name in (
             "org.pantheon.HostBroker1.conf",
             "pantheon-host-broker-seat.conf.template",
+            "pantheon-host-executor-seat.conf.template",
+            "org.pantheon.HostExecutor1.conf",
         ):
             raw = (DIST / name).read_text(encoding="utf-8")
             self.assertNotIn('="*"', raw, name)
