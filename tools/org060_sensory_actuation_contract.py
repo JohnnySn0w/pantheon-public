@@ -428,7 +428,10 @@ def _digest_record(data: Mapping[str, object], digest_field: str) -> str:
 
 def _loads_canonical(raw: bytes | str, *, limit: int = WIRE_LIMIT) -> Mapping[str, object] | TypedRefusal:
     if isinstance(raw, str):
-        raw_bytes = raw.encode("utf-8")
+        try:
+            raw_bytes = raw.encode("utf-8")
+        except UnicodeEncodeError:  # T-5629: e.g. a lone surrogate; refuse, never raise
+            return _refuse("malformed-json", "non-UTF8 text")
     elif isinstance(raw, bytes):
         raw_bytes = raw
     else:

@@ -1,0 +1,10 @@
+{"type":"user","timestamp":"2026-10-08T13:03:33.102Z","turnOrigin":"task_notification","message":{"content":"<task-notification><task-id>a498cf0ffc0bca734</task-id><status>completed</status></task-notification>"}}
+{"type":"assistant","timestamp":"2026-10-08T13:03:36.508Z","message":{"stop_reason":"tool_use"}}
+{"type":"assistant","timestamp":"2026-10-08T13:03:37.871Z","message":{"stop_reason":"tool_use"}}
+{"type":"user","timestamp":"2026-10-08T13:03:43.743Z","message":{"content":[{"type":"tool_result"}]}}
+{"type":"user","timestamp":"2026-10-08T13:03:43.898Z","message":{"content":[{"type":"tool_result"}]},"toolUseResult":{"backgroundTaskId":"bbv2hefe2"}}
+{"type":"attachment","timestamp":"2026-10-08T13:03:43.952Z"}
+{"type":"attachment","timestamp":"2026-10-08T13:03:46.135Z"}
+{"type":"assistant","timestamp":"2026-10-08T13:03:46.134Z","message":{"stop_reason":"end_turn"}}
+{"type":"system","subtype":"stop_hook_summary","timestamp":"2026-10-08T13:03:46.372Z"}
+{"type":"system","subtype":"turn_duration","timestamp":"2026-10-08T13:03:46.382Z"}

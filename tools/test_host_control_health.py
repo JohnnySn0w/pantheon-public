@@ -273,9 +273,12 @@ class BrokerPackageInventoryTests(unittest.TestCase):
             observed,
             [
                 "__init__.py",
+                "__main__.py",  # T-2920 U2: the production broker entrypoint
                 "approval_client.py",
                 "approval_source.py",
+                "broker_config.py",  # T-2920 U2: the broker root-config schema
                 "contracts.py",
+                "daemon_config.py",  # T-2920 U2: shared strict-parse helpers (no domain)
                 "dbus_service.py",
                 "driver.py",
                 "envelope.py",
@@ -318,10 +321,27 @@ class HealthModuleStructureTests(unittest.TestCase):
                     any(name.startswith("tools.host_control.approval") for name in imports)
                 )
         for path in sorted(APPROVAL_PACKAGE.glob("*.py")):
+            if path.name == "__main__.py":
+                # T-2920 U2: the approval DAEMON ENTRYPOINT is the composition
+                # root that exports the approval Health1 surface, so it (and
+                # only it) wires health/health_dbus; the approval domain
+                # modules stay health-free. Both health modules import only
+                # tools.host_control.contracts (asserted below), so this edge
+                # reaches no broker module.
+                continue
             with self.subTest(module=path.name):
                 imports = _imports(path)
                 self.assertNotIn("tools.host_control.health", imports)
                 self.assertNotIn("tools.host_control.health_dbus", imports)
+        tools_imports = {
+            name
+            for module in ("health.py", "health_dbus.py")
+            for name in _imports(HOST_CONTROL / module)
+            if name.startswith("tools.")
+        }
+        self.assertEqual(
+            tools_imports, {"tools.host_control.contracts", "tools.host_control.health"}
+        )
 
 
 class HonestUnavailableBusTests(unittest.TestCase):

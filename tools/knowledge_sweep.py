@@ -511,6 +511,7 @@ def file_sweep_ticket(
         sys.executable,
         str(ticket_bin),
         "file",
+        "--automated-filer", "knowledge_sweep",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "specialist",
         "--target", "role:research_orchestrator",
         # NB: no --intent — ticket.py rejects --intent for non-operator targets

@@ -1,7 +1,8 @@
-"""Strict root-owned seat and manifest registry."""
+"""Strict root-owned seat, manifest and plan registry."""
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import os
 import re
@@ -11,16 +12,27 @@ from typing import Mapping
 
 from tools.host_control.contracts import (
     ManifestRecord,
+    PlanRecord,
     RegistryError,
     SeatRecord,
     SubjectContext,
 )
 from tools.host_control.trusted_files import RootOwnedFileLoader
+from tools.persona_installer_contracts import FRAMEWORK_CODE_ARTIFACTS
 
 
 _IDENTIFIER = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}\Z")
 _HEX_256 = re.compile(r"[0-9a-f]{64}\Z")
 _TOP_KEYS = frozenset(("schema", "seats", "manifests"))
+# T-5533: ``plans`` is optional (absent == no registered plans); a registry with
+# it has exactly these keys.
+_TOP_KEYS_WITH_PLANS = _TOP_KEYS | {"plans"}
+_PLAN_KEYS = frozenset(("seat_id", "manifest_revision", "path", "sha256"))
+#: Registered plan size cap (a seat plan is ~65 KB today).
+PLAN_MAX_BYTES = 2 * 1024 * 1024
+#: Per-file cap when re-hashing a framework artifact (persona_installer.py is
+#: the largest, ~0.5 MB).
+FRAMEWORK_ARTIFACT_MAX_BYTES = 8 * 1024 * 1024
 _SEAT_KEYS = frozenset(
     (
         "seat_id",
@@ -76,6 +88,8 @@ class SeatRegistry:
     _subjects: Mapping[int, SubjectContext]
     _manifests: Mapping[str, ManifestRecord]
     _files: RootOwnedFileLoader
+    _plans: Mapping[tuple[str, str], PlanRecord] = dataclasses.field(default_factory=dict)
+    _framework_root: Path | None = None
 
     @classmethod
     def load(
@@ -83,9 +97,24 @@ class SeatRegistry:
         path: Path,
         *,
         files: RootOwnedFileLoader,
+        framework_root: Path | None = None,
     ) -> "SeatRegistry":
+        """``framework_root`` (T-5533): the root-owned framework copy, under the
+        loader's trusted roots. ``check_framework_digest`` re-hashes it, so a plan
+        registered against an older framework copy is refused; without it that
+        check (and so ``HostPlanService.plan``) refuses. Optional here because
+        callers that never plan (the executor, the e29 child, the harness MCP
+        registration) load the registry too."""
+
+        if framework_root is not None:
+            framework_root = _absolute_normalized(str(framework_root), "framework root")
+            if not files.is_allowed(framework_root / FRAMEWORK_CODE_ARTIFACTS[0]):
+                raise RegistryError("framework root is outside trusted roots")
         raw = files.read_json(path, max_bytes=1024 * 1024)
-        _exact_keys(raw, _TOP_KEYS, "registry")
+        if isinstance(raw, dict) and "plans" in raw:
+            _exact_keys(raw, _TOP_KEYS_WITH_PLANS, "registry")
+        else:
+            _exact_keys(raw, _TOP_KEYS, "registry")
         if raw["schema"] != "pantheon-host-seat-registry/v1":
             raise RegistryError("unsupported registry schema")
         seats_raw = raw["seats"]
@@ -184,7 +213,38 @@ class SeatRegistry:
             if hashlib.sha256(manifest_bytes).hexdigest() != manifest_sha256:
                 raise RegistryError("registered manifest hash mismatch")
             manifests[revision] = record
-        return cls(seats, subjects, manifests, files)
+
+        plans_raw = raw.get("plans", [])
+        if not isinstance(plans_raw, list):
+            raise RegistryError("registry plans must be a list")
+        plans: dict[tuple[str, str], PlanRecord] = {}
+        for index, item in enumerate(plans_raw):
+            value = _exact_keys(item, _PLAN_KEYS, f"plan {index}")
+            seat_id = _identifier(value["seat_id"], "plan seat id")
+            revision = _identifier(value["manifest_revision"], "plan manifest revision")
+            if seat_id not in seats:
+                raise RegistryError("plan names an unregistered seat")
+            if revision not in manifests:
+                raise RegistryError("plan names an unregistered manifest revision")
+            plan_path = _absolute_normalized(value["path"], "plan path")
+            if not files.is_allowed(plan_path):
+                raise RegistryError("plan path is outside trusted roots")
+            plan_sha256 = value["sha256"]
+            if not isinstance(plan_sha256, str) or _HEX_256.fullmatch(plan_sha256) is None:
+                raise RegistryError("invalid registered plan digest")
+            key = (seat_id, revision)
+            if key in plans:
+                raise RegistryError("duplicate plan for seat and manifest revision")
+            plan_bytes = files.read_bytes(plan_path, max_bytes=PLAN_MAX_BYTES)
+            if hashlib.sha256(plan_bytes).hexdigest() != plan_sha256:
+                raise RegistryError("registered plan hash mismatch")
+            plans[key] = PlanRecord(
+                seat_id=seat_id,
+                manifest_revision=revision,
+                path=plan_path,
+                sha256=plan_sha256,
+            )
+        return cls(seats, subjects, manifests, files, plans, framework_root)
 
     def subject_for_uid(self, authenticated_uid: int) -> SubjectContext:
         if not isinstance(authenticated_uid, int) or isinstance(
@@ -222,4 +282,53 @@ class SeatRegistry:
         raw = self._files.read_bytes(record.path, max_bytes=1024 * 1024)
         if hashlib.sha256(raw).hexdigest() != record.sha256:
             raise RegistryError("registered manifest hash drift")
+        return raw
+
+    def check_framework_digest(self, record: ManifestRecord) -> None:
+        """T-5533 (orchestrator's scope add): refuse when the framework copy's artifact
+        digest (``FRAMEWORK_CODE_ARTIFACTS`` plus the record's template ids, the
+        same bytes and order as ``persona_installer._artifact_digest`` and the
+        executor's source check) differs from the registered ``framework_sha256``.
+        That is, the registered manifest and its plan are stale against the
+        copy. Fail closed (T-5533 review r1, B1): a registry loaded without a
+        framework root cannot prove its plans fresh, so this refuses. ``load``
+        keeps ``framework_root`` optional because the executor, the e29 child and
+        the harness MCP registration load the registry but never plan."""
+
+        if self._framework_root is None:
+            raise RegistryError("no framework root configured")
+        artifacts = (*FRAMEWORK_CODE_ARTIFACTS, *record.template_ids)
+        digest = hashlib.sha256()
+        for relative in sorted(artifacts):
+            data = self._files.read_bytes(
+                self._framework_root / relative,
+                max_bytes=FRAMEWORK_ARTIFACT_MAX_BYTES,
+            )
+            digest.update(relative.encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(data)
+            digest.update(b"\0")
+        if digest.hexdigest() != record.framework_sha256:
+            raise RegistryError("registered framework digest is stale against the framework copy")
+
+    def plan_record(self, seat_id: str, manifest_revision: str) -> PlanRecord:
+        """T-5533: the root-registered plan for ``(seat_id, manifest_revision)``."""
+
+        try:
+            return self._plans[(seat_id, manifest_revision)]
+        except (KeyError, TypeError) as exc:
+            raise RegistryError("no registered plan for seat and manifest revision") from exc
+
+    def read_plan_bytes(self, record: PlanRecord) -> bytes:
+        """Mirror of ``read_manifest_bytes`` for a registered plan: the record must
+        equal the registered one, the bytes come through the root-owned loader
+        (owner, mode and no-symlink checks), under ``PLAN_MAX_BYTES``, and must
+        still hash to the registered sha256."""
+
+        registered = self.plan_record(record.seat_id, record.manifest_revision)
+        if registered != record:
+            raise RegistryError("plan record is not registered")
+        raw = self._files.read_bytes(record.path, max_bytes=PLAN_MAX_BYTES)
+        if hashlib.sha256(raw).hexdigest() != record.sha256:
+            raise RegistryError("registered plan hash drift")
         return raw

@@ -67,6 +67,7 @@ from tools._git_utils import (  # noqa: E402  — after sys.path bootstrap.
     push_with_retry,
 )
 from tools._md_table import _md_row  # noqa: E402  — leaf module, re-only (T-1936)
+from tools import _frontmatter_block  # noqa: E402  — leaf module, re-only (T-5689)
 from tools.agent_role_map import (  # noqa: E402  — after sys.path bootstrap.
     account_persona_map as _account_persona_map,
 )
@@ -74,6 +75,7 @@ from tools.agent_role_map import (  # noqa: E402  — after sys.path bootstrap.
 # yaml), no cycle risk importing it at module scope (unlike ticket_lint,
 # which imports FROM this module).
 from tools import priority_list_parse  # noqa: E402
+from tools import _security_gate  # noqa: E402  — T-5678, pure leaf module
 
 # T-0761 c4: clone-on-demand repo provisioning (called after a successful claim).
 # Guarded top-level import: module may be absent in isolated worktrees used by
@@ -278,6 +280,17 @@ OPTIONAL_FRONT_MATTER = (
     "ratifiable_files",
     "intent",
     "operator_intent",  # T-5015
+    # T-5678 / ORG-105 s4: the security-ticket gate. security_gate is pending|accepted|
+    # rejected; pending is skipped by every pull path (tools/_security_gate.is_pending).
+    "security_gate",
+    "security_rank",
+    "threat_unclassified",  # T-5678 r1: automated filer, no chain yet; accept supplies it
+    "security_filer",
+    "threat_foothold",
+    "threat_impact",
+    "threat_path",
+    "threat_justification",
+    "not_security_reason",
     "serves",
     "retest_status",
     "appetite",  # T-3440 / ORG-089
@@ -307,7 +320,10 @@ REPAIR_FIELD_SPEC: dict = {
     "recovered_before_repair": ("bool", False),
 }
 REPAIR_ATTEMPTS_BUDGET_DEFAULT = 2
-BLOCK_SCALAR_FIELDS = ("evidence_snapshot",)
+# evidence_snapshot (T-4707) + the T-5678 free-text gate fields (threat_path,
+# threat_justification, not_security_reason). Single source in the leaf module
+# (T-5689) so ticket_purpose's parser applies the same legacy-indent rule.
+BLOCK_SCALAR_FIELDS = _frontmatter_block.BLOCK_SCALAR_FIELDS
 
 LIST_FIELDS = (
     "depends_on", "implements", "verifies", "supersedes", "informs",
@@ -1184,8 +1200,9 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
     """Split a ticket file's text into (front_matter_fields, body).
 
     Front matter is delimited by leading `---\\n` and a closing `---\\n`. Each
-    line within is `key: value`. Values are scalars, `null`, or single-line
-    flow-style lists `[a, b, c]`. No multi-line strings, no nested mappings.
+    line within is `key: value`. Values are scalars, `null`, single-line
+    flow-style lists `[a, b, c]`, or (T-4707/T-5689) a YAML `|` / `>` block
+    scalar on any key, read by tools/_frontmatter_block. No nested mappings.
     """
     if not text.startswith("---\n"):
         raise TicketError("front matter: missing opening `---` delimiter")
@@ -1203,7 +1220,10 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
         body = rest[end + len("\n---\n") :]
 
     fields: dict = {}
-    fm_lines = fm_block.splitlines()
+    # T-5694: LF is the ticket format's only source-line delimiter.  Python's
+    # splitlines() also consumes CR, VT, FF, the record separators, NEL, LS and
+    # PS; those are legitimate value bytes and must remain inside a scalar.
+    fm_lines = fm_block.split("\n")
     idx = 0
     while idx < len(fm_lines):
         raw_line = fm_lines[idx]
@@ -1216,23 +1236,20 @@ def parse_front_matter(text: str) -> tuple[dict, str]:
             raise TicketError(f"front matter: cannot parse line: {raw_line!r}")
         key = m.group(1)
         raw_val = m.group(2).strip()
-        if raw_val == "|" and key in BLOCK_SCALAR_FIELDS:
-            # T-4707: `|` block scalar (clip chomping): consume the indented
-            # continuation lines (blank lines allowed), strip the 2-space indent.
-            block: list[str] = []
-            while idx < len(fm_lines):
-                nxt = fm_lines[idx]
-                if nxt.strip() == "":
-                    block.append("")
-                elif nxt.startswith("  "):
-                    block.append(nxt[2:])
-                else:
-                    break
-                idx += 1
-            while block and block[-1] == "":
-                block.pop()
-            fields[key] = "\n".join(block) + "\n" if block else ""
-            continue
+        if _frontmatter_block.parse_block_header(raw_val) is not None:
+            # T-4707 / T-5689: a YAML `|` / `>` block scalar (any key, any
+            # chomping/indentation indicator) -- tools/_frontmatter_block is the
+            # ONE reader, shared with tools/ticket_purpose.py.
+            value, idx = _frontmatter_block.consume_block(fm_lines, idx, raw_val, key=key)
+            if value is not None:
+                fields[key] = value
+                continue
+            if key in BLOCK_SCALAR_FIELDS and raw_val == "|":
+                # T-4707 back-compat: an empty `|` block on a block field is "".
+                fields[key] = ""
+                continue
+            # Back-compat: a bare `serves: |` with no indented content stays the
+            # plain scalar "|" (pinned by test_ticket_repair_fields).
         fields[key] = _parse_value(key, raw_val)
 
     for req in REQUIRED_FRONT_MATTER:
@@ -1359,10 +1376,22 @@ def _render_value(key: str, val) -> str:
     if val is None:
         return "null"
     if key in BLOCK_SCALAR_FIELDS and isinstance(val, str):
+        if _frontmatter_block.plain_scalar_safe(val):
+            # T-5689 (orchestrator): a single-line value is written as a plain scalar,
+            # the same unquoted form as every other single-line field, so a seat
+            # still on pre-T-5689 readers (which choke on `threat_path: |`) can
+            # parse every --threat-chain filing.
+            return val
         # T-4707: YAML `|` block scalar -- each content line indented two spaces,
-        # blank lines kept blank. Parsed back by parse_front_matter.
-        body_lines = val.rstrip("\n").split("\n")
-        return "|\n" + "\n".join(("  " + ln) if ln else "" for ln in body_lines)
+        # blank lines kept blank, always clip. Parsed back by parse_front_matter.
+        return _frontmatter_block.render_block(val, always_clip=True)
+    if isinstance(val, str) and val.splitlines() != [val]:
+        # T-5689/T-5694: any other value containing a source-line separator
+        # re-renders as a `|` block with the chomping that reads back to the
+        # same value.  splitlines() is deliberately the detector here: besides
+        # LF it catches CR, VT, FF, the record separators, NEL, LS and PS.  The
+        # readers themselves split only on LF, so the other bytes stay data.
+        return _frontmatter_block.render_block(val)
     if isinstance(val, list):
         return "[" + ", ".join(_quote_flow_item(str(item)) for item in val) + "]"
     return str(val)
@@ -1983,6 +2012,13 @@ def _build_commit_message(verb: str, tid: str, title: str | None, detail: str | 
         if detail:
             short = detail if len(detail) <= 60 else detail[:57] + "..."
             subject = f"tickets: {verb} {tid} — {short}"
+    elif verb in ("security-accept", "security-reject"):
+        # T-5678: subject names the verb; the note rides in the body (never truncated).
+        subject = f"tickets: {verb} {tid}"
+    elif verb == "clear-operator-intent":
+        # T-5522: subject carries only the verb; the full decided-by/ref/why
+        # detail goes in the body so the audit chain is never truncated.
+        subject = f"tickets: clear-operator-intent {tid}"
     elif verb == "await-merge":
         # T-4119.
         subject = f"tickets: await-merge {tid}"
@@ -1999,6 +2035,8 @@ def _build_commit_message(verb: str, tid: str, title: str | None, detail: str | 
                 "label-add", "label-remove",
                 "re-earn", "drop", "adjust-appetite", "reopen") \
             and detail and len(detail) > 60:
+        body_parts.append(detail)
+    if verb in ("clear-operator-intent", "security-accept", "security-reject") and detail:
         body_parts.append(detail)
 
     if not body_parts:
@@ -2963,11 +3001,13 @@ def _purpose_values_from_args(args: argparse.Namespace) -> tuple[bool, str | Non
 
 def _purpose_issues_for_fields(fields: dict, *, mode) -> tuple:
     """Validate candidate fields against the on-disk ticket/project graph."""
+    from tools.goal_registry import registry_status
     from tools.project_catalogue import load_project_records
     from tools.ticket_purpose import (
         TicketPurpose,
         load_ticket_purpose_index,
         validate_new_ticket_purpose,
+        with_goal_registry_reason,
     )
     tid = str(fields["id"])
     purposes = load_ticket_purpose_index(TICKETS_ROOT)
@@ -2982,8 +3022,13 @@ def _purpose_issues_for_fields(fields: dict, *, mode) -> tuple:
     )
     purposes[tid] = candidate
     records = load_project_records(REPO_ROOT / "projects" / "records")
-    return validate_new_ticket_purpose(
-        candidate, purposes, records, frozenset(), mode
+    # T-5679: the canonical goal keys come from the goals.md markers. A
+    # missing/unparseable registry yields an empty set, and the reason is
+    # carried onto any goal-registry-unavailable issue rather than dropped.
+    goal_keys, registry_error = registry_status(REPO_ROOT)
+    return with_goal_registry_reason(
+        validate_new_ticket_purpose(candidate, purposes, records, goal_keys, mode),
+        registry_error,
     )
 
 
@@ -3148,6 +3193,24 @@ def _refuse_if_episode_committed(episode_id: str) -> None:
         )
 
 
+def _security_gate_fields(*, title, ask, labels, threat_chain=None,
+                          path_justification=None, not_security=None,
+                          automated_filer=None) -> dict:
+    """T-5678: run the ORG-105 gate; GateRefusal -> TicketRefusal (exit 3)."""
+    try:
+        return _security_gate.evaluate(
+            title=title,
+            ask=ask if isinstance(ask, str) else None,
+            labels=labels if isinstance(labels, list) else [],
+            threat_chain=threat_chain if isinstance(threat_chain, str) else None,
+            path_justification=path_justification if isinstance(path_justification, str) else None,
+            not_security=not_security if isinstance(not_security, str) else None,
+            automated_filer=automated_filer if isinstance(automated_filer, str) else None,
+        )
+    except _security_gate.GateRefusal as exc:
+        raise TicketRefusal(str(exc)) from None
+
+
 def cmd_file(args: argparse.Namespace) -> int:
     from tools.ticket_purpose import PurposeEnforcement
 
@@ -3218,6 +3281,17 @@ def cmd_file(args: argparse.Namespace) -> int:
         project_id, labels, nearest_intent_ref, mode=purpose_mode
     )
 
+    # --- T-5678 / ORG-105 s4: security-ticket gate (resolved once, pre-loop) ---
+    # Fail-fast before any mutation: a refusal leaves no trace. str-only reads so
+    # MagicMock'd Namespaces in other suites stay inert.
+    gate_fields = _security_gate_fields(
+        title=title, ask=getattr(args, "ask", None), labels=labels,
+        threat_chain=getattr(args, "threat_chain", None),
+        path_justification=getattr(args, "path_justification", None),
+        not_security=getattr(args, "not_security", None),
+        automated_filer=getattr(args, "automated_filer", None),
+    )
+
     # --- T-3328: file-time lineage-guard (resolved once, pre-loop) ---
     # A first-class ticket DAG needs every node connected — a new ticket must
     # carry >=1 lineage edge or explicitly assert (via --orphan) that it is a
@@ -3235,10 +3309,14 @@ def cmd_file(args: argparse.Namespace) -> int:
     #       accepted by _parse_edge_targets (T-2841/ORG-065 BT1), unchanged.
     #   parent_ticket/depends_on -> another ticket.
     # A genuine one-off with no goal alignment is still connected, not
-    # orphaned: use --serves with a non-goal-root value ('goal-neutral-
-    # maintenance' for housekeeping, 'operator-ad-hoc' for the operator's ungoaled
-    # asks — both free text today; a designated non-goal-root registry is
-    # future work, not built here). Existence of a referenced goal/ADR/ticket
+    # orphaned: use --serves goal-neutral-maintenance (or a maintenance:<asset>
+    # --nearest-intent-ref) for housekeeping, and --nearest-intent-ref
+    # ticket:T-5677 plus a descriptive --serves (which requires --appetite,
+    # per ORG-089: ad-hoc asks are bets) for the operator's ungoaled asks. T-5677 is the designated
+    # operational-root ticket (T-3332 (b), ratified by orchestrator 2026-10-27; the
+    # registry is the ORG-054 ref kinds plus tickets labelled operational-root).
+    # The free-text 'operator-ad-hoc' serves value is legacy. Existence of a
+    # referenced goal/ADR/ticket
     # is NOT validated at file-time — same warn-only-at-grooming precedent
     # already established for implements/verifies/supersedes/informs.
     #
@@ -3272,11 +3350,14 @@ def cmd_file(args: argparse.Namespace) -> int:
                 "  --depends-on T-NNNN[,...]  ticket(s) that gate this one\n"
                 "  --serves \"<phrase>\"        the goal/arc-intent this ticket "
                 "serves (ORG-034) — traces to a rulebook/goals.md north star; "
-                "use 'goal-neutral-maintenance' for housekeeping or "
-                "'operator-ad-hoc' for a genuine one-off with no goal "
-                "(operator-ad-hoc, like any serves other than "
+                "use 'goal-neutral-maintenance' for housekeeping; legacy "
+                "'operator-ad-hoc' (operator-ad-hoc, like any serves other than "
                 "goal-neutral-maintenance, also needs --appetite <1-10> — "
                 "ORG-089)\n"
+                "  --nearest-intent-ref ticket:T-5677  a genuine one-off with "
+                "no goal (ad-hoc the operator ask): the operational-root ticket "
+                "(T-3332), plus a descriptive --serves (which requires "
+                "--appetite <1-10>, per ORG-089)\n"
                 "  --implements <T-NNNN|ADR-NNN#E<k>>  the parent work or ADR "
                 "obligation this ticket implements\n"
                 "  --verifies <T-NNNN|ADR-NNN#E<k>>    the obligation this "
@@ -3538,6 +3619,7 @@ def cmd_file(args: argparse.Namespace) -> int:
                     fields["no_file_reason"] = no_file_reason  # T-5014
                 if labels:
                     fields["labels"] = labels
+                fields.update(gate_fields)  # T-5678
                 if args.stale_after:
                     fields["stale_after"] = args.stale_after.strip()
                 if args.not_before:
@@ -4629,12 +4711,27 @@ def _resolve_wip_cap(now: datetime | None = None) -> int:
     return n
 
 
+def _refuse_if_security_pending(tid: str) -> None:
+    """T-5678: claim must not pull a ticket awaiting HO's ORG-105 security accept."""
+    try:
+        fields = parse_front_matter(_find_ticket(tid).read_text(encoding="utf-8"))[0]
+    except TicketRefusal:
+        return  # not found: the normal claim path reports it
+    if _security_gate.is_pending(fields):
+        raise TicketRefusal(
+            f"claim refused: {tid} is security_gate: pending (ORG-105 s4); HO must run "
+            f"`ticket.py security-accept {tid} --rank primary|secondary --note ...` "
+            f"(or security-reject) before it can be pulled."
+        )
+
+
 def cmd_claim(args: argparse.Namespace) -> int:
     # T-0463: pre-claim origin-side state check. Refuses if origin shows the
     # ticket already past inbox (concurrent-claim divergence pre-empt).
     # Caveat: TOCTOU window between this check and the local claim landing on
     # origin — bounds the worst case but doesn't eliminate it. Pair with
     # PWA-tier optimistic-lock UI (T-0367 follow-on) for fuller coverage.
+    _refuse_if_security_pending(args.ticket)  # T-5678
     origin_state = _origin_state_of_ticket(args.ticket)
     if origin_state is not None and origin_state != "inbox":
         raise TicketRefusal(
@@ -5454,6 +5551,238 @@ def cmd_adjust_appetite(args: argparse.Namespace) -> int:
         args.ticket, verb="adjust-appetite", appetite=appetite, rationale=rationale,
         no_push=getattr(args, "no_push", False),
         require_overrun=False, clear_overrun=True,
+    )
+
+
+# ---------------------------------------------------------------------------
+# T-5522: clear a STALE operator_intent (HO-only).
+#
+# T-5015 keeps `operator_intent` on a retarget away from operator so a real
+# the operator carrier stays register-gated at close. When the ask was instead
+# pulled to agent tier and decided there, that preserved field forces any
+# closer to fabricate an operator ruling. This verb removes it, with one audited
+# transition-log line, so the register only ever holds his real rulings.
+# ---------------------------------------------------------------------------
+
+CLEAR_OPERATOR_INTENT_ROLE = "head_engineering_orchestrator"
+
+
+def _is_operator_name(value: str) -> bool:
+    """True when *value* names the operator in any case or `role:` form (T-5522)."""
+    v = value.strip().lower()
+    if v.startswith("role:"):
+        v = v[len("role:"):].strip()
+    return _resolve_persona(v) == "operator"
+
+
+def cmd_clear_operator_intent(args: argparse.Namespace) -> int:
+    """Remove a stale `operator_intent` from an agent-tier ticket (T-5522).
+
+    HO-only. The actor check is ADVISORY, same-user trust like PANTHEON_ACTOR
+    everywhere else in ticket.py; it is not an auth boundary.
+    """
+    verb = "clear-operator-intent"
+    tid = args.ticket
+    # Lazy, but free: tools.agent_role_map is already imported at module scope.
+    from tools.agent_role_map import resolve_role
+
+    persona = _claiming_persona()
+    if resolve_role(persona) != CLEAR_OPERATOR_INTENT_ROLE:
+        raise TicketRefusal(
+            f"{verb} refused: actor {_actor()!r} (persona {persona!r}) is not the "
+            f"head engineering orchestrator. Clearing an item off the operator's desk is "
+            f"an HO-operator boundary decision (T-5522): ask orchestrator to run it."
+        )
+    decided_by = (getattr(args, "decided_by", None) or "").strip()
+    ref = (getattr(args, "ref", None) or "").strip()
+    why = (getattr(args, "why", None) or "").strip()
+    missing = [f for f, v in (("--decided-by", decided_by), ("--ref", ref),
+                              ("--why", why)) if not v]
+    if missing:
+        raise TicketRefusal(f"{verb} refused: empty {', '.join(missing)}")
+    if _is_operator_name(decided_by):
+        raise TicketRefusal(
+            f"{verb} refused: --decided-by {decided_by!r} names the operator. A real "
+            f"the operator ruling belongs in his decision register, not erased by a "
+            f"clear: use `ticket.py resolve {tid} --ruling \"<his call, TG id>\" "
+            f"--implies ... --delegable ... --category ...` (T-5015)."
+        )
+
+    def _check(path: Path, fields: dict) -> None:
+        if path.parent.name == "done":
+            raise TicketRefusal(
+                f"{verb} refused: {tid} is in done/ (closed provenance is not rewritten)."
+            )
+        if fields.get("target") == "operator":
+            raise TicketRefusal(
+                f"{verb} refused: {tid} has target: operator, so it is still the operator's. "
+                f"Retarget it off the operator first, or resolve it with --ruling."
+            )
+        if fields.get("intent"):
+            raise TicketRefusal(
+                f"{verb} refused: {tid} carries a live intent: {fields.get('intent')!r} "
+                f"(still the operator's ask)."
+            )
+        if not fields.get("operator_intent"):
+            raise TicketRefusal(
+                f"{verb} refused: {tid} has no operator_intent; nothing to clear."
+            )
+
+    pre = _find_ticket(tid)
+    _check(pre, parse_front_matter(pre.read_text(encoding="utf-8"))[0])
+
+    no_push = getattr(args, "no_push", False)
+    with git_mutation_lock(label=f"{verb} {tid}"):
+        _pull_if_needed(no_push)
+        path = _find_ticket(tid)
+        fields, body = parse_front_matter(path.read_text(encoding="utf-8"))
+        _check(path, fields)  # re-verify inside the lock (T-1770 posture)
+        old_fields = _fm_snapshot(fields)
+        old_value = fields.pop("operator_intent")
+        detail = (f"operator_intent={old_value} cleared; decided-by={decided_by}; "
+                  f"ref={ref}; why={why}")
+        body = append_transition(body, _actor(), verb, detail)
+        path.write_text(_build_ticket_text(fields, body, old_fields=old_fields),
+                        encoding="utf-8")
+        _commit_and_push([path], _build_commit_message(verb, tid, None, detail),
+                         no_push=no_push)
+    print(f"{verb} {tid}: operator_intent={old_value} cleared (decided-by {decided_by})")
+    return 0
+
+
+def _require_ho_actor(verb: str) -> None:
+    """HO-only actor check, same source of identity as clear-operator-intent (T-5522).
+
+    ADVISORY: `_actor()` reads $PANTHEON_ACTOR else the OS user, and a subagent runs as
+    its dispatcher's OS user, so this is same-user trust, not an auth boundary."""
+    from tools.agent_role_map import resolve_role
+
+    persona = _claiming_persona()
+    if resolve_role(persona) != CLEAR_OPERATOR_INTENT_ROLE:
+        raise TicketRefusal(
+            f"{verb} refused: actor {_actor()!r} (persona {persona!r}) is not the "
+            f"head engineering orchestrator. Accepting or rejecting a security-gated "
+            f"ticket is an HO decision (T-5678, ORG-105 s4): ask orchestrator to run it."
+        )
+
+
+def _security_verb_check(verb: str, tid: str, path: Path, fields: dict) -> None:
+    if path.parent.name == "done":
+        raise TicketRefusal(f"{verb} refused: {tid} is in done/.")
+    if not _security_gate.is_pending(fields):
+        raise TicketRefusal(
+            f"{verb} refused: {tid} is not security_gate: pending "
+            f"(found {fields.get('security_gate')!r})."
+        )
+
+
+def cmd_security_accept(args: argparse.Namespace) -> int:
+    """T-5678 (HO-only): pending -> accepted (pullable), or released as not-security.
+
+    `--rank` accepts. `--not-security "<reason>"` releases instead (clears the gate and
+    records the reason): the cheap exit for keyword false positives. A pending ticket
+    that an automated filer left UNCLASSIFIED needs `--threat-chain` here when accepted
+    (the HO supplies the chain at acceptance); a classified one refuses the flag."""
+    verb = "security-accept"
+    tid = args.ticket
+    _require_ho_actor(verb)
+    rank = (getattr(args, "rank", None) or "").strip()
+    note = (getattr(args, "note", None) or "").strip()
+    not_sec = (getattr(args, "not_security", None) or "").strip()
+    chain = (getattr(args, "threat_chain", None) or "").strip()
+    just = getattr(args, "path_justification", None)
+    if bool(rank) == bool(not_sec):
+        raise TicketRefusal(
+            f"{verb} refused: give exactly one of --rank "
+            f"{{{','.join(_security_gate.RANKS)}}} (accept) or --not-security '<reason>' (release)"
+        )
+    if rank and rank not in _security_gate.RANKS:
+        raise TicketRefusal(f"{verb} refused: --rank must be one of {', '.join(_security_gate.RANKS)}")
+    if not note:
+        raise TicketRefusal(f"{verb} refused: empty --note")
+    if not_sec and chain:
+        raise TicketRefusal(f"{verb} refused: --not-security and --threat-chain are exclusive")
+
+    def _gate(path: Path, fields: dict) -> dict:
+        _security_verb_check(verb, tid, path, fields)
+        unclassified = _security_gate.is_unclassified(fields)
+        if rank and unclassified and not chain:
+            raise TicketRefusal(
+                f"{verb} refused: {tid} was filed by an automated filer with no chain. "
+                f"Supply --threat-chain 'foothold=<F>;impact=<I>;path=<text>' "
+                f"(F in {{{','.join(_security_gate.FOOTHOLDS)}}}, I in "
+                f"{{{','.join(_security_gate.ASSETS)}}}), or release it with "
+                f"--not-security '<reason>'."
+            )
+        if chain and not unclassified:
+            raise TicketRefusal(
+                f"{verb} refused: {tid} already carries a chain; --threat-chain applies "
+                f"only to an unclassified ticket."
+            )
+        if chain:
+            try:
+                return _security_gate.chain_fields(chain, just)
+            except _security_gate.GateRefusal as exc:
+                raise TicketRefusal(f"{verb} refused: {exc}") from None
+        return {}
+
+    pre = _find_ticket(tid)
+    _gate(pre, parse_front_matter(pre.read_text(encoding="utf-8"))[0])
+
+    no_push = getattr(args, "no_push", False)
+    with git_mutation_lock(label=f"{verb} {tid}"):
+        _pull_if_needed(no_push)
+        path = _find_ticket(tid)
+        fields, body = parse_front_matter(path.read_text(encoding="utf-8"))
+        chain_updates = _gate(path, fields)  # re-verify inside the lock (T-1770)
+        old_fields = _fm_snapshot(fields)
+        if not_sec:
+            fields.pop("security_gate", None)
+            fields.pop("threat_unclassified", None)
+            fields["not_security_reason"] = not_sec
+            detail = f"released as not-security: {not_sec}; {note}"
+            result = "released (not security)"
+        else:
+            fields.update(chain_updates)
+            fields.pop("threat_unclassified", None)
+            fields["security_gate"] = "accepted"
+            fields["security_rank"] = rank
+            detail = f"rank={rank}; {note}" + ("; chain supplied at accept" if chain_updates else "")
+            result = f"accepted ({rank})"
+        body = append_transition(body, _actor(), verb, detail)
+        path.write_text(_build_ticket_text(fields, body, old_fields=old_fields), encoding="utf-8")
+        _commit_and_push([path], _build_commit_message(verb, tid, None, detail), no_push=no_push)
+    print(f"{verb} {tid}: {result}")
+    return 0
+
+
+def cmd_security_reject(args: argparse.Namespace) -> int:
+    """T-5678 (HO-only): pending -> dropped (done/, substate: dropped) with the note."""
+    verb = "security-reject"
+    tid = args.ticket
+    _require_ho_actor(verb)
+    note = (getattr(args, "note", None) or "").strip()
+    if not note:
+        raise TicketRefusal(f"{verb} refused: empty --note")
+    path = _find_ticket(tid)
+    fields = parse_front_matter(path.read_text(encoding="utf-8"))[0]
+    _security_verb_check(verb, tid, path, fields)
+    origin = path.parent.name
+    return _do_transition(
+        tid=tid,
+        expected_state=origin,
+        new_state="done",
+        verb=verb,
+        detail=note,
+        no_push=getattr(args, "no_push", False),
+        field_updates={
+            "substate": "dropped",
+            "dropped_reason": f"security-reject (ORG-105 s4): {note}",
+            "dropped_from_state": origin,
+            "security_gate": "rejected",
+        },
+        skip_closure_gate=True,  # dropped != satisfied
+        appetite_outcome="dropped",
     )
 
 
@@ -7339,8 +7668,29 @@ def cmd_label_add(args: argparse.Namespace) -> int:
         )
         return 0
 
+    # T-5678: adding a security label is a security-shaped mutation: it needs the same
+    # ORG-105 chain as `file`, unless the ticket already went through the gate.
+    gate_note = ""
+    if (_security_gate.label_hits(added)
+            and not _security_gate.label_hits(fields.get("labels") or [])
+            and not fields.get("security_gate")):
+        if path.parent.name == "active":
+            raise TicketRefusal(
+                f"label add refused: {tid} is active, and a security label would make it "
+                f"security_gate: pending under someone's hands. `unclaim` it first, or have "
+                f"HO accept it directly (security-accept {tid})."
+            )
+        gate_fields = _security_gate_fields(
+            title=_extract_title(body) or "", ask=None, labels=new_fields.get("labels") or [],
+            threat_chain=getattr(args, "threat_chain", None),
+            path_justification=getattr(args, "path_justification", None),
+            not_security=None,
+        )
+        new_fields.update(gate_fields)
+        gate_note = "; security_gate: pending (ORG-105 chain recorded)"
+
     actor = _actor()
-    detail = f"labels added: {', '.join(added)}"
+    detail = f"labels added: {', '.join(added)}{gate_note}"
     if already_present:
         detail += f"; already-present (skipped): {', '.join(already_present)}"
     body = append_transition(body, actor, "labels added", detail)
@@ -8122,6 +8472,137 @@ def _backfill_audit_report(scope: str | None) -> list[str]:
     return lines
 
 
+_LINEAGE_STATE_CHOICES = ("open", "inbox", "active", "done", "all")
+# T-3332 / T-5679: the goals file `lineage` reads its goal keys from, through
+# tools/goal_registry.py (the canonical marker parser). Module-level so tests
+# can point it at a fixture.
+LINEAGE_GOALS_PATH = REPO_ROOT / "rulebook" / "goals.md"
+
+
+def _lineage_states(raw: str) -> tuple[str, ...]:
+    if raw == "open":
+        return ("inbox", "active")
+    if raw == "all":
+        return STATES
+    return (raw,)
+
+
+def _lineage_edge_fields(raw: str | None) -> tuple[str, ...]:
+    """--edges: 'default', 'all', or a comma list; a '+f' item adds to default."""
+    from tools.ticket_lineage import ALL_UP_FIELDS, DEFAULT_UP_FIELDS
+
+    if not raw or raw == "default":
+        return DEFAULT_UP_FIELDS
+    if raw == "all":
+        return ALL_UP_FIELDS
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    base: list[str] = list(DEFAULT_UP_FIELDS) if all(i.startswith("+") for i in items) else []
+    for item in items:
+        name = item.lstrip("+")
+        if name not in ALL_UP_FIELDS:
+            raise TicketRefusal(
+                f"--edges: unknown edge field {name!r} (choose from {', '.join(ALL_UP_FIELDS)})"
+            )
+        if name not in base:
+            base.append(name)
+    return tuple(base)
+
+
+def cmd_lineage(args: argparse.Namespace) -> int:
+    """T-3332 (a): read-only lineage-graph queries (up / down / roots).
+
+    Never writes, commits, fetches or pushes: one corpus read pass through
+    ticket_lint.iter_ticket_frontmatter, then in-memory walks. Logic lives in
+    tools/ticket_lineage.py; this is only the CLI shell."""
+    from tools import ticket_lineage as tl
+    from tools.goal_registry import registry_status
+
+    edge_fields = _lineage_edge_fields(getattr(args, "edges", None))
+    # T-5679: a missing/unparseable registry is named on stderr, never a
+    # silent empty set; every goal ref then reads as goal-ref-unregistered.
+    goal_keys, registry_error = registry_status(REPO_ROOT, path=LINEAGE_GOALS_PATH)
+    if registry_error is not None:
+        print(f"[lineage] WARN goal-registry-unavailable: {registry_error}", file=sys.stderr)
+    graph = tl.build_graph(TICKETS_ROOT, goal_keys, edge_fields)
+    findings = {
+        "unparseable": graph.unparseable,
+        "malformed": graph.malformed,
+    }
+
+    if args.lineage_cmd == "roots":
+        summary = tl.roots_summary(graph, _lineage_states(args.state))
+        if args.cls:
+            summary["members"] = {args.cls: summary["members"].get(args.cls, [])}
+        if args.counts:
+            summary.pop("members", None)
+        elif args.limit is not None:
+            summary["members"] = {k: v[: args.limit] for k, v in summary["members"].items()}
+        if args.json:
+            out = dict(summary, edge_fields=list(edge_fields),
+                       goal_keys=sorted(goal_keys), findings=findings)
+            print(json.dumps(out, indent=2, sort_keys=True))
+            return 0
+        print(f"lineage roots: {summary['total']} ticket(s) in {'/'.join(summary['states'])}; "
+              f"edges {','.join(edge_fields)}")
+        for cls in tl.PRECEDENCE:
+            name = cls.value
+            note = "   <- honesty metric: traces to no goal or named root" if cls is tl.Terminus.UNROOTED else ""
+            print(f"  {name:<17}{summary['counts'][name]:>6}{note}")
+            for code, n in sorted(summary["detail"][name].items(), key=lambda kv: (-kv[1], kv[0])):
+                print(f"      {code:<26}{n:>6}")
+        if "members" in summary:
+            for name, rows in summary["members"].items():
+                if not rows:
+                    continue
+                print(f"\n{name}:")
+                for row in rows:
+                    via = "" if row["via"] == row["ticket"] else f" via {row['via']}"
+                    print(f"  {row['ticket']} [{row['state']}] {row['code']}{via}")
+        if graph.unparseable or graph.malformed:
+            print(f"findings: {len(graph.unparseable)} unparseable, {len(graph.malformed)} malformed edge value(s)")
+        return 0
+
+    direction = args.lineage_cmd
+    try:
+        if direction == "up":
+            node = args.node.strip()
+            if node not in graph.nodes:
+                raise tl.SeedError(f"unknown ticket {node}")
+            seeds = [node]
+        else:
+            seeds = tl.resolve_down_seeds(graph, args.node)
+    except tl.SeedError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    result = tl.walk(graph, seeds, direction, args.depth)
+    tl.load_titles(graph, TICKETS_ROOT, result["visited"])
+    terminus = {}
+    if direction == "up":
+        cls, via = tl.ticket_terminus(graph, seeds[0])
+        terminus = {"class": cls.cls.value, "code": cls.code, "detail": cls.text, "via": via}
+    if args.json:
+        out = {
+            "query": {"direction": direction, "node": args.node, "seeds": seeds,
+                      "depth": args.depth, "edge_fields": list(edge_fields)},
+            "nodes": {n: tl.node_record(graph, n) for n in result["visited"]},
+            "edges": result["edges"],
+            "terminus": terminus or None,
+            "findings": dict(findings, cycles=result["cycles"], missing=result["missing"]),
+        }
+        print(json.dumps(out, indent=2, sort_keys=True))
+        return 0
+    for line in tl.render_tree(graph, seeds, direction, args.depth):
+        print(line)
+    if terminus:
+        via = "" if terminus["via"] == seeds[0] else f" via {terminus['via']}"
+        print(f"terminus: {terminus['class']} ({terminus['code']}: {terminus['detail']}){via}")
+    else:
+        print(f"{len(result['visited']) - len(seeds)} node(s) below {len(seeds)} seed(s)")
+    if result["cycles"] or result["missing"]:
+        print(f"findings: {len(result['cycles'])} cycle(s), {len(result['missing'])} missing ticket(s)")
+    return 0
+
+
 def cmd_label_backfill_audit(args: argparse.Namespace) -> int:
     """`ticket.py label backfill-audit [--scope inbox|active|done|all]`.
     Report-only — never mutates. Exit code is always 0 (informational)."""
@@ -8832,7 +9313,7 @@ def cmd_list(args: argparse.Namespace) -> int:
                 t.fields.get("requester", "?"),
                 t.fields.get("target", "?"),
                 _format_age(t.fields.get("created", "")),
-                t.title,
+                t.title + (" [security-pending]" if _security_gate.is_pending(t.fields) else ""),
             )
         )
 
@@ -8900,6 +9381,8 @@ def cmd_ready(args: argparse.Namespace) -> int:
         if args.target and not _visible_to_target(t.fields.get("target"), args.target, eligible):
             continue
         if t.fields.get("depends_on"):  # non-empty dep gate → blocked
+            continue
+        if _security_gate.is_pending(t.fields):  # T-5678: awaiting HO security accept
             continue
         nb = t.fields.get("not_before")
         if nb and not _not_before_passed(nb, now):  # future calendar gate → blocked
@@ -9057,6 +9540,7 @@ def cmd_prime(args: argparse.Namespace) -> int:
         return _visible_to_target(t.fields.get("target"), args.target, eligible)
 
     ready, blocked, active = [], [], []
+    sec_pending = []  # T-5678
     done = []
     for t in tickets:
         state = t.fields.get("state")
@@ -9068,6 +9552,9 @@ def cmd_prime(args: argparse.Namespace) -> int:
         if state == "active" and _match_target(t):
             active.append(t)
         if not _match_target(t):
+            continue
+        if _security_gate.is_pending(t.fields):
+            sec_pending.append(t)
             continue
         nb = t.fields.get("not_before")
         is_dep_gated = bool(t.fields.get("depends_on"))
@@ -9084,11 +9571,13 @@ def cmd_prime(args: argparse.Namespace) -> int:
         "ready": [_ticket_brief(t, unblocks) for t in ready],
         "blocked": [_ticket_brief(t, unblocks) for t in blocked],
         "active": [_ticket_brief(t, unblocks) for t in active],
+        "security_pending": [_ticket_brief(t, unblocks) for t in sec_pending],
         "recently_done": [_ticket_brief(t, unblocks) for t in recently_done],
         "counts": {
             "ready": len(ready),
             "blocked": len(blocked),
             "active": len(active),
+            "security_pending": len(sec_pending),
             "done_total": len(done),
         },
     }
@@ -9235,6 +9724,32 @@ def _build_parser() -> argparse.ArgumentParser:
              "Any other value is refused (T-4499).",
     )
     f.add_argument(
+        "--threat-chain", dest="threat_chain", default=None,
+        help="T-5678 / ORG-105 s4: REQUIRED for a security-shaped ticket (security-ish "
+             "label or title/ask keyword). Form: "
+             "'foothold=<F>;impact=<I>;path=<how F reaches I>' with F in "
+             f"{{{','.join(_security_gate.FOOTHOLDS)}}} and I in "
+             f"{{{','.join(_security_gate.ASSETS)}}}. Files land security_gate: pending "
+             "until HO runs security-accept.",
+    )
+    f.add_argument(
+        "--path-justification", dest="path_justification", default=None,
+        help="T-5678: required with --threat-chain when the ORG-105 s7 matrix marks the "
+             "foothold x asset cell with an em dash (no realistic path): why the path is real.",
+    )
+    f.add_argument(
+        "--automated-filer", dest="automated_filer", default=None, metavar="NAME",
+        help="T-5678: a non-interactive filer names itself. A security-shaped filing with "
+             "no chain is then NOT refused: it lands security_gate: pending + "
+             "threat_unclassified (HO supplies the chain at security-accept). Interactive "
+             "callers must NOT pass this.",
+    )
+    f.add_argument(
+        "--not-security", dest="not_security", default=None,
+        help="T-5678: reason this keyword-only hit is not a security finding. Refused "
+             "when the ticket carries a security label.",
+    )
+    f.add_argument(
         "--target",
         required=True,
         help="who should action the ticket: a role pool `role:<R>` (e.g. "
@@ -9265,7 +9780,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="ticket:T-NNNN|project:ID|goal:KEY|maintenance:ASSET",
         help="T-3168/ORG-054 typed nearest-purpose edge. Goal-neutral maintenance "
-             "must name the maintained asset with maintenance:<asset-ref>.",
+             "must name the maintained asset with maintenance:<asset-ref>. "
+             "File operator-directed one-offs (ad-hoc the operator asks) with "
+             "--nearest-intent-ref ticket:T-5677 (the operational-root ticket, "
+             "T-3332 (b)) plus a descriptive --serves (which requires --appetite, "
+             "per ORG-089): it traces them to a named non-goal root without a "
+             "false goal ladder, and they are still bets.",
     )
     # T-2841 / ORG-065 BT1: typed-edge fields (warn-only model layer). Each is
     # a comma-separated list of targets — a ticket id (T-NNNN) or an ADR
@@ -9394,9 +9914,10 @@ def _build_parser() -> argparse.ArgumentParser:
              "descriptor). Also the goal-edge in the T-3328 lineage DAG: this "
              "is how a ticket traces to a rulebook/goals.md north star. "
              "'goal-neutral-maintenance' is a valid value for housekeeping "
-             "tickets; 'operator-ad-hoc' is a valid value for a genuine "
-             "one-off with no goal alignment (both non-goal-root conventions, "
-             "free text — no registry enforcement yet). Satisfies the T-3328 "
+             "tickets. 'operator-ad-hoc' is LEGACY: file ad-hoc the operator asks "
+             "with --nearest-intent-ref ticket:T-5677 (the operational-root "
+             "ticket, T-3332 (b)) plus a descriptive --serves (which requires "
+             "--appetite, per ORG-089). Satisfies the T-3328 "
              "file-time lineage guard (see --orphan below for the alternative). "
              "ORG-089 APPETITE GATE (T-4494): any --serves value other than "
              "'goal-neutral-maintenance' — 'operator-ad-hoc' included — REQUIRES "
@@ -9729,6 +10250,62 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_successor_arg(dr)
     dr.set_defaults(func=cmd_drop)
 
+    sacc = sub.add_parser(
+        "security-accept",
+        help="T-5678 (HO-only): accept a security_gate: pending ticket (ORG-105 s4 chain "
+             "reviewed) so it enters the work queue",
+        description="HO-only, advisory actor check (same as clear-operator-intent).",
+    )
+    sacc.add_argument("ticket")
+    sacc.add_argument("--rank", default=None, choices=list(_security_gate.RANKS),
+                      help="ORG-105 concern rank: primary or secondary (accepts the ticket)")
+    sacc.add_argument("--note", required=True, help="why the chain is real / why released")
+    sacc.add_argument("--threat-chain", dest="threat_chain", default=None,
+                      help="REQUIRED when accepting an UNCLASSIFIED ticket (filed by an "
+                           "automated filer with no chain): "
+                           "'foothold=<F>;impact=<I>;path=<text>'")
+    sacc.add_argument("--path-justification", dest="path_justification", default=None,
+                      help="needed when the chain's matrix cell is an em dash")
+    sacc.add_argument("--not-security", dest="not_security", default=None,
+                      help="release the ticket as NOT a security finding (reason); clears "
+                           "the gate instead of accepting")
+    sacc.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                      help="commit locally but skip the remote update")
+    sacc.set_defaults(func=cmd_security_accept)
+
+    srej = sub.add_parser(
+        "security-reject",
+        help="T-5678 (HO-only): drop a security_gate: pending ticket with the note as reason",
+        description="HO-only, advisory actor check (same as clear-operator-intent).",
+    )
+    srej.add_argument("ticket")
+    srej.add_argument("--note", required=True, help="why there is no in-scope chain")
+    srej.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                      help="commit locally but skip the remote update")
+    srej.set_defaults(func=cmd_security_reject)
+
+    cmi = sub.add_parser(
+        "clear-operator-intent",
+        help="T-5522 (HO-only): clear a STALE operator_intent on a ticket pulled to "
+             "agent tier and decided there, so closing it needs no fabricated "
+             "the operator register row",
+        description="HO-only: the actor must resolve to the head engineering "
+                    "orchestrator role. The check is advisory, same-user trust like "
+                    "PANTHEON_ACTOR elsewhere; it is not an auth system. Refuses "
+                    "--decided-by operator outright: a real the operator ruling goes "
+                    "through `resolve --ruling` into his decision register.",
+    )
+    cmi.add_argument("ticket")
+    cmi.add_argument("--decided-by", dest="decided_by", required=True,
+                     help="who actually decided at agent tier (persona or role; never operator)")
+    cmi.add_argument("--ref", required=True,
+                     help="anchor for that decision: ticket note, mail id, TG id")
+    cmi.add_argument("--why", required=True,
+                     help="why the ask no longer needs the operator")
+    cmi.add_argument("--no-push", dest="no_push", action="store_true", default=False,
+                     help="commit locally but skip git push")
+    cmi.set_defaults(func=cmd_clear_operator_intent)
+
     ro = sub.add_parser(
         "reopen",
         help="ORG-089: reopen a DROPPED bet (done/ -> inbox/) with a fresh "
@@ -9985,6 +10562,11 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     la.add_argument("ticket")
     la.add_argument("labels", nargs="+", metavar="LABEL")
+    la.add_argument("--threat-chain", dest="threat_chain", default=None,
+                    help="T-5678: ORG-105 chain, required when adding a security label "
+                         "(same form as `file --threat-chain`)")
+    la.add_argument("--path-justification", dest="path_justification", default=None,
+                    help="T-5678: see `file --path-justification`")
     la.add_argument("--no-push", dest="no_push", action="store_true", default=False,
                      help="commit locally but skip git push")
     la.set_defaults(func=cmd_label_add)
@@ -10015,6 +10597,48 @@ def _build_parser() -> argparse.ArgumentParser:
         help="ticket states to audit (default: inbox+active)",
     )
     lba.set_defaults(func=cmd_label_backfill_audit)
+
+    lin = sub.add_parser(
+        "lineage",
+        help="T-3332: read-only lineage-graph queries -- what a ticket serves "
+             "(up), what serves a node (down), where walks end (roots)",
+    )
+    lin_sub = lin.add_subparsers(dest="lineage_cmd", required=True,
+                                 parser_class=_NoAbbrevParser)
+    edges_help = ("edge fields to walk: 'default' (nearest_intent_ref ticket refs, "
+                  "parent_ticket, implements, verifies, ratifies), 'all' (adds the "
+                  "informational depends_on, supersedes, informs), a comma list, or "
+                  "'+field' items added to the default")
+    lup = lin_sub.add_parser("up", help="walk T-NNNN up to its terminus -- read-only")
+    lup.add_argument("node", metavar="T-NNNN")
+    ldn = lin_sub.add_parser(
+        "down",
+        help="walk down from T-NNNN, goal:KEY, maintenance[:ASSET], "
+             "operational-root, or ORG-NNN[#Ek] -- read-only",
+    )
+    ldn.add_argument("node", metavar="NODE")
+    for sp in (lup, ldn):
+        sp.add_argument("--edges", default=None, help=edges_help)
+        sp.add_argument("--depth", type=int, default=None, help="stop after N hops")
+        sp.add_argument("--json", action="store_true", help="graph-shaped JSON output")
+        sp.set_defaults(func=cmd_lineage, off_main_ok=True)
+    lrt = lin_sub.add_parser(
+        "roots",
+        help="classify tickets by terminus (goal / operational-root / maintenance / "
+             "UNROOTED) -- read-only",
+    )
+    lrt.add_argument("--state", choices=_LINEAGE_STATE_CHOICES, default="open",
+                     help="tickets to classify (default open = inbox+active)")
+    lrt.add_argument("--counts", action="store_true",
+                     help="per-class counts only (UNROOTED is the honesty metric)")
+    lrt.add_argument("--class", dest="cls", default=None,
+                     choices=("goal", "operational-root", "maintenance", "UNROOTED"),
+                     help="list only this class")
+    lrt.add_argument("--limit", type=int, default=None, help="max tickets listed per class")
+    lrt.add_argument("--edges", default=None, help=edges_help)
+    lrt.add_argument("--json", action="store_true", help="JSON output")
+    # Read-only, so exempt from the run-from-main guard (T-4760 (f) precedent).
+    lrt.set_defaults(func=cmd_lineage, off_main_ok=True)
 
     return p
 
@@ -10086,10 +10710,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     try:
         # T-4760 (f): a subcommand opts out of the run-from-main guard ONLY by
-        # setting `off_main_ok=True` in its parser defaults — today just
-        # `lint-frontmatter`, which is read-only (it never writes, commits or
-        # pushes, so it cannot strand ticket state on a branch — the failure the
-        # guard exists for) and must run on PR branches for S2's CI gate.
+        # setting `off_main_ok=True` in its parser defaults — today
+        # `lint-frontmatter` and the T-3332 `lineage up|down|roots` queries.
+        # Both are read-only (they never write, commit or push, so they cannot
+        # strand ticket state on a branch — the failure the guard exists for);
+        # lint-frontmatter must also run on PR branches for S2's CI gate.
         if not getattr(args, "off_main_ok", False):
             _assert_cli_checkout_allowed(REPO_ROOT)
         return args.func(args)

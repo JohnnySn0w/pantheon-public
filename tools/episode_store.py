@@ -1209,7 +1209,7 @@ def _file_argv(ep: dict, spec: DetectorSpec, route: dict, fields_path: Path) -> 
            f"label subject:{route['target']} describes, it does not route. "
            f"Attempts budget {spec.attempts_budget}.")
     labels = ",".join(["repair", "org-076", _slug(spec.subsystem, 40), f"subject:{route['target']}"])
-    return ["file", "--requester", spec.requester, "--target", _repair_ticket_target(route["target"]), "--title", title,
+    return ["file", "--automated-filer", "episode_store", "--requester", spec.requester, "--target", _repair_ticket_target(route["target"]), "--title", title,
             "--labels", labels, "--serves", "ORG-076 fleet health-and-repair: one repair ticket per fault episode",
             "--project-id", "null", "--nearest-intent-ref", f"maintenance:fleet-health/{_slug(spec.subsystem, 40)}",
             "--appetite", "5", "--ask", ask, "--no-push", "--repair-fields-json", str(fields_path)]

@@ -11,6 +11,11 @@ and ``tools.user_systemd`` only, including function-level imports (pinned by
 ``tools/test_host_control_import_closure.py``). ``tools.persona_installer``
 re-exports every name.
 
+T-5608: the T-5473 residue-quarantine predicate (desired parse, residue listing,
+liveness gate, receipt pairs and rollback check, and the shared preflight
+``_residue_quarantine_check``) moved here verbatim too, so the per-seat executor
+runs the SAME objects as the installer's backends.
+
 The runtime budget values below are TRANSCRIBED from ``tools.runtime_controller``
 (importing it would load the mailbox client and harness adapter into the
 executor); a test pins them equal.
@@ -21,14 +26,17 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, Mapping
+from typing import Any, Callable, Literal, Mapping
 
 from tools.persona_installer_contracts import (
     InstallOperation,
     ManifestError,
     OperationFailed,
+    PreflightResult,
     _canonical_json,
     _sha256_bytes,
 )
@@ -496,4 +504,177 @@ def _is_installer_managed(content: str) -> bool:
     return (
         isinstance(raw, dict)
         and raw.get("managed_by") == "pantheon-persona-installer"
+    )
+
+
+# T-5471 phase-Q residue (SOP hand-moving-an-established-seat §4 phase Q), MINUS `overrides`:
+# overrides/holds.json is the operator's holds (runtime_controller._holds_path), not residue.
+# (relative path, is-glob) under <persona_state_root>/<persona>/runtime-controller, the
+# persona root, and the state root. Moved (never deleted) by the operator before a bootstrap.
+RESIDUE_RUNTIME_CONTROLLER = (
+    "runtime.json", "initial-viability.json", "initial-viability-invocations", "transition.json", "quota",
+)
+RESIDUE_PERSONA_ROOT = (
+    "staged-cutover-*.json", "active-runtime.json", "mid-session-cap.json", "runtimes", "invocations", "quota",
+)
+RESIDUE_STATE_ROOT_SUFFIXES = (".json", ".backoff.json", ".policyskip.json", ".softstreak.json", ".diagstreak.json")
+QUARANTINE_DIR_PREFIX = ".installer-quarantine-"
+
+
+# ---- T-5473: phase-Q runtime-residue quarantine (receipt-owned move, never delete) ----
+# The op runs ONLY where the unit-fire is an actual bootstrap fire: the consume timer is NOT
+# enabled (the disabled-timer branch of the `connective.unit-fire` preflight/execute, the same
+# `not unit_file_enablement(timer).enabled` read that gates `_unit_fire_bootstrap_blocker`).
+# On a converged/live seat the controller owns runtime.json etc., so the op is a recorded
+# no-op and moves nothing. One predicate per backend: `_bootstrap_fire_pending`.
+_QUARANTINE_CLASSES = ("runtime-controller", "persona-root", "state-root")
+_PERSONA_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
+
+
+def _quarantine_desired(operation: "InstallOperation") -> tuple[str, str, str]:
+    """(persona_state_root, persona, consume timer unit), validated."""
+    root = operation.desired.get("persona_state_root", "")
+    persona = operation.desired.get("persona", "")
+    timer = operation.desired.get("timer", "")
+    if not root or not os.path.isabs(root):
+        raise OperationFailed("residue quarantine: persona_state_root must be absolute")
+    if not _PERSONA_NAME.match(persona):
+        raise OperationFailed("residue quarantine: persona is not a plain name")
+    if not timer:
+        raise OperationFailed("residue quarantine: consume timer unit is not named")
+    return root.rstrip("/") or "/", persona, timer
+
+
+def _quarantine_class_base(root: str, persona: str, cls: str) -> str:
+    return {
+        "runtime-controller": f"{root}/{persona}/runtime-controller",
+        "persona-root": f"{root}/{persona}",
+        "state-root": root,
+    }[cls]
+
+
+def _bootstrap_residue_entries(persona_state_root: Path, persona: str) -> list[tuple[str, str]]:
+    """(class, name) of every existing phase-Q residue path. Read-only. The class says where the
+    path lives (and where its quarantined copy goes); ``_bootstrap_residue`` renders the same list."""
+    found: list[tuple[str, str]] = []
+    root = persona_state_root
+    for cls, base, patterns in (
+        ("runtime-controller", root / persona / "runtime-controller", RESIDUE_RUNTIME_CONTROLLER),
+        ("persona-root", root / persona, RESIDUE_PERSONA_ROOT),
+    ):
+        for pattern in patterns:
+            if "*" in pattern:
+                found.extend((cls, item.name) for item in sorted(base.glob(pattern)))
+            elif os.path.lexists(base / pattern):
+                found.append((cls, pattern))
+    for suffix in RESIDUE_STATE_ROOT_SUFFIXES:
+        if os.path.lexists(root / f"{persona}{suffix}"):
+            found.append(("state-root", f"{persona}{suffix}"))
+    return found
+
+
+_RESIDUE_SAFE_ACTIVE_STATES = frozenset({"inactive", "failed"})
+
+
+def _runtime_liveness_refusal(states: Mapping[str, str | None]) -> str | None:
+    """THE shared liveness gate for the residue quarantine (both backends; reviewer B1). ``states``
+    maps unit -> ActiveState (None == unreadable). Anything but inactive/failed -- active,
+    activating, reloading, deactivating, an unreadable or unknown state -- means the old runtime
+    may still own runtime.json, so the quarantine fails closed."""
+    for unit, state in states.items():
+        if state is None:
+            return f"{unit} state is unreadable: refusing to move runtime state under a possibly live seat"
+        if state not in _RESIDUE_SAFE_ACTIVE_STATES:
+            return (
+                f"{unit} is {state}: the old runtime is live, stop it first (SOP phase Q runs after "
+                "teardown); refusing to move its runtime state"
+            )
+    return None
+
+
+def _quarantine_stamp() -> str:
+    """Execute-time UTC stamp (SOP $STAMP convention). Never part of the plan or its digest."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _quarantine_dir_for(root: str, persona: str, stamp: str) -> str:
+    return f"{root}/{persona}/{QUARANTINE_DIR_PREFIX}{stamp}"
+
+
+def _quarantine_pairs(before: Mapping[str, str], target: str | None = None) -> list[tuple[str, str]]:
+    """(quarantined copy, original path) for each path the receipt moved. Raises on a malformed
+    receipt (a name that could escape its directory, an unknown class)."""
+    try:
+        root, persona = before["persona_state_root"], before["persona"]
+        stamp = before["stamp"]
+        moved = json.loads(before.get("moved", "[]"))
+    except (KeyError, ValueError) as exc:
+        raise OperationFailed(f"residue quarantine receipt is malformed: {exc}") from exc
+    if not _PERSONA_NAME.match(persona) or not re.match(r"^[0-9A-Za-z-]+$", stamp) or not os.path.isabs(root):
+        raise OperationFailed("residue quarantine receipt is malformed")
+    if target is not None and target != f"{root.rstrip('/')}/{persona}":
+        raise OperationFailed("residue quarantine receipt does not match its mutation target")
+    qdir = _quarantine_dir_for(root, persona, stamp)
+    pairs: list[tuple[str, str]] = []
+    for item in moved:
+        if not (isinstance(item, list) and len(item) == 2):
+            raise OperationFailed("residue quarantine receipt is malformed")
+        cls, name = item
+        if cls not in _QUARANTINE_CLASSES or not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
+            raise OperationFailed("residue quarantine receipt names a path outside the closed residue set")
+        pairs.append((f"{qdir}/{cls}/{name}", f"{_quarantine_class_base(root, persona, cls)}/{name}"))
+    return pairs
+
+
+def _quarantine_can_rollback(
+    before: Mapping[str, str], lexists: "Callable[[str], bool]", target: str | None = None
+) -> "PreflightResult":
+    """Shared by both backends and by rollback itself, so can_rollback predicts the same refusal.
+    Every destination and every quarantined copy is checked BEFORE anything moves."""
+    if before.get("state") != "present":
+        return PreflightResult(True, "not-applied", "nothing was quarantined")
+    try:
+        pairs = _quarantine_pairs(before, target)
+    except OperationFailed as exc:
+        return PreflightResult(False, "malformed", str(exc))
+    for quarantined, original in pairs:
+        if lexists(original):
+            return PreflightResult(False, "drifted", f"{original} was re-created after the receipt; not moving the quarantined copy back over it")
+        if not lexists(quarantined):
+            return PreflightResult(False, "drifted", f"quarantined copy {quarantined} is gone")
+    return PreflightResult(True, "owned", "quarantined paths match the receipt")
+
+
+def _residue_quarantine_check(
+    operation: "InstallOperation",
+    *,
+    bootstrap_fire_pending: Callable[[str], bool],
+    liveness: Callable[[str], Mapping[str, str | None]],
+    entries: Callable[[str, str], list[tuple[str, str]]],
+) -> "PreflightResult":
+    """T-5608: THE residue-quarantine preflight predicate, shared by the installer's backends
+    and the per-seat executor. Each injects its own reads; the order is fixed here: desired,
+    then the bootstrap-fire read (converged when the timer is enabled), then liveness through
+    ``_runtime_liveness_refusal``, then the residue listing. Read-only; execute calls it again
+    first, so preflight and execute answer from the same code. An ``OperationFailed`` from any
+    read is a ``conflicting`` refusal."""
+    try:
+        root, persona, timer = _quarantine_desired(operation)
+        if not bootstrap_fire_pending(timer):
+            return PreflightResult(
+                True, "converged",
+                "consume timer already enabled: not a bootstrap fire, runtime state left in place",
+            )
+        live = _runtime_liveness_refusal(liveness(persona))
+        if live:
+            return PreflightResult(False, "conflicting", live)
+        found = entries(root, persona)
+    except OperationFailed as exc:
+        return PreflightResult(False, "conflicting", str(exc))
+    if not found:
+        return PreflightResult(True, "absent", "no control-plane residue to quarantine")
+    names = ", ".join(f"{cls}/{name}" for cls, name in found)
+    return PreflightResult(
+        True, "ready",
+        f"would move {len(found)} path(s) into {root}/{persona}/{QUARANTINE_DIR_PREFIX}<stamp>: {names}",
     )

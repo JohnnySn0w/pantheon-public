@@ -56,6 +56,8 @@ DONE_DIR = REPO_ROOT / "tickets" / "done"
 PIN_REL = ".local/state/pantheon/" + rr.PIN_FILENAME
 SEAT_TIMEOUT = 30
 PIN_REPO = "pantheon-config"  # the clone whose repos.yaml the seat pin covers
+UNIT_DIR_REL = ".config/systemd/user"
+READ_FAILOVER_ON = "PANTHEON_READ_FAILOVER=1"  # the T-1998 arming drop-in's line
 
 
 @dataclass(frozen=True)
@@ -175,6 +177,11 @@ def _pin_finding(account, h: Path, clone: Path, subject: str, run) -> list[Findi
     if yml.returncode != 0:
         return [Finding("PIN", subject, "repos.yaml unreadable")]
     if hashlib.sha256(yml.stdout.encode()).hexdigest() != pin.stdout.strip():
+        # T-5672: only an ARMED seat (read failover on) consults the pin, and only its pull
+        # refreshes it; an unarmed seat's pin just ages. Stale there is info, not a refusal.
+        if run(account, ["grep", "-rqs", READ_FAILOVER_ON, str(h / UNIT_DIR_REL)]).returncode != 0:
+            return [Finding("PIN", subject, "pin does not match repos.yaml; seat unarmed (pin unused), "
+                            "refresh before arming (python3 tools/manifest_pin.py refresh)", info=True)]
         return [Finding("PIN", subject, "pin does not match repos.yaml; the seat refuses the "
                         "manifest (python3 tools/manifest_pin.py refresh)")]
     return []

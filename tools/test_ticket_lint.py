@@ -1338,6 +1338,8 @@ class TestRetargetDetachedHeadPush(unittest.TestCase):
         wt_tools.mkdir(parents=True, exist_ok=True)
         for fname in ("ticket.py", "_git_utils.py", "agent_role_map.py", "hermes_action.py",
                       "_md_table.py",  # T-1936: ticket.py's README-row emitter imports it
+                      "_security_gate.py",  # T-5678: ticket.py imports it
+                      "_frontmatter_block.py",  # T-5689: ticket.py imports it
                       "priority_list_parse.py"):  # T-3020 BT3: ticket.py imports it at module scope
             src = repo_tools / fname
             if src.exists():

@@ -36,16 +36,17 @@ from tools.germinate.engine.invariant_digest import list_path_for, load_list as 
 from tools.germinate.engine.operation import Operation, OperationError, operation_from_json_obj, parse_operation
 from tools.germinate.engine.planner import REQUEST_SCHEMA, InProcessJsonPlannerRunner, PlanError, PlannerRunner
 from tools.germinate.engine.receipts import build_body, mutation_from_json_obj, mutation_to_json_obj
-from tools.germinate.engine.run_state import RunHandle, RunStateError, RunStore, RunTuple, new_ulid, now_iso
+from tools.germinate.engine.run_state import MAX_PLAN_BYTES, RunHandle, RunStateError, RunStore, RunTuple, encode_plan, new_ulid, now_iso
 from tools.germinate.engine.transcript import Transcript
 from tools.germinate.planner_sandbox.admission import coordinator
-from tools.germinate.planner_sandbox.admission.exceptions import AdmissionRefused
+from tools.germinate.planner_sandbox.admission.exceptions import AdmissionRefused, ClaimHolderMismatch
 from tools.germinate.planner_sandbox.admission.exceptions import PrimitiveUnavailable as AdmissionPrimitiveUnavailable
 from tools.germinate.planner_sandbox.postboot import PostbootPreconditionUnmet, require_or_refuse
 from tools.germinate.planner_sandbox.postboot import PrimitiveUnavailable as PostbootPrimitiveUnavailable
 from tools.germinate.planner_sandbox.state_machine.states import State
 from tools.germinate.planner_sandbox.wal import (
     BytesPayload,
+    CanonicalJsonError,
     ReconcileError,
     StructuralPrefix,
     WalStore,
@@ -497,10 +498,32 @@ class Engine:
         if merged.digest != plan_digest:
             raise EngineRefusal("plan-digest-mismatch", f"approved {plan_digest}, current plan is {merged.digest}; re-plan")
         self._check_gates(merged, contracts, accept_gates, grants, transcript)
+        # Every node's plan.json is encoded under MAX_PLAN_BYTES BEFORE any claim or
+        # run admission (T-5809): an oversized node refuses with nothing claimed or
+        # admitted, for it or for any earlier node of the same plan.
+        plan_bytes = [self._encode_plan_node(node, merged) for node in merged.nodes]
         outcomes = []
-        for node in merged.nodes:
-            outcomes.append(self._apply_node(node, merged, transcript))
+        for node, data in zip(merged.nodes, plan_bytes):
+            outcomes.append(self._apply_node(node, merged, transcript, data))
         return outcomes
+
+    def _encode_plan_node(self, node: PlanNode, merged: MergedPlan) -> bytes:
+        try:
+            return encode_plan(
+                {
+                    "schema": PLAN_NODE_SCHEMA,
+                    "plan_digest": merged.digest,
+                    "op_registry_digest": merged.op_registry_digest,
+                    "node": node.to_json_obj(),
+                }
+            )
+        except CanonicalJsonError as exc:
+            if str(exc) == "json-too-large":
+                raise EngineRefusal(
+                    "plan-too-large", f"{node.component}: plan node does not encode under MAX_PLAN_BYTES ({MAX_PLAN_BYTES})"
+                ) from exc
+            # e.g. float-not-allowed: plan_digest's plain json.dumps accepted it, canonical JSON does not
+            raise EngineRefusal("plan-unencodable", f"{node.component}: plan node is not canonical JSON: {exc}") from exc
 
     def _claim(self, component: str, run_id: str, scope: str, verb: str) -> None:
         try:
@@ -513,13 +536,17 @@ class Engine:
         except AdmissionPrimitiveUnavailable as exc:
             raise EngineRefusal("primitive-unavailable", str(exc)) from exc
 
-    def _release(self, component: str) -> None:
+    def _release(self, component: str, run_id: str) -> None:
+        """Release ``run_id``'s claim; never another run's (T-5819 compare-and-delete)."""
+
         try:
-            coordinator.release(self.backend.gates_root, self.instance, component)
+            coordinator.release(self.backend.gates_root, self.instance, component, expected_run_id=run_id)
+        except ClaimHolderMismatch as exc:
+            raise EngineRefusal("claim-holder-mismatch", str(exc)) from exc
         except AdmissionPrimitiveUnavailable as exc:
             raise EngineRefusal("primitive-unavailable", str(exc)) from exc
 
-    def _apply_node(self, node: PlanNode, merged: MergedPlan, transcript: Transcript) -> RunOutcome:
+    def _apply_node(self, node: PlanNode, merged: MergedPlan, transcript: Transcript, plan_bytes: bytes) -> RunOutcome:
         run_id = new_ulid()
         self._claim(node.component, run_id, node.scope, "apply")
         tup = RunTuple(self.instance, node.component, node.scope, node.leg, run_id)
@@ -536,37 +563,30 @@ class Engine:
                     }
                     for op in node.operations
                 ],
+                plan=plan_bytes,  # written BEFORE record.json: an admitted run always has its plan + manifest (T-5810)
             )
         except Exception:
-            self._release(node.component)  # no record was admitted, so the claim must not outlive it
+            self._release(node.component, run_id)  # no record was admitted, so the claim must not outlive it
             raise
         try:
-            handle.write_plan(
-                canonical_json_bytes(
-                    {
-                        "schema": PLAN_NODE_SCHEMA,
-                        "plan_digest": merged.digest,
-                        "op_registry_digest": merged.op_registry_digest,
-                        "node": node.to_json_obj(),
-                    }
+            run_t = None
+            try:
+                wal = handle.wal()
+                run_t = transcript.bind(handle)
+                run_t.emit(
+                    "run.admitted",
+                    component=node.component,
+                    leg=node.leg,
+                    scope=node.scope,
+                    plan_digest=merged.digest,
+                    contract_digest=node.contract_digest,
+                    op_registry_digest=merged.op_registry_digest,
+                    expected_runtime_subset={"digest": merged.expected_runtime_subset_digest, "manifest_revision": None},
+                    evidence_scope=self.backend.evidence_scope,
                 )
-            )
-            wal = handle.wal()
-            stamp = now_iso()
-            wal.initialize_manifest(created_at=stamp, updated_at=stamp)
-            run_t = transcript.bind(handle)
-            run_t.emit(
-                "run.admitted",
-                component=node.component,
-                leg=node.leg,
-                scope=node.scope,
-                plan_digest=merged.digest,
-                contract_digest=node.contract_digest,
-                op_registry_digest=merged.op_registry_digest,
-                expected_runtime_subset={"digest": merged.expected_runtime_subset_digest, "manifest_revision": None},
-                evidence_scope=self.backend.evidence_scope,
-            )
-            handle.update(state=State.ACTIVE)
+                handle.update(state=State.ACTIVE)
+            except Exception as exc:  # noqa: BLE001 -- a pre-op failure leaves a recoverable run, never a wedge (T-5810)
+                self._settle_pre_op_failure(handle, node, run_t, exc)
             for op in node.operations:
                 try:
                     self._execute_op(handle, wal, node, merged, op, run_t)
@@ -576,11 +596,66 @@ class Engine:
                     run_t.emit("run.halted", op_id=op.operation_id, reason=reason)
                     raise EngineRefusal("halted", f"run {run_id} HALTED at {op.operation_id}: {reason}") from exc
             handle.update(state=State.SATISFIED)
-            self._release(node.component)
+            self._release(node.component, run_id)
             run_t.emit("run.satisfied")
             return RunOutcome(node.component, run_id, State.SATISFIED.value)
         finally:
             handle.close()
+
+    def _settle_pre_op_failure(self, handle: RunHandle, node: PlanNode, run_t: Transcript | None, exc: Exception) -> None:
+        """A failure after admission (record.json) but before the first op. Always raises.
+
+        No op has written an intent, so nothing is on the host. With ops, the run
+        halts at its first op through the existing PENDING->ACTIVE->HALTED edges and
+        KEEPS the claim, exactly like an op failure (ORG-080 §10): ``rollback`` then
+        finds every op BEFORE_INTENT and closes ROLLED_BACK, releasing the claim. A
+        zero-op node has no op to halt at, so it closes SATISFIED (vacuously
+        complete, as ``reconcile_run`` closes it) and releases. If these writes fail
+        too, the record stays PENDING/ACTIVE with its plan and manifest on disk
+        (``RunStore.create``), so ``reconcile_run`` then ``rollback`` recover it.
+        """
+
+        run_id = handle.tuple.run_id
+        reason = f"pre-op failure: {type(exc).__name__}: {exc}"
+        try:
+            if State(handle.read_record()["state"]) is State.PENDING:
+                handle.update(state=State.ACTIVE)
+            if not node.operations:
+                handle.update(state=State.SATISFIED)
+                self._release(node.component, run_id)
+            else:
+                handle.update(
+                    state=State.HALTED,
+                    halted={"op_id": node.operations[0].operation_id, "reason": reason, "at": now_iso()},
+                )
+        except Exception as settle_exc:  # noqa: BLE001 -- unsettled: the claim stays and reconcile_run recovers the run
+            if isinstance(settle_exc, EngineRefusal) and settle_exc.code == "claim-holder-mismatch":
+                # T-5819 N5: our claim is gone and another run holds the component; reconcile_run
+                # cannot fix that, so surface the typed refusal instead of a misleading remedy
+                raise EngineRefusal(
+                    "claim-holder-mismatch",
+                    f"run {run_id}: {reason}; claim held by another run: investigate as tampering "
+                    f"({settle_exc.message})",
+                ) from exc
+            # a zero-op run needs only reconcile_run (it closes SATISFIED or releases a SATISFIED run's
+            # claim; rollback refuses SATISFIED); a run with ops reconciles to HALTED, then rolls back
+            remedy = "reconcile_run" if not node.operations else "reconcile_run then rollback"
+            raise EngineRefusal(
+                "pre-op-failure",
+                f"run {run_id}: {reason}; settling it also failed ({type(settle_exc).__name__}: {settle_exc}); "
+                f"the claim is held: {remedy}",
+            ) from exc
+        if not node.operations:
+            raise EngineRefusal(
+                "pre-op-failure", f"run {run_id}: {reason}; the zero-op run closed SATISFIED and its claim is released"
+            ) from exc
+        op_id = node.operations[0].operation_id
+        if run_t is not None:
+            try:
+                run_t.emit("run.halted", op_id=op_id, reason=reason)
+            except Exception:  # noqa: BLE001 -- the record already carries the halt; a transcript fault must not mask it
+                pass
+        raise EngineRefusal("halted", f"run {run_id} HALTED before {op_id} ran: {reason}") from exc
 
     def _execute_op(
         self, handle: RunHandle, wal: WalStore, node: PlanNode, merged: MergedPlan, op: Operation, t: Transcript
@@ -705,7 +780,7 @@ class Engine:
                 t.emit("rollback.incomplete", outstanding=outstanding)
                 raise EngineRefusal("rollback-incomplete", f"run {run_id}: unreversed {outstanding}; the claim stays held (D-Y)")
             handle.update(state=State.ROLLED_BACK)
-            self._release(tup.component)
+            self._release(tup.component, run_id)
             t.emit("rollback.complete")
             return RunOutcome(tup.component, run_id, State.ROLLED_BACK.value)
 
@@ -751,6 +826,8 @@ class Engine:
         ACTIVE (or PENDING) -> HALTED at the first unreceipted op, or SATISFIED
         if every op is receipted. ROLLING_BACK -> ROLLBACK_INCOMPLETE with the
         not-yet-reversed ops outstanding; ``rollback`` then retries (D-Y).
+        SATISFIED / ROLLED_BACK still holding the claim -> release it (the close
+        failed after the record write; ORG-080 admission matrix, T-5810).
         """
 
         self.require_postboot()  # C3 covers library-call surfaces too
@@ -760,6 +837,15 @@ class Engine:
         holder = self._claim_holder(tup.component)
         if holder is None or holder.get("run_id") != run_id:
             raise EngineRefusal("tampering-signal", f"run {run_id} is in flight but does not hold {tup.component}'s claim")
+        if not store.has_record(tup):
+            # ORG-080 admission matrix: "active_run_id == run_X + no record.json" is a tampering signal,
+            # fail-closed (T-5810). It is also what a crash inside RunStore.create leaves; either way
+            # the claim is NOT released here: an operator inspects the directory first.
+            raise EngineRefusal(
+                "tampering-signal",
+                f"run {run_id} holds {tup.component}'s claim but its run directory has no record.json "
+                "(a crash inside run admission, or tampering); the claim stays held for operator investigation",
+            )
         with store.open(tup) as handle:
             record = handle.read_record()
             state = State(record["state"])
@@ -773,6 +859,11 @@ class Engine:
                     rollback_incomplete={"failed_run_id": run_id, "outstanding_inverses": outstanding},
                 )
                 return RunOutcome(tup.component, run_id, State.ROLLBACK_INCOMPLETE.value)
+            if state in (State.SATISFIED, State.ROLLED_BACK):
+                # ORG-080 admission matrix: terminal record + gate still naming this run means the
+                # close crashed between the record write and the gate clear; finish it (T-5810).
+                self._release(tup.component, run_id)
+                return RunOutcome(tup.component, run_id, state.value)
             if state is not State.ACTIVE:
                 raise EngineRefusal("nothing-to-reconcile", f"run {run_id} is {state.value}")
             wal = handle.wal()
@@ -796,7 +887,7 @@ class Engine:
                     )
                     return RunOutcome(tup.component, run_id, State.HALTED.value)
             handle.update(state=State.SATISFIED)
-            self._release(tup.component)
+            self._release(tup.component, run_id)
             return RunOutcome(tup.component, run_id, State.SATISFIED.value)
 
     # ------------------------------------------------------------------
@@ -889,6 +980,7 @@ class Engine:
         self.require_postboot()
         doc, _ = self._registry()
         runs = self._runs()
+        orphans = [t for store in self._stores() for t in store.orphan_tuples()]
         out = []
         for rid, row in sorted(self._component_rows(doc).items()):
             latest: dict[str, dict[str, Any]] = {}
@@ -903,6 +995,8 @@ class Engine:
                     "digest": row["contract"].get("digest"),
                     "claim": None if holder is None else {"run_id": holder.get("run_id"), "verb": holder.get("verb")},
                     "runs": latest,
+                    # record-less run directories (T-5810): reported, never read as runs
+                    "orphan_runs": sorted(t.run_id for t in orphans if t.component == rid),
                 }
             )
         return out

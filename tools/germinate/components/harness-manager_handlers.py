@@ -3,8 +3,11 @@
 ``OP_KINDS`` is literal data (read with ast.literal_eval): seat privilege, in the
 component's own non-reserved ``harness.runtime`` class.
 
-``HANDLERS`` holds ONE handler, and it is SIMULATED (CI tier, nothing live; the
-actuation boundary of the HO ruling, T-3296/T-5106). ``HarnessSeatSim`` keeps,
+``HANDLERS`` holds TWO handlers, both SIMULATED (CI tier, nothing live; the
+actuation boundary of the HO ruling, T-3296/T-5106): ``HarnessSeatSim`` for the
+configure (b) swap below, and ``HarnessInstallSim`` for the install leg's
+installer kinds (T-5091 U1; see its docstring, which records the P6 tension of
+claiming registry kinds in the shared simulated backend). ``HarnessSeatSim`` keeps,
 per seat account, JSON stand-ins for what the existing swap writes:
 
 * ``runtime``    -- runtime-controller/runtime.json's selection
@@ -183,7 +186,146 @@ class HarnessSeatSim:
         self.state = {"seats": copy.deepcopy(dict(state.get("seats") or {}))}
 
 
-HANDLERS = [HarnessSeatSim()]
+#: T-5091 U1: the installer kinds HarnessInstallSim simulates. Every one is an
+#: existing typed-op registry kind (NOT declared in OP_KINDS: ORG-080 D-AC), and
+#: mkdir / atomic-write are absent because the engine's built-in
+#: InstallerFileHandler already serves them.
+_INSTALL_READ_ONLY_KINDS = frozenset({
+    "brief-check", "claude-mcp-server-check", "codex-standing-instructions-override-check",
+    "codex-standing-instructions-source-check", "codex-standing-instructions-target-check",
+    "codex-telegram-disabled-first", "harness-check", "identity-check", "manager-check",
+    "policy-check", "source-check", "timer-enablement-absence-check",
+})
+_INSTALL_MUTATING_KINDS = frozenset({
+    "claude-mcp-server-registration", "codex-standing-instructions-install", "codex-telegram-mcp-check",
+    "codex-telegram-source-check", "daemon-reload", "direct-fire", "mailbox-probe",
+    "mailbox-writable-root-check", "seat-claude-settings-env", "seat-claude-workspace-trust",
+    "seat-periodic-daemon-reload", "seat-periodic-timer-enable", "seat-periodic-timer-observe",
+    "seat-periodic-unit-install", "seat-runtime-residue-quarantine", "seat-service-decommission",
+    "seat-service-enable-observe", "stale-unit-failure-reset", "timer-enable", "timer-observe",
+    "unit-fire", "user-unit-install",
+})
+
+
+class HarnessInstallSim:
+    """SIMULATED installer kinds for plan_install (T-5091 U1; CI tier, nothing live).
+
+    State, per seat account (the op's ``owner``)::
+
+        {"slots": {operation_id: json}, "facts": {target: bool}, "facts_default": bool}
+
+    Installer plans reuse targets (two daemon-reloads of one manager; a check and
+    a registration of one ``.claude.json``), so each MUTATING op owns one slot keyed
+    by its operation id. The value it leaves is a pure function of the op (its
+    kind, target and canonical desired). The write-ahead inverse is the slot's JSON
+    before the op; ``can_rollback`` tells not-applied (slot == before) / owned
+    (slot == this op's result) / drifted (anything else: refused). Preflight admits
+    an absent slot or one already at this op's result (idempotent re-entry) and
+    refuses a foreign value.
+
+    READ-ONLY (diagnostics.read) kinds write nothing; preflight and verify read
+    the seeded ``facts[target]`` (``facts_default`` when unseeded).
+
+    P6 tension, recorded not resolved: this handler claims 22 broker-envelope /
+    seat-local registry kinds (34 with the read-only checks, i.e. every installer
+    kind but mkdir / atomic-write) in the ONE shared simulated backend, where a
+    kind has exactly one handler. Promote it to an engine built-in (beside
+    InstallerFileHandler) if a second component needs these kinds.
+    """
+
+    name = "harness-manager-install"
+    kinds = _INSTALL_READ_ONLY_KINDS | _INSTALL_MUTATING_KINDS
+
+    def __init__(self):
+        self.state = {"seats": {}}
+
+    def add_seat(self, account, *, facts_default=True):
+        self.state["seats"][account] = {"slots": {}, "facts": {}, "facts_default": facts_default}
+
+    def _seat(self, account):
+        seat = self.state["seats"].get(account)
+        if seat is None:
+            raise KeyError(f"no simulated install seat {account!r}")
+        return seat
+
+    @staticmethod
+    def _result(op):
+        return {"kind": op.kind, "target": op.target, "desired": dict(op.desired)}
+
+    def _fact(self, seat, op):
+        return seat["facts"].get(op.target, seat["facts_default"]) is True
+
+    # --- EffectHandler ---------------------------------------------------------
+
+    def observe(self, component, scope):
+        if not scope.startswith(_SEAT_PREFIX):
+            return {"account": None, "install": None}
+        account = scope[len(_SEAT_PREFIX):]
+        return {"account": account, "install": copy.deepcopy(self.state["seats"].get(account))}
+
+    def preflight(self, op):
+        try:
+            seat = self._seat(op.owner)
+        except KeyError as exc:
+            return PreflightResult(False, self.name, str(exc))
+        if op.kind in _INSTALL_READ_ONLY_KINDS:
+            ok = self._fact(seat, op)
+            return PreflightResult(ok, self.name, f"{op.kind} {'passes' if ok else 'fails'} on {op.target}")
+        current = seat["slots"].get(op.operation_id)
+        ok = current is None or current == self._result(op)
+        return PreflightResult(ok, self.name, "slot absent or already this op's result" if ok else "slot holds a foreign value")
+
+    def rollback_intent(self, op):
+        seat = self._seat(op.owner)
+        before = {"slot": _canon(seat["slots"].get(op.operation_id))}
+        return MutationRecord(op.operation_id, op.kind, op.target, op.owner, True, before, _fingerprint(self._result(op)))
+
+    def execute(self, op):
+        seat = self._seat(op.owner)
+        if op.kind in _INSTALL_READ_ONLY_KINDS:
+            mutation = MutationRecord(op.operation_id, op.kind, op.target, op.owner, False, {}, "")
+            return mutation, OperationEvidence(op.operation_id, op.layer, op.kind, True, f"simulated read {op.kind}")
+        mutation = self.rollback_intent(op)
+        seat["slots"][op.operation_id] = self._result(op)
+        return mutation, OperationEvidence(op.operation_id, op.layer, op.kind, True, f"simulated {op.kind}")
+
+    def verify_operation(self, op):
+        seat = self._seat(op.owner)
+        if op.kind in _INSTALL_READ_ONLY_KINDS:
+            ok = self._fact(seat, op)
+        else:
+            ok = seat["slots"].get(op.operation_id) == self._result(op)
+        detail = f"{op.kind} verified" if ok else f"{op.kind} does not meet its postcondition"
+        return OperationEvidence(op.operation_id, op.layer, op.kind, ok, detail)
+
+    def can_rollback(self, mutation):
+        try:
+            seat = self._seat(mutation.owner)
+        except KeyError as exc:
+            return PreflightResult(False, "drifted", str(exc))
+        current = seat["slots"].get(mutation.operation_id)
+        if _canon(current) == mutation.before.get("slot"):
+            return PreflightResult(True, "not-applied", "slot still at its preimage")
+        if _fingerprint(current) == mutation.after_fingerprint:
+            return PreflightResult(True, "owned", "slot holds this op's result")
+        return PreflightResult(False, "drifted", "slot moved since this op")
+
+    def rollback_mutation(self, mutation):
+        seat = self._seat(mutation.owner)
+        before = json.loads(mutation.before["slot"])
+        if before is None:
+            seat["slots"].pop(mutation.operation_id, None)
+        else:
+            seat["slots"][mutation.operation_id] = before
+
+    def dump_state(self):
+        return copy.deepcopy(self.state)
+
+    def load_state(self, state):
+        self.state = {"seats": copy.deepcopy(dict(state.get("seats") or {}))}
+
+
+HANDLERS = [HarnessSeatSim(), HarnessInstallSim()]
 
 
 def VERIFY(list_doc, observed, scope):  # noqa: N802 -- the engine's registration name (components.py)

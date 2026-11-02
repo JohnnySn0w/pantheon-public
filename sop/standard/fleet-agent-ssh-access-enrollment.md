@@ -1,8 +1,8 @@
 # Fleet-agent SSH-access enrollment SOP
 
 **Purpose.** Enroll a Pantheon-fleet agent's SSH key on one of the operator's
-personal devices (currently: his W11 laptop `unalignedagi` at
-`100.122.175.73`), using the toggle-gated operator-owned-sshd pattern
+personal devices (currently: his W11 laptop `operator-laptop` at
+`100.110.28.146`), using the toggle-gated operator-owned-sshd pattern
 originally proven for Recovery under T-1953. The SOP generalizes T-1953's
 Recovery-specific runbook into a repeatable enrollment protocol so future
 per-agent enrollments (mason/artisan/archivist/specialist on demand) do not
@@ -24,9 +24,9 @@ of that setup.
 
 ## Preconditions (verify BEFORE requesting an operator-window)
 
-- The operator's W11 laptop is on the tailnet at `unalignedagi` (100.122.175.73).
+- The operator's W11 laptop is on the tailnet at `operator-laptop` (100.110.28.146).
 - OpenSSH server is installed + running (Recovery has verified since T-1953
-  resolve 2026-08-28); the operator's admin user is `micha`.
+  resolve 2026-08-28); the operator's admin user is `operator`.
 - The `C:\ProgramData\ssh\administrators_authorized_keys` file exists
   with strict ACL (`NT AUTHORITY\SYSTEM:(F)`, `BUILTIN\Administrators:(F)`,
   no inheritance) and at least one enrolled key.
@@ -124,8 +124,8 @@ cat >> ~/.ssh/config <<'EOF'
 
 # T-NNNN: the operator's W11 laptop — toggle-gated via the operator's sshd Start-Service/Stop-Service
 Host operator-w11
-    HostName 100.122.175.73
-    User micha
+    HostName 100.110.28.146
+    User operator
     IdentityFile ~/.ssh/id_ed25519_operator_w11
     IdentitiesOnly yes
     StrictHostKeyChecking accept-new
@@ -145,7 +145,7 @@ The operator's sshd should be running (Recovery or the operator confirms
 ```bash
 # 1. Connection + admin context sanity:
 ssh operator-w11 'hostname; whoami; Get-Date'
-# Expected: UnalignedAGI + unalignedagi\micha + current time
+# Expected: operator-laptop + operator-laptop\operator + current time
 
 # 2. COM enumeration (runbook §Verification step 2):
 ssh operator-w11 'Get-CimInstance Win32_SerialPort | Format-List Name, DeviceID'

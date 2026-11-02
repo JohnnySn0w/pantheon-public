@@ -612,5 +612,40 @@ class Org060SensoryActuationContractTests(unittest.TestCase):
                 self.assertEqual(ci.count(f"schemas/{filename}"), 1, filename)
 
 
+
+class Org060HostileTextNeverRaisesTests(unittest.TestCase):
+    """T-5629: a lone surrogate (or other unencodable text) refuses, never raises."""
+
+    PARSERS = (
+        org060.load_canonical_json_mapping,
+        org060.parse_actuation_request,
+        org060.parse_actuation_plan,
+        org060.parse_sensory_envelope,
+        org060.parse_actuation_receipt,
+    )
+    HOSTILE = ("\ud800", "{\"a\": \"\udfff\"}", "\ud83d", "x\udc80y")
+
+    def test_str_input_with_a_lone_surrogate_refuses_malformed_json(self) -> None:
+        for parse in self.PARSERS:
+            for text in self.HOSTILE:
+                with self.subTest(parser=parse.__name__, text=ascii(text)):
+                    result = parse(text)
+                    self.assertIsInstance(result, org060.TypedRefusal)
+                    self.assertEqual(result.reason, "malformed-json")
+
+    def test_mapping_input_with_a_lone_surrogate_refuses_instead_of_raising(self) -> None:
+        for parse in self.PARSERS:
+            with self.subTest(parser=parse.__name__):
+                result = parse({"schema_version": "\ud800"})
+                self.assertIsInstance(result, org060.TypedRefusal)
+
+    def test_valid_non_ascii_text_still_parses_past_the_encoding_step(self) -> None:
+        # a real astral character must not be confused with a surrogate
+        text = org060.canonical_json_bytes({"a": "\U0001F600 \u00e9"}).decode("utf-8")
+        result = org060.load_canonical_json_mapping(text)
+        self.assertNotIsInstance(result, org060.TypedRefusal)
+        self.assertEqual(result["a"], "\U0001F600 \u00e9")
+
+
 if __name__ == "__main__":
     unittest.main()

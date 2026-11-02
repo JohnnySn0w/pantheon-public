@@ -290,6 +290,11 @@ def build_domain(
             for revision in ("manifest-r1", "manifest-r2")
         ],
     }
+    # T-5533: the broker reads the root-registered plan, not an installer.
+    from tools._host_control_plan_fixtures import register_plan
+
+    for revision in ("manifest-r1", "manifest-r2"):
+        register_plan(registry_value, root, prototype, seat_id="recovery", manifest_revision=revision)
     policy_value = {
         "schema": "pantheon-host-policy/v1",
         "revision": "policy-r1",
@@ -323,7 +328,13 @@ def build_domain(
         (root,),
         expected_owner_uid=os.getuid(),
     )
-    registry = SeatRegistry.load(registry_path, files=files)
+    # T-5533 review r1 B1: the broker plans against a framework-copy overlay.
+    from tools._host_control_plan_fixtures import framework_overlay
+
+    framework = root / "framework"
+    if not framework.exists():  # a restarted domain re-uses its root (and overlay)
+        framework_overlay(framework, REPO_ROOT, tuple(template_ids))
+    registry = SeatRegistry.load(registry_path, files=files, framework_root=framework)
     policy = HostPolicy.load(policy_path, files=files)
     journal = BrokerJournal.open(root / "broker.sqlite3")
     handles = _handle_factory()
@@ -331,7 +342,6 @@ def build_domain(
         registry=registry,
         policy=policy,
         journal=journal,
-        installer=installer,
         clock=clock,
         handle_factory=handles,
         plan_ttl=plan_ttl,

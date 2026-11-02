@@ -59,12 +59,12 @@ AGENT = "recovery"                       # recovery-owned verdicts route direct 
 # Each home target: a name, the ICMP address (tailnet name or IP that resolves FROM recovery), and an
 # optional netdata base URL. pve2 is reachability-only — its netdata IS ct201, watched separately,
 # so if pve2 drops we see BOTH pve2 and ct201-netdata go UNREACHABLE (corroboration, not double
-# counting). Verified reachable from recovery 2026-08-03: boxon 100.65.78.101, pve2 100.91.113.24,
-# ct201 100.119.110.9.
+# counting). Verified reachable from recovery 2026-08-03: boxon 100.115.155.50, pve2 100.76.170.91,
+# ct201 100.72.126.1.
 HOSTS: list[dict] = [
     {"name": "boxon",         "ping": "boxon",         "netdata": "http://boxon:19999"},
     {"name": "pve2",          "ping": "pve2",          "netdata": None},
-    {"name": "ct201-netdata", "ping": "100.119.110.9", "netdata": "http://100.119.110.9:19999"},
+    {"name": "ct201-netdata", "ping": "100.72.126.1", "netdata": "http://100.72.126.1:19999"},
 ]
 
 PING_COUNT = int(os.environ.get("PANTHEON_FLEET_HEALTH_PING_COUNT", "3"))     # >=1 reply == up
@@ -114,6 +114,17 @@ class Ops:
         except OSError:
             return None                # ping binary absent/unrunnable -> we could not measure
         return r.returncode == 0
+
+    def tailscale_prewarm(self, host: str) -> None:
+        """T-5624: open an idle tailscale tunnel before the one re-probe. An idle tunnel's
+        path setup (DERP relay first, then direct) can outlast the ICMP window, so a healthy
+        host read UNREACHABLE (boxon 18:25Z, ct201-netdata 21:4xZ, 2026-10-26; both answered
+        from another seat at once). Best effort: the result is ignored, and the re-probe decides."""
+        try:
+            subprocess.run(["tailscale", "ping", "-c", "3", "--timeout", "5s", host],
+                           capture_output=True, text=True, timeout=25)
+        except (subprocess.TimeoutExpired, OSError):
+            pass
 
     def netdata_critical_alarms(self, base_url: str) -> list[str] | None:
         """CRITICAL alarm names currently raised, [] if none, or None if unmeasurable (-> UNKNOWN).
@@ -243,6 +254,10 @@ def check_host_once(cfg: dict, *, ops: Ops, state_dir: Path, now: int,
                        cooldown_secs=cooldown_secs, dry_run=dry_run)
 
     reachable = ops.icmp_reachable(cfg["ping"])
+    if reachable is False:
+        # T-5624: one prewarm + re-probe before calling it down (idle-tunnel false positive).
+        ops.tailscale_prewarm(cfg["ping"])
+        reachable = ops.icmp_reachable(cfg["ping"])
     critical = None
     if reachable is True and cfg.get("netdata"):
         critical = ops.netdata_critical_alarms(cfg["netdata"])

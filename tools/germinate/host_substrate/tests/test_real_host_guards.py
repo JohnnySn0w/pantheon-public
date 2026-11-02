@@ -290,10 +290,19 @@ def configured():
         ["/usr/bin/install", "-d", "-o", "alice", "-g", "pmail", "-m", "2770", "/srv/pantheon/mbox-alice"],
         ["/usr/bin/chown", "alice:pmail", "/srv/pantheon/shared"],
         ["/usr/bin/chmod", "00000", "/srv/pantheon/mbox-alice"],
+        # T-5653: the ruled shapes
+        ["/usr/bin/setfacl", "--physical", "--set", "user::rwx,group::r-x,other::---", "/srv/pantheon/shared"],
+        ["/usr/bin/chown", "-h", "alice:pmail", "/srv/pantheon/shared"],
     ],
 )
 def test_sandbox_path_arguments_are_admitted(configured, argv):
     agent.check_paths(argv)
+
+
+def test_the_ruled_flags_are_not_mistaken_for_path_or_owner_operands():
+    """T-5653: --physical and -h take no value, so the path check still sees exactly the subject."""
+    assert agent.path_arguments(["/usr/bin/setfacl", "--physical", "--set", "user::rwx", "/srv/a"]) == ["/srv/a"]
+    assert agent.path_arguments(["/usr/bin/chown", "-h", "alice:pmail", "/srv/a"]) == ["/srv/a"]
 
 
 @pytest.mark.parametrize(

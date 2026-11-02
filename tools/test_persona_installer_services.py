@@ -25,7 +25,7 @@ from tools.persona_installer import (
     OperationFailed,
     SimulatedHostBackend,
 )
-from tools.test_persona_installer import REPO_ROOT
+from tools.test_persona_installer import REPO_ROOT, _manifest_dict
 from tools.test_persona_installer_periodics import PeriodicCase, _strip_banner
 
 SYSTEMD = REPO_ROOT / "tools" / "systemd"
@@ -35,7 +35,33 @@ RESUMER_ID = "service.ho-resumer.decommission"
 SERVICE_KINDS = ("seat-service-enable-observe", "seat-service-decommission")
 
 
-class ServicePlanShapeTests(PeriodicCase):
+def legacy_ho_resumer_manifest() -> dict:
+    """T-5633: the periodic fixture with recovery's binding declaring the legacy
+    ho-resumer unit set, so recovery's plan carries the decommission op."""
+
+    data = _manifest_dict(second_persona=True)
+    data["roles"]["recovery"]["legacy_units"] = ["ho-resumer"]
+    return data
+
+
+class LegacyHoResumerCase(PeriodicCase):
+    """PeriodicCase whose recovery binding declares legacy_units: [ho-resumer]."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.set_manifest(legacy_ho_resumer_manifest())
+
+
+class UndeclaredFixtureTests(PeriodicCase):
+    def test_the_undeclared_fixture_plans_no_decommission(self) -> None:
+        # T-5633: without legacy_units the op is absent for every fixture seat
+        for persona in ("recovery", "consultant"):
+            with self.subTest(persona=persona):
+                self.assertNotIn(RESUMER_ID, self.ids(self.plan(persona)))
+                self.assertNotIn("seat-service-decommission", {o.kind for o in self.plan(persona).operations})
+
+
+class ServicePlanShapeTests(LegacyHoResumerCase):
     def test_controller_unit_is_banner_plus_verbatim_template_through_the_periodic_install_kind(self) -> None:
         operation = self.op(self.plan(), UNIT_ID)
         self.assertEqual(operation.kind, "seat-periodic-unit-install")
@@ -119,7 +145,8 @@ class ServicePlanShapeTests(PeriodicCase):
         residue_ids = {o.operation_id for o in residue}
         self.assertTrue({UNIT_ID, CONTROLLER_ID, RESUMER_ID} <= residue_ids)
         self.assertFalse({o.operation_id for o in broker.operations} & residue_ids)
-        self.assertLessEqual(len(residue), SEAT_LOCAL_RESIDUE_LIMIT)
+        # T-5470 (HO ruling 2026-10-26): routed launches have their own bound; B8 counts the rest
+        self.assertLessEqual(len([o for o in residue if o.kind not in EXECUTOR_KIND_CLASSES]), SEAT_LOCAL_RESIDUE_LIMIT)
 
     def test_controller_template_is_not_modified_by_the_installer_source(self) -> None:
         text = (SYSTEMD / "pantheon-runtime-controller@.service").read_text(encoding="utf-8")
@@ -127,14 +154,19 @@ class ServicePlanShapeTests(PeriodicCase):
         self.assertIn("Restart=always", text)
 
 
-class ResidueKindsTests(PeriodicCase):
+class ResidueKindsTests(LegacyHoResumerCase):
     def test_residue_kinds_constant_is_exactly_what_partition_leaves_and_no_executor_kind(self) -> None:
         from tools.host_control.planner import partition_installer_plan
 
         self.assertFalse(_pim.SEAT_LOCAL_RESIDUE_KINDS & set(EXECUTOR_KIND_CLASSES))
         seen: set[str] = set()
         for persona in ("recovery", "consultant"):
-            seen |= {op.kind for op in partition_installer_plan(self.plan(persona))[1]}
+            # T-5470: routed launches (in-envelope kinds) are set aside; the
+            # constant names the out-of-envelope residue kinds.
+            seen |= {
+                op.kind for op in partition_installer_plan(self.plan(persona))[1]
+                if op.kind not in EXECUTOR_KIND_CLASSES
+            }
         self.assertEqual(seen, set(_pim.SEAT_LOCAL_RESIDUE_KINDS))
 
 
@@ -198,7 +230,7 @@ class ParseAndJudgeTests(unittest.TestCase):
             _pim._judge_controller_samples([hist, dict(hist)])
 
 
-class ServiceSimulatedApplyTests(PeriodicCase):
+class ServiceSimulatedApplyTests(LegacyHoResumerCase):
     CONTROLLER = "pantheon-runtime-controller@recovery.service"
 
     def apply(self, backend=None):
@@ -275,7 +307,7 @@ class ServiceSimulatedApplyTests(PeriodicCase):
         self.assertEqual(result.classification, "adoptable")
 
 
-class DecommissionSimulatedTests(PeriodicCase):
+class DecommissionSimulatedTests(LegacyHoResumerCase):
     def seed(self, backend, operation, *, enabled=True):
         unit_dir = operation.desired["unit_dir"]
         backend.seed_file(f"{unit_dir}/{HO_RESUMER_TIMER_UNIT}", "[Timer]\nOnCalendar=x\n")
@@ -344,7 +376,7 @@ class DecommissionSimulatedTests(PeriodicCase):
         self.assertIn(f"{operation.desired['unit_dir']}/{HO_RESUMER_TIMER_UNIT}", backend.entries)
 
 
-class LocalServiceTests(PeriodicCase):
+class LocalServiceTests(LegacyHoResumerCase):
     """LocalHostBackend code paths against tmp roots and a mocked manager/_run only."""
 
     GOOD = "ActiveState=active\nSubState=running\nMainPID=4242\nNRestarts=0\n"
@@ -661,13 +693,22 @@ class ResidueBudgetTests(PeriodicCase):
             persona = raw.get("persona") if isinstance(raw, dict) else None
             if persona:
                 plan = installer.plan(manifest, persona, root=self.root / f"real-{persona}")
-                counts[persona] = len(partition_installer_plan(plan)[1])
+                # T-5470 partition routing (HO ruling 2026-10-26): routed launches have their own
+                # bound; B8 cap unchanged. Count only the out-of-envelope residue (a residue op of
+                # an in-envelope kind is a routed launch or dependent).
+                from tools.host_control.envelope import EXECUTOR_KIND_CLASSES
+
+                counts[persona] = len(
+                    [op for op in partition_installer_plan(plan)[1] if op.kind not in EXECUTOR_KIND_CLASSES]
+                )
         self.assertTrue(counts)
         self.assertLessEqual(max(counts.values()), SEAT_LOCAL_RESIDUE_LIMIT, counts)
         # PR-1 left orchestrator at 25; PR-2 adds exactly 3 (unit, enable-observe, decommission);
         # T-5454 adds the shell-box settings op to every claude seat (orchestrator 29 of 32)
         # T-5473/T-5474 add the residue quarantine and the workspace-trust op (orchestrator 31 of 32)
-        self.assertEqual(counts["orchestrator"], 31, counts)
+        # T-5608 admits the residue quarantine (files.seat_root): it leaves the residue (30 of 32)
+        # T-5633: orchestrator's binding declares legacy_units: [ho-resumer], so it keeps the decommission (30)
+        self.assertEqual(counts["orchestrator"], 30, counts)
 
 
 if __name__ == "__main__":

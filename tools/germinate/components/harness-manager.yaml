@@ -12,9 +12,16 @@
 # * the PersonaController1 emitter binding: the emitter block below is bound to the
 #   same list. The live emitter (tools/persona_controller_health_dbus.py) reports
 #   against it behind a dark flag (T-5137); sourcing the remaining facts is T-5404.
+# * install (T-5091 U1, GF2): plan_install in harness-manager.py, an adapter over
+#   the live installer's pure plan (PersonaInstaller.plan with an explicit
+#   desired.source_revision), one seat-scope sub-run per seat. Its kinds are the
+#   installer's own, already typed-op registry kinds (identity mapping; the 24 seat
+#   kinds are listed under privilege.seat, the 12 diagnostics.read kinds need no
+#   list). Ops run only through the SIMULATED handlers (HarnessInstallSim plus the
+#   engine's InstallerFileHandler for mkdir / atomic-write). Root needs are U2.
 #
-# DEFERRED to GF2 (T-5091), declared absent so the engine refuses them
-# (leg-not-declared): install / remove (with decommission), configure sub-op (a)
+# STILL DEFERRED in GF2 (T-5091), declared absent so the engine refuses them
+# (leg-not-declared): remove (with decommission), configure sub-op (a)
 # (supervisor cutover, hence no `supervisor` desired key), update, repair, the
 # root privilege list, the necessary external interactions and the other §2 gates.
 #
@@ -26,17 +33,24 @@ component:
   steward: orchestrator
   version: 1
   planner_kind: python
-  contract_digest: sha256:df43a9d698f9e305d1f2ccbf033cf832919654cda2bf52be5cda7ae246a657eb
-  handlers_digest: sha256:3844d3c9140727cdd1c9fd36dd441d2bae9fbc051d47029b333fa0977da8e509
+  contract_digest: sha256:800d340660c3f7033b4b64721c6cc2bc9f036365381edd266192d7d398b97343
+  handlers_digest: sha256:5a3b17be7aae0362e1563a8ea812aa104b917f533b7f02bdc0df44f99b2a8ff9
   depends_on: [host-substrate, mailbox, action-broker, credential-broker]
   scopes: [system, seat]
   desired_schema:
     harness: {enum: [claude, codex]}
+    source_revision: {}
   invariant_list_id: org.pantheon.persona-stack/v1
   invariant_list_digest: sha256:4aee6d6777b7f6dd273ea77fa8f88de1f8e61a2f7d33755f34b27ba8cfabd4e4
   privilege:
-    seat: [harness.transition-stage, harness.receiver-handoff, harness.runtime-replace, harness.transition-commit]
+    seat: [harness.transition-stage, harness.receiver-handoff, harness.runtime-replace, harness.transition-commit,
+           atomic-write, claude-mcp-server-registration, codex-standing-instructions-install, codex-telegram-mcp-check,
+           codex-telegram-source-check, daemon-reload, direct-fire, mailbox-probe, mailbox-writable-root-check, mkdir,
+           seat-claude-settings-env, seat-claude-workspace-trust, seat-periodic-daemon-reload, seat-periodic-timer-enable,
+           seat-periodic-timer-observe, seat-periodic-unit-install, seat-runtime-residue-quarantine, seat-service-decommission,
+           seat-service-enable-observe, stale-unit-failure-reset, timer-enable, timer-observe, unit-fire, user-unit-install]
   legs:
+    install: plan_install
     configure: plan_configure
     verify:
       invariant_list_ref: org.pantheon.persona-stack/v1@sha256:4aee6d6777b7f6dd273ea77fa8f88de1f8e61a2f7d33755f34b27ba8cfabd4e4

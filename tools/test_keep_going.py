@@ -27,6 +27,7 @@ import mailbox  # noqa: E402
 
 
 _ORIG_SEAT_HOLD = kg._seat_hold
+_ORIG_ACTIVE_HARNESS = kg.active_harness
 
 
 def setUpModule():
@@ -40,12 +41,24 @@ def setUpModule():
     # a nonexistent dir makes the usage gate fail open, so every pre-T-4510 test is
     # unchanged. The T-4510 class points the dir at its own temp readings.
     global _FLEET_ENV_PATCH
+    # T-5793: the pre-existing classes exercise the pane idle gate, so they run with the
+    # rollback lever (KEEP_GOING_IDLE_SOURCE=pane, the pre-T-5793 pane gate). That also
+    # keeps them off the host's real session logs. The log-mode classes set "log" and
+    # inject do_idle_reading or a fake reader.
     _FLEET_ENV_PATCH = mock.patch.dict(
-        os.environ, {"PANTHEON_FLEET_USAGE_DIR": "/nonexistent/pantheon-fleet-usage-hermetic"})
+        os.environ, {"PANTHEON_FLEET_USAGE_DIR": "/nonexistent/pantheon-fleet-usage-hermetic",
+                     "KEEP_GOING_IDLE_SOURCE": "pane"})
     _FLEET_ENV_PATCH.start()
+    # Runtime selection is host state. Existing unit tests exercise Claude-default
+    # semantics unless they explicitly patch active_harness for a Codex case.
+    global _ACTIVE_HARNESS_PATCH
+    _ACTIVE_HARNESS_PATCH = mock.patch.object(
+        kg, "active_harness", lambda _agent, cfg, **_kw: cfg.get("harness", "claude-code"))
+    _ACTIVE_HARNESS_PATCH.start()
 
 
 def tearDownModule():
+    _ACTIVE_HARNESS_PATCH.stop()
     _SEAT_HOLD_PATCH.stop()
     _FLEET_ENV_PATCH.stop()
 
@@ -80,6 +93,38 @@ class IdleGateTest(unittest.TestCase):
 
     def test_unknown_text_inconclusive(self):
         self.assertIsNone(kg.is_idle_at_prompt("just some\nrandom lines\nno sentinels"))
+
+
+class HarnessAwareDeliveryTest(unittest.TestCase):
+    def test_codex_inject_selects_codex_submit_profile(self):
+        completed = mock.Mock(returncode=0, stdout="", stderr="")
+        with mock.patch.object(kg.subprocess, "run", return_value=completed) as run:
+            self.assertTrue(kg.inject("codex-fallback-main:0", "continue", harness="codex"))
+        self.assertEqual(
+            run.call_args.args[0],
+            [str(kg._SEND_KEYS_HELPER), "--harness", "codex",
+             "codex-fallback-main:0", "continue"],
+        )
+
+    def test_active_runtime_cache_overrides_claude_default(self):
+        cfg = {"unix_user": "claude", "harness": "claude-code", "projects_dir": "/tmp"}
+        with tempfile.TemporaryDirectory() as td:
+            state = Path(td) / "active-runtime.json"
+            state.write_text(json.dumps({"runtime": "codex/interactive-chatgpt"}))
+            self.assertEqual(_ORIG_ACTIVE_HARNESS("orchestrator", cfg, state_path=state), "codex")
+
+    def test_codex_runtime_does_not_consume_claude_fleet_usage_gate(self):
+        cfg = {"unix_user": "claude", "harness": "claude-code"}
+        suppressed = mock.Mock(suppress=True, reason="claude at 95%", window_key="w")
+        with mock.patch.object(kg, "active_harness", return_value="codex"), \
+             mock.patch.object(kg, "is_usage_capped", return_value=True) as hit_cap:
+            verdict = kg.cap_or_usage_gate(
+                cfg, "orchestrator", 1,
+                do_fleet_gate=lambda _now: suppressed,
+                do_find_jsonl=lambda *_args: None,
+            )
+        self.assertFalse(verdict)
+        hit_cap.assert_not_called()
 
     def test_idle_with_hidden_task_list_footer(self):
         # Regression (2026-06-28): orchestrator keeps a hidden task list, so its idle footer
@@ -901,9 +946,9 @@ class QueueAwareOptInConfigTest(unittest.TestCase):
 
     def test_only_seats_are_opted_in(self):
         opted = {a for a, c in kg.AGENT_PANE.items() if c.get("queue_aware_backoff")}
-        self.assertEqual(opted, {"mason", "artisan"},
-                         "widening the floor to orchestrator/specialist/recovery is a separate decision; "
-                         "it must not arrive as a side effect of an edit here")
+        self.assertEqual(opted, {"mason", "artisan", "codex", "watchman"},
+                         "Codex seats need the same queue-aware anti-park bound; widening "
+                         "the floor to orchestrator/specialist/recovery remains a separate decision")
 
     def test_every_opted_in_agent_has_ticket_targets(self):
         for agent, cfg in kg.AGENT_PANE.items():
@@ -1351,6 +1396,223 @@ class FleetUsageGateT4510(unittest.TestCase):
         with mock.patch.dict(os.environ, {"PANTHEON_USAGE_GATE_ENABLED": "0"}):
             self._run()
         self.assertEqual(len(self.injected), 1)
+
+
+
+# ------------------------------------------------------------------ T-5793 log idle source
+from tools import harness_idle as _hi  # noqa: E402  (same module object keep_going uses)
+
+_HI_FIX = Path(__file__).resolve().parent / "fixtures" / "harness_idle"
+_CODEX_IDLE_PANE = (Path(__file__).resolve().parent / "fixtures" / "codex_panes"
+                    / "watchman_idle_2026-10-15.txt").read_text(encoding="utf-8")
+_CODEX_UPDATE_MODAL = ("\n  ✨ Update available! 0.136.0 -> 0.146.1\n\n"
+                       "› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n"
+                       "  3. Skip until next version\n\n  Press enter to continue\n")
+
+
+def _reading(verdict, harness="codex", session_id="S-new", reason="test"):
+    return _hi.IdleReading(verdict, harness=harness, log_path="/x/rollout.jsonl",
+                           session_id=session_id, reason=reason)
+
+
+class LogIdleSourceTest(unittest.TestCase):
+    """T-5793: KEEP_GOING_IDLE_SOURCE=log (the default) gates on the harness session log;
+    the pane is only the pre-inject safety gate; the reading feeds the session reset and
+    the submit profile."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"PANTHEON_STATE_DIR": self._tmp.name,
+                                           "KEEP_GOING_IDLE_SOURCE": "log"})
+        env.start()
+        self.addCleanup(env.stop)
+        self.injected = []
+        self.captured = []
+        self.kw = dict(do_work_ts=lambda cfg: None,
+                       do_session_id=lambda cfg: self.fail("log mode must not probe the Claude session"),
+                       do_cap_check=lambda *a, **k: False)
+
+    def _inject(self, pt, prompt, **kw):
+        self.injected.append((pt, prompt, kw))
+        return True
+
+    def _cap(self, pane):
+        def cap(pt, uu):
+            self.captured.append(pt)
+            return pane
+        return cap
+
+    def _run(self, agent, reading, pane, **kw):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = kg.run(agent, do_capture=self._cap(pane), do_inject=self._inject,
+                        do_idle_reading=lambda a, c: reading, **{**self.kw, **kw})
+        return rc, buf.getvalue()
+
+    def test_default_source_is_log(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("KEEP_GOING_IDLE_SOURCE", None)
+            self.assertEqual(kg.idle_source(), "log")
+        with mock.patch.dict(os.environ, {"KEEP_GOING_IDLE_SOURCE": " PANE "}):
+            self.assertEqual(kg.idle_source(), "pane")
+        with mock.patch.dict(os.environ, {"KEEP_GOING_IDLE_SOURCE": "bogus"}):
+            self.assertEqual(kg.idle_source(), "log")
+
+    def test_codex_seat_log_idle_and_injectable_pane_nudges_with_codex_profile(self):
+        rc, out = self._run("watchman", _reading(_hi.Verdict.IDLE), _CODEX_IDLE_PANE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.injected), 1)
+        pt, _prompt, kw = self.injected[0]
+        self.assertEqual(pt, kg.AGENT_PANE["watchman"]["pane_target"])
+        self.assertEqual(kw, {"harness": "codex"})
+        self.assertIn("nudged", out)
+
+    def test_claude_configured_seat_on_codex_runtime_nudges_with_codex_profile(self):
+        # specialist 2026-11-01: a claude-code seat the controller swapped to codex.
+        rc, _ = self._run("recovery", _reading(_hi.Verdict.IDLE, harness="codex"), _CODEX_IDLE_PANE)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.injected[0][2], {"harness": "codex"})
+
+    def test_log_idle_but_modal_pane_skips(self):
+        rc, out = self._run("watchman", _reading(_hi.Verdict.IDLE), _CODEX_IDLE_PANE + _CODEX_UPDATE_MODAL)
+        self.assertEqual(rc, 0)
+        self.assertEqual(self.injected, [])
+        self.assertIn("pane not injectable", out)
+
+    def test_log_idle_but_uncapturable_pane_skips(self):
+        rc, _ = self._run("watchman", _reading(_hi.Verdict.IDLE), None)
+        self.assertEqual((rc, self.injected), (0, []))
+
+    def test_non_idle_verdicts_skip_without_capturing(self):
+        for verdict in (_hi.Verdict.UNKNOWN, _hi.Verdict.WORKING, _hi.Verdict.BG_WAIT):
+            with self.subTest(verdict=verdict):
+                self.captured.clear()
+                rc, out = self._run("watchman", _reading(verdict, reason="why-" + verdict.value),
+                                    _CODEX_IDLE_PANE)
+                self.assertEqual(rc, 0)
+                self.assertEqual(self.injected, [])
+                self.assertEqual(self.captured, [], "the pane is not even captured")
+                self.assertIn(f"log says {verdict.value}", out)
+                self.assertIn("why-" + verdict.value, out)
+
+    def test_reading_session_id_resets_backoff(self):
+        kg.write_state(kg._state_path("watchman"),
+                       {"session_id": "S-old", "consecutive_ineffective": 5, "cycles_since_nudge": 0,
+                        "last_nudge_ts": 1})
+        rc, out = self._run("watchman", _reading(_hi.Verdict.IDLE, session_id="S-new"), _CODEX_IDLE_PANE)
+        self.assertEqual(rc, 0)
+        self.assertIn("new session — backoff reset", out)
+        self.assertEqual(len(self.injected), 1)
+        self.assertEqual(kg.read_state(kg._state_path("watchman"))["session_id"], "S-new")
+
+    def test_pane_source_restores_the_old_path(self):
+        with mock.patch.dict(os.environ, {"KEEP_GOING_IDLE_SOURCE": "pane"}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                rc = kg.run("recovery", do_capture=self._cap(IDLE_PANE),
+                            do_inject=lambda pt, pr: self.injected.append((pt, pr)) or True,
+                            do_idle_reading=lambda a, c: self.fail("pane mode must not read the log"),
+                            do_work_ts=lambda cfg: None, do_session_id=lambda cfg: None,
+                            do_cap_check=lambda *a, **k: False)
+        self.assertEqual(rc, 0)
+        self.assertEqual(len(self.injected), 1)
+        # and a codex pane is still inconclusive there, as before T-5793
+        with mock.patch.dict(os.environ, {"KEEP_GOING_IDLE_SOURCE": "pane"}):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                kg.run("watchman", do_capture=self._cap(_CODEX_IDLE_PANE),
+                       do_inject=lambda pt, pr: self.fail("no inject"),
+                       do_work_ts=lambda cfg: None, do_session_id=lambda cfg: None,
+                       do_cap_check=lambda *a, **k: False)
+        self.assertIn("inconclusive", buf.getvalue())
+
+    def test_seat_hold_still_precedes_the_log_read(self):
+        held = mock.Mock(sources=("record",))
+        rc = kg.run("watchman", do_seat_hold=lambda a: held,
+                    do_idle_reading=lambda a, c: self.fail("held seat must not read the log"),
+                    do_capture=self._cap(_CODEX_IDLE_PANE), do_inject=self._inject, **self.kw)
+        self.assertEqual((rc, self.injected), (0, []))
+
+
+class _FixtureReader:
+    """health_export.SudoReader-shaped fake over committed fixtures, keyed by seat paths."""
+
+    def __init__(self, files):
+        self.files = files
+
+    def newest_files(self, account, root, min_depth, max_depth, suffix, n):
+        prefix = root.rstrip("/") + "/"
+        rows = [(m, p) for p, (m, _t) in self.files.items()
+                if p.startswith(prefix) and p.endswith(suffix)
+                and min_depth <= p[len(prefix):].count("/") + 1 <= max_depth]
+        return sorted(rows, reverse=True)[:n] or None
+
+    def read_text_tail(self, account, path, max_bytes):
+        return self.files[path][1][-max_bytes:] if path in self.files else None
+
+    def read_text_head(self, account, path, max_bytes):
+        return self.files[path][1][:max_bytes] if path in self.files else None
+
+    def grep_tail(self, account, path, max_bytes, needles):
+        if path not in self.files:
+            return None
+        return [ln + "\n" for ln in self.files[path][1][-max_bytes:].splitlines()
+                if any(n.decode() in ln for n in needles)]
+
+
+class LogIdleEndToEndTest(unittest.TestCase):
+    """run() through the REAL idle_reading -> harness_idle.read_idle -> pane_inject_safe
+    chain; only the reader (fixtures), the clock, capture and inject are faked."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        env = mock.patch.dict(os.environ, {"PANTHEON_STATE_DIR": self._tmp.name,
+                                           "KEEP_GOING_IDLE_SOURCE": "log"})
+        env.start()
+        self.addCleanup(env.stop)
+        home = "/home/" + kg.AGENT_PANE["watchman"]["unix_user"]
+        rollout = (f"{home}/.codex/sessions/2026/10/28/"
+                   "rollout-2026-10-28T01-58-11-01a1803a-ae9e-7a33-8988-89e3ce3d3e07.jsonl")
+        self.text = (_HI_FIX / "codex" / "idle.jsonl").read_text(encoding="utf-8")
+        self.t_end = max(
+            _hi._parse_ts(json.loads(line).get("timestamp")) for line in self.text.splitlines())
+        runtime = json.dumps({"schema": "pantheon-runtime-state/v1", "harness": "codex",
+                              "started_at": "2026-10-28T01:58:00Z"})
+        self.files = {
+            f"{home}/.local/state/pantheon/personas/watchman/runtime-controller/runtime.json": (0, runtime),
+            rollout: (self.t_end, self.text),
+        }
+        self.injected = []
+
+    def _fire(self, now, pane):
+        reader = _FixtureReader(self.files)
+        buf = io.StringIO()
+        with mock.patch.object(_hi, "LocalReader", lambda: reader), \
+             mock.patch.object(_hi, "time", mock.Mock(time=lambda: now)), \
+             contextlib.redirect_stdout(buf):
+            rc = kg.run("watchman", do_capture=lambda pt, uu: pane,
+                        do_inject=lambda pt, pr, **kw: self.injected.append(kw) or True,
+                        do_work_ts=lambda cfg: None, do_cap_check=lambda *a, **k: False)
+        return rc, buf.getvalue()
+
+    def test_parked_codex_seat_is_nudged(self):
+        rc, out = self._fire(self.t_end + 700, _CODEX_IDLE_PANE)
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.injected, [{"harness": "codex"}])
+        state = kg.read_state(kg._state_path("watchman"))
+        self.assertEqual(state["session_id"], "01a1803a-ae9e-7a33-8988-89e3ce3d3e07")
+
+    def test_recently_active_codex_seat_is_not_nudged(self):
+        rc, out = self._fire(self.t_end + 30, _CODEX_IDLE_PANE)
+        self.assertEqual((rc, self.injected), (0, []))
+        self.assertIn("log says working", out)
+
+    def test_idle_log_but_modal_screen_is_not_nudged(self):
+        rc, out = self._fire(self.t_end + 700, _CODEX_IDLE_PANE + _CODEX_UPDATE_MODAL)
+        self.assertEqual((rc, self.injected), (0, []))
+        self.assertIn("pane not injectable", out)
 
 
 if __name__ == "__main__":

@@ -171,7 +171,7 @@ def test_real_contract_loads_and_registry_row_validates():
     assert row["contract_adoption"] == "not_adopted"
     body = yaml.safe_load((COMPONENTS / "harness-manager.yaml").read_text(encoding="utf-8"))["component"]
     assert body["scopes"] == ["system", "seat"]
-    assert set(body["legs"]) == {"configure", "verify"}
+    assert set(body["legs"]) == {"install", "configure", "verify"}  # install: T-5091 U1
 
 
 def test_planner_imports_leaf_modules_not_runtime_controller():
@@ -540,7 +540,7 @@ def test_configure_refuses_until_dependencies_are_installed(tmp_path):
 # --- absent / deferred legs and the dark-landing gate -----------------------------
 
 
-@pytest.mark.parametrize("leg", ["install", "update", "remove", "repair"])
+@pytest.mark.parametrize("leg", ["update", "remove", "repair"])  # install landed in T-5091 U1
 def test_deferred_legs_refuse_cleanly(real, leg):
     _repo_, eng = real
     with pytest.raises(EngineRefusal) as info:

@@ -25,8 +25,20 @@ from __future__ import annotations
 
 import subprocess
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
+
+@dataclass(frozen=True)
+class ProvisionReconcileResult:
+    ok: bool
+    detail: str
+    action: str
+    update_policy: str
+
+
+ScopedProvisionAdapter = Callable[[str, Path], ProvisionReconcileResult]
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -61,6 +73,7 @@ def provision_repos(
     git_runner: Callable[[list[str], Path | None, int], subprocess.CompletedProcess] | None = None,
     clone_base: Path | None = None,
     timeout: int = DEFAULT_CLONE_TIMEOUT_SECS,
+    reconcile_adapter: ScopedProvisionAdapter | None = None,
 ) -> list[str]:
     """Provision repos declared in ticket_fields['repos'] for the claiming agent.
 
@@ -94,6 +107,39 @@ def provision_repos(
 
     for repo_name, access in entries:
         skip_reason = _should_skip(repo_name, registry)
+        if reconcile_adapter is not None:
+            # The adapter owns exact declarative checkout selection, manifest
+            # resolution and scoped authorization. It is warning-only so a claim
+            # remains best effort. No ordinary caller supplies it yet.
+            if skip_reason and repo_name not in _ALWAYS_AVAILABLE_REPOS:
+                warnings.append(f"{repo_name}: skipped — {skip_reason}")
+                continue
+            try:
+                result = reconcile_adapter(repo_name, clone_base / repo_name)
+            except Exception as exc:  # noqa: BLE001 — preserve never-raise contract
+                warnings.append(f"{repo_name}: reconcile refused: unexpected reconciler error: {exc}")
+                continue
+            if type(result) is not ProvisionReconcileResult:
+                warnings.append(f"{repo_name}: reconcile refused: adapter result is not structured")
+                continue
+            if not result.ok:
+                warnings.append(f"{repo_name}: reconcile refused: {result.detail}")
+                continue
+            if result.update_policy != "availability-only":
+                warnings.append(
+                    f"{repo_name}: reconcile refused: update_policy {result.update_policy} is not availability-only"
+                )
+                continue
+            if result.action not in {"clone", "noop"}:
+                warnings.append(
+                    f"{repo_name}: reconcile refused: action {result.action} exceeds availability-only"
+                )
+                continue
+            if repo_name in _ALWAYS_AVAILABLE_REPOS and result.action != "noop":
+                warnings.append(
+                    f"{repo_name}: reconcile refused: always_available repo permits structured noop only, not {result.action}"
+                )
+            continue
         if skip_reason:
             warnings.append(f"{repo_name}: skipped — {skip_reason}")
             continue

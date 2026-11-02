@@ -29,19 +29,26 @@ MANIFEST = Path(__file__).with_name("host-substrate.manifest.yaml")
 REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _manifest():
-    return F.load_manifest(yaml.safe_load(MANIFEST.read_text(encoding="utf-8")), repo_root=REPO_ROOT)
+def _manifest(doc=None, repo_root=None):
+    """The validated manifest. Defaults: the in-repo CURRENT manifest and this
+    checkout. T-2920 U3a (render-staging seam, HO Q1): the host-broker installer
+    passes its rendered fragment and the staging dir instead (additive only)."""
+    if doc is None:
+        doc = yaml.safe_load(MANIFEST.read_text(encoding="utf-8"))
+    return F.load_manifest(doc, repo_root=REPO_ROOT if repo_root is None else Path(repo_root))
 
 
 class HostSubstrateSim:
     name = "host-substrate"
     kinds = frozenset(F.FAMILIES)
 
-    def __init__(self):
+    def __init__(self, *, manifest_doc=None, repo_root=None):
         self.port = SimulatedSubstratePort()
+        self._manifest_doc = manifest_doc
+        self._repo_root = repo_root
 
     def _helper(self):
-        return RootHelper(self.port, _manifest(), BOOTSTRAP)
+        return RootHelper(self.port, _manifest(self._manifest_doc, self._repo_root), BOOTSTRAP)
 
     def _step(self, op):
         phase = STAGE if getattr(op, "execution_scope", "all") == "staged-cutover" else ACTIVATE
@@ -56,6 +63,9 @@ class HostSubstrateSim:
     # --- EffectHandler -------------------------------------------------------
 
     def observe(self, component, scope):
+        # Shape divergence (T-2920 U3b review): the SIMULATED snapshot carries ``locked`` on
+        # passwd:*, which VERIFY's HS1 compares; HostSubstratePort.snapshot has no ``locked``
+        # (no shadow enumeration, Recovery D15). Wiring a host port here needs per-account get().
         return {"subjects": self.port.snapshot()}
 
     def preflight(self, op):
@@ -97,7 +107,8 @@ class HostSubstrateSim:
         return PreflightResult(False, "drifted", f"{mutation.target} moved past this op")
 
     def rollback_mutation(self, mutation):
-        self.port.put(mutation.target, json.loads(mutation.before["snapshot"]))
+        # T-5653: a rollback is path-taking actuation too; the symlink guard applies.
+        self._helper().guarded_put(mutation.target, json.loads(mutation.before["snapshot"]))
 
     def dump_state(self):
         return self.port.dump()

@@ -3,8 +3,8 @@
 
 Monthly timer entrypoint that files ONE per-account suite-health soak ticket to
 each Pantheon agent (specialist, orchestrator, recovery). Each filed ticket instructs that
-agent's OWN session to run its tools-suite leg with the guarded invocation and
-resolve with the green count — decentralizing execution so no cross-account sudo
+agent's OWN session to run its tools-suite leg with tools/soak_leg.py (T-3393) and
+resolve with its SOAK LEG summary line — decentralizing execution so no cross-account sudo
 is needed (T-0991 item-2 decision: option (b), per-account self-run; the
 all-accounts soak grew out of the T-0884 / ORG-025 watch-dispatch cutover).
 
@@ -60,11 +60,14 @@ SOAK_AGENTS = ("specialist", "orchestrator", "recovery")
 SOAK_LABEL = "suite-health-soak-auto"
 SOAK_LABELS_CSV = "suite-health,soak,suite-health-soak-auto,infra"
 
-# The guarded suite invocation the receiving agent runs. The env flag is
-# MANDATORY: without it the full suite leaks alerts via the send-keys-to-pane
-# path (the leak is now also fixed in inbox_consumer._send_alert_via_recovery, which
-# honors _live_telegram_suppressed, but the flag stays belt-and-suspenders).
-SOAK_INVOCATION = "PANTHEON_DISABLE_LIVE_TELEGRAM=1 python3 -m unittest discover -s tools -t ."
+# The leg runner the receiving agent runs (T-3393). tools/soak_leg.py builds or
+# reuses a venv on CI's exact pins (parsed from ci.yml), runs `pytest tools/` the
+# way CI does, with PANTHEON_DISABLE_LIVE_TELEGRAM=1 set for it (MANDATORY:
+# without it the full suite leaks alerts via the send-keys-to-pane path), then
+# CI's shell-suite outcome check, and prints one SOAK LEG summary line. It
+# replaced the bare system-python unittest discover, whose pytest-absent red on
+# some accounts was the last structural class.
+SOAK_INVOCATION = "python3 tools/soak_leg.py"
 
 # States whose presence means a prior soak leg is still UNRESOLVED. done/ is
 # excluded (resolved); blocked/ does not exist (ORG-019 retired it).
@@ -136,23 +139,33 @@ def _build_ask(agent: str) -> str:
         f"Suite-health soak leg for the `{agent}` account — standing all-accounts "
         f"soak (T-0991/T-0992 option b: each account runs its OWN leg, no "
         f"cross-account sudo).\n\n"
-        f"Run the full tools suite with the guarded invocation (the env flag is "
-        f"MANDATORY — without it the full suite leaks alerts via the "
-        f"send-keys-to-pane path):\n"
+        f"From the repo root, run the leg runner:\n"
         f"    {SOAK_INVOCATION}\n\n"
-        f"Route the output to a file (do NOT trust inline terminal output — test "
-        f"stdout garbles it), then verify exit 0 AND the `Ran N tests` / `OK` "
-        f"summary line. Resolve THIS ticket with the green count, e.g. "
-        f"`python3 tools/ticket.py resolve <id> --with \"NNNN green, exit 0\"`.\n\n"
+        f"It fetches origin and soaks a fresh detached worktree of origin/main (not "
+        f"your live checkout, whose seat state can redden canonical-path tests), "
+        f"builds or reuses a venv at ~/.cache/pantheon/soak-venv on CI's exact "
+        f"test pins (the FIRST run builds it and needs network for pip), runs the "
+        f"full tools suite under pytest the way CI does (it sets the MANDATORY "
+        f"PANTHEON_DISABLE_LIVE_TELEGRAM=1 itself), then CI's shell-suite outcome "
+        f"check, and prints one summary line, e.g. `SOAK LEG: sha=<commit> py=X.Y executed=N skipped=S "
+        f"failed=0 pytest_rc=0 shell_outcomes_rc=0 -> GREEN`. Full output lands in "
+        f"the log dir it names. Exit 0 means GREEN, 1 RED, 2 a setup error (git "
+        f"fetch/worktree, ci.yml pins, venv or pip: fix the setup, it is not a "
+        f"suite result). A full leg runs for HOURS: start it in the background "
+        f"with its output sent to a file and read the summary line from that file "
+        f"when it exits. Resolve THIS ticket with that "
+        f"summary line, e.g. `python3 tools/ticket.py resolve <id> --with \"SOAK "
+        f"LEG: sha=<commit> py=X.Y executed=N skipped=S failed=0 ... -> GREEN\"`.\n\n"
         f"If RED: a SINGLE red run is NOT conclusive — the suite has a rare flake "
         f"(T-0993, ~1 in 30+ runs, test unidentified). Re-run up to 2 more times. "
         f"A genuine account-dependent regression fails DETERMINISTICALLY (every "
         f"run); only treat it as real if it is RED on a majority of runs. If "
         f"consistently RED: do NOT resolve — investigate the regression (exactly "
-        f"what this soak exists to catch) and surface it. If it was a one-off "
-        f"flake: resolve noting the flake AND the failing test name (so T-0993 can "
-        f"finally pin it). Prior manual cycle (2026-06-09) was 1945 green on all "
-        f"three accounts; green is expected — the point is confirmation, not assumption."
+        f"what this soak exists to catch) and surface it, naming the failing tests "
+        f"the runner lists. If it was a one-off flake: resolve noting the flake AND "
+        f"the failing test name (so T-0993 can finally pin it). Expected structural "
+        f"red is 0 (T-3393: the runner's venv removes the pytest-absent class), so "
+        f"any deterministic red is real."
     )
 
 
@@ -203,6 +216,7 @@ def file_soak_tickets(
             sys.executable,
             str(tb),
             "file",
+            "--automated-filer", "soak_filer",  # T-5678: ORG-105 gate, non-interactive
             "--requester", "recovery",
             # T-5239 / ORG-088 (the operator TG 12076/12077): role-only routing. The leg is
             # routed to the seat's POOL role; whichever member pulls it runs it. The

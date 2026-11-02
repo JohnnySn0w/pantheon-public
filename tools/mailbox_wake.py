@@ -1195,6 +1195,17 @@ def _appserver_route_module():
     return mod
 
 
+def _is_hub_inbox(box: Path, agent: str) -> bool:
+    try:
+        return Path(box).resolve() == (MAILBOX_HUB / agent).resolve()
+    except OSError:
+        return False
+
+
+def _route_off_non_hub(prompt: str, newest: str, home: str) -> tuple:
+    return ("off", None)
+
+
 def appserver_route_try(prompt: str, newest: str, home: str) -> tuple:
     """('off', None) | ('enqueued', delivery_id) | ('unavailable', reason). A failure to
     even load the route module is 'off' only when no switch file exists; with a switch
@@ -1263,6 +1274,11 @@ def _run_locked(agent: str, *, inbox: Path | None = None, do_inject=inject,
     if cfg.get("harness") == "codex":
         prompt = build_kick(agent, names, _senders(new_dir, names),
                             _queued_subjects(new_dir, names))
+        # T-5660: the live route carries wakes for the seat's real hub inbox only. A
+        # wake for any other inbox (a test's tmp dir) took the default route_fn, and run
+        # as codex it enqueued into the LIVE spool (consultant 2026-10-27 03:33Z, 17 wakes).
+        if route_fn is None and not _is_hub_inbox(box, agent):
+            route_fn = _route_off_non_hub
         status, detail = (route_fn or appserver_route_try)(prompt, names[-1], cfg["home"])
         if status == "enqueued":
             _write_marker(marker, names[-1], current_session, now,

@@ -77,6 +77,14 @@ DEFAULT_SUBMIT_RETRIES = 2
 #: T-5412: wait before re-reading an empty post-Enter capture (one blank read can be
 #: a redraw in flight; only two in a row count as empty).
 EMPTY_RECAPTURE_S = 0.4
+#: T-5610: wait before the confirm re-sample of a "cleared" composer, so a paste
+#: that renders late on a heavy pane is seen before the submit is reported.
+CONFIRM_RESAMPLE_S = 1.5
+#: T-5651/T-5656: the late look on the failure path, for an Enter that lands after
+#: the retry window (a seat finishing its turn, or a very large slow-redraw pane):
+#: poll every LATE_CONFIRM_POLL_S, for at most LATE_CONFIRM_TOTAL_S, no extra Enter.
+LATE_CONFIRM_POLL_S = 1.5
+LATE_CONFIRM_TOTAL_S = 10.0
 #: T-5011 PR-B: Hermes's paste-mode settle (H0: ~1s measured, 1.2s with margin).
 #: send_keys_submit.sh's HERMES_ENTER_DELAY and inbox_consumer's hermes delay
 #: carry the same value (tests pin both).
@@ -673,8 +681,30 @@ def submit_verify(profile: dict, pane: str, text: str, *,
         if last_empty:
             continue
         if not submit_pending(profile, seen, text):
-            return SubmitResult(True, attempt + 1, "submit confirmed")
+            # T-5610: one "cleared" sample is not proof. On a heavy pane the collapsed
+            # paste can render AFTER this capture (orchestrator 2026-10-26 18:28Z: logged
+            # "woke", placeholder then sat unsubmitted). Re-sample once; a pending
+            # read falls through to the pre-retry check and the retry Enter.
+            sleep(CONFIRM_RESAMPLE_S)
+            again = capture(pane)
+            if not (again.strip() and submit_pending(profile, again, text)):
+                return SubmitResult(True, attempt + 1, "submit confirmed")
         # still pending — paste-mode/composer hasn't cleared; retry the Enter
+    # T-5651: one late look before reporting failure. A seat finishing a turn can
+    # take longer than the retry window to accept the Enter (specialist 2026-10-27 04:46Z
+    # answered a nudge this loop had just reported unconfirmed, which paged Recovery).
+    # Failure path only, so no added latency on success; no extra Enter is sent.
+    # T-5656: one 3s look was not enough for recovery's own very large pane (06:35Z
+    # 10-27, the wake landed later), so the look is a bounded poll. An empty
+    # sample casts no vote.
+    waited = 0.0
+    while waited + LATE_CONFIRM_POLL_S <= LATE_CONFIRM_TOTAL_S:
+        sleep(LATE_CONFIRM_POLL_S)
+        waited += LATE_CONFIRM_POLL_S
+        late = capture(pane)
+        if late.strip() and not submit_pending(profile, late, text):
+            return SubmitResult(True, retries + 1,
+                                "submit confirmed late (after the last retry)")
     if last_empty:
         return SubmitResult(False, retries + 1,
                             f"unverified: empty capture after {retries} Enter retries")

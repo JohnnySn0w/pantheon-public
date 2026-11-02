@@ -40,6 +40,7 @@ from tools.host_control.policy import AuthorizationDecision, HostPolicy
 from tools.host_control.registry import SeatRegistry
 from tools.host_control.trusted_files import RootOwnedFileLoader
 from tools.persona_installer import InstallPlan, Manifest, PersonaInstaller
+from tools._host_control_plan_fixtures import framework_overlay, register_plan
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -136,6 +137,8 @@ class HostControlCase(unittest.TestCase):
             harness_override="codex",
             root=Path("/projection"),
         )
+        # T-5533: the broker reads this plan from the registry's ``plans``.
+        self.prototype = prototype
         self.framework_sha256 = prototype.provenance[
             "source_artifact_sha256"
         ]
@@ -148,13 +151,16 @@ class HostControlCase(unittest.TestCase):
         self.registry_path = self.root / "registry.json"
         self.policy_path = self.root / "policy.json"
         self.journal_path = self.root / "broker.sqlite3"
+        # T-5533 review r1 B1: Plan() refuses without a framework root, so the
+        # broker fixture loads its registry against a framework-copy overlay.
+        self.framework = framework_overlay(self.root / "framework", REPO_ROOT, self.template_ids)
         self.write_registry()
         self.write_policy()
         self.files = RootOwnedFileLoader._open_for_test(
             (self.root,),
             expected_owner_uid=os.getuid(),
         )
-        self.registry = SeatRegistry.load(self.registry_path, files=self.files)
+        self.registry = SeatRegistry.load(self.registry_path, files=self.files, framework_root=self.framework)
         self.policy = HostPolicy.load(self.policy_path, files=self.files)
         self.journal = BrokerJournal.open(self.journal_path)
         self.handles = iter(character * 64 for character in "123456789abcdef0")
@@ -173,7 +179,6 @@ class HostControlCase(unittest.TestCase):
             registry=registry or self.registry,
             policy=policy or self.policy,
             journal=self.journal,
-            installer=self.installer,
             clock=lambda: FIXED_NOW,
             handle_factory=lambda: next(self.handles),
             plan_ttl=timedelta(hours=1),
@@ -196,7 +201,7 @@ class HostControlCase(unittest.TestCase):
         path.chmod(0o600)
 
     def registry_dict(self) -> dict:
-        return {
+        value = {
             "schema": "pantheon-host-seat-registry/v1",
             "seats": [
                 {
@@ -243,6 +248,8 @@ class HostControlCase(unittest.TestCase):
                 }
             ],
         }
+        register_plan(value, self.root, self.prototype, seat_id="recovery", manifest_revision="manifest-r1")
+        return value
 
     def write_registry(self, value: dict | None = None) -> None:
         self.write_json(self.registry_path, value or self.registry_dict())
@@ -343,12 +350,12 @@ class HostControlCase(unittest.TestCase):
             self.write_registry(value)
             with self.subTest(case=cases.index(value)):
                 with self.assertRaises(RegistryError):
-                    SeatRegistry.load(self.registry_path, files=self.files)
+                    SeatRegistry.load(self.registry_path, files=self.files, framework_root=self.framework)
 
         self.write_registry()
         self.manifest_path.write_bytes(self.manifest_path.read_bytes() + b"\n")
         with self.assertRaises(RegistryError):
-            SeatRegistry.load(self.registry_path, files=self.files)
+            SeatRegistry.load(self.registry_path, files=self.files, framework_root=self.framework)
 
     def test_capabilities_exposes_only_current_subject_intersection(self) -> None:
         result = self.service.capabilities(1003)
@@ -685,13 +692,14 @@ class HostControlCase(unittest.TestCase):
         second_manifest = dict(registry_value["manifests"][0])
         second_manifest["revision"] = "manifest-r2"
         registry_value["manifests"].append(second_manifest)
+        register_plan(registry_value, self.root, self.prototype, seat_id="recovery", manifest_revision="manifest-r2")
         self.write_registry(registry_value)
         policy_value = self.policy_dict()
         for grant in policy_value["grants"]:
             grant["manifest_revisions"].append("manifest-r2")
         self.write_policy(policy_value)
         changed_request_service = self.build_service(
-            registry=SeatRegistry.load(self.registry_path, files=self.files),
+            registry=SeatRegistry.load(self.registry_path, files=self.files, framework_root=self.framework),
             policy=HostPolicy.load(self.policy_path, files=self.files),
         )
         with self.assertRaises(IdempotencyConflict):
@@ -898,9 +906,9 @@ os._exit(17)
                 host_operation_families=frozenset(("persona.install",)),
             )
             with self.subTest(reason=expected_reason), mock.patch.object(
-                self.installer,
-                "plan",
-                side_effect=AssertionError("denial reached plan generation"),
+                SeatRegistry,
+                "read_plan_bytes",
+                side_effect=AssertionError("denial reached the registered plan"),
             ):
                 with self.assertRaises(PolicyDenied) as caught:
                     service.plan(
@@ -925,9 +933,9 @@ os._exit(17)
                 "approval_class_denied",
             ),
         ), mock.patch.object(
-            self.installer,
-            "plan",
-            side_effect=AssertionError("denial reached plan generation"),
+            SeatRegistry,
+            "read_plan_bytes",
+            side_effect=AssertionError("denial reached the registered plan"),
         ):
             with self.assertRaises(PolicyDenied) as caught:
                 approval_service.plan(
@@ -1160,7 +1168,7 @@ os._exit(17)
             "load",
             side_effect=AssertionError("planner reopened manifest path"),
         ):
-            registry = SeatRegistry.load(self.registry_path, files=self.files)
+            registry = SeatRegistry.load(self.registry_path, files=self.files, framework_root=self.framework)
             policy = HostPolicy.load(self.policy_path, files=self.files)
             result = self.build_service(
                 registry=registry,

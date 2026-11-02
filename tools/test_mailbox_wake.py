@@ -42,9 +42,19 @@ def setUpModule():
     build a private TMUX_TMPDIR on top of this."""
     tmp = tempfile.TemporaryDirectory(prefix="t5389-no-tmux-")
     unittest.addModuleCleanup(tmp.cleanup)
-    env = mock.patch.dict(os.environ, {"TMUX_TMPDIR": tmp.name})
+    # T-5277: run() consults the shared seat-maintenance registry. Point it at a path that
+    # does not exist so a live hold on this host (e.g. mason) can never change what these
+    # tests see. T-5817: set HERE, inside this module's env patch, not at import: the
+    # import-time assignment leaked into every other module of a one-process run (it
+    # outranks PANTHEON_STATE_DIR), so test_context_fill_monitor armed specialist in this one
+    # shared file and read it back. tearDownModule stops the patch explicitly (pytest does
+    # not run module cleanups), which restores TMUX_TMPDIR, TMUX and the registry.
+    env = mock.patch.dict(os.environ, {
+        "TMUX_TMPDIR": tmp.name,
+        "PANTHEON_MAINTENANCE_REGISTRY": os.path.join(tmp.name, "t5277-no-registry.json"),
+    })
     env.start()
-    unittest.addModuleCleanup(env.stop)
+    _SS_PATCHES.append(env)
     os.environ.pop("TMUX", None)
     # ORG-106 L2 (T-5525): run() now reads the seat-state reader. Stub its record / OOM
     # sources (and the cross-account record read, which would shell out) to "nothing
@@ -62,11 +72,6 @@ def tearDownModule():
     # pytest does not run unittest module cleanups for these, so stop explicitly.
     while _SS_PATCHES:
         _SS_PATCHES.pop().stop()
-
-# T-5277: run() consults the shared seat-maintenance registry. Point it at a path that does not
-# exist so a live hold on this host (e.g. mason) can never change what these tests see.
-os.environ["PANTHEON_MAINTENANCE_REGISTRY"] = os.path.join(
-    tempfile.gettempdir(), f"t5277-no-registry-{os.getpid()}.json")
 
 
 # T-4313: tmux's three ways of saying "that target is not there", reproduced on tmux 3.4:
@@ -329,6 +334,33 @@ class WakeTest(unittest.TestCase):
         self.assertEqual(len(self.injected), 1)
         self.assertEqual(self.injected[0][2], "codex", "codex pane must pass --harness codex")
         self.assertEqual(self.injected[0][0], "codex-session")
+
+    def test_non_hub_inbox_never_reaches_the_live_appserver_route(self):
+        # T-5660 (consultant 2026-10-27 03:33Z): run as codex, a test wake for a tmp inbox
+        # took the default route_fn, read the LIVE route switch and enqueued 17 fake
+        # wakes into consultant's real delivery spool. The live route carries hub wakes only.
+        mailbox.send(self.inbox, {"x": 1}, sender="orchestrator")
+        called = []
+        with mock.patch.object(mw, "appserver_route_try",
+                               lambda *a: called.append(a) or ("enqueued", "LEAK")):
+            mw.run("codex", inbox=self.inbox, do_inject=self._ok_inject,
+                   pane_idle_fn=lambda pane: None, unknown_pane_ok_fn=lambda pane, harness: True)
+        self.assertEqual(called, [])
+        self.assertEqual(len(self.injected), 1)
+
+    def test_hub_inbox_still_takes_the_appserver_route(self):
+        # The guard keys on the hub: the real seat inbox keeps its route.
+        hub = Path(self._tmp.name) / "hub"
+        box = hub / "codex"
+        mailbox.send(box, {"x": 1}, sender="orchestrator", provision_if_missing=True)
+        called = []
+        with mock.patch.object(mw, "MAILBOX_HUB", hub), \
+                mock.patch.object(mw, "appserver_route_try",
+                                  lambda *a: called.append(a) or ("enqueued", "d1")):
+            mw.run("codex", inbox=box, do_inject=self._ok_inject,
+                   pane_idle_fn=lambda pane: None, unknown_pane_ok_fn=lambda pane, harness: True)
+        self.assertEqual(len(called), 1)
+        self.assertEqual(self.injected, [])
 
     def test_claude_persona_passes_default_harness(self):
         # A Claude-Code persona (recovery) keeps the default claude-code profile.

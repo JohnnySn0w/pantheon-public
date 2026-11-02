@@ -89,6 +89,10 @@ def setUpModule() -> None:
     # unchanged. The T-4510 class below points the dir at its own temp readings.
     os.environ["PANTHEON_FLEET_USAGE_DIR"] = str(
         Path(_MODULE_STATE_TMP.name) / "no-such-fleet-usage-dir")
+    # T-5793: the pre-existing classes exercise the pre-T-5793 P1.b signals and send
+    # path, so they run under the rollback lever (ACTIVITY_MONITOR_IDLE_SOURCE=pane,
+    # the old path verbatim). The T-5793 classes set "log" themselves.
+    os.environ["ACTIVITY_MONITOR_IDLE_SOURCE"] = "pane"
     global _ENTRY_STUB
     _ENTRY_STUB = patch.object(am, "_jsonl_entry_epoch", return_value=None)
     _ENTRY_STUB.start()
@@ -102,6 +106,21 @@ def setUpModule() -> None:
                            "_read_maintenance", "_read_oom")]
     for _p in _SS_STUBS:
         _p.start()
+    # T-5793: _active_runtime_harness now reads the seat's runtime state through
+    # health_export.SudoReader (argv-only cross-account reads). Every cross-account read
+    # is refused module-wide (None = unreadable -> claude-code default), so no test
+    # escalates or reads a live seat. Patched on health_export, so _reload_am() cannot
+    # drop it. Same-account reads (account == the test runner) are untouched.
+    from tools import health_export as _he
+    _orig_run = _he.SudoReader._run
+
+    def _no_cross_account(self, account, argv, env=None):
+        if account is not None and account != self.self_account:
+            return None
+        return _orig_run(self, account, argv, env)
+
+    _SS_STUBS.append(patch("tools.health_export.SudoReader._run", _no_cross_account))
+    _SS_STUBS[-1].start()
 
 
 def _reload_am():
@@ -124,6 +143,7 @@ def tearDownModule() -> None:
         _ENTRY_STUB.stop()
     os.environ.pop("PANTHEON_STATE_DIR", None)
     os.environ.pop("PANTHEON_FLEET_USAGE_DIR", None)
+    os.environ.pop("ACTIVITY_MONITOR_IDLE_SOURCE", None)
     if _MODULE_STATE_TMP is not None:
         _MODULE_STATE_TMP.cleanup()
 
@@ -141,6 +161,8 @@ class TestAgentConfig(unittest.TestCase):
         self.assertEqual(cfg["sudo_user"], "claude")
         self.assertEqual(cfg["ledger_agent_id"], "orchestrator")
         self.assertIn("orchestrator", cfg["ticket_targets"])
+        # T-5649: orchestrator's single-member head role pool counts as its queue.
+        self.assertIn("role:head_engineering_orchestrator", cfg["ticket_targets"])
         # P1.c (ORG-037 Layer 3): orchestrator must carry a teams_dir to be eligible.
         self.assertEqual(cfg["teams_dir"], Path("/home/claude/.claude/teams"))
         # T-3557(e): orchestrator carries NO queue_states override → defaults to
@@ -188,6 +210,8 @@ class TestAgentConfig(unittest.TestCase):
             self.assertEqual(cfg["tmux_target_pane"], pane)
             self.assertEqual(cfg["ledger_agent_id"], agent)
             self.assertIn(agent, cfg["ticket_targets"])
+            # T-5649: never the shared pool, or P1.a/P1.b would always see work.
+            self.assertNotIn("role:engineering_orchestrator", cfg["ticket_targets"])
             # Active jsonl is the -pantheon-config project (consume-runtime launches
             # cwd=<account>/pantheon-config), NOT the month-stale plain -home-<account>.
             self.assertTrue(
@@ -350,6 +374,28 @@ class TestRecordFire(unittest.TestCase):
         predicates = [json.loads(line)["predicate"] for line in lines]
         self.assertEqual(predicates, ["p1a", "p1b"])
 
+    def test_deferred_match_is_flagged(self) -> None:
+        am._record_fire("orchestrator", "p1b", deferred=True)
+        rec = json.loads(self._fires_path().read_text(encoding="utf-8").splitlines()[0])
+        self.assertIs(rec["deferred"], True)
+
+    def test_backoff_reader_skips_deferred_matches(self) -> None:
+        # T-5648: the T-3991 handled-wait backoff streak must see delivered pokes only.
+        am._record_fire("orchestrator", "p1b")
+        am._record_fire("orchestrator", "p1b", deferred=True)
+        recs = am._read_recent_fires("orchestrator")
+        self.assertEqual(len(recs), 1)
+        self.assertNotIn("deferred", recs[0])
+
+    def test_drift_check_counts_a_deferred_match_as_alive(self) -> None:
+        # T-5648: orchestrator's p1b matched nightly but always deferred (busy pane), so
+        # the drift check paged it stale after 7.6d. A deferred match proves the
+        # matcher works.
+        import tools.activity_monitor_drift_check as dc
+        am._record_fire("orchestrator", "p1b", deferred=True)
+        fires = dc.read_fires(self._fires_path())
+        self.assertIn(("orchestrator", "p1b"), dc.last_fire_by_key(fires))
+
     def test_failure_is_swallowed_and_logged_not_raised(self) -> None:
         with patch.object(Path, "mkdir", side_effect=OSError("disk full")):
             with redirect_stdout(io.StringIO()) as out:
@@ -369,7 +415,8 @@ class TestDispatchPoke(unittest.TestCase):
 
     def _cfg(self) -> dict:
         return {"tmux_target_pane": "x:0", "sudo_user": "claude",
-                "jsonl_dir": Path("/x"), "pantheon_config_path": Path("/x")}
+                "jsonl_dir": Path("/x"), "pantheon_config_path": Path("/x"),
+                "active_runtime_harness": "claude-code"}
 
     def test_legacy_path_pokes_and_records(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -536,7 +583,9 @@ class TestDispatchPokeBusyGuard(unittest.TestCase):
                                        bounded_enabled=False, max_ineffective=1)
             self.assertEqual(rc, 0)          # deferred, NOT exit-1
             poke.assert_not_called()          # a doomed submit is never attempted
-            record_fire.assert_not_called()   # a deferral is not a fire
+            # T-5648: a deferral is not a DELIVERED fire, but the matcher did match;
+            # it is recorded deferred=True (drift check counts it, backoff skips it).
+            record_fire.assert_called_once_with("artisan", "p1b", deferred=True)
 
     def test_decide_time_busy_pane_defers_without_poking_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -548,7 +597,7 @@ class TestDispatchPokeBusyGuard(unittest.TestCase):
                                        bounded_enabled=True, max_ineffective=1)
             self.assertEqual(rc, 0)
             poke.assert_not_called()
-            record_fire.assert_not_called()
+            record_fire.assert_called_once_with("artisan", "p1b", deferred=True)
 
     def test_decide_time_unknown_pane_still_pokes(self) -> None:
         """None = UNKNOWN must NOT skip a poke (fail-open) — a foreign/unreadable
@@ -3892,7 +3941,9 @@ class TestSendPokeQuoting(unittest.TestCase):
             os.makedirs(tools_dir)
             got, side = os.path.join(d, "got.txt"), os.path.join(d, "side-effect")
             with open(os.path.join(tools_dir, "send_keys_submit.sh"), "w") as fh:
-                fh.write('#!/bin/bash\nprintf "%s" "$2" > "' + got + '"\n')
+                # T-5793: the helper now gets `--harness <profile>` first; the prompt is
+                # the last argument.
+                fh.write('#!/bin/bash\nfor a; do last=$a; done\nprintf "%s" "$last" > "' + got + '"\n')
             prompt = ("check (`ls ~/.claude/teams/*/inboxes/`) and $(touch " + side + ") "
                       "and 'quotes' \"dq\" $HOME \\ end")
             cfg = {"tmux_target_pane": "main:0.0", "sudo_user": "nobody",
@@ -3903,6 +3954,7 @@ class TestSendPokeQuoting(unittest.TestCase):
             cmd = run.call_args[0][0]
             self.assertEqual(cmd[:3], ["sudo", "-nu", "nobody"])
             self.assertEqual(cmd[3:5], ["bash", "-c"])
+            self.assertIn(" --harness claude-code ", cmd[5])
             # Run the exact script the monitor would hand to sudo, minus the sudo hop.
             subprocess.run(["bash", "-c", cmd[5]], check=True, timeout=10)
             with open(got) as fh:
@@ -3973,10 +4025,15 @@ class FleetUsageGateT4510(unittest.TestCase):
         })
         patcher.start()
         self.addCleanup(patcher.stop)
+        runtime_patcher = patch.dict(
+            am.AGENT_CONFIG["orchestrator"], {"active_runtime_harness": "claude-code"})
+        runtime_patcher.start()
+        self.addCleanup(runtime_patcher.stop)
 
     def _cfg(self) -> dict:
         return {"tmux_target_pane": "x:0", "sudo_user": "claude",
-                "jsonl_dir": Path("/x"), "pantheon_config_path": Path("/x")}
+                "jsonl_dir": Path("/x"), "pantheon_config_path": Path("/x"),
+                "active_runtime_harness": "claude-code"}
 
     def _reading(self, pct, *, seat="orchestrator", resets_in=3 * 86400, window="seven_day"):
         now = time.time()
@@ -3989,6 +4046,7 @@ class FleetUsageGateT4510(unittest.TestCase):
         sp = sp or (self.tmp / "poke_state.json")
         buf = io.StringIO()
         with patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_active_runtime_harness", return_value="claude-code"), \
              patch.object(am, "_pane_idle_probe", return_value=None), \
              patch.object(am, "_session_cap_modal", return_value=None), \
              patch.object(am, "_session_cap_state", return_value=None), \
@@ -4000,6 +4058,39 @@ class FleetUsageGateT4510(unittest.TestCase):
             rc = am._dispatch_poke(self._cfg(), "orchestrator", predicate, "PROMPT", sp,
                                    bounded_enabled=bounded, max_ineffective=1)
         return rc, poke, fire, buf.getvalue(), sp
+
+    def test_codex_fallback_is_not_suppressed_by_claude_usage(self) -> None:
+        self._reading(99)
+        cfg = self._cfg() | {"active_runtime_harness": "codex"}
+        with patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
+             patch.object(am, "_session_cap_modal", return_value=None), \
+             patch.object(am, "_session_cap_state", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "latest_jsonl_mtime", return_value=5000), \
+             patch.object(am, "_record_fire"), \
+             patch.object(am, "send_poke", return_value=True) as poke:
+            rc = am._dispatch_poke(
+                cfg, "orchestrator", "p1a", "PROMPT", self.tmp / "codex.json",
+                bounded_enabled=False, max_ineffective=1)
+        self.assertEqual(rc, 0)
+        poke.assert_called_once()
+
+    def test_runtime_lookup_uses_temp_record_and_fails_to_claude_default(self) -> None:
+        state = self.tmp / "active-runtime.json"
+        cfg = self._cfg()
+        cfg.pop("active_runtime_harness")
+        cfg["active_runtime_path"] = state
+        state.write_text(json.dumps({"runtime": "codex/interactive-chatgpt"}))
+        # T-5793: reads go through _seat_reader (SudoReader in prod); a local reader here.
+        local = patch.object(am, "_seat_reader", lambda: am.harness_idle.LocalReader())
+        local.start()
+        self.addCleanup(local.stop)
+        self.assertEqual(am._active_runtime_harness("orchestrator", cfg), "codex")
+        state.write_text("{malformed")
+        self.assertEqual(am._active_runtime_harness("orchestrator", cfg), "claude-code")
+        state.unlink()
+        self.assertEqual(am._active_runtime_harness("orchestrator", cfg), "claude-code")
 
     # -- suppression at/above the threshold ---------------------------------------
     def test_p1a_and_p1b_are_suppressed_at_99_in_both_modes(self) -> None:
@@ -4442,6 +4533,430 @@ class TestActionableRolePooledT5515(unittest.TestCase):
                 artisan = _scan_actionable_tickets(Path(d), frozenset({"artisan"}), "suborch2", ("active",))
         self.assertEqual((mason, artisan), (1, 0))
 
+
+# ---------------------------------------------------------------------------
+# T-5793 PR2: live-harness resolution through the cross-seat reader + --harness
+# ---------------------------------------------------------------------------
+
+
+class _DictReader:
+    """harness_idle/SudoReader-shaped fake keyed by path (no filesystem, no escalation)."""
+
+    def __init__(self, files):
+        self.files = files
+        self.calls = []
+
+    def read_text_head(self, account, path, max_bytes):
+        self.calls.append((account, path))
+        return self.files.get(path)
+
+    def read_text_tail(self, account, path, max_bytes):
+        return self.files.get(path)
+
+    def newest_files(self, account, root, min_depth, max_depth, suffix, n):
+        return None
+
+    def grep_tail(self, account, path, max_bytes, needles):
+        return None
+
+
+class ActiveRuntimeHarnessT5793(unittest.TestCase):
+    PDIR = "/home/suborch1/.local/state/pantheon/personas/mason"
+
+    def _cfg(self):
+        return {"tmux_target_pane": "suborch1-main:0", "sudo_user": "suborch1",
+                "jsonl_dir": Path("/x"), "pantheon_config_path": Path("/x")}
+
+    def _resolve(self, files):
+        reader = _DictReader(files)
+        with patch.object(am, "_seat_reader", lambda: reader):
+            return am._active_runtime_harness("mason", self._cfg()), reader
+
+    def test_cache_served_by_the_reader_resolves_codex(self):
+        got, reader = self._resolve({
+            f"{self.PDIR}/active-runtime.json": json.dumps({"runtime": "codex/interactive-chatgpt"})})
+        self.assertEqual(got, "codex")
+        self.assertIn(("suborch1", f"{self.PDIR}/active-runtime.json"), reader.calls,
+                      "read as the seat's own account (the 0600 file)")
+
+    def test_runtime_json_wins_over_the_cache(self):
+        got, _ = self._resolve({
+            f"{self.PDIR}/runtime-controller/runtime.json": json.dumps(
+                {"schema": "pantheon-runtime-state/v1", "harness": "codex"}),
+            f"{self.PDIR}/active-runtime.json": json.dumps({"runtime": "claude/x"})})
+        self.assertEqual(got, "codex")
+
+    def test_unreadable_state_falls_back_to_claude_code(self):
+        got, _ = self._resolve({})
+        self.assertEqual(got, "claude-code")
+
+    def test_declared_override_short_circuits(self):
+        reader = _DictReader({})
+        with patch.object(am, "_seat_reader", lambda: reader):
+            got = am._active_runtime_harness("mason", self._cfg() | {"active_runtime_harness": "codex"})
+        self.assertEqual((got, reader.calls), ("codex", []))
+
+
+class SendPokeHarnessT5793(unittest.TestCase):
+    def _cfg(self):
+        return {"tmux_target_pane": "suborch1-main:0", "sudo_user": "suborch1",
+                "pantheon_config_path": Path("/home/suborch1/pantheon-config")}
+
+    def _script(self, **kw):
+        with patch.object(am.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=0)
+            self.assertTrue(am.send_poke(self._cfg(), "PROMPT", **kw))
+        return run.call_args[0][0][5]
+
+    def test_codex_profile_reaches_the_helper(self):
+        script = self._script(harness="codex")
+        self.assertIn("send_keys_submit.sh --harness codex suborch1-main:0 PROMPT", script)
+
+    def test_default_profile_is_claude_code(self):
+        self.assertIn("--harness claude-code ", self._script())
+
+    def test_dispatch_poke_passes_the_resolved_harness(self):
+        with tempfile.TemporaryDirectory() as d, \
+             patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=True), \
+             patch.object(am, "_active_runtime_harness", return_value="codex"), \
+             patch.object(am, "_record_fire"), \
+             patch.object(am, "send_poke", return_value=True) as poke:
+            rc = am._dispatch_poke(self._cfg(), "mason", "p1b", "PROMPT", Path(d) / "s.json",
+                                   bounded_enabled=False, max_ineffective=1)
+        self.assertEqual(rc, 0)
+        self.assertEqual(poke.call_args.kwargs, {"harness": "codex"})
+
+
+
+# ---------------------------------------------------------------------------
+# T-5793 PR2 part 2: P1.b from session logs, interactive-await, pre-send pane gate
+# ---------------------------------------------------------------------------
+
+_HI_FIX = Path(__file__).resolve().parent / "fixtures" / "harness_idle"
+_PANES = Path(__file__).resolve().parent / "fixtures" / "codex_panes"
+_CODEX_IDLE_PANE = (_PANES / "watchman_idle_2026-10-15.txt").read_text(encoding="utf-8")
+_CODEX_UPDATE_MODAL = ("\n  ✨ Update available! 0.136.0 -> 0.146.1\n\n"
+                       "› 1. Update now (runs `npm install -g @openai/codex`)\n  2. Skip\n"
+                       "  3. Skip until next version\n\n  Press enter to continue\n")
+_MASON_HOME = "/home/suborch1"
+_MASON_PDIR = f"{_MASON_HOME}/.local/state/pantheon/personas/mason"
+_MASON_ROLLOUT = (f"{_MASON_HOME}/.codex/sessions/2026/10/28/"
+                  "rollout-2026-10-28T01-58-11-01a1803a-ae9e-7a33-8988-89e3ce3d3e07.jsonl")
+
+
+class _SeatReader:
+    """health_export.SudoReader-shaped fake keyed by path: no filesystem, no escalation."""
+
+    def __init__(self, files):
+        self.files = files  # path -> (mtime, text)
+
+    def newest_files(self, account, root, min_depth, max_depth, suffix, n):
+        prefix = root.rstrip("/") + "/"
+        rows = [(m, p) for p, (m, _t) in self.files.items()
+                if p.startswith(prefix) and p.endswith(suffix)
+                and min_depth <= p[len(prefix):].count("/") + 1 <= max_depth]
+        return sorted(rows, reverse=True)[:n] or None
+
+    def read_text_tail(self, account, path, max_bytes):
+        return self.files[path][1][-max_bytes:] if path in self.files else None
+
+    def read_text_head(self, account, path, max_bytes):
+        return self.files[path][1][:max_bytes] if path in self.files else None
+
+    def grep_tail(self, account, path, max_bytes, needles):
+        if path not in self.files:
+            return None
+        return [ln for ln in self.files[path][1][-max_bytes:].splitlines()
+                if any(n.decode() in ln for n in needles)]
+
+
+def _mason_cfg():
+    cfg = dict(am.AGENT_CONFIG["mason"])
+    cfg.pop("active_runtime_harness", None)
+    return cfg
+
+
+def _codex_seat_reader():
+    text = (_HI_FIX / "codex" / "idle.jsonl").read_text(encoding="utf-8")
+    t_end = max(am.harness_idle._parse_ts(json.loads(ln).get("timestamp"))
+                for ln in text.splitlines())
+    runtime = json.dumps({"schema": "pantheon-runtime-state/v1", "harness": "codex",
+                          "started_at": "2026-10-28T01:58:00Z"})
+    return _SeatReader({f"{_MASON_PDIR}/runtime-controller/runtime.json": (0, runtime),
+                        _MASON_ROLLOUT: (t_end, text)}), t_end
+
+
+def _reading(verdict, quiet=1800.0, harness="codex"):
+    return am.harness_idle.IdleReading(verdict, harness=harness, quiet_s=quiet, reason="t")
+
+
+class _LogModeCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        env = patch.dict(os.environ, {"ACTIVITY_MONITOR_IDLE_SOURCE": "log",
+                                      "PANTHEON_STATE_DIR": str(Path(self._tmp.name) / "state")})
+        env.start()
+        self.addCleanup(env.stop)
+
+    def _p1b_gates(self, *, queue=1):
+        """Gate-1 (the operator absent), queue, terminal ack and recent commit, all passing."""
+        stack = contextlib.ExitStack()
+        stack.enter_context(patch.object(am, "find_latest_jsonl", return_value=Path("/x.jsonl")))
+        stack.enter_context(patch.object(am, "latest_telegram_inbound_ts", return_value=None))
+        stack.enter_context(patch.object(am, "count_actionable_tickets", return_value=queue))
+        stack.enter_context(patch.object(am, "latest_terminal_state_ledger_ts_for_agent",
+                                         return_value=None))
+        stack.enter_context(patch.object(am, "agent_committed_recently", return_value=False))
+        return stack
+
+
+class P1bLogSourceT5793(_LogModeCase):
+    def test_codex_seat_with_idle_log_fires(self):
+        reader, t_end = _codex_seat_reader()
+        with self._p1b_gates(), \
+             patch.object(am, "_seat_reader", lambda: reader), \
+             patch.object(am.harness_idle, "time", MagicMock(time=lambda: t_end + 1000)), \
+             patch.object(am, "latest_assistant_ends_without_tool_use",
+                          side_effect=AssertionError("log mode must not use the Claude signal")):
+            self.assertTrue(am.check_p1b(_mason_cfg(), "", 900, agent="mason"))
+
+    def test_recent_codex_turn_end_does_not_fire(self):
+        reader, t_end = _codex_seat_reader()
+        with self._p1b_gates(), patch.object(am, "_seat_reader", lambda: reader), \
+             patch.object(am.harness_idle, "time", MagicMock(time=lambda: t_end + 600)):
+            self.assertFalse(am.check_p1b(_mason_cfg(), "", 900, agent="mason"))
+
+    def test_working_bg_wait_unknown_do_not_fire(self):
+        V = am.harness_idle.Verdict
+        for verdict in (V.WORKING, V.BG_WAIT, V.UNKNOWN):
+            with self.subTest(verdict=verdict), self._p1b_gates(), \
+                 patch.object(am, "p1b_idle_reading", return_value=_reading(verdict)):
+                self.assertFalse(am.check_p1b(_mason_cfg(), "", 900, agent="mason"))
+
+    def test_idle_below_the_quiet_floor_does_not_fire(self):
+        with self._p1b_gates(), patch.object(
+                am, "p1b_idle_reading", return_value=_reading(am.harness_idle.Verdict.IDLE, quiet=899)):
+            self.assertFalse(am.check_p1b(_mason_cfg(), "", 900, agent="mason"))
+
+    def test_other_gates_still_apply(self):
+        idle = _reading(am.harness_idle.Verdict.IDLE)
+        with self._p1b_gates(queue=0), patch.object(am, "p1b_idle_reading", return_value=idle):
+            self.assertFalse(am.check_p1b(_mason_cfg(), "", 900, agent="mason"))
+        with self._p1b_gates(), patch.object(am, "p1b_idle_reading", return_value=idle), \
+             patch.object(am, "agent_committed_recently", return_value=True):
+            self.assertFalse(am.check_p1b(_mason_cfg(), "", 900, agent="mason"))
+        with self._p1b_gates(), patch.object(am, "p1b_idle_reading", return_value=idle), \
+             patch.object(am, "latest_telegram_inbound_ts", return_value=int(time.time()) - 60):
+            self.assertFalse(am.check_p1b(_mason_cfg(), "", 900, agent="mason"))
+
+    def test_pane_lever_restores_both_old_signals(self):
+        with patch.dict(os.environ, {"ACTIVITY_MONITOR_IDLE_SOURCE": "pane"}), self._p1b_gates(), \
+             patch.object(am, "p1b_idle_reading",
+                          side_effect=AssertionError("pane mode must not read the log")), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=False), \
+             patch.object(am, "latest_assistant_interactive_tool_use", return_value="AskUserQuestion"):
+            self.assertTrue(am.check_p1b(_mason_cfg(), "", 900, agent="mason"),
+                            "Signal 2 still pokes under the lever (old behaviour)")
+        with patch.dict(os.environ, {"ACTIVITY_MONITOR_IDLE_SOURCE": "pane"}), self._p1b_gates(), \
+             patch.object(am, "latest_assistant_ends_without_tool_use", return_value=True), \
+             patch.object(am, "latest_assistant_interactive_tool_use", return_value=None):
+            self.assertTrue(am.check_p1b(_mason_cfg(), "", 900, agent="mason"))
+
+    def test_lever_parsing(self):
+        for raw, want in (("log", "log"), (" PANE ", "pane"), ("bogus", "log"), ("", "log")):
+            with patch.dict(os.environ, {"ACTIVITY_MONITOR_IDLE_SOURCE": raw}):
+                self.assertEqual(am.idle_source(), want)
+
+    def test_end_to_end_codex_idle_log_pokes_with_codex_profile(self):
+        """check_p1b -> _dispatch_poke: the codex seat is resolved through the same
+        reader, the pane gate passes on a codex idle pane, and the helper gets codex."""
+        reader, t_end = _codex_seat_reader()
+        cfg = _mason_cfg()
+        with self._p1b_gates(), \
+             patch.object(am, "_seat_reader", lambda: reader), \
+             patch.object(am.harness_idle, "time", MagicMock(time=lambda: t_end + 1000)), \
+             patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
+             patch.object(am, "capture_pane", return_value=_CODEX_IDLE_PANE), \
+             patch.object(am, "_record_fire"), \
+             patch.object(am.subprocess, "run") as run:
+            run.return_value = MagicMock(returncode=0)
+            self.assertTrue(am.check_p1b(cfg, "", 900, agent="mason"))
+            rc = am._dispatch_poke(cfg, "mason", "p1b", "PROMPT", Path(self._tmp.name) / "s.json",
+                                   bounded_enabled=False, max_ineffective=1)
+        self.assertEqual(rc, 0)
+        script = run.call_args[0][0][5]
+        self.assertIn("send_keys_submit.sh --harness codex suborch1-main:0 PROMPT", script)
+
+
+class PreSendPaneGateT5793(_LogModeCase):
+    def _dispatch(self, pane, *, bounded=False, modal=None, harness="claude-code"):
+        with patch.object(am, "_flush_stuck_poke", return_value=False), \
+             patch.object(am, "_pane_idle_probe", return_value=None), \
+             patch.object(am, "_active_runtime_harness", return_value=harness), \
+             patch.object(am, "capture_pane", return_value=pane), \
+             patch.object(am, "_session_cap_modal", return_value=modal), \
+             patch.object(am, "_session_cap_state", return_value=None), \
+             patch.object(am, "_session_cyber_blocked", return_value=False), \
+             patch.object(am, "latest_jsonl_activity", return_value=5000), \
+             patch.object(am, "send_modal_confirm", return_value=True) as confirm, \
+             patch.object(am, "_record_fire") as fire, \
+             patch.object(am, "send_poke", return_value=True) as poke:
+            rc = am._dispatch_poke(_mason_cfg(), "mason", "p1b", "PROMPT",
+                                   Path(self._tmp.name) / "s.json",
+                                   bounded_enabled=bounded, max_ineffective=1)
+        return rc, poke, confirm, fire
+
+    def test_unknown_pane_now_defers_the_text_poke(self):
+        for bounded in (False, True):
+            for pane in (None, "random\nlines\nno sentinels"):
+                with self.subTest(bounded=bounded, pane=pane):
+                    rc, poke, _c, fire = self._dispatch(pane, bounded=bounded)
+                    self.assertEqual(rc, 0)
+                    poke.assert_not_called()
+                    fire.assert_called_with("mason", "p1b", deferred=True)
+
+    def test_codex_modal_pane_defers(self):
+        rc, poke, _c, _f = self._dispatch(_CODEX_IDLE_PANE + _CODEX_UPDATE_MODAL, harness="codex")
+        self.assertEqual(rc, 0)
+        poke.assert_not_called()
+
+    def test_injectable_pane_pokes_with_the_harness(self):
+        rc, poke, _c, _f = self._dispatch(_CODEX_IDLE_PANE, harness="codex")
+        self.assertEqual(rc, 0)
+        self.assertEqual(poke.call_args.kwargs, {"harness": "codex"})
+
+    def test_cap_modal_still_reaches_the_t1369_confirm(self):
+        # The cap modal pane is not inject-safe, but the confirm branch runs before the
+        # pre-send gate, so the T-1369 Enter-confirm still happens.
+        rc, poke, confirm, _f = self._dispatch(None, bounded=True, modal=am.MODAL_SAFE)
+        self.assertEqual(rc, 0)
+        confirm.assert_called_once()
+        poke.assert_not_called()
+
+    def test_pane_lever_skips_the_gate(self):
+        with patch.dict(os.environ, {"ACTIVITY_MONITOR_IDLE_SOURCE": "pane"}):
+            rc, poke, _c, _f = self._dispatch(None)
+        self.assertEqual(rc, 0)
+        poke.assert_called_once()
+
+    def test_p1d_retry_inject_defers_on_an_unsafe_pane(self):
+        with patch.object(am, "check_p1b_interactive", return_value=None), \
+             patch.object(am, "check_p1a", return_value=False), \
+             patch.object(am, "check_p1b", return_value=False), \
+             patch.object(am, "check_p1d", return_value=True), \
+             patch.object(am, "_active_runtime_harness", return_value="claude-code"), \
+             patch.object(am, "capture_pane", return_value=None), \
+             patch.object(am, "_record_fire") as fire, \
+             patch.object(am, "send_poke", return_value=True) as poke:
+            rc = main(["--agent", "mason"])
+        self.assertEqual(rc, 0)
+        poke.assert_not_called()
+        fire.assert_called_with("mason", "p1d", deferred=True)
+
+
+class InteractiveAwaitT5793(_LogModeCase):
+    NOW = 2_000_000_000.0
+
+    def _rec(self, kind, age, **extra):
+        ts = datetime.fromtimestamp(self.NOW - age, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%S.000Z")
+        return {"type": kind, "timestamp": ts, **extra}
+
+    def _ask(self, age, name="AskUserQuestion"):
+        return self._rec("assistant", age, message={"content": [
+            {"type": "tool_use", "name": name, "input": {}}]})
+
+    def test_pure_detection(self):
+        f = am.interactive_await_tool
+        self.assertEqual(f([self._ask(1000)], self.NOW), "AskUserQuestion")
+        self.assertEqual(f([self._ask(1000, "EnterPlanMode"), {"type": "ai-title"}], self.NOW),
+                         "EnterPlanMode")
+        answered = [self._ask(1000), self._rec("user", 900, message={"content": [
+            {"type": "tool_result"}]})]
+        self.assertIsNone(f(answered, self.NOW))
+        self.assertIsNone(f([self._ask(60)], self.NOW), "too recent")
+        self.assertIsNone(f([self._ask(1000, "Bash")], self.NOW))
+        self.assertIsNone(f([self._rec("system", 10, subtype="turn_duration")], self.NOW))
+        self.assertIsNone(f([], self.NOW))
+
+    def _check(self, files, *, harness="claude-code", inbound=None):
+        reader = _SeatReader(files)
+        with patch.object(am, "_seat_reader", lambda: reader), \
+             patch.object(am, "_active_runtime_harness", return_value=harness), \
+             patch.object(am, "find_latest_jsonl", return_value=Path("/x.jsonl")), \
+             patch.object(am, "latest_telegram_inbound_ts", return_value=inbound):
+            return am.check_p1b_interactive(_mason_cfg(), 900, agent="mason", now=self.NOW)
+
+    def _transcript(self):
+        path = str(am.AGENT_CONFIG["mason"]["jsonl_dir"] / "11111111-0000-4000-8000-000000000000.jsonl")
+        text = "".join(json.dumps(r) + "\n" for r in (
+            self._rec("user", 2000, turnOrigin="human"), self._ask(1000)))
+        return {path: (self.NOW - 1000, text)}
+
+    def test_check_reads_the_claude_transcript_through_the_reader(self):
+        self.assertEqual(self._check(self._transcript()), "AskUserQuestion")
+
+    def test_codex_runtime_has_no_interactive_await(self):
+        self.assertIsNone(self._check(self._transcript(), harness="codex"))
+
+    def test_operator_present_does_not_escalate(self):
+        self.assertIsNone(self._check(self._transcript(), inbound=int(self.NOW) - 60))
+
+    def _main(self, tool, alerts):
+        with patch.object(am, "check_p1b_interactive", return_value=tool), \
+             patch.object(am, "check_p1a", return_value=False), \
+             patch.object(am, "check_p1b", return_value=False), \
+             patch.object(am, "check_p1d", return_value=False), \
+             patch.object(am, "count_actionable_tickets",
+                          side_effect=AssertionError("interactive-await is not queue-gated")), \
+             patch.object(am, "_route_failure_alert", side_effect=lambda a, m, v: alerts.append((a, v, m))), \
+             patch.object(am, "send_poke", side_effect=AssertionError("never poke a live menu")):
+            return main(["--agent", "mason"])
+
+    def test_escalates_once_per_blocked_episode_and_rearms(self):
+        alerts = []
+        with patch.dict(os.environ, {"ACTIVITY_MONITOR_COOLDOWN_SECONDS": "0"}):
+            self.assertEqual(self._main("AskUserQuestion", alerts), 0)
+            self.assertEqual(self._main("AskUserQuestion", alerts), 0)
+            self.assertEqual(len(alerts), 1, "transition-bounded: one alert per episode")
+            agent, vocab, msg = alerts[0]
+            self.assertEqual((agent, vocab), ("mason", "interactive-await"))
+            self.assertIn("mason", msg)
+            self.assertIn("AskUserQuestion", msg)
+            self._main(None, alerts)  # cleared: re-armed, nothing sent
+            self.assertEqual(len(alerts), 1)
+            state = am.read_poke_state(am._state_path_for_agent("mason"))
+            self.assertNotIn("escalated", state)
+            self._main("EnterPlanMode", alerts)  # a new episode alerts again
+        self.assertEqual(len(alerts), 2)
+        self.assertIn("EnterPlanMode", alerts[1][2])
+
+    def test_fire_is_recorded_under_the_vocab(self):
+        with patch.dict(os.environ, {"ACTIVITY_MONITOR_COOLDOWN_SECONDS": "0"}), \
+             patch.object(am, "_record_fire") as fire:
+            self._main("AskUserQuestion", [])
+        fire.assert_any_call("mason", "interactive-await")
+
+    def test_p1b_off_switch_and_pane_lever_skip_the_escalation(self):
+        for env in ({"ACTIVITY_MONITOR_P1B_ENABLED": "0"}, {"ACTIVITY_MONITOR_IDLE_SOURCE": "pane"}):
+            alerts = []
+            with self.subTest(env=env), patch.dict(os.environ, env), \
+                 patch.object(am, "check_p1b_interactive",
+                              side_effect=AssertionError("not consulted")), \
+                 patch.object(am, "check_p1a", return_value=False), \
+                 patch.object(am, "check_p1b", return_value=False), \
+                 patch.object(am, "check_p1d", return_value=False), \
+                 patch.object(am, "_route_failure_alert", side_effect=lambda *a: alerts.append(a)):
+                self.assertEqual(main(["--agent", "mason"]), 0)
+            self.assertEqual(alerts, [])
+
+    def test_vocab_is_registered_with_the_drift_check(self):
+        from tools import activity_monitor_drift_check as dc
+        self.assertIn(am.INTERACTIVE_AWAIT_VOCAB, dc.KNOWN_PREDICATES)
+
+
 if __name__ == "__main__":
     unittest.main()
-

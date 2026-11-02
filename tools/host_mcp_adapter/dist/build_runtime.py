@@ -197,11 +197,15 @@ def build(
         raise BuildError("refusing to build over an existing artifact")
     venv = prefix / "venv"
     prefix.mkdir(parents=True)
-    subprocess.run([python, "-m", "venv", "--without-pip", str(venv)], check=True)
+    # -I on EVERY child interpreter (T-2920 U3a, Recovery D15 condition f): with -m and
+    # no -I, sys.path[0] is the inherited cwd, so a planted venv/ or pip/ package
+    # there would run as the (root) builder.
+    subprocess.run([python, "-I", "-m", "venv", "--without-pip", str(venv)], check=True)
     venv_python = venv / "bin" / "python3"
     result = subprocess.run(
         [
             python,
+            "-I",
             "-m",
             "pip",
             "--python",

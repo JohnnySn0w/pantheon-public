@@ -191,10 +191,19 @@ persona_installer:
     # runtime_viability_blocked on a live pane; the two wakers are serialized
     # by <box>/.wake.lock (T-5283). Absent => empty set; a persona on both
     # lists is a manifest error.
-    wake_timer_secondary_personas: [artisan, specialist, recovery, mason]
+    wake_timer_secondary_personas: [artisan, specialist, recovery, mason, watchman]
   systemd:
     service_template: tools/systemd/pantheon-persona-consume@.service
     timer_template: tools/systemd/pantheon-persona-consume@.timer
+  # T-4679: Recovery owns the eventual fleet audit.  Installation is convergent
+  # but activation stays an explicit, reversible operator action after the
+  # supervised first-fire; ordinary convergence preserves that later choice.
+  mcp_allowlist_audit:
+    owner_persona: recovery
+    activation: operator-managed
+    authority: tools/mcp_allowlist.yaml
+    service_template: tools/systemd/pantheon-mcp-allowlist-audit.service
+    timer_template: tools/systemd/pantheon-mcp-allowlist-audit.timer
   quota_check:
     cadence_minutes: 30
     randomized_delay_seconds: 300
@@ -296,6 +305,17 @@ persona_installer:
         watchdog_units:
           - recovery-telegram-child-watchdog.timer
           - recovery-telegram-child-watchdog.service
+      archivist:
+        account: exocortex
+        claude_receiver_topology: runtime-owned
+        claude_receiver_unit: claude-telegram-exocortex.service
+        tmux_session: claude-telegram-bot-exocortex
+        tmux_pane: "0.0"
+        codex_receiver_unit: codex-telegram-poller.service
+        credential_env: .claude/channels/telegram/.env
+        state_dir: .config/codex-telegram
+        release_root: .local/lib/codex-telegram
+        mcp_name: telegram
   codex_standing_instructions:
     schema: pantheon-codex-standing-instructions/v1
     personas:
@@ -335,6 +355,18 @@ persona_installer:
           - /home/codex/codex-config/AGENTS.md
         identity: head-system-orchestrator
         canonical_source_of_truth: /home/claude-fallback/CLAUDE.md
+      archivist:
+        source_repo: pantheon-config
+        source: pinned-rules/archivist-codex.md
+        source_commit: f38343544b8193e93da1f9132faaa5e0065755b3
+        source_sha256: 12d94ff88435ad20c8c57861f132dbc39a890664a876ba5fad6d80410519f4bd
+        target: .codex/AGENTS.md
+        override_target: .codex/AGENTS.override.md
+        override_must_be_absent: true
+        forbidden_source_paths:
+          - /home/codex/codex-config/AGENTS.md
+        identity: head-memory-orchestrator
+        canonical_source_of_truth: /home/exocortex/CLAUDE.md
   # Claude-Code-side (user-scope) MCP servers (T-3559). D1 = user-scope
   # (~/.claude.json top-level mcpServers, cwd-independent); D2 = provisioned via
   # the `claude mcp add-json/remove --scope user` CLI (Claude's own race-free
@@ -441,8 +473,6 @@ harness_runtime:
     head-engineering-orchestrator:
       fallbacks:
         - codex/interactive-chatgpt
-      # T-5446: fleet policy applies regardless; this key is a deprecated no-op, removed in Phase B (T-5460).
-      fallback_return: true
       tmux:
         session: claude-telegram-bot
       post_start:
@@ -495,8 +525,6 @@ harness_runtime:
     specialist:
       fallbacks:
         - codex/interactive-chatgpt
-      # T-5446: fleet policy applies regardless; this key is a deprecated no-op, removed in Phase B (T-5460).
-      fallback_return: true
       # T-2633: CUTOVER COMPLETE -- pantheon-persona-consume@specialist.timer is ENABLED +
       # LIVE (verified 2026-08-10 via the enabled-timer symlink check). resolve_controller_config /
       # resolve_launch_config for role=specialist have exactly one production
@@ -560,8 +588,7 @@ harness_runtime:
       # timer); nothing else resolves this role at runtime. (Was "inert on disk until
       # fire" pre-cutover; the T-2590 cutover has since enabled the timer.)
       # T-5446 (the operator TG 12283): recovery returns to claude like every seat; the T-4522 off-state is
-      # superseded. Deprecated no-op, removed in Phase B (T-5460).
-      fallback_return: true
+      # superseded (fleet policy, no per-role key).
       tmux:
         session: claude-telegram-bot-fallback
       post_start:
@@ -607,9 +634,6 @@ harness_runtime:
       # (one line to the operator per swap, T-4804), and it returns to claude once claude is
       # viable again. mason is a non-comms, controller-managed seat
       # (pantheon-runtime-controller@mason running controller-main since 2026-10-13).
-      # T-5446: fleet policy applies regardless; this key is a deprecated no-op, removed in Phase B (T-5460).
-      mid_session_cap_swap: true
-      fallback_return: true
       # T-2677: brought onto the consume control plane 2026-08-08 (operator-directed,
       # TG 7340/7343 pre-auth, mason as the canary). MAILBOX-FIRST seat -- NO telegram
       # channel (unlike specialist/head-system-orchestrator), so `native` carries no `channels`
@@ -679,11 +703,13 @@ harness_runtime:
       # T-5063 (hand-move staging, commit A; inert while archivist runs bespoke under
       # claude-telegram-exocortex.service, since persona_bringup is the only runtime
       # reader). Mirrors her live exo-bot-supervise.sh argv so the controller launch
-      # keeps her Telegram chat with the operator. Claude-only for now: no codex fallback
-      # (a codex runtime has no Telegram, and her receiver is runtime-owned), so
-      # swap-on-death relaunches claude. Adding a fallback is a separate decision.
-      # Rollback: revert this stanza (nothing reads it until the consume timer is on).
-      fallbacks: []
+      # keeps her Telegram chat with the operator. T-5744 adds the provisioned Codex
+      # receiver and fallback so a confirmed Claude provider cap preserves her
+      # work queue instead of parking until reset (the operator TG 9008/9009).
+      # Rollback: revert this stanza and reconverge the receiver before the next
+      # controller cycle; the consume timer is live.
+      fallbacks:
+        - codex/interactive-chatgpt
       tmux:
         # Keep the bespoke session name so restart_pane, mailbox_wake AGENT_PANE and
         # the wake-timer pane keep resolving (same convention as orchestrator and recovery).
@@ -702,6 +728,14 @@ harness_runtime:
           channels: plugin:telegram@claude-plugins-official
           # T-4653: medium on every Claude seat (the operator TG 10756).
           effort: medium
+      codex:
+        profile: interactive-chatgpt
+        model: gpt-5.6-sol
+        native:
+          sandbox: danger-full-access
+          config_overrides:
+            approval_policy: never
+            model_reasoning_effort: high
     system-orchestrator-1:
       # T-4884 B6 (design §3): Watchman is codex-primary with NO fallback today;
       # falling back onto Claude would defeat the seat's purpose. A third service
@@ -737,6 +771,7 @@ roles:
                                         # subscription via OAuth. T-3751 tranche 2 amendment
                                         # 2026-09-16.
     persona_brief_ref: CLAUDE.md
+    legacy_units: [ho-resumer]   # T-5633: only seat that ever had ho-resumer (removed T-5435); plan keeps its decommission so a pre-T-5435 restore stays guarded
     token_ref: /home/claude/gh_token.env            # fine-grained PAT, HTTPS git + gh CLI (ref, not secret)
     session: pantheon-runtime-controller@orchestrator.service + pantheon-persona-consume@orchestrator.timer → tmux claude-telegram-bot:0 (window "harness")
     # Structured restart config (T-2076) — the fleet monitors read THESE, not the
@@ -875,6 +910,9 @@ roles:
     persona: codex
     account: codex
     harness: codex
+    # T-5748: the installer replaces this bespoke cadence with the shared,
+    # harness-aware pantheon-keep-going@codex timer; never leave both armed.
+    legacy_units: [codex-keep-going]
     billing_model: subscription-oauth   # ORG-099 axis billing-model-declared; ChatGPT OAuth
                                         # via codex-cli. Note: not a claude subscription — same
                                         # meter-shape family (subscription, not api-key). T-3751
@@ -912,7 +950,12 @@ roles:
     token_ref: ~/.ssh/pantheon_config_deploy (per-repo deploy key)   # verify — inferred from
                # identical ORG-043 seat provisioning, NOT checked on mason's account (his box,
                # his to confirm; T-1922 deliberately did not probe it)
-    session: tmux (seat session; name unverified)                    # verify
+    session: pantheon-runtime-controller@mason.service + pantheon-persona-consume@mason.timer → tmux suborch1-main:0 (window "harness"; verified 2026-11-01, T-5698)
+    # T-5698: restart_service deliberately ABSENT (watchman's shape): agent_role_map.restart_target
+    # derives the control-plane identity, and an explicit value would arm restart_drain here.
+    restart_mode: user
+    restart_pane: suborch1-main:0
+    supervisor: control-plane
     domain: engineering-orchestrator seat — owns project arcs retasked by the HO under ORG-043; drives
             # them with its own subagent teams; no operator-facing surface (all comms via mailbox)
   engineering-orchestrator-2:

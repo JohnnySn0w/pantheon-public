@@ -14,6 +14,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -479,6 +480,64 @@ class OutputTests(unittest.TestCase):
             self.assertTrue((Path(d) / "recovery.json").exists())
 
 
+class PruneRetiredRecordsT5836Tests(unittest.TestCase):
+    """T-5836: retired exporter-owned records are pruned; nothing else is touched."""
+
+    PERSONAS = [("recovery", "claude-fallback", "recovery-pane:0"), ("specialist", "claude-research", None)]
+
+    @staticmethod
+    def _retired(d: Path, persona: str = "the-ancestor") -> Path:
+        p = d / f"{persona}.json"
+        p.write_text(json.dumps({"schema_version": 1, "persona": persona, "account": persona,
+                                 "exported_at": 1792994838, "runtime": None}) + "\n")
+        return p
+
+    def test_retired_record_pruned_current_and_aux_files_kept(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            self._retired(d)
+            (d / "fleet-health.json").write_text(json.dumps({"schema": "x", "schema_version": 1,
+                                                               "entries": [], "collected_at": 1}))
+            (d / "notes.json").write_text(json.dumps({"hello": "world"}))
+            (d / "impostor.json").write_text(json.dumps({"schema_version": 1, "persona": "someone-else",
+                                                          "account": "x", "exported_at": 1}))
+            target = d / "kept-target.txt"
+            target.write_text("x")
+            (d / "linked.json").symlink_to(target)
+            rc = he.run(self.PERSONAS, reader=_happy_reader(), out_dir=d, now=NOW, hub=HUB)
+            self.assertEqual(rc, 0)
+            names = set(os.listdir(d))
+            self.assertNotIn("the-ancestor.json", names)
+            for kept in ("recovery.json", "specialist.json", "_exporter.json", "fleet-health.json",
+                         "notes.json", "impostor.json", "linked.json", "kept-target.txt"):
+                self.assertIn(kept, names, kept)
+
+    def test_empty_current_set_prunes_nothing(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            p = self._retired(d)
+            self.assertEqual(he.prune_retired_records(d, set()), [])
+            self.assertTrue(p.exists())
+
+    def test_partial_collection_prunes_nothing(self):
+        # A persona whose record fails the schema this run must not make others look retired.
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            p = self._retired(d)
+            real = he.sanitize
+            with unittest.mock.patch.object(
+                    he, "sanitize", side_effect=lambda r: None if r.get("persona") == "specialist" else real(r)):
+                he.run(self.PERSONAS, reader=_happy_reader(), out_dir=d, now=NOW, hub=HUB)
+            self.assertTrue(p.exists())
+
+    def test_mass_prune_is_refused(self):
+        with tempfile.TemporaryDirectory() as td:
+            d = Path(td)
+            olds = [self._retired(d, f"old-{i}") for i in range(3)]
+            self.assertEqual(he.prune_retired_records(d, {"recovery", "specialist"}), [])
+            self.assertTrue(all(p.exists() for p in olds))
+
+
 class PersonaEnumerationTests(unittest.TestCase):
     def test_enumerates_manifest_personas_with_accounts(self):
         personas = he.fleet_personas()
@@ -567,6 +626,241 @@ class SeatStateExportTests(unittest.TestCase):
         self.assertEqual((s["seat_state"], s["expected_down"]), ("active", False))
         s = he.sanitize({**base, "seat_state": "bogus", "expected_down": "yes"})
         self.assertEqual((s["seat_state"], s["expected_down"]), ("active", False))
+
+
+_SEAT_KEYS = ("seat_owner", "seat_reason", "seat_expires", "seat_indefinite",
+              "seat_set_age_s", "seat_indefinite_stale")
+_INACTIVE = {"seat_owner": None, "seat_reason": None, "seat_expires": None,
+             "seat_indefinite": False, "seat_set_age_s": None, "seat_indefinite_stale": False}
+
+
+def _iso(epoch: int) -> str:
+    import datetime as _dt
+    return _dt.datetime.fromtimestamp(epoch, _dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class SeatStateDetailExportTests(unittest.TestCase):
+    """ORG-106 L4b leg 1 (T-5528): owner/reason/expiry/no-expiry age on the per-seat record."""
+
+    def _rec(self, text=None, raw=False):
+        r = _happy_reader()
+        if text is not None:
+            r.tails[("claude-fallback", _SEAT_PATH)] = text
+        rec = _collect(r)
+        return rec if raw else he.sanitize(rec)
+
+    def _detail(self, rec):
+        return {k: rec[k] for k in _SEAT_KEYS}
+
+    def test_fields_registered_in_order(self):
+        self.assertEqual(he.FIELDS[-6:], _SEAT_KEYS)
+        self.assertEqual(set(self._rec(raw=True)), set(he.FIELDS))
+
+    def test_no_record_all_null_false(self):
+        self.assertEqual(self._detail(self._rec()), _INACTIVE)
+
+    def test_paused_with_expiry(self):
+        rec = self._rec(_seat_doc(state="paused-intake", phase="set", reason="vacation",
+                                  owner="role:head_engineering_orchestrator"))
+        self.assertEqual(self._detail(rec), {
+            "seat_owner": "role:head_engineering_orchestrator", "seat_reason": "vacation",
+            "seat_expires": "2027-02-01T00:00:00Z", "seat_indefinite": False,
+            "seat_set_age_s": 8 * 3600, "seat_indefinite_stale": False})
+
+    def test_deep_sleep_asleep_and_draining(self):
+        for phase, down in (("asleep", True), ("draining", False)):
+            rec = self._rec(_seat_doc(phase=phase))
+            self.assertEqual((rec["seat_state"], rec["expected_down"]), ("deep-sleep", down))
+            self.assertEqual(rec["seat_owner"], "operator")
+            self.assertEqual(rec["seat_expires"], "2027-02-01T00:00:00Z")
+
+    def test_indefinite_fresh(self):
+        rec = self._rec(_seat_doc(state="paused-intake", phase="set", expires=None))
+        self.assertEqual((rec["seat_indefinite"], rec["seat_expires"], rec["seat_indefinite_stale"]),
+                         (True, None, False))
+
+    def test_indefinite_stale_threshold(self):
+        week = 7 * 86400
+        for age, stale in ((week - 1, False), (week, True), (week + 5, True)):
+            rec = self._rec(_seat_doc(state="paused-intake", phase="set", expires=None,
+                                      set_ts=_iso(NOW - age)))
+            self.assertEqual((rec["seat_set_age_s"], rec["seat_indefinite_stale"]), (age, stale))
+
+    def test_expiring_pause_never_stale(self):
+        rec = self._rec(_seat_doc(state="paused-intake", phase="set", set_ts=_iso(NOW - 30 * 86400)))
+        self.assertEqual((rec["seat_indefinite"], rec["seat_indefinite_stale"]), (False, False))
+
+    def test_age_clamped_low_and_high(self):
+        rec = self._rec(_seat_doc(set_ts=_iso(NOW + 3600)))
+        self.assertEqual(rec["seat_set_age_s"], 0)
+        rec = self._rec(_seat_doc(state="paused-intake", phase="set", expires=None,
+                                  set_ts="1990-01-01T00:00:00Z"))
+        self.assertEqual(rec["seat_set_age_s"], he._MAX_AGE_S)
+        self.assertTrue(rec["seat_indefinite_stale"])
+
+    def test_expired_and_malformed_are_active_null(self):
+        for text in (_seat_doc(expires="2020-01-01T00:00:00Z"), "{nope", "[]",
+                     _seat_doc(set_ts="garbage"), _seat_doc(reason="")):
+            self.assertEqual(self._detail(self._rec(text)), _INACTIVE, text)
+
+    def test_hostile_reason_printable_capped_not_escaped(self):
+        rec = self._rec(_seat_doc(reason="<script>&\"'" + "x" * 150))
+        self.assertTrue(rec["seat_reason"].startswith("<script>&\"'"))
+        self.assertNotIn("&amp;", rec["seat_reason"])
+        self.assertTrue(rec["seat_reason"].isprintable())
+        self.assertLessEqual(len(rec["seat_reason"]), 200)
+        # control chars: the validator rejects them (record -> active); the helper strips anyway
+        self.assertEqual(self._detail(self._rec(_seat_doc(reason="a\x00b"))), _INACTIVE)
+        self.assertEqual(he._seat_reason("a\x00b\x1bc" + "y" * 400), "abc" + "y" * 197)
+        self.assertIsNone(he._seat_reason("\x00\x01"))
+        self.assertIsNone(he._seat_reason(5))
+
+    def test_owner_validation(self):
+        self.assertEqual(he._seat_owner("specialist"), "specialist")
+        self.assertEqual(he._seat_owner("m\u00e9tis"), "m\u00e9tis")
+        for bad in ("", "a b", "a\tb", "x" * 81, "a\x00", 5, None):
+            self.assertIsNone(he._seat_owner(bad), repr(bad))
+        self.assertEqual(he._seat_owner("x" * 80), "x" * 80)
+
+    def test_missing_owner_is_null(self):
+        doc = json.loads(_seat_doc())
+        del doc["owner"]
+        rec = self._rec(json.dumps(doc))
+        self.assertEqual((rec["seat_state"], rec["seat_owner"]), ("deep-sleep", None))
+
+    def _base(self, **over):
+        base = self._rec(_seat_doc(state="paused-intake", phase="set", expires=None))
+        return he.sanitize({**base, **over})
+
+    def test_sanitize_rejects_bad_fields(self):
+        cases = {
+            "seat_owner": ("a b", 7, "x" * 81, ""),
+            "seat_reason": (7, "", ["x"]),
+            "seat_expires": ("2027-02-01T00:00:00Z\n", "tomorrow", 5, "2027-02-01T00:00:00"),
+            "seat_set_age_s": (-1, True, "5", 1.5, he._MAX_AGE_S + 1),
+        }
+        for key, bads in cases.items():
+            for bad in bads:
+                self.assertIsNone(self._base(**{key: bad})[key], (key, bad))
+        for bad in ("yes", 1, None):
+            self.assertIs(self._base(seat_indefinite=bad)["seat_indefinite"], False)
+
+    def test_sanitize_oversize_reason_capped_and_ctrl_stripped(self):
+        s = self._base(seat_reason="a\x00" + "b" * 500)
+        self.assertEqual(s["seat_reason"], "a" + "b" * 199)
+
+    def test_sanitize_age_bound_inclusive(self):
+        self.assertEqual(self._base(seat_set_age_s=he._MAX_AGE_S)["seat_set_age_s"], he._MAX_AGE_S)
+        self.assertEqual(self._base(seat_set_age_s=0)["seat_set_age_s"], 0)
+
+    def test_sanitize_recomputes_stale(self):
+        s = self._base(seat_set_age_s=60, seat_indefinite_stale=True)
+        self.assertIs(s["seat_indefinite_stale"], False)
+        s = self._base(seat_set_age_s=7 * 86400, seat_indefinite_stale=False)
+        self.assertIs(s["seat_indefinite_stale"], True)
+        s = self._base(seat_indefinite=False, seat_set_age_s=9 * 86400, seat_indefinite_stale=True)
+        self.assertIs(s["seat_indefinite_stale"], False)
+
+    def test_sanitize_active_forces_all_null(self):
+        base = he.sanitize(_collect(_happy_reader()))
+        s = he.sanitize({**base, "seat_owner": "x", "seat_reason": "r", "seat_expires": "2027-02-01T00:00:00Z",
+                         "seat_indefinite": True, "seat_set_age_s": 9 * 86400, "seat_indefinite_stale": True})
+        self.assertEqual(self._detail(s), _INACTIVE)
+
+    def test_sanitize_expected_down_only_for_deep_sleep(self):
+        s = self._base(expected_down=True)
+        self.assertEqual((s["seat_state"], s["expected_down"]), ("paused-intake", False))
+        base = self._rec(_seat_doc())
+        self.assertIs(he.sanitize({**base})["expected_down"], True)
+
+    def test_sanitize_old_exporter_record_without_keys(self):
+        base = self._rec(_seat_doc())
+        old = {k: v for k, v in base.items() if k not in _SEAT_KEYS}
+        s = he.sanitize(old)
+        self.assertEqual(self._detail(s), _INACTIVE)
+        self.assertEqual(s["seat_state"], "deep-sleep")
+
+    def test_record_is_ascii_json_serialisable(self):
+        rec = self._rec(_seat_doc(reason="caf\u00e9 \u2603"))
+        self.assertEqual(rec["seat_reason"], "caf\u00e9 \u2603")
+        json.dumps(rec, ensure_ascii=True).encode("ascii")
+
+
+
+class SudoReaderSeamT5793Tests(unittest.TestCase):
+    """T-5793: the harness_idle reader seam on SudoReader. argv-only and bounded; the
+    runner (subprocess.run) is stubbed, so nothing escalates or reads a real file."""
+
+    def _reader(self, stdout="", rc=0, self_account="recovery-seat"):
+        r = he.SudoReader()
+        r.self_account = self_account
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append((argv, kw))
+            from unittest import mock as _m
+            return _m.Mock(returncode=rc, stdout=stdout)
+
+        return r, calls, fake_run
+
+    def test_read_text_head_cross_account_argv(self):
+        r, calls, fake = self._reader(stdout='{"type":"session_meta"}\n')
+        with unittest.mock.patch.object(he.subprocess, "run", side_effect=fake):
+            out = r.read_text_head("codex-seat", "/home/codex-seat/x.jsonl", 65536)
+        self.assertEqual(out, '{"type":"session_meta"}\n')
+        argv, kw = calls[0]
+        self.assertEqual(argv, ["sudo", "-n", "-u", "codex-seat",
+                                "head", "-c", "65536", "--", "/home/codex-seat/x.jsonl"])
+        self.assertIsInstance(argv, list)  # argv, never a shell string
+        self.assertNotIn("shell", kw)
+
+    def test_same_account_reads_skip_the_escalation_prefix(self):
+        r, calls, fake = self._reader(stdout="x", self_account="codex-seat")
+        with unittest.mock.patch.object(he.subprocess, "run", side_effect=fake):
+            r.read_text_head("codex-seat", "/p", 10)
+        self.assertEqual(calls[0][0], ["head", "-c", "10", "--", "/p"])
+
+    def test_grep_tail_is_one_bounded_tail_with_python_prefilter(self):
+        body = "".join([
+            'partial-line-cut-by-tail "backgroundTaskId":"zzz"}\n',
+            '{"type":"user","toolUseResult":{"backgroundTaskId":"b1"}}\n',
+            '{"type":"assistant","message":{}}\n',
+            '{"type":"attachment","attachment":{"prompt":"<task-id>b1</task-id>"}}\n',
+        ])
+        cap = len(body.encode())  # the read filled the window -> first line is cut
+        r, calls, fake = self._reader(stdout=body)
+        with unittest.mock.patch.object(he.subprocess, "run", side_effect=fake):
+            lines = r.grep_tail("seat", "/t.jsonl", cap, (b"backgroundTaskId", b"task-id"))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][0], ["sudo", "-n", "-u", "seat", "tail", "-c", str(cap), "--", "/t.jsonl"])
+        self.assertEqual(len(lines), 2)
+        self.assertNotIn("zzz", "".join(lines), "the cut first line is dropped")
+        self.assertTrue(all(not ln.endswith("\n") for ln in lines))
+
+    def test_grep_tail_keeps_first_line_when_window_not_filled(self):
+        body = '{"type":"user","toolUseResult":{"backgroundTaskId":"b1"}}\n'
+        r, _calls, fake = self._reader(stdout=body)
+        with unittest.mock.patch.object(he.subprocess, "run", side_effect=fake):
+            lines = r.grep_tail("seat", "/t.jsonl", 16 * 1024 * 1024, (b"backgroundTaskId",))
+        self.assertEqual(lines, [body.rstrip("\n")])
+
+    def test_grep_tail_and_head_fail_to_none(self):
+        r, _calls, fake = self._reader(rc=1)
+        with unittest.mock.patch.object(he.subprocess, "run", side_effect=fake):
+            self.assertIsNone(r.grep_tail("seat", "/t", 100, (b"x",)))
+            self.assertIsNone(r.read_text_head("seat", "/t", 100))
+
+    def test_seam_parses_through_harness_idle(self):
+        # grep_tail output (no trailing newlines) feeds harness_idle's marker scan.
+        from tools import harness_idle as hi
+        body = ('{"type":"user","timestamp":"2026-10-08T13:03:43.898Z",'
+                '"toolUseResult":{"backgroundTaskId":"b1"}}\n'
+                '{"type":"user","timestamp":"2026-10-08T13:03:44.898Z",'
+                '"toolUseResult":{"backgroundTaskId":"b2"}}\n')
+        r, _calls, fake = self._reader(stdout=body)
+        with unittest.mock.patch.object(he.subprocess, "run", side_effect=fake):
+            started, _ = hi._bg_markers(r, "seat", "/t.jsonl")
+        self.assertEqual(set(started), {"b1", "b2"})
 
 
 if __name__ == "__main__":

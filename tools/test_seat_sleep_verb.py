@@ -116,12 +116,22 @@ def test_dry_run_writes_nothing(rig):
 
 # --- refusals, in order, before any side effect ----------------------------------------------
 
-@pytest.mark.parametrize("persona", ["codex", "mason"])
+# T-5698: mason moved to the control plane (runtime controller + persona-consume, like artisan),
+# so codex is the remaining not-control-plane seat; mason is now covered by the allowed case below.
+@pytest.mark.parametrize("persona", ["codex"])
 def test_a_seat_that_is_not_control_plane_is_refused(rig, persona):
     assert agent_role_map.instance_binding(persona).get("supervisor") != "control-plane"
     code, _out, err = run(rig, persona, "--reason", "x", "--telegram-dark-ok")
     assert code == 2 and "control plane" in err
     assert record(rig, persona) is None and list(rig.hold.iterdir()) == []
+
+
+def test_mason_control_plane_seat_can_sleep(rig):
+    # T-5698: mason is control-plane now; sleep is allowed (no Telegram receiver, no ack needed).
+    assert agent_role_map.instance_binding("mason").get("supervisor") == "control-plane"
+    code, _out, err = run(rig, "mason", "--reason", "x")
+    assert code == 0, err
+    assert record(rig, "mason") is not None
 
 
 def test_non_control_plane_is_refused_before_the_telegram_check(rig):
@@ -158,12 +168,12 @@ def test_the_telegram_receiver_set_is_pinned_from_the_real_manifest():
     personas = sorted(set(agent_role_map.account_persona_map().values()))
     receivers = {p for p in personas if seat_sleep.is_telegram_receiver(p)}
     assert receivers == {"specialist", "archivist", "orchestrator", "recovery"}
-    # archivist receives through `--channels plugin:telegram` and is NOT in the codex bridge list:
-    # a bridge-only derivation would have missed her.
+    # All Telegram receiver seats now have a Codex bridge. Archivist joined in
+    # T-5744 so a Claude cap swap preserves her direct communications surface.
     from tools import persona_bringup
     doc = agent_role_map.load_instance_document(persona_bringup.DEFAULT_MANIFEST)
     bridge = set(doc["persona_installer"]["codex_telegram_bridge"]["personas"])
-    assert bridge < receivers and "archivist" not in bridge
+    assert bridge == receivers
 
 
 def test_a_manifest_fault_counts_as_a_receiver(tmp_path):

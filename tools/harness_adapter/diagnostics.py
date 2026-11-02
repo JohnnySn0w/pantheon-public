@@ -635,13 +635,12 @@ _RETIRED_FLIP_KEYS = ("mid_session_cap_swap", "fallback_return")
 
 
 def flip_key_violations(manifest: Mapping[str, Any]) -> list[str]:
-    """Roles whose retired flip keys hold a value the policy forbids (T-5446).
+    """Roles carrying a retired flip key at ALL (T-5446 Phase B, T-5460).
 
     The ONE strict definition, used by every validator (installer `Manifest.load`,
-    CI over instance.yaml, the controller's per-cycle report). `false` disables a
-    flip that is fleet policy (the operator TG 12274/12283), so it is a violation; a
-    non-bool is a violation; `true` is a tolerated deprecated no-op (Phase A) and is
-    NOT listed here. Pure; never raises.
+    CI over instance.yaml, the controller's per-cycle report). The flip is fleet
+    policy (the operator TG 12274/12283), so ANY presence of a retired key, at any value
+    including `true`, is a violation. Pure; never raises.
     """
     runtime = manifest.get("harness_runtime") if isinstance(manifest, Mapping) else None
     roles = runtime.get("roles") if isinstance(runtime, Mapping) else None
@@ -652,42 +651,23 @@ def flip_key_violations(manifest: Mapping[str, Any]) -> list[str]:
         if not isinstance(role_raw, Mapping):
             continue
         for key in _RETIRED_FLIP_KEYS:
-            if key in role_raw and role_raw[key] is not True:
+            if key in role_raw:
                 found.append(
                     f"harness_runtime.roles.{role}.{key}={role_raw[key]!r}: the flip is fleet policy, "
-                    f"not hand-settable (T-5446, the operator TG 12274/12283); remove the key"
+                    f"not hand-settable (T-5446, the operator TG 12274/12283); remove the key (T-5446/T-5460)"
                 )
     return found
 
 
-def flip_key_deprecations(manifest: Mapping[str, Any]) -> list[str]:
-    """Roles still carrying a retired flip key set to `true`: a tolerated deprecated
-    no-op in Phase A (old-code controllers still honour it); Phase B (T-5460) removes
-    the keys. Pure; never raises."""
-    runtime = manifest.get("harness_runtime") if isinstance(manifest, Mapping) else None
-    roles = runtime.get("roles") if isinstance(runtime, Mapping) else None
-    found: list[str] = []
-    if not isinstance(roles, Mapping):
-        return found
-    for role, role_raw in roles.items():
-        if isinstance(role_raw, Mapping):
-            for key in _RETIRED_FLIP_KEYS:
-                if role_raw.get(key) is True:
-                    found.append(f"harness_runtime.roles.{role}.{key}")
-    return found
-
-
 def _apply_flip_key_policy(role_raw: Mapping[str, Any] | None, *, role: str) -> None:
-    """T-5446 Phase A (the operator TG 12272/12274/12283): the mid-session cap swap (T-4037)
+    """T-5446 Phase B (the operator TG 12272/12274/12283): the mid-session cap swap (T-4037)
     and the fallback return (T-4046) are ON for every seat; the per-role keys are
     retired. The resolver is deliberately SILENT (its stderr is captured by shell
     callers, e.g. persona_cutover.sh evals it) and never crash-loops on a re-added key
-    (T-5458). By value:
-
-    - `true`: tolerated, a deprecated no-op (listed by `flip_key_deprecations`).
-    - `false` or any non-bool: IGNORED (the flag stays True). The strict rejection is
-      `flip_key_violations`, enforced by Manifest.load and CI; the controller reports
-      it through evidence plus a cooldown-gated alert.
+    (T-5458). A re-added key, whatever its value (`true`, `false`, non-bool), is
+    IGNORED at runtime (the flag stays True). The strict rejection is
+    `flip_key_violations`, enforced by Manifest.load and CI; the controller reports
+    it through evidence plus a cooldown-gated alert.
     """
     # Nothing to do at runtime: the resolver never reads these keys, so no value can alter
     # a flip or crash a controller (T-5458). Kept as the single named place for that policy.

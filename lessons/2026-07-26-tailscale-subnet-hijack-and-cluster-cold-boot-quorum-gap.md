@@ -12,7 +12,7 @@ A single node advertising `--advertise-routes` for a CIDR that overlaps the subn
 
 ### Mitigation (applied + live)
 
-- **Make each host a DIRECT tailnet node** instead of routing through one container: boxon `100.65.78.101`, pve2 `100.91.113.24`. Reaching either host no longer depends on any subnet router. `~/.ssh/config` prefers the direct nodes, with `-lan` (subnet) and `-via-boxon` (ProxyJump) fallbacks.
+- **Make each host a DIRECT tailnet node** instead of routing through one container: boxon `100.115.155.50`, pve2 `100.76.170.91`. Reaching either host no longer depends on any subnet router. `~/.ssh/config` prefers the direct nodes, with `-lan` (subnet) and `-via-boxon` (ProxyJump) fallbacks.
 - **Retire the overlapping subnet route** — the operator disabled the CT-101 route approval in the Tailscale admin console; CT-101 retired. This removed both the SPOF and the routing hijack.
 - Rule of thumb: advertise a subnet route ONLY for a network your tailnet clients **cannot otherwise reach** (a truly isolated segment). Never for the LAN your clients already live on.
 

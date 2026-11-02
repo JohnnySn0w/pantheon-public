@@ -259,4 +259,6 @@ FRAMEWORK_CODE_ARTIFACTS = (
     "tools/persona_installer.py",
     "tools/persona_installer_contracts.py",
     "tools/persona_installer_activation.py",
+    "tools/mcp_allowlist_registry.py",
+    "tools/mcp_allowlist.yaml",
 )

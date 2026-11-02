@@ -418,6 +418,8 @@ class TestBriefNamedSweep(unittest.TestCase):
             for fname in ("ticket.py", "_git_utils.py", "agent_role_map.py",
                           "__init__.py",
                           "_md_table.py",  # T-1936: ticket.py's README-row emitter imports it
+                          "_security_gate.py",  # T-5678: ticket.py imports it
+                          "_frontmatter_block.py",  # T-5689: ticket.py + ticket_purpose import it
                           # T-2842: resolve's closure gate imports ticket_lint,
                           # whose module-level imports pull the next two:
                           "ticket_lint.py",

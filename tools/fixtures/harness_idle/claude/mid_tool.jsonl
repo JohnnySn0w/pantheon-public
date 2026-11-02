@@ -1,0 +1,8 @@
+{"type":"user","timestamp":"2026-10-10T02:01:50.029Z","turnOrigin":"task_notification","message":{"content":"<task-notification><task-id>ad16fe71d8ce93702</task-id><status>completed</status></task-notification>"}}
+{"type":"assistant","timestamp":"2026-10-10T02:01:52.529Z","message":{"stop_reason":"end_turn"}}
+{"type":"system","subtype":"stop_hook_summary","timestamp":"2026-10-10T02:01:52.922Z"}
+{"type":"system","subtype":"turn_duration","timestamp":"2026-10-10T02:01:52.936Z","pendingBackgroundAgentCount":1}
+{"type":"file-history-snapshot"}
+{"type":"user","timestamp":"2026-10-10T02:03:06.651Z","turnOrigin":"human"}
+{"type":"attachment","timestamp":"2026-10-10T02:03:06.633Z"}
+{"type":"assistant","timestamp":"2026-10-10T02:03:10.043Z","message":{"stop_reason":"tool_use"}}

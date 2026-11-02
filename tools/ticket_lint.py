@@ -57,7 +57,7 @@ import subprocess
 import sys
 import urllib.parse
 import urllib.request
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -972,11 +972,13 @@ def warn_ticket_purposes(paths: list[Path]) -> list[LintResult]:
     # several lifecycle integration tests copy only ticket.py + ticket_lint.py
     # into a synthetic repository to exercise the real subprocess boundary.
     try:
+        from tools.goal_registry import registry_status
         from tools.project_catalogue import load_project_records
         from tools.ticket_purpose import (
             PurposeError,
             load_ticket_purpose_index,
             validate_intent_link,
+            with_goal_registry_reason,
         )
     except ImportError:
         return []
@@ -990,12 +992,16 @@ def warn_ticket_purposes(paths: list[Path]) -> list[LintResult]:
         project_records = load_project_records(repo_root / "projects" / "records")
     except (PurposeError, ValueError, OSError):
         return results
+    # T-5679: canonical goal keys from the goals.md markers; a registry
+    # failure is named on the goal-registry-unavailable finding itself.
+    goal_keys, registry_error = registry_status(repo_root)
     for path in paths:
         purpose = purpose_index.get(path.stem)
         if purpose is None:
             continue
-        for issue in validate_intent_link(
-            purpose, purpose_index, project_records, frozenset()
+        for issue in with_goal_registry_reason(
+            validate_intent_link(purpose, purpose_index, project_records, goal_keys),
+            registry_error,
         ):
             results.append(LintResult(
                 tid=path.stem,
@@ -1549,6 +1555,36 @@ def edge_node_id(raw: str) -> NodeId:
     return ("obligation", raw)
 
 
+def iter_ticket_frontmatter(
+    tickets_root: Path,
+    skipped: list[Path] | None = None,
+) -> Iterator[tuple[str, str, dict]]:
+    """Yield `(state_dir, ticket_id, frontmatter_fields)` for every ticket file
+    under `tickets_root`, one corpus pass in STATES order, files sorted by name.
+
+    The single corpus scan behind `build_typed_edge_graph` and the T-3332
+    lineage query surface (tools/ticket_lineage.py), so both see the same
+    node universe with the same parser and the same tolerance: a non-ticket
+    filename is ignored, and a file that fails `parse_front_matter` (or cannot
+    be read) is skipped, best-effort. Pass a list as `skipped` to collect the
+    paths of the skipped-unparseable files for reporting.
+    """
+    for st in STATES:
+        d = tickets_root / st
+        if not d.exists():
+            continue
+        for entry in sorted(d.iterdir()):
+            if not entry.is_file() or not TICKET_FILENAME_RE.fullmatch(entry.name):
+                continue
+            try:
+                fields, _body = parse_front_matter(entry.read_text(encoding="utf-8"))
+            except (TicketError, OSError):
+                if skipped is not None:
+                    skipped.append(entry)
+                continue
+            yield st, entry.stem, fields
+
+
 def build_typed_edge_graph(
     tickets_root: Path,
     edge_fields: tuple[str, ...] | None = None,
@@ -1575,29 +1611,18 @@ def build_typed_edge_graph(
     if edge_fields is None:
         edge_fields = _GATING_EDGE_FIELDS
     graph: dict[NodeId, list[NodeId]] = {}
-    for st in STATES:
-        d = tickets_root / st
-        if not d.exists():
-            continue
-        for entry in sorted(d.iterdir()):
-            if not entry.is_file() or not TICKET_FILENAME_RE.fullmatch(entry.name):
+    for _state, tid, fields in iter_ticket_frontmatter(tickets_root):
+        src: NodeId = ("ticket", tid)
+        out: list[NodeId] = []
+        for field_name in edge_fields:
+            if field_name == "parent_of":
+                parent = fields.get("parent_ticket")
+                if isinstance(parent, str) and parent.strip():
+                    out.append(("ticket", parent.strip()))
                 continue
-            tid = entry.stem
-            try:
-                fields, _body = parse_front_matter(entry.read_text(encoding="utf-8"))
-            except (TicketError, OSError):
-                continue
-            src: NodeId = ("ticket", tid)
-            out: list[NodeId] = []
-            for field_name in edge_fields:
-                if field_name == "parent_of":
-                    parent = fields.get("parent_ticket")
-                    if isinstance(parent, str) and parent.strip():
-                        out.append(("ticket", parent.strip()))
-                    continue
-                for raw in (fields.get(field_name) or []):
-                    out.append(edge_node_id(str(raw)))
-            graph.setdefault(src, []).extend(out)
+            for raw in (fields.get(field_name) or []):
+                out.append(edge_node_id(str(raw)))
+        graph.setdefault(src, []).extend(out)
     return graph
 
 

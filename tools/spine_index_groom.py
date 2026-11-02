@@ -415,6 +415,9 @@ def _parse_frontmatter(path: Path) -> dict[str, str]:
     for line in lines[1:]:
         if line.strip() == "---":
             break
+        # T-5689: an indented line is block-scalar content (`key: |` / `>`), never a key.
+        if line[:1] in (" ", "\t"):
+            continue
         if ":" in line:
             key, _, val = line.partition(":")
             result[key.strip()] = val.strip().strip('"').strip("'")

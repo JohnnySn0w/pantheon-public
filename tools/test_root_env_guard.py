@@ -137,20 +137,48 @@ class WrapperTest(unittest.TestCase):
 
     def test_pipes_the_password_without_newline_and_passes_args(self):
         proc = subprocess.run([str(_TOOLS / "pantheon-sudo"), "-u", "codex", "id"],
-                              env=self.env, capture_output=True, text=True, timeout=30)
+                              env=self.env, capture_output=True, text=True, timeout=30,
+                              stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout, "")  # nothing of the password on stdout
         self.assertEqual(self.log.read_text(), "-S\n-k\n-p\n\n-u\ncodex\nid\ns3cret")
 
     def test_usage_and_unreadable_file(self):
         proc = subprocess.run([str(_TOOLS / "pantheon-sudo")], env=self.env,
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 64)
         env = dict(self.env, PANTHEON_SUDO_PW_FILE=str(self.pw) + ".missing")
         proc = subprocess.run([str(_TOOLS / "pantheon-sudo"), "true"], env=env,
-                              capture_output=True, text=True, timeout=30)
+                              capture_output=True, text=True, timeout=30, stdin=subprocess.DEVNULL)
         self.assertEqual(proc.returncode, 65)
         self.assertNotIn("s3cret", proc.stderr)
+
+    def test_piped_stdin_is_refused_loudly_and_sudo_never_runs(self):
+        # T-5713 (svc:vote 10-27): `echo x | pantheon-sudo tee -a FILE` exited 0 and wrote
+        # nothing, because the command's stdin is the (already drained) password pipe.
+        # Passing the caller's stdin through is unsafe: a NOPASSWD/cached command never
+        # reads the password line, so the PASSWORD would flow into the command (tee -> file).
+        proc = subprocess.run([str(_TOOLS / "pantheon-sudo"), "tee", "-a", "/tmp/x"], env=self.env,
+                              input="payload\n", capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 66, proc.stderr)
+        self.assertIn("stdin", proc.stderr)
+        self.assertNotIn("s3cret", proc.stderr + proc.stdout)
+        self.assertFalse(self.log.exists(), "sudo must not run when stdin is refused")
+
+    def test_file_redirect_stdin_is_refused(self):
+        src = Path(self._tmp.name) / "in.txt"
+        src.write_text("payload\n")
+        with open(src) as fh:
+            proc = subprocess.run([str(_TOOLS / "pantheon-sudo"), "tee", "-a", "/tmp/x"], env=self.env,
+                                  stdin=fh, capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 66, proc.stderr)
+        self.assertFalse(self.log.exists())
+
+    def test_dev_null_stdin_still_runs(self):
+        proc = subprocess.run([str(_TOOLS / "pantheon-sudo"), "true"], env=self.env,
+                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self.log.exists())
 
 
 if __name__ == "__main__":

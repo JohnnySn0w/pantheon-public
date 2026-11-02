@@ -24,6 +24,7 @@ from tools.germinate.engine.run_state import RunStore
 from tools.germinate.engine.tests import helpers as H
 from tools.germinate.host_substrate import families as F
 from tools.germinate.host_substrate import gate32a
+from tools.germinate.host_substrate.helper import HelperRefusal
 from tools.germinate.host_substrate import invariants as I
 from tools.germinate.op_registry import load_op_registry
 from tools.germinate.planner_sandbox.admission import coordinator
@@ -50,7 +51,7 @@ def fixture_manifest(*, sudoers=False):
         "groups": {"pmail": {"gid": 3001}},
         "accounts": {"alice": {"uid": 3101, "home": "/home/alice", "shell": "/bin/bash", "linger": True, "groups": ["pmail"]}},
         "installer_roots": ["/srv/pantheon"],
-        "paths": {"/srv/pantheon/shared": {"owner": "alice", "group": "pmail", "mode": "0750", "acl": ["user::rwx", "group::r-x", "other::---", "group:pmail:r-x"]}},
+        "paths": {"/srv/pantheon/shared": {"owner": "alice", "group": "pmail", "mode": "0750", "acl": ["user::rwx", "group::r-x", "other::---", "group:pmail:r-x", "mask::r-x"]}},
         "mailbox_dirs": {"alice": {"path": "/srv/pantheon/mailbox-alice", "owner": "alice", "group": "pmail", "mode": "2770"}},
         "units": {"fixture.service": {"path": "/etc/systemd/system/fixture.service", "source": "fixture/fixture.service", "sha256": _sha(UNIT_BODY), "enable": True}},
         "dbus_policies": {"org.fixture": {"path": "/etc/dbus-1/system.d/org.fixture.conf", "source": "fixture/org.fixture.conf", "sha256": _sha(POLICY_BODY)}},
@@ -364,6 +365,27 @@ def test_handler_classifies_precondition_drift_with_resolved_subject(setup):
         "drifted",
         "group:pmail changed since plan",
     )
+
+
+@pytest.mark.parametrize("kind", ["acl.converge", "owner_mode.set", "mailbox_dir.ensure"])
+def test_handler_refuses_a_symlink_subject_loudly_and_never_skips(setup, kind):
+    """T-5653 (Recovery, D15): a symlink subject is REFUSED with a named reason, never skipped,
+    both in preflight and on the rollback write (guard ALL path-taking actuation)."""
+    _repo_, eng = setup
+    ops = [o for n in eng.plan("install", "system", CID).nodes for o in n.operations if o.kind == kind]
+    assert ops, kind
+    op = ops[0]
+    handler = eng.backend.handler(kind)
+    path = op.target.split(":", 1)[1]
+    handler.port.state["path_types"][path] = "symbolic link"
+    result = handler.preflight(op)
+    assert not result.ok and result.classification == "refused"
+    assert result.detail.startswith(f"SYMLINK_SUBJECT_REFUSED: {path} is a symbolic link")
+    mutation = handler.rollback_intent(op)
+    before = handler.port.dump()
+    with pytest.raises(HelperRefusal, match="symbolic link"):
+        handler.rollback_mutation(mutation)
+    assert handler.port.dump() == before
 
 
 # --- kill injection (ORG-080 D-X), every family the engine path actuates -------

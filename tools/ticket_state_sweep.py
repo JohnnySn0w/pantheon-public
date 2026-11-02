@@ -120,7 +120,8 @@ def _parse_ticket_front_matter(path: Path) -> dict:
     for line in lines[1:]:
         if line.strip() == "---":
             break
-        if ":" not in line:
+        # T-5689: an indented line is block-scalar content (`key: |` / `>`), never a key.
+        if ":" not in line or line[:1] in (" ", "\t"):
             continue
         key, _, value = line.partition(":")
         key = key.strip()

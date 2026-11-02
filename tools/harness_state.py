@@ -414,6 +414,10 @@ def clear_hold(persona: str, runtime: str, *, root: Path) -> tuple[dict[str, Any
     return doc, existed
 
 
+#: Failure classes with no cooldown timer: they block until `clear-cooldown`.
+UNTIMED_BLOCKING_FAILURE_CLASSES = frozenset({"runtime_blocked", "authentication_loss"})
+
+
 def clear_cooldown(
     persona: str,
     runtime: str,
@@ -429,13 +433,15 @@ def clear_cooldown(
     clearing the cooldown TIMER, not erasing failure history (see DECISIONS).
     T-5028 (d): a `runtime_blocked` record has no timer (it blocks until
     cleared), so clearing also resets its `failure_class` to null and counts
-    as having had a cooldown.
+    as having had a cooldown. T-5791: `authentication_loss` is the same shape
+    (no timer, blocks until cleared) and is cleared the same way -- this is the
+    revocation DR rollback.
     If no record exists yet, a fresh placeholder is created (there was
     nothing to clear, but the CLI still needs a `runtime` field to write).
     """
     validate_runtime(runtime)
     existing = load_last_attempt(persona, runtime, root=root)
-    blocked = bool(existing) and existing.get("failure_class") == "runtime_blocked"
+    blocked = bool(existing) and existing.get("failure_class") in UNTIMED_BLOCKING_FAILURE_CLASSES
     had_cooldown = bool(existing and existing.get("cooldown_until")) or blocked
     if existing is None:
         doc: dict[str, Any] = {

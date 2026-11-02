@@ -30,7 +30,13 @@ class FakeOps:
         self.off_reports.append((state, detail))
 
     def icmp_reachable(self, host):
-        return self._reachable.get(host)
+        v = self._reachable.get(host)
+        if isinstance(v, list):               # T-5624: successive probes
+            return v.pop(0) if len(v) > 1 else v[0]
+        return v
+
+    def tailscale_prewarm(self, host):
+        self.__dict__.setdefault("prewarms", []).append(host)
 
     def netdata_critical_alarms(self, url):
         return self._alarms.get(url)
@@ -220,8 +226,8 @@ class FinishAndCooldownTests(unittest.TestCase):
 class CheckAllTests(unittest.TestCase):
     def test_iterates_all_configured_hosts(self):
         with tempfile.TemporaryDirectory() as tmp:
-            ops = FakeOps(reachable={"boxon": True, "pve2": True, "100.119.110.9": True},
-                          alarms={"http://boxon:19999": [], "http://100.119.110.9:19999": []})
+            ops = FakeOps(reachable={"boxon": True, "pve2": True, "100.72.126.1": True},
+                          alarms={"http://boxon:19999": [], "http://100.72.126.1:19999": []})
             results = m.check_all(ops=ops, state_dir=Path(tmp))
             self.assertEqual([r["name"] for r in results], [h["name"] for h in m.HOSTS])
             self.assertTrue(all(r["verdict"] == m.OK for r in results))
@@ -247,6 +253,42 @@ class OffTailnetT5385Test(unittest.TestCase):
         self.assertEqual(r["verdict"], m.UNREACHABLE)
         self.assertEqual(len(ops.alerts), 1)
 
+
+
+class IdleTunnelPrewarmTests(unittest.TestCase):
+    """T-5624: an idle tailscale tunnel can outlast the ICMP window (boxon 18:25Z,
+    ct201-netdata 21:4xZ 2026-10-26, both answering from orchestrator). A failed probe is
+    followed by a tailscale-ping prewarm and ONE re-probe before UNREACHABLE."""
+
+    def _run(self, reachable):
+        cfg = {"name": "ct201-netdata", "ping": "100.72.126.1", "netdata": None}
+        ops = FakeOps(reachable={"100.72.126.1": reachable})
+        with tempfile.TemporaryDirectory() as d:
+            r = m.check_host_once(cfg, ops=ops, state_dir=Path(d), now=1000,
+                                    cooldown_secs=3600, dry_run=False)
+        return r, ops
+
+    def test_answer_after_prewarm_is_ok_and_does_not_alert(self):
+        r, ops = self._run([False, True])
+        self.assertEqual(r["verdict"], m.OK)
+        self.assertEqual(ops.alerts, [])
+        self.assertEqual(ops.prewarms, ["100.72.126.1"])
+
+    def test_still_silent_after_prewarm_alerts(self):
+        r, ops = self._run([False, False])
+        self.assertEqual(r["verdict"], m.UNREACHABLE)
+        self.assertEqual(len(ops.alerts), 1)
+        self.assertEqual(ops.prewarms, ["100.72.126.1"])
+
+    def test_first_probe_ok_skips_prewarm(self):
+        r, ops = self._run([True])
+        self.assertEqual(r["verdict"], m.OK)
+        self.assertEqual(ops.__dict__.get("prewarms", []), [])
+
+    def test_unrunnable_probe_is_not_prewarmed(self):
+        r, ops = self._run([None])
+        self.assertEqual(r["verdict"], m.UNKNOWN)
+        self.assertEqual(ops.__dict__.get("prewarms", []), [])
 
 if __name__ == "__main__":
     unittest.main()

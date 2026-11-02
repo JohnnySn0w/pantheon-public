@@ -69,6 +69,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
+
+ScopedSourceAdapter = Callable[[Path, str], tuple[bool, str]]
 
 # Make `from tools.X import Y` work whether invoked as `python3 tools/foo.py`
 # or `python3 -m tools.foo`.
@@ -240,13 +243,24 @@ def fetch_origin_sha() -> tuple[bool, str]:
     return True, sha
 
 
-def advance_source() -> tuple[bool, str]:
+def advance_source(
+    reconcile_adapter: ScopedSourceAdapter | None = None,
+    target_sha: str | None = None,
+) -> tuple[bool, str]:
     """ff-only advance the source checkout to origin/main.
 
     Uses `git pull --ff-only origin main`. A non-fast-forward (the source checkout
     has diverged from origin/main) ABORTS — we never `git reset --hard`. Returns
     (True, "") or (False, error_detail).
     """
+    if reconcile_adapter is not None:
+        if not target_sha:
+            return False, "scoped repo reconcile requires an exact target SHA"
+        try:
+            return reconcile_adapter(Path(SOURCE_DIR), target_sha)
+        except Exception as exc:  # noqa: BLE001 — pipeline reports a bounded refusal
+            return False, f"scoped repo reconcile errored: {exc}"
+
     inner = f"git -C {SOURCE_DIR} pull --ff-only origin main"
     try:
         res = _run(_sudo_claude(inner), GIT_TIMEOUT)
@@ -257,6 +271,21 @@ def advance_source() -> tuple[bool, str]:
             f"git pull --ff-only failed (rc={res.returncode}) — possible divergence; "
             f"NOT force-resetting: {_last_line(res)}"
         )
+    return True, ""
+
+
+def verify_source_head(target_sha: str) -> tuple[bool, str]:
+    """Independently bind adapter success to the exact deploy target."""
+    inner = f"git -C {SOURCE_DIR} rev-parse HEAD"
+    try:
+        res = _run(_sudo_claude(inner), GIT_TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return False, f"source HEAD verification errored: {exc!r}"
+    if res.returncode != 0:
+        return False, f"source HEAD verification failed (rc={res.returncode}): {_last_line(res)}"
+    observed = res.stdout.strip()
+    if observed != target_sha:
+        return False, f"source HEAD {observed!r} != deploy target {target_sha!r}"
     return True, ""
 
 
@@ -347,7 +376,10 @@ def verify_active() -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 
-def _deploy(target_sha: str) -> int:
+def _deploy(
+    target_sha: str,
+    reconcile_adapter: ScopedSourceAdapter | None = None,
+) -> int:
     """Run the smoke-gated deploy pipeline for target_sha. Returns an exit code.
 
     Ordering is fail-soft + smoke-gated: build → smoke (GATE) → rsync → restart →
@@ -356,11 +388,22 @@ def _deploy(target_sha: str) -> int:
     advanced ONLY after verify passes.
     """
     # 1. Advance the source checkout to the target tip (ff-only; abort on divergence).
-    ok, detail = advance_source()
+    ok, detail = (
+        advance_source()
+        if reconcile_adapter is None
+        else advance_source(reconcile_adapter, target_sha)
+    )
     if not ok:
         _err(f"source advance failed: {detail}")
         return EXIT_ADVANCE
     _log("source checkout advanced to origin/main (ff-only)")
+
+    if reconcile_adapter is not None:
+        ok, detail = verify_source_head(target_sha)
+        if not ok:
+            _err(f"source advance verification failed: {detail}")
+            return EXIT_ADVANCE
+        _log(f"source HEAD independently verified at deploy target {target_sha}")
 
     # 2. Build.
     ok, detail = build()
@@ -406,7 +449,11 @@ def _deploy(target_sha: str) -> int:
     return EXIT_OK
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    reconcile_adapter: ScopedSourceAdapter | None = None,
+) -> int:
     """Run one poll/deploy cycle. See module docstring for exit codes."""
 
     if not _is_enabled():
@@ -454,7 +501,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         _log(f"origin/main advanced: {last_sha} -> {origin_sha}; deploying")
 
-    return _deploy(origin_sha)
+    if reconcile_adapter is None:
+        return _deploy(origin_sha)
+    return _deploy(origin_sha, reconcile_adapter)
 
 
 if __name__ == "__main__":

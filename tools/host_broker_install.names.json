@@ -1,0 +1,696 @@
+{
+  "generator": "tools/host_broker_install.py names",
+  "manifest_revision": "provisional-2026-10-27",
+  "out_of_scope": "the ORG-052 wire vocabulary (error names, journal events, evidence labels; ADR :1129-1159) is not install surface; its canonical table is tools/host_control/README.md 'Provisional names pending ratification'",
+  "rows": [
+    {
+      "item": "broker service account",
+      "kind": "account",
+      "minted_in": "T-2912",
+      "proposed_final": "pantheon-hostbroker",
+      "provisional": "pantheon-hostbroker",
+      "rename_later_is_migration": "yes: unit User=, bus-policy user=, file and journal ownership; usermod -l plus a reviewed reinstall",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/__main__.py",
+        "tools/host_control/dist/org.pantheon.HostApproval1.conf",
+        "tools/host_control/dist/org.pantheon.HostBroker1.conf",
+        "tools/host_control/dist/org.pantheon.HostExecutor1.conf",
+        "tools/host_control/dist/pantheon-host-broker.service"
+      ]
+    },
+    {
+      "item": "approval service account",
+      "kind": "account",
+      "minted_in": "T-2913 (name from the T-2912 broker policy)",
+      "proposed_final": "pantheon-hostapproval",
+      "provisional": "pantheon-hostapproval",
+      "rename_later_is_migration": "yes: unit User=, bus-policy user=, file and journal ownership; usermod -l plus a reviewed reinstall",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/approval/__main__.py",
+        "tools/host_control/dist/org.pantheon.HostApproval1.conf",
+        "tools/host_control/dist/org.pantheon.HostApprovalTelegram1.conf",
+        "tools/host_control/dist/org.pantheon.HostBroker1.conf",
+        "tools/host_control/dist/pantheon-host-approval.service"
+      ]
+    },
+    {
+      "item": "ingress service account",
+      "kind": "account",
+      "minted_in": "T-2913",
+      "proposed_final": "pantheon-hostapproval-ingress",
+      "provisional": "pantheon-hostapproval-ingress",
+      "rename_later_is_migration": "yes: unit User=, bus-policy user=, file and journal ownership; usermod -l plus a reviewed reinstall",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/dist/org.pantheon.HostApproval1.conf",
+        "tools/host_control/dist/org.pantheon.HostApprovalTelegram1.conf",
+        "tools/host_control/dist/pantheon-host-approval-telegram-ingress.service",
+        "tools/host_control/telegram_ingress/__init__.py"
+      ]
+    },
+    {
+      "item": "monitor service account",
+      "kind": "account",
+      "minted_in": "T-2943 / T-2914",
+      "proposed_final": "pantheon-hostmonitor",
+      "provisional": "pantheon-hostmonitor",
+      "rename_later_is_migration": "yes: unit User=, bus-policy user=, file and journal ownership; usermod -l plus a reviewed reinstall",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/dist/org.pantheon.HostApproval1.conf",
+        "tools/host_control/dist/org.pantheon.HostBroker1.conf"
+      ]
+    },
+    {
+      "item": "healthsig service account (EXCLUDED, Q11)",
+      "kind": "account",
+      "minted_in": "T-3652",
+      "proposed_final": "out of scope (ORG-050 installer)",
+      "provisional": "pantheon-healthsig",
+      "rename_later_is_migration": "n/a here",
+      "status": "EXCLUDED",
+      "used_in": [
+        "tools/host_control/dist/pantheon-health-signal-writer.service"
+      ]
+    },
+    {
+      "item": "broker uid (gid == uid, user-private group)",
+      "kind": "uid",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "1901",
+      "provisional": "1901",
+      "rename_later_is_migration": "yes: chown of homes, configs and journal roots. NOTE: families account.ensure requires uid >= 1000, so these service accounts sit in the normal-user range (operator-visible); collision with live accounts is U3 preflight",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "approval uid (gid == uid, user-private group)",
+      "kind": "uid",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "1902",
+      "provisional": "1902",
+      "rename_later_is_migration": "yes: chown of homes, configs and journal roots. NOTE: families account.ensure requires uid >= 1000, so these service accounts sit in the normal-user range (operator-visible); collision with live accounts is U3 preflight",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "ingress uid (gid == uid, user-private group)",
+      "kind": "uid",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "1903",
+      "provisional": "1903",
+      "rename_later_is_migration": "yes: chown of homes, configs and journal roots. NOTE: families account.ensure requires uid >= 1000, so these service accounts sit in the normal-user range (operator-visible); collision with live accounts is U3 preflight",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "monitor uid (gid == uid, user-private group)",
+      "kind": "uid",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "1904",
+      "provisional": "1904",
+      "rename_later_is_migration": "yes: chown of homes, configs and journal roots. NOTE: families account.ensure requires uid >= 1000, so these service accounts sit in the normal-user range (operator-visible); collision with live accounts is U3 preflight",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "groups",
+      "kind": "group",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "user-private only",
+      "provisional": "user-private only (gid == uid)",
+      "rename_later_is_migration": "yes, together with the account",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "broker home (useradd --create-home)",
+      "kind": "path",
+      "minted_in": "T-2920 U1 (Q-B)",
+      "proposed_final": "/var/lib/pantheon/home/pantheon-hostbroker",
+      "provisional": "/var/lib/pantheon/home/pantheon-hostbroker",
+      "rename_later_is_migration": "light: usermod -d; holds no state (skel only), separate from every StateDirectory",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "approval home (useradd --create-home)",
+      "kind": "path",
+      "minted_in": "T-2920 U1 (Q-B)",
+      "proposed_final": "/var/lib/pantheon/home/pantheon-hostapproval",
+      "provisional": "/var/lib/pantheon/home/pantheon-hostapproval",
+      "rename_later_is_migration": "light: usermod -d; holds no state (skel only), separate from every StateDirectory",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "ingress home (useradd --create-home)",
+      "kind": "path",
+      "minted_in": "T-2920 U1 (Q-B)",
+      "proposed_final": "/var/lib/pantheon/home/pantheon-hostapproval-ingress",
+      "provisional": "/var/lib/pantheon/home/pantheon-hostapproval-ingress",
+      "rename_later_is_migration": "light: usermod -d; holds no state (skel only), separate from every StateDirectory",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "monitor home (useradd --create-home)",
+      "kind": "path",
+      "minted_in": "T-2920 U1 (Q-B)",
+      "proposed_final": "/var/lib/pantheon/home/pantheon-hostmonitor",
+      "provisional": "/var/lib/pantheon/home/pantheon-hostmonitor",
+      "rename_later_is_migration": "light: usermod -d; holds no state (skel only), separate from every StateDirectory",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "plan-producer user (T-5533 step a)",
+      "kind": "account",
+      "minted_in": "T-2920 U1 (Q-C)",
+      "proposed_final": "nobody:nogroup via setpriv",
+      "provisional": "nobody:nogroup via setpriv",
+      "rename_later_is_migration": "no: holds no state, no new account or grant",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "broker bus name",
+      "kind": "bus_name",
+      "minted_in": "ORG-052 section 4",
+      "proposed_final": "org.pantheon.HostBroker1",
+      "provisional": "org.pantheon.HostBroker1",
+      "rename_later_is_migration": "yes: adapters, bus policy, health monitor",
+      "status": "ADR-NAMED",
+      "used_in": [
+        "tools/host_control/README.md",
+        "tools/host_control/__main__.py",
+        "tools/host_control/dbus_service.py",
+        "tools/host_control/dist/org.pantheon.HostBroker1.conf",
+        "tools/host_control/dist/org.pantheon.HostExecutor1.conf",
+        "tools/host_control/dist/pantheon-host-broker-seat.conf.template",
+        "tools/host_control/dist/pantheon-host-broker.service",
+        "tools/host_control/dist/pantheon-host-executor-seat.conf.template",
+        "tools/host_control/executor/dbus_service.py",
+        "tools/host_control/wire.py"
+      ]
+    },
+    {
+      "item": "approval bus name",
+      "kind": "bus_name",
+      "minted_in": "ORG-052 section 5",
+      "proposed_final": "org.pantheon.HostApproval1",
+      "provisional": "org.pantheon.HostApproval1",
+      "rename_later_is_migration": "yes: adapters, broker, ingress, bus policy",
+      "status": "ADR-NAMED",
+      "used_in": [
+        "tools/approval_mcp_adapter/__init__.py",
+        "tools/host_control/approval/dbus_service.py",
+        "tools/host_control/approval/wire.py",
+        "tools/host_control/approval_client.py",
+        "tools/host_control/dist/org.pantheon.HostApproval1.conf",
+        "tools/host_control/dist/org.pantheon.HostApprovalTelegram1.conf",
+        "tools/host_control/dist/pantheon-host-approval-approver.conf.template",
+        "tools/host_control/dist/pantheon-host-approval-telegram-ingress.service",
+        "tools/host_control/dist/pantheon-host-approval.service",
+        "tools/host_control/executor_client.py",
+        "tools/host_control/telegram_ingress/dbus_service.py",
+        "tools/host_control/telegram_ingress/wire.py"
+      ]
+    },
+    {
+      "item": "Telegram ingress bus name",
+      "kind": "bus_name",
+      "minted_in": "T-2919 (ORG-052 section 5 table)",
+      "proposed_final": "org.pantheon.HostApprovalTelegram1",
+      "provisional": "org.pantheon.HostApprovalTelegram1",
+      "rename_later_is_migration": "yes: approval service and bus policy",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/approval/telegram_presenter.py",
+        "tools/host_control/approval/wire.py",
+        "tools/host_control/dist/org.pantheon.HostApprovalTelegram1.conf",
+        "tools/host_control/dist/pantheon-host-approval-telegram-ingress.service",
+        "tools/host_control/telegram_ingress/README.md",
+        "tools/host_control/telegram_ingress/dbus_service.py",
+        "tools/host_control/telegram_ingress/wire.py"
+      ]
+    },
+    {
+      "item": "per-seat executor bus name",
+      "kind": "bus_name",
+      "minted_in": "T-2917 5b (ruling i5)",
+      "proposed_final": "org.pantheon.HostExecutor1.U<uid>",
+      "provisional": "org.pantheon.HostExecutor1.U<uid>",
+      "rename_later_is_migration": "yes: broker, activation files, per-seat policy",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/README.md",
+        "tools/host_control/dist/org.pantheon.HostExecutor1.conf",
+        "tools/host_control/dist/org.pantheon.HostExecutor1.service.template",
+        "tools/host_control/dist/pantheon-host-executor-seat.conf.template",
+        "tools/host_control/dist/pantheon-host-executor@.service",
+        "tools/host_control/executor/__init__.py",
+        "tools/host_control/executor/wire.py",
+        "tools/host_control/executor_client.py"
+      ]
+    },
+    {
+      "item": "broker entrypoint",
+      "kind": "path",
+      "minted_in": "T-2912",
+      "proposed_final": "/usr/local/libexec/pantheon-host-broker",
+      "provisional": "/usr/local/libexec/pantheon-host-broker",
+      "rename_later_is_migration": "code + reinstall: unit ExecStart; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/__main__.py",
+        "tools/host_control/dist/pantheon-host-broker.service"
+      ]
+    },
+    {
+      "item": "approval entrypoint",
+      "kind": "path",
+      "minted_in": "T-2913",
+      "proposed_final": "/usr/local/libexec/pantheon-host-approval",
+      "provisional": "/usr/local/libexec/pantheon-host-approval",
+      "rename_later_is_migration": "code + reinstall: unit ExecStart; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/approval/__main__.py",
+        "tools/host_control/dist/pantheon-host-approval.service"
+      ]
+    },
+    {
+      "item": "ingress entrypoint",
+      "kind": "path",
+      "minted_in": "T-2919",
+      "proposed_final": "/usr/local/libexec/pantheon-host-approval-telegram-ingress",
+      "provisional": "/usr/local/libexec/pantheon-host-approval-telegram-ingress",
+      "rename_later_is_migration": "code + reinstall: unit ExecStart; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/dist/pantheon-host-approval-telegram-ingress.service"
+      ]
+    },
+    {
+      "item": "executor entrypoint",
+      "kind": "path",
+      "minted_in": "T-2917 5b (B5)",
+      "proposed_final": "/usr/local/libexec/pantheon-host-executor",
+      "provisional": "/usr/local/libexec/pantheon-host-executor",
+      "rename_later_is_migration": "code + reinstall: unit ExecStart; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/README.md",
+        "tools/host_control/dist/pantheon-host-executor@.service"
+      ]
+    },
+    {
+      "item": "host MCP adapter launcher",
+      "kind": "path",
+      "minted_in": "T-2915 / T-2916",
+      "proposed_final": "/usr/local/libexec/pantheon-host-mcp-adapter",
+      "provisional": "/usr/local/libexec/pantheon-host-mcp-adapter",
+      "rename_later_is_migration": "code + re-registration: harness MCP config of every registered seat",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/harness_adapter/golden/host_mcp/claude-approver.json",
+        "tools/harness_adapter/golden/host_mcp/claude-requester.json",
+        "tools/harness_adapter/golden/host_mcp/codex-approver.toml",
+        "tools/harness_adapter/golden/host_mcp/codex-requester.toml",
+        "tools/harness_adapter/host_mcp_registration.py"
+      ]
+    },
+    {
+      "item": "host MCP adapter runtime prefix",
+      "kind": "path",
+      "minted_in": "T-2915 / T-2916",
+      "proposed_final": "/usr/local/lib/pantheon/host-mcp-adapter",
+      "provisional": "/usr/local/lib/pantheon/host-mcp-adapter",
+      "rename_later_is_migration": "code + reinstall; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_mcp_adapter/dist/build_runtime.py"
+      ]
+    },
+    {
+      "item": "approval MCP adapter launcher",
+      "kind": "path",
+      "minted_in": "T-2915 / T-2916",
+      "proposed_final": "/usr/local/libexec/pantheon-approval-mcp-adapter",
+      "provisional": "/usr/local/libexec/pantheon-approval-mcp-adapter",
+      "rename_later_is_migration": "code + re-registration: harness MCP config of every registered seat",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/harness_adapter/golden/host_mcp/claude-approver.json",
+        "tools/harness_adapter/golden/host_mcp/codex-approver.toml",
+        "tools/harness_adapter/host_mcp_registration.py"
+      ]
+    },
+    {
+      "item": "approval MCP adapter runtime prefix",
+      "kind": "path",
+      "minted_in": "T-2915 / T-2916",
+      "proposed_final": "/usr/local/lib/pantheon/approval-mcp-adapter",
+      "provisional": "/usr/local/lib/pantheon/approval-mcp-adapter",
+      "rename_later_is_migration": "code + reinstall; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_mcp_adapter/dist/build_runtime.py"
+      ]
+    },
+    {
+      "item": "executor config",
+      "kind": "path",
+      "minted_in": "T-2917 5b (B5)",
+      "proposed_final": "/etc/pantheon/host-executor/config.json",
+      "provisional": "/etc/pantheon/host-executor/config.json",
+      "rename_later_is_migration": "code + reinstall: root-owned file rewritten by a new plan; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/README.md",
+        "tools/host_control/dist/pantheon-host-executor@.service",
+        "tools/host_control/executor/config.py"
+      ]
+    },
+    {
+      "item": "ingress config",
+      "kind": "path",
+      "minted_in": "T-2919",
+      "proposed_final": "/etc/pantheon/host-approval-telegram/ingress.json",
+      "provisional": "/etc/pantheon/host-approval-telegram/ingress.json",
+      "rename_later_is_migration": "code + reinstall: root-owned file rewritten by a new plan; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/dist/pantheon-host-approval-telegram-ingress.service"
+      ]
+    },
+    {
+      "item": "seat registry",
+      "kind": "path",
+      "minted_in": "T-2916 (host_mcp_registration)",
+      "proposed_final": "/etc/pantheon/host-broker/seat-registry.json",
+      "provisional": "/etc/pantheon/host-broker/seat-registry.json",
+      "rename_later_is_migration": "code + reinstall: root-owned file rewritten by a new plan; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/harness_adapter/host_mcp_registration.py",
+        "tools/host_control/broker_config.py"
+      ]
+    },
+    {
+      "item": "approver policy",
+      "kind": "path",
+      "minted_in": "T-2916 (host_mcp_registration)",
+      "proposed_final": "/etc/pantheon/host-approval/approver-policy.json",
+      "provisional": "/etc/pantheon/host-approval/approver-policy.json",
+      "rename_later_is_migration": "code + reinstall: root-owned file rewritten by a new plan; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/harness_adapter/host_mcp_registration.py",
+        "tools/host_control/approval/config.py"
+      ]
+    },
+    {
+      "item": "broker host policy (pantheon-host-policy/v1 grants)",
+      "kind": "path",
+      "minted_in": "T-2920 U3a",
+      "proposed_final": "/etc/pantheon/host-broker/host-policy.json",
+      "provisional": "/etc/pantheon/host-broker/host-policy.json",
+      "rename_later_is_migration": "code + reinstall: root-owned file rewritten by a new plan; no data",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "broker config (U2 schema)",
+      "kind": "path",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "/etc/pantheon/host-broker/config.json",
+      "provisional": "/etc/pantheon/host-broker/config.json",
+      "rename_later_is_migration": "code + reinstall: root-owned file rewritten by a new plan; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/broker_config.py"
+      ]
+    },
+    {
+      "item": "approval config (U2 schema)",
+      "kind": "path",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "/etc/pantheon/host-approval/config.json",
+      "provisional": "/etc/pantheon/host-approval/config.json",
+      "rename_later_is_migration": "code + reinstall: root-owned file rewritten by a new plan; no data",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/approval/config.py"
+      ]
+    },
+    {
+      "item": "Telegram bot-token file (0600, parent 0700)",
+      "kind": "path",
+      "minted_in": "T-2919",
+      "proposed_final": "/etc/pantheon/host-approval-telegram/credentials/bot-token",
+      "provisional": "/etc/pantheon/host-approval-telegram/credentials/bot-token",
+      "rename_later_is_migration": "re-place the credential + CredentialRef",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/dist/pantheon-host-approval-telegram-ingress.json.template"
+      ]
+    },
+    {
+      "item": "registered plans dir",
+      "kind": "path",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "/etc/pantheon/host-broker/plans",
+      "provisional": "/etc/pantheon/host-broker/plans",
+      "rename_later_is_migration": "no: regenerated per framework update",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "registered manifests dir",
+      "kind": "path",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "/etc/pantheon/host-broker/manifests",
+      "provisional": "/etc/pantheon/host-broker/manifests",
+      "rename_later_is_migration": "no: regenerated per framework update",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "producer run root (root:root 0755)",
+      "kind": "path",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "/run/pantheon-host-install",
+      "provisional": "/run/pantheon-host-install",
+      "rename_later_is_migration": "no: regenerated per framework update",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "producer staging dir (fresh per run, nobody:nogroup 0700)",
+      "kind": "path",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "/run/pantheon-host-install/staging",
+      "provisional": "/run/pantheon-host-install/staging",
+      "rename_later_is_migration": "no: regenerated per framework update",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "state/journal root of pantheon-host-broker.service",
+      "kind": "path",
+      "minted_in": "T-2912",
+      "proposed_final": "/var/lib/pantheon-host-broker",
+      "provisional": "/var/lib/pantheon-host-broker",
+      "rename_later_is_migration": "YES: journal data lives here; Q10 backs up, never migrates",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/__main__.py",
+        "tools/host_control/dist/pantheon-host-broker.service",
+        "tools/host_control/self_amendment.py"
+      ]
+    },
+    {
+      "item": "state/journal root of pantheon-host-approval.service",
+      "kind": "path",
+      "minted_in": "T-2913",
+      "proposed_final": "/var/lib/pantheon-host-approval",
+      "provisional": "/var/lib/pantheon-host-approval",
+      "rename_later_is_migration": "YES: journal data lives here; Q10 backs up, never migrates",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/approval/__main__.py",
+        "tools/host_control/dist/pantheon-host-approval.service",
+        "tools/host_control/self_amendment.py"
+      ]
+    },
+    {
+      "item": "state/journal root of pantheon-host-approval-telegram-ingress.service",
+      "kind": "path",
+      "minted_in": "T-2919",
+      "proposed_final": "/var/lib/pantheon-host-approval-telegram",
+      "provisional": "/var/lib/pantheon-host-approval-telegram",
+      "rename_later_is_migration": "YES: journal data lives here; Q10 backs up, never migrates",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/dist/pantheon-host-approval-telegram-ingress.json.template",
+        "tools/host_control/dist/pantheon-host-approval-telegram-ingress.service",
+        "tools/host_control/self_amendment.py"
+      ]
+    },
+    {
+      "item": "framework tree",
+      "kind": "path",
+      "minted_in": "T-2920 U1 (Q6)",
+      "proposed_final": "/usr/local/lib/pantheon/framework/<rev>",
+      "provisional": "/usr/local/lib/pantheon/framework/<rev>",
+      "rename_later_is_migration": "no: versioned and content-addressed; a new rev is a new plan",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/broker_config.py",
+        "tools/host_control/self_amendment.py"
+      ]
+    },
+    {
+      "item": "framework committed-rev pointer",
+      "kind": "path",
+      "minted_in": "T-2920 U1 (Q6)",
+      "proposed_final": "/usr/local/lib/pantheon/framework/active",
+      "provisional": "/usr/local/lib/pantheon/framework/active",
+      "rename_later_is_migration": "no",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "per-seat broker policy fragment",
+      "kind": "file_name",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "same",
+      "provisional": "/etc/dbus-1/system.d/org.pantheon.HostBroker1.seat-<seat_id>.conf",
+      "rename_later_is_migration": "no: re-rendered per plan",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "per-seat executor policy fragment",
+      "kind": "file_name",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "same",
+      "provisional": "/etc/dbus-1/system.d/org.pantheon.HostExecutor1.seat-<seat_id>.conf",
+      "rename_later_is_migration": "no: re-rendered per plan",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "per-approver policy fragment",
+      "kind": "file_name",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "same",
+      "provisional": "/etc/dbus-1/system.d/org.pantheon.HostApproval1.approver-<seat_id>.conf",
+      "rename_later_is_migration": "no: re-rendered per plan",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "per-seat executor unit",
+      "kind": "file_name",
+      "minted_in": "T-2917 5b",
+      "proposed_final": "same",
+      "provisional": "/etc/systemd/system/pantheon-host-executor@<seat_id>.service",
+      "rename_later_is_migration": "no: re-rendered per plan",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/README.md",
+        "tools/host_control/dist/org.pantheon.HostExecutor1.service.template",
+        "tools/host_control/dist/pantheon-host-executor@.service"
+      ]
+    },
+    {
+      "item": "per-seat activation file",
+      "kind": "file_name",
+      "minted_in": "T-2917 5b",
+      "proposed_final": "same",
+      "provisional": "/usr/share/dbus-1/system-services/org.pantheon.HostExecutor1.U<uid>.service",
+      "rename_later_is_migration": "no: re-rendered per plan",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/dist/org.pantheon.HostExecutor1.service.template"
+      ]
+    },
+    {
+      "item": "executor config schema",
+      "kind": "schema",
+      "minted_in": "T-2917 5b (B5)",
+      "proposed_final": "pantheon-host-executor-config/v1",
+      "provisional": "pantheon-host-executor-config/v1",
+      "rename_later_is_migration": "yes for readers: a schema bump is a versioned migration",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/README.md",
+        "tools/host_control/dist/pantheon-host-executor@.service",
+        "tools/host_control/executor/config.py"
+      ]
+    },
+    {
+      "item": "ingress config schema",
+      "kind": "schema",
+      "minted_in": "T-2919",
+      "proposed_final": "pantheon-telegram-ingress-config/v1",
+      "provisional": "pantheon-telegram-ingress-config/v1",
+      "rename_later_is_migration": "yes for readers: a schema bump is a versioned migration",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/dist/pantheon-host-approval-telegram-ingress.json.template",
+        "tools/host_control/telegram_ingress/config.py"
+      ]
+    },
+    {
+      "item": "broker config schema",
+      "kind": "schema",
+      "minted_in": "T-2920 U2 (#1367)",
+      "proposed_final": "pantheon-host-broker-config/v1",
+      "provisional": "pantheon-host-broker-config/v1",
+      "rename_later_is_migration": "yes for readers: a schema bump is a versioned migration",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/broker_config.py"
+      ]
+    },
+    {
+      "item": "approval config schema",
+      "kind": "schema",
+      "minted_in": "T-2920 U2 (#1367)",
+      "proposed_final": "pantheon-host-approval-config/v1",
+      "provisional": "pantheon-host-approval-config/v1",
+      "rename_later_is_migration": "yes for readers: a schema bump is a versioned migration",
+      "status": "PROVISIONAL",
+      "used_in": [
+        "tools/host_control/approval/config.py"
+      ]
+    },
+    {
+      "item": "install manifest schema",
+      "kind": "schema",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "pantheon-host-broker-install/v1",
+      "provisional": "pantheon-host-broker-install/v1",
+      "rename_later_is_migration": "yes for readers: a schema bump is a versioned migration",
+      "status": "PROVISIONAL",
+      "used_in": []
+    },
+    {
+      "item": "install plan schema",
+      "kind": "schema",
+      "minted_in": "T-2920 U1",
+      "proposed_final": "pantheon-host-broker-install-plan/v1",
+      "provisional": "pantheon-host-broker-install-plan/v1",
+      "rename_later_is_migration": "yes for readers: a schema bump is a versioned migration",
+      "status": "PROVISIONAL",
+      "used_in": []
+    }
+  ],
+  "schema": "pantheon-host-broker-install-names/v1"
+}

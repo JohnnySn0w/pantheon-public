@@ -1,0 +1,23 @@
+{"type":"user","timestamp":"2026-10-17T09:20:17.353Z","turnOrigin":"task_notification","message":{"content":"<task-notification><task-id>a6753c3e3bc39297d</task-id><status>failed</status></task-notification>"}}
+{"type":"last-prompt"}
+{"type":"ai-title"}
+{"type":"mode"}
+{"type":"permission-mode"}
+{"type":"atis-latch"}
+{"type":"api-request","timestamp":"2026-10-17T09:20:18.692Z"}
+{"type":"assistant","timestamp":"2026-10-17T09:20:19.142Z","message":{"stop_reason":"stop_sequence"}}
+{"type":"system","subtype":"turn_duration","timestamp":"2026-10-17T09:20:19.207Z"}
+{"type":"queue-operation","timestamp":"2026-10-17T09:28:45.800Z"}
+{"type":"queue-operation","timestamp":"2026-10-17T09:28:48.597Z"}
+{"type":"queue-operation","timestamp":"2026-10-17T09:54:45.107Z"}
+{"type":"queue-operation","timestamp":"2026-10-18T17:18:56.887Z"}
+{"type":"api-request-blob"}
+{"type":"api-request-blob"}
+{"type":"api-request","timestamp":"2026-10-18T17:19:00.627Z"}
+{"type":"user","timestamp":"2026-10-18T17:18:57.499Z","turnOrigin":"task_notification","message":{"content":"<task-notification><task-id>bhxao9i0k</task-id><status>completed</status></task-notification>"}}
+{"type":"attachment","timestamp":"2026-10-18T17:18:58.032Z"}
+{"type":"user","timestamp":"2026-10-18T17:19:01.572Z","message":{"content":[{"type":"text","text":"[Request interrupted by user]"}]}}
+{"type":"api-request-blob"}
+{"type":"api-request-blob"}
+{"type":"api-request","timestamp":"2026-10-18T17:19:41.617Z"}
+{"type":"file-history-snapshot"}

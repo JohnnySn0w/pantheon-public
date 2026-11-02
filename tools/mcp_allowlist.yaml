@@ -1,0 +1,65 @@
+schema: pantheon-mcp-allowlist/v1
+servers:
+  mailbox:
+    seats: [specialist, artisan, mason, archivist, orchestrator]
+    profiles: [claude-mailbox]
+  pantheon-mcp-codex:
+    seats: [orchestrator]
+    profiles: [claude-codex-review]
+  telegram:
+    seats: [specialist, archivist, orchestrator, recovery]
+    profiles: [claude-telegram-plugin, codex-telegram-bridge]
+  sticker:
+    seats: [specialist, archivist, orchestrator, recovery]
+    profiles: [claude-sticker, codex-sticker]
+  pantheon-host:
+    seats: []
+    profiles: [internal-host-adapter]
+  pantheon-approval:
+    seats: []
+    profiles: [internal-approval-adapter]
+fingerprints:
+  claude-mailbox:
+    category: claude
+    transport: stdio
+    command: python3
+    repo_script: tools/mailbox_mcp.py
+  claude-codex-review:
+    category: claude
+    transport: stdio
+    command: python3
+    home_script: .claude/mcp/pantheon-mcp-codex/server.py
+  claude-telegram-plugin:
+    category: plugin
+    transport: stdio
+    command: bun
+    plugin: telegram@claude-plugins-official
+    argv_shapes:
+      - [run, --cwd, "${CLAUDE_PLUGIN_ROOT}", "--shell=bun", --silent, start]
+      - [run, --cwd, "${CLAUDE_PLUGIN_ROOT}", --silent, server.ts]
+  codex-telegram-bridge:
+    category: codex
+    transport: stdio
+    command: python3
+    repo_script: tools/codex_telegram_bridge.py
+    argv_tail: [exec, --mode, server]
+  claude-sticker:
+    category: claude
+    transport: stdio
+    command: python3
+    repo_script: tools/sticker_mcp.py
+  codex-sticker:
+    category: codex
+    transport: stdio
+    command: python3
+    repo_script: tools/sticker_mcp.py
+  internal-host-adapter:
+    category: claude
+    transport: stdio
+    command: /usr/local/libexec/pantheon-host-mcp-adapter
+    argv_shapes: [[]]
+  internal-approval-adapter:
+    category: claude
+    transport: stdio
+    command: /usr/local/libexec/pantheon-approval-mcp-adapter
+    argv_shapes: [[]]

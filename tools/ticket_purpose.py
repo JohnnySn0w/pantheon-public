@@ -14,6 +14,7 @@ import ast
 import re
 from typing import AbstractSet, Mapping
 
+from tools import _frontmatter_block
 from tools.project_catalogue import PROJECT_ID_RE, ProjectRecord
 
 
@@ -21,6 +22,18 @@ TICKET_ID_RE = re.compile(r"^T-\d{4,}$")
 GOAL_KEY_RE = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 MAINTENANCE_REF_RE = re.compile(r"^[A-Za-z0-9._-]+(?:/[A-Za-z0-9._-]+)*$")
 SELF_REFERENCE_LABELS = frozenset({"project-formation", "exploratory-probe"})
+# T-3332 (b), ratified by orchestrator 2026-10-27: a ticket carrying this label is a
+# designated non-goal ROOT (e.g. T-5677, operator-directed one-offs). It is a
+# purpose terminal in its own right: a child whose nearest_intent_ref chain
+# reaches it is rooted, even though the root itself has no serves/intent ref.
+# Single source of truth, also imported by tools/ticket_lineage.py.
+OPERATIONAL_ROOT_LABEL = "operational-root"
+
+
+def is_purpose_terminal(purpose: "TicketPurpose") -> bool:
+    """True iff a chain walk may stop at `purpose` with no further intent ref:
+    it carries a `serves` arc-intent, or it is a labelled operational root."""
+    return bool(purpose.serves) or OPERATIONAL_ROOT_LABEL in purpose.labels
 
 
 class PurposeError(ValueError):
@@ -254,7 +267,9 @@ def _parse_frontmatter_text(text: str, label: str) -> Mapping[str, object]:
     if end < 0:
         raise PurposeError(f"{label}: missing closing frontmatter delimiter")
     fields: dict[str, object] = {}
-    fm_lines = text[4:end].splitlines()
+    # T-5694: LF is the ticket format's only source-line delimiter.  The other
+    # characters consumed by str.splitlines() are scalar value bytes.
+    fm_lines = text[4:end].split("\n")
     idx = 0
     while idx < len(fm_lines):
         raw_line = fm_lines[idx]
@@ -267,13 +282,15 @@ def _parse_frontmatter_text(text: str, label: str) -> Mapping[str, object]:
         key, raw = match.group(1), match.group(2).strip()
         if key in fields:
             raise PurposeError(f"{label}: duplicate frontmatter key {key!r}")
-        if raw == "|" and key == "evidence_snapshot":
-            # T-4707 / RFC-004 section 3(a): ORG-076 runtime repair tickets carry a YAML `|`
-            # block scalar. Purpose does not use it; consume the indented continuation lines.
-            while idx < len(fm_lines) and (not fm_lines[idx].strip() or fm_lines[idx].startswith("  ")):
-                idx += 1
-            fields[key] = "<block>"
-            continue
+        if _frontmatter_block.parse_block_header(raw) is not None:
+            # T-4707 / T-5689: a YAML `|` / `>` block scalar on ANY key (ORG-076
+            # evidence_snapshot, T-5678 threat_path, ...). Same shared reader as
+            # ticket.parse_front_matter, so the two parsers agree on the value.
+            # No indented content: fall through, the plain scalar (e.g. "|").
+            block, idx = _frontmatter_block.consume_block(fm_lines, idx, raw, key=key)
+            if block is not None:
+                fields[key] = block
+                continue
         if raw == "" or raw.lower() == "null":
             value: object = None
         elif raw.startswith("[") and raw.endswith("]"):
@@ -430,12 +447,13 @@ def _chain_issue(
         seen.append(current.ticket_id)
         raw = current.nearest_intent_ref
         if raw is None:
-            if current.serves:
+            if is_purpose_terminal(current):
                 return None
             return PurposeIssue(
                 "missing-purpose-terminal",
                 start.ticket_id,
-                f"{current.ticket_id} has neither nearest_intent_ref nor serves",
+                f"{current.ticket_id} has neither nearest_intent_ref nor serves "
+                f"nor the {OPERATIONAL_ROOT_LABEL} label",
             )
         try:
             ref = parse_intent_ref(raw)
@@ -575,7 +593,7 @@ def resolve_ticket_purpose_chain(
         path.append(current.ticket_id)
         raw = current.nearest_intent_ref
         if raw is None:
-            if current.serves:
+            if is_purpose_terminal(current):
                 return tuple(path)
             raise PurposeError(f"{current.ticket_id} has no purpose terminal")
         ref = parse_intent_ref(raw)
@@ -614,6 +632,26 @@ def validate_new_ticket_purpose(
     if mode is PurposeEnforcement.ENFORCE and issues:
         return issues
     return issues
+
+
+def with_goal_registry_reason(
+    issues: tuple[PurposeIssue, ...], reason: str | None
+) -> tuple[PurposeIssue, ...]:
+    """T-5679: name WHY the goal registry is unavailable on the issue itself.
+
+    ``reason`` comes from ``goal_registry.registry_status``. The validator's
+    fixed detail only says no keys were supplied; this swaps in the concrete
+    cause (missing file, malformed marker, duplicate key) so the warning or
+    refusal is honest about it. Issues of other codes pass through untouched.
+    """
+    if not reason:
+        return issues
+    return tuple(
+        PurposeIssue(issue.code, issue.ticket_id, f"goal registry unavailable: {reason}")
+        if issue.code == "goal-registry-unavailable"
+        else issue
+        for issue in issues
+    )
 
 
 def audit_automated_filers(repo_root: Path) -> tuple[PurposeIssue, ...]:

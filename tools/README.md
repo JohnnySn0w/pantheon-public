@@ -17,6 +17,9 @@ Before adding a new responsibility to any tool here, run the audit prompt from [
 | [`quant_h2_sampler.py`](quant_h2_sampler.py) | ORG-102 H2 blind-sample sampler/reply parser. Samples source-bearing outcome calls, renders neutral blind paraphrases with authenticated `codex exec`, stores source+prompt/model audit fields, and computes weekly reply verdicts. | T-4780 |
 | [`quant_weekly_digest.py`](quant_weekly_digest.py) | ORG-102 weekly digest builder. Writes the on-VPS Markdown digest, a plain-word Telegram pointer, and ensures the same weekly run produces the H2 outbox. | T-4780 |
 | [`tool_schema_budget.py`](tool_schema_budget.py) | Read-only worker-profile measurement for MCP/tool-definition schema budget. Resolves profiles from `instance.yaml`, optionally probes configured stdio MCP servers with `tools/list`, estimates schema tokens, and flags the >25K / >50K / >100K tiers. | T-4970 |
+| [`mcp_allowlist.yaml`](mcp_allowlist.yaml) | Sole runtime authority for ratified MCP server names, admitted seats, and source-grounded command/transport profiles. Markdown policy parity is test-only. | T-4679 |
+| [`mcp_allowlist_registry.py`](mcp_allowlist_registry.py) | Strict, bounded, no-follow loader shared by the MCP audit and both provisioners. | T-4679 |
+| [`mcp_allowlist_audit.py`](mcp_allowlist_audit.py) | Secret-free fleet MCP scanner and Recovery monitor with CLEAN/DRIFT/UNKNOWN verdicts, reviewed stdin probes, ORG-026 alerting, and default-dark unit convergence. | T-4679 |
 | [`ticket.py`](ticket.py) | Ticket-system lifecycle CLI (`file / claim / block / resolve / list`). `block` sets `not_before` or `depends_on` frontmatter in-place per ORG-019. Each transition is one narrow-scope commit with auto-push. ORG-003 substrate. **Exit codes (T-4496):** `0` ok; `1` fault (ticket.py or its environment failed: git/IO, a guard, a non-main checkout, a corrupt ticket file); `2` usage error (argparse); `3` refusal (the caller's request was invalid and was declined: bad flag value, unknown target/requester/ticket, lineage or appetite gate, state mismatch, stale-view conflict). The `error: ...` stderr line is the same for 1 and 3; wrappers key on the code. `file` also refuses a non-T-NNNN `--depends-on` element and an unknown `--requester` (T-4499). | shipped 2026-05-02 (`23c0d8d`); T-0004 bug fix `b2cf699`; T-0453 ORG-019 retirement 2026-05-19 |
 | [`ticket_grooming.py`](ticket_grooming.py) | Cron'd staleness scanner. Scans `tickets/active/`, idempotently appends `[grooming] stale` entries past threshold (`4h` default), sends Telegram digest as proof-of-life. Runs under Recovery's user (`claude-fallback`), daily 12:00 UTC. | shipped 2026-05-02 (`694689f`); T-0453 ORG-019 retirement of blocked-state scope 2026-05-19 |
 | [`_git_utils.py`](_git_utils.py) | Shared HERMES regex + git-subprocess helpers for auto-commit pipelines. Used by `watch_runner.py`, `ticket.py`, `ticket_grooming.py`. | shipped 2026-05-02 (`9eecce5`) |
@@ -177,6 +180,32 @@ Reports are flagged urgent if their text contains any of: `CVE-`, `RCE`, `supply
 ## systemd/
 
 Canonical templates for the timer + service units. Install instructions in [`systemd/README.md`](systemd/README.md). The actual installed units live at `~/.config/systemd/user/` and are not version-controlled there (precedent: telegram bot units, per the `project_telegram_two_bot_topology` memory).
+
+## mcp_allowlist_audit.py
+
+`tools/mcp_allowlist.yaml` is the sole runtime MCP authority. The scanner
+derives seats and homes from `instance.yaml`; it never scrapes the policy
+Markdown at runtime. Findings contain only seat, opaque source id, category,
+safe server name, and fixed reason code. Command arguments, environment values,
+and raw configuration values are never emitted.
+
+```sh
+# Human or deterministic JSON one-shot result:
+python3 tools/mcp_allowlist_audit.py scan --format human
+python3 tools/mcp_allowlist_audit.py scan --format json
+
+# Alert/dedupe monitor; --dry-run performs no delivery or state write:
+python3 tools/mcp_allowlist_audit.py monitor --format json --dry-run
+
+# Copy canonical units and daemon-reload only:
+python3 tools/mcp_allowlist_audit.py install
+```
+
+`scan` exits `0` for CLEAN, `2` for DRIFT, and `3` for UNKNOWN. `monitor`
+retains the structured verdict but exits nonzero when mailbox delivery or
+dedupe-state acknowledgement fails. `install` creates the owner-only state
+directory and copies units without enabling, disabling, starting, or firing
+them; later supervised activation is preserved.
 
 ## quant_h2_sampler.py
 
@@ -348,6 +377,7 @@ python3 tools/quant_weekly_digest.py build \
 | [`git_fixture.py`](git_fixture.py) | tools/git_fixture.py — the shared bubble-safe real-git test harness (T-3183 §1). |
 | [`git_reconciler.py`](git_reconciler.py) | git_reconciler — ff-only two-way sync between GitHub and Forgejo (ORG-101 §3, T-4690). |
 | [`github_companion_watch.py`](github_companion_watch.py) | Query GitHub for small companion-memory entrants. |
+| [`goal_registry.py`](goal_registry.py) | Canonical machine-readable goal keys (T-5679). |
 | [`grand_project_program.py`](grand_project_program.py) | ORG-061 stage evidence and owned re-evaluation obligation machinery. |
 | [`handoff_conservation.py`](handoff_conservation.py) | tools/handoff_conservation.py — detect silent detail loss across a HANDOFF rewrite (T-2638). |
 | [`handoff_first.py`](handoff_first.py) | Handoff-first: ask a live session to write its HANDOFF before it is killed (T-5069). |
@@ -367,6 +397,11 @@ python3 tools/quant_weekly_digest.py build \
 | [`hermes_local_audit.py`](hermes_local_audit.py) | Local byte-sequence discipline audit — origin-side coverage without a runner (T-2392). |
 | [`ho_resumer.py`](ho_resumer.py) | HO auto-resumer — reads the limit-hit state file and fires claude --resume. |
 | [`hook_allowlist_lint.py`](hook_allowlist_lint.py) | Hook-allowlist pairing lint (T-1102). |
+| [`host_broker_install.py`](host_broker_install.py) | T-2920 U1: the PURE planning core of the ORG-052 host-broker installer. |
+| [`host_broker_install_apply.py`](host_broker_install_apply.py) | T-2920 U3a: apply, verify and rollback for the ORG-052 host-broker install plan, DARK. |
+| [`host_broker_rehearsal.py`](host_broker_rehearsal.py) | T-2920 U4a: the nspawn REHEARSAL harness for the ORG-052 host-broker installer, DARK. |
+| [`host_broker_rehearsal_live.py`](host_broker_rehearsal_live.py) | T-2920 U4b: the ATTESTED rehearsal live layer (the only actuating code in the arc). |
+| [`host_plan_producer.py`](host_plan_producer.py) | Unprivileged plan producer for the ORG-052 host broker (T-5533, design (c)). |
 | [`inbox_consumer.py`](inbox_consumer.py) | Pantheon inbox auto-consumer. |
 | [`json_safe_edit.py`](json_safe_edit.py) | Concurrency-safe read-modify-write for shared JSON config (T-2329). |
 | [`keep_going.py`](keep_going.py) | tools/keep_going.py — periodic anti-idle nudge for a standing agent (T-0772 sibling). |
@@ -391,6 +426,8 @@ python3 tools/quant_weekly_digest.py build \
 | [`mailbox_writable_roots.py`](mailbox_writable_roots.py) | Resolve manifest-declared mailbox writable roots for harness launch. |
 | [`main_guard_lint.py`](main_guard_lint.py) | main_guard_lint — catch top-level definitions that sit AFTER a `__main__` guard. |
 | [`manifest_pin.py`](manifest_pin.py) | tools/manifest_pin.py — ORG-046 manifest pin LIFECYCLE (T-3764). |
+| [`mcp_allowlist_audit.py`](mcp_allowlist_audit.py) | Secret-free, fail-closed fleet MCP allowlist audit (T-4679). |
+| [`mcp_allowlist_registry.py`](mcp_allowlist_registry.py) | Strict parser for Pantheon's single machine-authoritative MCP registry. |
 | [`memex_failed_unit_check.py`](memex_failed_unit_check.py) | Carry a failed memex unit on LXC 203 to archivist without anyone having to look. |
 | [`memory_envelope.py`](memory_envelope.py) | Typed ORG-058 memory envelope + lifecycle schema and trust policy (T-3197). |
 | [`memory_index.py`](memory_index.py) | tools/memory_index.py — keep MEMORY.md's pin inventory drift-free (ORG-035 / T-1130). |
@@ -417,6 +454,8 @@ python3 tools/quant_weekly_digest.py build \
 | [`naming_history.py`](naming_history.py) | Pantheon naming-history registry — canonical old→new resolver. |
 | [`neutralize_seed.py`](neutralize_seed.py) | Build the pantheon-public seed from a pantheon-config source tree. |
 | [`notify_policy.py`](notify_policy.py) | Per-persona notification mute policy — the ORG-076 §7 "Operator plane" control (T-2978). |
+| [`org060_device_presence_simulator.py`](org060_device_presence_simulator.py) | Deterministic, fixture-only ORG-060 device and presence simulator. |
+| [`org060_presence_contract.py`](org060_presence_contract.py) | ORG-060 replaceable presence projection and interaction contract (T-3227, Child C). |
 | [`org060_sensory_actuation_contract.py`](org060_sensory_actuation_contract.py) | ORG-060 sensory/actuation typed contract (T-3226). |
 | [`org076_heartbeat_check.py`](org076_heartbeat_check.py) | ORG-076 BT3b -- external-witness heartbeat READER (RFC-004 acceptance 6.9), T-4709. |
 | [`org076_meta.py`](org076_meta.py) | ORG-076 BT3b -- in-band store-liveness meta-detector (RFC-004 sections 1, 2b), T-4709. |
@@ -460,6 +499,7 @@ python3 tools/quant_weekly_digest.py build \
 | [`provision_repos.py`](provision_repos.py) | provision_repos.py — T-0761 component 4: clone-on-demand repo provisioning. |
 | [`pve2_backup_freshness.py`](pve2_backup_freshness.py) | pve2_backup_freshness.py — alert when pve2's or boxon's nightly backups go stale or fail (T-4998, T-5301). |
 | [`pve2_heat_monitor.py`](pve2_heat_monitor.py) | pve2_heat_monitor.py — alert when pve2's CPU or GPU runs hot for a sustained stretch (T-5309). |
+| [`pwa_mirror_scrub.py`](pwa_mirror_scrub.py) | T-3316: the pwa-release-mirror option-2 scrub (the operator's T-2131 ruling). |
 | [`quant_calls_collect.py`](quant_calls_collect.py) | ORG-102 calls collector (step 2). |
 | [`quant_delivery_collect.py`](quant_delivery_collect.py) | ORG-102 delivery collector (T-4780 step 1). |
 | [`quant_h2_sampler.py`](quant_h2_sampler.py) | ORG-102 H2 weekly blind sampler and reply parser. |
@@ -480,6 +520,7 @@ python3 tools/quant_weekly_digest.py build \
 | [`restart_request.py`](restart_request.py) | Pantheon restart request — operator-facing CLI to trigger a graceful agent restart. |
 | [`retro_metrics.py`](retro_metrics.py) | retro_metrics.py — one-time best-effort retro-extraction of the cycle-stats |
 | [`runtime_controller.py`](runtime_controller.py) | Deterministic Pantheon runtime controller for persistent persona harnesses. |
+| [`runtime_invocation_receipt.py`](runtime_invocation_receipt.py) | Pure validator for the initial-viability invocation receipt (T-5572). |
 | [`s3star_audit_runner.py`](s3star_audit_runner.py) | tools/s3star_audit_runner.py — HO-side scheduler for the ORG-038 System-3* |
 | [`s3star_seat_evidence.py`](s3star_seat_evidence.py) | s3star_seat_evidence.py — Recovery-captured per-seat evidence for the S3* auditor (T-4928). |
 | [`scheduler_reconcile.py`](scheduler_reconcile.py) | tools/scheduler_reconcile.py — ORG-064 General Scheduler, phase 1: render the |
@@ -488,6 +529,8 @@ python3 tools/quant_weekly_digest.py build \
 | [`seat_context_bundle.py`](seat_context_bundle.py) | tools/seat_context_bundle.py — seed a SELECTED set of HO memory pins into a seat's |
 | [`seat_exec.py`](seat_exec.py) | seat_exec — the one own-account-safe way to build a per-seat cross-account argv. |
 | [`seat_launch_config.py`](seat_launch_config.py) | seat_launch_config.py — the model/effort a seat's role DECLARES in instance.yaml (T-4085). |
+| [`seat_sleep.py`](seat_sleep.py) | tools/seat_sleep.py - ORG-106 L3a (T-5526): the launch-side enforcement of DEEP-SLEEP. |
+| [`seat_sleep_drain.py`](seat_sleep_drain.py) | tools/seat_sleep_drain.py - ORG-106 L3b (T-5526): the DEEP-SLEEP drain. |
 | [`seat_state.py`](seat_state.py) | tools/seat_state.py - ORG-106 L0 (T-5523): seat-state record schema + read-only reader. |
 | [`seat_state_janitor.py`](seat_state_janitor.py) | tools/seat_state_janitor.py - ORG-106 L5 (T-5529): seat-state expiry lifecycle. |
 | [`seat_state_testkit.py`](seat_state_testkit.py) | Test helper (ORG-106 L4b, T-5527): build EffectiveSeatState values for monitor tests. |
@@ -515,11 +558,13 @@ python3 tools/quant_weekly_digest.py build \
 | [`t2598_live_codex_login_check.py`](t2598_live_codex_login_check.py) | tools/t2598_live_codex_login_check.py — gated live codex login-screen |
 | [`t2611_recovery_persona_apply.py`](t2611_recovery_persona_apply.py) | T-2611 driver: install-done precondition + real persona_installer apply |
 | [`t2693_config_roots.py`](t2693_config_roots.py) | T-2693: give each old-hub path in a per-account config a new-hub twin, fail-closed. |
+| [`t5740_readiness_mutation_gate.py`](t5740_readiness_mutation_gate.py) | Exact selectable Amendment-J mutations for T-5740 readiness. |
 | [`tailnet_self.py`](tailnet_self.py) | Is THIS host on the tailnet? One answer for every check that reaches a host over 100.x (T-5385). |
 | [`telegram_inbound.py`](telegram_inbound.py) | telegram_inbound.py (T-4205) — when did the operator last message this account's agent? |
 | [`tempfile_hygiene_lint.py`](tempfile_hygiene_lint.py) | tempfile_hygiene_lint — catch test temp-DIR creations with no registered cleanup. |
 | [`ticket.py`](ticket.py) | Pantheon ticket lifecycle CLI. |
 | [`ticket_grooming.py`](ticket_grooming.py) | Pantheon ticket-grooming staleness scanner. |
+| [`ticket_lineage.py`](ticket_lineage.py) | Read-only lineage-graph queries over the ticket corpus (T-3332 part (a)). |
 | [`ticket_lint.py`](ticket_lint.py) | Pantheon ticket-lint — hourly frontmatter format scanner and auto-fixer. |
 | [`ticket_purpose.py`](ticket_purpose.py) | Typed ORG-054 purpose links for Pantheon tickets. |
 | [`ticket_registry_gate.py`](ticket_registry_gate.py) | T-5496: refuse a ticket close that would turn `registry validate` red. |
@@ -546,6 +591,7 @@ python3 tools/quant_weekly_digest.py build \
 | [`welltrod_stats.py`](welltrod_stats.py) | Well-trod pathing stats — recurring fleet doc-traversal snapshot (T-1811). |
 | [`window_executor.py`](window_executor.py) | Pantheon maintenance-window executor — the D13 queue-drainer. |
 | [`worker_guard_cutover_smoke.py`](worker_guard_cutover_smoke.py) | worker_guard_cutover_smoke: prove the T-4177 worker-guard shim is decision-identical, then time it. |
+| [`worker_guard_v2_replay.py`](worker_guard_v2_replay.py) | Replay validation for worker-guard v2 (T-5686). A tool you run, not a CI test. |
 <!-- AUTOGEN-END spine-index -->
 
 

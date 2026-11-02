@@ -23,7 +23,7 @@ YAML). Because this module is never in ``HANDLERS`` and never imported at
 discover time, it adds no unpinned code to the discover path; T-5477 must land
 before any real handler is registered (it informs T-3936).
 
-Delegation (``tools/repo_reconciler.py`` is used UNCHANGED):
+Delegation to ``tools/repo_reconciler.py``:
 
 * ``observe()`` wraps ``GitCheckoutProbe`` through ``_TipRecordingProbe``, which
   keeps the refs of the probe's own single ``ls-remote`` so the desired-tip sha
@@ -32,9 +32,9 @@ Delegation (``tools/repo_reconciler.py`` is used UNCHANGED):
   sha and calls ``RepoReconciler(...).reconcile_plan()`` then ``.apply(plan)``.
   ``apply`` signals failure by omission (no ``installs`` / ``advances`` entry);
   this handler turns that into ``OperationFailed``.
-* ``repo.reclaim`` calls ``RepoReconciler.remove`` with a receipt rebuilt from
-  this handler's persisted install record (identity, dirty, untracked and HEAD
-  re-checks are the reconciler's own).
+* ``repo.reclaim`` calls ``RepoReconciler.remove`` with the original canonical
+  sealed clone receipt persisted in this handler's install record. Successful
+  removal is an atomic move into the receipt-specific quarantine, never deletion.
 
 Rollback:
 
@@ -51,7 +51,8 @@ Repo redirection: any repo-redirecting git variable in the environment
 (``REPO_REDIRECT_ENV``: GIT_DIR, GIT_WORK_TREE, ...) closes the dark gate, because
 the reconciler's git subprocesses inherit it and ``git -C`` would follow it to
 another repo. The handler's own git calls also strip those variables.
-* clone: ``RepoReconciler.rollback`` over the install record.
+* clone: ``RepoReconciler.rollback`` over the canonical sealed install receipt;
+  the clone is quarantined and the evidence reports its retained path.
 * reclaim: NOT generally reversible. Rollback is best-effort: it re-clones only
   while the remote still advertises the receipted sha as a tip; otherwise it is
   refused as drifted (ROLLBACK_INCOMPLETE), never a wrong-commit restore.
@@ -130,6 +131,14 @@ def _clean_env() -> dict[str, str]:
     return {k: v for k, v in os.environ.items() if k not in REPO_REDIRECT_ENV}
 
 
+def _path_identity(path: str) -> dict[str, int] | None:
+    try:
+        observed = os.lstat(path)
+    except OSError:
+        return None
+    return {"device": observed.st_dev, "inode": observed.st_ino}
+
+
 class LiveActuationDisabled(RuntimeError):
     """The real pantheon-config handler is dark in this tranche (T-5133; cutover T-3936)."""
 
@@ -194,7 +203,7 @@ class PantheonConfigRepoGit:
         self._resolver = remote_resolver
         self._health = health_probe or (lambda _entry: True)
         self._timeout = timeout
-        self.installs: dict[str, dict[str, str]] = {}  # checkout_id -> {path, installed_sha}
+        self.installs: dict[str, dict[str, Any]] = {}
 
     # --- the dark gate ------------------------------------------------------
 
@@ -230,7 +239,8 @@ class PantheonConfigRepoGit:
 
     def _url(self, entry: CheckoutEntry) -> str:
         try:
-            return self._resolver(entry.logical_repo) or ""
+            url = self._resolver(entry.logical_repo) or ""
+            return "" if url.startswith("-") or "\0" in url else url
         except Exception:  # noqa: BLE001 -- mirrors the reconciler: an unresolved source is ""
             return ""
 
@@ -257,8 +267,10 @@ class PantheonConfigRepoGit:
         return self._git(path, "merge-base", "--is-ancestor", older, newer).returncode == 0
 
     def _remote_tips(self, url: str) -> set[str] | None:
+        if not url or url.startswith("-") or "\0" in url:
+            return None
         res = subprocess.run(
-            ["git", "ls-remote", url], capture_output=True, text=True, check=False, timeout=self._timeout, env=_clean_env()
+            ["git", "ls-remote", "--", url], capture_output=True, text=True, check=False, timeout=self._timeout, env=_clean_env()
         )
         if res.returncode != 0:
             return None
@@ -288,13 +300,17 @@ class PantheonConfigRepoGit:
     def _pinned(entry: CheckoutEntry, sha: str) -> CheckoutEntry:
         return dataclasses.replace(entry, mode=CheckoutMode(pinned=sha))
 
-    def _receipt_for(self, entry: CheckoutEntry, installed_sha: str) -> ApplyReceipt:
-        return ApplyReceipt(
-            materialized=True,
-            installs=[entry.checkout_id],
-            install_paths={entry.checkout_id: entry.target_path},
-            installed_sha={entry.checkout_id: installed_sha},
-        )
+    def _receipt_for(self, entry: CheckoutEntry, record: dict[str, Any]) -> ApplyReceipt:
+        raw = record.get("receipt")
+        if type(raw) is not str:
+            raise OperationFailed(f"{entry.checkout_id}: canonical sealed clone receipt missing")
+        try:
+            receipt = ApplyReceipt.from_bytes(raw.encode("utf-8"))
+        except (UnicodeError, ValueError) as exc:
+            raise OperationFailed(f"{entry.checkout_id}: canonical clone receipt invalid: {exc}") from exc
+        if receipt.checkout_id != entry.checkout_id or receipt.target_path != entry.target_path:
+            raise OperationFailed(f"{entry.checkout_id}: clone receipt scope/path mismatch")
+        return receipt
 
     def _apply_one(self, entry: CheckoutEntry, sha: str, expected_action: str) -> tuple[CheckoutEntry, ApplyReceipt]:
         """reconcile_plan() + apply() over a one-entry spec pinned to ``sha``."""
@@ -309,7 +325,8 @@ class PantheonConfigRepoGit:
             raise OperationFailed(
                 f"{entry.checkout_id}: repo_reconciler plans {item.action} ({item.state} {item.detail}), not {expected_action}".strip()
             )
-        return pinned, reconciler.apply(plan)
+        authorization = reconciler.issue_authorization(plan, pinned.checkout_id)
+        return pinned, reconciler.apply(plan, authorization)
 
     # --- EffectHandler: observe ------------------------------------------------
 
@@ -381,27 +398,43 @@ class PantheonConfigRepoGit:
             record = self.installs.get(op.target)
             if record is None:
                 raise OperationFailed(f"{op.target}: not engine-installed; refusing to reap unknown data")
-            refusal = self._reconciler(entry).remove(entry.checkout_id, self._receipt_for(entry, record["installed_sha"]))
-            if refusal is not None:
-                raise OperationFailed(f"repo_reconciler remove refused: {refusal.as_text()}")
+            outcome = self._reconciler(entry).remove(entry.checkout_id, self._receipt_for(entry, record))
+            if not outcome.success:
+                raise OperationFailed(
+                    "repo_reconciler remove refused: "
+                    + "; ".join(refusal.as_text() for refusal in outcome.refusals)
+                )
             if Path(entry.target_path).exists():
                 raise OperationFailed(f"{op.target}: still present after remove")
             del self.installs[op.target]
+            return mutation, OperationEvidence(
+                op.operation_id, op.layer, op.kind, True,
+                f"git {op.kind} via repo_reconciler; quarantined at {outcome.quarantine_path}",
+            )
         return mutation, OperationEvidence(op.operation_id, op.layer, op.kind, True, f"git {op.kind} via repo_reconciler")
 
     def _clone(self, entry: CheckoutEntry, sha: str) -> None:
-        pinned, receipt = self._apply_one(entry, sha, ACTION_CLONE)
+        _pinned, receipt = self._apply_one(entry, sha, ACTION_CLONE)
         if entry.checkout_id not in receipt.installs:
-            raise OperationFailed(f"{entry.checkout_id}: clone failed")
+            detail = "; ".join(r.as_text() for r in receipt.refused) or "clone failed"
+            preserved = receipt.failed_clone_paths.get(entry.checkout_id)
+            suffix = f"; left in place at {preserved}" if preserved else ""
+            raise OperationFailed(f"{entry.checkout_id}: {detail}{suffix}")
         if receipt.installed_sha.get(entry.checkout_id) != sha:
-            # The reconciler's clone reaches a pin only when it is the default-branch tip.
-            # Reclaim our own pristine clone at once so the failed op leaves nothing behind.
-            refusals = self._reconciler(pinned).rollback(receipt)
             raise OperationFailed(
-                f"{entry.checkout_id}: clone landed on {receipt.installed_sha.get(entry.checkout_id)}, not {sha}; "
-                + ("reclaimed" if not refusals else "reclaim refused: " + "; ".join(r.as_text() for r in refusals))
+                f"{entry.checkout_id}: clone receipt mismatch; refusing cleanup"
             )
-        self.installs[entry.checkout_id] = {"path": entry.target_path, "installed_sha": sha}
+        identity = receipt.installed_path_identity.get(entry.checkout_id)
+        if identity is None:
+            raise OperationFailed(
+                f"{entry.checkout_id}: clone receipt lacks filesystem identity; refusing cleanup"
+            )
+        self.installs[entry.checkout_id] = {
+            "path": entry.target_path,
+            "installed_sha": sha,
+            "path_identity": dict(identity),
+            "receipt": receipt.to_bytes().decode("utf-8"),
+        }
 
     # --- verify ------------------------------------------------------------------
 
@@ -479,7 +512,13 @@ class PantheonConfigRepoGit:
         if mutation.kind == "repo.clone":
             if not present:
                 return PreflightResult(True, "not-applied", "never cloned")
-            owned = self._head(path) == mutation.after_fingerprint and self._clean(path)
+            record = self.installs.get(entry.checkout_id)
+            owned = (
+                record is not None
+                and record.get("path_identity") == _path_identity(path)
+                and self._head(path) == mutation.after_fingerprint
+                and self._clean(path)
+            )
             return PreflightResult(owned, "owned" if owned else "drifted", "pristine clone" if owned else "clone moved or dirty")
         if mutation.kind == "repo.reclaim":
             if present:
@@ -504,11 +543,17 @@ class PantheonConfigRepoGit:
         if not self._sandboxed(entry):  # pragma: no cover - _entry already refuses
             raise LiveActuationDisabled("refusing to roll back outside the sandbox")
         if mutation.kind == "repo.clone":
-            refusals = self._reconciler(self._pinned(entry, mutation.after_fingerprint)).rollback(
-                self._receipt_for(entry, mutation.after_fingerprint)
+            record = self.installs.get(entry.checkout_id)
+            if record is None:
+                raise OperationFailed("clone rollback refused: install identity record missing")
+            outcome = self._reconciler(self._pinned(entry, mutation.after_fingerprint)).rollback(
+                self._receipt_for(entry, record)
             )
-            if refusals or Path(entry.target_path).exists():
-                raise OperationFailed("clone rollback refused: " + "; ".join(r.as_text() for r in refusals))
+            if not outcome.success or Path(entry.target_path).exists():
+                raise OperationFailed(
+                    "clone rollback refused: "
+                    + "; ".join(refusal.as_text() for refusal in outcome.refusals)
+                )
             self.installs.pop(entry.checkout_id, None)
         elif mutation.kind == "repo.ff-advance":
             owned, detail = self._ff_owned(entry, mutation)  # re-check right before the rewind

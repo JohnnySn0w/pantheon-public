@@ -44,6 +44,9 @@ def _recovery_plan():
         )
         # T-5447: the BROKER plan (admitted kinds only); the seat-core periodic ops
         # are seat-local residue and never reach the broker's intents.
+        # T-5608: the residue quarantine is admitted, so the REAL codex plan
+        # keeps its admitted timer-enable for the D6 synthesized-intent path.
+        assert "seat-runtime-residue-quarantine" in {op.kind for op in full.operations}
         return partition_installer_plan(full)[0]
 
 

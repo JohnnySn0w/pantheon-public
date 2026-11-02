@@ -54,7 +54,10 @@ from tools import handoff_first
 from tools._lease import Lease
 from tools.codex_telegram_actions import HEALTH_409_ERROR_PREFIX, PriorRuntime
 from tools.codex_telegram_actions import receiver_handoff_actions as _receiver_action_order
-from tools.harness_adapter.claude import classify_claude_mid_session_cap
+from tools.harness_adapter.claude import (
+    classify_claude_authentication_loss,
+    classify_claude_mid_session_cap,
+)
 from tools.harness_adapter.codex import classify_codex_usage_limit
 # Re-exported for tools/bringup_acceptance/codex_acceptance_config_guard.py
 # (rc.ensure_*); the controller's own seeding goes through prepare_launch.
@@ -199,6 +202,10 @@ RUNTIME_SOURCE_HASH_PATHS = (
     "tools/harness_adapter/quota.py",
     "tools/harness_adapter/runner.py",
     "tools/harness_adapter/types.py",
+    "harness/codex/appserver_seats.json",
+    "harness/codex/appserver_supervise.py",
+    "tools/codex_delivery.py",
+    "tools/codex_seat_delivery.py",
     "tools/systemd/pantheon-persona-consume@.service",
     "tools/systemd/pantheon-persona-quota@.service",
     "tools/systemd/pantheon-persona-quota@.timer",
@@ -276,7 +283,7 @@ class RuntimeReplacementError(RuntimeError):
         self.original = original
 
 
-RuntimeFailureClass = Literal["subscription-cap", "operational-launch", "operational-readiness"]
+RuntimeFailureClass = Literal["subscription-cap", "authentication-loss", "operational-launch", "operational-readiness"]
 
 
 class RuntimeOperationalFailure(RuntimeError):
@@ -2001,7 +2008,7 @@ def _raise_for_post_start_assessment(
     started: RuntimeStart,
     assessment: PostStartAssessment,
 ) -> None:
-    if assessment.status != "subscription-cap":
+    if assessment.status not in {"subscription-cap", "authentication-loss"}:
         return
     evidence = {
         **_post_start_assessment_evidence(assessment),
@@ -2009,10 +2016,12 @@ def _raise_for_post_start_assessment(
         "created_scope": str(started.created_scope).lower(),
         "tmux_target": _target_text(binding.controller.tmux),
     }
+    auth_loss = assessment.status == "authentication-loss"
     raise RuntimeOperationalFailure(
+        "runtime post-start authentication loss detected" if auth_loss else
         "runtime post-start subscription cap detected",
-        failure_class="subscription-cap",
-        cause=assessment.cause or "post-start-subscription-cap",
+        failure_class="authentication-loss" if auth_loss else "subscription-cap",
+        cause=assessment.cause or ("post-start-authentication-loss" if auth_loss else "post-start-subscription-cap"),
         binding_runtime=_runtime_ref(binding),
         runtime_start=started,
         created_scope=started.created_scope,
@@ -2545,13 +2554,34 @@ def _verify_runtime_input_ready(
     context: TmuxRuntimeContext | None = None,
     launched_at: datetime | None = None,
 ) -> None:
-    readiness = _wait_for_runtime_input_ready(
-        binding.controller.tmux,
-        harness=binding.launch.harness,
-        profile=binding.launch.profile,
-        adapter=adapter,
-        **_context_kwargs(context),
-    )
+    structural_enabled = getattr(adapter, "appserver_input_readiness_enabled", lambda: False)()
+    if structural_enabled:
+        deadline = time.monotonic() + RUNTIME_INPUT_READY_TIMEOUT_SECONDS
+        while True:
+            if getattr(adapter, "appserver_input_ready")():
+                readiness = RuntimeInputReadiness(
+                    ready=True, pane_sha256="", reason="app-server writer readiness confirmed"
+                )
+                break
+            if not _runtime_alive(binding, context=context):
+                readiness = RuntimeInputReadiness(
+                    ready=False, pane_sha256="", reason="app-server wrapper exited before readiness"
+                )
+                break
+            if time.monotonic() >= deadline:
+                readiness = RuntimeInputReadiness(
+                    ready=False, pane_sha256="", reason="app-server writer readiness timed out"
+                )
+                break
+            time.sleep(RUNTIME_INPUT_READY_POLL_SECONDS)
+    else:
+        readiness = _wait_for_runtime_input_ready(
+            binding.controller.tmux,
+            harness=binding.launch.harness,
+            profile=binding.launch.profile,
+            adapter=adapter,
+            **_context_kwargs(context),
+        )
     if readiness.ready:
         return
     if readiness.adapter_status == "subscription-cap":
@@ -4394,6 +4424,7 @@ def _reanchor_held_recorded_selection(
     *,
     state_root: Path,
     context: TmuxRuntimeContext | None,
+    now: datetime,
 ) -> "PersonaBinding":
     """T-5028 (g): the initial-viability record can name a runtime the operator
     has since held (specialist 2026-10-15: claude held, the live pane runs codex).
@@ -4407,6 +4438,18 @@ def _reanchor_held_recorded_selection(
     holds = load_holds(selected_binding.persona, state_root=state_root)
     if _runtime_ref(selected_binding) not in holds:
         return selected_binding
+    # A stale cap record must not be made current merely because an unrelated
+    # hold also removes the recorded runtime from viability (T-5744 review).
+    # The explicit cap-fallback path below requires the same active-window proof.
+    attempt = load_last_attempt(
+        selected_binding.persona,
+        _binding_runtime_slug(selected_binding),
+        state_root=state_root,
+    ) or {}
+    if attempt.get("failure_class") == "subscription_cap":
+        cooldown_until = _parse_iso_or_none(attempt.get("cooldown_until"))
+        if cooldown_until is None or cooldown_until <= now:
+            return selected_binding
     unheld = [item for item in candidates if _runtime_ref(item) not in holds]
     if not unheld:
         return selected_binding
@@ -4521,7 +4564,7 @@ def _matching_recorded_runtime_selection(
         )
         return None
     anchor_binding = _reanchor_held_recorded_selection(
-        selected_binding, candidates, state_root=state_root, context=context
+        selected_binding, candidates, state_root=state_root, context=context, now=now
     )
     reanchored = anchor_binding is not selected_binding
     selected_binding = anchor_binding
@@ -4542,7 +4585,7 @@ def _matching_recorded_runtime_selection(
         # operator-only, so fallback-return keeps owning the return). Operator first.
         for transition_triggers, event in (
             (frozenset({"operator"}), "consume_selected_operator_destination"),
-            (_QUOTA_TRANSITION_TRIGGERS, "consume_selected_transition_destination"),
+            (_QUOTA_TRANSITION_TRIGGERS | _CONTROLLER_RETURN_TRIGGERS, "consume_selected_transition_destination"),
         ):
             transition_binding = _completed_transition_destination(
                 selected_binding.persona, candidates, triggers=transition_triggers, state_root=state_root
@@ -4566,6 +4609,45 @@ def _matching_recorded_runtime_selection(
                 )
                 selected_binding = transition_binding
                 break
+        # T-5744: a natural mid-session subscription-cap swap is controller-owned
+        # but has no transition.json (the cap outcome itself is the receipt).  Let
+        # consume follow it only when the ordinary viability selector independently
+        # chooses the exact runtime recorded in runtime.json, and the live pane's
+        # argv positively matches.  Missing/expired cap evidence, a different
+        # viability winner, or a dead/unreadable pane therefore still fails closed.
+        if not _state_matches(selected_binding, runtime_state, **_context_kwargs(context)):
+            selected_attempt = load_last_attempt(
+                selected_binding.persona,
+                _binding_runtime_slug(selected_binding),
+                state_root=state_root,
+            ) or {}
+            selected_cooldown_until = _parse_iso_or_none(selected_attempt.get("cooldown_until"))
+            viable, _skipped = _select_viable_runtime(
+                selected_binding.persona,
+                candidates,
+                load_holds(selected_binding.persona, state_root=state_root),
+                now,
+                state_root=state_root,
+            )
+            if (
+                viable is not None
+                and _binding_runtime_ref(viable) != _binding_runtime_ref(selected_binding)
+                and _state_matches(viable, runtime_state, **_context_kwargs(context))
+                and _pane_runs_binding(viable, context=context)
+                and selected_attempt.get("failure_class") == "subscription_cap"
+                and selected_cooldown_until is not None
+                and selected_cooldown_until > now
+            ):
+                _append_controller_evidence(
+                    selected_binding.persona,
+                    "consume_selected_cap_fallback",
+                    {
+                        "initial_viability_selected": _binding_runtime_ref(selected_binding),
+                        "destination": _binding_runtime_ref(viable),
+                    },
+                    state_root=state_root,
+                )
+                selected_binding = viable
     if not runtime_state or not _state_matches(selected_binding, runtime_state, **_context_kwargs(context)):
         _block_if_live_target(
             "runtime-state-missing-or-mismatched",
@@ -4764,6 +4846,8 @@ def _controller_cooldown_skip(
     attempt = load_last_attempt(binding.persona, _binding_runtime_slug(binding), state_root=state_root)
     if _runtime_blocked_record(attempt):
         return "controller-runtime-blocked", None
+    if (attempt or {}).get("failure_class") == "authentication_loss":
+        return "controller-authentication-loss", None
     if (attempt or {}).get("failure_class") != "subscription_cap":
         return None
     until = _parse_iso_or_none((attempt or {}).get("cooldown_until"))
@@ -7477,7 +7561,8 @@ def _replace_runtime(
         )
         try:
             _verify_runtime_input_ready(
-                target, runtime_start, state_root=state_root, **_context_kwargs(context)
+                target, runtime_start, state_root=state_root, adapter=adapter,
+                **_context_kwargs(context)
             )
         except RuntimeError:
             _clear_stale_runtime_state(target.persona, state_root=state_root)
@@ -9018,6 +9103,7 @@ RUNTIME_FAILURE_CLASSES = (
     "readiness_timeout",
     "operational_failure",
     "runtime_blocked",
+    "authentication_loss",
 )
 SUSTAINED_ALIVE_SECONDS = 300.0
 # T-5483: an operator `harness restart` marker is honoured only this long after it
@@ -9172,6 +9258,13 @@ class MidSessionCapSwapOutcome:
     modal_kind: str
     cooldown_until: datetime
     cooldown_source: str  # "parsed" | "conservative-default"
+
+
+@dataclass(frozen=True)
+class AuthenticationLossSwapOutcome:
+    """Confirmed provider auth loss; source is blocked until operator clear."""
+
+    pattern_id: str
 
 
 # ----------------------------------------------------------------------------
@@ -9770,7 +9863,7 @@ def _cooldown_until_for_failure(
     """Failure-class -> cooldown_until (spec SS Failure-class -> cooldown table)."""
     if failure_class == "subscription_cap":
         return cap_reset_ceiling(harness, now=now)
-    if failure_class == "runtime_blocked":
+    if failure_class in {"runtime_blocked", "authentication_loss"}:
         # Never expires automatically -- only `harness clear-cooldown` (BT4) clears it.
         return None
     # process_death / readiness_timeout / operational_failure: shared backoff ladder.
@@ -10002,6 +10095,11 @@ def _runtime_blocked_record(attempt: Mapping[str, Any] | None) -> bool:
     return bool(attempt) and attempt.get("outcome") == "failed" and attempt.get("failure_class") == "runtime_blocked"
 
 
+def _authentication_loss_record(attempt: Mapping[str, Any] | None) -> bool:
+    """Fail-closed provider revocation marker; only explicit cooldown clear removes it."""
+    return bool(attempt) and attempt.get("outcome") == "failed" and attempt.get("failure_class") == "authentication_loss"
+
+
 def _select_viable_runtime(
     persona: str,
     candidates: Sequence["PersonaBinding"],
@@ -10047,6 +10145,9 @@ def _select_viable_runtime(
             # T-5028 (d): runtime_blocked never expires on its own (cooldown_until
             # is None by design); only `harness clear-cooldown` makes it selectable.
             skipped.append({"runtime": ref, "reason": "runtime-blocked"})
+            continue
+        if _authentication_loss_record(attempt):
+            skipped.append({"runtime": ref, "reason": "authentication-loss"})
             continue
         cooldown_until = _parse_iso_or_none((attempt or {}).get("cooldown_until"))
         if cooldown_until is not None and cooldown_until > current_time:
@@ -10380,31 +10481,6 @@ def _report_swap_receiver_not_ready(
             pass
 
 
-def _note_deprecated_flip_keys(
-    persona: str,
-    prefix: str,
-    document: Mapping[str, Any],
-    *,
-    state_root: Path | None,
-    now: datetime | None,
-) -> None:
-    """T-5446 Phase A: the seat's role still carries a retired flip key set to `true`
-    (tolerated, a deprecated no-op until Phase B, T-5460). One evidence line per
-    cooldown window, no alert."""
-    from tools.harness_adapter.diagnostics import flip_key_deprecations
-
-    mine = [d for d in flip_key_deprecations(document) if d.startswith(prefix)]
-    if not mine:
-        return
-    current = now or _utc_now()
-    path = _persona_state(persona, state_root) / "deprecated-flip-key-note.json"
-    last = _parse_iso_or_none(_read_json(path).get("last_at"))
-    if last is not None and (current - last).total_seconds() < PRIOR_RECEIVER_ALERT_COOLDOWN_SECONDS:
-        return
-    _append_controller_evidence(persona, "deprecated_flip_key_noop", {"keys": mine}, state_root=state_root)
-    _atomic_json(path, {"last_at": _iso(current)})
-
-
 def _report_retired_flip_keys(
     persona: str,
     role: str,
@@ -10413,7 +10489,7 @@ def _report_retired_flip_keys(
     state_root: Path | None,
     now: datetime | None = None,
 ) -> None:
-    """T-5458 / T-5446 Phase A: a `false` (or non-bool) re-added to a retired flip key on
+    """T-5458 / T-5446 Phase B: a retired flip key re-added (any value, `true` included) on
     THIS seat's role is ignored by the resolver (the flip stays on), so the controller
     keeps running; surface it here with one evidence event and one cooldown-gated alert.
     CI and Manifest.load still fail on the same condition. Never raises."""
@@ -10425,11 +10501,10 @@ def _report_retired_flip_keys(
         document = agent_role_map.load_instance_document(manifest_path)
         mine = [v for v in flip_key_violations(document) if v.startswith(prefix)]
         if not mine:
-            _note_deprecated_flip_keys(persona, prefix, document, state_root=state_root, now=now)
             return
         msg = (
-            f"runtime-controller {persona}: instance.yaml carries a retired flip key with a forbidden "
-            f"value ({'; '.join(mine)[:900]}). The value is IGNORED and the flip stays on; remove the key "
+            f"runtime-controller {persona}: instance.yaml carries a retired flip key "
+            f"({'; '.join(mine)[:900]}). The value is IGNORED and the flip stays on; remove the key "
             f"(T-5446, the operator TG 12274/12283)."
         )
         result = _route_cooldown_gated_alert(
@@ -10612,6 +10687,10 @@ def _fallback_return_eligible(
 
 
 _QUOTA_TRANSITION_TRIGGERS = frozenset({"planned-quota", "quota-reset", "forced-cap"})
+#: T-5794: a controller fallback-return ends the fallback session and the respawned
+#: controller starts the primary directly, with no planned swap; controller_main
+#: leaves this completed receipt so consume can follow it (same receipt checks).
+_CONTROLLER_RETURN_TRIGGERS = frozenset({"fallback-return"})
 
 
 def _completed_transition_destination(
@@ -10634,8 +10713,66 @@ def _completed_transition_destination(
     state = transition_state(persona, state_root=state_root)
     if state.get("trigger") not in triggers or state.get("phase") != "completed":
         return None
-    destination = state.get("destination")
+    destination = _transition_record_destination(state)
     return next((c for c in candidates if _binding_runtime_ref(c) == destination), None)
+
+
+def _transition_record_destination(state: Mapping[str, Any]) -> str | None:
+    """A transition record's destination runtime ref (T-5794).
+
+    Operator and controller-swap records carry ``destination``; records begun by
+    _begin_transition (planned-quota / quota-reset / forced-cap) carry only
+    ``incoming_harness`` + ``incoming_profile``, which name the same runtime."""
+    destination = state.get("destination")
+    if isinstance(destination, str) and destination:
+        return destination
+    harness, profile = state.get("incoming_harness"), state.get("incoming_profile")
+    if isinstance(harness, str) and harness and isinstance(profile, str) and profile:
+        return f"{harness}/{profile}"
+    return None
+
+
+def _record_fallback_return_transition(
+    persona: str, source: "PersonaBinding", target_ref: str, *, state_root: Path | None, now: datetime,
+) -> bool:
+    """Leave a completed ``fallback-return`` transition receipt (T-5794).
+
+    Without it transition.json keeps the older swap that put the seat on its
+    fallback (incoming=fallback, fallback_active=True), so consume blocked every
+    fire against the primary the controller just relaunched, and the stale
+    fallback_active record could still drive a quota-reset return. An in-flight
+    or compensation-failed transition is never overwritten. Returns True when
+    written."""
+    current = transition_state(persona, state_root=state_root)
+    if current.get("phase") in {"preparing", "awaiting-successor-read", "compensation-failed"}:
+        _best_effort_controller_evidence(
+            persona, "fallback_return_transition_skipped",
+            {"phase": current.get("phase"), "trigger": current.get("trigger"), "destination": target_ref},
+            state_root=state_root,
+        )
+        return False
+    incoming_harness, _, incoming_profile = target_ref.partition("/")
+    _atomic_json(_transition_path(persona, state_root), {
+        "schema": "pantheon-runtime-transition/v1",
+        "transition_id": _new_transition_id(),
+        "persona": persona,
+        "trigger": "fallback-return",
+        "phase": "completed",
+        "source_runtime": _runtime_ref(source),
+        "destination": target_ref,
+        "outgoing_harness": source.launch.harness,
+        "outgoing_profile": source.launch.profile,
+        "incoming_harness": incoming_harness,
+        "incoming_profile": incoming_profile,
+        "fallback_active": False,
+        "completed_at": _iso(now),
+    })
+    _best_effort_controller_evidence(
+        persona, "fallback_return_transition_recorded",
+        {"source": _runtime_ref(source), "destination": target_ref},
+        state_root=state_root,
+    )
+    return True
 
 
 def _operator_transition_destination(
@@ -10706,6 +10843,7 @@ def _classify_death(exc: BaseException | None) -> str:
     if isinstance(exc, RuntimeOperationalFailure):
         return {
             "subscription-cap": "subscription_cap",
+            "authentication-loss": "authentication_loss",
             "operational-launch": "operational_failure",
             "operational-readiness": "readiness_timeout",
         }.get(exc.failure_class, "operational_failure")
@@ -12062,7 +12200,7 @@ def block_until_tmux_death(
     manifest_path: Path | None = None,
     seat_sleep_fn: Callable[[], "SeatSleepOutcome | None"] | None = None,
     seat_sleep_check_interval_seconds: float = SEAT_SLEEP_CHECK_INTERVAL_SECONDS,
-) -> "MidSessionCapSwapOutcome | FallbackReturnOutcome | OperatorSwapOutcome | SeatSleepOutcome | None":
+) -> "AuthenticationLossSwapOutcome | MidSessionCapSwapOutcome | FallbackReturnOutcome | OperatorSwapOutcome | SeatSleepOutcome | None":
     """Spec SS Controller invocation flow, step 4: block as MainPID until
     the started runtime's tmux session dies. `alive_check`/`sleep` are
     test seams (consistent with the file's existing injectable-dependency
@@ -12147,6 +12285,8 @@ def block_until_tmux_death(
     fallback_deadline: datetime | None = None
     last_handoff_attempt: datetime | None = None
     handoff_confirmed = False
+    auth_candidate: tuple[str, int] | None = None
+    auth_hits = 0
 
     while is_alive():
         sleep(poll_interval_seconds)
@@ -12220,8 +12360,39 @@ def block_until_tmux_death(
 
         if detect_cap and (current - last_cap_check).total_seconds() >= cap_check_interval_seconds:
             last_cap_check = current
+            try:
+                pane_text = capture_pane_fn()
+            except Exception:  # noqa: BLE001 -- pane telemetry is fail-open
+                pane_text = ""
+            auth = (
+                classify_claude_authentication_loss(pane_text)
+                if binding.launch.harness == "claude" else None
+            )
+            # T-5791 r1: corroborate on a FRESH failure only. A static pane re-reads
+            # the same banner count every poll and must never escalate; the second
+            # hit needs a new banner line (e.g. a mail-wake turn failing again).
+            # A shrinking count (banner scrolled away) just re-baselines.
+            if auth is None:
+                auth_candidate, auth_hits = None, 0
+            elif auth_candidate is None or auth[0] != auth_candidate[0]:
+                auth_candidate, auth_hits = auth, 1
+            elif auth[1] > auth_candidate[1]:
+                auth_candidate, auth_hits = auth, auth_hits + 1
+            elif auth[1] < auth_candidate[1]:
+                auth_candidate = auth
+            if auth_hits >= 2 and _mid_session_cap_swap_eligible(
+                binding, candidates=candidates, holds=holds, now=current, state_root=state_root,
+                usability_probe=usability_probe_fn, manifest_path=manifest_path,
+            ):
+                terminate = terminate_runtime_fn or _terminate_runtime_pid
+                terminate(binding, context=context)
+                deadline = current + timedelta(seconds=terminate_confirm_timeout_seconds)
+                while now_fn() < deadline and is_alive():
+                    sleep(poll_interval_seconds)
+                if not is_alive():
+                    return AuthenticationLossSwapOutcome(pattern_id=auth[0])
             observation = _observe_and_publish_mid_session_cap(
-                binding, capture_pane_fn=capture_pane_fn, now=current, state_root=state_root,
+                binding, capture_pane_fn=lambda: pane_text, now=current, state_root=state_root,
             )
             if (
                 observation is not None
@@ -12550,6 +12721,7 @@ def _persist_runtime_record_on_launch(
 
 #: T-5016: controller_main's block outcome -> the session-end cause it records.
 _SESSION_END_CAUSE_BY_OUTCOME = {
+    "AuthenticationLossSwapOutcome": "authentication-loss-swap",
     "MidSessionCapSwapOutcome": "cap-swap",
     "FallbackReturnOutcome": "fallback-return",
 }
@@ -12967,7 +13139,19 @@ def controller_main(
         # sustained-alive success/process_death branch entirely, even if the
         # runtime had been alive well past SUSTAINED_ALIVE_SECONDS before the
         # swap fired (the realistic case).
-        if isinstance(block_result, MidSessionCapSwapOutcome):
+        if isinstance(block_result, AuthenticationLossSwapOutcome):
+            record_last_attempt(
+                persona, selected, outcome="failed", failure_class="authentication_loss",
+                trigger=trigger, state_root=state_root, now=now(),
+            )
+            swap_notice = (
+                "authentication-loss-swap", _iso(now()),
+                f"runtime-controller {persona}: {selected_ref} lost provider authentication "
+                f"({block_result.pattern_id}); it remains fail-closed until an operator clears "
+                "the marker after successful OAuth recovery. The controller moves the seat to "
+                "its next manifest-declared viable runtime.",
+            )
+        elif isinstance(block_result, MidSessionCapSwapOutcome):
             prior_attempt = load_last_attempt(persona, _binding_runtime_slug(selected), state_root=state_root) or {}
             already_recorded = (
                 prior_attempt.get("failure_class") == "subscription_cap"
@@ -12996,6 +13180,9 @@ def controller_main(
             # alive before the failback fired.
             record_last_attempt(
                 persona, selected, outcome="success", trigger=trigger, state_root=state_root, now=now()
+            )
+            _record_fallback_return_transition(
+                persona, selected, block_result.target_ref, state_root=state_root, now=now(),
             )
             swap_notice = (
                 "fallback-return", _iso(now()),
@@ -13071,8 +13258,13 @@ def controller_main(
         # T-4804: after the state cleanup, so alerting can never sit ahead of it.
         if swap_notice is not None:
             kind, event_key, text = swap_notice
+            destination = (
+                block_result.target_ref
+                if isinstance(block_result, FallbackReturnOutcome)
+                else selected_ref
+            )
             _notify_runtime_swap(
-                persona, selected_ref if kind == "cap-swap" else block_result.target_ref,
+                persona, destination,
                 kind, event_key, text, state_root=state_root,
             )
         return 0

@@ -50,7 +50,46 @@ mount -t tmpfs -o mode=1777 tmpfs /tmp
 mount -t tmpfs -o mode=1777 tmpfs /var/tmp
 mount -t tmpfs -o mode=1777 tmpfs /dev/shm
 
+# T-5657 (Recovery D15): RootHelper's ancestor walk needs "/" to be a root-owned
+# directory, but in this rootless user namespace the real "/" belongs to an
+# unmapped uid (it stats as nobody:nogroup). So the agent runs CHROOTED into a
+# fresh tmpfs owned by namespace root. TEST-ONLY: nothing in production code
+# knows about this, and no flag selects it. Host trees come in read-only; the
+# sandbox trees above come in unchanged (same tmpfs, so the agent's st_dev
+# checks still hold).
+R=/mnt/.root
+mkdir -m 0755 "$R"
+mount -t tmpfs -o mode=0755 tmpfs "$R"
+for d in usr bin sbin lib lib32 lib64 libx32; do
+  if [ -L "/$d" ]; then
+    ln -s "$(readlink "/$d")" "$R/$d"   # merged-/usr: the same relative link
+  elif [ -d "/$d" ]; then
+    mkdir "$R/$d"
+    mount --rbind "/$d" "$R/$d"         # carries the fake loginctl/systemctl binds
+    mount -o remount,bind,ro "$R/$d"
+  fi
+done
+mkdir -p "$R/etc" "$R/home" "$R/srv" "$R/var/lib/systemd" "$R/var/tmp" "$R/tmp" "$R/dev" "$R/proc" "$R/mnt"
+mount --bind /mnt "$R/mnt"              # non-recursive: the sandbox tmpfs alone (no submounts)
+mount --bind /mnt/repo "$R/mnt/repo"
+mount -o remount,bind,ro "$R/mnt/repo"
+mount --bind /mnt/etc "$R/etc"
+mount --bind /mnt/home "$R/home"
+mount --bind /mnt/srv "$R/srv"
+mount --bind /mnt/vlsd "$R/var/lib/systemd"
+mount -t tmpfs -o mode=1777 tmpfs "$R/tmp"
+mount -t tmpfs -o mode=1777 tmpfs "$R/var/tmp"
+mount --rbind /dev "$R/dev"             # includes the private /dev/shm above
+mount --rbind /proc "$R/proc"
+
+# Fail closed: if "/" inside the chroot is not root:root, ABORT before the agent
+# prints "ready" (the launcher then raises SandboxError; nothing skips).
+ROOT_OWNER=$(/usr/sbin/chroot "$R" /usr/bin/stat -c %U:%G /) || ROOT_OWNER=unobservable
+if [ "$ROOT_OWNER" != "root:root" ]; then
+  echo "enter.sh: sandbox / is $ROOT_OWNER, not root:root (T-5657); aborting" >&2
+  exit 1
+fi
+
 # run from the sandbox root, never pytest's real cwd: nothing may resolve against
 # a real directory (the agent also refuses relative path arguments outright)
-cd /mnt
-exec /usr/bin/python3 -I /mnt/agent/agent.py "$NONCE" /mnt
+exec /usr/sbin/chroot "$R" /usr/bin/env -C /mnt /usr/bin/python3 -I /mnt/agent/agent.py "$NONCE" /mnt

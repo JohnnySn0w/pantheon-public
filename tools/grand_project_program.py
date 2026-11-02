@@ -937,6 +937,7 @@ def build_review_ticket_args(
     )
     args = [
         "file", "--requester", "recovery", "--target", obligation.review_target,
+        "--automated-filer", "grand_project_program",  # T-5678: ORG-105 gate, non-interactive
         "--title", title,
         "--labels", f"adr-reeval,reeval:{obligation.obligation_id},adr,process",
         "--project-id", "null",

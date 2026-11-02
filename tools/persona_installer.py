@@ -44,6 +44,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from tools import codex_telegram_bridge  # noqa: E402  (needs sys.path bootstrap)
+from tools.mcp_allowlist_registry import RegistryError, load_registry  # noqa: E402
 from tools.harness_adapter.diagnostics import flip_key_violations  # noqa: E402
 from tools.codex_telegram_actions import receiver_handoff_actions  # noqa: E402
 from tools.harness_permission_posture import (  # noqa: E402
@@ -128,6 +129,23 @@ from tools.persona_installer_activation import (  # noqa: E402,F401
     UNIT_FIRE_POLL_INTERVAL_SECONDS,
     _unit_fire_invocation_digest,
     _is_installer_managed,
+    # T-5608: the T-5473 residue-quarantine predicate, shared with the per-seat executor
+    QUARANTINE_DIR_PREFIX,
+    RESIDUE_RUNTIME_CONTROLLER,
+    RESIDUE_PERSONA_ROOT,
+    RESIDUE_STATE_ROOT_SUFFIXES,
+    _QUARANTINE_CLASSES,
+    _PERSONA_NAME,
+    _quarantine_desired,
+    _quarantine_class_base,
+    _bootstrap_residue_entries,
+    _RESIDUE_SAFE_ACTIVE_STATES,
+    _runtime_liveness_refusal,
+    _quarantine_stamp,
+    _quarantine_dir_for,
+    _quarantine_pairs,
+    _quarantine_can_rollback,
+    _residue_quarantine_check,
 )
 
 PLAN_SCHEMA = "pantheon-persona-install-plan/v1"
@@ -166,9 +184,9 @@ SEAT_LOCAL_RESIDUE_KINDS = frozenset(
         "seat-service-decommission",
         # T-5454: shell-box containment wiring in the seat's own settings.json.
         "seat-claude-settings-env",
-        # T-5473 / T-5474: phase-Q mechanized -- stale control-plane residue quarantine and
-        # first-launch workspace trust, both before the consume bootstrap fire.
-        "seat-runtime-residue-quarantine",
+        # T-5474: phase-Q first-launch workspace trust, before the consume bootstrap fire.
+        # (T-5473's residue quarantine is executor-admitted as files.seat_root since T-5608;
+        # the installer's own backends still execute it in an installer flow.)
         "seat-claude-workspace-trust",
     }
 )
@@ -185,7 +203,6 @@ RESIDUE_QUARANTINE_OP_ID = "service.runtime-residue.quarantine"
 WORKSPACE_TRUST_KIND = "seat-claude-workspace-trust"
 WORKSPACE_TRUST_OP_ID = "harness.claude-workspace-trust"
 TRUST_KEY = "hasTrustDialogAccepted"
-QUARANTINE_DIR_PREFIX = ".installer-quarantine-"
 LAYER_NAMES = {
     0: "host-substrate",
     1: "connective-substrate",
@@ -647,15 +664,19 @@ def _positive_int(value: Any, field_name: str) -> int:
 
 CLAUDE_MCP_SERVERS_SCHEMA = "pantheon-claude-mcp-servers/v1"
 
-# Fail-closed allowlist gate — rulebook/policies/mcp-adoption.md §2 (T-3275,
-# landed commit 0750b5e4d). A server absent from this table is not permitted on
-# any seat: the question "may seat X run server Y" is answered by set-membership,
-# not per-adoption judgment (P1). The per-server frozenset restricts which
-# personas may carry it. Adding a row is a reserved (operator-ratified) action.
-_CLAUDE_MCP_ALLOWLIST: Mapping[str, frozenset[str]] = {
-    "mailbox": frozenset({"orchestrator", "specialist", "archivist", "mason", "artisan"}),
-    "pantheon-mcp-codex": frozenset({"orchestrator"}),
-}
+# Fail-closed compatibility view of the single machine authority.  The YAML is
+# also consumed by the fleet audit; this name remains for existing provisioner
+# and host-broker callers, but is no longer an independently edited registry.
+def _load_mcp_allowlist(path: Path | None = None) -> Mapping[str, frozenset[str]]:
+    path = path or REPO_ROOT / "tools" / "mcp_allowlist.yaml"
+    try:
+        registry = load_registry(path)
+    except RegistryError as exc:
+        raise ManifestError("MCP allowlist authority is malformed or unreadable") from exc
+    return {name: server.seats for name, server in registry.servers.items()}
+
+
+_CLAUDE_MCP_ALLOWLIST: Mapping[str, frozenset[str]] = _load_mcp_allowlist()
 
 # Inline-secret gate — an env key whose name reads as a credential is rejected at
 # parse time (mcp-adoption.md §5: secrets come from the seat's secret path, never
@@ -1003,128 +1024,6 @@ def _settings_env_atomic_write(
             os.unlink(temporary)
 
 
-# ---- T-5473: phase-Q runtime-residue quarantine (receipt-owned move, never delete) ----
-# The op runs ONLY where the unit-fire is an actual bootstrap fire: the consume timer is NOT
-# enabled (the disabled-timer branch of the `connective.unit-fire` preflight/execute, the same
-# `not unit_file_enablement(timer).enabled` read that gates `_unit_fire_bootstrap_blocker`).
-# On a converged/live seat the controller owns runtime.json etc., so the op is a recorded
-# no-op and moves nothing. One predicate per backend: `_bootstrap_fire_pending`.
-_QUARANTINE_CLASSES = ("runtime-controller", "persona-root", "state-root")
-_PERSONA_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
-
-
-def _quarantine_desired(operation: "InstallOperation") -> tuple[str, str, str]:
-    """(persona_state_root, persona, consume timer unit), validated."""
-    root = operation.desired.get("persona_state_root", "")
-    persona = operation.desired.get("persona", "")
-    timer = operation.desired.get("timer", "")
-    if not root or not os.path.isabs(root):
-        raise OperationFailed("residue quarantine: persona_state_root must be absolute")
-    if not _PERSONA_NAME.match(persona):
-        raise OperationFailed("residue quarantine: persona is not a plain name")
-    if not timer:
-        raise OperationFailed("residue quarantine: consume timer unit is not named")
-    return root.rstrip("/") or "/", persona, timer
-
-
-def _quarantine_class_base(root: str, persona: str, cls: str) -> str:
-    return {
-        "runtime-controller": f"{root}/{persona}/runtime-controller",
-        "persona-root": f"{root}/{persona}",
-        "state-root": root,
-    }[cls]
-
-
-def _bootstrap_residue_entries(persona_state_root: Path, persona: str) -> list[tuple[str, str]]:
-    """(class, name) of every existing phase-Q residue path. Read-only. The class says where the
-    path lives (and where its quarantined copy goes); ``_bootstrap_residue`` renders the same list."""
-    found: list[tuple[str, str]] = []
-    root = persona_state_root
-    for cls, base, patterns in (
-        ("runtime-controller", root / persona / "runtime-controller", RESIDUE_RUNTIME_CONTROLLER),
-        ("persona-root", root / persona, RESIDUE_PERSONA_ROOT),
-    ):
-        for pattern in patterns:
-            if "*" in pattern:
-                found.extend((cls, item.name) for item in sorted(base.glob(pattern)))
-            elif os.path.lexists(base / pattern):
-                found.append((cls, pattern))
-    for suffix in RESIDUE_STATE_ROOT_SUFFIXES:
-        if os.path.lexists(root / f"{persona}{suffix}"):
-            found.append(("state-root", f"{persona}{suffix}"))
-    return found
-
-
-_RESIDUE_SAFE_ACTIVE_STATES = frozenset({"inactive", "failed"})
-
-
-def _runtime_liveness_refusal(states: Mapping[str, str | None]) -> str | None:
-    """THE shared liveness gate for the residue quarantine (both backends; reviewer B1). ``states``
-    maps unit -> ActiveState (None == unreadable). Anything but inactive/failed -- active,
-    activating, reloading, deactivating, an unreadable or unknown state -- means the old runtime
-    may still own runtime.json, so the quarantine fails closed."""
-    for unit, state in states.items():
-        if state is None:
-            return f"{unit} state is unreadable: refusing to move runtime state under a possibly live seat"
-        if state not in _RESIDUE_SAFE_ACTIVE_STATES:
-            return (
-                f"{unit} is {state}: the old runtime is live, stop it first (SOP phase Q runs after "
-                "teardown); refusing to move its runtime state"
-            )
-    return None
-
-
-def _quarantine_stamp() -> str:
-    """Execute-time UTC stamp (SOP $STAMP convention). Never part of the plan or its digest."""
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def _quarantine_dir_for(root: str, persona: str, stamp: str) -> str:
-    return f"{root}/{persona}/{QUARANTINE_DIR_PREFIX}{stamp}"
-
-
-def _quarantine_pairs(before: Mapping[str, str], target: str | None = None) -> list[tuple[str, str]]:
-    """(quarantined copy, original path) for each path the receipt moved. Raises on a malformed
-    receipt (a name that could escape its directory, an unknown class)."""
-    try:
-        root, persona = before["persona_state_root"], before["persona"]
-        stamp = before["stamp"]
-        moved = json.loads(before.get("moved", "[]"))
-    except (KeyError, ValueError) as exc:
-        raise OperationFailed(f"residue quarantine receipt is malformed: {exc}") from exc
-    if not _PERSONA_NAME.match(persona) or not re.match(r"^[0-9A-Za-z-]+$", stamp) or not os.path.isabs(root):
-        raise OperationFailed("residue quarantine receipt is malformed")
-    if target is not None and target != f"{root.rstrip('/')}/{persona}":
-        raise OperationFailed("residue quarantine receipt does not match its mutation target")
-    qdir = _quarantine_dir_for(root, persona, stamp)
-    pairs: list[tuple[str, str]] = []
-    for item in moved:
-        if not (isinstance(item, list) and len(item) == 2):
-            raise OperationFailed("residue quarantine receipt is malformed")
-        cls, name = item
-        if cls not in _QUARANTINE_CLASSES or not isinstance(name, str) or not name or "/" in name or name in (".", ".."):
-            raise OperationFailed("residue quarantine receipt names a path outside the closed residue set")
-        pairs.append((f"{qdir}/{cls}/{name}", f"{_quarantine_class_base(root, persona, cls)}/{name}"))
-    return pairs
-
-
-def _quarantine_can_rollback(
-    before: Mapping[str, str], lexists: "Callable[[str], bool]", target: str | None = None
-) -> "PreflightResult":
-    """Shared by both backends and by rollback itself, so can_rollback predicts the same refusal.
-    Every destination and every quarantined copy is checked BEFORE anything moves."""
-    if before.get("state") != "present":
-        return PreflightResult(True, "not-applied", "nothing was quarantined")
-    try:
-        pairs = _quarantine_pairs(before, target)
-    except OperationFailed as exc:
-        return PreflightResult(False, "malformed", str(exc))
-    for quarantined, original in pairs:
-        if lexists(original):
-            return PreflightResult(False, "drifted", f"{original} was re-created after the receipt; not moving the quarantined copy back over it")
-        if not lexists(quarantined):
-            return PreflightResult(False, "drifted", f"quarantined copy {quarantined} is gone")
-    return PreflightResult(True, "owned", "quarantined paths match the receipt")
 
 
 # ---- T-5474: first-launch workspace trust in ~/.claude.json ----
@@ -1459,6 +1358,16 @@ CONTROLLER_OBSERVE_INTERVAL_SECONDS = 2
 HO_RESUMER_TIMER_UNIT = "pantheon-ho-resumer.timer"
 HO_RESUMER_SERVICE_UNIT = "pantheon-ho-resumer.service"
 HO_RESUMER_UNITS = (HO_RESUMER_TIMER_UNIT, HO_RESUMER_SERVICE_UNIT)
+# T-5633: the closed vocabulary of an instance binding's ``legacy_units`` field. A
+# binding that declares a name here has (or may be restored with) those legacy units,
+# and only its plan carries their decommission op. Default empty: no op.
+HO_RESUMER_LEGACY_UNIT_SET = "ho-resumer"
+CODEX_KEEP_GOING_LEGACY_UNIT_SET = "codex-keep-going"
+CODEX_KEEP_GOING_UNITS = ("codex-keep-going.timer", "codex-keep-going.service")
+LEGACY_UNIT_SETS: Mapping[str, tuple[str, ...]] = {
+    HO_RESUMER_LEGACY_UNIT_SET: HO_RESUMER_UNITS,
+    CODEX_KEEP_GOING_LEGACY_UNIT_SET: CODEX_KEEP_GOING_UNITS,
+}
 SERVICE_RECOVERY_KINDS = frozenset({"timer-enable", "seat-service-enable-observe", "unit-fire"})
 
 
@@ -1595,8 +1504,28 @@ def _desired_int_or(operation: "InstallOperation", key: str, default: int) -> in
     return default if raw is None else _canonical_decimal_int(raw, key, allow_zero=False)
 
 
-def _ho_resumer_paths(unit_dir: Path, quarantine_dir: Path) -> tuple[tuple[str, Path, Path], ...]:
-    return tuple((name, unit_dir / name, quarantine_dir / name) for name in HO_RESUMER_UNITS)
+def _legacy_units_for_operation(operation: "InstallOperation") -> tuple[str, ...]:
+    raw = operation.desired.get("units", "")
+    for units in LEGACY_UNIT_SETS.values():
+        if raw == ",".join(units):
+            return units
+    raise OperationFailed("decommission unit list is not a closed legacy-unit set")
+
+
+def _legacy_unit_paths(
+    units: tuple[str, ...], unit_dir: Path, quarantine_dir: Path
+) -> tuple[tuple[str, Path, Path], ...]:
+    return tuple((name, unit_dir / name, quarantine_dir / name) for name in units)
+
+
+def _legacy_units_for_receipt(names: list[str]) -> tuple[str, ...]:
+    selected = set(names)
+    if not selected:
+        raise OperationFailed("decommission receipt names no units")
+    for units in LEGACY_UNIT_SETS.values():
+        if selected <= set(units):
+            return units
+    raise OperationFailed("decommission receipt names units outside one closed legacy-unit set")
 
 
 def _timer_enablement_link_proof(
@@ -1902,21 +1831,99 @@ def _parse_stale_unit_failure_reset_show(stdout: str) -> StaleUnitFailureResetSn
 
 
 STALE_ADOPTED = "adopted-converged"
-# T-5471 phase-Q residue (SOP hand-moving-an-established-seat §4 phase Q), MINUS `overrides`:
-# overrides/holds.json is the operator's holds (runtime_controller._holds_path), not residue.
-# (relative path, is-glob) under <persona_state_root>/<persona>/runtime-controller, the
-# persona root, and the state root. Moved (never deleted) by the operator before a bootstrap.
-RESIDUE_RUNTIME_CONTROLLER = (
-    "runtime.json", "initial-viability.json", "initial-viability-invocations", "transition.json", "quota",
-)
-RESIDUE_PERSONA_ROOT = (
-    "staged-cutover-*.json", "active-runtime.json", "mid-session-cap.json", "runtimes", "invocations", "quota",
-)
-RESIDUE_STATE_ROOT_SUFFIXES = (".json", ".backoff.json", ".policyskip.json", ".softstreak.json", ".diagstreak.json")
 MAINTENANCE_REFUSAL = (
     "{persona} is in seat maintenance: the consume bootstrap fire would be skipped (T-5282) and "
     "launch nothing; exit maintenance first (python3 tools/notify_policy.py exit-maintenance {persona})"
 )
+# T-5475: operator-requested one-shot bypass of consume's seat-maintenance skip, bound into the plan
+# digest by the unit-fire op's `maintenance_bypass` desired key (ABSENT when not requested).
+MAINTENANCE_BYPASS_KEY = "maintenance_bypass"
+MAINTENANCE_BYPASS_EVIDENCE = "maintenance_bypass_token"
+MAINTENANCE_BYPASS_DEEP_SLEEP_REFUSAL = (
+    "{persona} is in deep-sleep: consume ignores the maintenance bypass token during deep-sleep (it never "
+    "bypasses deep-sleep), so --maintenance-bypass cannot bootstrap this seat; wake it first"
+)
+MAINTENANCE_BYPASS_PREFLIGHT_NOTE = "maintenance armed; one-shot bypass token will be written before the fire"
+MAINTENANCE_BYPASS_TTL_SECONDS = 180  # SOP phase 4: now + 3 min (consume accepts up to 15 min)
+
+
+def _maintenance_bypass_requested(operation: "InstallOperation") -> bool:
+    return operation.desired.get(MAINTENANCE_BYPASS_KEY) == "true"
+
+
+def _maintenance_gate(
+    persona: str,
+    *,
+    in_maintenance: bool,
+    deep_sleeping: "Callable[[], bool]",
+    bypass: bool,
+) -> str | None:
+    """T-5475: the ONE maintenance verdict for a bootstrap fire, shared by both backends and by the
+    dry run and execute. None == the fire may proceed. Not armed: proceed. Armed without the
+    bypass: today's refusal, unchanged. Armed with the bypass: proceed, unless the seat is
+    deep-sleeping (consume then ignores the token), consulted only in that case."""
+    if not persona or not in_maintenance:
+        return None
+    if not bypass:
+        return MAINTENANCE_REFUSAL.format(persona=persona)
+    if deep_sleeping():
+        return MAINTENANCE_BYPASS_DEEP_SLEEP_REFUSAL.format(persona=persona)
+    return None
+
+
+def _bypass_token_payload(persona: str, by: str, now: "datetime | None" = None) -> dict[str, str]:
+    """The token handmove-seat writes: {"persona","expires": now+3min,"by"}. The clock is read at
+    call time (UTC), never pinned."""
+    from datetime import timedelta
+
+    moment = now if now is not None else datetime.now(timezone.utc)
+    expires = moment + timedelta(seconds=MAINTENANCE_BYPASS_TTL_SECONDS)
+    return {"persona": persona, "expires": expires.strftime("%Y-%m-%dT%H:%M:%SZ"), "by": by}
+
+
+def _bypass_token_path(state_root: Path, persona: str) -> Path:
+    from tools import persona_bringup
+
+    return persona_bringup.maintenance_bypass_path(state_root, persona)
+
+
+def _write_bypass_token(state_root: Path, persona: str, by: str) -> Path:
+    """Write consume's one-shot token atomically (tmp, fsync, hard-link into place, 0600). Refuses to
+    overwrite: an existing file is an unknown writer's token."""
+    path = _bypass_token_path(state_root, persona)
+    refusal = f"a maintenance bypass token already exists at {path}; refusing to overwrite it"
+    if os.path.lexists(path):
+        raise OperationFailed(refusal)
+    state_root.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(_bypass_token_payload(persona, by)) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.link(temporary, path)  # fails if a writer raced us in; never replaces
+    except FileExistsError:
+        raise OperationFailed(refusal) from None
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+    return path
+
+
+def _remove_bypass_token(state_root: Path, persona: str) -> bool:
+    """Idempotent; True when a file was removed."""
+    try:
+        _bypass_token_path(state_root, persona).unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _bypass_written(before: "Mapping[str, str]") -> bool:
+    return before.get(MAINTENANCE_BYPASS_EVIDENCE) == "written"
 
 
 def _stale_adoption_shape_refusal(pre: UnitSnapshot) -> str | None:
@@ -2069,6 +2076,9 @@ def _render_quota_timer_template(
     )
 
 
+_FULL_COMMIT_RE = re.compile(r"[0-9a-f]{40}")
+
+
 def _git_head(repo_root: Path) -> str:
     result = subprocess.run(
         ("git", "-C", str(repo_root), "rev-parse", "HEAD"),
@@ -2125,8 +2135,10 @@ def _mailbox_wake_membership(manifest: "Manifest", persona: str) -> bool:
 
 def _keep_going_planned(persona: str) -> bool:
     """T-5482: keep-going is not planned for personas keep_going.py deliberately
-    exempts (_NO_KEEP_GOING: archivist, codex, watchman; operator-directed,
-    T-3811/T-3832). An armed timer for an exempt persona exit-2s at argparse.
+    exempts (_NO_KEEP_GOING: currently archivist; operator-directed,
+    T-3811/T-3832). Codex personas are supported through the harness-aware
+    submit profile and must receive the same installer-owned anti-idle leg.
+    An armed timer for an exempt persona exit-2s at argparse.
     Lazy import: keep_going pulls agent_role_map at import time."""
     from tools import keep_going as _kg
 
@@ -2243,6 +2255,8 @@ class PersonaBinding:
     configured_harness: str
     persona_brief_ref: str | None = None
     credential_refs: tuple[CredentialReference, ...] = ()
+    # T-5633: declared legacy unit sets (closed vocabulary, LEGACY_UNIT_SETS).
+    legacy_units: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2368,6 +2382,7 @@ class Manifest:
                 )
             except PersonaBriefError as exc:
                 raise ManifestError(f"{self.path}: {exc}") from exc
+            legacy_units = _parse_legacy_units(raw.get("legacy_units"), self.path, str(role))
             return PersonaBinding(
                 role=str(role),
                 persona=persona,
@@ -2375,6 +2390,7 @@ class Manifest:
                 configured_harness=_normalize_harness(harness),
                 persona_brief_ref=persona_brief_ref,
                 credential_refs=refs,
+                legacy_units=legacy_units,
             )
         raise ManifestError(f"{self.path}: persona {persona!r} is not bound")
 
@@ -2451,6 +2467,29 @@ _FORBIDDEN_CREDENTIAL_KEYS = {
     "shell",
     "command",
 }
+
+
+def _parse_legacy_units(raw: Any, path: Path, role: str) -> tuple[str, ...]:
+    """T-5633: a binding's ``legacy_units`` -- absent, null or a list of distinct
+    names from the closed LEGACY_UNIT_SETS vocabulary. Anything else is refused."""
+
+    if raw is None:
+        return ()
+    if not isinstance(raw, list):
+        raise ManifestError(f"{path}: {role}.legacy_units must be a list")
+    seen: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise ManifestError(f"{path}: {role}.legacy_units entries must be strings")
+        if item not in LEGACY_UNIT_SETS:
+            raise ManifestError(
+                f"{path}: {role}.legacy_units: unknown legacy unit set {item!r} "
+                f"(known: {', '.join(sorted(LEGACY_UNIT_SETS))})"
+            )
+        if item in seen:
+            raise ManifestError(f"{path}: {role}.legacy_units: duplicate {item!r}")
+        seen.append(item)
+    return tuple(seen)
 
 
 def _parse_credential_refs(
@@ -3172,7 +3211,20 @@ class PersonaInstaller:
         harness_override: str | None = None,
         root: Path = Path("/"),
         codex_telegram_archive_dir: Path | None = None,
+        maintenance_bypass: bool = False,
+        *,
+        source_revision: str | None = None,
     ) -> InstallPlan:
+        # T-5475: maintenance_bypass adds ONE desired key to the unit-fire op (absent when False, so
+        # every default plan and digest is unchanged).
+        # T-5091 U1: source_revision is the pure plan seam for the germinate harness-manager
+        # plan_install adapter. None (the default) keeps the _git_head call, so every live plan
+        # and digest is unchanged; a given value must be a full 40-hex commit id and replaces
+        # the only process-spawning call in plan().
+        if source_revision is not None and not _FULL_COMMIT_RE.fullmatch(source_revision):
+            raise ManifestError(
+                f"source_revision must be a full 40-hex commit id: {source_revision!r}"
+            )
         # T-5068: operator-supplied private staging dir for the codex-telegram source
         # archive; None keeps the legacy fixed /tmp path (back-compat for unmigrated callers).
         if codex_telegram_archive_dir is not None and not codex_telegram_archive_dir.is_absolute():
@@ -3230,6 +3282,31 @@ class PersonaInstaller:
             if not source.is_file():
                 raise ManifestError(f"framework template missing: {source}")
         quota_config = _quota_check_install_config(manifest, repo_root=self.repo_root)
+        audit_raw = config.get("mcp_allowlist_audit")
+        audit_config: tuple[str, Path, Path, Path] | None = None
+        if audit_raw is not None:
+            expected = {"owner_persona", "activation", "authority", "service_template", "timer_template"}
+            if not isinstance(audit_raw, Mapping) or set(audit_raw) != expected:
+                raise ManifestError("persona_installer.mcp_allowlist_audit has invalid fields")
+            audit_owner = audit_raw.get("owner_persona")
+            if not isinstance(audit_owner, str) or audit_raw.get("activation") != "operator-managed":
+                raise ManifestError("persona_installer.mcp_allowlist_audit owner/activation is invalid")
+            manifest.binding(audit_owner)
+            audit_authority = _manifest_relative_path(
+                audit_raw.get("authority"), "persona_installer.mcp_allowlist_audit.authority"
+            )
+            audit_service = _manifest_relative_path(
+                audit_raw.get("service_template"), "persona_installer.mcp_allowlist_audit.service_template"
+            )
+            audit_timer = _manifest_relative_path(
+                audit_raw.get("timer_template"), "persona_installer.mcp_allowlist_audit.timer_template"
+            )
+            for source in (audit_authority, audit_service, audit_timer):
+                if not (self.repo_root / source).is_file():
+                    raise ManifestError(f"MCP allowlist audit source missing: {source}")
+            if audit_authority != Path("tools/mcp_allowlist.yaml"):
+                raise ManifestError("persona_installer.mcp_allowlist_audit must use the canonical authority")
+            audit_config = (audit_owner, audit_authority, audit_service, audit_timer)
         policy_bundle = tuple(
             _manifest_relative_path(item, "persona_installer.policy.bundle[]")
             for item in policy.get("bundle", ())
@@ -3244,10 +3321,13 @@ class PersonaInstaller:
             timer_relative,
             quota_config.service_template,
             quota_config.timer_template,
+            *((audit_config[2], audit_config[3]) if audit_config else ()),
         )
         base_provenance = dict(base_provenance) | {
             "declared_revision": base_provenance["source_revision"],
-            "source_revision": _git_head(self.repo_root),
+            "source_revision": (
+                _git_head(self.repo_root) if source_revision is None else source_revision
+            ),
             "source_artifact_sha256": _artifact_digest(
                 self.repo_root,
                 artifacts,
@@ -3268,6 +3348,14 @@ class PersonaInstaller:
             (self.repo_root / quota_config.timer_template).read_text(encoding="utf-8"),
             cadence_minutes=quota_config.cadence_minutes,
             randomized_delay_seconds=quota_config.randomized_delay_seconds,
+        )
+        audit_service_content = (
+            unit_banner + (self.repo_root / audit_config[2]).read_text(encoding="utf-8")
+            if audit_config and binding.persona == audit_config[0] else None
+        )
+        audit_timer_content = (
+            unit_banner + (self.repo_root / audit_config[3]).read_text(encoding="utf-8")
+            if audit_config and binding.persona == audit_config[0] else None
         )
         periodics = _seat_core_periodics(
             self.repo_root,
@@ -3743,6 +3831,32 @@ class PersonaInstaller:
                     ),
                 ),
                 *(
+                    [
+                        _content_operation(
+                            operation_id="mcp-allowlist-audit.service-unit",
+                            layer=1,
+                            kind="user-unit-install",
+                            target=unit_dir / "pantheon-mcp-allowlist-audit.service",
+                            content=audit_service_content,
+                            owner=binding.account,
+                            privilege="privileged-helper",
+                            provenance=_provenance(manifest, binding, selected_harness, fs_cap),
+                        ),
+                        _content_operation(
+                            operation_id="mcp-allowlist-audit.timer-unit",
+                            layer=1,
+                            kind="user-unit-install",
+                            target=unit_dir / "pantheon-mcp-allowlist-audit.timer",
+                            content=audit_timer_content,
+                            owner=binding.account,
+                            privilege="privileged-helper",
+                            provenance=_provenance(manifest, binding, selected_harness, fs_cap),
+                        ),
+                    ]
+                    if audit_service_content is not None and audit_timer_content is not None
+                    else []
+                ),
+                *(
                     _content_operation(
                         operation_id=operation_id,
                         layer=1,
@@ -3841,21 +3955,26 @@ class PersonaInstaller:
                 # T-5448: EARLY, before the consume bootstrap fire: a legacy
                 # ho-resumer tick must not `claude --resume` a second claude
                 # (Telegram poller theft) while the seat is being installed.
-                op(
-                    "service.ho-resumer.decommission",
-                    1,
-                    "seat-service-decommission",
-                    binding.account,
-                    {
-                        "units": ",".join(HO_RESUMER_UNITS),
-                        "unit_dir": str(unit_dir),
-                        "quarantine_dir": str(
-                            state_dir / binding.persona / "quarantine" / "ho-resumer"
-                        ),
-                    },
-                    "operator-required",
-                    manager_cap,
-                ),
+                # T-5633: planned only where the binding declares the legacy
+                # ho-resumer unit set (legacy_units); a must-run-before-launch kind.
+                *[
+                    op(
+                        f"service.{legacy_set}.decommission",
+                        1,
+                        "seat-service-decommission",
+                        binding.account,
+                        {
+                            "units": ",".join(LEGACY_UNIT_SETS[legacy_set]),
+                            "unit_dir": str(unit_dir),
+                            "quarantine_dir": str(
+                                state_dir / binding.persona / "quarantine" / legacy_set
+                            ),
+                        },
+                        "operator-required",
+                        manager_cap,
+                    )
+                    for legacy_set in binding.legacy_units
+                ],
                 op(
                     "connective.daemon-reload",
                     1,
@@ -3903,7 +4022,8 @@ class PersonaInstaller:
                     # T-5473/T-5474: ops that clear the bootstrap blockers before this fire; the
                     # dry run reads them to predict clear (execute re-checks for real).
                     | {"residue_cleared_by": RESIDUE_QUARANTINE_OP_ID}
-                    | ({"trust_set_by": WORKSPACE_TRUST_OP_ID} if selected_harness == "claude" else {}),
+                    | ({"trust_set_by": WORKSPACE_TRUST_OP_ID} if selected_harness == "claude" else {})
+                    | ({MAINTENANCE_BYPASS_KEY: "true"} if maintenance_bypass else {}),
                     "operator-required",
                     manager_cap,
                 ),
@@ -5319,6 +5439,13 @@ class SimulatedHostBackend:
         # T-5471: a seeded bootstrap blocker (maintenance / trust / residue reason) -- the
         # simulated twin of LocalHostBackend._unit_fire_bootstrap_blocker.
         self.bootstrap_blocker: str | None = None
+        # T-5475: simulated seat maintenance / deep-sleep, the one-shot bypass token (its JSON text,
+        # or None), whether the simulated consume reads it, and a lapse between gate and write.
+        self.in_maintenance = False
+        self.deep_sleeping = False
+        self.bypass_token: str | None = None
+        self.consume_reads_token = True
+        self.maintenance_lapses_before_write = False
         # T-5473/T-5474: opt-in entries-derived residue/trust model for the blocker twin, and
         # the simulated execute-time quarantine stamp.
         self.model_bootstrap_state = False
@@ -5429,6 +5556,8 @@ class SimulatedHostBackend:
                 idle, detail = _unit_fire_idle_prediction(self._sim_classify)
                 if not idle:
                     return PreflightResult(False, "conflicting", detail)
+                if _maintenance_bypass_requested(operation) and self.in_maintenance:
+                    return PreflightResult(True, "maintenance-bypass", MAINTENANCE_BYPASS_PREFLIGHT_NOTE)
         if operation.kind == "mkdir":
             state = self._snapshot(operation.target)
             if state["state"] in {"absent", "directory"}:
@@ -5763,6 +5892,31 @@ class SimulatedHostBackend:
                 idle, detail = _unit_fire_idle_prediction(self._sim_classify)
                 if not idle:
                     raise OperationFailed(detail)
+            # T-5475: the simulated twin of the local one-shot bypass token (a token is its JSON text)
+            bypass_state = "none"
+            bypass_persona = operation.provenance.get("persona", "")
+            if not self.timer_enabled and _maintenance_bypass_requested(operation):
+                if self.in_maintenance and not self.maintenance_lapses_before_write:
+                    if self.bypass_token is not None:
+                        raise OperationFailed(
+                            "a maintenance bypass token already exists; refusing to overwrite it"
+                        )
+                    self.bypass_token = _canonical_json(
+                        _bypass_token_payload(bypass_persona, f"persona_installer {operation.operation_id}")
+                    )
+                    self.events.append(f"bypass-token-written:{operation.operation_id}")
+                    # consume unlinks what it reads; a token it did not read is removed here, as the
+                    # local finally block does
+                    reads = self.consume_reads_token
+                    self.bypass_token = None
+                    if not reads:
+                        raise OperationFailed(
+                            "consume did not read the maintenance bypass token",
+                            evidence={MAINTENANCE_BYPASS_EVIDENCE: "survived-removed"},
+                        )
+                    bypass_state = "consumed"
+                else:
+                    bypass_state = "not-needed-maintenance-lapsed"
             selected = json.loads(operation.desired["allowed_runtime_refs"])[0]
             selected_harness, _, selected_profile = selected.partition("/")
             ok = self.converged or "connective.timer-enable" not in self.events
@@ -5819,6 +5973,16 @@ class SimulatedHostBackend:
                 changed = True
                 before = fire_identity
                 observed["fire_session_pid"] = "4242"
+            if bypass_state != "none":
+                observed[MAINTENANCE_BYPASS_EVIDENCE] = bypass_state
+            if bypass_state == "consumed":
+                changed = True
+                before = {
+                    **(before if before.get("launched") == "true" else {}),
+                    MAINTENANCE_BYPASS_EVIDENCE: "written",
+                    "persona": bypass_persona,
+                    "persona_state_root": str(viability.persona_state_root),
+                }
         elif operation.kind == "mailbox-probe":
             ok = self.mailbox_send and self.mailbox_receive
             detail = (
@@ -5969,11 +6133,10 @@ class SimulatedHostBackend:
         detail = "periodic timer operation passed"
         observed: dict[str, str] = {}
         if operation.kind == "seat-periodic-timer-enable":
-            gate = {
-                "connective.timer-observe",
-                "periodic.daemon-reload",
-                "service.runtime-controller.enable-observe",
-            }.issubset(self.events)
+            required = {
+                item for item in operation.desired.get("after", "").split(",") if item
+            }
+            gate = required.issubset(self.events)
             preflight = self._periodic_preflight(operation)
             if not preflight.ok:
                 raise OperationFailed(f"{operation.operation_id}: {preflight.detail}")
@@ -6114,11 +6277,10 @@ class SimulatedHostBackend:
         )
 
     def _sim_decommission_paths(self, operation: InstallOperation) -> list[tuple[str, str, str]]:
-        if operation.desired.get("units") != ",".join(HO_RESUMER_UNITS):
-            raise OperationFailed("decommission unit list is not the closed ho-resumer list")
+        units = _legacy_units_for_operation(operation)
         unit_dir = operation.desired["unit_dir"].rstrip("/")
         quarantine = operation.desired["quarantine_dir"].rstrip("/")
-        return [(name, f"{unit_dir}/{name}", f"{quarantine}/{name}") for name in HO_RESUMER_UNITS]
+        return [(name, f"{unit_dir}/{name}", f"{quarantine}/{name}") for name in units]
 
     def _decommission_preflight(self, operation: InstallOperation) -> PreflightResult:
         try:
@@ -6128,7 +6290,7 @@ class SimulatedHostBackend:
         for name, src, quarantined in paths:
             if self._snapshot(src)["state"] != "absent" and self._snapshot(quarantined)["state"] != "absent":
                 return PreflightResult(False, "conflicting", f"{name}: quarantine destination already exists")
-        return PreflightResult(True, "ready", "ho-resumer decommission is safe to apply")
+        return PreflightResult(True, "ready", "legacy-unit decommission is safe to apply")
 
     def _execute_decommission(
         self, operation: InstallOperation
@@ -6145,9 +6307,11 @@ class SimulatedHostBackend:
             before: dict[str, str] = {"state": "absent"}
             changed = False
         else:
-            was_enabled = HO_RESUMER_TIMER_UNIT in self.enabled_timers
-            self.enabled_timers.discard(HO_RESUMER_TIMER_UNIT)
-            self.entries.pop(f"{unit_dir}/timers.target.wants/{HO_RESUMER_TIMER_UNIT}", None)
+            timer_units = [name for name, _, _ in present if name.endswith(".timer")]
+            was_enabled = any(name in self.enabled_timers for name in timer_units)
+            for timer_unit in timer_units:
+                self.enabled_timers.discard(timer_unit)
+                self.entries.pop(f"{unit_dir}/timers.target.wants/{timer_unit}", None)
             for name, src, quarantined in present:
                 self.entries[quarantined] = self.entries.pop(src)  # move, never delete
             before = {
@@ -6167,8 +6331,8 @@ class SimulatedHostBackend:
             ),
             OperationEvidence(
                 operation.operation_id, operation.layer, operation.kind, True,
-                "ho-resumer decommissioned" if changed else "ho-resumer absent",
-                {"ho_resumer": "quarantined" if changed else "absent"},
+                "legacy units decommissioned" if changed else "legacy units absent",
+                {"legacy_units": "quarantined" if changed else "absent"},
             ),
         )
 
@@ -6340,6 +6504,14 @@ class SimulatedHostBackend:
         string always wins; the entries-derived model is opt-in (model_bootstrap_state)."""
         if self.bootstrap_blocker:
             return self.bootstrap_blocker
+        gate = _maintenance_gate(
+            operation.provenance.get("persona", ""),
+            in_maintenance=self.in_maintenance,
+            deep_sleeping=lambda: self.deep_sleeping,
+            bypass=_maintenance_bypass_requested(operation),
+        )
+        if gate:
+            return gate
         if not self.model_bootstrap_state:
             return None
         viability = _parse_unit_fire_initial_viability_desired(operation)
@@ -6425,9 +6597,12 @@ class SimulatedHostBackend:
                 return PreflightResult(True, "not-applied", "nothing was decommissioned")
             unit_dir = mutation.before["unit_dir"].rstrip("/")
             quarantine = mutation.before["quarantine_dir"].rstrip("/")
-            for name in mutation.before.get("moved", "").split(","):
-                if name not in HO_RESUMER_UNITS:
-                    return PreflightResult(False, "malformed", "receipt names a unit outside the closed list")
+            names = [name for name in mutation.before.get("moved", "").split(",") if name]
+            try:
+                _legacy_units_for_receipt(names)
+            except OperationFailed as exc:
+                return PreflightResult(False, "malformed", str(exc))
+            for name in names:
                 if self._snapshot(f"{unit_dir}/{name}")["state"] != "absent":
                     return PreflightResult(False, "drifted", f"{name}: unit path re-created after receipt")
                 if self._snapshot(f"{quarantine}/{name}")["state"] == "absent":
@@ -6453,9 +6628,12 @@ class SimulatedHostBackend:
                 for name in mutation.before["moved"].split(","):
                     self.entries[f"{unit_dir}/{name}"] = self.entries.pop(f"{quarantine}/{name}")
                 if mutation.before.get("timer_was_enabled") == "true":
-                    self.enabled_timers.add(HO_RESUMER_TIMER_UNIT)
-                    canonical = f"{unit_dir}/{HO_RESUMER_TIMER_UNIT}"
-                    self.entries[f"{unit_dir}/timers.target.wants/{HO_RESUMER_TIMER_UNIT}"] = {
+                    timer_unit = next(
+                        name for name in mutation.before["moved"].split(",") if name.endswith(".timer")
+                    )
+                    self.enabled_timers.add(timer_unit)
+                    canonical = f"{unit_dir}/{timer_unit}"
+                    self.entries[f"{unit_dir}/timers.target.wants/{timer_unit}"] = {
                         "state": "symlink",
                         "target": canonical,
                         "fingerprint": _sha256_bytes(canonical.encode("utf-8")),
@@ -6684,6 +6862,8 @@ class SimulatedHostBackend:
         allowed_roots: Sequence[str] = (),
     ) -> None:
         if mutation.kind == "unit-fire":
+            if _bypass_written(mutation.before):
+                self.bypass_token = None  # T-5475: only because the receipt records that we wrote it
             if not self.fire_session_alive:
                 return
             if self.fire_session_foreign:
@@ -7732,6 +7912,8 @@ class LocalHostBackend:
     def _fire_session_state(self, before: Mapping[str, str]) -> str:
         """gone | match | mismatch for a receipt-recorded fire-launched session. Touching it
         requires id (runtime started_at), pid (+ start time) and target to ALL still match."""
+        if "pane_pid" not in before and _bypass_written(before):
+            return "gone"  # T-5475: a bypass-only receipt (the fire launched nothing we own)
         try:
             pid = int(before["pane_pid"])
         except (KeyError, ValueError):
@@ -7769,6 +7951,16 @@ class LocalHostBackend:
         )
 
     def _rollback_fire_launch(self, mutation: MutationRecord) -> None:
+        # T-5475: the token is one-shot; the only thing to undo is a leftover THIS receipt wrote.
+        # The path is derived (containment-checked persona_state_root + persona), never read from
+        # the receipt, and a receipt that does not record a write leaves any token alone.
+        if _bypass_written(mutation.before):
+            persona = mutation.before.get("persona", "")
+            if not persona or Path(persona).name != persona or persona in {".", ".."}:
+                raise OperationFailed("bypass token cleanup: receipt persona is not a plain name; left untouched")
+            _remove_bypass_token(
+                Path(mutation.before["persona_state_root"]), mutation.before["persona"]
+            )
         state = self._fire_session_state(mutation.before)
         if state == "gone":
             return
@@ -7948,10 +8140,10 @@ class LocalHostBackend:
         )
 
     def _decommission_paths(self, operation: InstallOperation) -> list[tuple[str, Path, Path]]:
-        if operation.desired.get("units") != ",".join(HO_RESUMER_UNITS):
-            raise OperationFailed("decommission unit list is not the closed ho-resumer list")
+        units = _legacy_units_for_operation(operation)
         return list(
-            _ho_resumer_paths(
+            _legacy_unit_paths(
+                units,
                 _lexically_normalize_absolute(Path(operation.desired["unit_dir"])),
                 _lexically_normalize_absolute(Path(operation.desired["quarantine_dir"])),
             )
@@ -8036,26 +8228,13 @@ class LocalHostBackend:
         return states
 
     def _residue_quarantine_preflight(self, operation: InstallOperation) -> PreflightResult:
-        """Read-only; execute calls this first so both answer from the same code."""
-        try:
-            root, persona, timer = _quarantine_desired(operation)
-            if not self._bootstrap_fire_pending(timer):
-                return PreflightResult(
-                    True, "converged",
-                    "consume timer already enabled: not a bootstrap fire, runtime state left in place",
-                )
-            live = _runtime_liveness_refusal(self._runtime_liveness(persona))
-            if live:
-                return PreflightResult(False, "conflicting", live)
-            entries = _bootstrap_residue_entries(Path(root), persona)
-        except OperationFailed as exc:
-            return PreflightResult(False, "conflicting", str(exc))
-        if not entries:
-            return PreflightResult(True, "absent", "no control-plane residue to quarantine")
-        names = ", ".join(f"{cls}/{name}" for cls, name in entries)
-        return PreflightResult(
-            True, "ready",
-            f"would move {len(entries)} path(s) into {root}/{persona}/{QUARANTINE_DIR_PREFIX}<stamp>: {names}",
+        """Read-only; execute calls this first so both answer from the same code. T-5608: the
+        body is the shared ``_residue_quarantine_check`` (the executor runs the same one)."""
+        return _residue_quarantine_check(
+            operation,
+            bootstrap_fire_pending=self._bootstrap_fire_pending,
+            liveness=self._runtime_liveness,
+            entries=lambda root, persona: _bootstrap_residue_entries(Path(root), persona),
         )
 
     def _execute_residue_quarantine(
@@ -8203,20 +8382,23 @@ class LocalHostBackend:
                     operation.operation_id, operation.kind, operation.target, operation.owner,
                     False, {"state": "absent"}, "decommissioned",
                 ),
-                {"ho_resumer": "absent"},
+                {"legacy_units": "absent"},
             )
         was_enabled = was_active = False
-        if any(n == HO_RESUMER_TIMER_UNIT for n, _, _ in present):
-            timer_state = self._timer_unit_state(HO_RESUMER_TIMER_UNIT)
+        timer_units = [n for n, _, _ in present if n.endswith(".timer")]
+        service_units = [n for n, _, _ in present if n.endswith(".service")]
+        if timer_units:
+            timer_unit = timer_units[0]
+            timer_state = self._timer_unit_state(timer_unit)
             was_enabled = timer_state.classification == "enabled"
             was_active = timer_state.active_state == "active"
-            result = _completed(self.user_manager.disable_now(HO_RESUMER_TIMER_UNIT))
+            result = _completed(self.user_manager.disable_now(timer_unit))
             if result.returncode != 0:
                 text = result.stderr or result.stdout
                 if "not exist" not in text and "not loaded" not in text and "No such file" not in text:
-                    raise OperationFailed(text.strip() or "ho-resumer timer disable failed")
-        if any(n == HO_RESUMER_SERVICE_UNIT for n, _, _ in present):
-            self._stop_unit_or_converged_not_loaded(HO_RESUMER_SERVICE_UNIT)
+                    raise OperationFailed(text.strip() or "legacy timer disable failed")
+        for service_unit in service_units:
+            self._stop_unit_or_converged_not_loaded(service_unit)
         quarantine_dir = paths[0][2].parent
         quarantine_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         moved = []
@@ -8239,16 +8421,16 @@ class LocalHostBackend:
                 operation.operation_id, operation.kind, operation.target, operation.owner,
                 True, before, "decommissioned",
             ),
-            {"ho_resumer": "quarantined", "moved": ",".join(moved)},
+            {"legacy_units": "quarantined", "moved": ",".join(moved)},
         )
 
     def _decommission_moved(self, mutation: MutationRecord) -> list[tuple[str, Path, Path]]:
         names = [n for n in mutation.before.get("moved", "").split(",") if n]
-        if not set(names) <= set(HO_RESUMER_UNITS):
-            raise OperationFailed("decommission receipt names a unit outside the closed list")
+        units = _legacy_units_for_receipt(names)
         return [
             item
-            for item in _ho_resumer_paths(
+            for item in _legacy_unit_paths(
+                units,
                 _lexically_normalize_absolute(Path(mutation.before["unit_dir"])),
                 _lexically_normalize_absolute(Path(mutation.before["quarantine_dir"])),
             )
@@ -8281,9 +8463,12 @@ class LocalHostBackend:
         if reload_result.returncode != 0:
             raise OperationFailed((reload_result.stderr or reload_result.stdout).strip() or "daemon-reload failed")
         if mutation.before.get("timer_was_enabled") == "true":
-            result = _completed(self.user_manager.enable_now(HO_RESUMER_TIMER_UNIT))
+            timer_unit = next(
+                name for name in mutation.before["moved"].split(",") if name.endswith(".timer")
+            )
+            result = _completed(self.user_manager.enable_now(timer_unit))
             if result.returncode != 0:
-                raise OperationFailed((result.stderr or result.stdout).strip() or "ho-resumer timer re-enable failed")
+                raise OperationFailed((result.stderr or result.stdout).strip() or "legacy timer re-enable failed")
 
     def _timer_unit_state(self, unit: str) -> TimerUnitState:
         try:
@@ -8741,6 +8926,9 @@ class LocalHostBackend:
                 )
                 if not idle:
                     return PreflightResult(False, "conflicting", detail)
+                persona = operation.provenance.get("persona", "")
+                if _maintenance_bypass_requested(operation) and persona and self._seat_in_maintenance(persona):
+                    return PreflightResult(True, "maintenance-bypass", MAINTENANCE_BYPASS_PREFLIGHT_NOTE)
         if operation.kind == "seat-periodic-timer-enable":
             try:
                 link, canonical = self._periodic_paths_from_desired(operation)
@@ -8775,7 +8963,7 @@ class LocalHostBackend:
                         return PreflightResult(False, "conflicting", f"{name}: quarantine destination already exists")
             except OperationFailed as exc:
                 return PreflightResult(False, "conflicting", str(exc))
-            return PreflightResult(True, "ready", "ho-resumer decommission is safe to apply")
+            return PreflightResult(True, "ready", "legacy-unit decommission is safe to apply")
         if operation.kind == "timer-enable":
             try:
                 link, canonical = self._timer_enablement_paths_from_desired(operation)
@@ -8929,6 +9117,13 @@ class LocalHostBackend:
 
         return bool(persona_bringup._seat_in_maintenance(persona))
 
+    def _seat_deep_sleeping(self, persona: str) -> bool:
+        """T-5475: consume's own deep-sleep predicate (read-only, fail-open): the bypass never
+        overrides it."""
+        from tools import persona_bringup
+
+        return bool(persona_bringup._seat_deep_sleeping(persona))
+
     def _unit_fire_bootstrap_blocker(self, operation: InstallOperation) -> str | None:
         """T-5471: reasons a DISABLED-timer consume bootstrap fire cannot launch the runtime.
         One function, called by the dry-run preflight and again by execute right before the
@@ -8942,8 +9137,16 @@ class LocalHostBackend:
           block or mis-steer the bootstrap; the operator quarantines them (move, never delete).
         """
         persona = operation.provenance.get("persona", "")
-        if persona and self._seat_in_maintenance(persona):
-            return MAINTENANCE_REFUSAL.format(persona=persona)
+        # T-5475: armed maintenance refuses unless the operator asked for the one-shot bypass
+        # (digest-bound); deep-sleep is never bypassed. Shared with the simulated twin.
+        maintenance = _maintenance_gate(
+            persona,
+            in_maintenance=bool(persona and self._seat_in_maintenance(persona)),
+            deep_sleeping=lambda: self._seat_deep_sleeping(persona),
+            bypass=_maintenance_bypass_requested(operation),
+        )
+        if maintenance:
+            return maintenance
         try:
             viability = _parse_unit_fire_initial_viability_desired(operation)
         except OperationFailed as exc:
@@ -9422,6 +9625,10 @@ class LocalHostBackend:
                     raise OperationFailed(blocker)
                 self._baseline_invocation = ""
                 last_snapshot: UnitFirePollSnapshot | None = None
+                # T-5475: the one-shot bypass token (only when the operator asked, digest-bound)
+                bypass_requested = _maintenance_bypass_requested(operation)
+                bypass_persona = operation.provenance.get("persona", "")
+                bypass_state = "none"
                 try:
                     baseline = self._prove_unit_fire_pre_enqueue_idle(
                         operation.target,
@@ -9432,6 +9639,17 @@ class LocalHostBackend:
                     # runtime.json's wall-clock started_at (same basis: UTC wall time).
                     pre_pane_pid = self._fire_pane_pid(fire_target)
                     fire_wall_start = self._fire_wall_clock()
+                    if bypass_requested:
+                        # re-check the arm right before the write (SOP phase 4 step 1); a lapsed window
+                        # means a normal fire and no token. Written => this run owns it (finally).
+                        if self._seat_in_maintenance(bypass_persona):
+                            _write_bypass_token(
+                                viability.persona_state_root, bypass_persona,
+                                f"persona_installer {operation.operation_id}",
+                            )
+                            bypass_state = "written"
+                        else:
+                            bypass_state = "not-needed-maintenance-lapsed"
                     start = _completed(
                         self.user_manager.start_unit(
                             operation.target,
@@ -9600,6 +9818,16 @@ class LocalHostBackend:
                             start_count=start_count,
                             cleanup_state="pending",
                         )
+                    if bypass_state == "written":
+                        # consume unlinks a token it reads (valid or not); one that survived the fire
+                        # was never read, so the fire proved nothing about the bypass (SOP step 4)
+                        if _remove_bypass_token(viability.persona_state_root, bypass_persona):
+                            bypass_state = "survived"
+                            raise OperationFailed(
+                                "consume did not read the maintenance bypass token",
+                                evidence={MAINTENANCE_BYPASS_EVIDENCE: "survived-removed"},
+                            )
+                        bypass_state = "consumed"
                     if viability.require_invocation_receipt and not _valid_systemd_invocation_id(invocation_id):
                         raise OperationFailed("disabled first fire returned malformed InvocationID")
                     from tools import runtime_controller
@@ -9647,6 +9875,25 @@ class LocalHostBackend:
                         observed["fire_session_target"] = launch["tmux_target"]
                     else:
                         observed["fire_session"] = "none-owned"
+                    if bypass_requested:
+                        observed[MAINTENANCE_BYPASS_EVIDENCE] = bypass_state
+                    if bypass_state == "consumed":
+                        # the receipt records that THIS run wrote the token; rollback keys off it
+                        marker = {
+                            MAINTENANCE_BYPASS_EVIDENCE: "written",
+                            "persona": bypass_persona,
+                            "persona_state_root": str(viability.persona_state_root),
+                        }
+                        if launch:
+                            mutation = MutationRecord(
+                                operation.operation_id, operation.kind, operation.target, operation.owner,
+                                True, {**launch, **marker}, "fire-launched",
+                            )
+                        else:
+                            mutation = MutationRecord(
+                                operation.operation_id, operation.kind, operation.target, operation.owner,
+                                True, marker, "bypass-token-written",
+                            )
                 except OperationFailed as exc:
                     if started:
                         cleanup_failure: OperationFailed | None = None
@@ -9687,6 +9934,10 @@ class LocalHostBackend:
                             evidence.update(session_evidence)
                             raise OperationFailed(str(exc), evidence=evidence) from exc
                     raise
+                finally:
+                    # T-5475: never leave a token behind on any path; only one THIS run wrote
+                    if bypass_state == "written":
+                        _remove_bypass_token(viability.persona_state_root, bypass_persona)
         elif operation.kind == "mailbox-probe":
             observed = dict(self._mailbox_probe(operation))
         elif operation.kind == "timer-enablement-absence-check":
@@ -10524,11 +10775,20 @@ def _seat_verbs(parser: argparse.ArgumentParser, subparsers: Any) -> None:
     apply_p.add_argument("--manifest", type=Path, default=default_manifest)
     apply_p.add_argument("--persona", required=True)
     apply_p.add_argument("--harness")
-    apply_p.add_argument("--workflow", choices=("all-in-one", "stage-prefix", "staged-activate"),
+    apply_p.add_argument("--workflow", choices=("all-in-one", "stage-prefix", "staged-activate", "reconcile-keep-going"),
                          default="all-in-one")
     apply_p.add_argument("--execute", action="store_true")
     apply_p.add_argument("--plan-digest", help="digest printed by the dry run (required with --execute)")
     apply_p.add_argument("--receipt", help="staged receipt id (staged-activate only)")
+    apply_p.add_argument(
+        "--maintenance-bypass", action="store_true",
+        help=(
+            "T-5475: bootstrap a seat that is in maintenance by writing consume's one-shot bypass token "
+            "around the first fire (verified consumed). Part of the plan digest: give it on EVERY verb "
+            "whose plan is digest-bound (dry run, --execute, stage-prefix, staged-activate). Never "
+            "overrides deep-sleep. Default: refuse while armed."
+        ),
+    )
     rollback_p = subparsers.add_parser("rollback", help="roll back an apply by receipt id")
     rollback_p.add_argument("--manifest", type=Path, default=default_manifest)
     rollback_p.add_argument("--persona", required=True)
@@ -10570,10 +10830,12 @@ def _run_seat_verb(args: argparse.Namespace, parser: argparse.ArgumentParser) ->
             code, summary = _apply.execute(
                 args.manifest, args.persona, plan_digest=args.plan_digest,
                 workflow=args.workflow, receipt_id=args.receipt, harness=args.harness,
+                maintenance_bypass=args.maintenance_bypass,
             )
         else:
             code, summary = _apply.dry_run(
-                args.manifest, args.persona, workflow=args.workflow, harness=args.harness
+                args.manifest, args.persona, workflow=args.workflow, harness=args.harness,
+                maintenance_bypass=args.maintenance_bypass,
             )
     except InstallerError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)

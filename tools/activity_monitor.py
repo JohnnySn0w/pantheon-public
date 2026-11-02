@@ -73,6 +73,8 @@ if str(_REPO_ROOT) not in sys.path:
 from tools import agent_role_map  # noqa: E402  (after the sys.path shim above)
 from tools import telegram_inbound  # noqa: E402  (T-4212: shared inbound parser)
 from tools import fleet_usage_gate  # noqa: E402  (T-4510: fleet usage gate, stdlib-only)
+from tools import harness_idle  # noqa: E402  (T-5793: harness resolver + reader seam)
+from tools import health_export  # noqa: E402  (T-5793: SudoReader, argv-only cross-seat reads)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -152,6 +154,23 @@ P1B_BACKOFF_STREAK_GAP_SECONDS = 90 * 60  # fires within this gap count as one w
 # unbounded (cooldown-only) behavior is unchanged.
 MAX_INEFFECTIVE_POKES_DEFAULT = 1
 
+# T-5793: P1.b's await signal comes from the harness's own session log
+# (harness_idle.read_idle over the SudoReader): IDLE with quiet >= this many seconds
+# means the turn ended and the seat is waiting on itself. Also the minimum age of an
+# interactive-await (AskUserQuestion/EnterPlanMode) before it is escalated.
+P1B_LOG_QUIET_SECONDS = 15 * 60
+# Rollback lever: "log" (default) or "pane". "pane" restores the pre-T-5793 P1.b path
+# verbatim: the Claude-transcript structural signals (T-3071 text-final turn, T-0297
+# interactive tool_use, which POKES), no interactive-await escalation, and no positive
+# pane gate before a text poke. Read per run, so a unit drop-in flips it.
+IDLE_SOURCE_ENV = "ACTIVITY_MONITOR_IDLE_SOURCE"
+INTERACTIVE_AWAIT_PREDICATE = "p1b-interactive"
+INTERACTIVE_AWAIT_VOCAB = "interactive-await"
+
+
+def idle_source() -> str:
+    return "pane" if os.environ.get(IDLE_SOURCE_ENV, "log").strip().lower() == "pane" else "log"
+
 # Bridge /health endpoint (used for P1.b operator-inbound state).
 DEFAULT_BRIDGE_HEALTH_URL = "http://127.0.0.1:8765/health"
 
@@ -203,7 +222,13 @@ AGENT_CONFIG: dict[str, dict] = {
         # move and false-flag a live orchestrator as idle (P1.a).
         "jsonl_dir": Path(agent_role_map.live_session_projects_dir("claude")),
         "ledger_agent_id": "orchestrator",
-        "ticket_targets": frozenset({"orchestrator", "orchestrator"}),
+        # T-5649: + orchestrator's single-member head role. Since ORG-088 (10-19) tickets
+        # target role pools, and the head role has exactly one seat, so its open
+        # tickets are orchestrator's queue even before delivered_to is set. The shared
+        # role:engineering_orchestrator pool is deliberately NOT listed for any
+        # seat: hundreds of open pool tickets would make P1.a/P1.b always see work.
+        "ticket_targets": frozenset({"orchestrator", "orchestrator",
+                                     "role:head_engineering_orchestrator"}),
         "pantheon_config_path": Path("/home/claude/pantheon-config"),
         "bridge_inbound_key": "orchestrator",
         # P1.c (ORG-037 Layer 3): the session's team root (T-1290). active-team
@@ -411,7 +436,7 @@ def _fires_log_path() -> Path:
     return state_dir / "activity_monitor" / "fires.jsonl"
 
 
-def _record_fire(agent: str, predicate: str) -> None:
+def _record_fire(agent: str, predicate: str, *, deferred: bool = False) -> None:
     """Append one fire-event record to the Recovery-local drift-tracking JSONL
     (T-3072 meta-drift alarm — `tools/activity_monitor_drift_check.py` reads
     this to alert when a predicate has gone silently stale, the T-3070 class
@@ -419,6 +444,10 @@ def _record_fire(agent: str, predicate: str) -> None:
     fire-log must NEVER wedge the primary poke path (D12), the same posture
     as `_escalate_stuck`'s alert-routing catch and the P1.d
     session_reset_log append below.
+
+    deferred=True (T-5648): the predicate MATCHED but the poke was deferred (busy
+    pane, T-3599). The drift check counts it, because the matcher is alive; the
+    T-3991 backoff reader skips it, because no poke landed.
     """
     try:
         path = _fires_log_path()
@@ -430,6 +459,8 @@ def _record_fire(agent: str, predicate: str) -> None:
             "agent": agent,
             "predicate": predicate,
         }
+        if deferred:
+            record["deferred"] = True
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
     except Exception as exc:  # noqa: BLE001 — fire-tracking must never wedge the monitor
@@ -462,7 +493,8 @@ def _read_recent_fires(agent: str, limit: int = 50) -> list[dict]:
                 rec = json.loads(ln)
             except (json.JSONDecodeError, ValueError):
                 continue
-            if isinstance(rec, dict) and rec.get("agent") == agent and isinstance(rec.get("ts"), int):
+            if (isinstance(rec, dict) and rec.get("agent") == agent and isinstance(rec.get("ts"), int)
+                    and not rec.get("deferred")):  # T-5648: delivered pokes only
                 out.append(rec)
         return out[-limit:]
     except Exception as exc:  # noqa: BLE001 — fire-log read must never wedge the monitor
@@ -1073,9 +1105,9 @@ def _scan_actionable_tickets(
     # awk emits one line per ticket: "<path>|<target>|<depends_on>|<not_before>|<labels>|<blocked_by>|<delivered_to>"
     # — stops scanning each file at the closing '---' of the frontmatter.
     awk_prog = (
-        r"""BEGIN { in_fm=0; target=""; deps=""; nb=""; labels=""; blocked=""; dlv=""; path="" }
-        FNR==1 { if (path!="") print path "|" target "|" deps "|" nb "|" labels "|" blocked "|" dlv;
-                 path=FILENAME; in_fm=0; target=""; deps=""; nb=""; labels=""; blocked=""; dlv="" }
+        r"""BEGIN { in_fm=0; target=""; deps=""; nb=""; labels=""; blocked=""; dlv=""; sg=""; path="" }
+        FNR==1 { if (path!="") print path "|" target "|" deps "|" nb "|" labels "|" blocked "|" dlv "|" sg;
+                 path=FILENAME; in_fm=0; target=""; deps=""; nb=""; labels=""; blocked=""; dlv=""; sg="" }
         /^---$/ { if (in_fm==0) { in_fm=1 } else { in_fm=2 } }
         in_fm==1 && /^target:/ { sub(/^target:[[:space:]]*/, ""); target=$0 }
         in_fm==1 && /^depends_on:/ { sub(/^depends_on:[[:space:]]*/, ""); deps=$0 }
@@ -1083,7 +1115,8 @@ def _scan_actionable_tickets(
         in_fm==1 && /^labels:/ { sub(/^labels:[[:space:]]*/, ""); labels=$0 }
         in_fm==1 && /^blocked_by:/ { sub(/^blocked_by:[[:space:]]*/, ""); blocked=$0 }
         in_fm==1 && /^delivered_to:/ { sub(/^delivered_to:[[:space:]]*/, ""); dlv=$0 }
-        END { if (path!="") print path "|" target "|" deps "|" nb "|" labels "|" blocked "|" dlv }"""
+        in_fm==1 && /^security_gate:/ { sub(/^security_gate:[[:space:]]*/, ""); sg=$0 }
+        END { if (path!="") print path "|" target "|" deps "|" nb "|" labels "|" blocked "|" dlv "|" sg }"""
     )
     cmd = _sudo(sudo_user) + [
         "bash", "-c",
@@ -1104,7 +1137,7 @@ def _scan_actionable_tickets(
     for line in result.stdout.splitlines():
         # Tolerate the older 5- and 6-field shapes so test fixtures without the
         # blocked_by / delivered_to columns still parse cleanly.
-        parts = line.split("|", 6)
+        parts = line.split("|", 7)
         if len(parts) < 5:
             continue
         _path = parts[0]
@@ -1118,7 +1151,8 @@ def _scan_actionable_tickets(
         nb = parts[3]
         labels = parts[4]
         blocked_by = parts[5] if len(parts) >= 6 else ""
-        delivered_to = parts[6] if len(parts) == 7 else ""
+        delivered_to = parts[6] if len(parts) >= 7 else ""
+        security_gate = parts[7] if len(parts) == 8 else ""  # T-5678
         # T-5515: since the ORG-088 role pooling (10-19) a ticket targets role:<R> and
         # names its holder in delivered_to. Match either, or the count is 0 for every
         # seat and p1b (stuck with work) can never fire.
@@ -1133,6 +1167,8 @@ def _scan_actionable_tickets(
         if "interactive-required" in labels:
             continue
         if blocked_by.strip().lower() == "event":
+            continue
+        if security_gate.strip().lower() == "pending":  # T-5678: awaiting HO security-accept
             continue
         count += 1
     return count
@@ -1986,14 +2022,36 @@ def agent_committed_recently(
     return bool(result.stdout.strip())
 
 
+def p1b_idle_reading(cfg: dict, agent: str | None = None) -> "harness_idle.IdleReading":
+    """T-5793: the seat's idle reading from its live harness's session log, read as
+    the seat's account through the SudoReader. Never raises."""
+    user = str(cfg.get("sudo_user") or "")
+    name = agent or str(cfg.get("bridge_inbound_key") or "")
+    return harness_idle.read_idle(
+        name, account=user, home=f"/home/{user}", cwd=None,
+        default_harness=str(cfg.get("active_runtime_harness") or "claude-code"),
+        reader=_seat_reader(), quiet_s=P1B_LOG_QUIET_SECONDS,
+        claude_projects_dir=str(cfg["jsonl_dir"]))
+
+
 def check_p1b(
     cfg: dict,
     bridge_url: str,
     operator_absent_threshold_seconds: int,
+    *,
+    agent: str | None = None,
 ) -> bool:
     """P1.b: the operator absent + HO in await-state + queue.
 
-    Await-state has two sources:
+    T-5793 (ACTIVITY_MONITOR_IDLE_SOURCE=log, the default): the await-state is
+    harness_idle's IDLE verdict with quiet >= P1B_LOG_QUIET_SECONDS, read from the
+    live harness's own session log (codex rollout or Claude transcript) through the
+    SudoReader. It replaces Signal 1 below, and also works on codex. Signal 2 (a
+    user-blocking tool_use) no longer pokes here: it is escalated to Recovery by
+    check_p1b_interactive + main(). Every other gate is unchanged.
+
+    ACTIVITY_MONITOR_IDLE_SOURCE=pane keeps the pre-T-5793 await-state, which has
+    two sources:
       1. Structural (T-3071): latest assistant turn's final content-block is
          text, not tool_use — see latest_assistant_ends_without_tool_use.
       2. Latest assistant turn is a user-blocking tool_use (AskUserQuestion
@@ -2021,13 +2079,21 @@ def check_p1b(
         absent_seconds = int(time.time()) - latest_inbound_ts
     if absent_seconds < operator_absent_threshold_seconds:
         return False
-    # Signal 1: structural await (T-3071)
-    structural_await = latest_assistant_ends_without_tool_use(jsonl, cfg["sudo_user"])
-    # Signal 2: interactive tool_use await (T-0297)
-    interactive_tool = latest_assistant_interactive_tool_use(jsonl, cfg["sudo_user"])
-    tool_await = interactive_tool is not None
-    if not (structural_await or tool_await):
-        return False
+    if idle_source() == "pane":
+        # Signal 1: structural await (T-3071)
+        structural_await = latest_assistant_ends_without_tool_use(jsonl, cfg["sudo_user"])
+        # Signal 2: interactive tool_use await (T-0297)
+        interactive_tool = latest_assistant_interactive_tool_use(jsonl, cfg["sudo_user"])
+        tool_await = interactive_tool is not None
+        if not (structural_await or tool_await):
+            return False
+    else:
+        # T-5793: the turn ended and nothing happened for P1B_LOG_QUIET_SECONDS. IDLE
+        # already implies quiet >= quiet_s; WORKING / BG_WAIT / UNKNOWN do not fire.
+        reading = p1b_idle_reading(cfg, agent)
+        if reading.verdict is not harness_idle.Verdict.IDLE \
+                or (reading.quiet_s or 0) < P1B_LOG_QUIET_SECONDS:
+            return False
     queue_count = count_actionable_tickets(
         cfg["pantheon_config_path"], cfg["ticket_targets"], cfg["sudo_user"],
         queue_states=cfg.get("queue_states", ("inbox", "active")))
@@ -2079,6 +2145,87 @@ def check_p1b(
     ):
         return False
     return True
+
+
+def interactive_await_tool(records: list, now: float,
+                           min_age_seconds: int = P1B_LOG_QUIET_SECONDS) -> str | None:
+    """Pure: the user-blocking tool (USER_BLOCKING_TOOL_NAMES) the session is blocked
+    on, or None. Blocked = the NEWEST user/assistant record is an assistant record
+    carrying that tool_use (Claude Code writes one record per content block), so no
+    tool_result has come back, and it is at least `min_age_seconds` old."""
+    for rec in reversed(records):
+        if not isinstance(rec, dict) or rec.get("type") not in ("user", "assistant"):
+            continue
+        if rec.get("type") != "assistant":
+            return None
+        msg = rec.get("message") if isinstance(rec.get("message"), dict) else {}
+        content = msg.get("content")
+        if not isinstance(content, list):
+            return None
+        for block in content:
+            if (isinstance(block, dict) and block.get("type") == "tool_use"
+                    and block.get("name") in USER_BLOCKING_TOOL_NAMES):
+                ts = harness_idle._parse_ts(rec.get("timestamp"))
+                if ts is None or now - ts < min_age_seconds:
+                    return None
+                return str(block["name"])
+        return None
+    return None
+
+
+def check_p1b_interactive(cfg: dict, operator_absent_threshold_seconds: int, *,
+                          agent: str | None = None, now: float | None = None) -> str | None:
+    """T-5793: P1.b's former Signal 2 (T-0297) as an escalation trigger. Returns the
+    blocking tool name when the operator has been absent >= the P1.b threshold (Gate-1,
+    unchanged) AND the seat's live Claude transcript ends in an unanswered
+    AskUserQuestion/EnterPlanMode at least P1B_LOG_QUIET_SECONDS old; else None.
+
+    Only Claude has these tools, so a codex runtime returns None. Deliberately NOT
+    gated on the queue, the terminal-state ack or recent commits: those gates bound
+    POKE churn on an idle seat, while a seat blocked on a question is worth one
+    transition-bounded alert whatever its queue. Never raises (None)."""
+    try:
+        name = agent or str(cfg.get("bridge_inbound_key") or "")
+        if _active_runtime_harness(name, cfg) != "claude-code":
+            return None
+        jsonl = find_latest_jsonl(cfg["jsonl_dir"], cfg["sudo_user"])
+        if jsonl is None:
+            return None
+        latest_inbound_ts = latest_telegram_inbound_ts(jsonl, cfg["sudo_user"])
+        t = time.time() if now is None else now
+        absent = (operator_absent_threshold_seconds if latest_inbound_ts is None
+                  else int(t) - latest_inbound_ts)
+        if absent < operator_absent_threshold_seconds:
+            return None
+        user = str(cfg["sudo_user"])
+        reader = _seat_reader()
+        path = harness_idle.locate_log("claude-code", user, f"/home/{user}", None,
+                                       reader=reader, claude_projects_dir=str(cfg["jsonl_dir"]))
+        if path is None:
+            return None
+        text = reader.read_text_tail(user, str(path), harness_idle.TAIL_BYTES)
+        if not text:
+            return None
+        records = harness_idle.parse_jsonl(
+            text, truncated=len(text.encode("utf-8", errors="replace")) >= harness_idle.TAIL_BYTES)
+        return interactive_await_tool(records, t)
+    except Exception:  # noqa: BLE001 — a probe fault must never wedge the monitor
+        return None
+
+
+def _rearm_interactive_await(state_path: Path) -> None:
+    """Re-arm the interactive-await alert once the seat is no longer blocked: drop the
+    escalated flag from a p1b-interactive state record, keeping its ts so this never
+    starts a fresh cooldown. Best-effort."""
+    prior = read_poke_state(state_path)
+    if not prior or prior.get("predicate") != INTERACTIVE_AWAIT_PREDICATE \
+            or not prior.get("escalated"):
+        return
+    prior.pop("escalated", None)
+    try:
+        state_path.write_text(json.dumps(prior) + "\n", encoding="utf-8")
+    except OSError:
+        pass
 
 
 def check_p1d(cfg: dict, age_threshold_seconds: int) -> bool:
@@ -2209,7 +2356,7 @@ P1C_POKE_PROMPT = (
 )
 
 
-def send_poke(cfg: dict, prompt: str) -> bool:
+def send_poke(cfg: dict, prompt: str, *, harness: str | None = None) -> bool:
     """Send the poke prompt to the agent's tmux pane.
 
     T-0538: delegates to the target user's tools/send_keys_submit.sh via
@@ -2218,17 +2365,26 @@ def send_poke(cfg: dict, prompt: str) -> bool:
     in the bash -c string so the helper's tmux calls reach the target user's
     session bus (same pattern as capture_pane()). Returns True iff helper
     exits 0; False on any failure (send-keys error, timeout, OSError).
+
+    T-5793: the helper gets `--harness <profile>` for the seat's LIVE runtime
+    (callers pass _active_runtime_harness(agent, cfg)). Without it a Claude-configured seat
+    failed over to codex got the claude-code verify profile, whose sentinel is
+    always absent on codex's TUI, so the submit false-passed (the T-1106 class).
     """
     pane = cfg["tmux_target_pane"]
     sudo_user = cfg["sudo_user"]
     helper = Path(cfg["pantheon_config_path"]) / "tools" / "send_keys_submit.sh"
+    # Callers pass the resolved profile; the fallback is the cfg-declared harness, else
+    # claude-code (the helper's own default, i.e. the pre-T-5793 behaviour).
+    profile = harness or str(cfg.get("active_runtime_harness") or "claude-code")
     # T-4141: shlex.quote, NOT json.dumps. json.dumps yields a DOUBLE-quoted shell
     # string, so backticks and $(...) in the prompt were executed as the target user
     # (P1B_POKE_PROMPT's backticked ls arrived in the pane as '()').
     cmd = _sudo(sudo_user) + [
         "bash", "-c",
         f'XDG_RUNTIME_DIR=/run/user/$(id -u) INJECT_ENTER_DELAY={INJECT_ENTER_DELAY}'
-        f' bash {shlex.quote(str(helper))} {shlex.quote(pane)} {shlex.quote(prompt)}',
+        f' bash {shlex.quote(str(helper))} --harness {shlex.quote(profile)}'
+        f' {shlex.quote(pane)} {shlex.quote(prompt)}',
     ]
     try:
         r = subprocess.run(
@@ -2275,6 +2431,31 @@ def _pane_idle_probe(cfg: dict) -> bool | None:
         return pane_idle_state(pane_text, background_agents_busy=True)
     except Exception:  # noqa: BLE001 — best-effort signal; UNKNOWN on any error
         return None
+
+
+def _inject_safe(cfg: dict, agent: str, harness: str) -> bool:
+    """T-5793: positive evidence that a TEXT poke may be pasted right now:
+    harness_idle.pane_inject_safe on a fresh `-e` capture for the live harness
+    (claude: pane_idle_state(..., background_agents_busy=True) is True; codex: ready
+    composer, no codex modal, no busy footer). An uncapturable pane is not safe.
+    Applied only immediately before send_poke, never at the top of _dispatch_poke,
+    so the recovery branches (cap-modal Enter-confirm, escalations) stay reachable."""
+    pane = cfg.get("tmux_target_pane")
+    if not pane:
+        return False
+    return harness_idle.pane_inject_safe(capture_pane(pane, cfg["sudo_user"], escapes=True), harness)
+
+
+def _gate_text_poke(cfg: dict, agent: str, predicate: str) -> str | None:
+    """The harness for a text poke, or None when the poke must DEFER (log mode only:
+    the pane is not positively inject-safe). pane mode keeps the pre-T-5793 send."""
+    harness = _active_runtime_harness(agent, cfg)
+    if idle_source() == "pane" or _inject_safe(cfg, agent, harness):
+        return harness
+    _log(agent, f"{predicate}: pane not positively inject-safe for {harness} "
+                f"(modal / dialog / busy / unknown) — deferring text poke (T-5793)")
+    _record_fire(agent, predicate, deferred=True)
+    return None
 
 
 def _soft_defer_or_fail(cfg: dict, agent: str, predicate: str) -> int:
@@ -2575,13 +2756,54 @@ USAGE_GATED_PREDICATES = frozenset({"p1a", "p1b"})
 USAGE_SUPPRESSED = -1
 
 
-def _poke_suppressed_by_usage(agent: str, predicate: str, now: float | None = None) -> bool:
+def _seat_reader():
+    """The cross-seat reader (T-5793). activity_monitor runs as Recovery, and the persona
+    state files are 0600 under the seat's own account, so every read goes through
+    health_export.SudoReader (argv-only `sudo -n -u <seat>`). Tests patch this."""
+    return health_export.SudoReader()
+
+
+def _active_runtime_harness(agent: str, cfg: dict) -> str:
+    """Resolve the provider that owns the live pane (usage-gate accounting and the
+    send_poke submit profile).
+
+    The shared fleet usage record is Claude-only. Controller-managed seats retain
+    their persona/tmux identity while running Codex, so gating by persona would park
+    the fallback precisely when it should carry work.
+
+    T-5793: resolved by harness_idle.resolve_harness over the SudoReader: the
+    controller's runtime.json, then the active-runtime.json cache, then the role's
+    historical Claude default. The old raw Path.read_text ran as Recovery against the
+    seat's 0600 file, always failed, and always fell back to claude-code. Any
+    failure still fails to claude-code. `active_runtime_path` (tests) names the
+    cache file; runtime.json is looked up beside it under runtime-controller/.
+    """
+    declared = cfg.get("active_runtime_harness")
+    if declared in {"claude-code", "codex"}:
+        return str(declared)
+    user = str(cfg.get("sudo_user") or "")
+    override = cfg.get("active_runtime_path")
+    try:
+        profile, _started, _source = harness_idle.resolve_harness(
+            agent, home=Path(f"/home/{user}"), default="claude-code", account=user,
+            reader=_seat_reader(),
+            persona_dir=Path(override).parent if override else None)
+    except Exception:  # noqa: BLE001 — resolver never raises; belt and braces
+        return "claude-code"
+    return profile
+
+
+def _poke_suppressed_by_usage(
+    agent: str, predicate: str, now: float | None = None, *, cfg: dict | None = None,
+) -> bool:
     """T-4510: True iff this content poke must be skipped because the fleet's shared weekly
     Max usage is at/above the gate's threshold (default 95%). Called immediately before
     `send_poke(cfg, prompt)` — AFTER every recovery branch in `_dispatch_poke` — and only for
     USAGE_GATED_PREDICATES. Logs once per window per (agent, predicate), not once per tick.
     Fails OPEN: any gate error means the poke proceeds (today's behaviour)."""
     if predicate not in USAGE_GATED_PREDICATES:
+        return False
+    if cfg is not None and _active_runtime_harness(agent, cfg) == "codex":
         return False
     try:
         decision = fleet_usage_gate.evaluate(now)
@@ -2638,6 +2860,7 @@ def _dispatch_poke(
     if _pane_idle_probe(cfg) is False:
         _log(agent, f"{predicate}: pane BUSY (generating/manage-view) — "
                     f"deferring poke, not exit-1 (T-3599)")
+        _record_fire(agent, predicate, deferred=True)  # T-5648: matched, deferred
         return 0
     if bounded_enabled:
         # Pre-poke state-gate (T-1363 inc.3): a CYBER-BLOCKED session keeps emitting
@@ -2787,9 +3010,12 @@ def _dispatch_poke(
                 consecutive=consecutive,
             )
             return 0
-        if _poke_suppressed_by_usage(agent, predicate):  # T-4510: after ALL recovery branches
+        if _poke_suppressed_by_usage(agent, predicate, cfg=cfg):  # T-4510: after recovery
             return USAGE_SUPPRESSED
-        if send_poke(cfg, prompt):
+        harness = _gate_text_poke(cfg, agent, predicate)  # T-5793: positive pane gate
+        if harness is None:
+            return 0
+        if send_poke(cfg, prompt, harness=harness):
             _log(agent, f"{predicate} poke sent (bounded; consecutive_ineffective={consecutive})")
             write_poke_state(
                 state_path, agent, predicate,
@@ -2802,9 +3028,12 @@ def _dispatch_poke(
     # Legacy / ship-dark path — byte-for-byte the prior poke/state behavior
     # (the _record_fire call is a new, best-effort, non-wedging side-write —
     # T-3072 — it does not change what this branch pokes or persists).
-    if _poke_suppressed_by_usage(agent, predicate):  # T-4510: fleet usage gate (p1a/p1b only)
+    if _poke_suppressed_by_usage(agent, predicate, cfg=cfg):  # T-4510: provider-aware gate
         return USAGE_SUPPRESSED
-    if send_poke(cfg, prompt):
+    harness = _gate_text_poke(cfg, agent, predicate)  # T-5793: positive pane gate
+    if harness is None:
+        return 0
+    if send_poke(cfg, prompt, harness=harness):
         _log(agent, f"{predicate} poke sent")
         write_poke_state(state_path, agent, predicate)
         _record_fire(agent, predicate)
@@ -3117,6 +3346,7 @@ def main(argv: list[str] | None = None) -> int:
         "p1b": p1b_cooldown,
         "p1d": p1d_cooldown_seconds,
         "p1c": p1c_cooldown_seconds,
+        INTERACTIVE_AWAIT_PREDICATE: cooldown_seconds,
     }
 
     if in_cooldown(state_path, cooldown_map):
@@ -3183,6 +3413,29 @@ def main(argv: list[str] | None = None) -> int:
     # P1.c; every non-suppressed dispatch keeps today's return-early behaviour exactly.
     usage_suppressed = False
 
+    # T-5793: P1.b interactive-await (the former T-0297 Signal 2). A seat blocked on an
+    # unanswered AskUserQuestion/EnterPlanMode while the operator is away is escalated to Recovery
+    # ONCE (transition-bounded _escalate_stuck), never poked: a poke typed into a live
+    # menu is blind input. Before P1.a, which would otherwise match the same blocked seat
+    # (idle + queue) and end the cycle on a deferred poke. Not skipped for paused intake
+    # (a surfacing, not new work) or usage suppression (it costs no turn). log mode only.
+    if p1b_enabled and idle_source() == "log":
+        tool = check_p1b_interactive(cfg, operator_absent_threshold, agent=agent)
+        if tool is not None:
+            _log(agent, f"P1.b interactive-await: blocked on {tool} while the operator is away")
+            _escalate_stuck(
+                cfg, agent, INTERACTIVE_AWAIT_PREDICATE,
+                msg=(f"❓ [p1b] {agent} is blocked on an unanswered {tool} prompt "
+                     f"(>= {P1B_LOG_QUIET_SECONDS // 60}min) while the operator has been away "
+                     f"for >= {operator_absent_threshold // 60}min. Not poking: a poke would "
+                     f"type into the live menu. It needs the operator's answer, or a human at "
+                     f"the pane to answer or dismiss it."),
+                vocab=INTERACTIVE_AWAIT_VOCAB, state_path=state_path, cur_mtime=0,
+                consecutive=0,
+            )
+            return 0
+        _rearm_interactive_await(state_path)
+
     # Check P1.a first (it's a stronger signal: completely-idle).
     if not intake_held and check_p1a(cfg, idle_threshold):
         _log(agent, "P1.a fired: idle > threshold + queue ≥ 1")
@@ -3198,7 +3451,8 @@ def main(argv: list[str] | None = None) -> int:
         _log(agent, "P1.b skipped: ACTIVITY_MONITOR_P1B_ENABLED=0")
     elif intake_held:
         pass  # logged above; P1.b is a queue poke (ORG-106 L2)
-    elif not usage_suppressed and check_p1b(cfg, bridge_url, operator_absent_threshold):
+    elif not usage_suppressed and check_p1b(cfg, bridge_url, operator_absent_threshold,
+                                            agent=agent):
         _log(agent, "P1.b fired: the operator absent + await-state + queue ≥ 1")
         rc = _dispatch_poke(cfg, agent, "p1b", P1B_POKE_PROMPT, state_path,
                             bounded_enabled=bounded_poke_enabled,
@@ -3210,7 +3464,10 @@ def main(argv: list[str] | None = None) -> int:
     # P1.d: rate-limit aborted the turn + has persisted past threshold.
     if check_p1d(cfg, p1d_age_threshold):
         _log(agent, "P1.d fired: rate-limit visible + stale > threshold")
-        if send_poke(cfg, P1D_RETRY_PROMPT):
+        p1d_harness = _gate_text_poke(cfg, agent, "p1d")  # T-5793: positive pane gate
+        if p1d_harness is None:
+            return 0
+        if send_poke(cfg, P1D_RETRY_PROMPT, harness=p1d_harness):
             _log(agent, "P1.d retry-inject sent")
             write_poke_state(state_path, agent, "p1d")
             _record_fire(agent, "p1d")  # T-3072 — doesn't route through _dispatch_poke

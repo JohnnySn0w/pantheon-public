@@ -39,6 +39,7 @@ from __future__ import annotations
 import os
 import subprocess
 import tempfile
+import time
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -128,6 +129,17 @@ def local_only_commits(repo_path: Path) -> frozenset[str]:
 # false "leaked commit" failures (PRs #495/#497/#501, 2026-09-28).
 _GUARD_GIT_TIMEOUT_S = 60
 
+# T-5817: on a LIVE seat checkout another actor (the seat's own ticket.py, a
+# timer) commits to REPO_ROOT and pushes it moments later. Between the two the
+# commit is local-only, and a test tearing down in that window reported it as a
+# leak (orchestrator's soak, 2026-11-01: `tickets: clear stale auto_delivered on
+# T-4514` by orchestrator, failing TestRetargetDetachedHeadPush). A test's leaked
+# commit is never pushed, so before failing the guard waits up to this long for
+# the new SHAs to become reachable from origin/* and re-reads. It only costs
+# time when new local-only commits were seen; a clean tearDown never waits.
+REAL_REPO_SETTLE_S = 120.0
+_REAL_REPO_SETTLE_POLL_S = 2.0
+
 
 def _local_only_commits_or_none(repo_path: Path) -> frozenset[str] | None:
     """Like local_only_commits, but None (unknown) on any git failure or
@@ -171,6 +183,8 @@ def snapshot_real_repo(repo_path: Path | None = None) -> _RepoSnapshot:
 def assert_real_repo_untouched(
     snapshot: _RepoSnapshot,
     repo_path: Path | None = None,
+    *,
+    settle_s: float | None = None,
 ) -> None:
     """Raise AssertionError if a NEW local-only commit appeared in the real
     repo since the snapshot was taken.
@@ -183,13 +197,12 @@ def assert_real_repo_untouched(
     trigger this guard: the erroneous commit is local-only until pushed, and
     its SHA will appear in the tearDown set but not in the setUp set.
 
-    Residual-race acknowledgment: another actor (e.g. Specialist) can create a
-    local commit in REPO_ROOT between setUp and tearDown before pushing it.
-    That commit would be transiently local-only during the push window
-    (~sub-second).  If that SHA was NOT already in the setUp snapshot, it
-    would be a false positive.  This window is orders of magnitude narrower
-    than the prior "any HEAD movement" false-positive rate and is the
-    accepted tradeoff (ratified in T-1034 brief).
+    Concurrent actors (T-5817): another actor (e.g. the seat's own
+    ticket.py) can create a local commit in REPO_ROOT between setUp and
+    tearDown and push it moments later; until then it is local-only. So new
+    local-only SHAs are re-read for up to ``settle_s`` seconds (default
+    ``REAL_REPO_SETTLE_S``) and only the ones still local-only fail. A test's
+    leaked commit is never pushed, so it still fails, after the wait.
 
     Args:
         snapshot:  the ``_RepoSnapshot`` returned by ``snapshot_real_repo()``.
@@ -197,6 +210,9 @@ def assert_real_repo_untouched(
                    (which was set by ``snapshot_real_repo()``).  Override only
                    in tests that need to redirect the assertion to a different
                    repo than the one snapshotted.
+        settle_s:  how long new local-only SHAs may take to reach origin/*
+                   before they count as leaked (T-5817). None means
+                   ``REAL_REPO_SETTLE_S``.
 
     Raises:
         AssertionError: if new local-only commits appeared since the snapshot.
@@ -216,6 +232,9 @@ def assert_real_repo_untouched(
         return
     new_local = current - snapshot.local_only
     if new_local:
+        new_local = _settle_new_local(resolved, snapshot.local_only, new_local,
+                                      REAL_REPO_SETTLE_S if settle_s is None else settle_s)
+    if new_local:
         raise AssertionError(
             f"Real repo at {resolved} gained new local-only commits during "
             f"the test (not reachable from any origin/* ref). "
@@ -223,6 +242,20 @@ def assert_real_repo_untouched(
             f"New local-only SHAs: {sorted(new_local)}"
             f"{_describe_commits(resolved, sorted(new_local))}"
         )
+
+
+def _settle_new_local(repo_path: Path, baseline: frozenset[str], new_local: frozenset[str],
+                      settle_s: float) -> frozenset[str]:
+    """T-5817: re-read until none of `new_local` is still local-only, or `settle_s`
+    runs out; return the SHAs that stayed local-only (from the last good read).
+    A read that fails mid-wait keeps the previous answer (fail toward reporting)."""
+    deadline = time.monotonic() + max(0.0, settle_s)
+    while new_local and time.monotonic() < deadline:
+        time.sleep(min(_REAL_REPO_SETTLE_POLL_S, max(0.0, deadline - time.monotonic())))
+        current = _local_only_commits_or_none(repo_path)
+        if current is not None:
+            new_local = (current - baseline) & new_local
+    return new_local
 
 
 def _describe_commits(repo_path: Path, shas: list[str], max_files: int = 8) -> str:

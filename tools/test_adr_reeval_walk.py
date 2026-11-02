@@ -331,6 +331,57 @@ class RunWalk(unittest.TestCase):
             self.assertEqual(res.filed, [])
             self.assertEqual(res.deduped, ["ORG-100:R1"])
 
+    def _done_reeval(self, root: Path, tid: str, created: str) -> None:
+        _write(root / "done", f"{tid}.md", f"""\
+            ---
+            id: {tid}
+            created: {created}
+            requester: recovery
+            target: orchestrator
+            state: done
+            labels: [adr-reeval, "reeval:ORG-100:R1"]
+            ---
+            # x
+            ## Ask
+            x
+            ## Context
+            ## Transition log
+            - resolved
+            """)
+
+    def test_resolved_past_due_calendar_trigger_does_not_refile(self):
+        # T-4827: a calendar date stays past-due forever, so a DONE review
+        # ticket filed on/after the trigger date means this firing is handled.
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            adrs = tdp / "adr"; adrs.mkdir()
+            self._adrs(adrs)
+            root = tdp / "tickets"
+            for sub in ("inbox", "active", "done"):
+                (root / sub).mkdir(parents=True)
+            self._done_reeval(root, "T-8001", "2026-01-01T09:00:00Z")
+            with mock.patch.object(W, "file_reeval_ticket") as filer:
+                res = W.run_walk(now=dt.date(2026, 8, 3), adr_dir=adrs, tickets_root=root)
+            filer.assert_not_called()
+            self.assertEqual(res.filed, [])
+            self.assertEqual(res.deduped, ["ORG-100:R1"])
+
+    def test_done_review_from_before_the_trigger_date_does_not_suppress(self):
+        # A review resolved BEFORE this trigger's date answered an earlier
+        # firing (e.g. a moved date), not this one: the walk files.
+        with TemporaryDirectory() as td:
+            tdp = Path(td)
+            adrs = tdp / "adr"; adrs.mkdir()
+            self._adrs(adrs)
+            root = tdp / "tickets"
+            for sub in ("inbox", "active", "done"):
+                (root / sub).mkdir(parents=True)
+            self._done_reeval(root, "T-8002", "2025-12-31T23:59:59Z")
+            with mock.patch.object(W, "file_reeval_ticket", return_value="T-1235") as filer:
+                res = W.run_walk(now=dt.date(2026, 8, 3), adr_dir=adrs, tickets_root=root)
+            filer.assert_called_once()
+            self.assertEqual(res.filed, ["T-1235"])
+
     def test_dry_run_never_files(self):
         with TemporaryDirectory() as td:
             tdp = Path(td)

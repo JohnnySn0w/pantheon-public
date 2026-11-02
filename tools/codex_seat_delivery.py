@@ -23,9 +23,12 @@ into the per-seat delivery path in notes/2026-10-14-t4988-codex-appserver-build.
   Approvals       codex_delivery declines every server request; each one also pages Recovery
                   as a policy anomaly (under approval=never the server should never ask).
   Recovery        the build note's state-machine table; see RECOVERY below.
-  Heartbeat       thread/loaded/list every 30s, 10s timeout; 3 misses = hung: page Recovery,
-                  restart the server, recover as for a dead server. A reply without the
-                  seat's thread is the thread-won't-resume row.
+  Heartbeat       thread/loaded/list every 30s, 10s timeout; 3 misses = hung. Persist one
+                  owner-replacement attempt before acting. Only a complete exact-string
+                  list containing the seat thread clears it. An unhealthy successor holds
+                  without a second action and pages Recovery once across later generations.
+                  If the attempt cannot be persisted, hold without replacing and use an
+                  independent runtime witness to page once across writer generations.
   Compaction      thread/compacted (or a contextCompaction item) re-steers every accepted,
                   unacknowledged operator DM once, verbatim, same id, prefixed
                   "[re-delivery after compaction]".
@@ -61,6 +64,7 @@ import fcntl
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -70,16 +74,20 @@ from typing import Callable, Optional
 
 if __package__ == "tools":          # imported as tools.codex_seat_delivery (tests)
     from tools import codex_delivery as cd
+    from tools import codex_schema_contract as csc
 else:                               # run as a script, or imported with tools/ on sys.path
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import codex_delivery as cd  # noqa: E402
+    import codex_schema_contract as csc  # noqa: E402
 
-EXIT_OK, EXIT_DUPLICATE, EXIT_USAGE = 0, 5, 3
+EXIT_OK, EXIT_DUPLICATE, EXIT_USAGE, EXIT_RESTART_OWNER = 0, 5, 3, 6
 PRIORITY = {"operator_urgent": 0, "operator_dm": 1, "controller": 2, "mailbox": 3, "poke": 3}
 DRAINABLE = ("mailbox", "poke")
 HEARTBEAT_EVERY_S = 30.0
 HEARTBEAT_TIMEOUT_S = 10.0
 HEARTBEAT_MISSES = 3
+HUNG_RECOVERY_ATTEMPTS = 1
+HUNG_RECOVERY_STATE_VERSION = 1
 BACKOFF_MAX_S = 60.0
 RECONNECT_PAGE_AFTER = 3
 FAILED_RETRIES = 3
@@ -90,16 +98,137 @@ TERMINAL = (cd.DELIVERED, cd.FAILED, cd.AMBIGUOUS)
 HOLD_THREAD = "thread_wont_resume"
 HOLD_AUTH = "auth_expired"
 HOLD_IDENTITY = "identity_mismatch"
+HOLD_HUNG_RECOVERY = "hung_recovery_ineffective"
+INPUT_READY_SCHEMA = "pantheon-codex-appserver-input-ready/v1"
 
 
 def _write_json_atomic(path: Path, doc: dict) -> None:
-    tmp = path.with_name("." + path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    tmp = path.with_name(f".{path.name}.tmp.{secrets.token_hex(16)}")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(tmp, flags, 0o600)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, sort_keys=True)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        parent_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
+    finally:
+        try:
+            tmp.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def publish_input_ready(path: Path, *, persona: str, thread_id: str, launch_nonce: str) -> None:
+    """Durably publish the exact writer-owned current-launch readiness proof."""
+    if not launch_nonce or not thread_id or not persona:
+        raise ValueError("readiness identity fields must be nonempty")
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    _write_json_atomic(path, {
+        "schema": INPUT_READY_SCHEMA,
+        "persona": persona,
+        "thread_id": thread_id,
+        "launch_nonce": launch_nonce,
+    })
+
+
+def _escalation_witness_exists(path: Path) -> bool:
+    try:
+        path.lstat()
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _claim_escalation_witness(path: Path, seat: str) -> bool:
+    """Durably claim the cross-generation escalation transition.
+
+    This witness deliberately does not use the recovery-state JSON writer: its job is
+    to remain writable when that state/audit path is the failed component. ``O_EXCL``
+    makes one process the page owner; later generations observe the existing witness.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return False
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump(doc, fh, sort_keys=True)
+        json.dump({"version": 1, "seat": seat, "created_ns": time.time_ns()}, fh,
+                  sort_keys=True)
         fh.flush()
         os.fsync(fh.fileno())
-    os.replace(tmp, path)
+    parent_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+    return True
+
+
+def _clear_escalation_witness(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    parent_fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(parent_fd)
+    finally:
+        os.close(parent_fd)
+
+
+def load_hung_recovery_state(path: Path) -> tuple[dict, bool]:
+    """Load the strict durable recovery union.
+
+    Returns ``(state, malformed)``. A missing file is the clear state. Any
+    unreadable payload or value outside the three exact union members becomes
+    an attempted state, so corrupt state can never authorize another action.
+    ``type`` checks are intentional: bool is an int subclass in Python.
+    """
+    clear = {"episode_id": None, "attempts": 0, "escalated": False}
+    fail_closed = {"episode_id": "invalid-state", "attempts": 1, "escalated": False}
+    try:
+        doc = json.loads(Path(path).read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return clear, False
+    except (OSError, ValueError):
+        return fail_closed, True
+    if type(doc) is not dict or type(doc.get("version")) is not int \
+            or doc.get("version") != HUNG_RECOVERY_STATE_VERSION:
+        return fail_closed, True
+    episode = doc.get("episode_id")
+    attempts = doc.get("attempts")
+    escalated = doc.get("escalated")
+    is_clear = episode is None and type(attempts) is int and attempts == 0 \
+        and escalated is False
+    is_attempted = type(episode) is str and bool(episode) \
+        and type(attempts) is int and attempts == HUNG_RECOVERY_ATTEMPTS \
+        and escalated is False
+    is_escalated = type(episode) is str and bool(episode) \
+        and type(attempts) is int and attempts == HUNG_RECOVERY_ATTEMPTS \
+        and escalated is True
+    if not (is_clear or is_attempted or is_escalated):
+        return fail_closed, True
+    return {"episode_id": episode, "attempts": attempts, "escalated": escalated}, False
+
+
+def loaded_threads_from_heartbeat(response: object) -> Optional[list[str]]:
+    """Return a complete exact-string list, or None for any non-proof response."""
+    if type(response) is not dict:
+        return None
+    loaded = response.get("data")
+    if type(loaded) is not list or any(type(item) is not str for item in loaded):
+        return None
+    if response.get("partial") is not None or response.get("nextCursor") not in (None, ""):
+        return None
+    return loaded
 
 
 def _dirs(state: Path) -> dict:
@@ -235,11 +364,14 @@ class SeatDeliveryPath:
     def __init__(self, binding: SeatBinding, state_dir, connect: Callable[[], object], *,
                  pager: Callable[[str, str, str], None],
                  restart_server: Callable[[], None],
+                 restart_target: str = "app-server",
+                 escalation_witness_path: Optional[Path] = None,
                  clock: Callable[[], float] = time.monotonic,
                  request_timeout: float = 60.0, turn_timeout: float = 1800.0,
                  heartbeat_every: float = HEARTBEAT_EVERY_S,
                  heartbeat_timeout: float = HEARTBEAT_TIMEOUT_S,
-                 send_phase_wait: float = SEND_PHASE_WAIT_S):
+                 send_phase_wait: float = SEND_PHASE_WAIT_S,
+                 readiness_publisher: Optional[Callable[[str], None]] = None):
         self.b = binding
         self.state = Path(state_dir)
         self.d = _dirs(self.state)
@@ -247,12 +379,15 @@ class SeatDeliveryPath:
         self.connect_transport = connect
         self.pager = pager
         self.restart_server = restart_server
+        self.restart_target = restart_target
         self.clock = clock
         self.request_timeout = request_timeout
         self.turn_timeout = turn_timeout
         self.heartbeat_every = heartbeat_every
         self.heartbeat_timeout = heartbeat_timeout
         self.send_phase_wait = send_phase_wait
+        self.readiness_publisher = readiness_publisher
+        self._readiness_published = False
 
         self.client: Optional[cd.CodexDeliveryClient] = None
         self.hold: Optional[str] = None
@@ -267,8 +402,41 @@ class SeatDeliveryPath:
         self._next_reconnect = 0.0
         self._last_hb = 0.0
         self._hb_misses = 0
+        self._hung_recovery_path = self.state / "hung-recovery.json"
+        self._hung_escalation_witness = Path(escalation_witness_path) \
+            if escalation_witness_path is not None \
+            else self.state.parent / f".{self.state.name}-hung-recovery-escalated"
+        hung, malformed = load_hung_recovery_state(self._hung_recovery_path)
+        self._hung_recovery_episode = hung["episode_id"]
+        self._hung_recovery_attempts = hung["attempts"]
+        self._hung_recovery_escalated = hung["escalated"]
+        witnessed_escalation = _escalation_witness_exists(self._hung_escalation_witness)
+        witness_only = witnessed_escalation \
+            and not malformed and self._hung_recovery_episode is None \
+            and self._hung_recovery_attempts == 0 \
+            and self._hung_recovery_escalated is False
+        escalated_with_witness = witnessed_escalation \
+            and not malformed and type(self._hung_recovery_episode) is str \
+            and bool(self._hung_recovery_episode) \
+            and self._hung_recovery_attempts == HUNG_RECOVERY_ATTEMPTS \
+            and self._hung_recovery_escalated is True
+        if witnessed_escalation:
+            self._hung_recovery_episode = self._hung_recovery_episode \
+                or f"{self.b.seat}-failed-state-witness"
+            self._hung_recovery_attempts = HUNG_RECOVERY_ATTEMPTS
+            self._hung_recovery_escalated = True
+            self.paged.add("server_hung")
+        # A retained witness is also the recovery probe token for an already-escalated
+        # episode. The hold remains in force while only heartbeat traffic is allowed;
+        # no delivery, replacement, or page path is reopened.
+        self._hung_recovery_probe_required = witness_only or escalated_with_witness
         self._workers: dict[str, threading.Thread] = {}
         self._resteered: set[tuple[str, str]] = set()
+        if malformed or (self._hung_recovery_escalated and not witness_only):
+            self._hold_hung_recovery(
+                "durable hung-recovery state is invalid or already escalated; "
+                "refusing another replacement"
+            )
 
     # ---------------------------------------------------------- helpers
     def _audit(self, event: str, **fields) -> None:
@@ -277,16 +445,110 @@ class SeatDeliveryPath:
         rec.update(fields)
         self.log.append(rec)
 
+    def _audit_best_effort(self, event: str, **fields) -> None:
+        try:
+            self._audit(event, **fields)
+        except OSError:
+            pass
+
+    def _save_hung_recovery(self) -> None:
+        _write_json_atomic(self._hung_recovery_path, {
+            "version": HUNG_RECOVERY_STATE_VERSION,
+            "episode_id": self._hung_recovery_episode,
+            "attempts": self._hung_recovery_attempts,
+            "escalated": self._hung_recovery_escalated,
+            "updated_ns": time.time_ns(),
+        })
+
+    def _record_hung_recovery_attempt(self) -> bool:
+        if self._hung_recovery_episode is None:
+            self._hung_recovery_episode = f"{self.b.seat}-{time.time_ns()}-{os.getpid()}"
+        self._hung_recovery_attempts = HUNG_RECOVERY_ATTEMPTS
+        try:
+            self._save_hung_recovery()
+        except OSError as exc:
+            self._hold_hung_recovery(
+                f"could not durably record the recovery attempt; refusing replacement: {exc!r}"
+            )
+            return False
+        return True
+
+    def _clear_hung_recovery_after_healthy_heartbeat(self) -> None:
+        if self._hung_recovery_episode is None and self._hung_recovery_attempts == 0 \
+                and self._hung_recovery_escalated is False:
+            return
+        prior = (self._hung_recovery_episode, self._hung_recovery_attempts,
+                 self._hung_recovery_escalated)
+        self._hung_recovery_episode, self._hung_recovery_attempts = None, 0
+        self._hung_recovery_escalated = False
+        try:
+            self._save_hung_recovery()
+        except OSError as exc:
+            (self._hung_recovery_episode, self._hung_recovery_attempts,
+             self._hung_recovery_escalated) = prior
+            self._hold_hung_recovery(
+                f"healthy heartbeat observed but durable clear failed; holding: {exc!r}"
+            )
+            return
+        try:
+            _clear_escalation_witness(self._hung_escalation_witness)
+        except OSError as exc:
+            (self._hung_recovery_episode, self._hung_recovery_attempts,
+             self._hung_recovery_escalated) = prior
+            self._hold_hung_recovery(
+                f"healthy heartbeat observed but escalation witness clear failed; holding: {exc!r}"
+            )
+            return
+        self.paged.discard("server_hung")
+        self._hung_recovery_probe_required = False
+        if self.hold == HOLD_HUNG_RECOVERY:
+            self.hold = None
+        self._audit("hung_recovery_effective")
+
+    def _hold_hung_recovery(self, detail: str) -> None:
+        if self.hold is None:
+            self.hold = HOLD_HUNG_RECOVERY
+            self._audit_best_effort(
+                "hold", reason=HOLD_HUNG_RECOVERY, detail=cd.preview(detail, 300)
+            )
+        if self._hung_recovery_escalated:
+            return
+        self._hung_recovery_escalated = True
+        try:
+            self._save_hung_recovery()
+        except OSError as exc:
+            self._audit_best_effort(
+                "hung_recovery_state_write_failed", error=repr(exc)[:200]
+            )
+        try:
+            owns_escalation = _claim_escalation_witness(
+                self._hung_escalation_witness, self.b.seat
+            )
+        except OSError as exc:
+            self._audit_best_effort("hung_recovery_witness_write_failed", error=repr(exc)[:200])
+            # Ownership exists only after the exclusive witness and both durability
+            # barriers complete. A failed claim may have left a conservative partial
+            # witness, but it never authorizes this generation to page.
+            return
+        if not owns_escalation:
+            return
+        self.page(
+            "server_hung",
+            "codex app-server recovery bounded",
+            f"{detail}\nEverything stays queued in {self.d['pending']}; nothing is dropped. "
+            "Recovery must inspect the app-server before restarting the writer.",
+        )
+
     def page(self, key: str, subject: str, body: str) -> None:
         """Page Recovery once per key (per process lifetime)."""
         if key in self.paged:
             return
         self.paged.add(key)
-        self._audit("paged", key=key, subject=subject)
+        self._audit_best_effort("paged", key=key, subject=subject)
         try:
             self.pager(key, f"[{self.b.seat}] {subject}", body)
         except Exception as exc:
-            self._audit("page_failed", key=key, error=repr(exc)[:200])
+            self._audit_best_effort("page_failed", key=key, error=repr(exc)[:200])
 
     def _set_hold(self, reason: str, detail: str) -> None:
         if self.hold is None:
@@ -416,8 +678,12 @@ class SeatDeliveryPath:
             return self._connect_failed(f"resume: {exc}")
         self._reconnect_failures = 0
         self._hb_misses = 0
-        self._last_hb = self.clock()
-        self._audit("connected", thread_id=tid)
+        self._last_hb = self.clock() - self.heartbeat_every \
+            if self._hung_recovery_probe_required or self.readiness_publisher else self.clock()
+        if self._hung_recovery_probe_required:
+            self._audit_best_effort("connected", thread_id=tid)
+        else:
+            self._audit("connected", thread_id=tid)
         self.reconcile_held()
         with self._ev_lock:
             self._idle_edge = True      # a fresh connection is an idle transition
@@ -488,7 +754,7 @@ class SeatDeliveryPath:
     def tick(self) -> None:
         self._handle_events()       # first, so a new hold applies to this tick's claims
         self._claim_spool()
-        if self.hold:
+        if self.hold and not self._hung_recovery_probe_required:
             return
         if self.client is None or self.client.closed:
             if self.client is not None:
@@ -497,8 +763,14 @@ class SeatDeliveryPath:
                 self._next_reconnect = self.clock()     # first retry at once, then back off
             if self.clock() < self._next_reconnect or not self.connect():
                 return
+        recovery_probe_tick = self._hung_recovery_probe_required
         self._heartbeat()
-        if self.hold or self.client is None:
+        if recovery_probe_tick:
+            # Even a successful recovery proof only changes state on this tick.
+            # Delivery resumes on the next ordinary tick, after the hold/probe
+            # transition is fully behind the control gate.
+            return
+        if self.hold or self.client is None or self._hung_recovery_probe_required:
             return
         self._resteer_after_compaction()
         self._dispatch_new()
@@ -550,18 +822,37 @@ class SeatDeliveryPath:
             res = self.client.request("thread/loaded/list", {}, timeout=self.heartbeat_timeout)
         except (cd.RequestTimeout, cd.Disconnected):
             self._hb_misses += 1
-            self._audit("heartbeat_miss", misses=self._hb_misses)
+            self._audit_best_effort("heartbeat_miss", misses=self._hb_misses)
             if self._hb_misses >= HEARTBEAT_MISSES:
-                self.page("server_hung", "codex app-server hung",
-                          f"{self._hb_misses} heartbeats missed; restarting the server.")
-                self._audit("server_restart", reason="heartbeat")
+                if self._hung_recovery_attempts >= HUNG_RECOVERY_ATTEMPTS:
+                    self._audit_best_effort(
+                        "hung_recovery_ineffective", target=self.restart_target
+                    )
+                    self.client.close()
+                    self.client = None
+                    self._hold_hung_recovery(
+                        f"{self.restart_target} replacement did not restore a healthy heartbeat; "
+                        "bounded after one ineffective recovery"
+                    )
+                    return
+                if not self._record_hung_recovery_attempt():
+                    return
+                self._audit(
+                    "server_restart", reason="heartbeat", target=self.restart_target,
+                    attempt=self._hung_recovery_attempts,
+                )
                 try:
                     self.restart_server()
                 except Exception as exc:
                     self._audit("server_restart_failed", error=repr(exc)[:200])
+                    self.client.close()
+                    self.client = None
+                    self._hold_hung_recovery(
+                        f"could not replace {self.restart_target}: {exc!r}"
+                    )
+                    return
                 self.client.close()
                 self.client = None
-                self.paged.discard("server_hung")
                 self._hb_misses = 0
                 self._next_reconnect = self.clock()
             return
@@ -569,9 +860,25 @@ class SeatDeliveryPath:
             self._audit("heartbeat_error", error=cd.preview(str(exc), 200))
             return
         self._hb_misses = 0
-        if self.client.thread_id not in (res.get("data") or []):
-            self._set_hold(HOLD_THREAD, f"heartbeat: thread {self.client.thread_id} is no "
-                                        f"longer loaded on the app-server")
+        loaded = loaded_threads_from_heartbeat(res)
+        if loaded is None:
+            detail = f"heartbeat returned no complete exact thread list: {cd.preview(res, 200)}"
+            if self._hung_recovery_attempts:
+                self._hold_hung_recovery(detail)
+            else:
+                self._set_hold(HOLD_THREAD, detail)
+            return
+        if self.client.thread_id not in loaded:
+            detail = f"heartbeat: thread {self.client.thread_id} is no longer loaded on the app-server"
+            if self._hung_recovery_attempts:
+                self._hold_hung_recovery(detail)
+            else:
+                self._set_hold(HOLD_THREAD, detail)
+            return
+        if self.readiness_publisher is not None and not self._readiness_published:
+            self.readiness_publisher(self.client.thread_id)
+            self._readiness_published = True
+        self._clear_hung_recovery_after_healthy_heartbeat()
 
     def _resteer_after_compaction(self) -> None:
         with self._ev_lock:
@@ -713,6 +1020,11 @@ def _systemctl_restart(unit: str) -> Callable[[], None]:
     return restart
 
 
+def _exit_for_owner_restart() -> None:
+    """Terminate the writer so its owning wrapper replaces the whole lifecycle."""
+    raise SystemExit(EXIT_RESTART_OWNER)
+
+
 def policy_from_args(a) -> "cd.SeatPolicy":
     """The seat policy from --from-binding (appserver_seats.json) or explicit flags.
     Explicit flags may not contradict the binding: one source of truth."""
@@ -722,12 +1034,14 @@ def policy_from_args(a) -> "cd.SeatPolicy":
         return cd.SeatPolicy(a.sandbox, a.approval_policy, a.model, a.cwd)
     path = Path(__file__).resolve().parent.parent / "harness" / "codex" / "appserver_seats.json"
     b = json.loads(path.read_text(encoding="utf-8"))["seats"][a.seat]
+    bound_cwd = csc.resolve_binding_cwd(b, instance_root=path.parents[2])
     for flag, key in (("sandbox", "sandbox"), ("approval_policy", "approval_policy"),
                       ("model", "model"), ("cwd", "cwd")):
         given = getattr(a, flag)
-        if given is not None and given != b.get(key):
-            raise ValueError(f"--{flag.replace('_', '-')} {given!r} contradicts the binding {b.get(key)!r}")
-    return cd.SeatPolicy(b["sandbox"], b["approval_policy"], b.get("model"), b.get("cwd"),
+        bound_value = bound_cwd if key == "cwd" else b.get(key)
+        if given is not None and given != bound_value:
+            raise ValueError(f"--{flag.replace('_', '-')} {given!r} contradicts the binding {bound_value!r}")
+    return cd.SeatPolicy(b["sandbox"], b["approval_policy"], b.get("model"), bound_cwd,
                          bool(b.get("network_access")), tuple(b.get("writable_roots") or ()))
 
 
@@ -748,6 +1062,10 @@ def _cli(argv: Optional[list[str]] = None) -> int:
     r.add_argument("--cwd")
     r.add_argument("--account-email")
     r.add_argument("--server-unit", default="codex-daemon.service")
+    r.add_argument("--hung-recovery", choices=("restart-unit", "exit-owner"),
+                   default="restart-unit")
+    r.add_argument("--readiness-receipt")
+    r.add_argument("--launch-nonce")
     e = sub.add_parser("enqueue")
     e.add_argument("--state-dir", required=True)
     e.add_argument("--seat", default="seat")
@@ -765,6 +1083,8 @@ def _cli(argv: Optional[list[str]] = None) -> int:
     rp.add_argument("--state-dir", required=True)
     rp.add_argument("--id", required=True, dest="delivery_id")
     a = ap.parse_args(argv)
+    if a.cmd == "run" and bool(a.readiness_receipt) != bool(a.launch_nonce):
+        ap.error("--readiness-receipt and --launch-nonce must be supplied together")
 
     state = Path(a.state_dir)
     if a.cmd == "enqueue":
@@ -798,8 +1118,28 @@ def _cli(argv: Optional[list[str]] = None) -> int:
         lock.release()
         return EXIT_USAGE
     binding = SeatBinding(a.seat, policy, state / "thread.json", a.account_email)
-    path = SeatDeliveryPath(binding, state, lambda: cd.UnixWebSocketTransport(a.sock),
-                            pager=_mailbox_pager, restart_server=_systemctl_restart(a.server_unit))
+    if a.hung_recovery == "exit-owner":
+        restart_server = _exit_for_owner_restart
+        restart_target = "controller-owned runtime"
+    else:
+        restart_server = _systemctl_restart(a.server_unit)
+        restart_target = a.server_unit
+    readiness_publisher = None
+    if a.readiness_receipt:
+        receipt_path = Path(a.readiness_receipt)
+        if not receipt_path.is_absolute():
+            print("refused: readiness receipt path must be absolute", file=sys.stderr)
+            lock.release()
+            return EXIT_USAGE
+        readiness_publisher = lambda thread_id: publish_input_ready(
+            receipt_path, persona=a.seat, thread_id=thread_id, launch_nonce=a.launch_nonce,
+        )
+    path = SeatDeliveryPath(
+        binding, state, lambda: cd.UnixWebSocketTransport(a.sock),
+        pager=_mailbox_pager, restart_server=restart_server, restart_target=restart_target,
+        escalation_witness_path=Path(a.sock).parent / f"{a.seat}-hung-recovery-escalated",
+        readiness_publisher=readiness_publisher,
+    )
     try:
         path.startup_reconcile()
         while True:

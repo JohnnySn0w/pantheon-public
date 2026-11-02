@@ -47,3 +47,24 @@ class AdmissionRefused(Exception):
         self.scope = scope
         self.reason = reason
         super().__init__(f"admission refused (scope={scope}): {reason}")
+
+
+class ClaimHolderMismatch(Exception):
+    """A release found the claim held by a DIFFERENT run than the releaser's
+    (T-5819). Nothing was deleted: the other run's admission stands (C1).
+
+    Attributes:
+        component: the ``(instance, component)`` leaf's component name.
+        expected_run_id: the run that asked to release.
+        actual_run_id: the run the on-disk claim names (``None`` if the
+            claim carries no ``run_id`` field).
+    """
+
+    def __init__(self, component: str, expected_run_id: str, actual_run_id: str | None) -> None:
+        self.component = component
+        self.expected_run_id = expected_run_id
+        self.actual_run_id = actual_run_id
+        super().__init__(
+            f"claim-holder-mismatch: {component} is held by run_id={actual_run_id!r}, "
+            f"not the releasing run_id={expected_run_id!r}; nothing released"
+        )

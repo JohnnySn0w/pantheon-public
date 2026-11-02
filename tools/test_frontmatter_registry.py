@@ -92,10 +92,10 @@ class _RegistryEnv(unittest.TestCase):
 
 
 class TestParseRealRegistry(_RegistryEnv):
-    def test_real_org021_parses_with_57_fields(self) -> None:
+    def test_real_org021_parses_with_66_fields(self) -> None:
         reg = fr.load_registry()
         self.assertIsNotNone(reg, "real ORG-021 registry must parse")
-        self.assertEqual(len(reg.fields), 57)
+        self.assertEqual(len(reg.fields), 66)  # +9 T-5678 security-gate fields
         self.assertEqual(reg.get("state").values, frozenset({"inbox", "active", "done"}))
         self.assertEqual(reg.get("blocked_by").status, "legacy")
 

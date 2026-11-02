@@ -18,6 +18,7 @@ from unittest import mock
 
 from tools import test_host_control_core as _core
 from tools import test_host_control_dbus_driver as _driver
+from tools._host_control_plan_fixtures import registered_plan_transform
 from tools.host_control.approval_client import ApprovalConsumerClient
 from tools.host_control.contracts import (
     OPERATION_SCHEMA,
@@ -135,18 +136,17 @@ class _DomainCase(unittest.TestCase):
         )
         self.addCleanup(self.fixture.close)
         if self.narrow:
-            real = self.fixture.installer.plan
-
-            def narrowed(*args, **kwargs):
-                plan = real(*args, **kwargs)
+            # T-5533: narrow the REGISTERED plan the broker reads (was: wrap
+            # installer.plan, which the broker no longer calls).
+            def narrowed(plan):
                 keep = tuple(
                     op for op in plan.operations if EXECUTOR_KIND_CLASSES.get(op.kind) in IMPLEMENTED
                 )
                 return _core._plan_replace(plan, operations=keep)
 
-            patcher = mock.patch.object(self.fixture.installer, "plan", side_effect=narrowed)
-            patcher.start()
-            self.addCleanup(patcher.stop)
+            patcher = registered_plan_transform(narrowed)
+            patcher.__enter__()
+            self.addCleanup(patcher.__exit__, None, None, None)
         self.binder = CountingBinder()
         self.service = OperationService(
             registry=self.fixture.registry,
@@ -304,7 +304,7 @@ class ApplyPathTests(_DomainCase):
         # kinds (e.g. recovered from a pre-5b journal) is left untouched
         # T-2917 5d.3: re-pointed at the pre-flip table (pre_flip_table) so
         # the B4 mechanism stays tested after real plans become executable
-        with mock.patch.object(self.fixture.installer, "plan", wraps=_driver.PersonaInstaller(REPO_ROOT).plan):
+        with registered_plan_transform(lambda plan: plan, compose=False):
             full = self.fixture.plan_service.plan(SUBJECT_UID, "recovery", "manifest-r1", "full-plan")
         record, _ = self.service.prepare_apply(SUBJECT_UID, full.plan_handle, full.plan_digest, "full-apply", "ab" * 32)
         with pre_flip_table():
@@ -316,7 +316,7 @@ class ApplyPathTests(_DomainCase):
 
     def test_real_persona_plan_is_authorized_after_the_flip(self) -> None:
         # T-2917 5d.3 (T-2917:D22): the FULL real plan is implemented now
-        with mock.patch.object(self.fixture.installer, "plan", wraps=_driver.PersonaInstaller(REPO_ROOT).plan):
+        with registered_plan_transform(lambda plan: plan, compose=False):
             full = self.fixture.plan_service.plan(SUBJECT_UID, "recovery", "manifest-r1", "full-plan-flip")
         kinds = {op.kind for op in self.fixture.journal.load_plan_unbound(full.plan_handle).installer_plan.operations}
         self.assertIn("mailbox-probe", kinds)
@@ -422,7 +422,7 @@ class TransportGateTests(_DomainCase):
         instance._driver = mock.Mock(submit=self.submitted.append, failure=None)
         instance._get_unix_user = lambda sender: SUBJECT_UID
         self.instance = instance
-        with mock.patch.object(self.fixture.installer, "plan", wraps=_driver.PersonaInstaller(REPO_ROOT).plan):
+        with registered_plan_transform(lambda plan: plan, compose=False):
             self.full = self.fixture.plan_service.plan(SUBJECT_UID, "recovery", "manifest-r1", "full-plan-gate")
 
     def operation_count(self) -> int:
@@ -618,31 +618,25 @@ class InsideBrokerPlanRefusalTests(_DomainCase):
     OperationSpec."""
 
     def _bypassed_plan(self):
-        real = self.fixture.installer.plan
-
-        def with_unmapped(*args, **kwargs):
-            plan = real(*args, **kwargs)
+        def with_unmapped(plan):
             extra = dataclasses.replace(plan.operations[1], operation_id="injected", kind="claude-mcp-server-registration")
             return _core._plan_replace(plan, operations=plan.operations + (extra,))
 
         from tools.host_control import planner as planner_module
 
-        with mock.patch.object(self.fixture.installer, "plan", side_effect=with_unmapped), \
+        with registered_plan_transform(with_unmapped), \
                 mock.patch.object(planner_module, "partition_installer_plan", side_effect=lambda plan: (plan, ())), \
                 mock.patch.object(planner_module, "require_executor_envelope"):
             return self.fixture.plan_service.plan(SUBJECT_UID, "recovery", "manifest-r1", "bypass")
 
     def test_planner_belt_refuses_without_the_bypass(self) -> None:
-        real = self.fixture.installer.plan
-
-        def with_unmapped(*args, **kwargs):
-            plan = real(*args, **kwargs)
+        def with_unmapped(plan):
             extra = dataclasses.replace(plan.operations[1], operation_id="injected", kind="claude-mcp-server-registration")
             return _core._plan_replace(plan, operations=plan.operations + (extra,))
 
         from tools.host_control import planner as planner_module
 
-        with mock.patch.object(self.fixture.installer, "plan", side_effect=with_unmapped), \
+        with registered_plan_transform(with_unmapped), \
                 mock.patch.object(planner_module, "partition_installer_plan", side_effect=lambda plan: (plan, ())):
             with self.assertRaises(OutOfEnvelopeKinds):
                 self.fixture.plan_service.plan(SUBJECT_UID, "recovery", "manifest-r1", "belt")

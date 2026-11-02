@@ -15,8 +15,13 @@ discipline"): every `target_path` passed to a checkout entry flows through
 
 from __future__ import annotations
 
+import io
+import json
+import subprocess
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from tools import assembly_resolver as ar
 from tools.assembly_resolver import CompatibilityRefusal, LifecyclePlan, LockedComponent, RefusalKind
@@ -153,6 +158,11 @@ class _BubbleSafe(BubbleSafeCase):
             if item.checkout_id == checkout_id:
                 return item
         self.fail(f"no plan item for {checkout_id}")
+
+    def _authorized_apply(self, rec: RepoReconciler, plan: rr.ReconcilePlan):
+        self.assertEqual(len(plan.items), 1)
+        auth = rec.issue_authorization(plan, plan.items[0].checkout_id)
+        return rec.apply(plan, auth)
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +551,8 @@ class TestApplyVerify(_BubbleSafe):
         self._seed(remote)
         entry = self._entry("c", target_path=self._path("seat"))
         rec = self._reconciler([entry], {"demo": remote})  # functional=False (default)
-        receipt = rec.apply(rec.reconcile_plan())
+        plan = rec.reconcile_plan()
+        receipt = self._authorized_apply(rec, plan)
         self.assertFalse(receipt.materialized)
         self.assertEqual(receipt.installs, [])
         self.assertFalse(Path(self._path("seat")).exists())
@@ -551,7 +562,8 @@ class TestApplyVerify(_BubbleSafe):
         self._seed(remote)
         entry = self._entry("c", target_path=self._path("seat"))
         rec = self._reconciler([entry], {"demo": remote}, functional=True)
-        receipt = rec.apply(rec.reconcile_plan())
+        plan = rec.reconcile_plan()
+        receipt = self._authorized_apply(rec, plan)
         self.assertEqual(receipt.installs, ["c"])
         self.assertTrue((Path(self._path("seat")) / "file.txt").exists())
         # verify (re-plan) is convergent → CURRENT/noop.
@@ -566,8 +578,12 @@ class TestApplyVerify(_BubbleSafe):
         _git("fetch", "origin", cwd=Path(seat))
         entry = self._entry("c", target_path=seat)
         rec = self._reconciler([entry], {"demo": remote}, functional=True)
-        receipt = rec.apply(rec.reconcile_plan())
+        plan = rec.reconcile_plan()
+        receipt = self._authorized_apply(rec, plan)
         self.assertEqual(receipt.advances, ["c"])
+        self.assertFalse(receipt.rollback_supported)
+        with self.assertRaises(rr.ScopedAuthorizationError):
+            rec.rollback(receipt)
         self.assertEqual(_git("rev-parse", "HEAD", cwd=Path(seat)).stdout.strip(), tip)
         self.assertEqual(self._one(rec.verify(), "c").state, rr.STATE_CURRENT)
 
@@ -592,7 +608,7 @@ class TestRestartContractInert(_BubbleSafe):
         self.assertFalse(item.brokered_intent.dispatched)
         self.assertEqual(item.brokered_intent.target_unit, "kino.service")
         # apply emits it into the receipt but dispatches NOTHING (broker unavailable).
-        receipt = rec.apply(plan)
+        receipt = self._authorized_apply(rec, plan)
         self.assertEqual(len(receipt.intents), 1)
         self.assertEqual(receipt.dispatched, [])
         self.assertEqual(broker.dispatched, [])
@@ -620,7 +636,8 @@ class TestRemovalRollback(_BubbleSafe):
         self._seed(remote)
         installed = self._entry("c", target_path=self._path("seat"))
         rec = self._reconciler([installed], {"demo": remote}, functional=True)
-        receipt = rec.apply(rec.reconcile_plan())
+        plan = rec.reconcile_plan()
+        receipt = self._authorized_apply(rec, plan)
         self.assertEqual(receipt.installs, ["c"])
         seat_path = Path(self._path("seat"))
         self.assertTrue(seat_path.exists())
@@ -628,9 +645,10 @@ class TestRemovalRollback(_BubbleSafe):
         foreign = Path(self._path("foreign"))
         foreign.mkdir()
         (foreign / "keep.txt").write_text("not ours", encoding="utf-8")
-        refusals = rec.rollback(receipt)
-        self.assertEqual(refusals, [])
+        outcome = rec.rollback(receipt)
+        self.assertTrue(outcome.success)
         self.assertFalse(seat_path.exists())  # recorded install reclaimed
+        self.assertTrue(Path(outcome.quarantine_path).joinpath("file.txt").exists())
         self.assertTrue((foreign / "keep.txt").exists())  # unknown data untouched
 
     def test_remove_unrecorded_is_refused(self) -> None:
@@ -641,9 +659,8 @@ class TestRemovalRollback(_BubbleSafe):
         entry = self._entry("c", target_path=seat)
         rec = self._reconciler([entry], {"demo": remote}, functional=True)
         empty_receipt = rr.ApplyReceipt(materialized=True)  # nothing recorded as installed
-        refusal = rec.remove("c", empty_receipt)
-        self.assertIsNotNone(refusal)
-        self.assertEqual(refusal.kind, RefusalKind.FOREIGN_CHECKOUT)
+        with self.assertRaises(rr.ScopedAuthorizationError):
+            rec.remove("c", empty_receipt)
         self.assertTrue(marker.exists())  # never deleted
 
     def test_rollback_refuses_identity_changed_install(self) -> None:
@@ -651,13 +668,14 @@ class TestRemovalRollback(_BubbleSafe):
         self._seed(remote)
         entry = self._entry("c", target_path=self._path("seat"))
         rec = self._reconciler([entry], {"demo": remote}, functional=True)
-        receipt = rec.apply(rec.reconcile_plan())
+        plan = rec.reconcile_plan()
+        receipt = self._authorized_apply(rec, plan)
         # the installed checkout's identity is changed out from under us.
         other = self._new_remote("other")
         _git("remote", "set-url", "origin", other, cwd=Path(self._path("seat")))
-        refusals = rec.rollback(receipt)
-        self.assertEqual(len(refusals), 1)
-        self.assertEqual(refusals[0].kind, RefusalKind.FOREIGN_CHECKOUT)
+        outcome = rec.rollback(receipt)
+        self.assertEqual(len(outcome.refusals), 1)
+        self.assertEqual(outcome.refusals[0].kind, RefusalKind.FOREIGN_CHECKOUT)
         self.assertTrue(Path(self._path("seat")).exists())  # not reaped
 
 
@@ -833,7 +851,7 @@ class TestFfAdvanceFetchesCorrectRef(_BubbleSafe):
         item = self._one(plan, "c")
         self.assertEqual(item.state, rr.STATE_BEHIND)
         self.assertEqual(item.action, ACTION_FF_ADVANCE)
-        receipt = rec.apply(plan)
+        receipt = self._authorized_apply(rec, plan)
         self.assertEqual(receipt.advances, ["c"])
         seat_after = _git("rev-parse", "HEAD", cwd=Path(seat)).stdout.strip()
         self.assertEqual(seat_after, rel_b, "must advance to release tip B")
@@ -870,7 +888,7 @@ class TestFfAdvanceFetchesCorrectRef(_BubbleSafe):
         item = self._one(plan, "c")
         self.assertEqual(item.state, rr.STATE_BEHIND)
         self.assertEqual(item.action, ACTION_FF_ADVANCE)
-        receipt = rec.apply(plan)
+        receipt = self._authorized_apply(rec, plan)
         self.assertEqual(receipt.advances, ["c"])
         seat_after = _git("rev-parse", "HEAD", cwd=Path(seat)).stdout.strip()
         self.assertEqual(seat_after, pin_b, "must advance to the exact pin sha")
@@ -910,7 +928,8 @@ class TestFfAdvanceFetchesCorrectRef(_BubbleSafe):
         release_tip = _git("rev-parse", "HEAD", cwd=wp).stdout.strip()
         entry = self._entry("c", target_path=seat, tracking="release")
         rec = self._reconciler([entry], {"demo": remote}, functional=True)
-        receipt = rec.apply(rec.reconcile_plan())
+        plan = rec.reconcile_plan()
+        receipt = self._authorized_apply(rec, plan)
         seat_after = _git("rev-parse", "HEAD", cwd=Path(seat)).stdout.strip()
         # honest convergence to the desired branch — not a stale-tip no-op, not main.
         self.assertEqual(receipt.advances, ["c"])
@@ -936,7 +955,8 @@ class TestReclaimRefusesUnreconciledContent(_BubbleSafe):
         seat = self._path("seat")
         entry = self._entry("c", target_path=seat)
         rec = self._reconciler([entry], {"demo": remote}, functional=True)
-        receipt = rec.apply(rec.reconcile_plan())
+        plan = rec.reconcile_plan()
+        receipt = self._authorized_apply(rec, plan)
         self.assertEqual(receipt.installs, ["c"])
         self.assertIn("c", receipt.installed_sha)  # FIX2: install records HEAD sha
         self.assertTrue(Path(seat).exists())
@@ -948,8 +968,8 @@ class TestReclaimRefusesUnreconciledContent(_BubbleSafe):
         rec, receipt, seat = self._install()
         edited = seat / "file.txt"
         edited.write_text("USER UNCOMMITTED WORK", encoding="utf-8")
-        refusals = rec.rollback(receipt)
-        self.assertEqual([r.kind for r in refusals], [RefusalKind.DIRTY_CHECKOUT])
+        outcome = rec.rollback(receipt)
+        self.assertEqual([r.kind for r in outcome.refusals], [RefusalKind.DIRTY_CHECKOUT])
         self.assertTrue(seat.exists())  # never reaped
         self.assertEqual(edited.read_text(encoding="utf-8"), "USER UNCOMMITTED WORK")
 
@@ -957,8 +977,8 @@ class TestReclaimRefusesUnreconciledContent(_BubbleSafe):
         rec, receipt, seat = self._install()
         foreign = seat / "UNTRACKED_IMPORTANT.txt"
         foreign.write_text("someone's unsaved data", encoding="utf-8")
-        refusals = rec.rollback(receipt)
-        self.assertEqual([r.kind for r in refusals], [RefusalKind.FOREIGN_CHECKOUT])
+        outcome = rec.rollback(receipt)
+        self.assertEqual([r.kind for r in outcome.refusals], [RefusalKind.FOREIGN_CHECKOUT])
         self.assertTrue(seat.exists())
         self.assertTrue(foreign.exists())
         self.assertEqual(foreign.read_text(encoding="utf-8"), "someone's unsaved data")
@@ -969,8 +989,8 @@ class TestReclaimRefusesUnreconciledContent(_BubbleSafe):
         _git("add", "file.txt", cwd=seat)
         _git("commit", "-m", "user local commit", cwd=seat)
         head_after_commit = _git("rev-parse", "HEAD", cwd=seat).stdout.strip()
-        refusals = rec.rollback(receipt)
-        self.assertEqual([r.kind for r in refusals], [RefusalKind.FOREIGN_CHECKOUT])
+        outcome = rec.rollback(receipt)
+        self.assertEqual([r.kind for r in outcome.refusals], [RefusalKind.FOREIGN_CHECKOUT])
         self.assertTrue(seat.exists())  # user's commit survives
         self.assertEqual(_git("rev-parse", "HEAD", cwd=seat).stdout.strip(), head_after_commit)
 
@@ -980,9 +1000,8 @@ class TestReclaimRefusesUnreconciledContent(_BubbleSafe):
         rec, receipt, seat = self._install()
         edited = seat / "file.txt"
         edited.write_text("USER UNCOMMITTED WORK", encoding="utf-8")
-        refusal = rec.remove("c", receipt)
-        self.assertIsNotNone(refusal)
-        self.assertEqual(refusal.kind, RefusalKind.DIRTY_CHECKOUT)
+        outcome = rec.remove("c", receipt)
+        self.assertEqual(outcome.refusals[0].kind, RefusalKind.DIRTY_CHECKOUT)
         self.assertTrue(seat.exists())
         self.assertEqual(edited.read_text(encoding="utf-8"), "USER UNCOMMITTED WORK")
 
@@ -990,9 +1009,8 @@ class TestReclaimRefusesUnreconciledContent(_BubbleSafe):
         rec, receipt, seat = self._install()
         foreign = seat / "UNTRACKED_IMPORTANT.txt"
         foreign.write_text("someone's unsaved data", encoding="utf-8")
-        refusal = rec.remove("c", receipt)
-        self.assertIsNotNone(refusal)
-        self.assertEqual(refusal.kind, RefusalKind.FOREIGN_CHECKOUT)
+        outcome = rec.remove("c", receipt)
+        self.assertEqual(outcome.refusals[0].kind, RefusalKind.FOREIGN_CHECKOUT)
         self.assertTrue(seat.exists())
         self.assertTrue(foreign.exists())
 
@@ -1001,24 +1019,415 @@ class TestReclaimRefusesUnreconciledContent(_BubbleSafe):
         (seat / "file.txt").write_text("local work", encoding="utf-8")
         _git("add", "file.txt", cwd=seat)
         _git("commit", "-m", "user local commit", cwd=seat)
-        refusal = rec.remove("c", receipt)
-        self.assertIsNotNone(refusal)
-        self.assertEqual(refusal.kind, RefusalKind.FOREIGN_CHECKOUT)
+        outcome = rec.remove("c", receipt)
+        self.assertEqual(outcome.refusals[0].kind, RefusalKind.FOREIGN_CHECKOUT)
         self.assertTrue(seat.exists())
 
     # -- succeeds only on a pristine identity+sha-matched clone -----------
 
     def test_rollback_succeeds_on_pristine_clone(self) -> None:
         rec, receipt, seat = self._install()
-        refusals = rec.rollback(receipt)
-        self.assertEqual(refusals, [])
+        outcome = rec.rollback(receipt)
+        self.assertTrue(outcome.success)
         self.assertFalse(seat.exists())  # pristine install reclaimed
+        self.assertTrue(Path(outcome.quarantine_path).is_dir())
 
     def test_remove_succeeds_on_pristine_clone(self) -> None:
         rec, receipt, seat = self._install()
-        refusal = rec.remove("c", receipt)
-        self.assertIsNone(refusal)
+        outcome = rec.remove("c", receipt)
+        self.assertTrue(outcome.success)
         self.assertFalse(seat.exists())
+
+
+class TestScopedPhase2Cutover(_BubbleSafe):
+    def test_default_reconciler_remains_inert_without_scoped_authorization(self) -> None:
+        remote = self._new_remote(); self._seed(remote)
+        target = self._path("seat")
+        rec = self._reconciler([self._entry("c", target_path=target)], {"demo": remote}, functional=True)
+        receipt = rec.apply(rec.reconcile_checkout("c"))
+        self.assertFalse(receipt.materialized); self.assertFalse(Path(target).exists())
+
+    def test_scoped_authorization_cannot_widen_or_select_another_checkout(self) -> None:
+        remote = self._new_remote(); self._seed(remote)
+        a = self._entry("a", target_path=self._path("a")); b = self._entry("b", target_path=self._path("b"))
+        rec = self._reconciler([a, b], {"demo": remote}, functional=True)
+        with self.assertRaises(rr.ScopedAuthorizationError):
+            rec.issue_authorization(rec.reconcile_plan(), "a")
+        plan = rec.reconcile_checkout("a"); auth = rec.issue_authorization(plan, "a")
+        with self.assertRaises(rr.ScopedAuthorizationError):
+            rec.apply(rec.reconcile_checkout("b"), auth)
+
+    def test_apply_revalidates_and_refuses_dirty_diverged_identity_or_head_drift(self) -> None:
+        remote = self._new_remote(); self._seed(remote)
+        targets = {n: self._clone_seat(remote, n) for n in ("dirty", "diverged", "identity", "head")}
+        self._advance_remote(remote)
+        entries = [self._entry(n, target_path=p) for n, p in targets.items()]
+        rec = self._reconciler(entries, {"demo": remote}, functional=True)
+        plans = {n: rec.reconcile_checkout(n) for n in targets}
+        auths = {n: rec.issue_authorization(plans[n], n) for n in targets}
+        Path(targets["dirty"], "local.txt").write_text("dirty", encoding="utf-8")
+        _git("commit", "--allow-empty", "-m", "local divergence", cwd=Path(targets["diverged"]))
+        _git("remote", "set-url", "origin", self._new_remote("other"), cwd=Path(targets["identity"]))
+        _git("commit", "--allow-empty", "-m", "head drift", cwd=Path(targets["head"]))
+        for name in targets:
+            with self.subTest(name=name), self.assertRaises(rr.ScopedAuthorizationError):
+                rec.apply(plans[name], auths[name])
+
+    def test_rehearsal_clone_apply_verify_rollback_restores_absent_state(self) -> None:
+        remote = self._new_remote(); wanted = self._seed(remote); target = self._path("seat")
+        rec = self._reconciler([self._entry("c", target_path=target)], {"demo": remote}, functional=True)
+        plan = rec.reconcile_checkout("c"); receipt = rec.apply(plan, rec.issue_authorization(plan, "c"))
+        self.assertTrue(receipt.rollback_supported); self.assertEqual(receipt.installed_sha, {"c": wanted})
+        self.assertEqual(rec.verify().items[0].observed_head, wanted)
+        outcome = rec.rollback(receipt)
+        self.assertTrue(outcome.success); self.assertFalse(Path(target).exists())
+        self.assertTrue(Path(outcome.quarantine_path).is_dir())
+
+    def test_rollback_refuses_equivalent_replacement_checkout_identity(self) -> None:
+        remote = self._new_remote(); wanted = self._seed(remote); target = self._path("seat")
+        rec = self._reconciler([self._entry("c", target_path=target)], {"demo": remote}, functional=True)
+        plan = rec.reconcile_checkout("c"); receipt = rec.apply(plan, rec.issue_authorization(plan, "c"))
+        recorded_identity = receipt.installed_path_identity["c"]
+
+        # Replace the reconciler-owned directory with a separately-created clean
+        # clone of the same origin and HEAD. Content equivalence is not ownership.
+        Path(target).rename(self._path("original-clone"))
+        _git("clone", remote, target)
+        self.assertEqual(_git("rev-parse", "HEAD", cwd=Path(target)).stdout.strip(), wanted)
+        replacement_identity = {"device": Path(target).stat().st_dev, "inode": Path(target).stat().st_ino}
+        self.assertNotEqual(replacement_identity, recorded_identity)
+
+        outcome = rec.rollback(receipt)
+        self.assertEqual([refusal.kind for refusal in outcome.refusals], [RefusalKind.FOREIGN_CHECKOUT])
+        self.assertIn("filesystem identity", outcome.refusals[0].detail)
+        self.assertTrue(Path(target).exists())
+        self.assertEqual(_git("rev-parse", "HEAD", cwd=Path(target)).stdout.strip(), wanted)
+
+    def test_rehearsal_receipt_refuses_tamper_stale_scope_and_unknown_paths(self) -> None:
+        remote = self._new_remote(); self._seed(remote); target = self._path("seat")
+        rec = self._reconciler([self._entry("c", target_path=target)], {"demo": remote}, functional=True)
+        plan = rec.reconcile_checkout("c"); receipt = rec.apply(plan, rec.issue_authorization(plan, "c"))
+        tampered = json.loads(receipt.to_bytes()); tampered["target_path"] = self._path("elsewhere")
+        with self.assertRaises(rr.ScopedAuthorizationError):
+            rr.ApplyReceipt.from_bytes(json.dumps(tampered).encode())
+        wrong = rr.ApplyReceipt.from_bytes(receipt.to_bytes()); wrong.target_path = self._path("elsewhere"); wrong.seal()
+        with self.assertRaises(rr.ScopedAuthorizationError): rec.rollback(wrong)
+        unknown = rr.ApplyReceipt.from_bytes(receipt.to_bytes()); unknown.install_paths["extra"] = self._path("unknown"); unknown.seal()
+        with self.assertRaises(rr.ScopedAuthorizationError): rec.rollback(unknown)
+        _git("commit", "--allow-empty", "-m", "receipt stale", cwd=Path(target))
+        outcome = rec.rollback(receipt)
+        self.assertFalse(outcome.success); self.assertTrue(Path(target).exists())
+
+    def test_restart_intent_never_dispatches_in_phase2_without_built_broker(self) -> None:
+        remote = self._new_remote(); self._seed(remote); broker = _RecordingBroker(available=True)
+        contract = RestartContract(operation_family="service.restart", target_unit="kino.service")
+        entry = self._entry("c", target_path=self._path("seat"), restart_contract=contract)
+        rec = self._reconciler([entry], {"demo": remote}, broker=broker, functional=True)
+        plan = rec.reconcile_checkout("c"); receipt = rec.apply(plan, rec.issue_authorization(plan, "c"))
+        self.assertEqual(len(receipt.intents), 1); self.assertEqual(receipt.dispatched, []); self.assertEqual(broker.dispatched, [])
+
+    def test_failed_clone_race_leaves_foreign_content_and_preserves_receipt_evidence(self) -> None:
+        remote = self._new_remote(); self._seed(remote)
+        work = self._clone_seat(remote, "work")
+        _git("checkout", "-b", "side", cwd=Path(work))
+        _git("commit", "--allow-empty", "-m", "side", cwd=Path(work)); _git("push", "origin", "side", cwd=Path(work))
+        side = _git("rev-parse", "HEAD", cwd=Path(work)).stdout.strip(); target = self._path("seat")
+        entry = self._entry("c", target_path=target, tracking=None, pinned=side)
+        rec = self._reconciler([entry], {"demo": remote}, functional=True)
+        plan = rec.reconcile_checkout("c"); auth = rec.issue_authorization(plan, "c"); original = rr._run_git
+        def raced(args, **kwargs):
+            result = original(args, **kwargs)
+            if args and args[0] == "clone" and result.returncode == 0:
+                Path(target, "foreign.txt").write_text("preserve", encoding="utf-8")
+            return result
+        with patch.object(rr, "_run_git", side_effect=raced): receipt = rec.apply(plan, auth)
+        self.assertEqual(receipt.installs, []); self.assertEqual(receipt.failed_clone_paths, {"c": target})
+        self.assertTrue(receipt.refused); self.assertEqual(Path(target, "foreign.txt").read_text(), "preserve")
+        loaded = rr.ApplyReceipt.from_bytes(receipt.to_bytes())
+        self.assertEqual(loaded.failed_clone_paths, receipt.failed_clone_paths)
+        self.assertEqual([r.as_text() for r in loaded.refused], [r.as_text() for r in receipt.refused])
+
+    def test_receipt_strict_types_fail_closed_and_roundtrip_intents_refusals(self) -> None:
+        refusal = CompatibilityRefusal(RefusalKind.DIVERGED_CHECKOUT, "c", "kept")
+        intent = BrokeredIntent("c", "service.restart", "kino.service")
+        identity = {"c": {"device": 11, "inode": 22}}
+        receipt = rr.ApplyReceipt(
+            materialized=True,
+            installed_path_identity=identity,
+            intents=[intent],
+            refused=[refusal],
+        ).seal()
+        loaded = rr.ApplyReceipt.from_bytes(receipt.to_bytes())
+        self.assertEqual(loaded.intents, [intent]); self.assertEqual(loaded.refused, [refusal])
+        self.assertEqual(loaded.installed_path_identity, identity)
+
+        tampered = json.loads(receipt.to_bytes())
+        tampered["installed_path_identity"]["c"]["inode"] = 23
+        with self.assertRaisesRegex(rr.ScopedAuthorizationError, "digest mismatch"):
+            rr.ApplyReceipt.from_bytes(json.dumps(tampered).encode())
+
+        wrong_identity_type = json.loads(receipt.to_bytes())
+        wrong_identity_type["installed_path_identity"]["c"]["inode"] = "22"
+        typed_payload = {k: v for k, v in wrong_identity_type.items() if k != "receipt_digest"}
+        wrong_identity_type["receipt_digest"] = rr._sha256_bytes(rr._json_bytes(typed_payload))
+        with self.assertRaisesRegex(rr.ScopedAuthorizationError, "identity"):
+            rr.ApplyReceipt.from_bytes(json.dumps(wrong_identity_type).encode())
+
+        raw = json.loads(receipt.to_bytes()); raw["materialized"] = 1
+        payload = {k: v for k, v in raw.items() if k != "receipt_digest"}
+        raw["receipt_digest"] = rr._sha256_bytes(rr._json_bytes(payload))
+        with self.assertRaises(rr.ScopedAuthorizationError):
+            rr.ApplyReceipt.from_bytes(json.dumps(raw).encode())
+
+    def test_remote_and_path_option_injection_refused_and_git_argv_delimited(self) -> None:
+        entry = self._entry("c", target_path=self._path("seat"))
+        rec = self._reconciler([entry], {"demo": "--upload-pack=evil"})
+        self.assertEqual(rec.reconcile_checkout("c").items[0].state, rr.STATE_UNRESOLVED)
+        calls = []
+        def fake_run(args, **_kwargs):
+            calls.append(list(args)); return subprocess.CompletedProcess(args, 1, "", "")
+        with patch.object(rr, "_run_git", side_effect=fake_run): GitCheckoutProbe()._ls_remote("/tmp/repo.git")
+        self.assertEqual(calls[0], ["ls-remote", "--", "/tmp/repo.git"])
+        from tools.germinate.components import pantheon_config_git as pg
+        handler = object.__new__(pg.PantheonConfigRepoGit); handler._timeout = 1
+        with patch.object(pg.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "", "")) as run:
+            self.assertIsNone(handler._remote_tips("--evil")); handler._remote_tips("/tmp/repo.git")
+        self.assertEqual(run.call_args.args[0][:4], ["git", "ls-remote", "--", "/tmp/repo.git"])
+
+    def test_authorized_rehearsal_cli_real_git_integration_isolated(self) -> None:
+        real_root = Path(__file__).resolve().parent.parent
+        real_head = _git("-C", str(real_root), "rev-parse", "HEAD").stdout.strip()
+        remote = self._new_remote(); self._seed(remote); checkout_dir = Path(self._path("checkouts")); checkout_dir.mkdir()
+        target = self._path("rehearsal")
+        checkout_dir.joinpath("global.yaml").write_text(
+            "schema_version: 1\ncheckouts:\n  - checkout_id: rehearsal\n    logical_repo: demo\n"
+            "    remote_ref: manifest\n    target_account: fixture\n" + f"    target_path: {target}\n" +
+            "    mode: {tracking: main}\n    update_policy: ff-only\n", encoding="utf-8")
+        auth = Path(self._path("auth.json")); receipt = Path(self._path("receipt.json"))
+        common = ["--checkouts-dir", str(checkout_dir), "--repo-root", str(self.root), "--pin-path", self._path("unused"), "--checkout-id", "rehearsal"]
+        with patch.object(rr, "_production_resolver", return_value=_DictResolver({"demo": remote})):
+            self.assertEqual(rr.main(["authorize", *common, "--authorization-out", str(auth)]), 0)
+            self.assertEqual(rr.main(["apply", *common, "--authorization", str(auth), "--receipt-out", str(receipt)]), 0)
+            self.assertEqual(rr.main(["verify", *common, "--receipt", str(receipt)]), 0)
+            stdout = SimpleNamespace(buffer=io.BytesIO())
+            with patch("sys.stdout", stdout):
+                self.assertEqual(rr.main(["rollback", *common, "--receipt", str(receipt)]), 0)
+        rollback_report = json.loads(stdout.buffer.getvalue())
+        self.assertTrue(rollback_report["rolled_back"])
+        self.assertFalse(rollback_report["resumed"])
+        self.assertEqual(rollback_report["refusals"], [])
+        self.assertTrue(Path(rollback_report["quarantine_path"]).is_dir())
+        self.assertFalse(Path(target).exists())
+        self.assertEqual(_git("-C", str(real_root), "rev-parse", "HEAD").stdout.strip(), real_head)
+
+
+class TestQuarantineRollback(_BubbleSafe):
+    def _install(self, suffix: str = ""):
+        remote_name = f"remote{suffix}"; seed_name = f"seed{suffix}"; target_name = f"seat{suffix}"
+        remote = self._new_remote(remote_name); wanted = self._seed(remote, name=seed_name); target = self._path(target_name)
+        rec = self._reconciler([self._entry("c", target_path=target)], {"demo": remote}, functional=True)
+        plan = rec.reconcile_checkout("c")
+        receipt = rec.apply(plan, rec.issue_authorization(plan, "c"))
+        return rec, receipt, Path(target), remote, wanted
+
+    def test_forged_unsealed_receipt_refuses_without_moving_anything(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install()
+        receipt.receipt_digest = ""
+        with self.assertRaisesRegex(rr.ScopedAuthorizationError, "sealed"):
+            rec.rollback(receipt)
+        self.assertTrue(target.is_dir())
+
+    def test_recorded_path_different_from_spec_target_refuses(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install()
+        receipt.target_path = self._path("elsewhere")
+        receipt.install_paths = {"c": receipt.target_path}
+        receipt.seal()
+        with self.assertRaisesRegex(rr.ScopedAuthorizationError, "spec target"):
+            rec.rollback(receipt)
+        self.assertTrue(target.is_dir())
+
+    def test_semantic_exactness_rejects_ambiguous_clone_receipts(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install()
+        refusal = CompatibilityRefusal(RefusalKind.FOREIGN_CHECKOUT, "c", "ambiguous")
+        mutations = {
+            "wrong-action": lambda r: setattr(r, "action", ACTION_FF_ADVANCE),
+            "rollback-disabled": lambda r: setattr(r, "rollback_supported", False),
+            "missing-install": lambda r: r.installs.clear(),
+            "advance-present": lambda r: r.advances.append("c"),
+            "extra-path": lambda r: r.install_paths.__setitem__("extra", self._path("extra")),
+            "sha-mismatch": lambda r: r.installed_sha.__setitem__("c", "f" * 40),
+            "failed-clone": lambda r: r.failed_clone_paths.__setitem__("c", str(target)),
+            "refusal-present": lambda r: r.refused.append(refusal),
+        }
+        for name, mutate in mutations.items():
+            forged = rr.ApplyReceipt.from_bytes(receipt.to_bytes()); mutate(forged); forged.seal()
+            with self.subTest(name=name), self.assertRaises(rr.ScopedAuthorizationError):
+                rec.rollback(forged)
+            self.assertTrue(target.is_dir())
+
+    def test_target_symlink_refuses_without_following(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install()
+        owned = Path(self._path("owned")); target.rename(owned); target.symlink_to(owned, target_is_directory=True)
+        outcome = rec.rollback(receipt)
+        self.assertFalse(outcome.success)
+        self.assertEqual([r.kind for r in outcome.refusals], [RefusalKind.FOREIGN_CHECKOUT])
+        self.assertTrue(target.is_symlink()); self.assertTrue(owned.is_dir())
+
+    def test_precreated_quarantine_refuses_and_preserves_target(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install()
+        container, _payload = rr._quarantine_paths(receipt, target)
+        container.mkdir(mode=0o700)
+        outcome = rec.rollback(receipt)
+        self.assertFalse(outcome.success); self.assertTrue(target.is_dir())
+        self.assertTrue(container.is_dir())
+
+    def test_final_path_swap_is_moved_detected_and_restored_without_delete(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install()
+        owned_aside = Path(self._path("owned-aside")); original = rr._rename_noreplace
+        calls = 0
+        def swap_then_rename(source: Path, destination: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                source.rename(owned_aside)
+                source.mkdir(); source.joinpath("foreign.txt").write_text("preserve", encoding="utf-8")
+            original(source, destination)
+        with patch.object(rr, "_rename_noreplace", side_effect=swap_then_rename):
+            outcome = rec.rollback(receipt)
+        self.assertFalse(outcome.success)
+        self.assertEqual([r.kind for r in outcome.refusals], [RefusalKind.FOREIGN_CHECKOUT])
+        self.assertEqual(target.joinpath("foreign.txt").read_text(encoding="utf-8"), "preserve")
+        self.assertTrue(owned_aside.is_dir())
+        self.assertIsNone(outcome.quarantine_path)
+
+    def test_final_path_swap_with_repopulated_target_preserves_both_paths(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install()
+        owned_aside = Path(self._path("owned-aside")); original = rr._rename_noreplace; calls = 0
+        def swap_move_and_repopulate(source: Path, destination: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                source.rename(owned_aside)
+                source.mkdir(); source.joinpath("moved-foreign.txt").write_text("moved", encoding="utf-8")
+                original(source, destination)
+                source.mkdir(); source.joinpath("new-foreign.txt").write_text("new", encoding="utf-8")
+                return
+            original(source, destination)
+        with patch.object(rr, "_rename_noreplace", side_effect=swap_move_and_repopulate):
+            outcome = rec.rollback(receipt)
+        self.assertFalse(outcome.success); self.assertIsNotNone(outcome.quarantine_path)
+        self.assertEqual(target.joinpath("new-foreign.txt").read_text(encoding="utf-8"), "new")
+        self.assertEqual(Path(outcome.quarantine_path).joinpath("moved-foreign.txt").read_text(encoding="utf-8"), "moved")
+        self.assertTrue(owned_aside.is_dir())
+
+    def test_target_repopulated_after_payload_identity_check_refuses_and_preserves_both(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install()
+        _container, payload = rr._quarantine_paths(receipt, target)
+        original_identity = rr._filesystem_identity
+
+        def identity_then_repopulate(path: Path):
+            identity = original_identity(path)
+            if path == payload:
+                target.mkdir()
+                target.joinpath("foreign.txt").write_text("preserve", encoding="utf-8")
+            return identity
+
+        with patch.object(rr, "_filesystem_identity", side_effect=identity_then_repopulate):
+            outcome = rec.rollback(receipt)
+
+        self.assertFalse(outcome.success)
+        self.assertEqual(outcome.quarantine_path, str(payload))
+        self.assertEqual(target.joinpath("foreign.txt").read_text(encoding="utf-8"), "preserve")
+        self.assertTrue(payload.is_dir())
+        self.assertIn(str(target), outcome.refusals[0].detail)
+        self.assertIn(str(payload), outcome.refusals[0].detail)
+
+    def test_final_target_absence_lookup_error_refuses_without_moving_quarantine(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install()
+        _container, payload = rr._quarantine_paths(receipt, target)
+        original_lstat = rr.os.lstat
+
+        def fail_final_target_lookup(path):
+            if Path(path) == target and payload.exists() and not target.exists():
+                raise PermissionError("indeterminate final target lookup")
+            return original_lstat(path)
+
+        with patch.object(rr.os, "lstat", side_effect=fail_final_target_lookup):
+            outcome = rec.rollback(receipt)
+
+        self.assertFalse(outcome.success)
+        self.assertFalse(target.exists())
+        self.assertTrue(payload.is_dir())
+        self.assertEqual(outcome.quarantine_path, str(payload))
+        self.assertIn(str(target), outcome.refusals[0].detail)
+        self.assertIn(str(payload), outcome.refusals[0].detail)
+
+    def test_success_quarantines_exact_clone_without_deleting_bytes(self) -> None:
+        rec, receipt, target, _remote, wanted = self._install()
+        recorded = receipt.installed_path_identity["c"]
+        outcome = rec.rollback(receipt)
+        self.assertTrue(outcome.success); self.assertFalse(outcome.resumed)
+        self.assertFalse(target.exists()); self.assertIsNotNone(outcome.quarantine_path)
+        payload = Path(outcome.quarantine_path)
+        self.assertTrue(payload.is_dir())
+        self.assertEqual(payload.parent.stat().st_mode & 0o777, 0o700)
+        self.assertEqual({"device": payload.stat().st_dev, "inode": payload.stat().st_ino}, recorded)
+        self.assertEqual(_git("rev-parse", "HEAD", cwd=payload).stdout.strip(), wanted)
+
+    def test_matching_quarantine_resume_is_idempotent_and_foreign_is_refused(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install()
+        first = rec.rollback(receipt); second = rec.rollback(receipt)
+        self.assertTrue(first.success); self.assertTrue(second.success); self.assertTrue(second.resumed)
+        self.assertEqual(first.quarantine_path, second.quarantine_path)
+
+        rec2, receipt2, target2, _remote2, _wanted2 = self._install("-foreign")
+        container, payload = rr._quarantine_paths(receipt2, target2)
+        target2.rename(self._path("owned-second")); container.mkdir(mode=0o700); payload.mkdir()
+        payload.joinpath("foreign.txt").write_text("keep", encoding="utf-8")
+        outcome = rec2.rollback(receipt2)
+        self.assertFalse(outcome.success); self.assertTrue(payload.joinpath("foreign.txt").exists())
+
+        rec3, receipt3, target3, _remote3, _wanted3 = self._install("-empty")
+        empty_container, _empty_payload = rr._quarantine_paths(receipt3, target3)
+        target3.rename(self._path("owned-third")); empty_container.mkdir(mode=0o700)
+        empty = rec3.rollback(receipt3)
+        self.assertFalse(empty.success); self.assertTrue(empty_container.is_dir())
+
+        rec4, receipt4, _target4, _remote4, _wanted4 = self._install("-ambiguous")
+        first4 = rec4.rollback(receipt4); payload4 = Path(first4.quarantine_path)
+        payload4.parent.joinpath("foreign.txt").write_text("keep", encoding="utf-8")
+        ambiguous = rec4.rollback(receipt4)
+        self.assertFalse(ambiguous.success)
+        self.assertTrue(payload4.is_dir())
+        self.assertTrue(payload4.parent.joinpath("foreign.txt").is_file())
+
+    def test_nonzero_git_status_refuses_as_indeterminate(self) -> None:
+        rec, receipt, target, _remote, _wanted = self._install(); original = rr._run_git
+        def fail_status(args, **kwargs):
+            if "status" in args:
+                return subprocess.CompletedProcess(args, 128, "", "indeterminate")
+            return original(args, **kwargs)
+        with patch.object(rr, "_run_git", side_effect=fail_status):
+            outcome = rec.rollback(receipt)
+        self.assertFalse(outcome.success); self.assertTrue(target.is_dir())
+
+    def test_partial_failed_clone_evidence_roundtrips_and_rollback_refuses(self) -> None:
+        remote = self._new_remote(); self._seed(remote); target = Path(self._path("partial"))
+        rec = self._reconciler([self._entry("c", target_path=str(target))], {"demo": remote}, functional=True)
+        plan = rec.reconcile_checkout("c"); auth = rec.issue_authorization(plan, "c"); original = rr._run_git
+        def partial_clone(args, **kwargs):
+            if args and args[0] == "clone":
+                target.mkdir(); target.joinpath("foreign.partial").write_text("keep", encoding="utf-8")
+                return subprocess.CompletedProcess(args, 1, "", "clone failed")
+            return original(args, **kwargs)
+        with patch.object(rr, "_run_git", side_effect=partial_clone):
+            receipt = rec.apply(plan, auth)
+        loaded = rr.ApplyReceipt.from_bytes(receipt.to_bytes())
+        self.assertEqual(loaded.failed_clone_paths, {"c": str(target)})
+        self.assertIn("c", loaded.failed_clone_identity); self.assertTrue(loaded.refused)
+        with self.assertRaises(rr.ScopedAuthorizationError):
+            rec.rollback(loaded)
+        self.assertEqual(target.joinpath("foreign.partial").read_text(encoding="utf-8"), "keep")
 
 
 if __name__ == "__main__":

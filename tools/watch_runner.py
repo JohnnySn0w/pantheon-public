@@ -34,8 +34,10 @@ import hashlib
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
@@ -54,6 +56,7 @@ if __package__ in (None, ""):
 from tools._git_utils import (  # noqa: E402  — after sys.path bootstrap.
     _git,
     _hermes_scan_dir,
+    _hermes_scan_file,
     _hermes_scan_message,
     commit_scoped,
     git_mutation_lock,
@@ -69,6 +72,29 @@ from tools.ledger_shard import current_write_target  # noqa: E402
 REPO_ROOT = Path(__file__).resolve().parent.parent
 TOPICS_FILE = REPO_ROOT / "knowledge" / "watch" / "topics.md"
 REPORTS_ROOT = REPO_ROOT / "knowledge" / "watch" / "reports"
+
+
+@dataclass(frozen=True)
+class SnapshotSpec:
+    """Fixed authority for a raw, per-fire watch snapshot."""
+
+    url: str
+    slug: str
+    final_url: str
+    max_bytes: int = 1024 * 1024
+    timeout_s: int = 20
+
+
+# T-4401: this is intentionally executable, reviewable authority rather than a
+# general snapshot output surface.  Adding a topic/page requires a code review;
+# report or topic prose cannot select a URL or destination path at runtime.
+TOPIC_SNAPSHOTS: dict[str, SnapshotSpec] = {
+    "anthropic-policy-and-billing": SnapshotSpec(
+        url="https://code.claude.com/docs/en/legal-and-compliance.md",
+        final_url="https://code.claude.com/docs/en/legal-and-compliance.md",
+        slug="legal-and-compliance",
+    ),
+}
 
 STATE_DIR = Path.home() / ".local" / "state" / "pantheon" / "watch"
 STATE_FILE = STATE_DIR / "state.json"
@@ -330,6 +356,196 @@ class Topic:
             q_last = (last_fire.year, (last_fire.month - 1) // 3)
             return q_last < q_today
         return False
+
+
+class SnapshotCaptureError(RuntimeError):
+    """A required snapshot could not be captured without weakening its authority."""
+
+
+_SNAPSHOT_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+def _validate_snapshot_spec(spec: SnapshotSpec) -> None:
+    """Reject any authority/path shape broader than the fixed HTTPS contract."""
+    from urllib.parse import urlsplit
+
+    if not _SNAPSHOT_SLUG_RE.fullmatch(spec.slug):
+        raise SnapshotCaptureError(f"invalid snapshot slug: {spec.slug!r}")
+    parsed = urlsplit(spec.url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname != "code.claude.com"
+        or parsed.port is not None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/docs/en/legal-and-compliance.md"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise SnapshotCaptureError(f"snapshot URL is outside fixed authority: {spec.url!r}")
+    if spec.final_url != spec.url:
+        raise SnapshotCaptureError("snapshot redirects/final-URL changes are not authorized")
+    if spec.max_bytes <= 0 or spec.max_bytes > 4 * 1024 * 1024:
+        raise SnapshotCaptureError(f"invalid snapshot size bound: {spec.max_bytes}")
+    if spec.timeout_s <= 0 or spec.timeout_s > 60:
+        raise SnapshotCaptureError(f"invalid snapshot timeout: {spec.timeout_s}")
+
+
+def snapshot_relpath(spec: SnapshotSpec, date_iso: str) -> Path:
+    """Return the one authorized repository-relative path for this date."""
+    _validate_snapshot_spec(spec)
+    try:
+        parsed_date = date.fromisoformat(date_iso)
+    except ValueError as exc:
+        raise SnapshotCaptureError(f"invalid snapshot date: {date_iso!r}") from exc
+    if parsed_date.isoformat() != date_iso:
+        raise SnapshotCaptureError(f"non-canonical snapshot date: {date_iso!r}")
+    return Path("knowledge") / "watch" / "snapshots" / spec.slug / f"{date_iso}.md"
+
+
+def _expected_snapshot_relpaths(
+    date_iso: str, fired_topics: Sequence[Topic], statuses: dict[str, str]
+) -> list[Path]:
+    """Exact snapshot files required by successful configured topic fires."""
+    return [
+        snapshot_relpath(TOPIC_SNAPSHOTS[t.slug], date_iso)
+        for t in fired_topics
+        if statuses.get(t.slug) == "ok" and t.slug in TOPIC_SNAPSHOTS
+    ]
+
+
+def fetch_snapshot_bytes(
+    spec: SnapshotSpec,
+    *,
+    opener: Callable | None = None,
+) -> bytes:
+    """Fetch the fixed page as bytes; never decode, redirect, or add credentials."""
+    import urllib.request
+
+    _validate_snapshot_spec(spec)
+    open_url = opener or _open_snapshot_request
+    request = urllib.request.Request(
+        spec.url,
+        headers={"User-Agent": "pantheon-watch-snapshot/1"},
+    )
+    try:
+        with open_url(request, timeout=spec.timeout_s) as response:
+            status_code = getattr(response, "status", None)
+            if status_code is None:
+                status_code = response.getcode()
+            if status_code != 200:
+                raise SnapshotCaptureError(f"snapshot HTTP status {status_code}")
+            final_url = response.geturl()
+            if final_url != spec.final_url:
+                raise SnapshotCaptureError(
+                    f"snapshot final URL refused: {final_url!r} != {spec.final_url!r}"
+                )
+            content_length = response.headers.get("Content-Length")
+            if content_length is not None:
+                try:
+                    declared_size = int(content_length)
+                except ValueError as exc:
+                    raise SnapshotCaptureError(
+                        f"invalid snapshot Content-Length: {content_length!r}"
+                    ) from exc
+                if declared_size < 0 or declared_size > spec.max_bytes:
+                    raise SnapshotCaptureError(
+                        f"snapshot Content-Length outside 0..{spec.max_bytes}: "
+                        f"{declared_size}"
+                    )
+            body = response.read(spec.max_bytes + 1)
+    except SnapshotCaptureError:
+        raise
+    except Exception as exc:
+        raise SnapshotCaptureError(f"snapshot fetch failed: {exc!r}") from exc
+    if not body:
+        raise SnapshotCaptureError("snapshot body is empty")
+    if len(body) > spec.max_bytes:
+        raise SnapshotCaptureError(f"snapshot exceeds {spec.max_bytes} byte bound")
+    return body
+
+
+def _open_snapshot_request(request, *, timeout: int):
+    """Open one request with redirects disabled before any target is contacted."""
+    import urllib.request
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            return None
+
+    return urllib.request.build_opener(_NoRedirect()).open(request, timeout=timeout)
+
+
+def _validate_snapshot_destination(repo_root: Path, destination: Path) -> None:
+    """Refuse symlinked/non-regular components before reading or replacing."""
+    relative = destination.relative_to(repo_root)
+    expected_root = Path("knowledge") / "watch" / "snapshots"
+    if relative.parts[: len(expected_root.parts)] != expected_root.parts:
+        raise SnapshotCaptureError(f"snapshot destination outside fixed root: {relative}")
+    current = repo_root
+    for part in relative.parts[:-1]:
+        current = current / part
+        if current.is_symlink():
+            raise SnapshotCaptureError(f"snapshot parent is a symlink: {current}")
+        if current.exists() and not current.is_dir():
+            raise SnapshotCaptureError(f"snapshot parent is not a directory: {current}")
+    if destination.is_symlink():
+        raise SnapshotCaptureError(f"snapshot destination is a symlink: {destination}")
+    if destination.exists() and not stat.S_ISREG(destination.stat().st_mode):
+        raise SnapshotCaptureError(f"snapshot destination is not a regular file: {destination}")
+
+
+def capture_topic_snapshot(
+    topic_slug: str,
+    captured_on: date,
+    *,
+    repo_root: Path | None = None,
+    opener: Callable | None = None,
+) -> Path | None:
+    """Capture one configured successful fire, returning its exact relpath."""
+    spec = TOPIC_SNAPSHOTS.get(topic_slug)
+    if spec is None:
+        return None
+    root = repo_root if repo_root is not None else REPO_ROOT
+    relpath = snapshot_relpath(spec, captured_on.isoformat())
+    destination = root / relpath
+    _validate_snapshot_destination(root, destination)
+    body = fetch_snapshot_bytes(spec, opener=opener)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    _validate_snapshot_destination(root, destination)
+    if destination.exists() and destination.read_bytes() == body:
+        return relpath
+
+    fd = -1
+    tmp_name: str | None = None
+    try:
+        fd, tmp_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", suffix=".tmp", dir=destination.parent
+        )
+        with os.fdopen(fd, "wb") as tmp_file:
+            fd = -1
+            tmp_file.write(body)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_name, destination)
+        tmp_name = None
+    except Exception as exc:
+        raise SnapshotCaptureError(f"snapshot publish failed: {exc!r}") from exc
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if tmp_name is not None:
+            try:
+                os.unlink(tmp_name)
+            except FileNotFoundError:
+                pass
+    digest = hashlib.sha256(body).hexdigest()
+    _append_runner_log(
+        f"[{captured_on.isoformat()}] snapshot {topic_slug}: "
+        f"{relpath.as_posix()} bytes={len(body)} sha256={digest}"
+    )
+    return relpath
 
 
 def parse_topics(path: Path, warnings: list[str] | None = None) -> list[Topic]:
@@ -780,21 +996,42 @@ def index_unindexed_reports(date_dir: Path) -> list[str]:
         return []
     added: list[str] = []
     for report in sorted(date_dir.glob("*.md")):
-        if report.name == "README.md":
+        if report.name == "README.md" or report.name.startswith("_"):
+            # `_`-prefixed files are runner artifacts with deliberately no
+            # README row (e.g. _topic-warnings.md, see write_topic_warnings).
             continue
         slug = report.stem
         if day_index_has_row(date_dir, slug):
             continue
-        if not report_landed_ok(report):
-            # A stub/empty file is not a report. Indexing it would assert a
-            # landing that did not happen — the same "created is not delivered"
-            # shape this sweep exists to fix, one level down.
-            continue
-        headline = parse_report_headline(report)
-        summary = f"TL;DR: {headline}" if headline else "TL;DR: (no headline frontmatter)"
+        if report_landed_ok(report):
+            headline = parse_report_headline(report)
+            summary = f"TL;DR: {headline}" if headline else "TL;DR: (no headline frontmatter)"
+        else:
+            # A hand-delivered one-off report has a `# ` title and `## `
+            # sections but no watch-template frontmatter; index it by title.
+            # Anything smaller or unsectioned is a stub/empty file, not a
+            # report: indexing it would assert a landing that did not happen.
+            title = _adhoc_report_title(report)
+            if title is None:
+                continue
+            summary = f"Ad-hoc report: {title}"
         append_day_index_entry(date_dir, slug, "ok", summary)
         added.append(slug)
     return added
+
+
+def _adhoc_report_title(report: Path) -> str | None:
+    """`# ` title of a substantial report that lacks the watch template's
+    frontmatter, or None if `report` is too small or has no `## ` section."""
+    if report.stat().st_size < REPORT_MIN_BYTES:
+        return None
+    text = report.read_text(encoding="utf-8")
+    if not re.search(r"(?m)^## ", text):
+        return None
+    for line in text.splitlines():
+        if line.startswith("# "):
+            return line[2:].strip() or None
+    return None
 
 
 def day_index_has_row(date_dir: Path, slug: str) -> bool:
@@ -1054,6 +1291,13 @@ def _build_commit_message(
 ) -> str:
     slugs = [t.slug for t in fired_topics]
     status_pairs = ", ".join(f"{s}={statuses.get(s, '?')}" for s in slugs)
+    snapshots = [p.as_posix() for p in _expected_snapshot_relpaths(date_iso, fired_topics, statuses)]
+    scope_line = f"Scope: knowledge/watch/reports/{date_iso}/ only."
+    if snapshots:
+        scope_line = (
+            f"Scope: knowledge/watch/reports/{date_iso}/ plus exact snapshot(s): "
+            f"{', '.join(snapshots)}."
+        )
     return (
         f"research(watch): land {date_iso} reports\n"
         f"\n"
@@ -1061,7 +1305,7 @@ def _build_commit_message(
         f"Statuses: {status_pairs}\n"
         f"\n"
         f"Auto-committed by watch_runner.py (specialist unattended).\n"
-        f"Scope: knowledge/watch/reports/{date_iso}/ only.\n"
+        f"{scope_line}\n"
     )
 
 
@@ -1070,7 +1314,7 @@ def git_commit_and_push(
     *,
     cwd: "Path | None" = None,
 ) -> tuple[bool, str]:
-    """Commit reports under `knowledge/watch/reports/<date_iso>/` and push to origin/main.
+    """Commit reports plus exact configured snapshots and push to origin/main.
 
     Order: HERMES guard -> [ff-only pull (skipped in worktree mode) -> narrow
     stage -> scope assert -> partial-stage guard -> empty-set short-circuit ->
@@ -1122,6 +1366,8 @@ def git_commit_and_push(
     _cwd = cwd if cwd is not None else REPO_ROOT
     scope_prefix = f"knowledge/watch/reports/{date_iso}/"
     reports_dir = _cwd / "knowledge" / "watch" / "reports" / date_iso
+    snapshot_relpaths = _expected_snapshot_relpaths(date_iso, fired_topics, statuses)
+    snapshot_scope = {path.as_posix() for path in snapshot_relpaths}
 
     # 1. HERMES guard on report files. Refusal is loud — surfaces that the
     #    researcher emitted the trigger phrase in landed output. Cheap and
@@ -1148,9 +1394,14 @@ def git_commit_and_push(
             if not ok:
                 return False, pmsg
 
-        # 3. Stage strictly the date's reports dir.
-        res = _git("add", "--", scope_prefix, cwd=_cwd)
+        # 3. Stage strictly the date's reports dir and the exact snapshots
+        #    required by successful configured topic fires.  No snapshot
+        #    prefix is ever passed to git.
+        res = _git(
+            "add", "--", scope_prefix, *sorted(snapshot_scope), cwd=_cwd
+        )
         if res.returncode != 0:
+            _git("reset", "HEAD", cwd=_cwd)
             return False, f"git add failed: {res.stderr.strip() or res.stdout.strip()}"
 
         # 4. Read back staged paths; assert every one is in scope. If
@@ -1158,13 +1409,42 @@ def git_commit_and_push(
         #    and refuse.
         res = _git("diff", "--cached", "--name-only", cwd=_cwd)
         if res.returncode != 0:
+            _git("reset", "HEAD", cwd=_cwd)
             return False, f"git diff --cached failed: {res.stderr.strip() or res.stdout.strip()}"
         staged = [p for p in res.stdout.split("\n") if p.strip()]
 
-        leaked = [p for p in staged if not p.startswith(scope_prefix)]
+        leaked = [
+            p for p in staged
+            if not p.startswith(scope_prefix) and p not in snapshot_scope
+        ]
         if leaked:
             _git("reset", "HEAD", cwd=_cwd)
             return False, f"scope guard refused: out-of-scope paths staged: {leaked}"
+
+        # 4a. Snapshot presence/shape is a commit-time belt independent of the
+        #     capture call.  A pre-existing file, symlink swap, or direct caller
+        #     cannot turn the exact-path allowance into an optional artifact.
+        invalid_snapshots: list[str] = []
+        for relpath in snapshot_relpaths:
+            path = _cwd / relpath
+            try:
+                mode = path.lstat().st_mode
+                valid = stat.S_ISREG(mode) and not path.is_symlink() and path.stat().st_size > 0
+            except OSError:
+                valid = False
+            if not valid:
+                invalid_snapshots.append(relpath.as_posix())
+        if invalid_snapshots:
+            _git("reset", "HEAD", cwd=_cwd)
+            return False, f"snapshot guard refused: missing/invalid {invalid_snapshots}"
+
+        for relpath in snapshot_relpaths:
+            ok_snapshot, snapshot_detail = _hermes_scan_file(_cwd / relpath)
+            if not ok_snapshot:
+                _git("reset", "HEAD", cwd=_cwd)
+                msg = f"HERMES guard refused: {snapshot_detail}"
+                print(msg, file=sys.stderr)
+                return False, msg
 
         # 4b. Partial-stage guard (T-0662, strengthened T-1581): for every
         #     ok-status topic, assert its report file exists inside the
@@ -1188,6 +1468,7 @@ def git_commit_and_push(
             RUNNER_LOG.parent.mkdir(parents=True, exist_ok=True)
             with RUNNER_LOG.open("a", encoding="utf-8") as _log:
                 _log.write(f"[specialist] {msg}\n")
+            _git("reset", "HEAD", cwd=_cwd)
             return False, msg
 
         # 5. Nothing-to-commit short-circuit.
@@ -1199,11 +1480,13 @@ def git_commit_and_push(
         if not _hermes_scan_message(message):
             msg = "HERMES guard refused: commit message construction"
             print(msg, file=sys.stderr)
+            _git("reset", "HEAD", cwd=_cwd)
             return False, msg
 
         # 7. Commit (no signing flags, no --no-verify).
         res = _git("commit", "-m", message, cwd=_cwd)
         if res.returncode != 0:
+            _git("reset", "HEAD", cwd=_cwd)
             return False, f"git commit failed: {res.stderr.strip() or res.stdout.strip()}"
 
         # 8. Push with retry for non-ff (T-0487). No force, no
@@ -1214,7 +1497,10 @@ def git_commit_and_push(
         if not ok_push:
             return False, f"git push failed: {push_msg}"
 
-        return True, f"pushed {len(staged)} file(s) under {scope_prefix}"
+        scope_note = scope_prefix
+        if snapshot_scope:
+            scope_note += f" + exact {sorted(snapshot_scope)}"
+        return True, f"pushed {len(staged)} file(s) under {scope_note}"
 
 
 # ---------------------------------------------------------------------------
@@ -1776,6 +2062,7 @@ def file_followup(
         sys.executable,
         str(ticket_bin),
         "file",
+        "--automated-filer", "watch_runner",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "specialist",
         "--target", "role:research_orchestrator",
         "--title", title[:120],
@@ -1883,6 +2170,7 @@ def file_followup_overflow_summary(
         sys.executable,
         str(ticket_bin),
         "file",
+        "--automated-filer", "watch_runner",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "specialist",
         "--target", "role:research_orchestrator",
         "--title", title[:120],
@@ -1927,6 +2215,7 @@ def file_finding(
         sys.executable,
         str(ticket_bin),
         "file",
+        "--automated-filer", "watch_runner",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "specialist",
         "--target", policy["target"],
         "--title", title,
@@ -1994,6 +2283,7 @@ def file_cross_reference(
         sys.executable,
         str(ticket_bin),
         "file",
+        "--automated-filer", "watch_runner",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "specialist",
         "--target", policy["target"],
         "--title", title,
@@ -2285,10 +2575,12 @@ def land_reports(
     is `TL;DR: <report headline frontmatter>` so the actuation phase
     (extract_findings) picks ok rows up exactly as it does for the legacy path.
 
-    Flow: per due topic → derive status from disk, append day-index row
-    (idempotent), update_state → save_state → git_commit_and_push (cwd=None:
-    pull-ff-only + narrow `git add` scope + HERMES guard + partial-stage guard,
-    no worktree per the flagged P1 decision) → actuate_phase (best-effort).
+    Flow: first derive every due topic's status without mutating bookkeeping;
+    then capture every snapshot required by an `ok` configured topic; only
+    after that batch preflight succeeds append day-index rows, update state,
+    commit report+snapshot paths atomically, and actuate.  A snapshot failure
+    therefore cannot leave any topic in the batch recorded as successfully
+    landed.
 
     Respects --topic / --force the same way --emit-due-briefs / main() do, so the
     landed set matches the emitted set. Returns 1 if any topic failed or the
@@ -2311,6 +2603,9 @@ def land_reports(
     statuses: dict[str, str] = {}
     failures = 0
 
+    # Pass 1: determine the complete fired/status set without writing the day
+    # index, state, or probe baseline.  Snapshot capture is a batch preflight,
+    # so one failure must not leave an earlier topic recorded as landed.
     for topic in topics:
         if force or topic_filter:
             due = topic.cadence != "paused"
@@ -2328,8 +2623,33 @@ def land_reports(
             if skip:
                 print(f"  {topic.slug} → skipped (probe: {reason})")
                 continue
-        if landed:
-            status = "ok"
+        status = "ok" if landed else "fail"
+        if not landed:
+            failures += 1
+
+        fires.append(topic)
+        statuses[topic.slug] = status
+
+    # Pass 2 preflight: capture only snapshots whose matching report would
+    # land `ok`.  Missing/failed reports remain ordinary fail rows and do not
+    # authorize a snapshot.  No batch bookkeeping has been written yet.
+    for topic in fires:
+        if statuses[topic.slug] != "ok" or topic.slug not in TOPIC_SNAPSHOTS:
+            continue
+        try:
+            capture_topic_snapshot(topic.slug, today)
+        except SnapshotCaptureError as exc:
+            msg = f"required snapshot failed for {topic.slug}: {exc}"
+            print(f"ERROR: {msg}", file=sys.stderr)
+            _append_runner_log(f"[{today.isoformat()}] land-commit: {msg}")
+            return 1
+
+    # Pass 2 bookkeeping: the full snapshot preflight succeeded, so status,
+    # index, state, and probe-baseline mutations may now advance together.
+    for topic in fires:
+        status = statuses[topic.slug]
+        report_path = date_dir / f"{topic.slug}.md"
+        if status == "ok":
             headline = parse_report_headline(report_path)
             summary = f"TL;DR: {headline}" if headline else "TL;DR: (no headline frontmatter)"
             # T-5500: warn, never refuse. A missed readback must not block landing.
@@ -2347,12 +2667,7 @@ def land_reports(
             if new_ids:
                 print(f"  {topic.slug}: +{len(new_ids)} brief correction(s) accumulated")
         else:
-            status = "fail"
             summary = "dispatch produced no usable report on disk"
-            failures += 1
-
-        fires.append(topic)
-        statuses[topic.slug] = status
         if not day_index_has_row(date_dir, topic.slug):
             append_day_index_entry(date_dir, topic.slug, status, summary)
         update_state(state, topic.slug, today, status)
@@ -2499,6 +2814,7 @@ def file_watch_ticket(
         sys.executable,
         str(ticket_bin),
         "file",
+        "--automated-filer", "watch_runner",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "specialist",
         "--target", "role:research_orchestrator",
         "--title", title,

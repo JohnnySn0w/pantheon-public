@@ -187,7 +187,7 @@ def _file_ticket(cands: list[dict], digest: Path, date: str) -> None:
            f"Full text is in the local digest (not in git): {digest}\n\n"
            "Triage: for each id, either add a register row (cite `TG <id>`) or dismiss it "
            "as not a ruling; then resolve this ticket.")
-    cmd = [sys.executable, str(REPO / "tools" / "ticket.py"), "file", "--requester", "orchestrator",
+    cmd = [sys.executable, str(REPO / "tools" / "ticket.py"), "file", "--automated-filer", "operator_decision_sweep", "--requester", "orchestrator",
            "--target", "role:engineering_orchestrator", "--title",
            f"decision-register sweep {date}: {len(cands)} uncovered the operator rulings",
            "--labels", "decision-register,sweep", "--stale-after", "14d",

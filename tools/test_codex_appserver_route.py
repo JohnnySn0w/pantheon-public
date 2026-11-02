@@ -409,7 +409,9 @@ class MailboxWakeTests(Base):
         route = self.mw._appserver_route_module()   # the patched loader: alerts recorded
         route.try_enqueue = mock.Mock(side_effect=RuntimeError("boom"))
         route.safe_note_fallback = mock.Mock()
-        with mock.patch.object(self.mw, "_appserver_route_module", return_value=route):
+        # T-5660: the real route runs only for the hub inbox; this tmp inbox opts in.
+        with mock.patch.object(self.mw, "_appserver_route_module", return_value=route), \
+                mock.patch.object(self.mw, "_is_hub_inbox", lambda box, agent: True):
             rc, _ = self.run_wake("codex", None)
         self.assertEqual(rc, 0)
         self.assertEqual(self.injected, [("codex-session", "codex")])

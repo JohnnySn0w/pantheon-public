@@ -332,6 +332,18 @@ class ManifestRecord:
 
 
 @dataclass(frozen=True)
+class PlanRecord:
+    """T-5533: a root-registered, digest-pinned installer plan for one
+    (seat, manifest revision). Registration computes the plan OUTSIDE the
+    broker (``tools.host_plan_producer``); the broker only reads and checks it."""
+
+    seat_id: str
+    manifest_revision: str
+    path: Path
+    sha256: str
+
+
+@dataclass(frozen=True)
 class CapabilityGrant:
     action: HostAction
     target_seat_id: str

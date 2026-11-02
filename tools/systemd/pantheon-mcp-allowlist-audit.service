@@ -1,0 +1,13 @@
+[Unit]
+Description=Pantheon MCP allowlist fleet audit
+OnFailure=pantheon-unit-failure-alert@%n.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/pantheon-config
+ExecStart=/usr/bin/sg pantheon-mailbox -c "/usr/bin/python3 %h/pantheon-config/tools/mcp_allowlist_audit.py monitor --format json"
+TimeoutStartSec=90s
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/state/pantheon /home/post-office/mailbox

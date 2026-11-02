@@ -231,7 +231,11 @@ class ManifestRecord:
         return record
 
 
-def canonical_json_bytes(value: Mapping[str, object]) -> bytes:
+def canonical_json_bytes(value: Mapping[str, object], *, max_bytes: int = MAX_ARTIFACT_BYTES) -> bytes:
+    """Canonical bytes for ``value``, refusing above ``max_bytes`` (default: the generic
+    WAL artifact cap). Only an artifact with its own declared bound passes a larger one
+    (the run plan, ``engine.run_state.MAX_PLAN_BYTES``, T-5809)."""
+
     _reject_float(value)
     try:
         data = json.dumps(
@@ -243,7 +247,7 @@ def canonical_json_bytes(value: Mapping[str, object]) -> bytes:
         ).encode("utf-8") + b"\n"
     except (TypeError, ValueError) as exc:
         raise CanonicalJsonError("json-encode") from exc
-    if len(data) > MAX_ARTIFACT_BYTES:
+    if len(data) > max_bytes:
         raise CanonicalJsonError("json-too-large")
     return data
 
@@ -272,7 +276,7 @@ def load_canonical_json(data: bytes, *, max_bytes: int = MAX_ARTIFACT_BYTES) -> 
         raise CanonicalJsonError("json-decode") from exc
     if not isinstance(obj, dict):
         raise CanonicalJsonError("json-not-object")
-    if canonical_json_bytes(obj) != data:
+    if canonical_json_bytes(obj, max_bytes=max_bytes) != data:  # len(data) <= max_bytes already; same bound both ways
         raise CanonicalJsonError("json-noncanonical")
     return obj
 

@@ -162,6 +162,9 @@ def _parse_frontmatter(text: str) -> dict[str, str]:
         return {}
     out: dict[str, str] = {}
     for line in text[3:end].splitlines():
+        # T-5689: an indented line is block-scalar content (`key: |` / `>`), never a key.
+        if line[:1] in (" ", "\t"):
+            continue
         m = FRONTMATTER_FIELD_RE.match(line.strip())
         if m:
             out[m.group(1)] = m.group(2).strip()
@@ -415,6 +418,7 @@ def file_request(
         sys.executable,
         str(ticket_bin),
         "file",
+        "--automated-filer", "weekly_ticket_summary",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "orchestrator",
         "--target", "role:head_engineering_orchestrator",
         # NB: no --intent — it is a target=operator-specific surface (ticket.py

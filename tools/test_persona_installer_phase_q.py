@@ -27,6 +27,7 @@ from pathlib import Path
 from unittest import mock
 
 from tools import persona_installer as _pim
+from tools import persona_installer_activation as _act
 from tools.host_control.envelope import EXECUTOR_KIND_CLASSES, OUT_OF_ENVELOPE_KINDS
 from tools.persona_installer import (
     ExecutionContext,
@@ -37,6 +38,7 @@ from tools.persona_installer import (
     SimulatedHostBackend,
 )
 from tools.test_persona_installer_periodics import PeriodicCase
+from tools.test_persona_installer_services import legacy_ho_resumer_manifest
 
 QKIND = "seat-runtime-residue-quarantine"
 QID = "service.runtime-residue.quarantine"
@@ -369,7 +371,13 @@ class QuarantineContract:
     def test_dry_run_and_execute_use_the_same_liveness_helpers(self) -> None:
         # reviewer follow-up: ONE predicate, the same read in preflight and execute
         self.seed_full()
-        with mock.patch.object(_pim, "_runtime_liveness_refusal", wraps=_pim._runtime_liveness_refusal) as gate:
+        # T-5608: the predicate lives in persona_installer_activation (re-exported, same
+        # object); the local backend reaches it through the shared _residue_quarantine_check,
+        # the simulator through its re-export, so the ONE wrapper is installed in both.
+        gate = mock.MagicMock(wraps=_pim._runtime_liveness_refusal)
+        with mock.patch.object(_pim, "_runtime_liveness_refusal", gate), mock.patch.object(
+            _act, "_runtime_liveness_refusal", gate
+        ):
             self.backend.preflight(self.op)
             self.assertEqual(gate.call_count, 1)
             self.execute()
@@ -741,20 +749,28 @@ class LocalTrustTests(TrustContract, LocalTDriver, unittest.TestCase):
 # plan shape, wiring and dry-run/execute fidelity
 # ---------------------------------------------------------------------------
 class PlanShapeTests(PeriodicCase):
-    def test_kinds_are_seat_local_residue_outside_the_envelope(self) -> None:
+    def test_trust_is_seat_local_residue_and_quarantine_is_executor_admitted(self) -> None:
         from tools.host_control.planner import SEAT_LOCAL_RESIDUE_LIMIT, partition_installer_plan
 
+        # T-5474: workspace trust stays seat-local residue outside the envelope
+        self.assertIn(TKIND, _pim.SEAT_LOCAL_RESIDUE_KINDS)
+        self.assertIn(TKIND, OUT_OF_ENVELOPE_KINDS)
+        self.assertNotIn(TKIND, EXECUTOR_KIND_CLASSES)
+        # T-5608 (HO ruling 2026-10-27): the residue quarantine is files.seat_root
+        self.assertNotIn(QKIND, _pim.SEAT_LOCAL_RESIDUE_KINDS)
+        self.assertNotIn(QKIND, OUT_OF_ENVELOPE_KINDS)
+        self.assertEqual(EXECUTOR_KIND_CLASSES[QKIND], "files.seat_root")
         for kind in (QKIND, TKIND):
-            self.assertIn(kind, _pim.SEAT_LOCAL_RESIDUE_KINDS)
-            self.assertIn(kind, OUT_OF_ENVELOPE_KINDS)
-            self.assertNotIn(kind, EXECUTOR_KIND_CLASSES)
             self.assertIn(kind, _pim.ACTIVATION_OPERATION_KINDS)  # reviewer B3: run at activation, not stage
         broker, residue = partition_installer_plan(self.plan("recovery"))
-        self.assertLessEqual({QID, TID}, {o.operation_id for o in residue})
-        self.assertFalse({QID, TID} & {o.operation_id for o in broker.operations})
+        self.assertIn(TID, {o.operation_id for o in residue})
+        self.assertNotIn(TID, {o.operation_id for o in broker.operations})
+        self.assertIn(QID, {o.operation_id for o in broker.operations})
+        self.assertNotIn(QID, {o.operation_id for o in residue})
         self.assertLessEqual(len(residue), SEAT_LOCAL_RESIDUE_LIMIT)
 
     def test_trust_then_quarantine_precede_every_launch_and_the_fire(self) -> None:
+        self.set_manifest(legacy_ho_resumer_manifest())  # T-5633: the decommission is declared-only
         ids = self.ids(self.plan("recovery"))
         at = ids.index
         self.assertLess(at("host.user-manager"), at(TID))

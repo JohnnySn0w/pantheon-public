@@ -78,4 +78,4 @@ def acquire(
     try:
         yield resolved_run_id
     finally:
-        coordinator.release(system_dir, instance, component)
+        coordinator.release(system_dir, instance, component, expected_run_id=resolved_run_id)

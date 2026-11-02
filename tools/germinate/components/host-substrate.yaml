@@ -13,8 +13,8 @@ component:
   steward: orchestrator
   version: 1
   planner_kind: python
-  contract_digest: sha256:98d0a1e8ab665e1a39bbd9e045a616cc7d4049eb1620768c77dcef1cf3099b0c
-  handlers_digest: sha256:5a8d41a602145bd4cee953b7a1bc113a1d8e891ff9ef87b0ac3e4278d0e48687
+  contract_digest: sha256:647226ba26a7fece538d257ad3864f962a216bbc3756fb6f983498b673bdc5cb
+  handlers_digest: sha256:236daa0659df05393b3c36855b65148c396ae5650bf97ae353bcfb02de996df7
   depends_on: []
   scopes: [system]
   invariant_list_id: org.pantheon.host-substrate/v1

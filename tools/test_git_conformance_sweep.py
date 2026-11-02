@@ -87,10 +87,12 @@ class Seats(unittest.TestCase):
     YAML = "repos: []\n"
 
     def fake(self, origin="git@github.com:example-org/pantheon-config.git",
-             rewrite=None, pin="match"):
+             rewrite=None, pin="match", armed=True):
         def run(account, argv):
             def cp(rc, out=""):
                 return subprocess.CompletedProcess(argv, rc, out, "")
+            if argv[0] == "grep":  # T-5672: is the seat's read failover armed?
+                return cp(0 if armed else 1)
             if argv[-1] == "origin":
                 return cp(0, origin + "\n") if origin else cp(128)
             if argv[0] == "git" and argv[3] == "config":
@@ -121,6 +123,17 @@ class Seats(unittest.TestCase):
     def test_missing_and_stale_pin_are_flagged(self):
         self.assertEqual(kinds(self.seats(pin=None)), [("PIN", "acct:~/pantheon-config")])
         self.assertEqual(kinds(self.seats(pin="stale")), [("PIN", "acct:~/pantheon-config")])
+
+    def test_stale_pin_on_an_unarmed_seat_is_info_not_a_finding(self):
+        # T-5672 (10-27: codex, codex-fallback, suborch1): an unarmed seat never consults
+        # its pin and its pull never refreshes it, so a stale pin there is not a refusal.
+        got = self.seats(pin="stale", armed=False)
+        self.assertEqual([(f.kind, f.subject, f.info) for f in got],
+                         [("PIN", "acct:~/pantheon-config", True)])
+        self.assertIn("refresh before arming", got[0].detail)
+
+    def test_missing_pin_on_an_unarmed_seat_is_still_flagged(self):
+        self.assertEqual(kinds(self.seats(pin=None, armed=False)), [("PIN", "acct:~/pantheon-config")])
 
     def test_no_clone_is_not_this_checks_business(self):
         self.assertEqual(self.seats(origin=None), [])

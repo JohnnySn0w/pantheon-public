@@ -4,22 +4,20 @@
 
 How to tell whether a persona's Telegram-facing session is actually alive, and bring it back when it isn't. Audience: whoever is recovering a persona — Recovery (the monitoring/recovery host), the recovery seat (Watchman), HO/Orchestrator via sudo, or the operator directly. Applies to **Orchestrator, Specialist, Recovery and Archivist**. Each runs a harness TUI in a named tmux session, so any of them can die the same silent way, and "is the persona up?" is non-obvious from a process list.
 
-## Substrate (re-verified 2026-10-17, T-5061)
+## Substrate (re-verified 2026-10-30, T-5744)
 
 What owns each session differs by seat, and it is changing as seats cut over to the runtime controller (T-2953/ORG-068). **Don't hardcode the owner: resolve it live** with `python3 tools/agent_role_map.py restart-target <persona>`, which prints `SUPERVISOR`, `SERVICE`, `PANE` and `SESSION_UNIT` from instance.yaml.
 
-| Persona | Account | Supervisor (2026-10-17) | Session unit | tmux session | Runtime | jsonl dir |
+| Persona | Account | Supervisor (2026-10-30) | Session unit | tmux session | Runtime | jsonl dir |
 |---|---|---|---|---|---|---|
-| Orchestrator (HO) | `claude` | bespoke, until T-2953 | `claude-telegram.service` | `claude-telegram-bot` | claude | `/home/claude/.claude/projects/-home-claude` |
+| Orchestrator (HO) | `claude` | control-plane | `pantheon-runtime-controller@orchestrator.service` (consume: `pantheon-persona-consume@orchestrator`) | `claude-telegram-bot` | claude or codex fallback | `/home/claude/.claude/projects/-home-claude` |
 | Specialist | `claude-research` | control-plane | `pantheon-runtime-controller@specialist.service` (consume: `pantheon-persona-consume@specialist`) | `claude-research-bot` | claude/interactive-subscription | `/home/claude-research/.claude/projects/-home-claude-research-pantheon-config` |
 | Recovery | `claude-fallback` | control-plane (T-3026, 2026-09-29) | `pantheon-runtime-controller@recovery.service` (consume: `pantheon-persona-consume@recovery`) | `claude-telegram-bot-fallback` (window `harness`) | claude/interactive-subscription | `/home/claude-fallback/.claude/projects/-home-claude-fallback-pantheon-config` |
-| Archivist | `exocortex` | bespoke, until T-5063 | `claude-telegram-exocortex.service` | `claude-telegram-bot-exocortex` | claude | `/home/exocortex/.claude/projects/-home-exocortex` |
+| Archivist | `exocortex` | control-plane | `pantheon-runtime-controller@archivist.service` (consume: `pantheon-persona-consume@archivist`) | `claude-telegram-bot-exocortex` | claude or codex fallback | `/home/exocortex/.claude/projects/-home-exocortex` |
 
-**Telegram receiver.** instance.yaml `codex_telegram_bridge.personas.<p>.claude_receiver_topology` is `runtime-owned` for orchestrator, specialist and recovery. On a claude runtime the `--channels` plugin inside the TUI is the receiver; on a codex runtime the `codex-telegram-poller.service` bridge is. So "is the bot up?" depends on which runtime is live. Read `~/.local/state/pantheon/personas/<p>/active-runtime.json` (a cache; tmux plus pid liveness is authoritative) before choosing a recovery path.
+**Telegram receiver.** instance.yaml `codex_telegram_bridge.personas.<p>.claude_receiver_topology` is `runtime-owned` for orchestrator, specialist, recovery and archivist. On a claude runtime the `--channels` plugin inside the TUI is the receiver; on a codex runtime the `codex-telegram-poller.service` bridge is. So "is the bot up?" depends on which runtime is live. Read `~/.local/state/pantheon/personas/<p>/active-runtime.json` (a cache; tmux plus pid liveness is authoritative) before choosing a recovery path.
 
-**Bespoke seats** (Orchestrator, Archivist today): the session unit is a `systemctl --user` unit with a `Restart=always` supervisor script that keeps the named tmux session alive and exits when it dies so systemd respawns it (crash-loop guard `StartLimitIntervalSec`/`StartLimitBurst`).
-
-**Control-plane seats** (Specialist, Recovery; Orchestrator and Archivist after cutover): `pantheon-runtime-controller@<p>` owns the session and relaunches a dead pane through runtime selection (honouring holds and overrides). The old bespoke unit is retired and disabled: **never start or restart it**, because that resurrects a second supervisor next to the controller.
+**Control-plane seats** (all four personas above): `pantheon-runtime-controller@<p>` owns the session and relaunches a dead pane through runtime selection (honouring holds and overrides). The old bespoke unit is retired and disabled: **never start or restart it**, because that resurrects a second supervisor next to the controller.
 
 The auto-restart and health layer on top (context_fill_monitor api-health, wedge and fill restarts, `restart_drain`, `handoff_and_restart.sh`, the recovery watcher) reduces incidence but does not replace this runbook for the residual cases.
 
@@ -69,7 +67,7 @@ sudo -u <ACCT> XDG_RUNTIME_DIR=/run/user/$(id -u <ACCT>) systemctl --user status
      --service pantheon-persona-consume@<p>.service --mode user --target-pane <PANE> --supervisor control-plane'
    ```
    It asks the seat to write a handoff, ends the pane, and lets the controller re-run selection.
-2. **Pane wedged so hard the handoff can't land** (mode 3 with no prompt): end the tmux session (`sudo -u <ACCT> tmux kill-session -t <SESSION>`); the controller relaunches it. For an open spend-limit or picker modal, a lease-held Escape through the recovery broker (`codex-recovery unstick <target> spend-modal-dismiss`, recovery seat only) is the audited path. Don't restart `pantheon-runtime-controller@<p>` itself for a stuck pane.
+2. **Pane wedged so hard the handoff can't land** (mode 3 with no prompt): end the tmux session (`sudo -u <ACCT> tmux kill-session -t <SESSION>`); the controller relaunches it. A spend-limit modal is governed by the specific [agent spend-limit wedge SOP](agent-spend-limit-wedge.md), not this generic liveness recipe: its lease-held broker Escape is permitted only when fresh detector evidence identifies a monthly-spend-limit modal, the parsed reset time has passed, and a live capture immediately before action proves the exact modal still occupies the pane bottom. The detector state is reread after capture; missing, changed, stale, ambiguous, pre-reset, unreadable, or nonmatching evidence refuses. This broker action does not authorize dismissing a generic picker modal. Don't restart `pantheon-runtime-controller@<p>` itself for a stuck pane.
 3. **Controller unit `failed`** (start-limit): `systemctl --user reset-failed pantheon-runtime-controller@<p>.service`, then `start` it, then read controller-evidence for the cause before trying again.
 4. **Never** start or restart the retired bespoke unit (`claude-telegram-<x>.service`) on a control-plane seat.
 
@@ -115,7 +113,7 @@ On a control-plane seat, also confirm the last `controller_start_*` event in con
 - **2026-05-21 Recovery** — mode 2 (alive-but-400ing), 162 failures over ~14h; cause = a harness/model edge on a giant long-lived session, duration = missing self-recovery (`incidents/2026-05-21-recovery-personal-daemon-silent-outage`).
 - **2026-05-25 Orchestrator** — a `systemctl restart` no-op left the same inner-claude PID; a true restart needed `tmux kill-session`.
 - **2026-06-06 Orchestrator** — mode 4 (bridge healthy, outbound replies composed in the transcript without the reply tool, so the operator received nothing); recovered by a send-keys nudge to re-send via the tool.
-- **2026-10-15 Recovery (control-plane)** — a `/model` picker wedge (mode 3) was cleared by the recovery seat's lease-held `codex-recovery unstick … spend-modal-dismiss` (T-4884 B13), and a context-fill cycle went through the controller cleanly.
+- **2026-10-15 Recovery (control-plane)** — a `/model` picker wedge (mode 3) was cleared by the recovery seat's then-current lease-held `codex-recovery unstick … spend-modal-dismiss` (T-4884 B13), and a context-fill cycle went through the controller cleanly. This is historical evidence, not current authorization; T-5754 narrowed that action to verified post-reset monthly-spend-limit modals.
 
 ## Cross-references
 

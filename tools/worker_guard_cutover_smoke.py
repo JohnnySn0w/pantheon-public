@@ -333,11 +333,33 @@ def _describe(o: Outcome) -> str:
     return f"rc={o.rc} out={o.out[:160]!r} err={o.err[:160]!r}"
 
 
-def compare_scripts(ref: Path, new: Path, cases: list[Case], workers: int = 8) -> Comparison:
-    """Run `ref` and `new` over `cases`; (rc, stdout, stderr) must be byte-identical for every case."""
+# T-5817: the guard's own fail-closed clock (T-4389 DECIDE_DEADLINE_S, counted from process start)
+# is real time, so on a loaded host a run in the 8-wide pool can hit it and print this deny while
+# its twin did not: orchestrator's soak, 2026-11-01, 'fuzz-4177-1: ref[... T-4389 ... timed out] !=
+# new[allow]'. That is the host, not a decision difference. Such a pair is re-run one case at a
+# time; it still has to come out byte-identical, and one that keeps timing out stays a mismatch.
+TIMED_OUT_MARKER = b"BLOCKED (worker-guard, T-4389): worker-guard timed out deciding"
+TIMEOUT_RERUNS = 3
+
+
+def _timed_out(o: Outcome) -> bool:
+    return TIMED_OUT_MARKER in o.out
+
+
+def compare_scripts(ref: Path, new: Path, cases: list[Case], workers: int = 8,
+                    timeout_reruns: int = TIMEOUT_RERUNS) -> Comparison:
+    """Run `ref` and `new` over `cases`; (rc, stdout, stderr) must be byte-identical for every case.
+    A differing pair where either side hit the guard's T-4389 deadline is re-run serially, up to
+    `timeout_reruns` times (T-5817), and judged on the re-run."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         ref_out = list(pool.map(lambda c: run_script(ref, c[1]), cases))
         new_out = list(pool.map(lambda c: run_script(new, c[1]), cases))
+    for i, (_label, raw) in enumerate(cases):
+        for _ in range(timeout_reruns):
+            r, n = ref_out[i], new_out[i]
+            if r == n or not (_timed_out(r) or _timed_out(n)):
+                break
+            ref_out[i], new_out[i] = run_script(ref, raw), run_script(new, raw)
     mismatches = [
         f"{label}: ref[{_describe(r)}] != new[{_describe(n)}]"
         for (label, _raw), r, n in zip(cases, ref_out, new_out)

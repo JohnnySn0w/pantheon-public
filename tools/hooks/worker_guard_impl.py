@@ -2810,6 +2810,7 @@ _PY_ARITH_RUN = re.compile(r"[^()\[\]$`;&|\n]+")
 _PY_PE_RUN = re.compile(r"[^}'\"\\$`]+")
 _PY_REDIR_OP = re.compile(r"<<<|<<-|<<|<>|<&|<|>>|>&|>\||>|&>>|&>")
 _PY_FD = re.compile(r"\d+|-")
+_PY_STDOUT_PATHS = frozenset({"/dev/stdout", "/dev/fd/1", "/proc/self/fd/1"})  # T-5571
 # T-5430: bash's named fd, `{fd}>f`: a whole unquoted word right before a
 # redirect operator is an io-number, like `2>f` (`{1}>f`, `a{fd}>f` are words)
 _PY_NAMED_FD = re.compile(r"\{[A-Za-z_][A-Za-z0-9_]*\}")
@@ -2942,7 +2943,8 @@ class _PyCmd:
     T-5505: `infiles` (each stdin `<`/`0<` redirect's word; None if built at run time) is
     recorded for the script-file reading (`_sf_collect`) only."""
 
-    __slots__ = ("words", "targets", "badredir", "dyn", "argv", "herestrs", "heredocs", "infiles")
+    __slots__ = ("words", "targets", "badredir", "dyn", "argv", "herestrs", "heredocs", "infiles",
+                 "errout", "stdindup", "qwords")
 
     def __init__(self):
         self.words: list[str] = []
@@ -2953,12 +2955,19 @@ class _PyCmd:
         self.herestrs: list = []
         self.heredocs: list = []
         self.infiles: list = []
+        # T-5571 (read by `_decide_noncomputable` only): stderr reaches stdout (`|&` after it,
+        # `2>&1`, `2>/dev/stdout`, `&>/dev/stdout`), and a `<&N`/`0<&N` stdin duplication
+        self.errout = False
+        self.stdindup = False
+        # T-5662: the indexes of the words that had a quote character (`"$x"`, not `$x`),
+        # read by the run-time command-word reading (`_sf_dynhead`) only
+        self.qwords: set[int] | None = None  # (made on the first quoted word)
 
 
 class _PyFrame:
     __slots__ = ("kind", "cmd", "parts", "started", "quoted", "pending", "hdocs", "groups",
                  "closer", "outer", "first_cmd", "depth", "end", "resume", "lex", "start", "dyn",
-                 "open_at", "hdoc_cmds", "rfd")
+                 "open_at", "hdoc_cmds", "rfd", "wfd")
 
     def __init__(self, kind, start):
         self.kind = kind
@@ -2981,6 +2990,7 @@ class _PyFrame:
         self.open_at = -1  # where this frame's last grouping `(` was (T-4444)
         self.hdoc_cmds: list = []  # T-5332: the command owning each `hdocs` entry
         self.rfd = None  # T-5505: the fd word of a pending `<` redirect (None: stdin)
+        self.wfd = None  # T-5571: (operator, fd word) of a pending `>`/`>&`/`<>`/`&>` redirect
 
 
 class _PyLexer:
@@ -3023,6 +3033,15 @@ class _PyLexer:
             return
         w = "".join(f.parts)
         p = f.pending
+        if p in ("w", "d"):
+            # T-5571 (recorded only): `<>` on stdin reads it too; stderr sent to stdout
+            op, lfd = f.wfd or (None, None)
+            f.wfd = None
+            if op == "<>" and lfd in (None, "0"):
+                f.cmd.infiles.append(None if f.dyn or _PY_SUBST in w or _PY_PWD_MARK in w else w)
+            if (p == "d" and lfd == "2" and w == "1") or (
+                    w in _PY_STDOUT_PATHS and (lfd == "2" or op in ("&>", "&>>"))):
+                f.cmd.errout = True
         if p == "w" or (p == "d" and not _PY_FD.fullmatch(w)):
             if w != "/dev/null":
                 f.cmd.targets.append(w)
@@ -3034,6 +3053,8 @@ class _PyLexer:
                 f.cmd.herestrs.append(None if f.dyn or _PY_SUBST in w or _PY_PWD_MARK in w else w)
             elif f.rfd in (None, "0"):  # T-5505: a stdin `<` redirect's word, recorded only
                 f.cmd.infiles.append(None if f.dyn or _PY_SUBST in w or _PY_PWD_MARK in w else w)
+            elif f.rfd in ("&", "&0") and w not in ("-", "0"):
+                f.cmd.stdindup = True  # T-5571: `<&N` / `0<&N`, recorded only
             f.rfd = None
         elif p and p[0] == "h":
             f.hdocs.append((w, f.quoted, p == "h-"))
@@ -3042,6 +3063,10 @@ class _PyLexer:
         elif p is None:
             if f.dyn:
                 f.cmd.dyn.add(len(f.cmd.words))
+            if f.quoted:
+                if f.cmd.qwords is None:
+                    f.cmd.qwords = set()
+                f.cmd.qwords.add(len(f.cmd.words))
             f.cmd.words.append(w)
         f.pending = None
         f.parts, f.started, f.quoted, f.dyn = [], False, False, False
@@ -3191,13 +3216,17 @@ class _PyLexer:
                 f.pending = "s"  # read exactly as "r" (T-5332 records the word)
             elif op in ("<", "<&"):
                 f.pending = "r"
-                f.rfd = rfd if op == "<" else "&"  # T-5505: `<&N` duplicates, reads no file
+                # T-5505: `<&N` duplicates, reads no file (T-5571: `&` + its fd, recorded)
+                f.rfd = rfd if op == "<" else "&" + (rfd or "")
             elif op == ">&":
                 f.pending = "d"
+                f.wfd = (op, rfd)
             else:
                 f.pending = "w"
+                f.wfd = (op, rfd)
             return i + len(op)
         if c == "|" and s.startswith("|&", i):
+            f.cmd.errout = True  # T-5571: stderr into the pipe too
             self._end_cmd(f, "|")  # `|&` is a pipe (stderr too), not a background `&`
             return i + 2
         if c in ";&|":
@@ -4497,6 +4526,9 @@ def _ho_code_string_dynamic_write_hit(command: str, cwd: str) -> bool:
 # >(bash)`, `bash < <(...)`, `bash <(...)`, `BASH_ENV=<(...)`), a pipe into an `if`/`while`
 # body, `bash -c bash`, `bash -c 'source /dev/stdin'`, `cd -`/`$OLDPWD`/`CDPATH`/a dynamic
 # chdir target, and a shell under a name this hook does not know.
+# T-5571: those feeds (a file or another program, a process substitution, an `if`/`while`
+# body, `bash -c bash`) are now refused when they reach a shell (`_decide_noncomputable`);
+# this reading still judges only the computable ones.
 _FED_DEPTH = 4
 _FED_MAX_CODES = 32
 _FED_MAX_CANDS = 32
@@ -4531,7 +4563,7 @@ _FED_INT = re.compile(r"\s*([+-]?)(0[xX][0-9A-Fa-f]+|0[0-7]*|[1-9][0-9]*)\Z")
 _FED_HD_UNESCAPE = re.compile(r"\\(\n|[\\$`])")
 _FED_EVEN_BS_NL = re.compile(r"(?<!\\)((?:\\\\)+)\n")
 _FED_HERESTR = re.compile(r"<<<[ \t]*")
-_FED_PREFILTER = ("sh", "stdin", "fd/0", "xargs")
+_FED_PREFILTER = ("sh", "stdin", "fd/0", "xargs", "sg", "newgrp", "firejail")  # T-5571: + wrappers
 
 
 class _FedUnknown(Exception):
@@ -4798,7 +4830,8 @@ def _fed_peeled(full: list[str]) -> tuple[list[str], list[str], int, list[int]]:
 def _fed_consumer(c: _PyCmd, depth: int = 0):
     """None, or a function from a text fed on `c`'s stdin to the code `c` runs: a shell
     reading commands from stdin, `source`/`.` of `/dev/stdin`, or `xargs CMD`."""
-    if not any("sh" in w or "xargs" in w or w in (".", "source", "eval") for w in c.words):
+    if not any("sh" in w or "xargs" in w or w in (".", "source", "eval") or "sg" in w
+               or "newgrp" in w or "firejail" in w for w in c.words):
         return None
     i = _py_head_index(c.words)
     if i >= len(c.words) or i in c.dyn or _PY_SUBST in c.words[i] or _PY_PWD_MARK in c.words[i]:
@@ -4837,7 +4870,25 @@ def _fed_consumer(c: _PyCmd, depth: int = 0):
         return _fed_eval_consumer(c, words, depth)
     if head in (".", "source"):
         ops = words[1:2] if words[1:2] != ["--"] else words[2:3]
-        return (lambda t: t) if ops and ops[0] in _FED_STDIN_PATHS else None
+        return (lambda t: t) if ops and _fed_stdin_operand(ops[0]) else None
+    name = None if head in _SHELL_NAMES else _wc_name(words[0])
+    if name is not None:
+        # T-5571: `sg GROUP`, `newgrp`, `firejail [opts]` with no command start a shell that
+        # reads stdin; `firejail [opts] CMD` passes its stdin to CMD (a code string, `sg -c
+        # CODE`, or a word built at run time is `_decide_wrapcode`'s)
+        strip = len(base) - n - len(words)  # (a `busybox` word dropped above)
+        wdyn = [src[n + strip + k] + i in c.dyn or _PY_SUBST in words[k] or _PY_PWD_MARK in words[k]
+                for k in range(len(words))]
+        got = _wc_parse(name, words, lambda k: wdyn[k])
+        if got[0] == "stdin":
+            return lambda t: t
+        if got[0] == "argv" and depth < _FED_DEPTH:
+            at = len(words) - len(got[1])
+            sub = _PyCmd()
+            sub.words = list(got[1])
+            sub.dyn = {k - at for k in range(at, len(words)) if wdyn[k]}
+            return _fed_consumer(sub, depth + 1)
+        return None
     if head not in _SHELL_NAMES:
         return None
     k, smode = 1, False
@@ -4857,9 +4908,22 @@ def _fed_consumer(c: _PyCmd, depth: int = 0):
             return None  # a code string: `_py_code_strings` reads it
         smode = smode or (w[0] == "-" and "s" in w[1:])
         k += 1 + w.count("o", 1) + w.count("O", 1)
-    if smode or k >= len(words) or words[k] in _FED_STDIN_PATHS:
+    if smode or k >= len(words) or _fed_stdin_operand(words[k]):
         return lambda t: t
     return None
+
+
+_FED_SLASHES = re.compile(r"/+")
+
+
+def _fed_stdin_operand(word: str) -> bool:
+    """A shell's or source's operand that names its own stdin: a `_FED_STDIN_PATHS` spelling
+    or (T-5571, a superset) any other path under /dev/ or /proc/ but /dev/null (`/dev//stdin`,
+    `/dev/./stdin`, `/dev/fd/00`, `/proc/self/fd//0`): no script lives there."""
+    if word in _FED_STDIN_PATHS:
+        return True
+    norm = _FED_SLASHES.sub("/", word)
+    return norm.startswith(("/dev/", "/proc/")) and norm != "/dev/null"
 
 
 _FED_XARGS_FLAGS = frozenset("0rtpxo")
@@ -5049,6 +5113,7 @@ def _fed_xargs_run(spec: dict, cmd: list[str]):
     def run(text: str) -> str:
         return "\n".join(" ".join(shlex.quote(w) for w in inv)
                          for inv in _fed_xargs_invocations(spec, cmd, text))
+    run.nc_xargs = True  # T-5571: xargs reads the pipe as arguments, not as a shell's code
     return run
 
 
@@ -5897,32 +5962,70 @@ def _argument_surface(command: str) -> str:
 _IDENTITY_SEGMENT_SEP = re.compile(r"[;|&]")
 _IDENTITY_GIT_WORD = re.compile(r"\bgit\b")
 _IDENTITY_CONFIG_WORD = re.compile(r"\bconfig\b")
+# T-5817: the identity rule's `config` anchor is the `git config` command word,
+# never the `--config-env` OPTION. `git --config-env=user.email=VAR commit` sets
+# identity for that one invocation from an environment variable, exactly like
+# `git -c user.email=... commit` (which never matched: it has no `config` word),
+# and writes no config file, so it is the sanctioned one-shot route the denial
+# text names, not a persistent write. Every persistent spelling still carries a
+# real `config` word (`git config`, `git-config`, `git --config-env=... config
+# user.email x`: the scan skips the option and anchors on the later word), so
+# nothing that writes config is newly allowed. Only the exact `--config-env`
+# option is skipped: a bare `config-env` word still anchors, since it could be a
+# git alias for `config`. The account-wide-scope rule
+# keeps the plain `\bconfig\b` anchor unchanged (no decision there moves).
+_IDENTITY_CONFIG_SUBCOMMAND = re.compile(r"\bconfig\b(?!(?<=--config)-env\b)")
 _GIT_CONFIG_GLOBAL = re.compile(r"--(?:global|system)\b")
 _GIT_CONFIG_IDENTITY = re.compile(r"\buser\.(?:name|email)\b")
-_SHARED_CHECKOUT_C = re.compile(r"\bgit\s+-C\s+/home/claude/[^/\s]+")
+# T-5817: the head orchestrator's account home. Its main checkouts
+# (`<home>/<repo>`) are the SHARED checkouts T-1687 protects; every other seat
+# works in its own home. One definition, read at CALL time by
+# `_under_ho_home` and `_shared_checkout_res`, so a test points it elsewhere
+# (unittest.mock.patch.object) and covers the shared-checkout branch on any
+# machine, instead of only on the seat whose checkout happens to sit there.
+# Not read from the environment: a worker controls its own env.
+_HO_HOME = "/home/claude"
 # T-4963: the `-C` operand itself, read again after normalisation (quotes
 # stripped, `_py_norm` folding `//`, `/./` and `..`), so another spelling of
 # the same shared checkout classifies the same. `\S+` keeps the scan linear.
 _GIT_C_OPERAND = re.compile(r"\bgit\s+-C\s+(\S+)")
-_SHARED_CHECKOUT_PATH = re.compile(r"/home/claude/[^/]+")
+
+
+def _under_ho_home(path: str) -> bool:
+    """True if `path` lies under the head orchestrator's home (`_HO_HOME`)."""
+    return path.startswith(_HO_HOME.rstrip("/") + "/")
+
+
+@functools.lru_cache(maxsize=4)
+def _shared_checkout_res(ho_home: str) -> tuple[re.Pattern, re.Pattern]:
+    """(`git -C <home>/<repo>` in raw text, `<home>/<repo>` at the start of a
+    normalised operand) for `ho_home`: the pre-T-5817 literals, built from it."""
+    home = re.escape(ho_home.rstrip("/"))
+    return (re.compile(r"\bgit\s+-C\s+" + home + r"/[^/\s]+"),
+            re.compile(home + r"/[^/]+"))
 
 
 def _targets_shared_checkout(command: str) -> bool:
-    """True if a `git -C <dir>` in `command` names a /home/claude/<repo> checkout."""
-    if _SHARED_CHECKOUT_C.search(command):
+    """True if a `git -C <dir>` in `command` names a `<_HO_HOME>/<repo>` checkout."""
+    raw_c, path_re = _shared_checkout_res(_HO_HOME)
+    if raw_c.search(command):
         return True
     for m in _GIT_C_OPERAND.finditer(command):
         op = m.group(1).strip("'\"")
-        if op.startswith("/") and _SHARED_CHECKOUT_PATH.match(_py_norm(op)):
+        if op.startswith("/") and path_re.match(_py_norm(op)):
             return True
     return False
 
 
-def _git_config_segment_has(command: str, key: re.Pattern) -> bool:
+def _git_config_segment_has(command: str, key: re.Pattern,
+                            config_word: re.Pattern = _IDENTITY_CONFIG_WORD) -> bool:
     """True iff one ;|&-free segment of `command` holds `git`, then `config`, then `key`.
 
     Same answer as the pre-T-4317 `\\bgit\\b[^;|&]*\\bconfig\\b[^;|&]*<key>` search,
-    in linear time (see the T-4317 note above).
+    in linear time (see the T-4317 note above). `config_word` is the anchor
+    (T-5817: the identity rule passes one that skips the `--config-env` option);
+    the earliest-anchor argument holds for it too, since whether a `config`
+    occurrence qualifies depends only on the few characters around it.
     """
     pos, n = 0, len(command)
     while pos <= n:
@@ -5931,7 +6034,7 @@ def _git_config_segment_has(command: str, key: re.Pattern) -> bool:
             return False
         sep = _IDENTITY_SEGMENT_SEP.search(command, git.end())
         end = sep.start() if sep else n
-        config = _IDENTITY_CONFIG_WORD.search(command, git.end(), end)
+        config = config_word.search(command, git.end(), end)
         if config is not None and key.search(command, config.end(), end) is not None:
             return True
         pos = end + 1
@@ -5952,8 +6055,8 @@ def _git_identity_match(command: str, cwd: str) -> str | None:
             "to touch --global/--system git config (account-wide state; workers never "
             "touch git identity — T-1687 after the 6-day misattribution incident)"
         )
-    if _git_config_segment_has(command, _GIT_CONFIG_IDENTITY):
-        in_shared_cwd = cwd.startswith("/home/claude/")
+    if _git_config_segment_has(command, _GIT_CONFIG_IDENTITY, _IDENTITY_CONFIG_SUBCOMMAND):
+        in_shared_cwd = _under_ho_home(cwd)
         targets_shared = _targets_shared_checkout(command)
         if in_shared_cwd or targets_shared:
             return (
@@ -7368,7 +7471,8 @@ _WRAPPER_GRAMMAR: dict[str, tuple[str, frozenset[str], int]] = {
     # T-5505 r1: pass-through wrappers whose next word (after their options) is the command:
     # moreutils chronic [-ev] CMD; expect's unbuffer [-p] CMD; libfaketime faketime [-m] [-f]
     # [-p PID] [--exclude-monotonic] [--date-prog PROG] TIMESTAMP CMD; nocache [-n N] CMD.
-    # (firejail's option table and sg's single code-string argument are not this shape.)
+    # (firejail's option table and sg's single code-string argument are not this shape: T-5571
+    # reads both in a derived reading of their own, `_decide_wrapcode`.)
     "chronic": ("", frozenset(), 0),
     "unbuffer": ("", frozenset(), 0),
     "faketime": ("p", frozenset({"date-prog"}), 1),
@@ -8981,13 +9085,13 @@ def _gh_target_reason(path: str, cwd: str, is_dir: bool) -> str | None:
 def _in_shared_main_checkout(cwd: str) -> bool:
     """True if `cwd` is a shared main checkout, where `gh pr checkout` would
     switch the branch under every other user of it. T-1687's shared-checkout
-    rule (a cwd under /home/claude/, outside an Agent-tool isolation worktree),
+    rule (a cwd under `_HO_HOME`, outside an Agent-tool isolation worktree),
     plus any git MAIN checkout (`.git` a directory, not a linked worktree's
     file) outside a scratch prefix, which covers the other seats' homes.
     Fail-open without a cwd, like the rest of the module."""
     if not cwd:
         return False
-    if cwd.startswith("/home/claude/") and "/.claude/worktrees/" not in cwd + "/":
+    if _under_ho_home(cwd) and "/.claude/worktrees/" not in cwd + "/":
         return True
     root, _common = _worktree_root_and_common(cwd)
     if not root or not os.path.isdir(os.path.join(root, ".git")):
@@ -13090,6 +13194,15 @@ _SF_PRE_RUN = re.compile(r"(?<![\w.-])" + _SF_SH + r"(?![\w.-])(?:[ \t]+(?:--\S*
                          r"(?:[ \t]+(?![-+]|<<|[|;&)\n]|$)|[ \t]*<(?!<))", re.M)
 _SF_ANSI_C = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S)
 _SF_PRE_SHELL = re.compile(r"(?<![\w.-])" + _SF_SH + r"(?![\w.-])")
+# T-5571 r1: a stdin `<`/`<>` anywhere in the command (`< s.sh bash`, `X=1 < s.sh bash`,
+# `{ < s.sh bash; }`, `bash <> s.sh`) with a shell word: not a heredoc, here-string or `<(`
+_SF_PRE_LT = re.compile(r"(?<!<)<(?![<(&])")
+_SF_PRE_NUM = re.compile(r"\d+[smhd]?\Z")
+_SF_PRE_SEG = re.compile(r"[;&|\n(){}!]")  # T-5662
+_SF_PRE_LEAD = frozenset({"do", "then", "else", "elif", "if", "while", "until", "time", "!", "{"})
+_SF_PRE_WRAP = frozenset({"env", "exec", "command", "builtin", "nohup", "nice", "timeout", "stdbuf",
+                          "setsid", "ionice", "chrt", "taskset", "flock", "watch", "busybox",
+                          "xargs", "strace", "doas", "chronic", "unbuffer", "parallel", "sem"})
 _SF_PRE_WORDS = re.compile(r"(?<![\w.-])(?:source|xargs|make|gmake)(?![\w.-])")
 _SF_PRE_KEYS = ("/", "PATH", "HOME", "ZDOTDIR", "INPUTRC", "ENV", "rcfile", "init-file",
                 "-exec", "-ok")
@@ -13141,6 +13254,22 @@ _SF_REASONS = {
              "absolute path"),
     "relay": ("to hand a shell its script through {} (T-5505): the hook cannot see which file "
               "runs. Run each script by a literal path (`bash /abs/x.sh`), one per command"),
+    "dynhead": ("to run a command whose name is built at run time (T-5662): `{}` is a "
+                "variable the hook cannot resolve to a literal (its value comes from a command's "
+                "output, `read`, a positional parameter, a pattern or a brace), a `$(...)` or a "
+                "backtick, so the hook cannot tell whether it runs a script it should read. "
+                "Spell the command literally (`/usr/bin/python3`, not `$(command -v python3)`), "
+                "or assign the variable a literal (`x=bash; $x /abs/x.sh`)"),
+    "envhead": ("to run a command named by a variable the hook cannot see, together with a "
+                "file (T-5662): the variable (`$PY`, `$X`) may hold a shell, which would read "
+                "that file as a script, and the same command also names the file in a way "
+                "that may rewrite it. Spell the command literally (`/usr/bin/python3 FILE`, "
+                "`bash FILE`), or assign the variable a literal first (`x=bash; $x FILE`)"),
+    "pathhead": ("to run a command whose bare name `{}` is built at run time, in a text that "
+                 "also sets PATH or renames a command (`PATH=`, `export PATH`, the hash "
+                 "builtin's `-p`) (T-5662): bash searches PATH for a bare name, so the hook "
+                 "cannot tell which file runs. Spell the command's path literally "
+                 "(`/usr/bin/ls`, `/abs/dir/x.sh`), or set PATH in a call of its own"),
     "generic": ("to run a script file (`bash FILE`, `sh FILE`, `source ./FILE`, `./FILE`, "
                 "`bash < FILE`) whose contents this hook cannot read and judge (T-5505): {}. "
                 "Fix the path so it names an existing, readable text script (at most 64 KiB) "
@@ -13167,7 +13296,7 @@ def _sf_show(word) -> str:
 
 def _sf_reason(cls: str, arg=None) -> dict:
     text = _SF_REASONS[cls]
-    if cls in ("dyn", "missing"):
+    if cls in ("dyn", "missing", "dynhead", "pathhead"):
         text = text.format(_sf_show(arg))
     elif cls == "bare":
         text = text.format(_sf_show(arg), _sf_show(arg))
@@ -13307,18 +13436,21 @@ def _sf_cmd(c: _PyCmd, runs: list, writers: list, info: dict) -> None:
         return  # (`A[k]=v`: an assignment the head index does not skip)
     full = c.words[i:]
     words, dyn = list(full), [k + i in c.dyn for k in range(len(full))]
+    qw = c.qwords or ()
+    qd = [k + i in qw for k in range(len(full))]
     prefix: list = []
     if os.path.basename(full[0]) in _WRAPPER_GRAMMAR:
         try:
             words, base, n, src = _fed_peeled(full)
             dyn = [src[n + k] + i in c.dyn for k in range(len(words))]
+            qd = [src[n + k] + i in qw for k in range(len(words))]
             prefix = list(base[:n])
         except _FedUnknown:
             pass
     pnames = [os.path.basename(w) for w in prefix]
     relay = any(p in _FED_STDIN_TAKERS or p == "xargs" for p in pnames)
     if words and os.path.basename(words[0]) == "busybox":
-        words, dyn = words[1:], dyn[1:]
+        words, dyn, qd = words[1:], dyn[1:], qd[1:]
     if not words or words[0][:1] == "-":
         return  # (an option word as the command: `time --output=F cmd` read past `time`)
     head = os.path.basename(words[0])
@@ -13328,6 +13460,8 @@ def _sf_cmd(c: _PyCmd, runs: list, writers: list, info: dict) -> None:
             info["refuse"].append(("relay", f"`{hit[0]}` (`xargs bash`, `xargs sh -c`, "
                                             "`parallel bash ::: FILE`)"))
             return
+    if head in _SF_RUNNERS:
+        _sf_runner_words(head, words, dyn, qd, runs, writers, info)  # T-5662 r1
     if head in ("find",):
         for k in range(1, len(words) - 1):
             if words[k] in _FIND_EXEC_WORDS:
@@ -13383,7 +13517,10 @@ def _sf_cmd(c: _PyCmd, runs: list, writers: list, info: dict) -> None:
         _sf_writer_words(words, dyn, 0, False, writers)
         return
     if dyn[0]:
-        _sf_writer_words(words, dyn, 0, False, writers)  # an unknown command
+        # T-5662: what it may run; a head read as literal values is those commands (each
+        # read below with its own writer words), any other is an unknown command
+        if not _sf_dynhead(c, words, dyn, qd, runs, writers, info):
+            _sf_writer_words(words, dyn, 0, False, writers)
         return
     if head in _SF_READONLY or head == "eval":
         return  # (an eval's words are code, walked as a code string: its writes are read there)
@@ -13415,6 +13552,281 @@ def _sf_cmd(c: _PyCmd, runs: list, writers: list, info: dict) -> None:
     _sf_writer_words(words, dyn, 0, head in _SF_WRITERS, writers)
 
 
+# --- T-5662: a command word built at run time, read as the script it may run ---
+# `x=/abs/s.sh; $x`, `x=bash; $x s.sh`, `$(echo /abs/s.sh)`, `a=(/abs/s.sh); "${a[@]}"` ran a
+# script the T-5505 reading never saw (the head was not a literal, so no run was recorded).
+# Per walked text (`_sf_assigns`) the literal values each NAME is assigned are collected (`NAME=v`,
+# `NAME=(a b)`, `for NAME in a b`; at most `_SF_ASSIGN_MAX` values, text order ignored: the union
+# of every assignment); a head that is a NAME-expansion (`$x`, `${x}`, `"$x"`, `${a[@]}`,
+# `${x:-d}`, pieces of them) is read as each value it can take, as if spelled (`_sf_dynhead`
+# re-reads the command with the value as its head: a path is a script run, a shell takes the
+# operand as its script, a wrapper is peeled). Otherwise:
+#   * a head built from output or input (`$(..)`, a backtick, a NAME assigned from either, `read`,
+#     `+=`, a positional `$1`/`"$@"`, a pattern or brace, an unreadable expansion) fails closed
+#     (`dynhead`);
+#   * a NAME the text never assigns is the environment's value: it passes (OUT of scope with the
+#     rest of the profile environment, T-5647). Its first operand is read as the command when
+#     the expansion is empty and the word is unquoted (`$UNSET ./x`), and each operand that is
+#     an existing file is read as shell (`opd`: a shell shebang always; otherwise unless its
+#     extension names data or another language, `_SF_OPD_SKIP`) because the value could be a shell.
+_SF_ASSIGN_MAX = 32
+_SF_WHOLE_ARRAY = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\[[@*]\]\}")
+_SF_ASSIGN_W = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?(\+?)=(.*)\Z", re.S)
+_SF_ASSIGN_EXP = re.compile(r"\$\{!?([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?:?[=?]")
+# (`PATH=`, `PATH+=`, `PATH[0]=` in any position; the hash builtin's `-p`; `BASH_CMDS`)
+_SF_PATH_ANY = re.compile(r"(?<![\w$])PATH(?:\[[^\]]*\])?\+?=|(?<![\w-])hash\s+-\w*p|BASH_CMDS")
+_SF_DECLARERS = frozenset({"declare", "typeset", "local", "export", "readonly", "let"})
+_SF_READERS = frozenset({"read", "mapfile", "readarray", "getopts", "select"})
+_SF_VARREF = re.compile(r"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)"
+                        r"(?:\[[^\]]*\])?(?:(:?-)([^}$`*?\[{\\]*))?\})\Z")
+_SF_DYN_TOKEN = re.compile(r"(\$\{[^}]*\}|\$[A-Za-z0-9_@*#?!$-]+|[\0\1`]|\$\()")
+_SF_OPD_SKIP = frozenset({
+    ".py", ".pyi", ".pyc", ".js", ".mjs", ".cjs", ".jsx", ".ts", ".tsx", ".json", ".jsonl", ".md",
+    ".markdown", ".rst", ".txt", ".toml", ".yaml", ".yml", ".rs", ".c", ".h", ".cc", ".cpp",
+    ".hpp", ".go", ".java", ".kt", ".rb", ".pl", ".php", ".lua", ".lock", ".cfg", ".ini",
+    ".conf", ".csv", ".tsv", ".log", ".xml", ".html", ".htm", ".css", ".sql", ".png", ".jpg",
+    ".jpeg", ".gif", ".svg", ".webm", ".mp4", ".mp3", ".wav", ".pdf", ".zip", ".gz", ".tar",
+    ".whl", ".o", ".a", ".so", ".tex", ".diff", ".patch", ".proto"})
+_SF_SHELLISH_EXT = (".sh", ".bash", ".zsh", ".ksh", ".dash")
+
+
+def _sf_note(table: dict, name: str, value) -> None:
+    """Record `value` (a str, or None: built at run time) among `name`'s values."""
+    got = table.setdefault(name, set())
+    if got is None or (value is not None and value in got):
+        return
+    if value is None or len(got) >= _SF_ASSIGN_MAX:
+        table[name] = None
+    else:
+        got.add(value)
+
+
+def _sf_assigns(text: str, lex, table: dict) -> None:
+    """Add to `table` (NAME -> its literal values, or None) what `text`'s commands assign."""
+    for m in _SF_ASSIGN_EXP.finditer(text):
+        table[m.group(1)] = None  # `${x:=v}` assigns, whatever v is
+    # T-5662 r3: PATH set anywhere in the walk (any position, function body, subshell, or a
+    # command renamed with the hash builtin's -p)
+    pview = text.replace("\\\n", "").translate(_QUOTE_STRIP)
+    if "PATH" in pview or "BASH_CMDS" in pview or "hash" in pview:
+        if _SF_PATH_ANY.search(pview) or _sf_path_set_otherwise(pview):
+            table["\0path"] = True
+    events = lex.events
+    arrays: set = set()
+    open_name, elems = None, []  # the array `a=(x y)` being read, one pass (an inner `b=(` is data)
+    for idx, e in enumerate(events):
+        if open_name is not None:
+            if isinstance(e, _PyCmd):
+                for j, w in enumerate(e.words):
+                    elems.append(None if _gc_dynamic(e, j, w) else w)
+                    _sf_note(table, open_name, elems[-1])
+            elif e == ")":
+                # (the elements in order, for the whole array as a command: None if set twice)
+                key = "\0arr:" + open_name
+                table[key] = None if key in table or None in elems else elems
+                open_name, elems = None, []
+            continue
+        if (isinstance(e, _PyCmd) and e.words and idx + 1 < len(events) and events[idx + 1] == "("
+                and _SF_ARRAY_OPEN.fullmatch(e.words[-1])):
+            open_name = _SF_ASSIGN_W.match(e.words[-1] + "x").group(1)  # `a=(x y)`
+            arrays.add(open_name)
+            table.setdefault(open_name, set())
+            elems = []
+    if open_name is not None:
+        table[open_name] = None  # (an array that does not close)
+        table["\0arr:" + open_name] = None
+    for c in lex.cmds:
+        words = c.words
+        if not words:
+            continue
+        if words[0] in ("for", "select") and words[2:3] == ["in"]:
+            for j in range(3, len(words)):
+                _sf_note(table, words[1], None if _gc_dynamic(c, j, words[j]) else words[j])
+            continue
+        if words[0] in ("for", "select") and len(words) > 1:
+            _sf_note(table, words[1], None)  # (`for x; do`: the positional parameters)
+            continue
+        i = _py_head_index(words)
+        while i < len(words) and _ASSIGN_WORD.match(words[i]):
+            i += 1  # (a subscripted `a[0]=v` is an assignment `_py_head_index` stops at)
+        head = os.path.basename(words[i]) if i < len(words) else ""
+        if head in _SF_READERS:
+            for w in words[i + 1:]:
+                if w[:1] != "-" and _DC_NAME.fullmatch(w):
+                    _sf_note(table, w, None)
+        elif head in ("declare", "typeset", "local", "export", "readonly") and any(
+                w[:1] == "-" and w[1:2] != "-" and "n" in w for w in words[i + 1:]):
+            table["\0nameref"] = None  # a nameref: every NAME may stand for another
+        elif head == "printf" and "-v" in words[i + 1:]:
+            nxt = words[words.index("-v", i) + 1:words.index("-v", i) + 2]
+            if nxt:
+                _sf_note(table, nxt[0], None)
+        # (only a word in assignment position: before the command word, or a declarer's/env's
+        # argument; the code string `x=ls; $x` given to `bash -c` is no assignment)
+        for j, w in enumerate(words):
+            if j >= i and head not in _SF_ENV_SETTERS and head not in _SF_DECLARERS:
+                break
+            m = _SF_ASSIGN_W.match(w)
+            if m is None:
+                continue
+            name, plus, value = m.groups()
+            if "[" in w[:w.find("=")]:
+                table["\0arr:" + name] = None  # (an element set on its own: the order is unknown)
+            if not value and name in arrays and j == len(words) - 1 and plus == "":
+                continue  # (`a=` of `a=(..)`, read above)
+            _sf_note(table, name, None if plus or _gc_dynamic(c, j, w) else value)
+
+
+_SF_RUNNERS = frozenset({"find", "fd", "fdfind", "entr"})
+_SF_FD_EXEC = frozenset({"-x", "-X", "--exec", "--exec-batch"})
+
+
+def _sf_runner_words(head: str, words: list, dyn: list, qd: list, runs: list, writers: list,
+                     info: dict) -> None:
+    """T-5662 r1: a runner's command slot (`find -exec/-execdir/-ok/-okdir`, `fd -x/-X/--exec/
+    --exec-batch`, `entr`) holding a word built at run time is a command word like any head:
+    the command from there (to the `;`/`+` of a find) is read as a command of its own
+    (`_sf_dynhead`). A literal word there keeps the rules of `_sf_cmd` (xargs, parallel, watch
+    and the other wrappers are peeled to their command before the head is read). One pass: a
+    command ends at the next `-exec` word."""
+    slots = []
+    if head == "find":
+        slots = [k + 1 for k in range(1, len(words) - 1) if words[k] in _FIND_EXEC_WORDS]
+    elif head in ("fd", "fdfind"):
+        slots = [k + 1 for k in range(1, len(words) - 1) if words[k] in _SF_FD_EXEC]
+    elif head == "entr":
+        k = 1
+        while k < len(words) and words[k][:1] == "-":
+            k += 1
+        slots = [k] if k < len(words) else []
+    for k in slots:
+        # (a run-time word, or a wrapper before one: `-exec nice $x \;` is peeled like a head)
+        if not dyn[k] and not (os.path.basename(words[k]) in _WRAPPER_GRAMMAR and any(dyn[k:])):
+            continue
+        end = k + 1
+        while end < len(words):
+            if head == "find" and (words[end] == ";" or (words[end] == "+" and words[end - 1] == "{}")
+                                   or words[end] in _FIND_EXEC_WORDS):
+                break
+            end += 1
+        sub = _PyCmd()
+        sub.words = words[k:end]
+        sub.dyn = {j for j in range(end - k) if dyn[k + j]}
+        sub.qwords = {j for j in range(end - k) if qd[k + j]}
+        _sf_cmd(sub, runs, writers, info)
+
+
+def _sf_head_values(head: str, table: dict):
+    """(the literal values the run-time command word `head` can take, whether it uses a NAME
+    the text never assigns), or None when it cannot be read."""
+    if "\0nameref" in table or _PY_SUBST in head or _PY_PWD_MARK in head or "`" in head:
+        return None
+    pieces = _SF_DYN_TOKEN.split(head)
+    values, unset = [""], False
+    for k, piece in enumerate(pieces):
+        if k % 2 == 0:
+            options = [piece]
+        else:
+            m = _SF_VARREF.match(piece)
+            if m is None:
+                return None
+            name, braced, op, dflt = m.group(1), m.group(2), m.group(3), m.group(4)
+            name = name or braced
+            if name in table:
+                got = table[name]
+                if got is None:
+                    return None
+                options = sorted(got)
+                if op == ":-" and dflt is not None and "" in got:
+                    options.append(dflt)
+            else:
+                unset = True
+                options = ([""] + ([dflt] if op and dflt is not None else []))
+        values = [v + o for v in values for o in options]
+        if len(values) > _SF_ASSIGN_MAX:
+            return None
+    values = list(dict.fromkeys(values))
+    if any(_SF_GLOB.search(v) or _py_dynamic(v) for v in values):
+        return None
+    return values, unset
+
+
+def _sf_dynhead(c: _PyCmd, words: list, dyn: list, qd: list, runs: list, writers: list,
+                info: dict) -> bool:
+    """T-5662: `words[0]` is a command word built at run time: read each value it can take as
+    the command (see the block comment above), or fail closed. True if the head was read as
+    values of names the text assigns (no name unset)."""
+    got = _sf_head_values(words[0], info["assigns"])
+    if got is None:
+        # (a word with blanks or quotes is a code string a wrapper runs, `watch "env x $(d)"`,
+        # read as code; a lone substitution a shell reads on stdin is T-5571's)
+        if not (re.search(r"[\s'\"]", words[0]) or (
+                (info.get("fed") or _FED_ACTIVE[0]) and len(words) == 1 and words[0] == _PY_SUBST)):
+            info["refuse"].append(("dynhead", words[0]))
+        return False
+    values, unset = got
+    whole = _SF_WHOLE_ARRAY.fullmatch(words[0])
+    elems = info["assigns"].get("\0arr:" + whole.group(1)) if whole else None
+    if whole and elems is None and len(values) > 1:
+        # (elements set one by one: the command is their joined words, in an order not read)
+        info["refuse"].append(("dynhead", words[0]))
+        return False
+    if info["assigns"].get("\0path") and any(
+            v.split() and "/" not in v.split()[0] for v in values):
+        # a bare name searched along a PATH the text sets (or renames with the hash builtin)
+        info["refuse"].append(("pathhead", words[0]))
+        return False
+    for v in values + ([None] if elems else []):
+        if v is None:  # the whole array: its elements are the command and its arguments
+            sub = _PyCmd()
+            sub.infiles = c.infiles
+            sub.words = list(elems) + list(words[1:])
+            sub.dyn = {len(elems) + k - 1 for k in range(1, len(words)) if dyn[k]}
+            sub.qwords = {len(elems) + k - 1 for k in range(1, len(words)) if qd[k]}
+            _sf_cmd(sub, runs, writers, info)
+            continue
+        if v and not qd[0]:
+            head_words = v.split() or [""]  # (an unquoted expansion splits at blanks)
+        else:
+            head_words = [v]
+        sub = _PyCmd()
+        sub.infiles = c.infiles
+        sub.words = [h for h in head_words if h] + list(words[1:])
+        if not v and qd[0]:
+            continue  # (a quoted empty word: "command not found", nothing runs)
+        keep = len([h for h in head_words if h])
+        sub.dyn = {keep + k - 1 for k in range(1, len(words)) if dyn[k]}
+        sub.qwords = {keep + k - 1 for k in range(1, len(words)) if qd[k]}
+        if sub.words:
+            _sf_cmd(sub, runs, writers, info)
+    if unset:
+        for k in range(1, len(words)):
+            w = words[k]
+            if (w[:1] != "-" and not dyn[k] and w and _PY_SUBST not in w and "$" not in w
+                    and "`" not in w and not _SF_GLOB.search(w)):
+                runs.append((w, "opd", False, None))
+    return not unset
+
+
+def _sf_opd_kind(path: str) -> str | None:
+    """How the operand file at `path` of a command word that may be a shell is read: "sh" for a
+    file that begins with a shell shebang, or whose extension is not data or another language;
+    None for a directory, a non-file, a binary, a system file, or such a file."""
+    try:
+        real = os.path.realpath(path)
+        if real.startswith(_SF_SYSTEM) or not os.path.isfile(real):
+            return None
+        with open(real, "rb") as fh:
+            first = fh.read(256).split(b"\n", 1)[0]
+    except (OSError, ValueError):
+        return None
+    if first[:4] == b"\x7fELF" or b"\0" in first:
+        return None
+    if _sf_shebang_shell(first):
+        return "sh"
+    return None if os.path.splitext(path)[1].lower() in _SF_OPD_SKIP else "sh"
+
+
 def _sf_noexec(words: list[str]) -> bool:
     """A shell that runs nothing (`bash -n`, `-o noexec`): no `-c` and no file it executes."""
     return (os.path.basename(words[0]) in _SHELL_NAMES and _sf_shell_operand(words) is None
@@ -13431,6 +13843,38 @@ def _sf_writer_words(words: list[str], dyn: list, skip, known: bool, writers: li
             writers.append((words[k], dyn[k], known, False))
 
 
+def _sf_dynword_head(view: str) -> bool:
+    """T-5662: True if a simple command of `view` (quote-dropped) starts with a word that begins
+    with an expansion (`$x`, `${x}`, `$(..)`, a backtick), or a wrapper word has one after it.
+    Linear: each segment's words are looked at once."""
+    for seg in _SF_PRE_SEG.split(view):
+        if "$" not in seg and "`" not in seg:
+            continue  # (the cheap reject: most segments hold no expansion)
+        words = seg.split()
+        k = 0
+        while k < len(words) and (words[k] in _SF_PRE_LEAD or (
+                "=" in words[k] and _PY_ASSIGN.match(words[k]))):
+            k += 1
+        if k >= len(words):
+            continue
+        w0 = words[k]
+        if w0[0] in "$`":
+            return True
+        base = w0.rsplit("/", 1)[-1] if "/" in w0 else w0
+        if base in _SF_RUNNERS:  # (the command slot is anywhere after its option)
+            if any(w[0] in "$`" for w in words[k + 1:]):
+                return True
+        elif base in _SF_PRE_WRAP:
+            j = k + 1  # (past the wrapper's options, their values and a duration or count)
+            while j < len(words) and (words[j][:1] == "-" or words[j - 1][:1] == "-"
+                                      or _SF_PRE_NUM.match(words[j])
+                                      or ("=" in words[j] and _PY_ASSIGN.match(words[j]))):
+                j += 1
+            if j < len(words) and words[j][0] in "$`":
+                return True
+    return False
+
+
 def _sf_wanted(text: str) -> bool:
     """False when `text` cannot spell a script run or a form the T-5505 rules read (H: the
     cheap prefilter run before any lexing; on the copy with quotes and backslashes dropped,
@@ -13445,8 +13889,10 @@ def _sf_wanted(text: str) -> bool:
     view = text.replace("\\\n", "").translate(_QUOTE_STRIP)
     if "/" in view or any(k in view for k in _SF_PRE_KEYS):
         return True
+    if ("$" in view or "`" in view) and _sf_dynword_head(view):
+        return True  # T-5662: a command word that starts with an expansion
     return bool(_SF_PRE_RUN.search(view) or _SF_PRE_WORDS.search(view) or _SF_DOT.search(view)
-                or ("|" in view and _SF_PRE_SHELL.search(view)))
+                or (("|" in view or _SF_PRE_LT.search(view)) and _SF_PRE_SHELL.search(view)))
 
 
 def _sf_collect(command: str) -> tuple:
@@ -13461,11 +13907,20 @@ def _sf_collect(command: str) -> tuple:
     return got
 
 
+_SF_LEX_LAST: list = [None]  # T-5571: (text, view) of the last text lexed here (read-only views)
+
+
 def _sf_lexed(text: str):
     cached = _FED_LEX_CACHE[0]
     if cached is not None and cached[0] == text:
         return _FedLexView(cached[1].cmds[:cached[2]], cached[1].events)
-    return _py_lex(text)
+    last = _SF_LEX_LAST[0]
+    if last is not None and last[0] == text:
+        return last[1]  # (T-5571: the stdin-feed reading lexes the text T-5505 just did)
+    lex = _py_lex(text)
+    view = _FedLexView(list(lex.cmds), lex.events)
+    _SF_LEX_LAST[0] = (text, view)
+    return view
 
 
 def _sf_collect_walk(command: str) -> tuple:
@@ -13473,12 +13928,14 @@ def _sf_collect_walk(command: str) -> tuple:
     writers: list = []
     chains: list = []
     info: dict = {"refuse": [], "bulk": [], "inter": False, "home": False, "pathdirs": [],
-                  "envfiles": []}
+                  "envfiles": [], "assigns": {}}
     work = [(command, 0)]
     queued = {command}
+    fed: set = set()  # T-5662: the texts a shell reads from stdin (T-5571 reads those)
     budget = 4 * len(command) + 4096
     while work:
         text, depth = work.pop()
+        info["fed"] = text in fed
         lex = _sf_lexed(text)
         view = text.replace("\\\n", "").translate(_QUOTE_STRIP)
         if "<(" in view and _sf_procsub(view):
@@ -13493,6 +13950,8 @@ def _sf_collect_walk(command: str) -> tuple:
             chains.append(tuple(chain))
         more: list = []
         skip = _sf_not_commands(lex.events)
+        if "$" in view:
+            _sf_assigns(text, lex, info["assigns"])  # T-5662 (before the commands read it)
         for c in lex.cmds:
             if id(c) not in skip:
                 _sf_cmd(c, runs, writers, info)
@@ -13503,7 +13962,9 @@ def _sf_collect_walk(command: str) -> tuple:
         if "PATH" in view:
             _sf_path_rule(lex, view, runs, info)
         if _fed_wanted(text):
-            more.extend(_stdin_fed_codes(text)[0])
+            codes = _stdin_fed_codes(text)[0]
+            fed.update(codes)
+            more.extend(codes)
         for code in more:
             if code in queued:
                 continue
@@ -13622,7 +14083,10 @@ def _sf_path_rule(lex, view: str, runs: list, info: dict) -> None:
             continue
         i = _py_head_index(c.words)
         if i < len(c.words) and "/" not in c.words[i] and i not in c.dyn:
-            name = c.words[i]
+            names = [c.words[i]]
+        else:  # (a bare name built at run time: `_sf_dynhead` fails it closed, T-5662 r3)
+            names = []
+        for name in names:
             for d in dirs:
                 cand = os.path.join(d, name)
                 if os.path.isfile(cand):
@@ -14186,7 +14650,7 @@ def _decide_script_files_impl(data: dict, tool_input: dict, command: str) -> dic
     st["envset"] = st.get("envset") or bool(info["envfiles"])
     st["writers"].extend((w, tuple(cands)) for w in writers)
     st["pathdirs"].extend((d, tuple(cands)) for d in info["pathdirs"])
-    if any(None in ch for ch in chains) and any(_sf_relative(r[0]) for r in runs):
+    if any(None in ch for ch in chains) and any(_sf_relative(r[0]) for r in runs if r[1] != "opd"):
         raise _SfRefused("generic", "it runs a relative script path after a change to a "
                                     "directory built at run time (`cd \"$d\"`, `cd -`, `popd`)")
     seen_real: set = set()
@@ -14197,12 +14661,19 @@ def _decide_script_files_impl(data: dict, tool_input: dict, command: str) -> dic
             if path is None or not os.path.lexists(path):
                 continue
             found = True
+            eff = kind
+            if kind == "opd":  # T-5662: an operand of a command word that may be a shell
+                eff = _sf_opd_kind(path)
+                if eff is None:
+                    continue
             if not os.path.isdir(path):
                 st["runs"].append((word, path))
-            text = _sf_text(path, kind, cwd)
+                if kind == "opd":
+                    st.setdefault("opd", set()).add(path)
+            text = _sf_text(path, eff, cwd)
             if text is None:
                 continue
-            if kind == "src" and located and (not _sf_gate(text, True) or (names and any(
+            if eff == "src" and located and (not _sf_gate(text, True) or (names and any(
                     re.search(r"(?<![\w$])" + re.escape(n) + r"\s*\+?=|"
                               + _SF_NAME_USE.format(re.escape(n)), text) for n in names))):
                 raise _SfRefused("generic", f"the sourced `{word}` may change a path this hook "
@@ -14222,10 +14693,10 @@ def _decide_script_files_impl(data: dict, tool_input: dict, command: str) -> dic
             if not text.strip():
                 continue
             denial = _sf_judge(data, tool_input, text, cwd, cwd_only,
-                               (os.path.abspath(path), real, kind, cwd, _sf_typed(word, path)))
+                               (os.path.abspath(path), real, eff, cwd, _sf_typed(word, path)))
             if denial is not None:
                 return denial
-        if not found:
+        if not found and not (kind == "opd" and not word.lower().endswith(_SF_SHELLISH_EXT)):
             raise _SfRefused("missing", word)
     return None
 
@@ -14257,6 +14728,17 @@ def _sf_final() -> dict | None:
 
 
 def _sf_final_impl() -> dict | None:
+    got = _sf_final_core()
+    # T-5662 r1: every script of the run set is an operand of a command word that may be a shell
+    # (`$PY ok.sh`): the rewrite check fired on the operand the command names, not on a write
+    st = _SF_STATE
+    if got is not None and st.get("opd") and got == _sf_reason("rewrite") and all(
+            path in st["opd"] for _w, path in st["runs"]):
+        return _sf_reason("envhead")
+    return got
+
+
+def _sf_final_core() -> dict | None:
     st = _SF_STATE
     if st.get("envset") and st["inter"]:
         return _sf_reason("startup", "an `ENV=` file is set in one text and an interactive "
@@ -14368,6 +14850,22 @@ def _overflow_checked(data: dict, denial: dict | None) -> dict | None:
 #     the text denies if it uses NAME anywhere outside the words that define it.
 # `hash` without `-p` (`hash git`, `hash -r`, `hash -t git`) only refreshes the path cache and
 # is left alone. One forward pass per reading (linear).
+# T-5598: read flatly, a word in a backtick body or a double-quoted eval / `-c` / ssh string is
+# at the wrong quoting level (`eval "hash -p P \$(echo git)"` runs `$(echo git)`). Rule A
+# (`_RN_ESC_EXPANSION`, everywhere): a word holding an escaped expansion start is built at run
+# time, and an escaped quote or `$` is no literal first character. Rule B (`_rn_in_region`,
+# inside a code region `_rn_find` tracks: a backtick body, a double-quoted code string, the
+# arguments of eval/ssh/watch): any `$` or backtick makes a word run time and turns the T-5600
+# narrowing off (printf only at its `-v` NAME: it writes nothing else). Deny-only, linear.
+# r1: one level down quotes, backslashes, braces and globs are read again too, so a hash/enable
+# operand or an alias NAME holding one is run time there (`_RN_REGION_RENAME`; the quote that
+# closes a code string is trimmed, `_rn_trim_closer`); `eval --`, `builtin --`, `command -p`
+# keep command position (`_RN_LEAD_OPTS`); region ends only grow, under a scan budget.
+# r2: a declare-family word's NAME side (all of a nameref word) holding one of them in a
+# region is run time; an alias word in an eval/ssh/watch argument outside one double-quoted
+# string (`_rn_join_plain`) that does not stay one word once the join removes its quotes is
+# unreadable (`eval alias x='1 git=/usr/bin/sudo'`); a BASH_CMDS/BASH_ALIASES key holding a
+# brace or glob character is unreadable (`declare BASH_CMDS[{git,x}]=...` expands it).
 _RN_ACTIVE = [False]
 _RN_GATE = ("hash", "alias", "enable", "BASH_")
 _RN_RUN = re.compile(r"[^\s;&|()<>`]+")
@@ -14387,6 +14885,11 @@ _RN_ARR_NAME = re.compile(r"BASH_(?:CMDS|ALIASES)(?!\w)")
 _RN_ARR_READ = re.compile(r"\$\{?[!#]?BASH_(?:CMDS|ALIASES)(?!\w)")
 _RN_VERBS = ("hash", "alias", "enable")
 _RN_CODE_HEADS = frozenset({"eval", "watch", "ssh", "su", "sh", "bash", "dash", "zsh", "ksh"})
+_RN_JOIN_HEADS = frozenset({"eval", "watch", "ssh"})  # T-5598: join their arguments as code
+# T-5598 r1: options after which a lead word still runs the next word as its command (`eval
+# -- hash ...`, `builtin -- hash`, `command -p -- hash`, `time -p hash`)
+_RN_LEAD_OPTS = {"eval": frozenset({"--"}), "builtin": frozenset({"--"}),
+                 "command": frozenset({"--", "-p"}), "time": frozenset({"--", "-p"})}
 _RN_C_OPT = re.compile(r"-[A-Za-z]*c")
 # T-5417: mapfile/readarray's `-C CALLBACK` (separate, or glued to its cluster: `-tCcb`, `-C=cb`)
 _RN_CB_HEADS = frozenset({"mapfile", "readarray"})
@@ -14439,11 +14942,136 @@ class _RnText:
     """The text renames are read from, with per-quote memos that keep unterminated-quote
     scans linear (a quote found missing from `i` on is missing from every later `i`)."""
 
-    __slots__ = ("text", "n", "nofrom")
+    __slots__ = ("text", "n", "nofrom", "inner_until", "bt_open", "region_budget", "plain",
+                 "plain_from")
 
     def __init__(self, text: str):
         self.text, self.n = text, len(text)
         self.nofrom = {"'": self.n + 1, '"': self.n + 1, "`": self.n + 1}
+        # T-5598: the end of the code region (`_rn_find`) the reader is in: a word starting
+        # before it is one quoting level down (`_rn_in_region`); `bt_open` memoizes, as
+        # `nofrom` does, the first backtick-body start no bare backtick closes. r1: region
+        # ends only grow, and `region_budget` bounds the characters their scans read (past
+        # it the rest of the text is one region: deny-only, and linear)
+        self.inner_until, self.bt_open = 0, self.n + 1
+        self.region_budget = 4 * self.n + 4096
+        # r2: the characters of eval/ssh/watch arguments that are not one double-quoted
+        # string (`plain`, marked lazily), where the join removes the outer quotes before the
+        # text is read again; every character from `plain_from` on counts as one
+        self.plain, self.plain_from = None, self.n + 1
+
+
+def _rn_mark_join(t: _RnText, words: list) -> None:
+    """T-5598 r2: mark the join arguments `words` (as `_rn_args` reads them) that are not one
+    double-quoted string as plain (`_rn_join_plain`). Marking costs no more than the scan that
+    read them (bounded by `region_budget`)."""
+    for a, e, *_rest in words:
+        if t.text[a] == '"' and _rn_dq_end(t, a) == e:
+            continue
+        if t.plain is None:
+            t.plain = bytearray(t.n + 1)
+        t.plain[a:e] = b"\x01" * (e - a)
+
+
+def _rn_join_plain(t: _RnText, a: int) -> bool:
+    """T-5598 r2: True if position `a` lies in a plain eval/ssh/watch argument (above)."""
+    return a >= t.plain_from or (t.plain is not None and a < t.n and t.plain[a] == 1)
+
+
+def _rn_grow_region(t: _RnText, start: int, end: int) -> None:
+    """T-5598 r1: a code region from `start` to `end` (the scan that found it read about
+    `end - start` characters, charged to the budget; spent, the region runs to the end).
+    Callers scan only while `inner_until < n`: a region reaching the end cannot grow, so the
+    budget bounds the scanned characters to about `4 n` (linear)."""
+    t.region_budget -= max(0, end - start)
+    t.inner_until = max(t.inner_until, end if t.region_budget >= 0 else t.n)
+
+
+# T-5598 (Rule A, escape level): a backslash before an expansion start protects it from ONE
+# level of evaluation, and the reader is flat (it cannot tell the level a word is at): in a
+# backtick body or a double-quoted eval / `-c` / ssh string, `\$(echo git)` and `` \`echo
+# git\` `` are substitutions when the string runs. A word holding one (`` \` ``, or `\$` before
+# a character that starts an expansion: `\$%`, `\$ ` start none) is built at run time.
+_RN_ESC_EXPANSION = re.compile(r"\\(?:`|\$(?=[A-Za-z0-9_({@*#?$!'\"-]))")
+
+
+# T-5598 r1: one level down, a quote, backslash, brace or glob character is read again too
+# (`eval hash "'-p'"` runs `hash '-p'`; `bash -c "hash \"-p\" ..."`; `eval hash ... '{git,x}'`).
+# The rename words (hash/enable operands, an alias NAME) are run time if they hold any of
+# them in a code region; a variable writer's words keep `$`/backtick (its NAME side is read
+# by the BASH_* word rule and the glob rule: `BASH_CMDS[git]` holds `[`).
+_RN_REGION_RUNTIME = "$`"
+_RN_REGION_RENAME = "$`'\"\\{}*?["
+
+
+def _rn_in_region(t: _RnText, a: int, e: int, chars: str = _RN_REGION_RUNTIME) -> bool:
+    """T-5598 (Rule B, quote level): True if the word `text[a:e]` starts inside a code region
+    and holds one of `chars` anywhere: one level down the reader's quotes need not be the
+    shell's (`eval hash '"-$q"'` runs `hash "-$q"`), so its value is built at run time."""
+    if a >= t.inner_until:
+        return False
+    raw = _rn_trim_closer(t.text[a:e])
+    return any(c in raw for c in chars)
+
+
+def _rn_trim_closer(raw: str) -> str:
+    """T-5598 r1: `raw` less a last quote character no other quote of its kind in it pairs
+    with (unescaped, outside the other kind of quote): read flatly, the quote that closes a
+    code string sticks to its last word (`eval "hash -r"` reads `-r"`), and one level down it
+    is gone."""
+    if not raw or raw[-1] not in "'\"":
+        return raw
+    q, k, n, quote, odd = raw[-1], 0, len(raw), "", False
+    while k < n:
+        c = raw[k]
+        if quote == "'":
+            if c == "'":
+                quote = ""
+        elif c == "\\":
+            k += 1
+        elif quote == '"':
+            if c == '"':
+                quote = ""
+        elif c in "'\"":
+            quote = c
+            if k == n - 1:
+                odd = c == q
+        k += 1
+    return raw[:-1] if odd else raw
+
+
+def _rn_lit(t: _RnText, a: int, e: int) -> bool:
+    """`_rn_literal_head` of the word `text[a:e]`, off (False) inside a code region (T-5598
+    Rule B: there a quote may be no quote, so no first character is known to be literal)."""
+    return a >= t.inner_until and _rn_literal_head(t.text[a:e])
+
+
+def _rn_dq_end(t: _RnText, j: int) -> int:
+    """T-5598: the end of the double-quoted string opening at `j` (`\\X` skipped; the end of
+    the text when no quote closes it, memoized as `_rn_word` does)."""
+    text, n = t.text, t.n
+    k = j + 1 if j < t.nofrom['"'] else n
+    while k < n and text[k] != '"':
+        k += 2 if text[k] == "\\" else 1
+    if k >= n:
+        t.nofrom['"'] = min(t.nofrom['"'], j)
+        return n
+    return k + 1
+
+
+def _rn_bt_end(t: _RnText, j: int) -> int:
+    """T-5598: the end of the backtick body opening at `j`: past the next backtick no
+    backslash escapes (a nested one is `` \\` ``); the end of the text when none closes it."""
+    text, n = t.text, t.n
+    if j >= t.bt_open:
+        return n
+    k = j + 1
+    while k < n and text[k] != "`":
+        k += 2 if text[k] == "\\" else 1
+    if k >= n:
+        t.bt_open = min(t.bt_open, j)
+        return n
+    return k + 1
 
 
 # T-5491: a quoted expansion bash still splits into one word per element: `"$@"`, `"${@:2}"`,
@@ -14544,9 +15172,13 @@ def _rn_word_run(t: _RnText, i: int) -> tuple:
     return i + len(run), run.translate(_QUOTE_STRIP), dyn, dyn
 
 
-def _rn_args(t: _RnText, i: int) -> tuple:
+def _rn_args(t: _RnText, i: int, region: str | None = _RN_REGION_RUNTIME) -> tuple:
     """(end, words) of the arguments from `i` to the end of the simple command: each word
-    as `_rn_word` reads it, with its raw start; redirections (`2>/dev/null`) are skipped."""
+    as `_rn_word` reads it, with its raw start; redirections (`2>/dev/null`) are skipped.
+    T-5598: a word holding an escaped expansion (Rule A, `_RN_ESC_EXPANSION`) or, with
+    `region` (a character set; None: off), one of those characters inside a code region
+    (Rule B, `_rn_in_region`) is built at run time and may split (one level down it may be
+    unquoted)."""
     text, n = t.text, t.n
     words = []
     while True:
@@ -14568,6 +15200,10 @@ def _rn_args(t: _RnText, i: int) -> tuple:
         if end < n and text[end] in "<>" and value.isdigit() and not dyn:
             i = end  # an fd number: the redirection is skipped next
             continue
+        # (the lookahead may read the character after the word: `\$(` ends a word at `(`)
+        if not splits and (_RN_ESC_EXPANSION.search(text, i, min(end + 1, n))
+                           or (region and _rn_in_region(t, i, end, region))):
+            dyn = splits = True  # T-5598: run time one quoting level down
         words.append((i, end, value, dyn, splits))
         i = end
 
@@ -14625,8 +15261,8 @@ def _rn_literal_head(raw: str) -> bool:
                     return False
                 ch = nn if nn in '$`"\\' else "\\"
         elif c == "\\":
-            if nxt in ("\n", ""):
-                return False
+            if nxt in ("\n", "") or nxt in "$`\"'\\":
+                return False  # (T-5598: one level down `\"`, `\$` are a quote, an expansion)
             ch = nxt
         elif c in "$`~":
             return False  # (an unquoted `~` expands: `~-` is $OLDPWD, `~+` $PWD, `~u` a home)
@@ -14675,16 +15311,18 @@ def _rn_hash_like(t: _RnText, cmd: str, i: int, found: _RnFound) -> int:
 
     T-5600: a run-time word whose first character is literal and safe (`_rn_literal_head`:
     `hash "x$c"`) cannot be an option: it is the first name (options end there), and for
-    `enable` a builtin name. `hash "$c"` still fails closed (use `hash -- "$c"`)."""
-    end, words = _rn_args(t, i)
-    if cmd == "enable" and any(w[3] and not _rn_literal_head(t.text[w[0]:w[1]]) for w in words):
+    `enable` a builtin name. `hash "$c"` still fails closed (use `hash -- "$c"`).
+    T-5598 r1: in a code region a word holding a quote, backslash, brace or glob is run time
+    too (`_RN_REGION_RENAME`: `eval hash "'-p'" ...` runs `hash '-p' ...`)."""
+    end, words = _rn_args(t, i, _RN_REGION_RENAME)
+    if cmd == "enable" and any(w[3] and not _rn_lit(t, w[0], w[1]) for w in words):
         raise _RnRuntimeArg(end, _RN_RUNTIME_ARG_DENY)
     opt = _RN_OPTS[cmd]
     path, has_opt, k = None, False, 0
     while k < len(words):
         _a, _e, value, dyn, _s = words[k]
         if dyn:
-            if _rn_literal_head(t.text[_a:_e]):
+            if _rn_lit(t, _a, _e):
                 break  # T-5600: the first name (the NAME rule below reads it under `-p`)
             raise _RnRuntimeArg(end, _RN_RUNTIME_ARG_DENY)
         if value == "--":
@@ -14742,12 +15380,28 @@ def _rn_writer_args(t: _RnText, head: str, i: int) -> None:
 
     Rules per site: a declare-family word and a read/mapfile/readarray NAME (or `-a`/`-v`
     value) use the NAME rule (strict: `"B$x[git]="` may build BASH_CMDS); only the printf
-    FORMAT word, an option position, is narrowed by T-5600 (`printf "Total $n\n"`)."""
-    end, words = _rn_args(t, i)
+    FORMAT word, an option position, is narrowed by T-5600 (`printf "Total $n\n"`).
+
+    T-5598: printf writes only through `-v`, so in a code region (Rule B) only its `-v` NAME
+    is read one quoting level down; its format and arguments are read as at top level (Rule
+    A still applies: `printf \\"\\$f\\"` in `eval "..."` is `printf "$f"`)."""
+    end, words = _rn_args(t, i, region=None if head == "printf" else _RN_REGION_RUNTIME)
     text = t.text
     if head in _RN_DECL_HEADS:
         nameref = False
         for a, e, value, dyn, _s in words:
+            if a < t.inner_until:
+                # T-5598 r2: one level down a quote, brace or glob in the NAME side (before
+                # `=`; all of a nameref's word, whose value is a name) is read again:
+                # `eval declare 'BASH_CMDS[{git,x}]=...'`, `eval declare -n r=BASH_'{,C}MDS'`.
+                # The VALUE side keeps `$`/backtick (`export PATH=\"\$HOME/bin\"` is fine)
+                # (a word with no `=` assigns nothing unless an expansion builds one, which
+                # the `dyn` rule reads: `export MSG=\"hello world\"` splits flatly)
+                raw = text[a:e]
+                eq = raw.find("=")
+                side = raw if nameref else raw[:eq]
+                if eq >= 0 and any(c in _rn_trim_closer(side) for c in _RN_REGION_RENAME):
+                    raise _RnRuntimeArg(end, _RN_RUNTIME_NAME_DENY)
             if not dyn:
                 if value[:1] in "-+" and "=" not in value and "n" in value[1:]:
                     nameref = True
@@ -14791,7 +15445,7 @@ def _rn_writer_args(t: _RnText, head: str, i: int) -> None:
         glued = raw[x + 1:]
         if not glued:
             if k < n:
-                if take in names and words[k][3]:
+                if take in names and (words[k][3] or _rn_in_region(t, words[k][0], words[k][1])):
                     raise _RnRuntimeArg(end, _RN_RUNTIME_NAME_DENY)
                 k += 1
         elif take in names and any(c in _RN_RUNTIME_CHARS for c in glued):
@@ -14809,6 +15463,23 @@ def _rn_alias(t: _RnText, i: int, found: _RnFound) -> int:
     """`alias` arguments from `i`: each `NAME=VALUE` word is a rename."""
     end, words = _rn_args(t, i)
     for a, e, value, dyn, splits in words:
+        if _rn_join_plain(t, a) and any(c in t.text[a:e] for c in "'\"\\"):
+            # T-5598 r2: eval/ssh/watch remove these quotes before the text is read again: the
+            # word is read again as the value they leave, and one that does not stay one word
+            # there splits into a second NAME=VALUE (`eval alias x='1 git=/usr/bin/sudo'`);
+            # `eval alias ll="'ls -l'"` stays one word (`ll='ls -l'`)
+            again = _RnText(value)
+            if _rn_word(again, 0)[0] < again.n:
+                raise _RnUnknown(end)
+        if a < t.inner_until:
+            # T-5598 r1: in a code region the NAME side (before `=`) is read again one level
+            # down (`bash -c "alias \"git\"=/usr/bin/sudo"`); its VALUE keeps the rules below
+            # (a word with no `=` can become NAME=VALUE one level down only by an expansion,
+            # which the `dyn` rule below reads: `alias g=\"git status\"` splits flatly)
+            raw = t.text[a:e]
+            eq = raw.find("=")
+            if eq >= 0 and any(c in raw[:eq] for c in _RN_REGION_RENAME):
+                raise _RnUnknown(end)
         if not dyn:
             name, eq, val = value.partition("=")
             if eq and any(c in _RN_STOP for c in name):
@@ -14863,14 +15534,21 @@ def _rn_arrays(t: _RnText, found: _RnFound) -> list:
 
 
 def _rn_arr_item(t: _RnText, kind: str, key: str, at: int, found: _RnFound) -> int:
-    """One `[KEY]=VALUE` of BASH_CMDS / BASH_ALIASES, the value read from `at`."""
-    if any(c in key for c in "$`"):
+    """One `[KEY]=VALUE` of BASH_CMDS / BASH_ALIASES, the value read from `at`.
+    T-5598 r2: a key holding a brace or glob character, quoted or not, is unreadable: as a
+    declare/typeset/local argument (or one level down) the word is brace- and glob-expanded
+    (`declare BASH_CMDS[{git,x}]=/usr/bin/sudo` writes BASH_CMDS[git]). A plain assignment
+    word is not expanded, but the reader does not tell the two apart: it fails closed."""
+    if any(c in key for c in "$`{}*?["):
         raise _RnUnknown
     key = key.translate(_QUOTE_STRIP)
     if not key or any(c in _RN_STOP for c in key):
         raise _RnUnknown  # r2: a key no command word can match as read here (`[ x ]`)
     if at < t.n and t.text[at] not in _RN_STOP:
         end, value, dyn, _s = _rn_word(t, at)
+        # T-5598: a `$` or backtick, quoted or escaped, may be live one level down
+        # (`eval "BASH_CMDS[x]=\$(echo /usr/bin/git)"`)
+        dyn = dyn or "$" in t.text[at:end] or "`" in t.text[at:end]
     else:
         end, value, dyn = at, "", False
     if kind == "cmd" and (dyn or not os.path.basename(value)):
@@ -14899,11 +15577,15 @@ def _rn_find(text: str) -> _RnFound:
     found = _RnFound()
     parsed = _rn_arrays(t, found) if "BASH_" in text else []
     comments = _rn_comments(text)
-    skip, at_cmd, head, prev = 0, True, None, ""
+    skip, at_cmd, head, prev, lead = 0, True, None, "", None
     for m in _RN_TOK.finditer(text):
         raw = m.group()
         if raw in _RN_SEP_TOKENS:
-            at_cmd, head, prev = True, None, ""
+            if raw == "`" and m.start() >= t.inner_until:
+                # T-5598: a backtick body (one opening inside a region is its closer or a
+                # nested, escaped one)
+                _rn_grow_region(t, m.start(), _rn_bt_end(t, m.start()))
+            at_cmd, head, prev, lead = True, None, "", None
             continue
         if m.start() < skip:
             continue  # an argument of the rename read last
@@ -14915,7 +15597,27 @@ def _rn_find(text: str) -> _RnFound:
             # r3 (G1): a quoted string that may be code (`bash -c "{ hash ...; }"`) starts a
             # command: its lead words (`{`, `time`, `!`, `builtin`, `FOO=1`, `if`) keep that
             # position exactly as at top level
-            at_cmd = True
+            at_cmd, lead = True, None
+            if raw[0] == '"' and t.inner_until < t.n:
+                # T-5598: a double-quoted code string (a single-quoted one is read verbatim);
+                # r1: also inside an open region, whose end may be a false one (a backtick
+                # between single quotes opens a "body" the tokenizer cannot tell from one)
+                _rn_grow_region(t, m.start(), max(_rn_dq_end(t, m.start()), _rn_word(t, m.start())[0]))
+        if at_cmd and word in _RN_JOIN_HEADS:
+            # T-5598: eval / ssh / watch join their arguments and run them as code: the rest
+            # of the simple command is one quoting level down (`eval hash '"-$q"'`); r1:
+            # also inside an open region (ends only grow; `region_budget` keeps it linear).
+            # r2: its arguments outside one double-quoted string are marked plain; once the
+            # scans stop, everything after it counts as plain (fail closed)
+            if t.inner_until < t.n:
+                j_end, j_words = _rn_args(t, m.end(), region=None)
+                _rn_grow_region(t, m.end(), j_end)
+                if t.region_budget >= 0:
+                    _rn_mark_join(t, j_words)
+                else:
+                    t.plain_from = min(t.plain_from, m.end())
+            else:
+                t.plain_from = min(t.plain_from, m.end())
         if not at_cmd and head in _RN_CB_HEADS:
             # T-5417: a mapfile/readarray `-C CALLBACK` runs as code in this shell: its first
             # word is at command position (`-C 'hash -p ...'`, `-tC hash`); a callback glued
@@ -14935,8 +15637,11 @@ def _rn_find(text: str) -> _RnFound:
             if word in _RN_LEAD_WORDS or assign:
                 if word == "eval":
                     head = word  # (its words are code: an assignment there runs)
+                lead = word
+            elif lead in _RN_LEAD_OPTS and word in _RN_LEAD_OPTS[lead]:
+                pass  # T-5598 r1: `eval --`, `command -p`, `builtin --` keep command position
             else:
-                head, at_cmd = word, False
+                head, at_cmd, lead = word, False, None
         if heads and not assign and any(c in raw for c in "${}*?[") and _rn_spells_verb(word):
             raise _RnUnknown  # a rename verb an expansion, brace or glob builds
         if runs and (word in _RN_DECL_HEADS or word in _RN_NAME_HEADS):
@@ -15745,15 +16450,30 @@ def _gc_codes(command: str):
     """The command-valued git config codes of `command` (see the comment above), in order and
     without repeats, or `_GC_UNREADABLE`."""
     flat = command.replace("\\\n", "").translate(_QUOTE_STRIP)
-    if "git" not in flat or not _GC_GATE.search(flat):
+    env_on = _ge_gate(flat)  # T-5637: environment variables git or a pager runs
+    git_on = "git" in flat and (env_on or bool(_GC_GATE.search(flat)))
+    if not (git_on or env_on):
         return []
+    if env_on and _GE_EXPANSION.search(flat):
+        return _GE_UNREADABLE  # `${PAGER:=...}` sets it from text this reading cannot see
     lex = _py_lex(command)
     _py_expand_code(lex, skip_unknown=True)
     out = _GcOut()
+    kv: dict = {}
+    lits = _ge_literals(lex.cmds) if env_on else {}
+    # `named`: a tracked name is spelled somewhere (r2: in the lexed words too, where `$'GIT_\x45DITOR'`
+    # is decoded, or a `$'`/`$"` quoting is there for the decode to hide a name behind)
+    named = env_on and (bool(_GE_NAMES_RE.search(flat)) or "$'" in flat or '$"' in flat
+                        or any(_GE_NAMES_RE.search(w) for c in lex.cmds for w in c.words))
     for c in lex.cmds:
-        for j, w in enumerate(c.words):
-            if os.path.basename(w) == "git" and not _gc_git_codes(c, j, out):
-                return _GC_UNREADABLE
+        if git_on:
+            for j, w in enumerate(c.words):
+                if os.path.basename(w) == "git" and not _gc_git_codes(c, j, out):
+                    return _GC_UNREADABLE
+        if env_on and not _ge_cmd(c, out, kv, lits, named):
+            return _GE_UNREADABLE
+    if kv and not _ge_pairs(kv, out):
+        return _GE_UNREADABLE
     if out.aliases and _gc_alias_uses(out) is _GC_UNREADABLE:
         return _GC_UNREADABLE
     return [x for x in dict.fromkeys(out) if x.strip()]
@@ -15799,6 +16519,8 @@ def _decide_gitcfg(data: dict, tool_input: dict, command: str) -> dict | None:
     codes = _gc_codes(command)
     if codes is _GC_UNREADABLE:
         return _GC_UNREADABLE_DENY
+    if codes is _GE_UNREADABLE:
+        return _GE_UNREADABLE_DENY
     outer = _GC_ACTIVE[0]
     if outer == 0:
         _GC_JUDGED[0] = set()
@@ -15823,6 +16545,285 @@ def _decide_gitcfg(data: dict, tool_input: dict, command: str) -> dict | None:
     finally:
         _GC_ACTIVE[0], _DC_ACTIVE[0] = outer, dc
     return None
+
+
+# --- T-5637: command-valued environment variables, read as code ---
+# The environment sibling of T-5414. git (and the pagers and helpers it starts) run the value of
+# some environment variables as a command: `GIT_SSH_COMMAND='sudo ls' git fetch`,
+# `GIT_EDITOR='sudo ls' git commit`, `GIT_PAGER=... git log`, `PAGER`, `EDITOR`, `VISUAL`,
+# `GIT_EXTERNAL_DIFF`, `GIT_ASKPASS`/`SSH_ASKPASS`, `GIT_PROXY_COMMAND`, `GIT_SSH`, `BROWSER`,
+# `MANPAGER`, and `LESSOPEN`/`LESSCLOSE` (less runs them through a shell when a pager starts).
+# To every other rule the value was an argument. `_gc_codes` (T-5414) now also reads, in every
+# lexed simple command (code strings included), the assignments in these positions: the
+# leading `NAME=value` words; the arguments of export/declare/typeset/readonly/local; and the
+# words after `env` (past its options and nested wrappers: env, command, exec, nohup, nice,
+# time, ...; an `env -S STRING` is judged as a code string). An assignment is read wherever the
+# variable's name appears in the text (the gate does not need a `git` word: `PAGER=... man x`).
+# A value is judged as code by every rule as a T-5414 code is (`_decide_gitcfg`), deny-only;
+# `LESSOPEN`/`LESSCLOSE` lose their leading `|`/`||`/`-`. GIT_CONFIG_PARAMETERS (`'k'='v'`
+# words) and GIT_CONFIG_COUNT with GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n (every KEY and VALUE of
+# an index, anywhere in the command, are paired) go through `_gc_pair`, the T-5414 key check
+# itself. Fails closed (`_GE_UNREADABLE_DENY`): a value built at run time; a variable name
+# built at run time in an export-style or env argument; the variable set where the guard
+# cannot read the value (`read`, `mapfile`, `printf -v`, `getopts`, `for`/`select`,
+# `declare -n`, `${NAME:=...}`); and the path-valued variables (GIT_EXEC_PATH: helpers git
+# execs; GIT_TEMPLATE_DIR: hooks `git init` copies; GIT_CONFIG_GLOBAL/SYSTEM: a config file)
+# off their default values, as core.hooksPath is.
+_GE_CODE_VARS = frozenset({
+    "GIT_SSH_COMMAND", "GIT_SSH", "GIT_PROXY_COMMAND", "GIT_ASKPASS", "SSH_ASKPASS", "GIT_EDITOR",
+    "GIT_SEQUENCE_EDITOR", "GIT_PAGER", "GIT_EXTERNAL_DIFF", "PAGER", "EDITOR", "VISUAL", "BROWSER",
+    "MANPAGER", "LESSOPEN", "LESSCLOSE"})
+_GE_PATH_VARS = {
+    "GIT_EXEC_PATH": frozenset({"/usr/lib/git-core", "/usr/libexec/git-core"}),
+    "GIT_TEMPLATE_DIR": frozenset({"", "/dev/null", "/usr/share/git-core/templates"}),
+    "GIT_CONFIG_GLOBAL": frozenset({"/dev/null", "~/.gitconfig", "$HOME/.gitconfig",
+                                    "${HOME}/.gitconfig", os.path.expanduser("~/.gitconfig")}),
+    "GIT_CONFIG_SYSTEM": frozenset({"/dev/null", "/etc/gitconfig"}),
+}
+_GE_NAMES = sorted(_GE_CODE_VARS | set(_GE_PATH_VARS) | {"GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"})
+_GE_ALT = "|".join(_GE_NAMES) + r"|GIT_CONFIG_(?:KEY|VALUE)_\d+"
+_GE_TRACKED = re.compile(r"(?:" + _GE_ALT + r")\Z")
+# the gate: a tracked name, or an `=` with a word that can set a variable whose name the text
+# does not spell (`env "$k=$v" git log`)
+_GE_NAMES_RE = re.compile(r"(?<![A-Za-z0-9_])(?:" + "|".join(_GE_NAMES) + r"|GIT_CONFIG_(?:KEY|VALUE)_)")
+_GE_SETTER_RE = re.compile(r"(?<![A-Za-z0-9_])(?:export|declare|typeset|readonly|local|env)(?![A-Za-z0-9_])")
+_GE_DYN_TOKEN = re.compile(r"(\$\{[^}]*\}|\$[A-Za-z0-9_@*#?!$-]+|[\0\1`]|\$\()")
+_GE_VAR_TOKEN = re.compile(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?\Z")
+_GE_LIT_ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\+?=(.*)\Z", re.S)
+_GE_LIT_MAX = 8  # literal values kept per variable name
+
+
+_GE_ENV_RE = re.compile(r"(?<![A-Za-z0-9_])env(?![A-Za-z0-9_])")
+
+
+# r2: a runner that substitutes or appends arguments to the command it runs: with an `env` among
+# its words, the words it supplies (`xargs -a f -I{} env {} git commit`) may be a NAME=VALUE
+_GE_RUNNERS = frozenset({"xargs", "parallel", "find", "fd", "entr", "watch"})
+_GE_RUNNER_RE = re.compile(r"(?<![A-Za-z0-9_])(?:xargs|parallel|find|fd|entr|watch)(?![A-Za-z0-9_])")
+# every tracked name holds one of these (a substring test before the regexes: `_GE_NAMES_RE`
+# tries ~25 alternatives at each position of a large text)
+_GE_KEYS = ("GIT_", "PAGER", "EDITOR", "VISUAL", "BROWSER", "ASKPASS", "LESS")
+
+
+def _ge_gate(flat: str) -> bool:
+    # (r1: an `env` with a run-time word, which may supply a NAME=VALUE: `env $(cat f) git`;
+    # r2: an `env` and a runner)
+    if any(k in flat for k in _GE_KEYS) and _GE_NAMES_RE.search(flat):
+        return True
+    if "=" in flat and _GE_SETTER_RE.search(flat):
+        return True
+    return "env" in flat and bool(_GE_ENV_RE.search(flat) and (
+        ("$" in flat or "`" in flat) or _GE_RUNNER_RE.search(flat)))
+
+
+def _ge_literals(cmds) -> dict:
+    """NAME -> the literal values the command text assigns it (None: a value built at run time,
+    or past `_GE_LIT_MAX` of them): what `$NAME` in a variable name may stand for."""
+    lits: dict = {}
+    for c in cmds:
+        for j, w in enumerate(c.words):
+            m = _GE_LIT_ASSIGN.match(w)
+            if m is None:
+                continue
+            seen = lits.setdefault(m.group(1), set())
+            if seen is None:
+                continue
+            if _gc_dynamic(c, j, w) or len(seen) >= _GE_LIT_MAX:
+                lits[m.group(1)] = None
+            else:
+                seen.add(m.group(2))
+    return lits
+
+
+def _ge_may_name(text: str, lits: dict) -> bool:
+    """True if `text` (the part of a word before its `=`, run-time pieces left as written) may
+    spell a tracked variable's name: a `$x` whose literal values the command assigns stands for
+    them (`x=BASHOPT; env ${x}S=...`), any other run-time piece for anything."""
+    pieces = _GE_DYN_TOKEN.split(text)
+    if len(pieces) == 1:
+        return False
+    parts = []
+    for k, piece in enumerate(pieces):
+        if k % 2 == 0:
+            parts.append(re.escape(piece))
+            continue
+        m = _GE_VAR_TOKEN.match(piece)
+        vals = lits.get(m.group(1)) if m else None
+        parts.append("(?:" + "|".join(re.escape(v) for v in sorted(vals)) + ")" if vals else ".*")
+    pat = re.compile("".join(parts), re.S)
+    return any(pat.fullmatch(name) for name in _GE_SAMPLES)
+_GE_SAMPLES = _GE_NAMES + ["GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"]
+_GE_ASSIGN = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?(\+?)=", re.S)  # (`NAME[0]=` is NAME's value)
+_GE_KV = re.compile(r"GIT_CONFIG_(KEY|VALUE)_(\d+)\Z")
+_GE_EXPANSION = re.compile(r"\$\{(?:" + _GE_ALT + r")(?:\[[^\]]*\])?:?=")
+_GE_DECLARERS = frozenset({"export", "declare", "typeset", "readonly", "local"})
+_GE_SETTERS = frozenset({"read", "mapfile", "readarray", "getopts"})
+_GE_WRAPPERS = frozenset({"env", "command", "builtin", "exec", "nohup", "nice", "time", "setsid",
+                          "timeout", "stdbuf", "ionice"})
+_GE_ENV_ARG_OPTS = frozenset({"-u", "--unset", "-C", "--chdir", "-a", "--argv0"})
+_GE_PAIR_MAX = 256  # KEY x VALUE combinations judged per index
+_GE_DYN = object()  # a GIT_CONFIG_KEY_n/VALUE_n built at run time
+_GE_UNREADABLE = object()
+_GE_UNREADABLE_DENY = _deny(
+    "BLOCKED (worker-guard, T-5637): this command sets an environment variable that git or a "
+    "pager runs as a command (GIT_SSH_COMMAND, GIT_EDITOR, GIT_PAGER, PAGER, EDITOR, "
+    "GIT_EXTERNAL_DIFF, *ASKPASS, LESSOPEN, ...), injects git config through GIT_CONFIG_*, or "
+    "points GIT_EXEC_PATH / GIT_TEMPLATE_DIR / GIT_CONFIG_GLOBAL / GIT_CONFIG_SYSTEM off their "
+    "defaults, and the guard cannot read it: the value (or the variable name) is built at run "
+    "time, is set by read/mapfile/printf -v/a ${NAME:=...} expansion, or is a path the guard "
+    "cannot vouch for; refused (fail-closed). Spell the value out literally, or run the "
+    "command it names directly."
+)
+
+
+def _ge_tracked_name(word: str) -> bool:
+    return bool(_GE_TRACKED.match(word.partition("[")[0]))
+
+
+def _ge_value(c: _PyCmd, j: int, name: str, value: str, out: list, kv: dict,
+              append: bool = False) -> bool:
+    """Judge one `NAME=value` (word `j` of `c`): add its code to `out` (or the config pair to
+    `kv`); False to fail closed. r1: `NAME+=value` on a tracked name fails closed: the shell
+    assembles the value from pieces this reading judges one at a time (`E=s E+=udo`)."""
+    if append and _ge_tracked_name(name):
+        return False
+    dyn = _gc_dynamic(c, j, c.words[j])
+    k = _GE_KV.match(name)
+    if k is not None:
+        kv.setdefault((k.group(1), k.group(2)), {}).setdefault(_GE_DYN if dyn else value, (c, j))
+        return True
+    if not (name in _GE_CODE_VARS or name in _GE_PATH_VARS or name == "GIT_CONFIG_PARAMETERS"):
+        return True
+    if dyn:
+        return False
+    if name in _GE_PATH_VARS:
+        return value in _GE_PATH_VARS[name]
+    if name == "GIT_CONFIG_PARAMETERS":
+        try:
+            toks = shlex.split(value)
+        except ValueError:
+            return False
+        return all(_gc_pair(c, j, *tok.partition("=")[::2], j, out) for tok in toks)
+    if name in ("LESSOPEN", "LESSCLOSE"):
+        value = value.lstrip("|-")
+    if value.strip():
+        out.append(value)
+    return True
+
+
+def _ge_declare(c: _PyCmd, k: int, out: list, kv: dict, lits: dict, named: bool = True,
+                nameref_ok: bool = False) -> bool:
+    """The arguments of export/declare/... from word `k` on. `named`: the command text spells a
+    tracked variable's name somewhere. `nameref_ok`: `-n` is not a nameref flag here (export,
+    readonly: `export -n` only drops the export attribute)."""
+    words, nameref = c.words, False
+    for j in range(k, len(words)):
+        w = words[j]
+        if w.startswith("-") and w != "-":
+            nameref = nameref or (not nameref_ok and not w.startswith("--") and "n" in w)
+            continue
+        m = _GE_ASSIGN.match(w)
+        base = m.group(1) if m else w.partition("=")[0]
+        if nameref and (_ge_tracked_name(base) or named or m is None or _gc_dynamic(c, j, w)):
+            # r1: the name refers to another variable, so a later `ref=value` is a write to the
+            # target, and this reading cannot follow it: fails closed when the command spells a
+            # tracked name anywhere (the target may be it: `declare -n r=GIT_EDITOR`, `r=GIT_EDITOR`
+            # later, `x=GIT_EDITOR; declare -n x`), when the target is built at run time or when
+            # none is given (`declare -n r` takes the variable's own value as target).
+            return False
+        if m:
+            if not _ge_value(c, j, m.group(1), w[m.end():], out, kv, bool(m.group(2))):
+                return False
+        elif _gc_dynamic(c, j, base) and _ge_may_name(base, lits):
+            return False  # (a name built at run time: `export "$k=v"`, `export $(echo PAGER=x)`)
+    return True
+
+
+def _ge_cmd(c: _PyCmd, out: list, kv: dict, lits: dict, named: bool = True) -> bool:
+    """T-5637: the environment assignments of one simple command; False to fail closed."""
+    words, n = c.words, len(c.words)
+    if n >= 2 and words[0] in ("for", "select") and _ge_tracked_name(words[1]):
+        return False
+    i = 0
+    while i < n and words[i] in _PY_RESERVED:
+        i += 1
+    while i < n and (m := _GE_ASSIGN.match(words[i])):
+        if not _ge_value(c, i, m.group(1), words[i][m.end():], out, kv, bool(m.group(2))):
+            return False
+        i += 1
+    while i < n:
+        b = os.path.basename(words[i])
+        if b in _GE_DECLARERS:
+            return _ge_declare(c, i + 1, out, kv, lits, named, b in ("export", "readonly"))
+        if b in _GE_SETTERS:
+            return not any(_ge_tracked_name(w) for w in words[i + 1:])
+        if b == "printf":  # `printf -v NAME ...`
+            return not any(w == "-v" and t + 1 < n and _ge_tracked_name(words[t + 1])
+                           or w.startswith("-v") and _ge_tracked_name(w[2:])
+                           for t, w in enumerate(words) if t > i)
+        if b in _GE_RUNNERS and any(os.path.basename(w) == "env" for w in words[i + 1:]):
+            return False  # (r2: the words the runner supplies may be env's NAME=VALUE)
+        if b not in _GE_WRAPPERS:
+            # (an `env` further on: `xargs -I{} env A=1 cmd`, `find -exec env A=1 cmd \;`)
+            nxt = next((t for t in range(i + 1, n) if os.path.basename(words[t]) == "env"), None)
+            if nxt is None:
+                break
+            i = nxt
+            continue
+        is_env = b == "env"
+        i += 1
+        while i < n:
+            w = words[i]
+            if (m := _GE_ASSIGN.match(w)):
+                if not _ge_value(c, i, m.group(1), w[m.end():], out, kv, bool(m.group(2))):
+                    return False
+                i += 1
+            elif is_env and "=" not in w and not w.startswith("-") and i in c.dyn:
+                # r1: a run-time word in env's argument position can split into (or be) a
+                # NAME=VALUE the shell supplies (`env $(cat envfile) git commit`); the text of
+                # its value is not visible, so it cannot be judged
+                return False
+            elif is_env and "=" in w and _gc_dynamic(c, i, w.partition("=")[0]) \
+                    and _ge_may_name(w.partition("=")[0], lits):
+                return False
+            elif w == "--":
+                i += 1
+            elif is_env and (w in ("-S", "--split-string") or w.startswith("--split-string=")
+                             or (w.startswith("-S") and not w.startswith("--"))):
+                s = words[i + 1] if w in ("-S", "--split-string") and i + 1 < n else (
+                    w.partition("=")[2] if w.startswith("--") else w[2:])
+                at = i + 1 if w in ("-S", "--split-string") else i
+                if s and _gc_dynamic(c, at, s):
+                    return False
+                if _GE_NAMES_RE.search(s):
+                    out.append(s)  # (the other rules read an env -S string's other words)
+                i = at + 1
+            elif w.startswith("-") and w != "-":
+                i += 2 if is_env and w in _GE_ENV_ARG_OPTS else 1
+            elif not is_env and w.rstrip("smhd").isdigit():
+                i += 1  # `nice -n 5`, `timeout 5`
+            else:
+                break
+    return True
+
+
+def _ge_pairs(kv: dict, out: list) -> bool:
+    """Pair each GIT_CONFIG_KEY_n with each GIT_CONFIG_VALUE_n and judge them as `-c KEY=VALUE`."""
+    for (kind, idx), keys in kv.items():
+        if kind != "KEY":
+            continue
+        values = kv.get(("VALUE", idx), {})
+        if len(keys) * len(values) > _GE_PAIR_MAX:
+            return False
+        for key, (c, j) in keys.items():
+            if key is _GE_DYN:
+                return False
+            if not _gc_runs_code(key):
+                continue
+            for value in values:
+                if value is _GE_DYN or not _gc_pair(c, j, key, value, j, out):
+                    return False
+    return True
 
 
 # --- T-5441: a trap ACTION read as code ---
@@ -16094,6 +17095,1230 @@ def _decide_trap(data: dict, tool_input: dict, command: str) -> dict | None:
     return None
 
 
+# --- T-5571: sg/newgrp/firejail, and shells fed a stdin this hook cannot compute ---
+# (1) Wrappers that run a command the shared peel does not read. shadow's `sg [-] GROUP [-c]
+# CODE` runs CODE with `/bin/sh -c`: only the first word after GROUP and an optional `-c`,
+# later words are ignored (checked against /usr/bin/sg on this box: `sg g echo a b` runs
+# `echo`). `firejail [--opt[=v] ...] [--] CMD ...` runs CMD (older releases through a shell,
+# its words joined). Each such code is judged as a command of its own by every reading
+# (`_decide_wrapcode`, as T-5441 judges a trap action), alone and after the command (its cwd
+# context): sg's CODE; firejail's words as argv (quoted), as one shell line (joined), and from
+# each of its next `_WC_SUFFIXES` words on (a superset: an option value this reading does not
+# know cannot hide the command). The command word is read past the shared wrapper peel
+# (`env`/`nice`/`timeout`/...), and may be a brace or glob word that builds the name. With no
+# command, `sg GROUP`, `newgrp [-] [GROUP]` and `firejail [opts]` start a shell that reads
+# its commands on stdin: they are stdin consumers to the T-5332 fed reading (`_fed_consumer`)
+# and to (2). Fails closed (`_WC_UNREADABLE_DENY`) on a word built at run time up to and
+# including the command (`sg grp -c "$c"`, `sg "$g" -c CODE`, `firejail "$X"`), on an
+# `xargs`/`parallel`/`find -exec` that hands one its words, and past `_FED_DEPTH`/the budget.
+# (2) A shell reading its commands on stdin (`_fed_consumer`'s direct consumers: a shell with
+# no `-c` and no script operand, `-s`, `-`, `source`/`.` of /dev/stdin, `eval bash`, the (1)
+# wrappers; also a command word built at run time with no operand, `| $X`, `| "$SH" -s`) must
+# be fed text this hook computes (`_decide_noncomputable`): its own here-string or heredoc
+# with no expansion; a stdin `< FILE` the T-5505 reading reads (a shell or source only); a
+# pipe from computable producers (a printf/echo of literal words, `xargs printf|echo`,
+# `cat`/`tee` passing a computable stdin on, a `{ }`/`( )` group of them, `true`/`false`/`:`);
+# or `cat FILE` piped straight into it (T-5505 judges FILE). Anything else is refused:
+# another producer (`tac`, `head`, `sed`, `grep`, `curl`, `python3 -c ...`, `cat FILE | cat`,
+# `env`, `cat - FILE`), a printf/echo/here-string/heredoc holding an expansion (r1:
+# `$HOME`/`$PWD`/`~` too), a producer whose stderr reaches the pipe (r1: its own `|&`/`2>&1`/
+# `2>/dev/stdout`, recorded by the lexer), the consumer's own `<&N`, a `<`/`<>` the T-5505
+# reading does not read, `script` without `-c` fed anything (r1), and a consumer that
+# inherits its stdin (`exec 3<f; bash <&3`, `exec <f; bash`, a `while`/`{ }`/function body,
+# a process substitution, a `-c` string or `$(...)` body of a piped or redirected command,
+# a script file's own text) when the text, or the text around it, may pipe or redirect it
+# (`_nc_has_feed`: a superset), and a call of a function the text defines when a body may
+# read stdin. A consumer is also a brace or glob command word that may build one (`{bash,}`,
+# `b?sh`; with a letter, as T-5441 reads trap), and an operand or `<` under /dev/ or /proc/
+# (`/dev//stdin`); a `case` pattern (`a|b)`) is no command. A command's compound depth comes
+# from the lexer's `(`/`)` events and its leading reserved words. The worker's alternative is
+# always there: write the script with the Write tool and run it by a literal path, or run
+# the commands directly.
+# Children (each static or run-time `-c`/eval/sg/firejail code string; each `$(...)`/backtick
+# body, when the lexer found a substitution command that may read stdin or run code) are
+# walked to `_PY_CODE_DEPTH` and the fed-walk budget; past them, refused when the unread text
+# may hold a consumer.
+_WC_NAMES = ("sg", "firejail", "newgrp")
+_WC_SUFFIXES = 3
+_WC_SUFFIX_HEADS = _ESCALATOR_WORDS | _SHELL_NAMES | frozenset(_WRAPPER_GRAMMAR) | {"git", "gh"}
+_WC_MAX = 256  # (r1: the joinable codes are judged in one text)
+_WC_ACTIVE = [0]  # the nesting level of the wrapper-code reading being judged (0: none)
+_WC_JUDGED: list = [set()]  # codes an outer level already judged
+_WC_BUDGET = [0]  # characters left to judge in this decision (set at level 0)
+_WC_UNREADABLE = object()
+_WC_UNREADABLE_DENY = _deny(
+    "BLOCKED (worker-guard, T-5571): this command runs `sg`, `newgrp` or `firejail` with a "
+    "group, option or command word built at run time (`sg grp -c \"$c\"`, `sg \"$g\" -c CODE`, "
+    "`firejail \"$X\"`), hands one its words through `xargs`/`parallel`/`find -exec`, or passes "
+    "the guard's bounds; the guard cannot tell what it runs, so it is refused (fail-closed). "
+    "Spell the command as literal words (`sg grp -c 'make test'`), or run it directly."
+)
+
+
+def _wc_name(word: str) -> str | None:
+    """T-5571: which of sg/firejail/newgrp command word `word` runs: its basename, or a brace
+    or glob word that may build one (`{sg,}`, `s?`, `fire*`); None otherwise."""
+    base = os.path.basename(word)
+    if base in _WC_NAMES:
+        return base
+    if not any(ch in base for ch in "{*?[") or "$" in base or len(base) > 256:
+        return None
+    for cand in _rn_brace_expand(base):
+        cand = cand.replace("{", "").replace("}", "")
+        for name in _WC_NAMES:
+            if cand == name or (any(ch in cand for ch in "*?[") and _RN_LETTER.search(cand)
+                                and fnmatch.fnmatchcase(name, cand)):
+                return name
+    return None
+
+
+def _wc_parse(name: str, words: list[str], dyn) -> tuple:
+    """T-5571: what wrapper `name` (`words[0]`) runs: ("code", CODE) for `sg`'s code string,
+    ("argv", WORDS) for `firejail`'s command, ("stdin",) for a shell reading stdin, or
+    ("dyn",) when a word up to the command's place (`dyn(k)`) is built at run time."""
+    n = len(words)
+    if name == "newgrp":
+        return ("stdin",)
+    k = 1
+    if name == "sg":
+        if k < n and not dyn(k) and words[k] == "-":
+            k += 1
+        if k < n and dyn(k):
+            return ("dyn",)
+        k += 1  # GROUP
+        if k < n and dyn(k):
+            return ("dyn",)
+        if k < n and words[k] == "-c":
+            k += 1
+        if k >= n:
+            return ("stdin",)
+        return ("dyn",) if dyn(k) else ("code", words[k])
+    while k < n:  # firejail: `--opt`, `--opt=value`, `-c`; `--` ends them
+        if dyn(k):
+            return ("dyn",)
+        w = words[k]
+        k += 1
+        if w == "--":
+            break
+        if w[:1] != "-" or w == "-":
+            k -= 1
+            break
+    if k >= n:
+        return ("stdin",)
+    if any(dyn(j) for j in range(k, n)):
+        return ("dyn",)
+    return ("argv", list(words[k:]))
+
+
+def _wc_cmd(c: _PyCmd):
+    """T-5571: the code strings simple command `c` runs through sg/firejail (see (1) above),
+    or `_WC_UNREADABLE`."""
+    i = _py_head_index(c.words)
+    full = c.words[i:]
+    if not full or not any(_wc_name(w) for w in full):
+        return []
+    words = list(full)
+    dyn = [k + i in c.dyn or _PY_SUBST in w or _PY_PWD_MARK in w for k, w in enumerate(full)]
+    pnames: list = []
+    if os.path.basename(full[0]) in _WRAPPER_GRAMMAR:
+        try:
+            words, base, n, src = _fed_peeled(full)
+        except _FedUnknown:
+            return _WC_UNREADABLE
+        dyn = [src[n + k] + i in c.dyn or _PY_SUBST in w or _PY_PWD_MARK in w
+               for k, w in enumerate(words)]
+        pnames = [os.path.basename(w) for w in base[:n]]
+    if words and os.path.basename(words[0]) == "busybox":
+        words, dyn = words[1:], dyn[1:]
+    if words and os.path.basename(words[0]) == "find":
+        for k in range(1, len(words) - 1):
+            if words[k] in _FIND_EXEC_WORDS and _wc_name(words[k + 1]):
+                return _WC_UNREADABLE  # (find appends its own words)
+    if not words or dyn[0]:
+        return []
+    name = _wc_name(words[0])
+    if name is None:
+        return []
+    if any(p in _SF_RELAYS for p in pnames):
+        return _WC_UNREADABLE  # (`xargs sg grp -c`: the code comes from the input)
+    got = _wc_parse(name, words, lambda k: dyn[k])
+    if got[0] == "dyn":
+        return _WC_UNREADABLE
+    if got[0] == "code":
+        return [got[1]]
+    if got[0] == "argv":
+        rest = got[1]
+        codes = [shlex.join(rest), " ".join(rest)]
+        # (r1: a suffix only from a word that can start what the rules deny: an escalator,
+        # git/gh, a shell or a wrapper; a plain argument judged as a command over-blocks)
+        codes += [shlex.join(rest[j:]) for j in range(1, min(len(rest), _WC_SUFFIXES + 1))
+                  if os.path.basename(rest[j]) in _WC_SUFFIX_HEADS or _wc_name(rest[j])]
+        return codes
+    return []
+
+
+_WC_SPECIAL = re.compile(r"[{*?\[]")
+_WC_SEP = re.compile(r"[\s;&|()<>`]")
+
+
+def _wc_hint(text: str) -> bool:
+    """A superset: `text` may name sg/firejail/newgrp (each `$'...'` decoded first; a brace
+    or glob token that may build a name counts)."""
+    if "$'" in text:
+        try:
+            text = _SF_ANSI_C.sub(lambda m: _fed_escapes(m.group(1), "fmt")[0], text)
+        except Exception:
+            return True
+        if "$'" in text:
+            return True
+    flat = text.replace("\\\n", "").translate(_QUOTE_STRIP)
+    if any(x in flat for x in _WC_NAMES):
+        return True
+    end = 0  # (each token holding a brace or glob character is read once: linear)
+    for m in _WC_SPECIAL.finditer(flat):
+        if m.start() < end:
+            continue
+        start = m.start()
+        while start > end and not _WC_SEP.match(flat, start - 1):
+            start -= 1
+        sep = _WC_SEP.search(flat, m.end())
+        end = sep.start() if sep else len(flat)
+        if _wc_name(flat[start:end]):
+            return True
+    return False
+
+
+def _wc_codes(command: str):
+    """T-5571: the sg/firejail codes of `command` (code strings included), in order and
+    without repeats, or `_WC_UNREADABLE`."""
+    if not _wc_hint(command):
+        return []
+    lex = _py_lex(command)
+    _py_expand_code(lex, skip_unknown=True)
+    if lex.frame_limited:
+        return _WC_UNREADABLE
+    out: list = []
+    for c in lex.cmds:
+        got = _wc_cmd(c)
+        if got is _WC_UNREADABLE:
+            return got
+        out.extend(got)
+    return [x for x in dict.fromkeys(out) if x.strip()]
+
+
+def _wc_joinable(code: str) -> bool:
+    """r1: `code` is a whole text on its own line: the lexer reads it to the end with nothing
+    unfinished, it opens no heredoc and does not end in a `\\` continuation."""
+    if "<<" in code or code.rstrip(" \t\n").endswith("\\"):
+        return False
+    lex = _py_lex(code)
+    return not lex.frame_limited and not lex.tails
+
+
+def _decide_wrapcode(data: dict, tool_input: dict, command: str) -> dict | None:
+    """T-5571 (1): the codes `command` runs through sg/firejail, judged as commands of their
+    own by every reading (see the comment above), or None."""
+    outer = _WC_ACTIVE[0]
+    if outer == 0:
+        _WC_JUDGED[0] = set()
+        _WC_BUDGET[0] = 8 * len(command) + 4096
+    codes = _wc_codes(command)
+    if codes is _WC_UNREADABLE:
+        return _WC_UNREADABLE_DENY
+    judged = _WC_JUDGED[0]
+    codes = [x for x in codes if x not in judged]
+    if not codes:
+        return None
+    if outer >= _FED_DEPTH or len(codes) > _WC_MAX:
+        return _WC_UNREADABLE_DENY
+    judged.update(codes)
+    # r1: every code that can stand on a line of its own (no unfinished quote or construct,
+    # no heredoc, no trailing `\`: it cannot swallow the line after it) is judged in ONE text,
+    # one code per line (alone, and after the command for its cwd context); any other alone
+    joined = [x for x in codes if _wc_joinable(x)]
+    copies = []
+    if joined:
+        alone = "\n".join(joined)
+        copies += [alone, command + "\n" + alone]
+    for code in codes:
+        if code not in joined:
+            copies += [code, command + "\n" + code]
+    _WC_BUDGET[0] -= sum(len(x) for x in copies)
+    if _WC_BUDGET[0] < 0:
+        return _WC_UNREADABLE_DENY
+    dc = _DC_ACTIVE[0]
+    _WC_ACTIVE[0], _DC_ACTIVE[0] = outer + 1, False  # (a code is judged by every rule)
+    try:
+        for copy in copies:
+            if len(copy) > 2 * BASH_COMMAND_MAX_CHARS:
+                return _TOO_LONG
+            denial = _decide_readings({**data, "tool_input": {**tool_input, "command": copy}})
+            if denial is not None:
+                return denial
+    finally:
+        _WC_ACTIVE[0], _DC_ACTIVE[0] = outer, dc
+    return None
+
+
+_NC_REASON = (
+    "to feed a shell its commands on stdin from {} (T-5571): the hook cannot compute that "
+    "text, so it cannot judge the commands the shell runs (only a literal printf/echo, "
+    "here-string or heredoc, or `cat FILE`/`< FILE` straight into the shell, is read). Write "
+    "the commands to a script with the Write tool and run it by a literal path (`bash "
+    "/abs/x.sh`), or run the commands directly in this call"
+)
+_NC_HINT = re.compile(r"\||<|>\(|(?<![\w-])coproc(?![\w-])")
+_NC_PRE = re.compile(r"(?<![\w.-])(?:" + _SF_SH + r"|source|eval|sg|newgrp|firejail|busybox|script)"
+                     r"(?![\w.-])|[$`*?\[{]|(?:^|[\s;&|(){}!])\.(?=\s)")  # (a brace/glob word may build one)
+_NC_EXPANSION = re.compile(r"\\.|(\$[A-Za-z_{(0-9@*#?!$-]|`)", re.S)
+# r1: a word-bounded `$HOME`/`$PWD` (static to the lexer) and a leading `~` expand at run time
+# too, and the command can set them (`HOME=$(...)`, `read HOME`, `cd 'a;b'`): an expansion.
+_NC_HOME_WORD = re.compile(r"\$\{?(?:HOME|PWD|OLDPWD)(?!\w)|^~")
+# r1: a `( ... )` group's stderr into its pipe (the redirect after `)` makes no command)
+_NC_PAREN_ERR = re.compile(r"\)[ \t]*(?:\d*>&|&>|\|&)")
+_NC_SILENT = frozenset({"true", "false", ":"})
+_NC_INHERIT = ("a stdin the shell inherits (`bash <&3`, `exec < f; bash`, a `while`/`{ }`/"
+               "function body, a process substitution, or a `-c` string, `$(...)` body or "
+               "script file run with a piped or redirected stdin)")
+_NC_DYN_TEXT = ("a printf/echo/here-string/heredoc holding an expansion (`<<< \"$(cat f)\"`, "
+                "`echo \"$X\" |`, an unquoted heredoc with `$X` or `$HOME`)")
+_NC_ERR_TEXT = "a producer whose stderr reaches the pipe (`|&`, `2>&1`, `2>/dev/stdout`)"
+_NC_DUP_TEXT = "a `<&N` file-descriptor duplication (`bash <&3`, `exec 3<f; bash 0<&3`)"
+# r1: util-linux `script` without `-c`/`--command` runs an interactive `$SHELL` on its stdin
+_NC_SCRIPT_C = re.compile(r"-[A-Za-z]*c|--c(?:o(?:m(?:m(?:a(?:n(?:d)?)?)?)?)?)?(?:=|$)")
+
+
+def _nc_has_feed(text: str) -> bool:
+    """A superset: `text` may pipe or redirect a command's stdin."""
+    return bool(_NC_HINT.search(text.replace("||", "  ")))
+
+
+def _nc_own(c: _PyCmd) -> str | None:
+    """Why `c`'s own here-strings/heredocs are not computable text, or None."""
+    for w in c.herestrs:
+        if w is None or _NC_HOME_WORD.search(w):
+            return _NC_DYN_TEXT
+    for body, expands, _strip in c.heredocs:
+        if expands and any(m.group(1) for m in _NC_EXPANSION.finditer(body)):
+            return _NC_DYN_TEXT  # (r1: `$HOME`/`$PWD` too: no exemption)
+    return None
+
+
+def _nc_words_dyn(c: _PyCmd) -> bool:
+    """`c` (a printf/echo producer) has a word built at run time (r1: `$HOME`/`$PWD`/`~` too)."""
+    return _fed_dynamic(c) or any(_NC_HOME_WORD.search(w) for w in c.words)
+
+
+_NC_NAMES = tuple(sorted(_SHELL_NAMES | {".", "source", "eval", "busybox"} | set(_WC_NAMES)))
+
+
+def _nc_spelled(word: str) -> list[str]:
+    """The stdin consumers' names brace or glob word `word` may build (as `_wc_name` reads it)."""
+    out: list = []
+    for cand in _rn_brace_expand(word):
+        cand = cand.replace("{", "").replace("}", "")
+        for name in _NC_NAMES:
+            if name not in out and (cand == name or (
+                    any(ch in cand for ch in "*?[") and _RN_LETTER.search(cand)
+                    and fnmatch.fnmatchcase(name, cand))):  # (a lone `*` builds no name: T-5441)
+                out.append(name)
+    return out
+
+
+def _nc_kind(c: _PyCmd) -> str | None:
+    """"fed": `_fed_consumer` reads `c`'s stdin as code (a direct consumer, not xargs);
+    "dyn": a command word built at run time with a shell's stdin shape; else None."""
+    try:
+        run = _fed_consumer(c)
+    except _FedUnknown:
+        return "dyn"
+    if run is not None:
+        return None if getattr(run, "nc_xargs", False) else "fed"
+    i = _py_head_index(c.words)
+    if i >= len(c.words):
+        return None
+    if "script" in c.words[i] or (c.words[i:] and os.path.basename(c.words[i]) in _WRAPPER_GRAMMAR):
+        words = c.words[i:]
+        if os.path.basename(words[0]) in _WRAPPER_GRAMMAR and os.path.basename(words[0]) != "script":
+            try:
+                words = _fed_peeled(words)[0]
+            except _FedUnknown:
+                words = []
+        if words and os.path.basename(words[0]) == "script" and not any(
+                _NC_SCRIPT_C.fullmatch(x) for x in words[1:]):
+            return "opaque"  # (r1: `| script -q /dev/null`: an interactive shell on stdin)
+    w = c.words[i]
+    if not (i in c.dyn or _PY_SUBST in w or _PY_PWD_MARK in w):
+        # a brace or glob command word that may build a consumer's name (`{bash,}`, `b?sh`,
+        # `/bin/b*sh`, `{source,} /dev/stdin`): read as each name it may build
+        base = os.path.basename(w)
+        if not any(ch in base for ch in "{*?[") or len(base) > 256:
+            return None
+        for name in _nc_spelled(base):
+            sub = _PyCmd()
+            sub.words = [name] + c.words[i + 1:]
+            sub.dyn = {k - i for k in c.dyn if k > i}
+            try:
+                if _fed_consumer(sub) is not None:
+                    return "dyn"
+            except _FedUnknown:
+                return "dyn"
+        return None
+    tail = w.rsplit("/", 1)[-1]
+    if tail and "$" not in tail and _PY_SUBST not in tail and "`" not in tail and (
+            tail not in _SHELL_NAMES and _wc_name(tail) is None):
+        return None  # (`"$VENV/bin/python"`: a static name that is no shell)
+    args = c.words[i + 1:]
+    if any(a[:2] == "--" for a in args):
+        return None  # (`"$f" --version`: read as a program, not a shell)
+    sub = _PyCmd()  # (the word read as a shell: `| $X`, `| "$SH" -s`, `| $X -`)
+    sub.words = ["bash"] + list(args)
+    sub.dyn = {k - i for k in c.dyn if k > i}
+    try:
+        return "dyn" if _fed_consumer(sub) is not None else None
+    except _FedUnknown:
+        return "dyn"
+
+
+def _nc_sf_reads(c: _PyCmd) -> bool:
+    """`c`'s `< FILE` is read by the T-5505 script-file reading (`_sf_cmd`'s head: a shell or
+    source past the wrapper peel, not behind a relay)."""
+    i = _py_head_index(c.words)
+    full = c.words[i:]
+    if not full:
+        return False
+    words, pnames = full, []
+    if os.path.basename(full[0]) in _WRAPPER_GRAMMAR:
+        try:
+            words, base, n, _src = _fed_peeled(full)
+            pnames = [os.path.basename(w) for w in base[:n]]
+        except _FedUnknown:
+            return False
+    if any(p in _FED_STDIN_TAKERS or p == "xargs" for p in pnames):
+        return False
+    if words and os.path.basename(words[0]) == "busybox":
+        words = words[1:]
+    return bool(words) and (os.path.basename(words[0]) in _SHELL_NAMES
+                            or os.path.basename(words[0]) in (".", "source"))
+
+
+def _nc_upstream(p: _PyCmd, src: dict, gin, depth: int) -> str | None:
+    """Why the stdin `cat`/`tee` producer `p` passes on is not computable, or None."""
+    if p.stdindup:
+        return _NC_DUP_TEXT
+    if p.herestrs or p.heredocs:
+        return _nc_own(p)
+    if p.infiles:
+        return "`cat < FILE` that is not piped straight into the shell"
+    if id(p) in src:
+        return _nc_unit(src[id(p)], src, False, depth + 1)
+    if gin is not None and gin is not p:
+        return _nc_own(gin)
+    return "`cat`/`tee` passing on a stdin this hook cannot see"
+
+
+def _nc_producer(p: _PyCmd, src: dict, cat_ok: bool, gin, depth: int) -> str | None:
+    """Why producer `p`'s output is not computable text (see (2) above), or None."""
+    if p.errout:
+        return _NC_ERR_TEXT  # (r1: stderr into the pipe: `x |& bash`, `x 2>&1 | bash`)
+    full = _fed_words(p)
+    if not full:
+        return None  # (`}`, or the group's own here-string holder)
+    xs = _fed_xargs_split(full)
+    words = xs[1] if xs else _ho_static_command_words(full)
+    if xs:
+        cmd = words or ["echo"]
+        if os.path.basename(cmd[0]) not in ("printf", "echo"):
+            return f"`xargs {_sf_show(cmd[0])}`"
+        return _NC_DYN_TEXT if _nc_words_dyn(p) else _nc_upstream(p, src, gin, depth)
+    if not words:
+        return f"`{_sf_show(full[0])}`"  # (a wrapper alone: `env` prints the environment)
+    head = os.path.basename(words[0])
+    if head in ("printf", "echo"):
+        return _NC_DYN_TEXT if _nc_words_dyn(p) else None
+    if head == "tee" or (head == "cat" and all(w[:1] == "-" or w in _FED_STDIN_PATHS for w in words[1:])):
+        if p.infiles and head == "cat" and cat_ok and not (p.herestrs or p.heredocs) and not (
+                words[1:] or p.stdindup):
+            return None  # (`cat < FILE | bash`: T-5505 judges FILE)
+        return _nc_upstream(p, src, gin, depth)
+    if head == "cat":
+        # r1: computable only as T-5505 reads it: every operand a literal file (no `-`,
+        # /dev/stdin or /dev/fd/N beside it, no option), and none built at run time
+        raw = p.words[_py_head_index(p.words)] if _py_head_index(p.words) < len(p.words) else ""
+        ops = words[1:]
+        if any(w[:1] == "-" or _fed_stdin_operand(w) for w in ops) or _fed_dynamic(p) or (
+                p.infiles or p.herestrs or p.heredocs or p.stdindup):
+            return "a `cat` that reads its stdin beside or instead of a file (`cat - FILE`)"
+        if cat_ok and os.path.basename(raw) == "cat":
+            return None  # (T-5505 judges FILE, or refuses several files)
+        return "`cat FILE` that is not piped straight into the shell (`cat FILE | cat | bash`)"
+    if head in _NC_SILENT:
+        return None
+    return f"`{_sf_show(head)}`"
+
+
+def _nc_unit(unit: list, src: dict, cat_ok: bool, depth: int) -> str | None:
+    """Why the producer unit `unit` (one command, or a group's) writes text this hook cannot
+    compute into the pipe after it, or None."""
+    if depth > 16:
+        return "a relay chain past 16 hops"
+    last = unit[-1]
+    gin = None
+    if not last.words[_py_head_index(last.words):] and (last.herestrs or last.heredocs):
+        gin = last
+    for p in unit:
+        what = _nc_producer(p, src, cat_ok and len(unit) == 1, gin, depth)
+        if what:
+            return what
+    return None
+
+
+_NC_OPEN = frozenset({"{", "if", "while", "until", "for", "select", "case"})
+_NC_CLOSE = frozenset({"}", "fi", "done", "esac"})
+_NC_PAREN_REDIR = re.compile(r"\)[ \t]*\d*<")
+_NC_PRE_NAMES = re.compile(r"(?<![\w.-])(?:" + _SF_SH + r"|source|eval|sg|newgrp|firejail|busybox|script)"
+                           r"(?![\w.-])|(?:^|[\s;&|(){}!])\.(?=\s)")
+
+
+def _nc_after_pipe(ev: list, idx: int) -> bool:
+    j = idx - 1
+    while j >= 0 and ev[j] == "\n":
+        j -= 1
+    return j >= 0 and ev[j] == "|" and not (j >= 1 and ev[j - 1] == "|")
+
+
+def _nc_pattern_start(ev: list, idx: int) -> bool:
+    """A `(` at event `idx` opens a `case` pattern: right after `case WORD in` or a `;;`/`;&`."""
+    j = idx - 1
+    while j >= 0 and ev[j] == "\n":
+        j -= 1
+    if j < 0:
+        return False
+    if isinstance(ev[j], _PyCmd):
+        return bool(ev[j].words) and ev[j].words[-1] == "in"
+    return ev[j] in (";", "&") and j >= 1 and ev[j - 1] == ";"
+
+
+def _nc_text(text: str, ctx: bool, children: list) -> str | None:
+    """Why a consumer in `text` (whose own stdin may be fed from around it when `ctx`) reads
+    a stdin this hook cannot compute, or None; adds each code string and `$(...)` body of
+    `text` to `children` as (text, whether its stdin may be fed)."""
+    lex = _sf_lexed(text)
+    ev = lex.events
+    src: dict = {}
+    adjacent: set = set()
+    where: dict = {}  # id(cmd) -> (inside a compound, inside one whose stdin may be fed)
+    stack: list = []  # open compounds: (kind, fed)
+    funcs: set = set()
+    defs: set = set()  # ids of the `NAME ( )` / `function NAME` words: a definition, no call
+    kw_def = False
+    procsub = ">(" in text
+    exec_in = False
+    patterns: set = set()  # ids of a `case` pattern's words, which the lexer reads as commands
+    paren_fed: set = set()
+    for idx, e in enumerate(ev):
+        if e == "(":
+            if stack and stack[-1][0] == "case" and _nc_pattern_start(ev, idx):
+                stack.append(("pat", stack[-1][1]))  # (`case x in (a|b) ...`)
+                continue
+            stack.append(("(", _nc_after_pipe(ev, idx) or procsub or bool(stack and stack[-1][1])))
+            continue
+        if e == ")":
+            if stack and stack[-1][0] in ("case", "pat"):
+                if stack[-1][0] == "pat":
+                    stack.pop()
+                k = idx - 1  # (`a|b)`: the run of words joined by `|` before it is a pattern)
+                while k >= 0 and isinstance(ev[k], _PyCmd):
+                    patterns.add(id(ev[k]))
+                    if k >= 1 and ev[k - 1] == "|" and not (k >= 2 and ev[k - 2] == "|"):
+                        k -= 2
+                        continue
+                    break
+            elif stack and stack[-1][0] == "(":
+                stack.pop()
+            continue
+        if not isinstance(e, _PyCmd):
+            continue
+        j = idx - 1
+        while j >= 0 and ev[j] in ("\n", "("):
+            j -= 1
+        if j >= 0 and ev[j] == "|" and not (j >= 1 and ev[j - 1] == "|"):
+            unit = _fed_group(ev, j - 1) if j >= 1 else []
+            if unit:
+                src[id(e)] = unit
+            if j == idx - 1 and j >= 1 and isinstance(ev[j - 1], _PyCmd):
+                adjacent.add(id(e))
+            if j >= 1 and ev[j - 1] == ")":
+                paren_fed.add(id(e))  # (fed by a `( ... )` group: its stderr, `_NC_PAREN_ERR`)
+        first = True
+        for w in e.words:
+            if w in _NC_CLOSE:
+                if stack and stack[-1][0] != "(":
+                    stack.pop()
+            elif w in _NC_OPEN:
+                stack.append((w, (first and _nc_after_pipe(ev, idx)) or bool(stack and stack[-1][1])))
+                first = False
+            elif w not in _PY_RESERVED:
+                break
+        where[id(e)] = (bool(stack), bool(stack and stack[-1][1]))
+        h = _py_head_index(e.words)
+        if h < len(e.words):
+            head = e.words[h]
+            if head == "exec" and (e.herestrs or e.heredocs or e.infiles or e.stdindup):
+                exec_in = True  # (`exec < f`, `exec <> f`, `exec 0<&3`: every later command's stdin)
+            if len(e.words) == h + 1 and ev[idx + 1:idx + 3] == ["(", ")"]:
+                funcs.add(head)  # `NAME ( )`
+                defs.add(id(e))
+            elif head == "function" and h + 1 < len(e.words):
+                funcs.add(e.words[h + 1].partition("(")[0])
+                defs.add(id(e))
+                kw_def = True  # (`function f { bash; }`: the body's first words share this command)
+    # (`done < f`, `} <<< x`, `( ... ) < f`: the redirect of a compound may feed any command in
+    # one, a superset)
+    closer_fed = bool(_NC_PAREN_REDIR.search(text)) or any(
+        (e.herestrs or e.heredocs or e.infiles or e.stdindup) and e.words[:1]
+        and e.words[0] in _NC_CLOSE for e in ev if isinstance(e, _PyCmd))
+    feeds = _nc_has_feed(text)
+    paren_err = None
+    wc = _wc_hint(text)
+    func_reads = None
+    for idx, e in enumerate(ev):
+        if not isinstance(e, _PyCmd) or id(e) in patterns:
+            continue
+        nested, cfed = where[id(e)]
+        own = bool(e.herestrs or e.heredocs or e.infiles)
+        fed_here = ctx or exec_in or own or id(e) in src or (nested and (cfed or closer_fed))
+        kind = _nc_kind(e)
+        h = _py_head_index(e.words)
+        if kind is None and funcs and h < len(e.words) and e.words[h] in funcs and id(e) not in defs:
+            if func_reads is None:  # (a function whose body may read stdin as code)
+                func_reads = kw_def or any(_nc_kind(c) is not None for c in lex.cmds)
+            kind = "func" if func_reads else None
+        # a code string's stdin is its command's: fed when this one's may be (a consumer's own
+        # feed is judged here, so its strings read only what is around it)
+        sub = ctx if kind is not None else fed_here
+        if _fed_may_run_code(e):
+            children.extend((x, sub) for x in _py_code_strings(e, keep_dynamic=True) or ())
+        got = _wc_cmd(e) if wc else ()
+        if got is not _WC_UNREADABLE:
+            children.extend((x, sub) for x in got)
+        if kind is None:
+            continue
+        if e.stdindup:
+            return _NC_DUP_TEXT  # (r1: the consumer's own `<&N`, not one anywhere in the text)
+        if "coproc" in e.words[:h]:
+            return "a `coproc` (the shell writes its stdin at run time)"
+        if kind == "func" and (own or id(e) in src or fed_here):
+            return "a function whose body reads stdin as code (`f() { bash; }; ... | f`)"
+        if kind == "opaque" and (own or id(e) in src or fed_here):
+            return "`script` without `-c`, an interactive shell that reads its stdin as commands"
+        what = _nc_own(e)
+        if what:
+            return what
+        if any(f is not None and _fed_stdin_operand(f) for f in e.infiles):
+            return "a `< /dev/stdin`-style redirect (the shell reads the pipe or fd it names)"
+        if e.infiles and (kind != "fed" or not _nc_sf_reads(e)):
+            return "a `< FILE` redirect into a command the script-file reading does not read"
+        if own:
+            continue  # (its own stdin: the fed and script-file readings judge it)
+        if id(e) in src:
+            # r1: stderr is read on the producer side only (`_nc_producer`: each producer's own
+            # `|&`/`2>&1`); a `( ... )` group's redirect makes no command: the raw text after a `)`
+            if id(e) in paren_fed:
+                if paren_err is None:
+                    paren_err = bool(_NC_PAREN_ERR.search(text))
+                if paren_err:
+                    return _NC_ERR_TEXT
+            # (`cat FILE` straight into a shell or source: T-5505's `_sf_cat_feeds` reads FILE)
+            what = _nc_unit(src[id(e)], src, kind == "fed" and id(e) in adjacent and _nc_sf_reads(e), 0)
+            if what:
+                return what
+            continue
+        if kind != "dyn" and (ctx or exec_in or (nested and (cfed or closer_fed))):
+            return _NC_INHERIT
+    if ("$(" in text or "`" in text) and _nc_inner_reads(lex, ev):
+        # (a `$(...)` body's stdin is that of the command it is expanded for: a superset. The
+        # raw bodies are read only when the lexer found a substitution command that may read
+        # stdin as code or run a code string: a backtick in a comment or quotes is no body.)
+        sub = ctx or exec_in or feeds
+        children.extend((x, sub) for x in _fed_subst_bodies(text))
+    return None
+
+
+def _nc_inner_reads(lex, ev: list) -> bool:
+    """A command the lexer read inside a substitution (not a top-level event) that may read
+    stdin as code, or run a code string, or be a brace/glob/run-time command word."""
+    top = {id(e) for e in ev if isinstance(e, _PyCmd)}
+    for c in lex.cmds:
+        if id(c) in top:
+            continue
+        if _nc_kind(c) is not None or _fed_may_run_code(c) or _wc_cmd(c):
+            return True  # (`_wc_cmd`: an sg/firejail code, or `_WC_UNREADABLE`)
+    return False
+
+
+def _nc_walk(command: str, ctx: bool) -> str | None:
+    """T-5571 (2): why a shell in `command` (or its code strings and `$(...)` bodies, to
+    `_PY_CODE_DEPTH`) reads its commands from a stdin this hook cannot compute, or None."""
+    work = [(command, ctx, 0)]
+    queued = {(command, ctx)}
+    budget = 4 * len(command) + 4096
+    while work:
+        text, fed, depth = work.pop()
+        if not fed and not _nc_has_feed(text) and "$'" not in text:
+            continue  # (no stdin here or below it can be fed: children are substrings)
+        if not _NC_PRE.search(text.replace("\\\n", "").translate(_QUOTE_STRIP)):
+            continue  # (no consumer and no code string can be spelled)
+        children: list = []
+        what = _nc_text(text, fed, children)
+        if what:
+            return what
+        for code, sub in children:
+            if not code or (code, sub) in queued:
+                continue
+            queued.add((code, sub))
+            budget -= len(code)
+            if depth >= _PY_CODE_DEPTH or budget < 0:
+                # past the bounds: refused only when the unread text may hold a consumer this
+                # rule reads (a consumer's name, or a run-time command word with its own pipe
+                # or redirect: one that inherits its stdin is not refused, as above)
+                view = code.replace("\\\n", "").translate(_QUOTE_STRIP)
+                if "$'" in code or _NC_PRE_NAMES.search(view) or (
+                        ("$" in view or "`" in view) and _nc_has_feed(code)):
+                    return "a nesting past the guard's depth or size bounds"
+                continue
+            work.append((code, sub, depth + 1))
+    return None
+
+
+def _decide_noncomputable(data: dict, tool_input: dict, command: str) -> dict | None:
+    """T-5571 (2): a shell fed a stdin this hook cannot compute is refused (see above)."""
+    del data, tool_input
+    what = _nc_walk(command, _SF_LEVEL[0] > 0)  # (a script file's stdin is never the tool's)
+    return None if what is None else _reason(_NC_REASON.format(what))
+
+
+# --- T-5634: prompt expansion, history and editor commands run a value as code ---
+# bash runs the code in a value it prompt-expands: `${var@P}` (any `@P}`; a quoted, escaped
+# or run-time operator is a bad substitution, a `\`+newline inside one is not), PS4 under
+# xtrace (`set -x`, `set -o xtrace`, `shopt -so xtrace`, `bash -x`, SHELLOPTS), PS0/PS1/PS2,
+# PROMPT_COMMAND and the `?message` of a MAILPATH entry in an interactive shell (`... | bash
+# -i`). `fc` runs its editor (`-e CMD`, FCEDIT) or a stored line (`-s`), history expansion
+# (`!!`, `!-1`, `!?s?`, `^a^b`, on with `set -H`/`-o histexpand`/`-o history` or in `bash -i`)
+# runs a stored line (`history -s/-r/-n`, a HISTFILE), `compgen -C CMD` runs CMD and
+# `compgen -W WORDS` expands WORDS (a `$(...)` in them runs), even in `bash -c`. Every other
+# rule reads a quoted value as data, so `PS4='$(sudo -n true)'; set -x; :` ran sudo (checked
+# in bash 5.2 with a stand-in). Of the other transforms none runs code (@E/@A/@Q/@K/@k/@a/
+# @U/@u/@L), nor do PS3 (`select` prints it as is), `read -p`, `complete -C/-F` (no completion
+# runs without readline), MAIL or TIMEFORMAT; history expansion is off in `bash -c`.
+# Each text (the command, its comment-cut and eval-joined copies, and every code string the
+# lexer finds in them, `-c`/eval/wrapper codes, to `_PY_CODE_DEPTH` levels under a budget)
+# fails closed (`_pe_walk`) on:
+#   (1) an `@P}` or an undecodable `$'...'` (a `\cX`) in its normalised copy (each
+#       `\`+newline dropped, each `$'...'` decoded, every quote and backslash dropped);
+#   (2) a PS0-PS4/PROMPT_COMMAND/MAILPATH/HISTFILE/histchars name in that copy unless the
+#       raw text has it, as written, as a read (`$PS4`, `${PS4}`, `${PS1:-}`: an operator
+#       that neither writes nor evaluates), an `unset`, or a PS0-PS4 assignment (`PS4=`,
+#       `PS4+=` at a word start, as an export/declare/local word too) whose value is a literal
+#       that cannot run code (`_pe_value_safe`); a name the copy shows that the raw text does
+#       not spell (`P"S4"`, `$'\x50S4'`) is unreadable; every other PROMPT_COMMAND/MAILPATH/
+#       histchars write fails, and every HISTFILE write but an empty or `/dev/null` one;
+#   (3) a command (`_py_lex`) whose command word is `fc`; `compgen` with a `-C` value, a `-W`
+#       value holding `$`, a backtick, a backslash or (T-5667) a `(` (`'<(cmd)'` runs cmd),
+#       glued or not, or any argument built at run time; `history` with a `-s`/`-r`/`-n`
+#       option word (glued too) or a run-time one;
+#   (4) history on (`_PE_HIST_ON`, a SHELLOPTS name, `_pe_hist_switch`'s word reader, or an
+#       outer text's) in a text that holds a history designator (`_PE_HIST_DESIG`) or a
+#       command word built at run time (it may be `fc`); a code string or a fed text
+#       (`_stdin_fed_codes`) of such a text is read with history on;
+#   (5) T-5667: history on in a text whose shell reads its commands from a feed the readings
+#       above do not judge with history on (`_pe_fed_unread`): a `< FILE` other than
+#       /dev/null, a pipe, a script file operand, or a stdin inside a `$(...)` (`bash -i <
+#       f`, `cat f | bash -i`, `bash -o history -H f`, `env SHELLOPTS=history:histexpand
+#       bash < f`; the script-file reading reads f with history off). Refused (fail closed).
+# T-5667: `_pe_hist_switch` reads the words as bash does, in any order: for `set` and a
+# shell's own options, each `o`/`O` of an option word takes the next word as its value
+# (`set -euo pipefail -o history`, `set -oo a history`; a next word that is empty or starts
+# with `-`/`+` is not taken), and history is on with a literal `history`/`histexpand` value
+# of a `-` word, a `-` word holding `H` (a shell's: `H` or `i`, or `--interactive`), or an
+# option word or value built at run time (a shell's run-time word is T-5505's); `+H`/`+o`
+# turn it off and are not counted. `shopt` takes no option values (`shopt -o -s nounset
+# history`): any `history`/`histexpand` or run-time argument turns it on. BASHOPTS carries no
+# history option (checked in bash 5.2), so it is not read.
+# It runs after every other rule (their reasons come first). Deny-only; linear (one pass
+# builds the copy, the index map only when a name shows; value words parsed under a budget).
+_PE_NAME = re.compile(
+    r"(?<![A-Za-z0-9_])(?:PS[0-4]|PROMPT_COMMAND|MAILPATH|HISTFILE|histchars)(?![A-Za-z0-9_])")
+# reads only (r2: and `unset`, and a HISTFILE of `/dev/null` or empty, which turn saving off)
+_PE_NO_WRITE = frozenset({"PROMPT_COMMAND", "MAILPATH", "HISTFILE", "histchars"})
+_PE_UNSET = re.compile(r"(?<![\w-])unset[ \t]+(?:-v[ \t]+)?$")
+_PE_AT_P = re.compile(r"@P\}")
+_PE_FC_WORD = re.compile(r"(?<![\w.$/@:%+-])fc(?![\w.=/@:%+-])")
+# r2: a history store option word, its value glued or not (`-s'x'`, `-rfile`)
+_PE_HISTORY_OPT = re.compile(r"-[A-Za-z]*[srn]")
+# compgen's option letters that take a value (glued, `-W'x'`, or the next word)
+_PE_COMPGEN_ARG = frozenset("oAGWFCXPS")
+_PE_LEX_HINT = re.compile(r"fc|compgen|history")
+_PE_DEEP_HINT = re.compile(
+    r"fc|compgen|history|@P|PS[0-4]|PROMPT_COMMAND|MAILPATH|HISTFILE|histchars")
+_PE_HIST_WORD = re.compile(r"set|sh|history|histexpand|interactive")
+_PE_HIST_ON = re.compile(
+    r"histexpand|-o\s*history|(?<![\w-])set\s+(?:[-+][A-Za-z]*\s+)*-[A-Za-z]*H"
+    r"|(?<![\w.-])(?:ba|da|z|k)?sh\s+(?:-\S+\s+)*-[A-Za-z]*[iH]|--interactive")
+# r2: bash inhibits history expansion only in `$!` and `${!` (not `{!`)
+_PE_HIST_DESIG = re.compile(r"(?<!\$)(?<!\$\{)![^\s=(]|(?m:^[ \t]*\^)")
+# T-5667: the words that may turn history on (`_pe_hist_switch`): a `set`/`shopt` or shell
+# word; and the option values that do
+_PE_SWITCH_HINT = re.compile(r"(?<![\w.-])(?:set|shopt)(?![\w.=-])|sh(?![\w.=-])")
+_PE_SHELL_WORD = re.compile(r"sh(?![\w.=-])")  # (a shell may read a script file: `bash -i f`)
+_PE_HIST_NAMES = frozenset({"history", "histexpand"})
+_PE_SHELL_LONG_VALUE = frozenset({"--rcfile", "--init-file"})
+_PE_WORD_START = frozenset(" \t\n;&|()`")
+_PE_WORD_END = frozenset(" \t\n;&|)")
+_PE_ANSI = re.compile(r"\$'((?:[^'\\]|\\.|\\$)*)(?:'|$)", re.S)
+_PE_DROP = str.maketrans("", "", "'\"\\")
+_PE_QSPACE = str.maketrans("'\"\\", "   ")  # (a decoded quote stays a word boundary)
+# a read's operator right after the name in `${NAME...}`: one that neither writes nor
+# evaluates (`:-` `-` `:+` `+` `:?` `?` `#` `%` `/` `^` `,` `@Q`..., not `:=`, `=`, `@P`)
+_PE_READ_OP = re.compile(r"\}|:[-+?]|[-+?#%/^,]|@[^P]")
+# a stored prompt value may hold `$NAME`, a special parameter, `$` before a blank or at the
+# end, and `${...}` expansions (nested too) whose subscripts are digits, `@` or `*`; never a
+# `$(`, `$[`, backtick, backslash (a prompt escape such as `\044` decodes to `$`), `$'`, `$"`,
+# `@P`, `${!` (indirection) or a `${NAME:...}` substring (its offset is arithmetic)
+_PE_DOLLAR_OK = re.compile(r"\$(?:[A-Za-z0-9_#?!@*$-]|(?=[ \t\n])|$)")
+_PE_SUBSCRIPT_OK = re.compile(r"\[(?:\d+|[@*])\]")
+_PE_DENY = _deny(
+    "BLOCKED (worker-guard, T-5634): this command prompt-expands a value (`${var@P}`, or a "
+    "PS0-PS4/PROMPT_COMMAND/MAILPATH value, which xtrace (`set -x`, `bash -x`) or an "
+    "interactive shell expands), stores or expands shell history (`history -s`, HISTFILE, "
+    "`!!` with history expansion on), or runs an editor or completion command (`fc`, "
+    "`compgen -C`/`-W`): bash runs any `$(...)` in that value or line as code, and the guard "
+    "reads it as data; refused (fail-closed). Set PS4 to a literal (`PS4='+ '`, "
+    "`PS4='+ $LINENO: '`), drop `@P`, and run the code as its own command. If the words are "
+    "only text, search with the Grep tool, and put a commit message that names PS4/"
+    "PROMPT_COMMAND in a file: `git commit -F <file>`."
+)
+
+
+class _PeUnreadable(Exception):
+    """A `$'...'` the decoder cannot read (`\\cX`): fail closed."""
+
+
+def _pe_ansi_value(m: re.Match) -> str:
+    val = _py_ansi_c(m.group(1))
+    if val is None:
+        raise _PeUnreadable
+    return val.translate(_PE_QSPACE)
+
+
+def _pe_normalised(text: str) -> tuple[str, list[int]]:
+    """`text` (`\\`+newline already dropped) with each `$'...'` decoded and every quote and
+    backslash dropped, and for each character of it the index in `text` it came from (every
+    character a `$'...'` decodes to comes from its `$`). Misreading a quote only makes a name
+    look unreadable (a deny), never readable. Raises `_PeUnreadable` on an undecodable one."""
+    out: list[str] = []
+    org: list[int] = []
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "$" and i + 1 < n and text[i + 1] == "'":
+            j = i + 2
+            while j < n and text[j] != "'":
+                j += 2 if text[j] == "\\" else 1
+            val = _py_ansi_c(text[i + 2:min(j, n)])
+            if val is None:
+                raise _PeUnreadable
+            for c in val:
+                out.append(c)
+                org.append(i)
+            i = j + 1
+            continue
+        if ch not in "'\"\\":
+            out.append(ch)
+            org.append(i)
+        i += 1
+    return "".join(out), org
+
+
+def _pe_value(text: str, i: int, budget: list) -> str | None:
+    """The value bash stores for the assignment word whose value starts at `text[i]`, when it
+    is a literal (single-quoted, `$'...'`, double-quoted or bare text with no expansion); None
+    when it is built at run time, is an array, or is unreadable here."""
+    n = len(text)
+    out: list[str] = []
+    if i < n and text[i] in "(~":
+        return None
+    while i < n:
+        budget[0] -= 1
+        if budget[0] < 0:
+            return None
+        ch = text[i]
+        if ch in _PE_WORD_END:
+            break
+        if ch in "(<>$`" and not (ch == "$" and i + 1 < n and text[i + 1] == "'"):
+            return None
+        if ch == "'":
+            j = text.find("'", i + 1)
+            if j < 0:
+                return None
+            budget[0] -= j - i
+            out.append(text[i + 1:j])
+            i = j + 1
+        elif ch == "$":  # `$'...'`
+            j = i + 2
+            while j < n and text[j] != "'":
+                j += 2 if text[j] == "\\" else 1
+            if j >= n:
+                return None
+            budget[0] -= j - i
+            val = _py_ansi_c(text[i + 2:j])
+            if val is None:
+                return None
+            out.append(val)
+            i = j + 1
+        elif ch == '"':
+            i += 1
+            while i < n and text[i] != '"':
+                budget[0] -= 1
+                c = text[i]
+                if c in "$`":
+                    return None
+                if c == "\\" and i + 1 < n:
+                    e = text[i + 1]
+                    out.append(e if e in '$`"\\' else "\\" + e)
+                    i += 2
+                    continue
+                out.append(c)
+                i += 1
+            if i >= n:
+                return None
+            i += 1
+        elif ch == "\\":
+            if i + 1 >= n:
+                return None
+            out.append(text[i + 1])
+            i += 2
+        else:
+            out.append(ch)
+            i += 1
+    return None if budget[0] < 0 else "".join(out)
+
+
+def _pe_value_safe(stored: str) -> bool:
+    """True when a prompt value `stored` cannot run code when prompt-expanded (see
+    `_PE_DOLLAR_OK` above): one pass, tracking the `${...}` depth."""
+    if "`" in stored or "\\" in stored or "@P" in stored:
+        return False
+    depth, k, n = 0, 0, len(stored)
+    ref = False  # just past a `${NAME` or its `[N]`, where `:` starts its operator
+    while k < n:
+        ch = stored[k]
+        if ref and ch == ":" and not stored.startswith((":-", ":+", ":?"), k):
+            return False  # `${NAME:offset}` (arithmetic) or `${NAME:=v}` (a write)
+        if ref and ch == "[":
+            m = _PE_SUBSCRIPT_OK.match(stored, k)
+            if not m:
+                return False  # an arithmetic subscript
+            k = m.end()
+            continue
+        ref = False
+        if ch == "$":
+            if stored.startswith("${", k):
+                if stored.startswith("${!", k):
+                    return False
+                depth += 1
+                k += 2
+                while k < n and (stored[k].isalnum() or stored[k] == "_"):
+                    k += 1
+                ref = True
+                continue
+            if not _PE_DOLLAR_OK.match(stored, k):
+                return False
+        elif ch == "}" and depth:
+            depth -= 1
+        elif ch == "[" and depth:
+            return False  # a subscript not right after a name: unreadable here
+        k += 1
+    return True
+
+
+def _pe_raw_ok(text: str, p: int, name: str, budget: list) -> bool:
+    """True when the name `name` at `text[p]` is a read or a literal-safe PS0-PS4 assignment
+    as written."""
+    e = p + len(name)
+    if p >= 1 and text[p - 1] == "$" and (p < 2 or text[p - 2] != "$"):
+        return True  # `$PS4` (a read; its value is never re-read)
+    if (p >= 2 and text[p - 2:p] == "${") or (p >= 3 and text[p - 3:p] == "${#"):
+        return bool(_PE_READ_OP.match(text, e))  # `${PS4}`, `${PS1:-}`, `${#PS4}`
+    if (e >= len(text) or text[e] in _PE_WORD_END) and _PE_UNSET.search(text, max(0, p - 64), p):
+        return True  # `unset HISTFILE`
+    if p > 0 and text[p - 1] not in _PE_WORD_START:
+        return False
+    if text.startswith("=", e):
+        v = e + 1
+    elif text.startswith("+=", e) and name not in _PE_NO_WRITE:
+        v = e + 2
+    else:
+        return False
+    stored = _pe_value(text, v, budget)
+    if name in _PE_NO_WRITE:
+        # its value is code (or a history file): every write fails closed, but saving off
+        return name == "HISTFILE" and stored in ("", "/dev/null")
+    return stored is not None and _pe_value_safe(stored)
+
+
+def _pe_names_ok(text: str, norm: str) -> bool:
+    """(2) above, for `text` (`\\`+newline dropped) and its normalised copy `norm`."""
+    if not _PE_NAME.search(norm) and not _PE_NAME.search(text):
+        return True
+    norm, org = _pe_normalised(text)
+    budget = [4 * len(text) + 4096]
+    raw_at = {}
+    for m in _PE_NAME.finditer(text):
+        if not _pe_raw_ok(text, m.start(), m.group(0), budget):
+            return False
+        raw_at[m.start()] = m.group(0)
+    for m in _PE_NAME.finditer(norm):
+        k, name = m.start(), m.group(0)
+        start = org[k]
+        if raw_at.get(start) != name or any(org[k + j] != start + j for j in range(len(name))):
+            return False  # the copy shows a name the raw text does not spell as such
+    return True
+
+
+def _pe_dyn(c: "_PyCmd", j: int) -> bool:
+    w = c.words[j]
+    return j in c.dyn or _PY_SUBST in w or _PY_PWD_MARK in w
+
+
+def _pe_compgen_runs(c: "_PyCmd", i: int) -> bool:
+    """compgen's words from `i + 1`: any built at run time (it may become an option), a `-C`
+    value, or a `-W` value holding `$`, a backtick, a backslash or (T-5667) a `(` (a
+    `<(...)`/`>(...)` in it runs) (r2: an option's value glued to it, `-W'...'`, `-aC'...'`,
+    is read too; every option-shaped word counts, `--` or not)."""
+    words, n = c.words, len(c.words)
+    if any(_pe_dyn(c, k) for k in range(i + 1, n)):
+        return True
+    j = i + 1
+    while j < n:
+        w = words[j]
+        if w.startswith("-") and w != "--":
+            for k in range(1, len(w)):
+                ch = w[k]
+                if ch in _PE_COMPGEN_ARG:
+                    val = w[k + 1:]
+                    if not val and j + 1 < n:
+                        j += 1
+                        val = words[j]
+                    if ch == "C" or (ch == "W" and any(x in val for x in "$`\\(")):
+                        return True
+                    break
+        j += 1
+    return False
+
+
+def _pe_cmd_runs(c: "_PyCmd") -> bool:
+    """(3) above, for one lexed command."""
+    words = c.words
+    i = _py_head_index(words)
+    if i >= len(words):
+        return False
+    head = words[i]
+    if head == "fc":
+        return True
+    if head == "compgen":
+        return _pe_compgen_runs(c, i)
+    if head != "history":
+        return False
+    return any(_pe_dyn(c, j) or _PE_HISTORY_OPT.match(words[j]) for j in range(i + 1, len(words)))
+
+
+def _pe_opts_on(c: "_PyCmd", j: int, letters: str, shell: bool) -> bool:
+    """T-5667: `c`'s option words from `j` read as bash reads them (see above): True when
+    they turn history (expansion) on, or (`set`) one is built at run time. Ends at `--`, `-`
+    or the first word that is no option and no option's value (`set -- -o history`). One
+    pass: every word is read once."""
+    words, n = c.words, len(c.words)
+    while j < n:
+        if _pe_dyn(c, j):
+            return not shell  # (a shell's run-time option or script word is T-5505's)
+        w = words[j]
+        if w in ("--", "-") or len(w) < 2 or w[0] not in "-+":
+            return False
+        j += 1
+        if shell and w[1] == "-":
+            if w == "--interactive":
+                return True
+            if w in _PE_SHELL_LONG_VALUE:
+                j += 1
+            continue
+        on = w[0] == "-"
+        for ch in w[1:]:
+            if ch in "oO":
+                if j >= n:
+                    break
+                if _pe_dyn(c, j):
+                    return not shell
+                v = words[j]
+                if v and v[0] not in "-+":  # (else bash lists the options and takes no value)
+                    if on and v in _PE_HIST_NAMES:
+                        return True
+                    j += 1
+            elif on and ch in letters:
+                return True
+    return False
+
+
+def _pe_hist_switch(c: "_PyCmd") -> bool:
+    """r2 (M1), T-5667: True when `c` may turn history or history expansion on: a `set`
+    (`set -o vi -H`, `set -euo pipefail -o $h`), a `shopt` (`shopt -so history`, `shopt -o -s
+    history`, `shopt -s $x`) or a shell's own options (`bash -i`, `bash --rcfile f -i`, `bash
+    -o history -H`), read by `_pe_opts_on` (see above)."""
+    words = c.words
+    i = _py_head_index(words)
+    n = len(words)
+    if i >= n:
+        return False
+    head = words[i]
+    if head == "set":
+        return _pe_opts_on(c, i + 1, "H", False)
+    if head == "shopt":
+        return any(_pe_dyn(c, j) or words[j] in _PE_HIST_NAMES for j in range(i + 1, n))
+    for k in range(i, n):  # a shell, behind any wrapper (a superset: any shell-named word)
+        if os.path.basename(words[k]) in _SHELL_NAMES and not _pe_dyn(c, k):
+            return _pe_opts_on(c, k + 1, "iH", True)
+    return False
+
+
+def _pe_shell_script(c: "_PyCmd") -> bool:
+    """T-5667: `c` runs a shell (behind any wrapper) with a script file operand and no code
+    string (`bash -i f`, `bash -o history -H f`)."""
+    words, n = c.words, len(c.words)
+    i = _py_head_index(words)
+    k = next((k for k in range(i, n) if os.path.basename(words[k]) in _SHELL_NAMES), n)
+    k += 1
+    while k < n:
+        w = words[k]
+        if w == "--":
+            k += 1
+            break
+        if len(w) < 2 or w[0] not in "-+":
+            break
+        if w[1] == "-":
+            k += 2 if w in _PE_SHELL_LONG_VALUE else 1
+            continue
+        if "c" in w[1:]:
+            return False  # a code string: `_py_code_strings` reads it
+        k += 1 + w.count("o", 1) + w.count("O", 1)
+    return k < n and words[k] != "-"
+
+
+def _pe_shell_unread(c: "_PyCmd", piped: bool, nested: bool) -> bool:
+    """T-5667 (5): with history on, `c` reads its commands from a feed no reading here judges
+    with history on: a stdin from a `< FILE` other than /dev/null (or one built at run time),
+    a pipe, or (inside a `$(...)`) its command's stdin; or a script file operand."""
+    try:
+        run = _fed_consumer(c)
+    except _FedUnknown:
+        return True
+    if run is None:
+        return _pe_shell_script(c)
+    if any(f != "/dev/null" for f in c.infiles) or piped:
+        return True
+    return nested and not (c.herestrs or c.heredocs or c.infiles)
+
+
+def _pe_fed_unread(lex) -> bool:
+    """T-5667 (5): a command of `lex` that `_pe_shell_unread` refuses (a pipe as the fed
+    reading finds one: a `|` event before it, not `||`). Linear in the events."""
+    ev = lex.events
+    top = set()
+    for idx, e in enumerate(ev):
+        if not isinstance(e, _PyCmd):
+            continue
+        top.add(id(e))
+        j = idx - 1
+        while j >= 0 and ev[j] in ("\n", "("):
+            j -= 1
+        piped = j >= 0 and ev[j] == "|" and not (j >= 1 and ev[j - 1] == "|")
+        if _pe_shell_unread(e, piped, False):
+            return True
+    return any(id(c) not in top and _pe_shell_unread(c, False, True) for c in lex.cmds)
+
+
+def _pe_head_dyn(c: "_PyCmd") -> bool:
+    i = _py_head_index(c.words)
+    return i < len(c.words) and _pe_dyn(c, i)
+
+
+def _pe_walk(text: str, depth: int, budget: list, hist: bool = False) -> bool:
+    """True when `text`, or a code string in it, holds what the rule above refuses. `hist`:
+    an outer text may turn history on for this one (a code string, a fed text)."""
+    budget[0] -= len(text)
+    if budget[0] < 0 or depth > _PY_CODE_DEPTH:
+        return True
+    text = text.replace("\\\n", "")
+    try:
+        # the same copy `_pe_normalised` makes, built at C speed without the index map
+        norm = _PE_ANSI.sub(_pe_ansi_value, text) if "$'" in text else text
+        norm = norm.translate(_PE_DROP)
+        if _PE_AT_P.search(norm) or not _pe_names_ok(text, norm):
+            return True
+    except _PeUnreadable:
+        return True
+    desig = _PE_HIST_DESIG.search(norm) is not None
+    # (T-5667: a SHELLOPTS a child shell reads may carry history: `env SHELLOPTS=... bash`)
+    hist = hist or _PE_HIST_ON.search(norm) is not None or "SHELLOPTS" in norm
+    if desig and hist:
+        return True
+    # a code string's text is this text's with quotes and backslashes removed, or `$'...'`
+    # decoded: with no `$'` and none of the words the rule reads, no code string holds one
+    deep = ("$'" in text or _PE_DEEP_HINT.search(norm) is not None
+            or (("!" in norm or "^" in norm) and _PE_HIST_WORD.search(norm) is not None))
+    codes = deep and _may_hold_code_strings(text)
+    # r2 (M1/M4), T-5667: a `set`/`shopt`/shell word may turn history on (read by words),
+    # which matters only to a designator, a run-time command word, a code string or a feed
+    switch = not hist and _PE_SWITCH_HINT.search(norm) is not None and (
+        desig or codes or "$" in norm or "`" in norm or "<" in norm or "|" in norm
+        or _PE_SHELL_WORD.search(norm) is not None)
+    if not codes and not hist and not switch and not _PE_LEX_HINT.search(norm):
+        return False
+    lex = _py_lex(text)
+    if lex.frame_limited and (hist or switch or desig or _PE_FC_WORD.search(norm)
+                              or "compgen" in norm or "history" in norm):
+        return True  # the rest of the text was never lexed
+    if switch and any(_pe_hist_switch(c) for c in lex.cmds):
+        if desig:
+            return True
+        hist = True
+    if hist and _pe_fed_unread(lex):
+        return True  # T-5667 (5)
+    for c in lex.cmds:
+        if _pe_cmd_runs(c):
+            return True
+        if hist and _pe_head_dyn(c):
+            return True  # r2 (M4): with history on, a run-time command word may be fc
+        if codes or hist:
+            for code in _py_code_strings(c, keep_dynamic=True) or ():
+                if _pe_walk(code, depth + 1, budget, hist):
+                    return True
+    if hist:
+        # (M4) a text fed to a shell here runs with this one's history on (`bash -i <<E`)
+        fed, _chains, refused = _stdin_fed_codes(text)
+        if refused:
+            return True
+        for code in fed:
+            if code != text and _pe_walk(code, depth + 1, budget, True):
+                return True
+    return False
+
+
+def _prompt_eval_match(command: str) -> bool:
+    """T-5634: True when `command` prompt-expands a value the guard cannot read, stores or
+    expands shell history, or runs an `fc` / `compgen -C`/`-W` string (see above)."""
+    return _pe_walk(command, 0, [_PY_CODE_BUDGET * len(command) + 4096])
+
+
 def _decide_readings(data: dict) -> dict | None:
     """`_decide`, and for a Bash command whose comment hides a `\\`+newline,
     `_decide` on the copy bash actually reads (`_comment_cut_text`, T-4393):
@@ -16120,7 +18345,11 @@ def _decide_readings(data: dict) -> dict | None:
     denial = _decide_trap(data, tool_input, command)  # T-5441: each trap action as code
     if denial is not None:
         return denial
+    denial = _decide_wrapcode(data, tool_input, command)  # T-5571: sg/firejail codes as code
+    if denial is not None:
+        return denial
     alt = _comment_cut_text(command)
+    pe_texts = [command] if alt is None else [command, alt]  # T-5634: judged last, below
     if alt is not None:
         denial = _decide({**data, "tool_input": {**tool_input, "command": alt}})
         if denial is not None:
@@ -16139,11 +18368,13 @@ def _decide_readings(data: dict) -> dict | None:
     if joined == command:
         joined = None
     if joined is not None:
+        pe_texts.append(joined)
         denial = _decide({**data, "tool_input": {**tool_input, "command": joined}})
         if denial is not None:
             return denial
         alt = _comment_cut_text(joined)
         if alt is not None:
+            pe_texts.append(alt)
             denial = _decide({**data, "tool_input": {**tool_input, "command": alt}})
             if denial is not None:
                 return denial
@@ -16154,6 +18385,13 @@ def _decide_readings(data: dict) -> dict | None:
     denial = _decide_script_files(data, tool_input, command)  # T-5505: each script file run
     if denial is not None:
         return denial
+    denial = _decide_noncomputable(data, tool_input, command)  # T-5571: uncomputed stdin feeds
+    if denial is not None:
+        return denial
+    # T-5634: after every other rule, so theirs come first; the comment-cut and eval-joined
+    # copies too (`_decide` alone judges those)
+    if any(_prompt_eval_match(t) for t in pe_texts):
+        return _PE_DENY
     if _ENV_S_ACTIVE[0]:
         return None
     if not _SCAN_HEREDOCS[0] and not _ENV_S_HEREDOC_OP.search(command):

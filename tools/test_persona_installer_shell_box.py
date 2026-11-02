@@ -32,6 +32,7 @@ from tools.persona_installer import (
     SimulatedHostBackend,
 )
 from tools.test_persona_installer_periodics import PeriodicCase
+from tools.test_persona_installer_services import legacy_ho_resumer_manifest
 
 KIND = "seat-claude-settings-env"
 OP_ID = "harness.claude-shell-box"
@@ -57,6 +58,7 @@ class PlanShapeTests(PeriodicCase):
         self.assertEqual(plan.provenance["shell_box_containment"], "applicable")
 
     def test_op_precedes_every_claude_launch_and_the_ho_resumer_decommission(self) -> None:
+        self.set_manifest(legacy_ho_resumer_manifest())  # T-5633: the decommission is declared-only
         ids = self.ids(self.plan("recovery"))
         at = ids.index
         self.assertLess(at("host.user-manager"), at(OP_ID))
@@ -74,7 +76,8 @@ class PlanShapeTests(PeriodicCase):
                 for dep in str(source.get("after", "")).split(","):
                     with self.subTest(op=operation.operation_id, dep=dep):
                         self.assertNotIn(dep.strip(), (OP_ID, KIND))
-        # takes effect in the stage-prefix leg of a staged install, before any fire
+        # takes effect in the staged-ACTIVATE leg of a staged install (after the first
+        # activation op, still before every launch op), not in the stage-prefix leg
         self.assertNotIn(KIND, _pim.ACTIVATION_OPERATION_KINDS)
 
     def test_kind_is_seat_local_residue_outside_the_envelope_and_partitions_cleanly(self) -> None:
@@ -86,7 +89,8 @@ class PlanShapeTests(PeriodicCase):
         broker, residue = partition_installer_plan(self.plan("recovery"))
         self.assertIn(OP_ID, {o.operation_id for o in residue})
         self.assertNotIn(OP_ID, {o.operation_id for o in broker.operations})
-        self.assertLessEqual(len(residue), SEAT_LOCAL_RESIDUE_LIMIT)
+        # T-5470 (HO ruling 2026-10-26): routed launches have their own bound; B8 counts the rest
+        self.assertLessEqual(len([o for o in residue if o.kind not in EXECUTOR_KIND_CLASSES]), SEAT_LOCAL_RESIDUE_LIMIT)
 
     def test_codex_only_seat_gets_no_op_and_a_not_applicable_plan_note(self) -> None:
         plan = self.plan("consultant")
@@ -116,7 +120,9 @@ class PlanShapeTests(PeriodicCase):
         for persona in personas:
             with self.subTest(persona=persona):
                 plan = installer.plan(manifest, persona, root=self.root / "real")
-                self.assertLessEqual(len(partition_installer_plan(plan)[1]), SEAT_LOCAL_RESIDUE_LIMIT)
+                # T-5470 (HO ruling 2026-10-26): routed launches have their own bound; B8 counts the rest
+                residue = partition_installer_plan(plan)[1]
+                self.assertLessEqual(len([o for o in residue if o.kind not in EXECUTOR_KIND_CLASSES]), SEAT_LOCAL_RESIDUE_LIMIT)
 
 
 # ---------------------------------------------------------------------------
@@ -474,9 +480,23 @@ class VerifySeatContainmentTests(PeriodicCase):
         self.assertIn("systemd-run not on PATH", check["detail"])
 
     def test_check_does_not_read_the_host_environment_when_seams_are_injected(self) -> None:
-        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/nonexistent-host-xdg"}), \
-                mock.patch("shutil.which", side_effect=AssertionError("read host PATH")):
-            self.assertTrue(self.by_name(self.run_checks())["user-manager"]["ok"])
+        # T-5470: containment_checks binds ``which=shutil.which`` at def time, so
+        # patching shutil.which never reached it (a dead patch). Inject a recording
+        # ``which`` instead and prove it is the lookup the check consults; the
+        # host-default lookup is swapped for one that fails loudly if it is used.
+        asked: list[str] = []
+
+        def injected_which(name: str) -> str:
+            asked.append(name)
+            return "/usr/bin/systemd-run"
+
+        host_default = mock.patch.dict(
+            vs.containment_checks.__kwdefaults__,
+            {"which": mock.Mock(side_effect=AssertionError("read host PATH"))},
+        )
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/nonexistent-host-xdg"}), host_default:
+            self.assertTrue(self.by_name(self.run_checks(which=injected_which))["user-manager"]["ok"])
+        self.assertEqual(asked, ["systemd-run"])
 
     def test_fallback_log_absent_or_empty_passes_and_non_empty_fails(self) -> None:
         self.assertTrue(self.by_name(self.run_checks())["fallback-log"]["ok"])

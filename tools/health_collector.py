@@ -62,7 +62,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tools.health_export import (  # noqa: E402
-    SudoReader, _bounded_int, _ident, atomic_write_json, fleet_personas,
+    SudoReader, _bounded_int, _ident, _seat_owner, atomic_write_json, fleet_personas,
 )
 
 SCHEMA = "pantheon-fleet-health/1"
@@ -272,7 +272,8 @@ def _seat_state(props: dict) -> dict | None:
         "state": state,
         "sources": (sorted({x for x in sources if x in SEAT_STATE_SOURCES})
                     if isinstance(sources, list) else []),
-        "owner": _ident(_typed(props, "SeatStateOwner", "s")),
+        # T-5645: the harness --owner shape (incl. `role:<id>`), not a persona ident.
+        "owner": _seat_owner(_typed(props, "SeatStateOwner", "s")),
         "reason": _seat_reason(_typed(props, "SeatStateReason", "s")),
         "expires": expires if isinstance(expires, str) and _ISO_Z_RE.fullmatch(expires) else None,
         "fault": bool(fault) if isinstance(fault, str) else False,
@@ -369,7 +370,7 @@ def _sanitize_seat_state(ss: object) -> dict | None:
         "state": state,
         "sources": (sorted({x for x in sources if isinstance(x, str) and x in SEAT_STATE_SOURCES})
                     if isinstance(sources, list) else []),
-        "owner": _ident(ss.get("owner")),
+        "owner": _seat_owner(ss.get("owner")),
         "reason": _seat_reason(ss.get("reason")),
         "expires": expires if isinstance(expires, str) and _ISO_Z_RE.fullmatch(expires) else None,
         "fault": ss["fault"] if isinstance(ss.get("fault"), bool) else False,

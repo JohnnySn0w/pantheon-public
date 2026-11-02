@@ -42,6 +42,7 @@ lock file (Base engine mechanics L318-319: only root, only at
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import time
@@ -49,7 +50,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .exceptions import AdmissionRefused, PrimitiveUnavailable
+from .exceptions import AdmissionRefused, ClaimHolderMismatch, PrimitiveUnavailable
 
 #: Sticky + world-writable: any uid may create a claim attempt; only the
 #: owner (or root) may unlink an existing one (matches /tmp's own model).
@@ -207,24 +208,148 @@ def claim(
         _best_effort_unlink(tmp_path)
 
 
-def release(system_dir: Path, instance: str, component: str) -> None:
-    """Explicitly release a held claim.
+def release(system_dir: Path, instance: str, component: str, *, expected_run_id: str) -> None:
+    """Explicitly release the claim held by ``expected_run_id`` (T-5819).
 
     Called only by the run's own finalize path -- never automatically
     on process exit (that automaticity is exactly what the rejected
     caller-held-flock design would have given us, and exactly what C1's
     caller-exit-persistence requirement forbids).
+
+    Compare-and-delete: deletes the canonical claim ONLY if it names
+    ``expected_run_id``, so a releaser that checked the holder earlier
+    can never delete a claim a different run took since.
+
+    - claim absent -> no-op (idempotent release);
+    - claim names another run -> ``ClaimHolderMismatch``, nothing deleted;
+    - claim unreadable / malformed -> ``PrimitiveUnavailable``, nothing
+      deleted (fail closed, C4; before T-5819 a malformed claim was
+      unlinked unconditionally);
+    - release lock busy past ``_RELEASE_LOCK_WAIT_S`` -> ``PrimitiveUnavailable``.
+
+    Operator recovery for a malformed claim (C4 fail-closed is intended:
+    release never guesses whose claim an unparseable file was): inspect
+    the file named in the ``PrimitiveUnavailable`` reason; if it is
+    confirmed stale (no live run owns the component), remove it by hand
+    as its owner or root (the leaf is sticky). The next admission can
+    then proceed.
+
+    The read and the unlink both act relative to the locked leaf-directory
+    fd, so the lock, the read and the delete all hit the SAME directory
+    even if the gate tree is renamed or replaced mid-section (C4-1).
+
+    Why a lock around release only is sufficient: the canonical name goes
+    absent->present only through ``claim()``'s ``link()``, which fails if
+    the name exists, and present->absent only here. With every removal
+    serialized under the leaf-directory flock, a claim that is present
+    when the holder reads it is the same claim when this unlinks it.
+    ``claim()`` takes no lock, so admission semantics are unchanged. The
+    flock is a microsecond critical section, NOT the claim: the claim file
+    stays the mechanism-of-record and persists across process exit (C1).
     """
 
+    leaf = _leaf_dir(system_dir, instance, component)
     canonical = _claim_path(system_dir, instance, component)
     try:
-        os.unlink(canonical)
+        lock_fd = os.open(leaf, os.O_RDONLY | os.O_DIRECTORY)
     except FileNotFoundError:
-        pass
+        return  # no leaf, so no claim: nothing to release
     except OSError as exc:
         raise PrimitiveUnavailable(
-            PRIMITIVE_NAME, f"release failed at {canonical}: {exc}"
+            PRIMITIVE_NAME, f"release lock unopenable at {leaf}: {exc}"
         ) from exc
+    try:
+        _lock_leaf(lock_fd, leaf)
+        holder = _read_claim_at(lock_fd, canonical)  # raises PrimitiveUnavailable if malformed
+        if holder is None:
+            return
+        _after_holder_read()
+        actual = holder.get("run_id")
+        if actual != expected_run_id:
+            raise ClaimHolderMismatch(component, expected_run_id, actual)
+        try:
+            os.unlink(_CLAIM_LEAF_NAME, dir_fd=lock_fd)
+        except OSError as exc:  # FileNotFoundError included: the lock forbids a concurrent removal
+            raise PrimitiveUnavailable(
+                PRIMITIVE_NAME, f"release failed at {canonical}: {exc}"
+            ) from exc
+    finally:
+        os.close(lock_fd)  # closing the fd drops the flock
+
+
+def _read_claim_at(dir_fd: int, canonical: Path) -> dict[str, Any] | None:
+    """Read the claim relative to the locked leaf fd (T-5819 L1).
+
+    ``None`` if absent. ``PrimitiveUnavailable`` (fail closed, nothing
+    deleted) if unreadable, a symlink (``O_NOFOLLOW``), not JSON, or JSON
+    that is not an object. ``canonical`` is for messages only.
+    """
+
+    try:
+        fd = os.open(_CLAIM_LEAF_NAME, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise PrimitiveUnavailable(
+            PRIMITIVE_NAME, f"claim unreadable at {canonical}: {exc}"
+        ) from exc
+    try:
+        chunks = []
+        while True:
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError as exc:
+        raise PrimitiveUnavailable(
+            PRIMITIVE_NAME, f"claim unreadable at {canonical}: {exc}"
+        ) from exc
+    finally:
+        os.close(fd)
+    try:
+        payload = json.loads(b"".join(chunks).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PrimitiveUnavailable(
+            PRIMITIVE_NAME, f"claim malformed at {canonical}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise PrimitiveUnavailable(
+            PRIMITIVE_NAME,
+            f"claim malformed at {canonical}: expected a JSON object, got {type(payload).__name__}",
+        )
+    return payload
+
+
+#: Bound on waiting for the release critical section. The section is a
+#: read + unlink; a holder past this bound is wedged or hostile, so release
+#: fails closed (C4) rather than hanging.
+_RELEASE_LOCK_WAIT_S = 2.0
+_RELEASE_LOCK_RETRY_S = 0.01
+
+
+def _lock_leaf(lock_fd: int, leaf: Path) -> None:
+    deadline = time.monotonic() + _RELEASE_LOCK_WAIT_S
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise PrimitiveUnavailable(
+                    PRIMITIVE_NAME,
+                    f"release lock busy at {leaf} past {_RELEASE_LOCK_WAIT_S}s; nothing released",
+                ) from None
+            time.sleep(_RELEASE_LOCK_RETRY_S)
+        except OSError as exc:
+            raise PrimitiveUnavailable(
+                PRIMITIVE_NAME, f"release lock failed at {leaf}: {exc}"
+            ) from exc
+
+
+def _after_holder_read() -> None:
+    """Test injection point: runs inside the release critical section,
+    after the holder read and before the compare-and-unlink. No-op in
+    production."""
 
 
 def _best_effort_unlink(path: Path) -> None:

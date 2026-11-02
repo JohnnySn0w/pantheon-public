@@ -1598,6 +1598,48 @@ class ApprovalJournal:
         ).fetchall()
         return tuple(row[0] for row in rows)
 
+    def pending_human_request_page(
+        self,
+        now_iso: str,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+    ) -> tuple[tuple[str, str], ...]:
+        """One keyset page of still-undelivered, unexpired human requests
+        (T-2920 U2: the approval daemon re-arms EVERY pending request at
+        start, not only the first page). Rows are ``(created_at,
+        request_handle)`` in that explicit total order (``request_handle`` is
+        the primary key, so the key is unique); ``after`` is the last key of
+        the previous page and only strictly later keys are returned, so a
+        caller that advances it can never see the same row twice. Read-only.
+        """
+
+        if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+            raise HostControlError("invalid pending human request limit")
+        connection = self._require_open()
+        if after is None:
+            rows = connection.execute(
+                "SELECT created_at, request_handle FROM human_requests "
+                "WHERE state='pending' AND expires_at > ? "
+                "ORDER BY created_at, request_handle LIMIT ?",
+                (now_iso, limit),
+            ).fetchall()
+        else:
+            if (
+                not isinstance(after, tuple)
+                or len(after) != 2
+                or not all(isinstance(item, str) for item in after)
+            ):
+                raise HostControlError("invalid pending human request cursor")
+            rows = connection.execute(
+                "SELECT created_at, request_handle FROM human_requests "
+                "WHERE state='pending' AND expires_at > ? "
+                "AND (created_at > ? OR (created_at = ? AND request_handle > ?)) "
+                "ORDER BY created_at, request_handle LIMIT ?",
+                (now_iso, after[0], after[0], after[1], limit),
+            ).fetchall()
+        return tuple((str(row[0]), str(row[1])) for row in rows)
+
     def due_for_expiry(
         self,
         now_iso: str,

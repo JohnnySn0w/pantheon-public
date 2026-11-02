@@ -1,0 +1,32 @@
+176 175 253:1 /var/lib/machines/pantheon-rehearsal-1990856d106c / rw,relatime,idmapped shared:477 - ext4 /dev/vda1 rw,discard,errors=remount-ro,commit=30
+177 176 0:70 / /tmp rw,nosuid,nodev shared:478 - tmpfs tmpfs rw,size=813180k,nr_inodes=409600,uid=1708523520,gid=1708523520,inode64
+178 176 0:71 / /sys ro,nosuid,nodev,noexec,relatime shared:480 - tmpfs tmpfs rw,size=4096k,nr_inodes=1024,mode=555,uid=1708523520,gid=1708523520,inode64
+179 176 0:72 / /dev rw,nosuid shared:481 - tmpfs tmpfs rw,size=4096k,nr_inodes=65536,mode=755,uid=1708523520,gid=1708523520,inode64
+185 179 0:73 / /dev/shm rw,nosuid,nodev shared:482 - tmpfs tmpfs rw,size=813180k,nr_inodes=409600,uid=1708523520,gid=1708523520,inode64
+186 179 0:75 / /dev/pts rw,nosuid,noexec,relatime shared:483 - devpts devpts rw,gid=1708523525,mode=620,ptmxmode=666
+187 176 0:74 / /run rw,nosuid,nodev shared:484 - tmpfs tmpfs rw,size=1626356k,nr_inodes=819200,mode=755,uid=1708523520,gid=1708523520,inode64
+188 187 0:74 /host /run/host ro,nosuid,nodev,noexec shared:485 - tmpfs tmpfs rw,size=1626356k,nr_inodes=819200,mode=755,uid=1708523520,gid=1708523520,inode64
+189 188 253:1 /usr/lib/os-release /run/host/os-release ro,nosuid,nodev,noexec,relatime shared:486 - ext4 /dev/vda1 rw,discard,errors=remount-ro,commit=30
+190 188 0:24 /systemd/nspawn/propagate/pantheon-rehearsal-1990856d106c /run/host/incoming ro,relatime shared:487 master:5 - tmpfs tmpfs rw,size=813180k,mode=755,inode64
+193 176 253:1 /srv/rehearsal/repo /srv/rehearsal/repo ro,relatime shared:492 master:1 - ext4 /dev/vda1 rw,discard,errors=remount-ro,commit=30
+195 176 0:78 / /proc rw,nosuid,nodev,noexec,relatime shared:493 - proc proc rw
+196 195 0:78 /sys /proc/sys ro,nosuid,nodev,noexec,relatime shared:493 - proc proc rw
+202 196 0:78 /sys/net /proc/sys/net rw,nosuid,nodev,noexec,relatime shared:493 - proc proc rw
+203 195 0:78 /sys/net /proc/sys/net rw,nosuid,nodev,noexec,relatime shared:493 - proc proc rw
+204 195 0:78 /acpi /proc/acpi ro,nosuid,nodev,noexec,relatime shared:493 - proc proc rw
+205 195 0:78 /bus /proc/bus ro,nosuid,nodev,noexec,relatime shared:493 - proc proc rw
+206 195 0:78 /fs /proc/fs ro,nosuid,nodev,noexec,relatime shared:493 - proc proc rw
+207 195 0:78 /irq /proc/irq ro,nosuid,nodev,noexec,relatime shared:493 - proc proc rw
+208 195 0:78 /scsi /proc/scsi ro,nosuid,nodev,noexec,relatime shared:493 - proc proc rw
+209 179 0:77 / /dev/mqueue rw,nosuid,nodev,noexec,relatime shared:495 - mqueue mqueue rw
+211 178 0:79 /block /sys/block ro,nosuid,nodev,noexec,relatime shared:496 - sysfs sysfs ro
+212 178 0:79 /bus /sys/bus ro,nosuid,nodev,noexec,relatime shared:496 - sysfs sysfs ro
+217 178 0:79 /class /sys/class ro,nosuid,nodev,noexec,relatime shared:496 - sysfs sysfs ro
+219 178 0:79 /dev /sys/dev ro,nosuid,nodev,noexec,relatime shared:496 - sysfs sysfs ro
+334 178 0:79 /devices /sys/devices ro,nosuid,nodev,noexec,relatime shared:496 - sysfs sysfs ro
+776 178 0:79 /kernel /sys/kernel ro,nosuid,nodev,noexec,relatime shared:496 - sysfs sysfs ro
+173 178 0:28 / /sys/fs/cgroup rw,nosuid,nodev,noexec,relatime shared:474 - cgroup2 cgroup rw,nsdelegate,memory_recursiveprot
+172 196 0:74 /.#proc-sys-kernel-random-boot-ida6c5390f447ec4de//deleted /proc/sys/kernel/random/boot_id ro,nosuid,nodev,noexec shared:484 - tmpfs tmpfs rw,size=1626356k,nr_inodes=819200,mode=755,uid=1708523520,gid=1708523520,inode64
+174 195 0:74 /.#proc-sys-kernel-random-boot-ida6c5390f447ec4de//deleted /proc/sys/kernel/random/boot_id rw,nosuid,nodev shared:484 - tmpfs tmpfs rw,size=1626356k,nr_inodes=819200,mode=755,uid=1708523520,gid=1708523520,inode64
+191 195 0:74 /.#proc-kmsga1e5a99e17967672//deleted /proc/kmsg rw,nosuid,nodev shared:484 - tmpfs tmpfs rw,size=1626356k,nr_inodes=819200,mode=755,uid=1708523520,gid=1708523520,inode64
+192 187 0:76 / /run/lock rw,nosuid,nodev,noexec,relatime shared:322 - tmpfs tmpfs rw,size=5120k,uid=1708523520,gid=1708523520,inode64

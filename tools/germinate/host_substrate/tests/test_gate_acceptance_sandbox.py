@@ -171,7 +171,7 @@ def test_bootstrap_converges_every_family_and_the_invariants_hold(sb):
     results = I.evaluate(m, observed)
     assert all(r["ok"] for r in results), results
     assert sb.read("/var/lib/systemd/linger/alice") == b""  # fake-port tier
-    assert any(call[0] == P.SETFACL and call[2] == ",".join(sorted(ACL)) for call in port.runner.calls)
+    assert any(call[:3] == (P.SETFACL, "--physical", "--set") and call[3] == ",".join(sorted(ACL)) for call in port.runner.calls)
 
 
 @needs_sandbox
@@ -480,7 +480,7 @@ def test_f2_a_manifest_acl_without_base_entries_is_refused():
         with pytest.raises(F.ManifestError):
             F.load_manifest(doc)
     r = F.resolve("acl.converge", {"path": "/srv/pantheon/shared"}, F.load_manifest(MANIFEST))
-    assert P.apply_argv(r) == [[P.SETFACL, "--set", ",".join(sorted(ACL)), "/srv/pantheon/shared"]]
+    assert P.apply_argv(r) == [[P.SETFACL, "--physical", "--set", ",".join(sorted(ACL)), "/srv/pantheon/shared"]]
 
 
 def test_f3_rollback_of_a_retire_is_the_exact_unlock_argv():

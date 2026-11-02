@@ -63,7 +63,7 @@ IMPLEMENTED = frozenset(("diagnostics.read", "files.seat_root", "mailbox.probe")
 
 
 def _narrow_installer_class():
-    from tools.host_control.envelope import EXECUTOR_KIND_CLASSES
+    from tools.host_control.envelope import EXECUTOR_KIND_CLASSES, KIND_INSPECTION_READS
     from tools.persona_installer import InstallPlan, PersonaInstaller
 
     class NarrowInstaller(PersonaInstaller):
@@ -74,8 +74,12 @@ def _narrow_installer_class():
                 for name in plan.__dataclass_fields__
                 if name != "digest"
             }
+            # T-5608: a files.seat_root kind with declared user-manager
+            # inspection reads (the residue quarantine) is left out with the
+            # activation kinds: this fixture's executor has no manager state
             values["operations"] = tuple(
-                op for op in plan.operations if EXECUTOR_KIND_CLASSES.get(op.kind) in IMPLEMENTED
+                op for op in plan.operations
+                if EXECUTOR_KIND_CLASSES.get(op.kind) in IMPLEMENTED and op.kind not in KIND_INSPECTION_READS
             )
             return InstallPlan.create(**values)
 
@@ -155,6 +159,10 @@ def prepare_tree(root: Path) -> dict:
             }
         ],
     }
+    # T-5533: the broker reads the root-registered (narrowed) plan, not an installer.
+    from tools._host_control_plan_fixtures import register_plan
+
+    register_plan(registry, trusted, prototype, seat_id="recovery", manifest_revision="manifest-r1")
     policy = {
         "schema": "pantheon-host-policy/v1",
         "revision": "policy-r1",
@@ -226,8 +234,11 @@ def serve_broker(config: dict) -> int:
     dbus.mainloop.glib.threads_init()
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     trusted = Path(config["trusted"])
-    files = RootOwnedFileLoader._open_for_test((trusted,), expected_owner_uid=os.getuid())
-    registry = SeatRegistry.load(trusted / "registry.json", files=files)
+    framework = Path(config["framework"])
+    # T-5533 review r1 B1: Plan() refuses without a framework root; the broker
+    # re-hashes the fixture's framework copy, so it is a trusted root too.
+    files = RootOwnedFileLoader._open_for_test((trusted, framework), expected_owner_uid=os.getuid())
+    registry = SeatRegistry.load(trusted / "registry.json", files=files, framework_root=framework)
     policy = HostPolicy.load(trusted / "policy.json", files=files)
     journal_path = Path(config["journal"])
     journal = BrokerJournal.open(journal_path)
@@ -237,7 +248,6 @@ def serve_broker(config: dict) -> int:
         registry=registry,
         policy=policy,
         journal=journal,
-        installer=_narrow_installer_class()(Path(config["framework"])),
         clock=clock,
         handle_factory=handles,
         plan_ttl=timedelta(hours=1),

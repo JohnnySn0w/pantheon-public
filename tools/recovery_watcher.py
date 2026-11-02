@@ -106,6 +106,7 @@ DEFAULT_HEALTH_DIR = Path("/run/pantheon-health")
 DEFAULT_STATE_FILE = Path.home() / ".local/state/pantheon/recovery_watcher.json"
 DEFAULT_WATCHER_HEALTH_DIR = Path("/run/recovery-seat-health")
 WATCHER_HEARTBEAT_NAME = "watcher.json"
+FLEET_AGGREGATE_NAME = "fleet-health.json"  # health_collector output, not a persona record
 
 RECOVERY_PERSONA = "recovery"
 # The recovery seat's identity anchor is its unix account, which never changes;
@@ -265,6 +266,8 @@ def load_health(health_dir: Path, personas: frozenset[str]) -> tuple[dict, int, 
     seen = 0
     for name in names:
         if not name.endswith(".json") or name.startswith("."):
+            continue
+        if name == FLEET_AGGREGATE_NAME:
             continue
         seen += 1
         if seen > MAX_FILES:

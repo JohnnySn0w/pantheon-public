@@ -27,6 +27,7 @@ FAILED_TESTS=()
 # Speed up sleeps for tests (overrides the default 0.7s delay).
 export INJECT_ENTER_DELAY=0.001
 export EMPTY_RECAPTURE_S=0.001
+export LATE_CONFIRM_POLL_S=0.001  # T-5680: the failure-path late-confirm poll
 # T-4362: the render gate's poll interval. The gate itself stays off (RENDER_WAIT_S
 # unset = 0) unless a test passes --render-wait.
 export RENDER_POLL_S=0.001
@@ -734,6 +735,30 @@ postcheck_render_gate_codex_accepts_the_collapsed_paste() {
   ! grep -q "WARNING" "$SBX/stderr" || { echo "    unexpected WARNING"; return 1; }
 }
 
+# --- T-5680: bounded late-confirm poll on the failure path ----------------------
+# specialist keep-going 10-27 15:08Z: every check in the retry window read pending, the
+# Enter landed after it, and the unit false-failed. Captures 1-5 are the 3 post-Enter
+# reads and the 2 pre-retry reads; then the late poll looks again, with NO Enter.
+preflight_late_confirm_after_last_retry() {
+  printf '%s\n' "[Pasted text — still pending" "[Pasted text — still pending" \
+    "[Pasted text — still pending" "[Pasted text — still pending" "[Pasted text — still pending" \
+    "[Pasted text — still pending" "[Pasted text — still pending" "clean pane" > "$SBX/pane_states"
+}
+postcheck_late_confirm_after_last_retry() {
+  local n; n=$(cat "$SBX/sendkeys_calls")
+  [[ "$n" -eq 3 ]] || { echo "    expected exactly 3 Enters (no Enter from the late poll), got $n"; return 1; }
+  grep -q "confirmed late" "$SBX/stderr" || { echo "    expected the 'confirmed late' note"; return 1; }
+}
+# All pending: the late poll is bounded (LATE_CONFIRM_POLLS looks), sends no Enter, rc 2.
+preflight_late_confirm_poll_is_bounded() {
+  printf '%s\n' "[Pasted text — still pending" > "$SBX/pane_states"
+}
+postcheck_late_confirm_poll_is_bounded() {
+  local n caps; n=$(cat "$SBX/sendkeys_calls"); caps=$(cat "$SBX/capture_call")
+  [[ "$n" -eq 3 ]] || { echo "    expected 3 Enters, got $n"; return 1; }
+  [[ "$caps" -eq $((5 + 6)) ]] || { echo "    expected 5 retry-window + 6 late captures, got $caps"; return 1; }
+}
+
 # --- T-5380 r2: re-verify before every RETRY Enter ----------------------------
 # Enter 1's capture reads pending; the pre-retry capture reads submitted (Enter 1
 # landed late, inside the settle window). No second Enter may be pressed.
@@ -798,6 +823,18 @@ preflight_empty_then_pending_is_exit_2() { printf '%s\n' "" "[Pasted text — st
 run_test success_first_try 0 "main:0.0" "Hello, agent"
 run_test success_on_retry  0 "main:0.0" "Hello, agent"
 run_test late_enter_gets_no_retry_enter 0 "main:0.0" "Hello, agent"        # T-5380 r2
+# T-5680: the shell poll equals submit_verify.py's (1.5s x floor(10/1.5)=6 looks).
+if python3 -c "
+import sys; sys.path.insert(0, '$SCRIPT_DIR')
+import submit_verify as sv
+sys.exit(0 if (sv.LATE_CONFIRM_POLL_S, int(sv.LATE_CONFIRM_TOTAL_S // sv.LATE_CONFIRM_POLL_S)) == (1.5, 6) else 1)
+" && grep -q '^LATE_CONFIRM_POLL_S="\${LATE_CONFIRM_POLL_S:-1.5}"' "$SUT" && grep -q '^LATE_CONFIRM_POLLS="\${LATE_CONFIRM_POLLS:-6}"' "$SUT"; then
+  echo "  PASS: late_confirm_constants_match_submit_verify"; PASS=$((PASS+1))
+else
+  echo "  FAIL: late_confirm_constants_match_submit_verify"; FAIL=$((FAIL+1)); FAILED_TESTS+=("late_confirm_constants_match_submit_verify")
+fi
+run_test late_confirm_after_last_retry 0 "main:0.0" "Hello, agent"       # T-5680
+run_test late_confirm_poll_is_bounded 2 "main:0.0" "Hello, agent"        # T-5680
 run_test pre_retry_pending_still_retries 2 "main:0.0" "Hello, agent"  # T-5380 r2
 run_test empty_pre_retry_capture_is_no_vote 0 "main:0.0" "Hello, agent"  # T-5380 r3
 run_test empty_post_enter_capture_is_unverified 2 "main:0.0" "Hello, agent"  # T-5412

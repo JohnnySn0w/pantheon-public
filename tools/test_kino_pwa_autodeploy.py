@@ -478,5 +478,43 @@ class TestStepShapes(_Base):
             self.assertIn(ad.SOURCE_DIR, cmd[-1])
 
 
+def test_kino_adapter_preserves_build_smoke_rsync_restart_order_and_does_not_restart_on_reconcile_refusal() -> None:
+    calls: list[str] = []
+    target = "a" * 40
+    def adapter(_path: Path, wanted: str) -> tuple[bool, str]:
+        assert wanted == target; calls.append("reconcile"); return True, ""
+    def step(name: str, detail: str = ""):
+        def run(*_args): calls.append(name); return True, detail
+        return run
+    with patch.object(ad, "verify_source_head", side_effect=step("head")), \
+         patch.object(ad, "build", side_effect=step("build")), \
+         patch.object(ad, "smoke", side_effect=step("smoke")), \
+         patch.object(ad, "rsync_to_deploy", side_effect=step("rsync")), \
+         patch.object(ad, "restart_kino", side_effect=step("restart")), \
+         patch.object(ad, "verify_active", side_effect=step("verify", "active")), \
+         patch.object(ad, "_write_last_sha", side_effect=lambda _sha: calls.append("state")):
+        assert ad._deploy(target, adapter) == ad.EXIT_OK
+    assert calls == ["reconcile", "head", "build", "smoke", "rsync", "restart", "verify", "state"]
+
+    refusing = lambda _path, _wanted: (False, "scope mismatch")
+    with patch.object(ad, "build") as build, patch.object(ad, "restart_kino") as restart:
+        assert ad._deploy("b" * 40, refusing) == ad.EXIT_ADVANCE
+    build.assert_not_called(); restart.assert_not_called()
+
+
+def test_kino_lying_or_newer_adapter_head_mismatch_stops_before_downstream_stages() -> None:
+    target = "a" * 40; newer = "b" * 40; calls: list[tuple[Path, str]] = []
+    def lying(path: Path, wanted: str) -> tuple[bool, str]:
+        calls.append((path, wanted)); return True, "advanced"
+    with patch.object(ad, "verify_source_head", return_value=(False, f"HEAD {newer} != {target}")), \
+         patch.object(ad, "build") as build, patch.object(ad, "smoke") as smoke, \
+         patch.object(ad, "rsync_to_deploy") as rsync, patch.object(ad, "restart_kino") as restart, \
+         patch.object(ad, "verify_active") as active, patch.object(ad, "_write_last_sha") as state:
+        assert ad._deploy(target, lying) == ad.EXIT_ADVANCE
+    assert calls == [(Path(ad.SOURCE_DIR), target)]
+    for downstream in (build, smoke, rsync, restart, active, state):
+        downstream.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

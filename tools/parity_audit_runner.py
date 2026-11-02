@@ -435,7 +435,7 @@ def _default_ticket_sink(seat: str, body: str) -> None:
     ask, context = _split_ask_context(body)
     argv = [
         sys.executable, str(TICKET_BIN), "file",
-        "--requester", "recovery", "--target", "role:engineering_orchestrator",
+        "--automated-filer", "parity_audit_runner", "--requester", "recovery", "--target", "role:engineering_orchestrator",
         "--title", f"Seat-parity REBASELINE — {seat} SOFT-drift persisting >{SOFT_FAIL_REBASELINE_DAYS}d",
         "--labels", "seat-parity,parity-audit,rebaseline",
         "--project-id", "null",

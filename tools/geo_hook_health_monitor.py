@@ -31,7 +31,7 @@ except ImportError:  # script run: tools/ is on sys.path, the repo root is not
     from agent_role_map import mailbox_hub  # type: ignore
     import tailnet_self  # type: ignore
 
-DEFAULT_URL = "http://100.74.212.54:8787/health"  # geo-hook tailnet IP (T-3647)
+DEFAULT_URL = "http://100.84.210.244:8787/health"  # geo-hook tailnet IP (T-3647)
 DEFAULT_THRESHOLD = 3  # consecutive failures before alerting (~15 min at 5-min cadence)
 DEFAULT_STATE = Path.home() / ".local" / "state" / "pantheon" / "geo-hook-health.json"
 MAILBOX_HUB = mailbox_hub()

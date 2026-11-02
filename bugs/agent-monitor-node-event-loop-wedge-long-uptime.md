@@ -1,5 +1,5 @@
 ---
-symptom: "agent-monitor.service (Claude-Code-Agent-Monitor, node server/index.js) wedges after multi-day uptime — port 4820 stays open but HTTP requests stall or time out; accept-queue accumulates unaccepted connections; dashboard.tail26cadd.ts.net effectively down with no crash signal in journal"
+symptom: "agent-monitor.service (Claude-Code-Agent-Monitor, node server/index.js) wedges after multi-day uptime — port 4820 stays open but HTTP requests stall or time out; accept-queue accumulates unaccepted connections; dashboard.example.ts.net effectively down with no crash signal in journal"
 fix: "restart the user-mode systemd unit: `XDG_RUNTIME_DIR=/run/user/$(id -u) systemctl --user restart agent-monitor.service` (run as the `claude` user; Restart=on-failure does NOT trip because the process didn't exit)"
 domain: "pantheon, agent-monitor, node, third-party, systemd-user"
 ---
@@ -18,7 +18,7 @@ domain: "pantheon, agent-monitor, node, third-party, systemd-user"
 
 ## Symptom
 
-`tailscale serve` config intact (`svc:dashboard` → `dashboard.tail26cadd.ts.net` → `http://127.0.0.1:4820`), but the dashboard is unreachable:
+`tailscale serve` config intact (`svc:dashboard` → `dashboard.example.ts.net` → `http://127.0.0.1:4820`), but the dashboard is unreachable:
 
 - `curl -m 10 http://127.0.0.1:4820/` returns HTTP 000 (timeout) or a long-stalled 200 (50s+).
 - `ss -tlnp` on port 4820 shows the listener with Recv-Q > 0 — unaccepted connections piling up.
@@ -58,4 +58,4 @@ A timer-driven watchdog now detects this automatically: `tools/agent_monitor_hea
 
 ## Keywords
 
-agent-monitor, agent-dashboard, agent-monitor.service, Claude-Code-Agent-Monitor, dashboard.tail26cadd.ts.net, svc:dashboard, port 4820, node server/index.js, event loop wedge, listener stalled, accept-queue accumulating, Recv-Q nonzero, no crash signal, restart-on-failure no-op, multi-day uptime, third-party node app, Son Nguyen Hoang, pantheon dashboard down
+agent-monitor, agent-dashboard, agent-monitor.service, Claude-Code-Agent-Monitor, dashboard.example.ts.net, svc:dashboard, port 4820, node server/index.js, event loop wedge, listener stalled, accept-queue accumulating, Recv-Q nonzero, no crash signal, restart-on-failure no-op, multi-day uptime, third-party node app, Son Nguyen Hoang, pantheon dashboard down

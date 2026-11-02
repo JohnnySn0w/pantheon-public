@@ -30,6 +30,7 @@ that actually ran, not to a plan re-derived from a repo that has since moved.
 from __future__ import annotations
 
 import json
+import dataclasses
 import os
 import pwd
 import re
@@ -68,7 +69,7 @@ DEFAULT_STATE_DIR_RELATIVE = ".local/state/pantheon/persona-installer"
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_MANIFEST = REPO_ROOT / "instance.yaml"
-WORKFLOWS = ("all-in-one", "stage-prefix", "staged-activate")
+WORKFLOWS = ("all-in-one", "stage-prefix", "staged-activate", "reconcile-keep-going")
 _RECEIPT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 PLAN_SIDECAR_SCHEMA = "pantheon-persona-install-plan-sidecar/v1"
 
@@ -141,6 +142,7 @@ def preflight_verdicts(
     scopes = workflow_scopes(workflow)
     context = {
         "all-in-one": EXECUTION_CONTEXT_ALL_IN_ONE,
+        "reconcile-keep-going": EXECUTION_CONTEXT_ALL_IN_ONE,
         "stage-prefix": EXECUTION_CONTEXT_STAGE_PREFIX,
         "staged-activate": EXECUTION_CONTEXT_STAGED_ACTIVATE,
     }[workflow]
@@ -188,10 +190,64 @@ def build_plan(
     harness: str | None = None,
     repo_root: Path = REPO_ROOT,
     root: Path = Path("/"),
+    maintenance_bypass: bool = False,
+    workflow: str = "all-in-one",
 ) -> tuple[PersonaInstaller, InstallPlan, Manifest]:
     manifest = Manifest.load(manifest_path)
     installer = PersonaInstaller(repo_root=repo_root)
-    plan = installer.plan(manifest, persona, harness_override=harness, root=root)
+    # T-5475: the flag is a plan input (digest-bound); only passed when set so every default
+    # call is the exact pre-T-5475 call
+    extra = {"maintenance_bypass": True} if maintenance_bypass else {}
+    plan = installer.plan(manifest, persona, harness_override=harness, root=root, **extra)
+    if workflow == "reconcile-keep-going":
+        keep_ids = {
+            "connective.config-dir",
+            "connective.systemd-dir",
+            "connective.unit-dir",
+            "connective.local-dir",
+            "connective.local-state-dir",
+            "connective.pantheon-state-dir",
+            "connective.installer-state-dir",
+            "connective.state-dir",
+            "connective.receipt-dir",
+            "periodic.keep-going.service-unit",
+            "periodic.keep-going.timer-unit",
+            "periodic.daemon-reload",
+            "periodic.keep-going.timer-enable",
+            "periodic.keep-going.timer-observe",
+        }
+        selected = (
+            operation
+            for operation in plan.operations
+            if operation.operation_id in keep_ids
+            or (
+                operation.kind == "seat-service-decommission"
+                and operation.operation_id.endswith("codex-keep-going.decommission")
+            )
+        )
+        operations = tuple(
+            dataclasses.replace(
+                operation,
+                desired={**operation.desired, "after": "periodic.daemon-reload"},
+            )
+            if operation.kind == "seat-periodic-timer-enable"
+            else operation
+            for operation in selected
+        )
+        plan = InstallPlan.create(
+            schema=plan.schema,
+            manifest_version=plan.manifest_version,
+            instance=plan.instance,
+            role=plan.role,
+            persona=plan.persona,
+            account=plan.account,
+            configured_harness=plan.configured_harness,
+            selected_harness=plan.selected_harness,
+            root=plan.root,
+            operations=operations,
+            operator_actions=(),
+            provenance=plan.provenance,
+        )
     return installer, plan, manifest
 
 
@@ -252,13 +308,15 @@ def dry_run(
     backend: HostBackend | None = None,
     euid: int | None = None,
     uid_of: Callable[[str], int | None] = _account_uid,
+    maintenance_bypass: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     """Plan + full preflight. Never mutates (see the module docstring and
     test_persona_installer_apply_cli.DryRunIsReadOnlyTests). Operations whose
     preflight would write (the mailbox writable-root probe) are DEFERRED to execute:
     a distinct state that is neither a pass nor a refusal and does not fail the run."""
     _installer, plan, _manifest = build_plan(
-        manifest_path, persona, harness=harness, repo_root=repo_root, root=root
+        manifest_path, persona, harness=harness, repo_root=repo_root, root=root,
+        maintenance_bypass=maintenance_bypass, workflow=workflow,
     )
     require_target_account(plan, euid=euid, uid_of=uid_of)
     ensure_account_path(_account_home(plan))
@@ -350,11 +408,13 @@ def execute(
     backend: HostBackend | None = None,
     euid: int | None = None,
     uid_of: Callable[[str], int | None] = _account_uid,
+    maintenance_bypass: bool = False,
 ) -> tuple[int, dict[str, Any]]:
     if workflow not in WORKFLOWS:
         raise ApplyRefused(f"unknown workflow {workflow!r}")
     installer, plan, manifest = build_plan(
-        manifest_path, persona, harness=harness, repo_root=repo_root, root=root
+        manifest_path, persona, harness=harness, repo_root=repo_root, root=root,
+        maintenance_bypass=maintenance_bypass, workflow=workflow,
     )
     require_target_account(plan, euid=euid, uid_of=uid_of)
     if plan_digest != plan.digest:
@@ -365,7 +425,7 @@ def execute(
     ensure_account_path(_account_home(plan))
     backend = backend or _default_backend()
     actor = actor_for_plan(plan, uid=euid)
-    if workflow == "all-in-one":
+    if workflow in {"all-in-one", "reconcile-keep-going"}:
         report = installer.apply(plan, plan.digest, backend, actor, manifest=manifest)
     elif workflow == "stage-prefix":
         report = installer.stage_disabled(plan, plan.digest, backend, actor, manifest=manifest)

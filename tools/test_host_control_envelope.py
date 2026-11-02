@@ -15,7 +15,6 @@ import tempfile
 import typing
 import unittest
 from pathlib import Path
-from unittest import mock
 
 from tools import persona_installer as _pim
 from tools.host_control import envelope, wire
@@ -30,6 +29,8 @@ from tools.host_control.envelope import (
     require_executor_envelope,
 )
 from tools import test_host_control_core as _core  # module import: never re-collect its TestCases
+from tools._host_control_plan_fixtures import registered_plan_transform
+from tools.host_control.envelope import LAUNCH_DEPENDENT_KINDS, LAUNCH_KINDS, MUST_RUN_BEFORE_LAUNCH_KINDS
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -50,8 +51,8 @@ UNMAPPED_KINDS = (
     "seat-service-decommission",
     # T-5454: shell-box containment wiring in the seat's own settings.json, seat-local too
     "seat-claude-settings-env",
-    # T-5473 / T-5474: phase-Q residue quarantine + first-launch workspace trust, seat-local too
-    "seat-runtime-residue-quarantine",
+    # T-5474: first-launch workspace trust, seat-local too (T-5473's residue
+    # quarantine is admitted as files.seat_root since T-5608)
     "seat-claude-workspace-trust",
 )
 
@@ -94,6 +95,106 @@ class EnvelopeTableTests(unittest.TestCase):
         self.assertTrue(PERMISSION_POSTURE_KINDS)
         self.assertEqual(frozenset(EXECUTOR_KIND_CLASSES) & PERMISSION_POSTURE_KINDS, frozenset())
         self.assertLessEqual(PERMISSION_POSTURE_KINDS, OUT_OF_ENVELOPE_KINDS)
+
+
+class ResidueQuarantineAdmissionTests(unittest.TestCase):
+    """T-5608 (HO ruling 2026-10-27): files.seat_root + declared inspection reads."""
+
+    KIND = "seat-runtime-residue-quarantine"
+
+    def test_quarantine_is_files_seat_root_and_not_out_of_envelope(self) -> None:
+        self.assertEqual(EXECUTOR_KIND_CLASSES[self.KIND], "files.seat_root")
+        self.assertNotIn(self.KIND, OUT_OF_ENVELOPE_KINDS)
+        require_executor_envelope([self.KIND])
+
+    def test_quarantine_is_not_permission_posture(self) -> None:
+        # it moves runtime state; it changes no harness approval / MCP posture
+        self.assertNotIn(self.KIND, PERMISSION_POSTURE_KINDS)
+
+    def test_quarantine_still_must_run_before_every_launch(self) -> None:
+        self.assertIn(self.KIND, MUST_RUN_BEFORE_LAUNCH_KINDS)
+
+    def test_declared_reads_are_pinned_closed_and_read_only(self) -> None:
+        from tools.host_control.envelope import (
+            INSPECTION_PORT_METHODS,
+            INSPECTION_UNIT_ROLES,
+            KIND_INSPECTION_READS,
+        )
+        from tools.user_systemd import ReadPurpose
+
+        with self.assertRaises(TypeError):
+            KIND_INSPECTION_READS[self.KIND] = ()  # type: ignore[index]
+        self.assertEqual(
+            dict(KIND_INSPECTION_READS),
+            {
+                self.KIND: (
+                    ("unit_file_enablement", "timer", ""),
+                    ("read_unit", "controller", "service-observe"),
+                    ("read_unit", "consume", "service-observe"),
+                )
+            },
+        )
+        self.assertEqual(INSPECTION_PORT_METHODS, {"unit_file_enablement", "read_unit"})
+        self.assertEqual(INSPECTION_UNIT_ROLES, {"timer", "consume", "controller"})
+        purposes = {purpose.value for purpose in ReadPurpose}
+        for kind, reads in KIND_INSPECTION_READS.items():
+            self.assertIn(kind, EXECUTOR_KIND_CLASSES)
+            self.assertNotEqual(EXECUTOR_KIND_CLASSES[kind], "user_systemd.activate")
+            hash(reads)
+            for method, role, purpose in reads:
+                self.assertIn(method, INSPECTION_PORT_METHODS)
+                self.assertIn(role, INSPECTION_UNIT_ROLES)
+                self.assertEqual(purpose == "", method == "unit_file_enablement")
+                if purpose:
+                    self.assertIn(purpose, purposes)
+
+    def test_declared_reads_enter_the_op_registry_digest(self) -> None:
+        from types import MappingProxyType
+        from unittest import mock
+
+        from tools.germinate import op_registry
+        from tools.host_control.envelope import KIND_INSPECTION_READS
+
+        loaded = op_registry.load_op_registry()
+        self.assertEqual(
+            loaded.entries[self.KIND].inspection_reads, KIND_INSPECTION_READS[self.KIND]
+        )
+        self.assertIn(b'"inspection_reads"', loaded.blob)
+        for changed in (
+            KIND_INSPECTION_READS[self.KIND][:-1],  # a read dropped
+            KIND_INSPECTION_READS[self.KIND] + (("read_unit", "timer", "timer-elapse"),),  # added
+        ):
+            with self.subTest(reads=changed), mock.patch.object(
+                op_registry, "KIND_INSPECTION_READS", MappingProxyType({self.KIND: changed})
+            ):
+                self.assertNotEqual(op_registry.load_op_registry().digest, loaded.digest)
+        with mock.patch.object(
+            op_registry, "KIND_INSPECTION_READS", MappingProxyType({"no-such-kind": ()})
+        ), self.assertRaises(op_registry.OpRegistryError):
+            op_registry.load_op_registry()
+
+    def test_kinds_without_declared_reads_keep_their_registry_bytes(self) -> None:
+        from tools.germinate import op_registry
+
+        for kind, entry in op_registry.load_op_registry().entries.items():
+            if kind != self.KIND:
+                self.assertNotIn("inspection_reads", entry.to_json_obj())
+
+
+class HoResumerDecommissionKindTests(unittest.TestCase):
+    """T-5633: the decommission is a must-run-before-launch kind and stays
+    seat-local residue (never admitted)."""
+
+    KIND = "seat-service-decommission"
+
+    def test_decommission_must_run_before_every_launch(self) -> None:
+        self.assertIn(self.KIND, MUST_RUN_BEFORE_LAUNCH_KINDS)
+
+    def test_decommission_stays_out_of_the_envelope(self) -> None:
+        self.assertIn(self.KIND, OUT_OF_ENVELOPE_KINDS)
+        self.assertNotIn(self.KIND, EXECUTOR_KIND_CLASSES)
+        with self.assertRaises(OutOfEnvelopeKinds):
+            require_executor_envelope([self.KIND])
 
 
 class EnvelopeRefusalTests(unittest.TestCase):
@@ -152,27 +253,40 @@ class PlannerEnvelopeTests(unittest.TestCase):
         # T-2917 5b (HO ruling T-4861, superseding the 5a whole-plan
         # refusal): the broker plan holds only admitted kinds and each
         # non-admitted kind is NAMED in the digest-bound residue.
-        real_plan = self.installer.plan
+        # T-5533: inject into the REGISTERED plan the broker reads.
         for index, kind in enumerate(UNMAPPED_KINDS):
             with self.subTest(kind=kind):
 
-                def injected(*args, _kind=kind, **kwargs):
-                    plan = real_plan(*args, **kwargs)
+                def injected(plan, _kind=kind):
                     extra = dataclasses.replace(
                         plan.operations[0],
                         operation_id=f"injected.{_kind}",
                         kind=_kind,
                     )
+                    if _kind in MUST_RUN_BEFORE_LAUNCH_KINDS:
+                        # T-5470: a must-run-before-launch kind is placed where a
+                        # real plan carries it, ahead of the launches (appended
+                        # last it is a launch-before-containment plan, refused).
+                        return _core._plan_replace(plan, operations=(extra,) + plan.operations)
                     return _core._plan_replace(plan, operations=plan.operations + (extra,))
 
-                with mock.patch.object(self.installer, "plan", side_effect=injected):
+                with registered_plan_transform(injected):
                     result = self.service.plan(1003, "recovery", "manifest-r1", f"partitioned-{index}")
                 summary = json.loads(result.summary_json)
                 self.assertNotIn(kind, {op["kind"] for op in summary["operations"]})
                 # T-5447: the baseline periodic residue is set aside; the injected
-                # kind must still be the ONLY other residue entry.
+                # kind must still be the ONLY other residue entry. T-5470: a residue
+                # must-run-before-launch kind also routes the plan's launches (and
+                # their dependents) to the residue; those are set aside too.
+                # (T-5473 puts the residue quarantine on every seat, so the fixture's
+                # launches are routed whatever kind is injected.)
+                # Only the in-envelope routed class is set aside, never an injected kind.
+                routed = (LAUNCH_KINDS | LAUNCH_DEPENDENT_KINDS) & set(EXECUTOR_KIND_CLASSES)
                 self.assertEqual(
-                    [r for r in summary["seat_local_residue"] if not r["operation_id"].startswith(("periodic.", "service."))],
+                    [
+                        r for r in summary["seat_local_residue"]
+                        if not r["operation_id"].startswith(("periodic.", "service.")) and r["kind"] not in routed
+                    ],
                     [{"operation_id": f"injected.{kind}", "kind": kind, "status": "pending-seat-local"}],
                 )
                 self.assertEqual(self._plan_count(), index + 1)

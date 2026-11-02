@@ -127,6 +127,27 @@ class TicketPurposeTests(unittest.TestCase):
             {"dangling-ticket-purpose"},
         )
 
+    def test_operational_root_label_is_a_purpose_terminal(self) -> None:
+        """T-3332 (b): a child of a labelled operational root (T-5677 shape:
+        no serves, no intent ref) is rooted; an ordinary unterminated parent
+        still raises missing-purpose-terminal."""
+        root = _purpose("T-5677", nearest=None, serves=None,
+                        labels=frozenset({tp.OPERATIONAL_ROOT_LABEL, "meta", "tracker"}))
+        child = _purpose("T-5678", nearest="ticket:T-5677")
+        tickets = {p.ticket_id: p for p in (root, child)}
+        codes = {i.code for i in tp.validate_intent_link(child, tickets, {}, frozenset())}
+        self.assertNotIn("missing-purpose-terminal", codes)
+        self.assertEqual(
+            tp.resolve_ticket_purpose_chain("T-5678", tickets, {}, frozenset()),
+            ("T-5678", "T-5677"),
+        )
+        plain = replace(root, labels=frozenset({"meta", "tracker"}))
+        tickets = {plain.ticket_id: plain, child.ticket_id: child}
+        codes = {i.code for i in tp.validate_intent_link(child, tickets, {}, frozenset())}
+        self.assertIn("missing-purpose-terminal", codes)
+        with self.assertRaises(tp.PurposeError):
+            tp.resolve_ticket_purpose_chain("T-5678", tickets, {}, frozenset())
+
     def test_ticket_chain_rejects_conflicting_project_membership(self) -> None:
         parent = _purpose(
             "T-4000", project_id="alpha-project", nearest="project:alpha-project"
@@ -593,6 +614,121 @@ class TestAppetiteValidation(unittest.TestCase):
             })
 
 
+class TestGoalRegistryWiringT5679(unittest.TestCase):
+    """T-5679: purpose validation reads the canonical goals.md goal keys."""
+
+    FIXTURE = REPO_ROOT / "tools" / "fixtures" / "goal_registry" / "goal_headings_ok.md"
+
+    def _repo(self, td: str, *, with_registry: bool) -> Path:
+        from tools import goal_registry as gr
+
+        repo = Path(td)
+        (repo / "tickets" / "inbox").mkdir(parents=True)
+        if with_registry:
+            target = repo / gr.GOALS_RELPATH
+            target.parent.mkdir(parents=True)
+            target.write_bytes(self.FIXTURE.read_bytes())
+        return repo
+
+    @staticmethod
+    def _fields(nearest: str) -> dict:
+        return {
+            "id": "T-4000",
+            "state": "inbox",
+            "project_id": None,
+            "nearest_intent_ref": nearest,
+            "serves": "fixture purpose",
+            "labels": [],
+        }
+
+    def _file_time_codes(self, repo: Path, nearest: str) -> dict[str, str]:
+        with patch.object(ticket, "REPO_ROOT", repo), patch.object(
+            ticket, "TICKETS_ROOT", repo / "tickets"
+        ):
+            issues = ticket._purpose_issues_for_fields(
+                self._fields(nearest), mode=tp.PurposeEnforcement.WARN
+            )
+        return {issue.code: issue.detail for issue in issues}
+
+    def test_file_time_validation_sees_registered_goal_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(td, with_registry=True)
+            self.assertEqual(self._file_time_codes(repo, "goal:alpha-goal"), {})
+            self.assertEqual(self._file_time_codes(repo, "goal:gamma-site"), {})
+            codes = self._file_time_codes(repo, "goal:operator-bandwidth")
+            self.assertEqual(set(codes), {"dangling-goal-purpose"})
+
+    def test_file_time_registry_unavailable_only_when_missing_and_names_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(td, with_registry=False)
+            codes = self._file_time_codes(repo, "goal:alpha-goal")
+            self.assertEqual(set(codes), {"goal-registry-unavailable"})
+            self.assertIn("goal registry missing", codes["goal-registry-unavailable"])
+            # A non-goal purpose is unaffected by the missing registry.
+            self.assertEqual(self._file_time_codes(repo, "maintenance:ticket-board"), {})
+
+    def _lint_codes(self, repo: Path, nearest: str) -> dict[str, str]:
+        path = repo / "tickets" / "inbox" / "T-4000.md"
+        path.write_text(
+            "---\nid: T-4000\ncreated: 2026-09-01T00:00:00Z\nrequester: recovery\n"
+            f"target: orchestrator\nstate: inbox\nproject_id: null\nnearest_intent_ref: {nearest}\n"
+            "parent_ticket: null\ndepends_on: []\nserves: fixture purpose\n---\n",
+            encoding="utf-8",
+        )
+        found: dict[str, str] = {}
+        for result in ticket_lint.warn_ticket_purposes([path]):
+            code, _, detail = result.description.removeprefix("structured purpose ").partition(": ")
+            found[code] = detail
+        return found
+
+    def test_lint_digest_sees_registered_goal_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(td, with_registry=True)
+            self.assertEqual(self._lint_codes(repo, "goal:beta-site"), {})
+            self.assertEqual(
+                set(self._lint_codes(repo, "goal:operator-bandwidth")), {"dangling-goal-purpose"}
+            )
+
+    def test_lint_digest_registry_unavailable_names_reason(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._repo(td, with_registry=False)
+            codes = self._lint_codes(repo, "goal:beta-site")
+            self.assertEqual(set(codes), {"goal-registry-unavailable"})
+            self.assertIn("goal registry missing", codes["goal-registry-unavailable"])
+
+    def test_with_goal_registry_reason_only_rewrites_unavailable(self) -> None:
+        issues = (
+            tp.PurposeIssue("goal-registry-unavailable", "T-1", "old"),
+            tp.PurposeIssue("missing-serves", "T-1", "keep"),
+        )
+        self.assertEqual(tp.with_goal_registry_reason(issues, None), issues)
+        rewritten = tp.with_goal_registry_reason(issues, "goal registry missing: x")
+        self.assertEqual(rewritten[0].detail, "goal registry unavailable: goal registry missing: x")
+        self.assertEqual(rewritten[1], issues[1])
+
+    def test_live_repo_has_no_goal_registry_unavailable(self) -> None:
+        index = tp.load_ticket_purpose_index(REPO_ROOT / "tickets")
+        from tools import goal_registry as gr
+        from tools.project_catalogue import load_project_records
+
+        keys, error = gr.registry_status(REPO_ROOT)
+        self.assertIsNone(
+            error,
+            "T-5679: the tracked goals.md must carry the ratified goal-key markers",
+        )
+        records = load_project_records(REPO_ROOT / "projects" / "records")
+        unavailable = [
+            purpose.ticket_id
+            for purpose in index.values()
+            for issue in tp.validate_intent_link(purpose, index, records, keys)
+            if issue.code == "goal-registry-unavailable"
+        ]
+        self.assertEqual(
+            unavailable,
+            [],
+            "T-5679: goal-registry-unavailable fires on the live corpus; the tracked "
+            "goals.md must carry the ratified goal-key markers",
+        )
 
 
 if __name__ == "__main__":

@@ -555,8 +555,8 @@ def _do_status(
             cooldown = doc.get("cooldown_until")
             if holds_malformed is not None or runtime in held:
                 viability = "held"
-            elif doc.get("outcome") == "failed" and doc.get("failure_class") == "runtime_blocked":
-                viability = "blocked"  # T-5028 (d): until clear-cooldown
+            elif doc.get("outcome") == "failed" and doc.get("failure_class") in hs.UNTIMED_BLOCKING_FAILURE_CLASSES:
+                viability = "blocked"  # T-5028 (d) / T-5791: until clear-cooldown
             elif cooldown and cooldown > now:
                 viability = "cooldown-active"
                 active_cooldowns.append(cooldown)

@@ -21,7 +21,7 @@ Program 'bun.exe' failed to run: The path cannot be traversed because it contain
 
 Happens regardless of shell choice (PowerShell direct, `cmd /c "..."`) as long as bun is invoked by name from `PATH`. `Unblock-File` on the resolved bun.exe does not fix it — the Zone.Identifier stream isn't the actual gate.
 
-Reproduced when the operator's `bun` on `PATH` resolves to `C:\Users\micha\AppData\Local\Microsoft\WinGet\Links\bun.exe` (the WinGet Links shim), which itself points at `C:\Users\micha\AppData\Local\Microsoft\WinGet\Packages\Oven-sh.Bun_Microsoft.Winget.Source_8wekyb3d8bbwe\bun-windows-x64\bun.exe`.
+Reproduced when the operator's `bun` on `PATH` resolves to `C:\Users\operator\AppData\Local\Microsoft\WinGet\Links\bun.exe` (the WinGet Links shim), which itself points at `C:\Users\operator\AppData\Local\Microsoft\WinGet\Packages\Oven-sh.Bun_Microsoft.Winget.Source_8wekyb3d8bbwe\bun-windows-x64\bun.exe`.
 
 Same user, same box, interactive local shell: `bun` works fine. Only fails in non-interactive SSH context — different security token, different mount-trust state.
 
@@ -36,7 +36,7 @@ Not specific to bun — any WinGet-installed CLI whose Links shim crosses this m
 **Workaround (verified 2026-09-14):** invoke bun via the full Packages-directory path inside a `cmd /c` wrapper, bypassing the Links shim entirely:
 
 ```bash
-BUN='C:\Users\micha\AppData\Local\Microsoft\WinGet\Packages\Oven-sh.Bun_Microsoft.Winget.Source_8wekyb3d8bbwe\bun-windows-x64\bun.exe'
+BUN='C:\Users\operator\AppData\Local\Microsoft\WinGet\Packages\Oven-sh.Bun_Microsoft.Winget.Source_8wekyb3d8bbwe\bun-windows-x64\bun.exe'
 ssh operator-w11 "cmd /c \"cd C:\\path\\to\\project && $BUN install --frozen-lockfile\""
 ```
 

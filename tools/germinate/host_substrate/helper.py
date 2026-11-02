@@ -22,13 +22,14 @@ CURRENT (co-author recovery; D15 approved at 71fd484cc): the admission rules are
 
 from __future__ import annotations
 
+import posixpath
 from dataclasses import dataclass, field
 from typing import Any, Final, Mapping
 
 from tools.ci_fleet_account_reconcile import CONFLICT, DRIFT, AccountSpec, PasswdEntry, classify
 
 from . import families as F
-from .ports import SimulatedSubstratePort
+from .ports import STAT_FILE_TYPES, SubstratePort
 
 BOOTSTRAP: Final = "bootstrap-in-process-root"
 DAEMON: Final = "broker-daemon"
@@ -77,6 +78,36 @@ class ScheduledActivationRefused(HelperRefusal):
 
 class PreflightRefused(HelperRefusal):
     code = "PREFLIGHT_REFUSED"
+
+
+class SymlinkSubjectRefused(PreflightRefused):
+    """T-5653 (Recovery, D15): root never re-ACLs, chowns or chmods through a symlink subject."""
+
+    code = "SYMLINK_SUBJECT_REFUSED"
+
+
+class AncestorRefused(PreflightRefused):
+    """T-5657 (Recovery, D15): an ancestor of a path subject is not a trusted directory."""
+
+    code = "ANCESTOR_REFUSED"
+
+
+#: Evidence ``code`` -> the exception it raises (apply / restore / guarded_put).
+_REFUSAL_CLASSES: Final = {c.code: c for c in (SymlinkSubjectRefused, AncestorRefused)}
+
+
+def _ancestors(path: str) -> list[str]:
+    """``/a/b/c`` -> ``["/", "/a", "/a/b"]``: top-down, ``/`` to the subject's parent."""
+
+    parts = path.strip("/").split("/")[:-1]
+    return ["/"] + ["/" + "/".join(parts[:i]) for i in range(1, len(parts) + 1)]
+
+
+#: T-5653: the live subject kinds whose actuation takes a path, one-to-one with the
+#: guarded families (acl.converge, owner_mode.set, mailbox_dir.ensure / .retire).
+SYMLINK_GUARDED_KINDS: Final = {"acl": ("acl.converge",), "owner_mode": ("owner_mode.set",),
+                                "dir": ("mailbox_dir.ensure", "mailbox_dir.retire")}
+SYMLINK_TYPE: Final = "symbolic link"
 
 
 @dataclass(frozen=True)
@@ -143,7 +174,7 @@ class _ManifestAccount(AccountSpec):
 
 
 class RootHelper:
-    def __init__(self, port: SimulatedSubstratePort, manifest: F.Manifest, context: str):
+    def __init__(self, port: SubstratePort, manifest: F.Manifest, context: str):
         if context not in CONTEXTS:
             raise HelperRefusal(f"unknown invocation context {context!r}")
         self.port = port
@@ -169,10 +200,115 @@ class RootHelper:
             raise PreflightRefused(str(exc)) from None
         return Step(resolved, phase)
 
+    # --- ancestor walk (T-5657) + symlink guard (T-5653) ----------------------
+
+    def designated_owner(self, subject: str, entry: Mapping[str, Any] | None = None) -> str | None:
+        """T-5657 (Recovery, D15): the ONE non-root owner the leaf's parent may have. It is the
+        ``owner`` of the subject's OWN manifest entry: ``entry`` (``step.resolved.entry``,
+        which ``families.resolve`` took from the manifest) where a step is available; else,
+        for restore / guarded_put, the entry looked up by the subject path (``paths.<p>``
+        for ``acl:`` and ``owner_mode:``; the ``mailbox_dirs`` entry with that path for
+        ``dir:``, unique since load_manifest refuses duplicate paths). Never a step value or
+        caller data. It counts only when it is a NON-ROOT, DECLARED manifest account;
+        otherwise None (only root may own every ancestor)."""
+
+        kind, path = subject.split(":", 1)
+        if entry is None and kind in ("acl", "owner_mode"):
+            entry = self.manifest.section("paths").get(path)
+        elif entry is None:
+            entry = next((s for s in self.manifest.section("mailbox_dirs").values() if s.get("path") == path), None)
+        owner = entry.get("owner") if isinstance(entry, Mapping) else None
+        if not isinstance(owner, str) or owner == "root" or owner not in self.manifest.section("accounts"):
+            return None
+        return owner
+
+    def ancestor_walk(self, subject: str, entry: Mapping[str, Any] | None = None) -> Evidence | None:
+        """T-5657: walk EVERY ancestor of a live path subject, ``/`` down to its parent, with
+        the row-4 stat (no -L; ``port.path_stat``). Refuse unless each is present, a
+        directory (never a symlink or another type), owned by root (the leaf's parent alone
+        may instead be owned by ``designated_owner``) and not group/other-writable (that
+        holds for the D-owned parent too). No cache: an earlier op in the same run can
+        change an ancestor (U1's /etc/pantheon is both a subject and an ancestor)."""
+
+        path = subject.split(":", 1)[1]
+        parent = posixpath.dirname(path)
+        d_owner = self.designated_owner(subject, entry)
+
+        def refuse(anc: str, why: str) -> Evidence:
+            return Evidence(False, f"{AncestorRefused.code}: {subject}: ancestor {anc} {why}; root never acts "
+                                   f"below an untrusted directory (T-5657 D15)",
+                            {"code": AncestorRefused.code, "ancestor": anc})
+
+        for anc in _ancestors(path):
+            try:
+                st = self.port.path_stat(anc)
+            except Exception as exc:  # noqa: BLE001 - any observation failure refuses
+                return refuse(anc, f"could not be observed ({type(exc).__name__}: {str(exc)[:200]})")
+            if st is None:
+                return refuse(anc, "is absent")
+            ftype, owner, _group, mode = st
+            if ftype == SYMLINK_TYPE:
+                return refuse(anc, "is a symbolic link")
+            if ftype != "directory":
+                return refuse(anc, f"is a {str(ftype)[:80]!r}, not a directory")
+            # "/" itself is never D-owned, even when it is a depth-1 subject's parent.
+            allowed = ("root", d_owner) if (anc == parent and anc != "/" and d_owner) else ("root",)
+            if owner not in allowed:
+                return refuse(anc, f"is owned by {owner!r}, not {' or '.join(map(repr, allowed))}")
+            try:
+                bits = int(mode, 8)
+            except (TypeError, ValueError):
+                return refuse(anc, f"has an unparseable mode {str(mode)[:20]!r}")
+            # mode & 0o022 must be 0. Sticky is no exemption: a 1777 /tmp is refused.
+            if bits & 0o020:
+                return refuse(anc, f"is group-writable (mode {mode})")
+            if bits & 0o002:
+                return refuse(anc, f"is other-writable (mode {mode})")
+        return None
+
+    def symlink_guard(self, subject: str, entry: Mapping[str, Any] | None = None) -> Evidence | None:
+        """The path guard BEFORE any path-taking actuation. First the T-5657 ancestor walk
+        (stat without -L follows an intermediate symlink, so the subject's own type means
+        nothing until its ancestors are proven), then the T-5653 subject typing with the
+        row-4 stat: a symlink is REFUSED with a named reason, never skipped. An
+        unobservable type refuses too (fail closed). Staged subjects never touch the host,
+        and other subject kinds take no path argv; both return None (nothing to guard)."""
+
+        if subject.startswith(STAGED_PREFIX) or ":" not in subject:
+            return None
+        kind, path = subject.split(":", 1)
+        if kind not in SYMLINK_GUARDED_KINDS:
+            return None
+        refusal = self.ancestor_walk(subject, entry)
+        if refusal is not None:
+            return refusal
+        try:
+            ftype = self.port.path_type(path)
+        except Exception as exc:  # noqa: BLE001 - any observation failure refuses
+            return Evidence(False, f"{subject}: could not type the subject path ({type(exc).__name__}: {exc}); refused",
+                            {"code": PreflightRefused.code})
+        if ftype is not None and ftype not in STAT_FILE_TYPES:  # review MED-1: allowlist, never "not a symlink"
+            return Evidence(False, f"{subject}: unrecognised file type {str(ftype)[:80]!r} (not a C-locale "
+                                   f"allowlisted %F); refused", {"code": PreflightRefused.code})
+        if ftype == SYMLINK_TYPE:
+            return Evidence(False, f"{SymlinkSubjectRefused.code}: {path} is a symbolic link; root never "
+                                   f"re-ACLs/chowns/chmods a symlink target (T-5653 D15)",
+                            {"code": SymlinkSubjectRefused.code})
+        return None
+
+    def _require_not_symlink(self, subject: str) -> None:
+        refusal = self.symlink_guard(subject)
+        if refusal is not None:
+            raise _REFUSAL_CLASSES.get(refusal.data.get("code"), PreflightRefused)(refusal.detail)
+
     # --- preflight ---------------------------------------------------------
 
     def preflight(self, step: Step) -> Evidence:
         r = step.resolved
+        if any(r.family in families for families in SYMLINK_GUARDED_KINDS.values()):
+            refusal = self.symlink_guard(r.subject, r.entry)  # the LIVE subject, in both phases
+            if refusal is not None:
+                return refusal
         snapshot = self.port.snapshot()
         if r.family == "group.ensure":
             name = r.subject.split(":", 1)[1]
@@ -211,7 +347,7 @@ class RootHelper:
 
         evidence = self.preflight(step)
         if not evidence.ok:
-            raise PreflightRefused(evidence.detail)
+            raise _REFUSAL_CLASSES.get(evidence.data.get("code"), PreflightRefused)(evidence.detail)
         before = self.port.get(step.subject)
         self.port.put(step.subject, step.resolved.after)
         if step.phase == ACTIVATE and step.resolved.family == "sudoers_fragment.ensure":
@@ -230,7 +366,15 @@ class RootHelper:
         return evidence
 
     def restore(self, step: Step, before: Any) -> None:
+        # T-5653 "guard ALL path-taking actuation": a restore re-applies argv on the path too.
+        self._require_not_symlink(step.subject)
         self.port.put(step.subject, before)
+
+    def guarded_put(self, subject: str, value: Any) -> None:
+        """A rollback write (the component handler's rollback_mutation) under the same guard."""
+
+        self._require_not_symlink(subject)
+        self.port.put(subject, value)
 
     def sudo_l(self, template: Mapping[str, Any]) -> Evidence:
         """Modelled ``sudo -l -U <grantee>``: positive for every template command,

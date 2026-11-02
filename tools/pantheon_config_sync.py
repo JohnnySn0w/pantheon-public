@@ -28,6 +28,9 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Callable
+
+ScopedSyncAdapter = Callable[[Path], tuple[bool, str]]
 
 # T-0471 opt-out: pantheon_config_sync is pull-only (fetch + ff-merge or
 # push of already-committed local-ahead state). It never commits new work
@@ -246,7 +249,36 @@ def _enforce_default_safe(args: argparse.Namespace) -> int | None:
     return None
 
 
-def main(argv: list[str] | None = None) -> int:
+def _pull_remote_ahead(reconcile_adapter: ScopedSyncAdapter | None = None) -> None:
+    """Advance only the pull half; publishing remains outside the reconciler."""
+
+    if reconcile_adapter is not None:
+        ok, detail = reconcile_adapter(REPO)
+        if not ok:
+            raise SyncError(f"scoped repo reconcile refused: {detail}")
+        return
+
+    # Legacy behavior remains the default until an exact authorization adapter
+    # is explicitly injected by a supervised caller.
+    current = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
+    if current == "main":
+        run(["git", "pull", "--ff-only", "origin", "main"])
+    else:
+        try:
+            run(["git", "fetch", "origin", "main:main"])
+        except SyncError as fetch_err:
+            if "refusing to fetch into branch" in str(fetch_err):
+                run(["git", "fetch", "origin", "main"])
+                print("sync: pull ok (refspec-fetch deferred — another worktree has main)")
+                return
+            raise
+
+
+def main(
+    argv: list[str] | None = None,
+    *,
+    reconcile_adapter: ScopedSyncAdapter | None = None,
+) -> int:
     args = _parse_args(argv)
 
     refusal = _enforce_default_safe(args)
@@ -302,25 +334,7 @@ def main(argv: list[str] | None = None) -> int:
             # which updates local main without checkout. When HEAD IS on main,
             # the refspec form is rejected (would update checked-out ref), so fall
             # back to pull.
-            current = run(["git", "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip()
-            if current == "main":
-                run(["git", "pull", "--ff-only", "origin", "main"])
-            else:
-                # T-0222: refspec-fetch refuses when ANY worktree has main
-                # checked out (e.g., a transient /tmp HO worktree). Try the
-                # refspec form; on the specific "refusing to fetch into branch"
-                # error, fall back to plain fetch — leaves local main stale this
-                # cycle but doesn't fail; next cycle when HEAD lands on main, the
-                # normal pull path will complete.
-                try:
-                    run(["git", "fetch", "origin", "main:main"])
-                except SyncError as fetch_err:
-                    if "refusing to fetch into branch" in str(fetch_err):
-                        run(["git", "fetch", "origin", "main"])
-                        print("sync: pull ok (refspec-fetch deferred — another worktree has main)")
-                        _clear_alert_state()
-                        return 0
-                    raise
+            _pull_remote_ahead(reconcile_adapter)
             print("sync: pull ok")
             _clear_alert_state()
             return 0

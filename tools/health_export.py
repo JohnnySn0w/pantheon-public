@@ -42,6 +42,7 @@ import json
 import os
 import pwd
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -74,6 +75,13 @@ FIELDS: tuple[str, ...] = (
     "pane_state",
     "seat_state",
     "expected_down",
+    # ORG-106 L4b leg 1 (T-5528): detail so kino can render a pause/sleep as expected.
+    "seat_owner",
+    "seat_reason",
+    "seat_expires",
+    "seat_indefinite",
+    "seat_set_age_s",
+    "seat_indefinite_stale",
 )
 
 CONTROLLER_EVENTS = frozenset({
@@ -151,6 +159,29 @@ class SudoReader:
 
     def read_text_tail(self, account: str, path: str, max_bytes: int) -> str | None:
         return self._run(account, ["tail", "-c", str(int(max_bytes)), "--", path])
+
+    def read_text_head(self, account: str | None, path: str, max_bytes: int) -> str | None:
+        """The first `max_bytes` of `path` (harness_idle reader seam: codex session_meta,
+        runtime.json). argv-only `head -c N -- path`."""
+        return self._run(account, ["head", "-c", str(max(0, int(max_bytes))), "--", path])
+
+    def grep_tail(self, account: str | None, path: str, max_bytes: int,
+                  needles: tuple[bytes, ...]) -> list[str] | None:
+        """Complete lines within the last `max_bytes` of `path` that contain any of
+        `needles` (harness_idle's background-shell marker scan, T-5793). One argv-only
+        `tail -c N -- path` read; the substring prefilter runs here in Python, so no
+        shell and no second process. The cut first line is dropped when the read filled
+        the window. Lines are returned without trailing newlines (harness_idle accepts
+        both shapes)."""
+        cap = max(0, int(max_bytes))
+        out = self._run(account, ["tail", "-c", str(cap), "--", path])
+        if out is None:
+            return None
+        lines = out.split("\n")
+        if lines and len(out.encode("utf-8", errors="replace")) >= cap:
+            lines = lines[1:]
+        wanted = [n.decode("utf-8", errors="replace") for n in needles if n]
+        return [ln for ln in lines if ln and any(n in ln for n in wanted)]
 
     def newest_mtime(self, account: str, root: str, min_depth: int, max_depth: int,
                      suffix: str) -> float | None:
@@ -251,23 +282,75 @@ def _runtime(reader, account: str, persona: str) -> str | None:
     return None
 
 
-def _seat_state(reader, account: str, persona: str, now: float) -> tuple[str, bool]:
-    """(state, expected_down) from the seat's ORG-106 seat-state record, read through the
-    SAME cross-account reader as every other field here (no new sudo surface).
-    FAIL-OPEN: a missing, unreadable, malformed or expired record is ("active", False)."""
+_SEAT_REASON_MAX = 200
+_SEAT_OWNER_MAX = 80
+_ISO_Z_RE = re.compile(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z")
+
+# Every seat_* key at its inactive value: the fail-open result and the "active" shape.
+_SEAT_INACTIVE: dict = {
+    "seat_state": "active", "expected_down": False,
+    "seat_owner": None, "seat_reason": None, "seat_expires": None,
+    "seat_indefinite": False, "seat_set_age_s": None, "seat_indefinite_stale": False,
+}
+
+
+def _seat_owner(v: object) -> str | None:
+    """Printable, no whitespace, 1-80 (harness.py --owner shape). Anything else is null."""
+    if (isinstance(v, str) and 1 <= len(v) <= _SEAT_OWNER_MAX and v.isprintable()
+            and not any(c.isspace() for c in v)):
+        return v
+    return None
+
+
+def _seat_reason(v: object) -> str | None:
+    """Free text for kino: printable only, control chars stripped, capped. NOT HTML-escaped
+    (escaping is the renderer's job). Empty after stripping is null."""
+    if not isinstance(v, str):
+        return None
+    out = "".join(c for c in v if c.isprintable())[:_SEAT_REASON_MAX]
+    return out or None
+
+
+def _seat_expires(v: object) -> str | None:
+    return v if isinstance(v, str) and _ISO_Z_RE.fullmatch(v) else None
+
+
+def _seat_stale(indefinite: bool, age: int | None) -> bool:
     from tools import seat_state
 
+    return bool(indefinite and age is not None and age >= seat_state.INDEFINITE_FLAG_AGE.total_seconds())
+
+
+def _seat_state(reader, account: str, persona: str, now: float) -> dict:
+    """The seat_* keys from the seat's ORG-106 seat-state record, read through the SAME
+    cross-account reader as every other field here (no new sudo surface, one read).
+    FAIL-OPEN: a missing, unreadable, malformed or expired record is the inactive shape."""
+    from tools import seat_state
+
+    out = dict(_SEAT_INACTIVE)
     text = reader.read_text_tail(account, f"{_persona_state_dir(account, persona)}/overrides/seat-state.json",
                                  _RUNTIME_JSON_BYTES)
     if not text:
-        return "active", False
+        return out
     try:
-        c = seat_state.parse_record(json.loads(text), now=datetime.fromtimestamp(now, timezone.utc))
+        doc = json.loads(text)
+        c = seat_state.parse_record(doc, now=datetime.fromtimestamp(now, timezone.utc))
+        if not c.active or c.state not in SEAT_STATES:
+            return out
+        # validate_record (inside parse_record) guaranteed set_ts / indefinite are well-formed.
+        set_ts = seat_state._parse_ts(doc["set_ts"])
+        indefinite = doc["indefinite"] is True
+        age = max(0, min(int(now - set_ts.timestamp()), _MAX_AGE_S))  # clamp, don't null
+        out.update(
+            seat_state=c.state, expected_down=bool(c.expected_down),
+            seat_owner=_seat_owner(c.owner), seat_reason=_seat_reason(c.reason),
+            seat_expires=None if indefinite else _seat_expires(c.expires),
+            seat_indefinite=indefinite, seat_set_age_s=age,
+            seat_indefinite_stale=_seat_stale(indefinite, age),
+        )
     except Exception:  # noqa: BLE001
-        return "active", False
-    if not c.active or c.state not in SEAT_STATES:
-        return "active", False
-    return c.state, bool(c.expected_down)
+        return dict(_SEAT_INACTIVE)
+    return out
 
 
 def _map_event(raw: object) -> str | None:
@@ -460,7 +543,7 @@ def collect_persona(reader, persona: str, account: str, *, now: float, hub: str,
     ctl = _safe(_controller, reader, account, persona, now) or (None, None)
     mail = _safe(_mail, reader, hub, persona, now) or (None, None)
     pane_text = _safe(reader.capture_pane, account, pane_target) if pane_target else None
-    seat = _safe(_seat_state, reader, account, persona, now) or ("active", False)
+    seat = _safe(_seat_state, reader, account, persona, now) or dict(_SEAT_INACTIVE)
     rec = {
         "schema_version": SCHEMA_VERSION,
         "persona": persona,
@@ -474,8 +557,7 @@ def collect_persona(reader, persona: str, account: str, *, now: float, hub: str,
         "mail_oldest_unread_age_s": mail[1],
         "consume_unit": _safe(_consume_unit, reader, account, persona) or "unknown",
         "pane_state": classify_pane(pane_text if isinstance(pane_text, str) else None),
-        "seat_state": seat[0],
-        "expected_down": seat[1],
+        **{k: seat[k] for k in _SEAT_INACTIVE},
     }
     del pane_text  # never stored, never written
     return rec
@@ -500,6 +582,23 @@ def _bounded_int(v: object, hi: int) -> int | None:
     return None
 
 
+def _sanitize_seat_detail(record: dict, seat_st: str) -> dict:
+    """Consume-side validation of the six L4b seat_* keys. An active seat carries none of
+    them; a missing key (older exporter) is null/false; stale is recomputed, never trusted."""
+    if seat_st == "active":
+        return {k: v for k, v in _SEAT_INACTIVE.items() if k not in ("seat_state", "expected_down")}
+    indefinite = record.get("seat_indefinite") is True
+    age = _bounded_int(record.get("seat_set_age_s"), _MAX_AGE_S)
+    return {
+        "seat_owner": _seat_owner(record.get("seat_owner")),
+        "seat_reason": _seat_reason(record.get("seat_reason")),
+        "seat_expires": None if indefinite else _seat_expires(record.get("seat_expires")),
+        "seat_indefinite": indefinite,
+        "seat_set_age_s": age,
+        "seat_indefinite_stale": _seat_stale(indefinite, age),
+    }
+
+
 def sanitize(record: object) -> dict | None:
     """Enforce schema v1 on a record. Returns a NEW dict with exactly FIELDS, or None.
 
@@ -519,6 +618,9 @@ def sanitize(record: object) -> dict | None:
     event = record.get("controller_last_event")
     consume = record.get("consume_unit")
     pane = record.get("pane_state")
+    seat_st = (record["seat_state"] if isinstance(record.get("seat_state"), str)
+               and record["seat_state"] in SEAT_STATES else "active")
+    seat_extra = _sanitize_seat_detail(record, seat_st)
     return {
         "schema_version": SCHEMA_VERSION,
         "persona": persona,
@@ -534,9 +636,10 @@ def sanitize(record: object) -> dict | None:
         "mail_oldest_unread_age_s": _bounded_int(record.get("mail_oldest_unread_age_s"), _MAX_AGE_S),
         "consume_unit": consume if isinstance(consume, str) and consume in CONSUME_STATES else "unknown",
         "pane_state": pane if isinstance(pane, str) and pane in PANE_STATES else "unknown",
-        "seat_state": (record["seat_state"] if isinstance(record.get("seat_state"), str)
-                       and record["seat_state"] in SEAT_STATES else "active"),
-        "expected_down": record["expected_down"] if isinstance(record.get("expected_down"), bool) else False,
+        "seat_state": seat_st,
+        # kino keys its "asleep" glance on expected_down: only a deep-sleep seat can be down.
+        "expected_down": (record.get("expected_down") is True and seat_st == "deep-sleep"),
+        **seat_extra,
     }
 
 
@@ -578,6 +681,69 @@ def atomic_write_json(out_dir: Path, name: str, doc: dict, mode: int = 0o640) ->
         pass  # rename already landed; dir fsync is durability, not correctness
 
 
+_PRUNE_MAX_BYTES = 64 * 1024
+_RECORD_CORE_KEYS = frozenset({"schema_version", "persona", "account", "exported_at"})
+
+
+def _exporter_owned_record(path: Path) -> bool:
+    """True only for a file THIS exporter wrote as a persona record (T-5836).
+
+    A regular file (never a symlink), owned by this uid, whose stem is a valid
+    persona identifier and whose content is a schema-v1 record naming that same
+    persona. _exporter.json (leading underscore), fleet-health.json (no
+    `persona`) and any foreign JSON therefore never qualify."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid() or st.st_size > _PRUNE_MAX_BYTES:
+        return False
+    stem = path.name[: -len(".json")]
+    if not _IDENT_RE.match(stem):
+        return False
+    try:
+        doc = json.loads(path.read_text(encoding="ascii"))
+    except (OSError, ValueError):
+        return False
+    return (isinstance(doc, dict) and _RECORD_CORE_KEYS <= set(doc)
+            and doc.get("schema_version") == SCHEMA_VERSION and doc.get("persona") == stem)
+
+
+def prune_retired_records(out_dir: Path, current: set[str]) -> list[str]:
+    """Remove exporter-owned records whose persona left the manifest (T-5836).
+
+    health_export overwrites current records but never pruned retired filenames,
+    so a retired seat's record persisted forever and recovery_watcher counted it as
+    an invalid (unknown_persona) record. Fail-safe: an EMPTY current set prunes
+    nothing (a manifest read failure must never wipe the directory), and more
+    candidates than half the current fleet is treated as a fault and skipped.
+    Returns the pruned persona names."""
+    if not current:
+        return []
+    try:
+        names = sorted(os.listdir(out_dir))
+    except OSError:
+        return []
+    candidates = [n[: -len(".json")] for n in names
+                  if n.endswith(".json") and not n.startswith((".", "_"))
+                  and n[: -len(".json")] not in current
+                  and _exporter_owned_record(out_dir / n)]
+    if len(candidates) > max(1, len(current) // 2):
+        print(f"health_export: refusing to prune {len(candidates)} records (more than half the fleet)",
+              file=sys.stderr)
+        return []
+    pruned = []
+    for persona in candidates:
+        try:
+            (out_dir / f"{persona}.json").unlink()
+            pruned.append(persona)
+        except OSError:
+            pass
+    if pruned:
+        print(f"health_export: pruned retired persona records: {', '.join(pruned)}", file=sys.stderr)
+    return pruned
+
+
 def fleet_personas() -> list[tuple[str, str, str | None]]:
     """(persona, account, pane_target) for every manifest persona bound to an account.
 
@@ -602,6 +768,7 @@ def run(personas, *, reader, out_dir: Path, now: float | None = None, hub: str |
         dry_run: bool = False) -> int:
     now = time.time() if now is None else now
     hub = agent_role_map.mailbox_hub() if hub is None else hub
+    personas = list(personas)
     records: dict[str, dict] = {}
     for persona, account, target in personas:
         rec = sanitize(collect_persona(reader, persona, account, now=now, hub=hub, pane_target=target))
@@ -620,6 +787,13 @@ def run(personas, *, reader, out_dir: Path, now: float | None = None, hub: str |
     try:
         for persona, rec in records.items():
             atomic_write_json(out_dir, f"{persona}.json", rec)
+        # T-5836: prune only when EVERY manifest persona produced a record this run, so
+        # a partial collection can never read as "retired".
+        if records and len(records) == len(personas):
+            try:
+                prune_retired_records(out_dir, set(records))
+            except Exception:  # noqa: BLE001 - pruning is hygiene; never fail the export
+                pass
         atomic_write_json(out_dir, HEARTBEAT_NAME, heartbeat)  # LAST: its age is the signal
     except OSError as exc:
         print(f"health_export: write failed in {out_dir}: {exc.__class__.__name__}", file=sys.stderr)

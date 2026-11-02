@@ -354,6 +354,15 @@ class SeatStateTests(unittest.TestCase):
         self.assertIsNone(ss["expires"])
         self.assertIs(ss["fault"], True)
 
+    def test_role_owner_survives_both_paths(self):
+        # T-5645: harness.py's default owner for an agent-set pause is the operator's
+        # role (`role:<id>`); the persona-name ident check dropped it to null.
+        owner = "role:head_engineering_orchestrator"
+        e = self._e(_pc_seat(SeatStateOwner=("s", owner)))
+        self.assertEqual(e["seat_state"]["owner"], owner)
+        clean = hc.sanitize_entry({**e, "seat_state": {**e["seat_state"], "owner": owner}})
+        self.assertEqual(clean["seat_state"]["owner"], owner)
+
     def test_trailing_newline_is_rejected_in_every_new_pattern(self):
         # `$` matches before a trailing newline; the patterns use fullmatch / _has_ctrl.
         e = self._e(_pc_seat(SeatStateExpires=("s", "2026-10-26T00:00:00Z\n"),

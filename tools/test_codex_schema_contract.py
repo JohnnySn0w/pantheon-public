@@ -59,7 +59,18 @@ class PinGateTests(unittest.TestCase):
             for key in ("account", "codex_version", "codex_bin", "cwd", "model", "sandbox",
                         "approval_policy", "network_access", "writable_roots"):
                 self.assertIn(key, b, f"{name} binding lacks {key}")
-            csc.cd.SeatPolicy(b["sandbox"], b["approval_policy"], b["model"], b["cwd"])
+            cwd = csc.resolve_binding_cwd(b, instance_root=Path("/srv/pantheon"))
+            csc.cd.SeatPolicy(b["sandbox"], b["approval_policy"], b["model"], cwd)
+
+    def test_instance_root_sentinel_resolves_to_the_active_checkout(self):
+        self.assertEqual(
+            csc.resolve_binding_cwd({"cwd": "@instance-root"}, instance_root=Path("/tmp/check")),
+            "/tmp/check",
+        )
+
+    def test_other_relative_binding_cwd_is_refused(self):
+        with self.assertRaises(ValueError):
+            csc.resolve_binding_cwd({"cwd": "relative/path"}, instance_root=Path("/tmp/check"))
 
     def test_live_regeneration_matches_the_snapshot_when_the_pinned_codex_is_here(self):
         for name, b in csc.load_bindings().items():

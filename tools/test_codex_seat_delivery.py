@@ -10,6 +10,7 @@ Run: python3 -m unittest tools.test_codex_seat_delivery
 from __future__ import annotations
 
 import json
+import itertools
 import queue
 import shutil
 import sys
@@ -18,6 +19,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -36,6 +38,7 @@ class SeatServer(FakeAppServer):
         super().__init__(lambda obj: None, **kw)
         self.history: dict[str, dict] = {}
         self.loaded = [THREAD]
+        self.loaded_response = None
         self.account = {"type": "chatgpt", "email": "consultant@example.test", "planType": "pro"}
         self.hang_heartbeat = False
         self.resume_error = None
@@ -50,7 +53,10 @@ class SeatServer(FakeAppServer):
 
     def h_thread_loaded_list(self, msg):
         if not self.hang_heartbeat:
-            self.respond(msg["id"], {"data": list(self.loaded), "nextCursor": None})
+            response = self.loaded_response
+            if response is None:
+                response = {"data": list(self.loaded), "nextCursor": None}
+            self.respond(msg["id"], response)
 
     def h_thread_read(self, msg):
         self.respond(msg["id"], {"thread": {"id": THREAD, "turns": list(self.history.values())}})
@@ -584,7 +590,47 @@ class RecoveryTableTests(Base):
 
 # ------------------------------------------------------------------ heartbeat
 class HeartbeatTests(Base):
-    def test_three_misses_page_restart_and_ambiguate_in_flight(self):
+    def test_readiness_publication_requires_exact_loaded_thread_heartbeat(self):
+        receipts = []
+        p = self.path(readiness_publisher=receipts.append)
+        self.server.loaded_response = {"data": THREAD}
+        p.tick()
+        self.assertEqual(receipts, [], "connected transport is not readiness proof")
+        p.close()
+        p = self.path(readiness_publisher=receipts.append)
+        self.server.loaded_response = {"data": [THREAD], "nextCursor": None}
+        p.tick()
+        self.assertEqual(receipts, [THREAD])
+        self.clock.t += sd.HEARTBEAT_EVERY_S
+        p.tick()
+        self.assertEqual(receipts, [THREAD], "receipt must publish once")
+
+    def test_atomic_readiness_receipt_has_exact_schema_and_owner_mode(self):
+        receipt = self.state / "input-ready.json"
+        sd.publish_input_ready(receipt, persona="consultant", thread_id=THREAD, launch_nonce="n-1")
+        self.assertEqual(receipt.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(json.loads(receipt.read_text()), {
+            "schema": sd.INPUT_READY_SCHEMA, "persona": "consultant",
+            "thread_id": THREAD, "launch_nonce": "n-1",
+        })
+
+    def test_atomic_receipt_temp_symlink_substitution_fails_without_target_damage(self):
+        receipt = self.state / "input-ready.json"
+        victim = self.state / "victim"
+        victim.write_text("do-not-touch")
+        fixed = "ab" * 16
+        temp = receipt.with_name(f".{receipt.name}.tmp.{fixed}")
+        temp.symlink_to(victim)
+        with mock.patch.object(sd.secrets, "token_hex", return_value=fixed):
+            with self.assertRaises(FileExistsError):
+                sd.publish_input_ready(
+                    receipt, persona="consultant", thread_id=THREAD, launch_nonce="nonce",
+                )
+        self.assertEqual(victim.read_text(), "do-not-touch")
+        self.assertTrue(temp.is_symlink())
+        self.assertFalse(receipt.exists())
+
+    def test_three_misses_persist_one_replacement_and_ambiguate_in_flight(self):
         self.server.auto_complete = False
         p = self.path(heartbeat_timeout=0.05)
         self.enqueue("dm", "operator_dm", "dm-0001")
@@ -595,7 +641,9 @@ class HeartbeatTests(Base):
             self.clock.t += sd.HEARTBEAT_EVERY_S
             p.tick()
         self.assertEqual(self.restarts, 1)
-        self.assertIn("server_hung", self.page_keys())
+        self.assertNotIn("server_hung", self.page_keys())
+        state = json.loads((self.state / "hung-recovery.json").read_text())
+        self.assertEqual((state["attempts"], state["escalated"]), (1, False))
         self.settle(p, "dm-0001", cd.AMBIGUOUS)
 
     def test_two_misses_do_nothing(self):
@@ -618,6 +666,421 @@ class HeartbeatTests(Base):
         self.clock.t += sd.HEARTBEAT_EVERY_S
         p.tick()
         self.assertEqual(p.hold, sd.HOLD_THREAD)
+
+    def test_unhealthy_successor_holds_without_a_second_replacement_and_pages_once(self):
+        first = self.path(heartbeat_timeout=0.05)
+        first.tick()
+        self.server.hang_heartbeat = True
+        for _ in range(3):
+            self.clock.t += sd.HEARTBEAT_EVERY_S
+            first.tick()
+        self.assertEqual(self.restarts, 1)
+        first.close()
+
+        successor = self.path(heartbeat_timeout=0.05)
+        for _ in range(6):
+            self.clock.t += sd.HEARTBEAT_EVERY_S
+            successor.tick()
+        self.assertEqual(self.restarts, 1, "the persistent bound must block generation two")
+        self.assertEqual(successor.hold, sd.HOLD_HUNG_RECOVERY)
+        self.assertEqual(self.page_keys().count("server_hung"), 1)
+        state = json.loads((self.state / "hung-recovery.json").read_text())
+        self.assertEqual((state["attempts"], state["escalated"]), (1, True))
+
+    def test_malformed_state_normalizes_and_later_generations_inherit_hold_without_repage(self):
+        (self.state / "hung-recovery.json").write_text(json.dumps({
+            "version": 1, "episode_id": None, "attempts": 0, "escalated": True,
+        }))
+        first = self.path()
+        self.assertEqual(first.hold, sd.HOLD_HUNG_RECOVERY)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.page_keys(), ["server_hung"])
+        durable = json.loads((self.state / "hung-recovery.json").read_text())
+        self.assertEqual((durable["attempts"], durable["escalated"]), (1, True))
+        self.assertTrue(durable["episode_id"])
+        first.close()
+
+        successor = self.path()
+        self.assertEqual(successor.hold, sd.HOLD_HUNG_RECOVERY)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.page_keys(), ["server_hung"])
+
+    def test_state_write_failure_holds_without_replacement_or_exception(self):
+        p = self.path(heartbeat_timeout=0.05)
+        p.tick()
+        self.server.hang_heartbeat = True
+        failure = OSError(28, "No space left on device")
+        with mock.patch.object(p.log, "append", side_effect=failure), \
+                mock.patch.object(sd, "_write_json_atomic", side_effect=failure):
+            for _ in range(3):
+                self.clock.t += sd.HEARTBEAT_EVERY_S
+                p.tick()
+            self.assertEqual(p.hold, sd.HOLD_HUNG_RECOVERY)
+            self.assertEqual(self.restarts, 0)
+            self.assertEqual(self.page_keys(), ["server_hung"])
+            self.assertFalse((self.state / "hung-recovery.json").exists())
+            self.assertTrue(
+                (self.state.parent / ".codex-appserver-hung-recovery-escalated").exists()
+            )
+            for _ in range(3):
+                self.clock.t += sd.HEARTBEAT_EVERY_S
+                p.tick()
+            self.assertEqual(self.restarts, 0)
+            self.assertEqual(self.page_keys(), ["server_hung"])
+
+    def test_unproven_witness_ownership_holds_without_replacement_or_page(self):
+        p = self.path(heartbeat_timeout=0.05)
+        p.tick()
+        self.server.hang_heartbeat = True
+        failure = OSError(28, "No space left on device")
+        with mock.patch.object(p.log, "append", side_effect=failure), \
+                mock.patch.object(sd, "_write_json_atomic", side_effect=failure), \
+                mock.patch.object(sd, "_claim_escalation_witness", side_effect=failure):
+            for _ in range(3):
+                self.clock.t += sd.HEARTBEAT_EVERY_S
+                p.tick()
+            self.assertEqual(p.hold, sd.HOLD_HUNG_RECOVERY)
+            self.assertEqual(self.restarts, 0)
+            self.assertEqual(self.page_keys(), [])
+            for _ in range(3):
+                self.clock.t += sd.HEARTBEAT_EVERY_S
+                p.tick()
+            self.assertEqual(self.restarts, 0)
+            self.assertEqual(self.page_keys(), [])
+            self.assertFalse((self.state / "hung-recovery.json").exists())
+            self.assertFalse(
+                (self.state.parent / ".codex-appserver-hung-recovery-escalated").exists()
+            )
+
+    def test_lost_witness_claim_race_holds_without_replacement_or_page(self):
+        (self.state / "hung-recovery.json").write_text(json.dumps({
+            "version": 1, "episode_id": "episode-1", "attempts": 1,
+            "escalated": False,
+        }))
+        p = self.path(heartbeat_timeout=0.05)
+        p.tick()
+        self.server.hang_heartbeat = True
+        with mock.patch.object(sd, "_claim_escalation_witness", return_value=False):
+            for _ in range(3):
+                self.clock.t += sd.HEARTBEAT_EVERY_S
+                p.tick()
+        self.assertEqual(p.hold, sd.HOLD_HUNG_RECOVERY)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.page_keys(), [])
+
+    def _assert_partial_witness_failure_holds_silently(self, phase):
+        p = self.path(heartbeat_timeout=0.05)
+        p.tick()
+        self.server.hang_heartbeat = True
+        failure = OSError(28, f"synthetic {phase} failure")
+        if phase == "write":
+            witness_patch = mock.patch.object(sd.json, "dump", side_effect=failure)
+        else:
+            real_fsync = sd.os.fsync
+            calls = 0
+
+            def fail_at_phase(fd):
+                nonlocal calls
+                calls += 1
+                if calls == (1 if phase == "file_fsync" else 2):
+                    raise failure
+                return real_fsync(fd)
+
+            witness_patch = mock.patch.object(sd.os, "fsync", side_effect=fail_at_phase)
+        with mock.patch.object(p.log, "append", side_effect=failure), \
+                mock.patch.object(sd, "_write_json_atomic", side_effect=failure), \
+                witness_patch:
+            for _ in range(3):
+                self.clock.t += sd.HEARTBEAT_EVERY_S
+                p.tick()
+        witness = self.state.parent / ".codex-appserver-hung-recovery-escalated"
+        self.assertEqual(p.hold, sd.HOLD_HUNG_RECOVERY)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.page_keys(), [])
+        self.assertTrue(witness.exists(), "partial exclusive witness must be retained")
+
+    def test_witness_write_failure_after_exclusive_create_holds_silently(self):
+        self._assert_partial_witness_failure_holds_silently("write")
+
+    def test_witness_file_fsync_failure_holds_silently(self):
+        self._assert_partial_witness_failure_holds_silently("file_fsync")
+
+    def test_witness_parent_fsync_failure_holds_silently(self):
+        self._assert_partial_witness_failure_holds_silently("parent_fsync")
+
+    def test_exact_healthy_heartbeat_clears_failed_state_escalation_witness(self):
+        failed = self.path(heartbeat_timeout=0.05)
+        failed.tick()
+        self.server.hang_heartbeat = True
+        failure = OSError(28, "No space left on device")
+        with mock.patch.object(failed.log, "append", side_effect=failure), \
+                mock.patch.object(sd, "_write_json_atomic", side_effect=failure):
+            for _ in range(3):
+                self.clock.t += sd.HEARTBEAT_EVERY_S
+                failed.tick()
+        witness = self.state.parent / ".codex-appserver-hung-recovery-escalated"
+        self.assertTrue(witness.exists())
+        self.assertEqual(self.page_keys(), ["server_hung"])
+        failed.close()
+
+        self.server.hang_heartbeat = False
+        recovered = self.path()
+        recovered.tick()
+        self.assertIsNone(recovered.hold)
+        self.assertFalse(witness.exists())
+        durable = json.loads((self.state / "hung-recovery.json").read_text())
+        self.assertEqual(
+            (durable["episode_id"], durable["attempts"], durable["escalated"]),
+            (None, 0, False),
+        )
+        self.assertEqual(self.page_keys(), ["server_hung"])
+
+    def test_escalated_partial_witness_probes_until_exact_healthy_list_clears(self):
+        witness = self.state.parent / ".codex-appserver-hung-recovery-escalated"
+        (self.state / "hung-recovery.json").write_text(json.dumps({
+            "version": 1, "episode_id": "episode-1", "attempts": 1,
+            "escalated": True,
+        }))
+        witness.write_bytes(b'{"version":')
+        self.enqueue("held until recovery proof", "operator_dm", "dm-0099")
+        p = self.path()
+        self.assertEqual(p.hold, sd.HOLD_HUNG_RECOVERY)
+
+        malformed = (
+            {"data": None},
+            {"data": THREAD},
+            {"data": [THREAD, 1]},
+            {"data": {THREAD: True}},
+        )
+        for response in malformed:
+            with self.subTest(response=response):
+                self.server.loaded_response = response
+                p.tick()
+                durable = json.loads((self.state / "hung-recovery.json").read_text())
+                self.assertEqual(
+                    (durable["episode_id"], durable["attempts"], durable["escalated"]),
+                    ("episode-1", 1, True),
+                )
+                self.assertTrue(witness.exists())
+                self.assertEqual(p.hold, sd.HOLD_HUNG_RECOVERY)
+                self.assertEqual(self.restarts, 0)
+                self.assertEqual(self.page_keys(), [])
+                self.assertEqual(self.starts(), [], "hold must permit heartbeat traffic only")
+                self.clock.t += sd.HEARTBEAT_EVERY_S
+
+        self.server.loaded_response = {"data": [THREAD]}
+        p.tick()
+        durable = json.loads((self.state / "hung-recovery.json").read_text())
+        self.assertEqual(
+            (durable["episode_id"], durable["attempts"], durable["escalated"]),
+            (None, 0, False),
+        )
+        self.assertFalse(witness.exists())
+        self.assertIsNone(p.hold)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.page_keys(), [])
+        self.assertEqual(self.starts(), [], "the recovery probe tick must not dispatch")
+        p.tick()
+        self.assertTrue(wait_for(lambda: len(self.starts()) == 1))
+
+    def test_healthy_reset_write_failure_preserves_bound_and_holds(self):
+        attempted = {
+            "version": 1, "episode_id": "episode-1", "attempts": 1,
+            "escalated": False,
+        }
+        (self.state / "hung-recovery.json").write_text(json.dumps(attempted))
+        p = self.path()
+        p.tick()
+        self.clock.t += sd.HEARTBEAT_EVERY_S
+        with mock.patch.object(
+            sd, "_write_json_atomic", side_effect=OSError(13, "Permission denied")
+        ):
+            p.tick()
+        self.assertEqual(p.hold, sd.HOLD_HUNG_RECOVERY)
+        self.assertEqual(self.restarts, 0)
+        self.assertEqual(self.page_keys(), ["server_hung"])
+        durable = json.loads((self.state / "hung-recovery.json").read_text())
+        self.assertEqual(
+            (durable["episode_id"], durable["attempts"], durable["escalated"]),
+            ("episode-1", 1, False),
+        )
+
+    def test_only_exact_string_list_containing_thread_clears_attempt(self):
+        witness = self.state.parent / ".codex-appserver-hung-recovery-escalated"
+        (self.state / "hung-recovery.json").write_text(json.dumps({
+            "version": 1, "episode_id": "episode-1", "attempts": 1, "escalated": False,
+        }))
+        malformed = [
+            {"data": THREAD},
+            {"data": {THREAD: True}},
+            {"data": None},
+            {"data": [THREAD, 1]},
+            {"data": [THREAD], "partial": True},
+            {},
+        ]
+        for index, response in enumerate(malformed):
+            with self.subTest(response=response):
+                self.server.loaded_response = response
+                p = self.path()
+                p.tick()
+                self.clock.t += sd.HEARTBEAT_EVERY_S
+                p.tick()
+                state = json.loads((self.state / "hung-recovery.json").read_text())
+                self.assertEqual(state["attempts"], 1, f"case {index} cleared the bound")
+                self.assertIsNotNone(state["episode_id"])
+                p.close()
+                (self.state / "hung-recovery.json").write_text(json.dumps({
+                    "version": 1, "episode_id": "episode-1", "attempts": 1,
+                    "escalated": False,
+                }))
+                sd._clear_escalation_witness(witness)
+
+        self.server.loaded_response = {"data": [THREAD]}
+        healthy = self.path()
+        healthy.tick()
+        self.clock.t += sd.HEARTBEAT_EVERY_S
+        healthy.tick()
+        state = json.loads((self.state / "hung-recovery.json").read_text())
+        self.assertEqual(
+            (state["episode_id"], state["attempts"], state["escalated"]),
+            (None, 0, False),
+        )
+
+
+class AtomicStateWriteTests(unittest.TestCase):
+    def test_atomic_json_write_fsyncs_file_and_parent_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            with mock.patch.object(sd.os, "fsync", wraps=sd.os.fsync) as fsync:
+                sd._write_json_atomic(path, {"state": "attempted"})
+            self.assertEqual(json.loads(path.read_text()), {"state": "attempted"})
+            self.assertGreaterEqual(fsync.call_count, 2)
+
+    def test_escalation_witness_is_exclusive_durable_and_clearable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "runtime/hung-recovery-escalated"
+            with mock.patch.object(sd.os, "fsync", wraps=sd.os.fsync) as fsync:
+                self.assertTrue(sd._claim_escalation_witness(path, "consultant"))
+                self.assertFalse(sd._claim_escalation_witness(path, "consultant"))
+                self.assertGreaterEqual(fsync.call_count, 2)
+                self.assertEqual(json.loads(path.read_text())["seat"], "consultant")
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+                sd._clear_escalation_witness(path)
+            self.assertFalse(path.exists())
+
+    def test_escalation_witness_flushes_userspace_buffer_before_file_fsync(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "runtime/hung-recovery-escalated"
+            events = []
+            real_fdopen = sd.os.fdopen
+            real_fsync = sd.os.fsync
+
+            class TrackedFile:
+                def __init__(self, handle):
+                    self.handle = handle
+
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return self.handle.__exit__(*args)
+
+                def __getattr__(self, name):
+                    return getattr(self.handle, name)
+
+                def write(self, value):
+                    return self.handle.write(value)
+
+                def flush(self):
+                    events.append("flush")
+                    return self.handle.flush()
+
+            def tracked_fdopen(fd, *args, **kwargs):
+                return TrackedFile(real_fdopen(fd, *args, **kwargs))
+
+            def tracked_fsync(fd):
+                events.append("fsync")
+                return real_fsync(fd)
+
+            with mock.patch.object(sd.os, "fdopen", side_effect=tracked_fdopen), \
+                    mock.patch.object(sd.os, "fsync", side_effect=tracked_fsync):
+                self.assertTrue(sd._claim_escalation_witness(path, "consultant"))
+            self.assertEqual(events[:2], ["flush", "fsync"])
+
+    def test_witness_failures_after_exclusive_create_retain_partial_and_never_own(self):
+        failure = OSError(28, "synthetic durability failure")
+        for phase in ("write", "file_fsync", "parent_fsync"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "runtime/hung-recovery-escalated"
+                if phase == "write":
+                    patcher = mock.patch.object(sd.json, "dump", side_effect=failure)
+                else:
+                    real_fsync = sd.os.fsync
+                    calls = 0
+
+                    def fail_at_phase(fd):
+                        nonlocal calls
+                        calls += 1
+                        if calls == (1 if phase == "file_fsync" else 2):
+                            raise failure
+                        return real_fsync(fd)
+
+                    patcher = mock.patch.object(sd.os, "fsync", side_effect=fail_at_phase)
+                with patcher:
+                    with self.assertRaises(OSError):
+                        sd._claim_escalation_witness(path, "consultant")
+                self.assertTrue(path.exists(), "failed witness must remain conservatively")
+                self.assertFalse(
+                    sd._claim_escalation_witness(path, "consultant"),
+                    "a later generation must observe the retained exclusive witness",
+                )
+
+
+class HungRecoveryStateTableTests(unittest.TestCase):
+    def test_exact_union_and_bool_int_traps(self):
+        episodes = (None, "episode-1", "", 0)
+        attempts = (0, 1, 2, False, True)
+        escalated = (False, True, 0, 1, None)
+        def is_valid(episode, count, page):
+            clear = episode is None and type(count) is int and count == 0 and page is False
+            active = type(episode) is str and bool(episode) and type(count) is int \
+                and count == 1 and type(page) is bool
+            return clear or active
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hung-recovery.json"
+            for episode, count, page in itertools.product(episodes, attempts, escalated):
+                path.write_text(json.dumps({
+                    "version": 1,
+                    "episode_id": episode,
+                    "attempts": count,
+                    "escalated": page,
+                }))
+                state, malformed = sd.load_hung_recovery_state(path)
+                expected = is_valid(episode, count, page)
+                with self.subTest(episode=episode, attempts=count, escalated=page):
+                    self.assertEqual(not malformed, expected)
+                    if expected:
+                        self.assertEqual(
+                            (state["episode_id"], state["attempts"], state["escalated"]),
+                            (episode, count, page),
+                        )
+                    else:
+                        self.assertEqual((state["attempts"], state["escalated"]), (1, False))
+
+    def test_missing_corrupt_and_wrong_version_fail_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "hung-recovery.json"
+            state, malformed = sd.load_hung_recovery_state(path)
+            self.assertFalse(malformed)
+            self.assertEqual(
+                (state["episode_id"], state["attempts"], state["escalated"]),
+                (None, 0, False),
+            )
+            for raw in ("{", "[]", '{"version": 2}'):
+                path.write_text(raw)
+                state, malformed = sd.load_hung_recovery_state(path)
+                self.assertTrue(malformed)
+                self.assertEqual((state["attempts"], state["escalated"]), (1, False))
 
 
 # ------------------------------------------------------------------ compaction

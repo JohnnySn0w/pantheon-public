@@ -8,7 +8,11 @@ Authored 2026-06-02 (T-0727 thread). Canonical reference for how tickets move th
 
 ## Verbs (`tools/ticket.py`)
 
-`file` (→inbox) · `claim` (inbox→active) · `unclaim` (active→inbox) · `block` (set `not_before`/`depends_on` in place) · `await-merge` (set/clear `substate: awaiting-merge` in place) · `resolve` (→done) · `retarget` (change `target`) · `close-noodle` / `close-action` (the operator's noodle/action close verbs) · `list`. All commit + push by default (`--no-push` to skip).
+`file` (→inbox) · `claim` (inbox→active) · `unclaim` (active→inbox) · `block` (set `not_before`/`depends_on` in place) · `await-merge` (set/clear `substate: awaiting-merge` in place) · `resolve` (→done) · `retarget` (change `target`) · `close-noodle` / `close-action` (the operator's noodle/action close verbs) · `security-accept` / `security-reject` (HO-only, see below) · `list`. All commit + push by default (`--no-push` to skip).
+
+## Security-shaped filings are gated (T-5678, ORG-105 §4)
+
+`ticket.py file` refuses a security-shaped ticket (a security-ish label, or a keyword such as bypass, inject*, leak*, credential* in the title or ask) unless it carries `--threat-chain 'foothold=<F>;impact=<I>;path=<text>'`, or `--not-security '<reason>'` for a keyword-only hit. Slugs and the "—" cell rule are in `sop/standard/applying-the-threat-model.md`. An accepted filing is `security_gate: pending` and is invisible to `claim`, `ready`, `prime`'s ready bucket and the inbox consumer until HO runs `security-accept T-N --rank primary|secondary --note "..."` (HO-only; `security-reject` drops it). Tickets already open are not migrated. Automated filers pass `--automated-filer <name>` and land `pending` + `threat_unclassified` instead of being refused; HO's `security-accept` then needs `--threat-chain`, or `--not-security '<reason>'` releases a false positive (see applying-the-threat-model.md).
 
 ## `target` = assignment
 

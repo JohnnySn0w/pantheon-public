@@ -533,5 +533,26 @@ def tearDownModule() -> None:
     _seat_state_isolation.stop()
 
 
+def test_sync_adapter_preserves_push_half_and_refuses_divergence_without_reset() -> None:
+    adapter = MagicMock(return_value=(True, ""))
+    with patch.object(sync, "determine_state", return_value=(True, False)), \
+         patch.object(sync, "push_main") as push, \
+         patch.object(sync, "_clear_alert_state"):
+        assert sync.main([], reconcile_adapter=adapter) == 0
+    push.assert_called_once_with(); adapter.assert_not_called()
+
+    adapter.reset_mock()
+    with patch.object(sync, "determine_state", return_value=(True, True)), \
+         patch.object(sync, "_write_alert_state"):
+        assert sync.main([], reconcile_adapter=adapter) == 3
+    adapter.assert_not_called()
+
+    refusing = MagicMock(return_value=(False, "diverged; no reset"))
+    with patch.object(sync, "determine_state", return_value=(False, True)), \
+         patch.object(sync, "_write_alert_state"):
+        assert sync.main([], reconcile_adapter=refusing) == 5
+    refusing.assert_called_once_with(sync.REPO)
+
+
 if __name__ == "__main__":
     unittest.main()

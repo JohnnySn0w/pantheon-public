@@ -424,6 +424,37 @@ def existing_open_reeval_ticket(
     return None
 
 
+def handled_calendar_reeval_ticket(
+    dedup_key: str, trigger_date: dt.date, tickets_root: Path = TICKETS_ROOT
+) -> str | None:
+    """Id of a DONE re-eval ticket for `dedup_key` created on/after `trigger_date`.
+
+    T-4827: a calendar trigger stays past-due forever, so open-only dedup would
+    refile it after every resolve. A review ticket filed on or after the date
+    answered this firing; one filed before it answered an earlier one.
+    """
+    from tools.ticket import TICKET_FILENAME_RE, TicketError, parse_ticket
+
+    key_label = f"reeval:{dedup_key}"
+    d = tickets_root / "done"
+    if not d.exists():
+        return None
+    for path in sorted(d.iterdir()):
+        if not (path.is_file() and TICKET_FILENAME_RE.fullmatch(path.name)):
+            continue
+        try:
+            ticket = parse_ticket(path)
+        except TicketError:
+            continue
+        labels = ticket.fields.get("labels") or []
+        if not (isinstance(labels, list) and REEVAL_LABEL in labels and key_label in labels):
+            continue
+        created = _parse_iso_date(str(ticket.fields.get("created", "")))
+        if created is not None and created >= trigger_date:
+            return str(ticket.fields.get("id", path.stem))
+    return None
+
+
 def file_reeval_ticket(
     trigger: Trigger, *, repo_root: Path = REPO_ROOT, push: bool = True
 ) -> str:
@@ -440,6 +471,7 @@ def file_reeval_ticket(
     labels = f"{REEVAL_LABEL},reeval:{trigger.trigger_id},adr,process"
     cmd = [
         sys.executable, str(repo_root / "tools" / "ticket.py"), "file",
+        "--automated-filer", "adr_reeval_walk",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "recovery",
         "--target", "role:engineering_orchestrator",
         "--title", title,
@@ -681,6 +713,13 @@ def run_walk(
         if existing_open_reeval_ticket(trigger.dedup_key, tickets_root) is not None:
             deduped.append(trigger.trigger_id)
             continue
+        if trigger.ttype == "calendar":
+            trigger_date = _parse_iso_date(trigger.when)
+            if trigger_date is not None and handled_calendar_reeval_ticket(
+                trigger.dedup_key, trigger_date, tickets_root
+            ) is not None:
+                deduped.append(trigger.trigger_id)
+                continue
         if dry_run:
             filed.append(f"(dry-run) {trigger.trigger_id}")
             continue

@@ -64,6 +64,7 @@ from tools.codex_recovery import (
     load_broker_manifest,
     load_manifest,
     main as broker_main,
+    pane_shows_monthly_spend_modal_at_bottom,
     real_linger_probe,
     resolve_invoker,
 )
@@ -584,6 +585,21 @@ class PaneProbeTargetSocketTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 class UnstickDispatchTests(DispatchFixtureMixin, unittest.TestCase):
+    SPEND_MODAL = (
+        Path(__file__).parent / "testdata" / "orchestrator_spend_limit_modal_pane.txt"
+    ).read_text(encoding="utf-8")
+
+    def test_real_committed_spend_modal_fixture_matches_live_classifier(self) -> None:
+        self.assertTrue(pane_shows_monthly_spend_modal_at_bottom(self.SPEND_MODAL))
+
+    def test_nearby_monthly_phrase_plus_different_picker_footer_does_not_match(self) -> None:
+        pane = (
+            "Earlier transcript: the monthly spend limit issue is fixed.\n"
+            "Choose model\n❯ Opus\n  Sonnet\n"
+            "Enter to confirm · Esc to cancel\n"
+        )
+        self.assertFalse(pane_shows_monthly_spend_modal_at_bottom(pane))
+
     def test_unstick_argv_is_control_keys_only(self) -> None:
         argv = build_unstick_argv(_target(), "wake-drop-cancel", pwnam=_fake_pwnam)
         self.assertEqual(argv, [
@@ -603,6 +619,159 @@ class UnstickDispatchTests(DispatchFixtureMixin, unittest.TestCase):
     def test_spend_modal_dismiss_sends_escape(self) -> None:
         argv = build_unstick_argv(_target(), "spend-modal-dismiss", pwnam=_fake_pwnam)
         self.assertEqual(argv[-1], "Escape")
+
+    def test_spend_modal_dismiss_refuses_before_parsed_reset(self) -> None:
+        probe = MagicMock(return_value=_good_snapshot())
+        reset_probe = MagicMock(return_value={
+            "schema": "pantheon-persona-mid-session-cap/v1",
+            "modal_present": True,
+            "modal_kind": "monthly-spend-limit",
+            "observed_at": "1970-01-01T00:16:30Z",
+            "reset_at": "1970-01-01T00:20:00Z",
+            "reset_source": "parsed",
+        })
+
+        result = self.dispatch(
+            verb="unstick", action="spend-modal-dismiss",
+            foreground_probe=probe, spend_reset_probe=reset_probe,
+            clock=lambda: 1000.0,
+        )
+
+        self.assertEqual(result.outcome, "refused")
+        self.assertIn("before parsed reset", result.detail)
+        self.runner.assert_not_called()
+        refusal = next(r for r in self.audit_records() if r["event"] == "refuse")
+        self.assertEqual(refusal["reset_comparison"], "pre-reset")
+        self.assertEqual(refusal["reset_at"], "1970-01-01T00:20:00Z")
+        self.assertEqual(refusal["reset_checked_at"], "1970-01-01T00:16:40Z")
+
+    def test_spend_modal_dismiss_after_reset_executes_escape_only(self) -> None:
+        probe = MagicMock(return_value=_good_snapshot())
+        reset_probe = MagicMock(return_value={
+            "schema": "pantheon-persona-mid-session-cap/v1",
+            "modal_present": True,
+            "modal_kind": "monthly-spend-limit",
+            "observed_at": "1970-01-01T00:16:30Z",
+            "reset_at": "1970-01-01T00:15:00Z",
+            "reset_source": "parsed",
+        })
+
+        result = self.dispatch(
+            verb="unstick", action="spend-modal-dismiss",
+            foreground_probe=probe, spend_reset_probe=reset_probe,
+            pane_capture=MagicMock(side_effect=[self.SPEND_MODAL, "normal prompt\n"]),
+            clock=lambda: 1000.0,
+        )
+
+        self.assertEqual(result.outcome, "executed")
+        argv = self.runner.call_args.args[0]
+        self.assertEqual(argv[-1], "Escape")
+        self.assertEqual(argv[-4:], ["send-keys", "-t", "claude-telegram-bot-fallback", "Escape"])
+        pre = next(r for r in self.audit_records() if r["event"] == "pre_action")
+        self.assertEqual(pre["reset_comparison"], "post-reset")
+        self.assertEqual(pre["reset_at"], "1970-01-01T00:15:00Z")
+        self.assertEqual(pre["reset_checked_at"], "1970-01-01T00:16:40Z")
+        post = next(r for r in self.audit_records() if r["event"] == "post_action")
+        self.assertEqual(post["modal_confirmation"], "cleared")
+
+    def test_spend_modal_dismiss_refuses_ambiguous_reset_evidence(self) -> None:
+        probe = MagicMock(return_value=_good_snapshot())
+        ambiguous_states = (
+            {},
+            {"schema": "pantheon-persona-mid-session-cap/v1", "modal_present": True,
+             "modal_kind": "monthly-spend-limit", "observed_at": "1970-01-01T00:16:30Z",
+             "reset_at": "not-a-time", "reset_source": "parsed"},
+            {"schema": "pantheon-persona-mid-session-cap/v1", "modal_present": True,
+             "modal_kind": "monthly-spend-limit", "observed_at": "1970-01-01T00:16:30Z",
+             "reset_at": "1970-01-01T00:15:00Z", "reset_source": None},
+            {"schema": "pantheon-persona-mid-session-cap/v1", "modal_present": False,
+             "modal_kind": "monthly-spend-limit", "observed_at": "1970-01-01T00:16:30Z",
+             "reset_at": "1970-01-01T00:15:00Z", "reset_source": "parsed"},
+            {"schema": "pantheon-persona-mid-session-cap/v1", "modal_present": True,
+             "modal_kind": "weekly-limit", "observed_at": "1970-01-01T00:16:30Z",
+             "reset_at": "1970-01-01T00:15:00Z", "reset_source": "parsed"},
+            {"schema": "pantheon-persona-mid-session-cap/v1", "modal_present": True,
+             "modal_kind": "monthly-spend-limit", "observed_at": "1970-01-01T00:00:00Z",
+             "reset_at": "1970-01-01T00:15:00Z", "reset_source": "parsed"},
+        )
+        for state in ambiguous_states:
+            with self.subTest(state=state):
+                self.runner.reset_mock()
+                result = self.dispatch(
+                    verb="unstick", action="spend-modal-dismiss",
+                    foreground_probe=probe,
+                    spend_reset_probe=MagicMock(return_value=state),
+                    clock=lambda: 1000.0,
+                )
+                self.assertEqual(result.outcome, "refused")
+                self.runner.assert_not_called()
+
+    def test_spend_modal_dismiss_refuses_when_live_pane_is_not_exact_modal(self) -> None:
+        state = {
+            "schema": "pantheon-persona-mid-session-cap/v1", "runtime": "claude/default",
+            "modal_present": True, "modal_kind": "monthly-spend-limit",
+            "detected_at": "1970-01-01T00:14:00Z",
+            "observed_at": "1970-01-01T00:16:30Z",
+            "reset_at": "1970-01-01T00:15:00Z", "reset_source": "parsed",
+        }
+        panes = (
+            "normal prompt\n",
+            "Model picker\nEnter to confirm · Esc to cancel\n",
+            "Earlier transcript: the monthly spend limit issue is fixed.\n"
+            "Choose model\n❯ Opus\n  Sonnet\nEnter to confirm · Esc to cancel\n",
+            "I saw Monthly spend limit reached\nEnter to confirm · Esc to cancel\n> prompt\n",
+            None,
+        )
+        for pane in panes:
+            with self.subTest(pane=pane):
+                self.runner.reset_mock()
+                result = self.dispatch(
+                    verb="unstick", action="spend-modal-dismiss",
+                    foreground_probe=MagicMock(return_value=_good_snapshot()),
+                    spend_reset_probe=MagicMock(return_value=state),
+                    pane_capture=MagicMock(return_value=pane), clock=lambda: 1000.0,
+                )
+                self.assertEqual(result.outcome, "refused")
+                self.runner.assert_not_called()
+
+    def test_spend_modal_dismiss_refuses_when_live_capture_unreadable(self) -> None:
+        state = {
+            "schema": "pantheon-persona-mid-session-cap/v1", "runtime": "claude/default",
+            "modal_present": True, "modal_kind": "monthly-spend-limit",
+            "detected_at": "1970-01-01T00:14:00Z",
+            "observed_at": "1970-01-01T00:16:30Z",
+            "reset_at": "1970-01-01T00:15:00Z", "reset_source": "parsed",
+        }
+        result = self.dispatch(
+            verb="unstick", action="spend-modal-dismiss",
+            foreground_probe=MagicMock(return_value=_good_snapshot()),
+            spend_reset_probe=MagicMock(return_value=state),
+            pane_capture=MagicMock(side_effect=OSError("pane vanished")),
+            clock=lambda: 1000.0,
+        )
+        self.assertEqual(result.outcome, "refused")
+        self.runner.assert_not_called()
+
+    def test_spend_modal_dismiss_refuses_when_state_changes_after_capture(self) -> None:
+        initial = {
+            "schema": "pantheon-persona-mid-session-cap/v1", "runtime": "claude/default",
+            "modal_present": True, "modal_kind": "monthly-spend-limit",
+            "detected_at": "1970-01-01T00:14:00Z",
+            "observed_at": "1970-01-01T00:16:30Z",
+            "reset_at": "1970-01-01T00:15:00Z", "reset_source": "parsed",
+        }
+        changed = {**initial, "modal_present": False, "modal_kind": None,
+                   "observed_at": "1970-01-01T00:16:35Z"}
+        reset_probe = MagicMock(side_effect=[initial, changed])
+        result = self.dispatch(
+            verb="unstick", action="spend-modal-dismiss",
+            foreground_probe=MagicMock(return_value=_good_snapshot()),
+            spend_reset_probe=reset_probe,
+            pane_capture=MagicMock(return_value=self.SPEND_MODAL), clock=lambda: 1000.0,
+        )
+        self.assertEqual(result.outcome, "refused")
+        self.assertEqual(reset_probe.call_count, 2)
+        self.runner.assert_not_called()
 
     def test_unknown_unstick_action_refused(self) -> None:
         with self.assertRaises(DispatchRefusedError):

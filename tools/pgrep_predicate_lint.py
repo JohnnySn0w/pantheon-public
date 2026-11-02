@@ -114,6 +114,16 @@ SKIP_PATH_PREFIXES: tuple[tuple[str, ...], ...] = ((".claude", "worktrees"),)
 #: (path relative to repo root, reason). Curated — see ALLOWLIST above.
 ALLOWLIST: tuple[tuple[str, str], ...] = (
     (
+        "tools/s3star_audit_runner.py",
+        "T-5666 --await-audit: `pgrep -u codex -af 'codex --profile s3star-audit-p2'` "
+        "detects the interactive profiled auditor, which is typed into a tmux pane "
+        "(no systemd unit, no discriminating process name). uid-scoped + the "
+        "audit-specific profile argv makes a false match negligible; the caller's own "
+        "argv does not contain the pattern (pgrep excludes itself), and a probe "
+        "ERROR (rc other than 0/1) fails closed, and the gate is read-only, so a "
+        "wrong answer can only delay or hasten a human's landing decision.",
+    ),
+    (
         "tools/stage-echo-worktree.sh",
         "T-1932 auth-smoke wrapper: `pgrep -af 'cargo|rustc'` feeds a WARNING "
         "LINE only — no behavior is gated on the match. The wrapper isolates "

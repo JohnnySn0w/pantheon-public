@@ -26,7 +26,13 @@ privilege-free harness adapter over that service.
 The initial package increment does not expose D-Bus or MCP and cannot mutate a
 host. It establishes only server-owned planning truth:
 
-- frozen root-owned registry, policy, and manifest input;
+- frozen root-owned registry, policy, and manifest input, plus a
+  root-registered installer plan per seat and manifest revision (T-5533):
+  the unprivileged `tools/host_plan_producer.py` computes it at
+  registration, the registry pins its path and sha256 under `plans`, and
+  the broker reads it through the root-owned loader. The broker never
+  imports `tools.persona_installer`, and `Plan()` refuses unless the
+  registry is loaded with a `framework_root` whose digest matches;
 - a closed actor-neutral effect digest and actor-bound plan digest;
 - structured operation-family and approval-class metadata;
 - subject-bound opaque plan handles;
@@ -144,9 +150,19 @@ starts anything; the staged files under `dist/` are T-2920's to install.
   only admitted kinds. Every excluded or unclassified kind becomes a
   `seat-local.<operation_id>` operator action: it is bound into the plan
   and effect digests and listed under `seat_local_residue` in the plan
-  summary the approver reads. The plan is refused whole when the residue
-  exceeds 32 entries or when an admitted operation is ordered `after` a
-  residue operation.
+  summary the approver reads. The plan is refused whole when the
+  out-of-envelope residue exceeds 32 entries or when an admitted operation
+  is ordered `after` a residue operation.
+- *Launch routing* (HO ruling T-5470). When a plan carries a
+  must-run-before-launch op that is residue (`seat-claude-settings-env`,
+  `seat-runtime-residue-quarantine`, `seat-claude-workspace-trust`), its
+  launch ops (direct-fire, unit-fire, timer-enable,
+  seat-service-enable-observe) and timer-observe route to the residue in
+  plan order. Routed ops do not count toward the 32 cap; they have their
+  own bound of one per kind. The producer and `Plan()` both refuse a plan
+  whose effective broker order (admitted, then residue) runs a launch
+  before a must-run op, or a claude plan that launches without
+  containment.
 - *Verify* (rulings B2/B3). Verify is policy-authorized: the caller's own
   stored plan for that seat is the authority, and ValidateAndBind is never
   called. The record carries the closed sentinels

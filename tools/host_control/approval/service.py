@@ -1147,6 +1147,35 @@ class ApprovalService:
             self._delivery.resume(handle)
         return len(handles)
 
+    def resume_all_human_deliveries(self, *, page: int = 100) -> int:
+        """Re-arm delivery for EVERY still-pending, unexpired human request
+        (T-2920 U2, the T-5518 obligation at daemon start). Unlike
+        ``resume_human_deliveries`` (one fixed first page: re-arming does
+        not change a request's state until its async reply is processed, so
+        repeating that call returns the same page forever), this walks the
+        journal by a strictly advancing ``(created_at, request_handle)``
+        keyset cursor and stops on the first short page, so it terminates by
+        construction. Idempotent per request (``HumanCardDelivery.resume``).
+        Returns how many pending requests were visited."""
+
+        if not isinstance(page, int) or isinstance(page, bool) or page < 1:
+            raise HostControlError("invalid resume page size")
+        if self._delivery is None:
+            return 0
+        now_iso = self._now().isoformat()
+        cursor: tuple[str, str] | None = None
+        visited = 0
+        while True:
+            rows = self._journal.pending_human_request_page(
+                now_iso, limit=page, after=cursor
+            )
+            for _created_at, handle in rows:
+                self._delivery.resume(handle)
+            visited += len(rows)
+            if len(rows) < page:
+                return visited
+            cursor = rows[-1]
+
     def withdraw_human_request(
         self,
         subject: str,

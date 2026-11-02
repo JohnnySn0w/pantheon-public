@@ -1045,12 +1045,17 @@ class DispatchTicketLandAfterExitTextTests(unittest.TestCase):
         )
         return slot, today, ask
 
-    def test_ask_gates_landing_on_codex_process_exit(self):
+    def test_ask_gates_landing_on_await_audit_rc0(self):
+        # T-5666: the process-exit gate never fired (interactive codex idles at
+        # its prompt), so the gate is the executable --await-audit.
         slot, today, ask = self._ask()
-        session = runner.codex_audit_session_name(slot.slug, today)
-        self.assertIn("Codex process has EXITED", ask)
-        self.assertIn(f"in the `{session}` pane", ask)
+        self.assertIn(
+            f"--await-audit --slot {slot.slug} --date {today.isoformat()}", ask
+        )
+        self.assertIn("returns 0", ask)
         self.assertIn("not when", ask)  # explicitly rules out landing on first appearance
+        self.assertIn("T-4307", ask)
+        self.assertNotIn("Codex process has EXITED", ask)
         self.assertNotIn("confirm Codex's findings landed", ask)
 
     def test_ask_does_not_gate_on_the_tmux_session_exiting(self):
@@ -1061,21 +1066,15 @@ class DispatchTicketLandAfterExitTextTests(unittest.TestCase):
         self.assertNotIn("session has EXITED", ask)
         self.assertIn("stays alive until --teardown-audit", ask)
 
-    def test_ask_gives_a_concrete_process_exit_check(self):
+    def test_ask_no_longer_hand_gates_on_a_raw_pgrep(self):
         _slot, _today, ask = self._ask()
-        self.assertIn(
-            f"pgrep -u {runner.CODEX_AUDIT_USER} -af 'codex --profile {runner.AUDIT_PROFILE}'",
-            ask,
-        )
-        # T-4314 (scope item 3): the claude account cannot read that pane, so
-        # the "pane's last line is a shell prompt" alternative check is gone;
-        # pgrep is the one check.
+        self.assertNotIn("prints nothing", ask)
         self.assertNotIn("equivalently", ask)
         self.assertNotIn("last line is a shell prompt", ask)
 
-    def test_exit_gate_precedes_both_landing_commands(self):
+    def test_await_gate_precedes_both_landing_commands(self):
         _slot, _today, ask = self._ask()
-        gate = ask.index("Codex process has EXITED")
+        gate = ask.index("--await-audit")
         self.assertLess(gate, ask.index("--land-findings"))
         self.assertLess(gate, ask.index("--land-verdicts"))
 
@@ -4221,6 +4220,204 @@ class LiveRepoOpenRetestsRoutingTests(unittest.TestCase):
                 f"{tid} should route into Open re-tests (remediated, not yet "
                 f"independently re-verified per its own transition log)",
             )
+
+
+class _FakeClock:
+    def __init__(self, t=2_000_000.0):
+        self.t = t
+        self.sleeps = 0
+        self.on_sleep = None
+
+    def now(self):
+        return self.t
+
+    def sleep(self, s):
+        self.sleeps += 1
+        self.t += s
+        if self.on_sleep:
+            self.on_sleep(self)
+
+
+_SEALED = "preamble\n\ns3star-audit-end: findings=0\n"
+_UNSEALED = "preamble\n\nstill writing\n"
+
+
+class AwaitAuditTests(unittest.TestCase):
+    """T-5666: --await-audit, the executable land gate. Injected clock, sleep
+    and process probe; tmp run dir; no real processes or sleeps."""
+
+    def setUp(self):
+        self._td = tempfile.TemporaryDirectory()
+        self.addCleanup(self._td.cleanup)
+        self.run_dir = Path(self._td.name)
+        self.clock = _FakeClock()
+        self.running = True
+        self.calls = []
+        self.out = []
+
+    def _probe(self, argv, **kw):
+        self.calls.append(argv)
+        if self.running:
+            return subprocess.CompletedProcess(argv, 0, stdout="123 codex --profile x\n", stderr="")
+        return subprocess.CompletedProcess(argv, 1, stdout="", stderr="")
+
+    def _set(self, name, text=None, age=None):
+        p = self.run_dir / name
+        if text is not None:
+            p.write_text(text)
+        t = self.clock.t - age
+        os.utime(p, (t, t))
+
+    def _age_dir(self, age):
+        t = self.clock.t - age
+        os.utime(self.run_dir, (t, t))
+
+    def _await(self, *, stable=600, timeout=7200, poll=30):
+        return runner.await_audit(
+            "weekly-narrow", date(2026, 10, 27), run_dir=self.run_dir,
+            stable_seconds=stable, timeout_seconds=timeout, poll_seconds=poll,
+            run=self._probe, now=self.clock.now, sleep=self.clock.sleep,
+            out=self.out.append,
+        )
+
+    def test_clears_on_process_exit(self):
+        self._set("findings.md", _UNSEALED, age=1)
+        n = {"i": 0}
+
+        def flip(_c):
+            n["i"] += 1
+            if n["i"] >= 2:
+                self.running = False
+
+        self.clock.on_sleep = flip
+        self.assertEqual(self._await(), 0)
+        self.assertIn("process exited", "\n".join(self.out))
+        self.assertIn("findings.md", "\n".join(self.out))  # mtimes printed
+
+    def test_clears_on_sealed_and_stable(self):
+        self._set("findings.md", _SEALED, age=1000)
+        self._set("verdicts.jsonl", "{}\n", age=900)
+        self._age_dir(800)
+        self.assertEqual(self._await(), 0)
+        self.assertIn("sealed", "\n".join(self.out))
+        self.assertEqual(self.clock.sleeps, 0)
+
+    def test_sealed_but_recently_modified_waits_then_clears(self):
+        self._set("findings.md", _SEALED, age=10)
+        self._age_dir(1000)
+        self.assertEqual(self._await(timeout=7200), 0)
+        self.assertGreater(self.clock.sleeps, 0)
+        self.assertGreaterEqual(self.clock.t - (2_000_000.0 - 10), 600)
+
+    def test_sealed_but_recently_modified_times_out(self):
+        self._set("findings.md", _SEALED, age=10)
+        self._age_dir(1000)
+        self.assertEqual(self._await(timeout=300), 1)
+
+    def test_unsealed_but_stable_does_not_clear(self):
+        self._set("findings.md", _UNSEALED, age=5000)
+        self._age_dir(5000)
+        self.assertEqual(self._await(timeout=300), 1)
+
+    def test_missing_findings_does_not_clear_while_running(self):
+        self._age_dir(5000)
+        self.assertEqual(self._await(timeout=300), 1)
+
+    def test_verdicts_change_after_seal_blocks_clearing(self):
+        self._set("findings.md", _SEALED, age=5000)
+        self._set("verdicts.jsonl", "{}\n", age=5000)
+        self._age_dir(5000)
+
+        def rewrite(c):
+            self._set("verdicts.jsonl", None, age=0)
+
+        self.clock.on_sleep = rewrite
+        rewrite(self.clock)
+        self.assertEqual(self._await(timeout=1500), 1)
+
+    def test_run_dir_mtime_change_blocks_clearing(self):
+        self._set("findings.md", _SEALED, age=5000)
+        self._age_dir(5)
+        self.assertEqual(self._await(timeout=300), 1)
+
+    def test_timeout_is_rc1(self):
+        self.assertEqual(self._await(timeout=100, poll=30), 1)
+        self.assertIn("timeout", "\n".join(self.out).lower())
+
+    def test_read_only_only_the_probe_runs(self):
+        self._set("findings.md", _UNSEALED, age=1)
+        with patch.object(runner.subprocess, "run") as real_run, \
+                patch.object(runner.subprocess, "Popen") as popen:
+            self._await(timeout=90)
+            real_run.assert_not_called()
+            popen.assert_not_called()
+        self.assertTrue(self.calls)
+        for argv in self.calls:
+            self.assertEqual(argv[0], "pgrep")
+            self.assertIn(f"codex --profile {runner.AUDIT_PROFILE}", argv[-1])
+            self.assertEqual(argv[1:3], ["-u", runner.CODEX_AUDIT_USER])
+
+    def test_probe_error_fails_closed(self):
+        def bad(argv, **kw):
+            return subprocess.CompletedProcess(argv, 2, stdout="", stderr="boom")
+
+        self._set("findings.md", _UNSEALED, age=5000)
+        rc = runner.await_audit(
+            "weekly-narrow", date(2026, 10, 27), run_dir=self.run_dir,
+            stable_seconds=600, timeout_seconds=100, poll_seconds=30,
+            run=bad, now=self.clock.now, sleep=self.clock.sleep, out=self.out.append,
+        )
+        self.assertEqual(rc, 1)
+
+    def test_probe_exceptions_fail_closed_and_keep_polling(self):
+        for exc in (
+            subprocess.TimeoutExpired(["pgrep"], 15),
+            FileNotFoundError("pgrep"),
+            OSError("boom"),
+        ):
+            def bad(argv, _e=exc, **kw):
+                raise _e
+
+            self.out.clear()
+            self._set("findings.md", _UNSEALED, age=5000)
+            clock = _FakeClock()
+            rc = runner.await_audit(
+                "weekly-narrow", date(2026, 10, 27), run_dir=self.run_dir,
+                stable_seconds=600, timeout_seconds=100, poll_seconds=30,
+                run=bad, now=clock.now, sleep=clock.sleep, out=self.out.append,
+            )
+            self.assertEqual(rc, 1, repr(exc))
+            self.assertGreater(clock.sleeps, 1, repr(exc))  # kept polling
+            self.assertIn("probe failed", "\n".join(self.out))
+
+    def test_missing_run_dir_is_rc2(self):
+        rc = runner.await_audit(
+            "weekly-narrow", date(2026, 10, 27), run_dir=self.run_dir / "nope",
+            stable_seconds=600, timeout_seconds=100, poll_seconds=30,
+            run=self._probe, now=self.clock.now, sleep=self.clock.sleep, out=self.out.append,
+        )
+        self.assertEqual(rc, 2)
+        self.assertEqual(self.calls, [])
+
+    def test_main_missing_run_dir_rc2(self):
+        with patch.object(runner, "AUDIT_WORKSPACE_ROOT", self.run_dir):
+            rc = runner.main(["--await-audit", "--slot", "weekly-narrow", "--date", "2026-10-27"])
+        self.assertEqual(rc, 2)
+
+    def test_main_bad_args_rc2(self):
+        for argv in (
+            ["--await-audit"],
+            ["--await-audit", "--slot", "weekly-narrow", "--poll-seconds", "0"],
+            ["--await-audit", "--slot", "weekly-narrow", "--timeout-seconds", "-1"],
+            ["--await-audit", "--slot", "weekly-narrow", "--stable-seconds", "-5"],
+        ):
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(runner.main(argv), 2, argv)
+
+    def test_await_audit_is_one_of_the_exclusive_modes(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = runner.main(["--await-audit", "--slot", "weekly-narrow", "--emit-brief"])
+        self.assertEqual(rc, 64)
 
 
 class WorkspaceRootOffTheAncestor(unittest.TestCase):

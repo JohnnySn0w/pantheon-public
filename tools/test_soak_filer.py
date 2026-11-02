@@ -233,6 +233,21 @@ class SoakFilerTest(unittest.TestCase):
             self.assertIn("Re-run", ask)
             self.assertIn("T-0993", ask)
 
+    # T-3393 ------------------------------------------------------------
+    def test_invocation_is_the_leg_runner(self):
+        self.assertEqual(soak_filer.SOAK_INVOCATION, "python3 tools/soak_leg.py")
+        self.assertTrue((Path(soak_filer.__file__).parent / "soak_leg.py").is_file())
+
+    def test_ask_runs_the_runner_and_resolves_with_its_summary_line(self):
+        for agent in soak_filer.SOAK_AGENTS:
+            ask = soak_filer._build_ask(agent)
+            self.assertIn(soak_filer.SOAK_INVOCATION, ask)
+            self.assertIn("SOAK LEG:", ask)
+            self.assertIn("needs network", ask)
+            self.assertIn("T-3393", ask)
+            self.assertNotIn("1945", ask)
+            self.assertNotIn("unittest discover", ask)
+
     # default-safe -------------------------------------------------------
     def test_refuses_without_explicit_mode(self):
         self.assertEqual(soak_filer.main([]), 64)

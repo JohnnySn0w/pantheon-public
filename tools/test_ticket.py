@@ -318,6 +318,8 @@ class TestMainCheckoutGuard(unittest.TestCase):
                 "_git_utils.py",
                 "agent_role_map.py",
                 "_md_table.py",
+                "_security_gate.py",  # T-5678: ticket.py imports it
+                "_frontmatter_block.py",  # T-5689: ticket.py imports it
                 "hermes_action.py",
                 # T-3020 BT3 / ORG-078: ticket.py now imports this at module
                 # scope (priority-sort's rank-map source) — the subprocess

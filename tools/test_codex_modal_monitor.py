@@ -4,9 +4,19 @@ import os
 import sys
 import tempfile
 import unittest
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import codex_modal_monitor as cm  # noqa: E402
+
+
+class TimerContract(unittest.TestCase):
+    def test_level_triggered_timer_rearms_after_manager_restart(self):
+        timer = (Path(__file__).resolve().parent / "systemd" /
+                 "pantheon-codex-modal-monitor.timer").read_text(encoding="utf-8")
+        self.assertIn("OnActiveSec=1min", timer)
+        self.assertIn("OnUnitActiveSec=5min", timer)
+        self.assertNotRegex(timer, r"(?m)^\s*Persistent\s*=")
 
 # Real capture (2026-06-28) of codex wedged on the model-switch modal.
 MODAL_PANE = "\n".join([

@@ -148,10 +148,10 @@ class SandboxSubstratePort:
             members = result.stdout.strip().split(":")[3].split(",")
             return True if account in members else None
         if kind == "acl":
-            result = self._q([GETFACL, "--omit-header", "--absolute-names", key])
-            if result.returncode != 0:
-                return None
-            return {"entries": sorted(line.strip() for line in result.stdout.splitlines() if line.strip())}
+            # T-5652: the exact host parse (getfacl --no-effective, every line must be an
+            # allowlisted ACL entry, no normalization), so a manifest mask:: compares exactly
+            # and a computed-but-undeclared mask shows as drift here too.
+            return P.observe(self.runner, subject)
         if kind in ("owner_mode", "dir"):
             st = self._stat(key)
             return None if st is None else {"owner": st[0], "group": st[1], "mode": st[2].zfill(4)}
@@ -264,6 +264,19 @@ class SandboxSubstratePort:
         if result.returncode != 0:
             return "error"
         return "warning" if result.stderr.strip() else "ok"
+
+    def path_type(self, path: str) -> str | None:
+        """T-5653: the host port's row-4 stat and typed parse, run in the sandbox."""
+
+        (argv,) = P.path_type_argv(path)
+        return P.parse_path_type(path, self._q(argv))
+
+    def path_stat(self, path: str) -> tuple[str, str, str, str] | None:
+        """T-5657: the host port's row-4 ancestor stat and typed parse, run in the sandbox
+        (enter.sh chroots into a root-owned tmpfs, so ``/`` is ns-root there)."""
+
+        (argv,) = P.path_stat_argv(path)
+        return P.parse_path_stat(path, self._q(argv))
 
     def snapshot(self) -> dict[str, Any]:
         out: dict[str, Any] = {}

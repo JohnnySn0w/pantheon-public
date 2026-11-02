@@ -832,6 +832,7 @@ def _file_ticket(result: PairResult, slug: str, title: str, ask: str, repo_root:
     labels = f"{REFRESH_LABEL},pair:{slug},infra,mirror"
     cmd = [
         sys.executable, str(repo_root / "tools" / "ticket.py"), "file",
+        "--automated-filer", "mirror_drift_sweep",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "recovery",
         "--target", result.refresh_target or "role:system_orchestrator",
         "--title", title,

@@ -58,7 +58,7 @@ def _tuple():
 def _create(tmp_path):
     store = RS.RunStore(tmp_path / "rs")
     tup = _tuple()
-    handle = store.create(tup, operations=[{"op_id": "op-1", "crash_contract": "stageable"}])
+    handle = store.create(tup, operations=[{"op_id": "op-1", "crash_contract": "stageable"}], plan=RS.encode_plan({}))
     return store, tup, handle
 
 
@@ -128,7 +128,7 @@ def test_ancestor_with_wrong_mode_refuses_create(tmp_path):
     root.mkdir(mode=0o755)
     os.chmod(root, 0o755)
     with pytest.raises(RS.RunStateError, match="mode-0700"):
-        RS.RunStore(root).create(_tuple(), operations=[])
+        RS.RunStore(root).create(_tuple(), operations=[], plan=RS.encode_plan({}))
 
 
 def test_unknown_schema_refuses(tmp_path):

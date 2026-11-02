@@ -14,7 +14,9 @@ seat's home:
 It logs only counts, timings and status, never prompt or account content.
 
 Exit codes: 0 ok; 1 billing-reroute signature (credit balance / not on subscription);
-2 the turn failed for another reason; 3 the canary could not run at all.
+2 the turn failed for another reason; 3 the canary could not run at all; 4 the subscription
+is explicitly at a 100% session/all-model weekly cap and the inference check is deferred.
+The systemd unit treats 4 as a neutral success so cap windows do not page as defects.
 """
 
 from __future__ import annotations
@@ -32,6 +34,10 @@ SAFE = ["--safe-mode", "--tools", "", "--no-session-persistence", "--output-form
 # "not using your subscription" pass (T-4634 REBOUND).
 ON_SUBSCRIPTION = re.compile(r"\byou are currently using your subscription\b")
 NOT_ON_SUBSCRIPTION = re.compile(r"\bnot\b[^.\n]{0,40}\busing your subscription\b")
+CAP_EXHAUSTED = re.compile(
+    r"^current (?:session|week \(all models\)):\s*100% used\b",
+    re.IGNORECASE | re.MULTILINE,
+)
 REROUTE_MARKERS = ("credit balance", "api usage billing", "insufficient credit")
 # Credentials that would make the CLI bill an API key or a third-party provider instead of the
 # seat's subscription login. Inheriting them would let the canary pass on the wrong billing path
@@ -69,6 +75,8 @@ def classify(usage: dict, turn: dict) -> tuple[int, str]:
     if (usage.get("is_error") or NOT_ON_SUBSCRIPTION.search(usage_text)
             or not ON_SUBSCRIPTION.search(usage_text)):
         return 1, "/usage does not say the session runs on the subscription"
+    if turn.get("api_error_status") == 429 and CAP_EXHAUSTED.search(usage_text):
+        return 4, "cap-window: subscription confirmed at 100%; inference billing check deferred"
     if turn.get("is_error") or turn.get("subtype") != "success":
         return 2, f"turn failed: subtype={turn.get('subtype')} api_error_status={turn.get('api_error_status')}"
     if str(turn.get("result", "")).strip().upper().rstrip(".") != "OK":

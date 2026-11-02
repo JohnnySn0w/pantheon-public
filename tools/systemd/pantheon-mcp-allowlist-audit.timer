@@ -1,0 +1,11 @@
+[Unit]
+Description=Periodic Pantheon MCP allowlist fleet audit
+
+[Timer]
+OnCalendar=*-*-* 03:17:00 UTC
+RandomizedDelaySec=15m
+Persistent=true
+Unit=pantheon-mcp-allowlist-audit.service
+
+[Install]
+WantedBy=timers.target

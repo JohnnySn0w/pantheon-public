@@ -51,17 +51,24 @@ class ContractTests(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "0")
 
 
+def _own_cgroup() -> str:
+    return Path("/proc/self/cgroup").read_text(encoding="utf-8").strip()
+
+
 class FailOpenTests(unittest.TestCase):
+    """Unboxed means no NEW scope: the child stays in the test process's own cgroup. Not
+    "no run-*.scope at all", which fails when the suite itself runs from a seat shell the
+    wrapper already boxed (T-5802)."""
+
     def test_no_user_manager_runs_the_command_unboxed(self):
-        r = run("grep -c 'run-.*\\.scope' /proc/self/cgroup || true; exit 3",
-                env={"XDG_RUNTIME_DIR": "/nonexistent"})
+        r = run("cat /proc/self/cgroup; exit 3", env={"XDG_RUNTIME_DIR": "/nonexistent"})
         self.assertEqual(r.returncode, 3)
-        self.assertEqual(r.stdout.strip(), "0")
+        self.assertEqual(r.stdout.strip(), _own_cgroup())
 
     def test_kill_switch_runs_unboxed(self):
-        r = run("grep -c 'run-.*\\.scope' /proc/self/cgroup || true",
-                env={"PANTHEON_SHELL_BOX": "off"})
-        self.assertEqual(r.stdout.strip(), "0")
+        r = run("cat /proc/self/cgroup", env={"PANTHEON_SHELL_BOX": "off"})
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual(r.stdout.strip(), _own_cgroup())
 
 
 class ScopeStartFailureTests(unittest.TestCase):

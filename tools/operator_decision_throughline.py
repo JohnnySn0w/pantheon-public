@@ -125,7 +125,7 @@ def build_body(new_rows: list[dict]) -> str:
 
 def file_ticket(new_rows: list[dict]) -> None:
     dates = sorted(r["date"] for r in new_rows)
-    cmd = [sys.executable, str(REPO / "tools" / "ticket.py"), "file", "--requester", "orchestrator",
+    cmd = [sys.executable, str(REPO / "tools" / "ticket.py"), "file", "--automated-filer", "operator_decision_throughline", "--requester", "orchestrator",
            "--target", "role:engineering_orchestrator", "--title",
            f"decision throughline pass: {len(new_rows)} new register rows ({dates[0]} to {dates[-1]})",
            "--labels", "decision-register,throughline", "--stale-after", "14d",

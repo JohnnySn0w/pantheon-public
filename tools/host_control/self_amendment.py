@@ -31,6 +31,7 @@ from typing import Final, Iterable
 
 import tools.germinate as _germinate_pkg
 import tools.host_control as _host_control_pkg
+import tools.persona_installer_contracts as _installer_contracts
 from tools.host_control.contracts import PolicyDenied
 from tools.host_control.envelope import EXECUTOR_KIND_CLASSES
 
@@ -50,6 +51,11 @@ STATIC_PROTECTED_ROOTS: Final[tuple[str, ...]] = (
     "/etc/sudoers.d",
     "/var/lib/pantheon-host-broker",   # broker journal (StateDirectory)
     "/var/lib/pantheon-host-approval",  # approval journal (StateDirectory)
+    # T-2920 U2 (E36): the Telegram ingress state (its StateDirectory) and the
+    # versioned root-owned framework install prefix (HO ruling Q6:
+    # /usr/local/lib/pantheon/framework/<rev>/ plus the "active" symlink)
+    "/var/lib/pantheon-host-approval-telegram",
+    "/usr/local/lib/pantheon",
 )
 
 
@@ -57,10 +63,26 @@ def _package_root(module: object) -> str:
     return str(Path(module.__file__).resolve().parent)  # type: ignore[attr-defined]
 
 
-def default_protected_roots(extra: Iterable[str | Path] = ()) -> tuple[str, ...]:
-    """Static roots + the op-enum packages this broker loaded + ``extra``."""
+def _installer_enum_files() -> tuple[str, ...]:
+    """T-2920 U2 (E36, orchestrator 10-26 ask 3): the files that define the installer
+    operation enum the broker plans over: ``persona_installer_contracts.py``
+    (``InstallOperation`` / ``OperationKind`` since T-5516) and its sibling
+    ``persona_installer.py`` (named by path only; the broker never imports it)."""
 
-    roots = [*STATIC_PROTECTED_ROOTS, _package_root(_host_control_pkg), _package_root(_germinate_pkg)]
+    contracts = Path(_installer_contracts.__file__).resolve()
+    return (str(contracts), str(contracts.with_name("persona_installer.py")))
+
+
+def default_protected_roots(extra: Iterable[str | Path] = ()) -> tuple[str, ...]:
+    """Static roots + the op-enum packages and installer enum files this broker
+    loaded + ``extra``."""
+
+    roots = [
+        *STATIC_PROTECTED_ROOTS,
+        _package_root(_host_control_pkg),
+        _package_root(_germinate_pkg),
+        *_installer_enum_files(),
+    ]
     roots.extend(str(item) for item in extra)
     return tuple(dict.fromkeys(posixpath.normpath(root) for root in roots))
 

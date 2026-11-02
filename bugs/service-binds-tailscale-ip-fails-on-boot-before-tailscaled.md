@@ -6,7 +6,7 @@ domain: systemd, tailscale, mqtt, boot-race
 
 ## Symptom
 
-A service whose config binds a **specific Tailscale IP** (e.g. mosquitto `listener 1883 100.122.54.49`) fails on a fresh VPS boot and never recovers:
+A service whose config binds a **specific Tailscale IP** (e.g. mosquitto `listener 1883 100.122.74.200`) fails on a fresh VPS boot and never recovers:
 
 ```
 mosquitto.service: Main process exited, code=exited, status=1/FAILURE

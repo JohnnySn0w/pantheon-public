@@ -3,11 +3,20 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from tools import headless_billing_canary as canary
 
 USAGE_OK = {"is_error": False, "result": "You are currently using your subscription to power your Claude Code usage\n..."}
+USAGE_WEEKLY_CAP = {
+    "is_error": False,
+    "result": (
+        "You are currently using your subscription to power your Claude Code usage\n\n"
+        "Current session: 0% used\n"
+        "Current week (all models): 100% used · resets Nov 1, 4:59pm (UTC)"
+    ),
+}
 TURN_OK = {"type": "result", "subtype": "success", "is_error": False, "result": "OK", "num_turns": 1}
 
 
@@ -33,6 +42,34 @@ class TestClassify(unittest.TestCase):
     def test_other_turn_failure_is_not_called_a_reroute(self) -> None:
         turn = {"subtype": "error_during_execution", "is_error": True, "result": "overloaded"}
         self.assertEqual(canary.classify(USAGE_OK, turn)[0], 2)
+
+    def test_429_at_explicit_subscription_cap_is_neutral(self) -> None:
+        turn = {"subtype": "success", "is_error": True, "result": "", "api_error_status": 429}
+        self.assertEqual(canary.classify(USAGE_WEEKLY_CAP, turn), (
+            4,
+            "cap-window: subscription confirmed at 100%; inference billing check deferred",
+        ))
+
+    def test_429_without_explicit_cap_still_fails(self) -> None:
+        turn = {"subtype": "success", "is_error": True, "result": "", "api_error_status": 429}
+        self.assertEqual(canary.classify(USAGE_OK, turn)[0], 2)
+
+    def test_429_at_fable_only_cap_still_fails(self) -> None:
+        usage = dict(
+            USAGE_OK,
+            result=USAGE_OK["result"] + "\nCurrent week (Fable): 100% used",
+        )
+        turn = {"subtype": "success", "is_error": True, "result": "", "api_error_status": 429}
+        self.assertEqual(canary.classify(usage, turn)[0], 2)
+
+    def test_reroute_signature_wins_even_at_cap(self) -> None:
+        turn = {
+            "subtype": "success",
+            "is_error": True,
+            "result": "Credit balance is too low",
+            "api_error_status": 429,
+        }
+        self.assertEqual(canary.classify(USAGE_WEEKLY_CAP, turn)[0], 1)
 
     def test_wrong_answer_fails(self) -> None:
         self.assertEqual(canary.classify(USAGE_OK, dict(TURN_OK, result="Sure! OK"))[0], 2)
@@ -80,6 +117,12 @@ class TestMain(unittest.TestCase):
         for k in canary.BILLING_ENV:
             self.assertNotIn(k, env)
         self.assertEqual(env.get("KEEP_ME"), "1")
+
+
+class TestSystemdContract(unittest.TestCase):
+    def test_neutral_cap_exit_is_success_for_systemd(self) -> None:
+        unit = Path("tools/systemd/pantheon-headless-billing-canary.service").read_text()
+        self.assertIn("SuccessExitStatus=4", unit)
 
 
 if __name__ == "__main__":

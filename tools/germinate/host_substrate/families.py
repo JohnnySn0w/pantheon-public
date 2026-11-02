@@ -130,6 +130,12 @@ def _mode(where: str, value: Any) -> str:
     return value.zfill(4)
 
 
+def _rwx(digit: int) -> str:
+    """One octal permission digit as ACL perms text (5 -> 'r-x')."""
+
+    return "".join(c if digit & v else "-" for c, v in (("r", 4), ("w", 2), ("x", 1)))
+
+
 def _mapping_section(doc: Mapping[str, Any], name: str) -> dict[str, Any]:
     if name not in doc:
         return {}
@@ -297,6 +303,20 @@ def load_manifest(doc: Any, *, repo_root: Path | None = None) -> Manifest:
         for acl_entry in acl:
             if not isinstance(acl_entry, str) or not _ACL_RE.match(acl_entry):
                 raise ManifestError(f"paths.{p}: ACL entry {acl_entry!r} is not an allowlisted shape")
+        # T-5665 (Recovery, D15): at most ONE entry per key (prefix, tag, qualifier), the entry
+        # with its perms stripped ('default:user:alice:rwx' -> 'default:user:alice').
+        # setfacl --set accepts duplicates and keeps the LAST, so observe would never match
+        # the declared list. This subsumes the exact-string dedup and T-5653's one-mask rule.
+        # LOAD-BEARING: _ACL_RE admits only long-form tags and NAME qualifiers (no u:/g:/d:
+        # short forms, no numeric ids), which is what makes the textual key canonical.
+        seen: dict[str, str] = {}
+        for acl_entry in acl:
+            key = acl_entry.rsplit(":", 1)[0]
+            if key in seen:
+                raise ManifestError(
+                    f"paths.{p}.acl: {seen[key]!r} and {acl_entry!r} both set {key}: (one entry per prefix, "
+                    f"tag and qualifier; setfacl --set keeps the last; T-5665)")
+            seen[key] = acl_entry
         # T-5510 (F2): acl.converge runs `setfacl --set`, which REPLACES the whole ACL, so a
         # list of named entries alone is a malformed ACL on a real host ("Missing or wrong
         # entry"). Base entries are declared, never derived from `mode`: with named entries
@@ -310,10 +330,54 @@ def load_manifest(doc: Any, *, repo_root: Path | None = None) -> Manifest:
                 if missing:
                     raise ManifestError(
                         f"paths.{p}.acl: setfacl --set needs the base entries; missing {', '.join(missing)}")
-        if len(set(acl)) != len(acl):
-            raise ManifestError(f"paths.{p}.acl: duplicate entries are refused")
+            # T-5652 (Recovery, D15): with a named user:/group: entry, `setfacl --set` computes a
+            # mask:: entry the manifest did not declare, so observe (which compares exactly and
+            # never normalizes) would see drift forever. Named entries REQUIRE the mask.
+            for prefix in ("", "default:"):
+                named = any(re.match(rf"^{prefix}(?:user|group):[^:]+:", a) for a in acl)
+                if named and not any(a.startswith(f"{prefix}mask::") for a in acl):
+                    raise ManifestError(
+                        f"paths.{p}.acl: named entries need {prefix}mask:: (setfacl --set would compute one; T-5652)")
+            # T-5653 (Recovery, D15): the complete mask rule. Per prefix at most ONE mask:: (now
+            # enforced by the T-5665 one-entry-per-key rule above), and a
+            # mask:: ONLY with named entries (with T-5652 above: mask-iff-named). For the ACCESS
+            # prefix the mask IS the mode's group bits on a real host (setfacl writes one into the
+            # other, chmod the reverse), so they must agree or acl.converge and owner_mode.set
+            # fight and verify never converges. The default mask has no mode constraint.
+            for prefix in ("", "default:"):
+                masks = [a for a in acl if a.startswith(f"{prefix}mask::")]
+                named = any(re.match(rf"^{prefix}(?:user|group):[^:]+:", a) for a in acl)
+                if masks and not named:
+                    raise ManifestError(
+                        f"paths.{p}.acl: a lone {prefix}mask:: with no named user:/group: entry is refused (T-5653)")
+                if masks and not prefix:
+                    group_bits = _rwx(int(_mode(f"paths.{p}", spec["mode"])[-2]))
+                    if masks[0].rsplit(":", 1)[1] != group_bits:
+                        raise ManifestError(
+                            f"paths.{p}.acl: {masks[0]} must equal the mode's group bits {group_bits} "
+                            f"(mode {spec['mode']}; T-5653)")
+            # T-5658 (Recovery, D15): the ACCESS base entries ARE the mode bits on a real host
+            # (setfacl --set writes them into the mode, chmod writes the mode back), so they
+            # must agree or acl.converge and owner_mode.set fight forever. user:: == owner
+            # bits, other:: == other bits; with no named entry (so, by T-5652/T-5653, no mask)
+            # group:: == group bits; with named entries the mask holds the group bits (T-5653
+            # above) and group:: is free. (A duplicate base entry never gets here: T-5665
+            # refuses it above.) The default: prefix is unconstrained. Never rewritten.
+            mode = _mode(f"paths.{p}", spec["mode"])
+            named = any(re.match(r"^(?:user|group):[^:]+:", a) for a in acl)
+            bases = [("user", "owner", mode[-3]), ("other", "other", mode[-1])]
+            if not named:
+                bases.append(("group", "group", mode[-2]))
+            for tag, what, digit in bases:
+                want = _rwx(int(digit))
+                for a in acl:
+                    if a.startswith(f"{tag}::") and a.rsplit(":", 1)[1] != want:
+                        raise ManifestError(
+                            f"paths.{p}.acl: base entry {a} must equal the mode's {what} bits {want} "
+                            f"(mode {spec['mode']}; T-5658)")
 
     mailbox_dirs = _mapping_section(doc, "mailbox_dirs")
+    dir_paths: dict[str, str] = {}
     for m, spec in mailbox_dirs.items():
         if not isinstance(m, str) or not _ID_RE.match(m):
             raise ManifestError(f"mailbox_dirs.{m}: bad id")
@@ -321,6 +385,11 @@ def load_manifest(doc: Any, *, repo_root: Path | None = None) -> Manifest:
             f"mailbox_dirs.{m}", spec, required=frozenset({"path", "owner", "group", "mode"})
         )
         _owned_path(f"mailbox_dirs.{m}", spec["path"], spec)
+        # T-2920 U3d review LOW-1: one entry per path, so a dir: subject (and its T-5657
+        # designated owner) resolves to exactly one manifest entry.
+        if spec["path"] in dir_paths:
+            raise ManifestError(f"mailbox_dirs.{m}.path: {spec['path']!r} duplicates mailbox_dirs.{dir_paths[spec['path']]}")
+        dir_paths[spec["path"]] = m
 
     for section, root in (("units", UNIT_DIR), ("dbus_policies", DBUS_DIR)):
         entries = _mapping_section(doc, section)

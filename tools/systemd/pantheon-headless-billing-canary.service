@@ -10,6 +10,7 @@ Type=oneshot
 WorkingDirectory=/tmp
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
 ExecStart=/usr/bin/python3 %h/pantheon-config/tools/headless_billing_canary.py
+SuccessExitStatus=4
 StandardOutput=journal
 StandardError=journal
 TimeoutStartSec=10min

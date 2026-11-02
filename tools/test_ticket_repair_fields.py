@@ -7,13 +7,14 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 
-from tools import ticket
+from tools import _frontmatter_block, ticket
 from tools._episode_fixtures import SRC_ROOT, RepoFixture, git
 
 BASE_SHA = "b7831b0703f1"  # origin/main when T-4707 was staged (pre-change ticket.py)
@@ -134,6 +135,33 @@ class RepairFieldsCli(unittest.TestCase):
             self.assertNotIn(k + ":", text)
 
 
+_FM_KEY_RE = re.compile(r"^([a-z_][a-z0-9_]*):\s*(.*)$")
+
+
+def _block_scalar_exempt(old, new, text: str) -> bool:
+    """The base parser (pre-T-4707) cannot read a YAML block scalar by design:
+    exempt a ticket iff the base raised, the new parser read it, and the ticket
+    really carries a block -- a ticket.BLOCK_SCALAR_FIELDS value (ORG-076
+    evidence_snapshot, first T-5030; the T-5678 security-gate fields, first
+    T-5686) that contains a newline, or (T-5689) a `|` / `>` block opener on any
+    other key. Merely HAVING a single-line threat_* key exempts nothing (r1 LOW-3)."""
+    if not (isinstance(old, tuple) and old and old[0] == "ERR"):
+        return False
+    if not (isinstance(new, tuple) and new and isinstance(new[0], dict)):
+        return False
+    fields = new[0]
+    if any(isinstance(fields.get(k), str) and "\n" in fields[k]
+           for k in ticket.BLOCK_SCALAR_FIELDS):
+        return True
+    fm = text[4 : text.find("\n---", 4)] if text.startswith("---\n") else ""
+    for line in fm.splitlines():
+        m = _FM_KEY_RE.match(line.rstrip())
+        if (m and m.group(1) not in ticket.BLOCK_SCALAR_FIELDS
+                and _frontmatter_block.parse_block_header(m.group(2).strip()) is not None):
+            return True
+    return False
+
+
 class ParserBackCompat(unittest.TestCase):
     """parse_front_matter output is unchanged for every existing ticket in the real corpus."""
 
@@ -164,16 +192,44 @@ class ParserBackCompat(unittest.TestCase):
                     new = ticket.parse_front_matter(text)
                 except ticket.TicketError as e:
                     new = ("ERR", str(e))
-                # A real ORG-076 repair ticket (first: T-5030) carries the
-                # evidence_snapshot block scalar this change ADDED; the base parser
-                # can't read it by design. Back-compat covers every other ticket.
-                if (isinstance(old, tuple) and old and old[0] == "ERR"
-                        and isinstance(new, tuple) and new and isinstance(new[0], dict)
-                        and "evidence_snapshot" in new[0]):
+                if _block_scalar_exempt(old, new, text):
                     continue
                 self.assertEqual(old, new, f.name)
                 n += 1
         self.assertGreater(n, 100)
+
+    def test_block_scalar_fixtures_exempt_or_identical(self):
+        """T-5689: a multi-line threat_path (the pre-mitigation T-5686, captured from
+        git) is exempt -- the base parser can't read it, the new one does; the same
+        ticket with a single-line threat_path parses identically through both."""
+        base = self._base_module()
+        multi = (SRC_ROOT / "tools" / "fixtures" / "frontmatter_block"
+                 / "T-5686-pre-mitigation.md").read_text(encoding="utf-8")
+        single = multi.replace("threat_path: |\n  ", "threat_path: ")
+        self.assertNotEqual(multi, single)
+        for text, want_exempt in ((multi, True), (single, False)):
+            try:
+                old = base.parse_front_matter(text)
+            except base.TicketError as e:
+                old = ("ERR", str(e))
+            new = ticket.parse_front_matter(text)
+            self.assertEqual(_block_scalar_exempt(old, new, text), want_exempt)
+            if want_exempt:
+                self.assertTrue(new[0]["threat_path"].startswith("a subagent steered"))
+            else:
+                self.assertEqual(old, new)
+
+    def test_exemption_needs_a_real_block(self):
+        """r1 LOW-3: a base-parser error on a ticket whose threat_* value is single-line
+        (no block anywhere) is NOT exempt -- it must still be compared."""
+        text = ("---\nid: T-1\ncreated: x\nrequester: a\ntarget: b\nstate: inbox\n"
+                "threat_path: one line, no block\n---\n\nbody\n")
+        new = ticket.parse_front_matter(text)
+        self.assertFalse(_block_scalar_exempt(("ERR", "other failure"), new, text))
+        block = text.replace("threat_path: one line, no block", "threat_path: |\n  one line")
+        self.assertTrue(_block_scalar_exempt(("ERR", "x"), ticket.parse_front_matter(block), block))
+        folded = text.replace("threat_path: one line, no block", "serves: >-\n  one line")
+        self.assertTrue(_block_scalar_exempt(("ERR", "x"), ticket.parse_front_matter(folded), folded))
 
     def test_bare_pipe_value_on_other_keys_unchanged(self):
         text = "---\nid: T-1\ncreated: x\nrequester: a\ntarget: b\nstate: inbox\nserves: |\n---\n\nbody\n"

@@ -8,9 +8,9 @@ Over the REAL instance.yaml:
   (c) reverse: a role with a codex fallback AND a Claude telegram channel has a
       bridge entry (else a swap leaves the seat comms-dark).
 
-Archivist is data-only. Her codex fallback awaits an operator data-boundary decision
-and is deliberately NOT in instance.yaml. Adding her later needs exactly these keys
-and no code change (proved synthetically below):
+Archivist is data-only. The operator's T-5744 ruling resolved the former data-boundary
+decision in favour of availability during provider cap windows. Her real manifest
+therefore needs exactly these keys and no controller code change:
   * persona_installer.codex_telegram_bridge.personas.archivist
   * harness_runtime.roles.head-memory-orchestrator.fallbacks: [codex/<profile>]
   * persona_installer.codex_standing_instructions.personas.archivist
@@ -126,10 +126,16 @@ class ArchivistIsDataOnly(unittest.TestCase):
                 _codex_bridge_required(m, m.binding("archivist"), selected_harness="claude")
             )
 
-    def test_real_manifest_has_no_archivist_codex_entry(self):
+    def test_real_manifest_has_archivist_codex_entry(self):
         m = Manifest.load(MANIFEST)
-        self.assertNotIn("archivist", _bridge_personas(m))
-        self.assertFalse(_has_codex_fallback(m, "archivist"))
+        self.assertIn("archivist", _bridge_personas(m))
+        self.assertTrue(_has_codex_fallback(m, "archivist"))
+        self.assertTrue(_has_codex_standing(m, "archivist"))
+
+    def test_real_manifest_selects_codex_after_claude(self):
+        m = Manifest.load(MANIFEST)
+        refs = _role_runtime_references(m, m.binding("archivist"))
+        self.assertEqual(refs, frozenset({"codex/interactive-chatgpt"}))
 
     def test_command_sheet_routes_archivist_to_generic_path(self):
         # command_sheet special-cases {"specialist","recovery"} to _legacy_command_sheet;

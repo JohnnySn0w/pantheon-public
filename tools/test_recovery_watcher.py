@@ -485,6 +485,18 @@ class TestCooldown(unittest.TestCase):
 
 # ------------------------------------------------------------ hostile inputs
 class TestMaliciousExport(unittest.TestCase):
+    def test_fleet_aggregate_ignored_but_unknown_json_still_invalid(self):
+        f = Fixture(self)
+        f.write([rec("recovery")])
+        (f.health / "fleet-health.json").write_text(json.dumps(
+            {"schema": "pantheon-fleet-health/1", "entries": []}))
+        (f.health / "unknown.json").write_text(json.dumps(rec("unknown")))
+
+        records, invalid, _ = rw.load_health(f.health, PERSONAS)
+
+        self.assertEqual(sorted(records), ["recovery"])
+        self.assertEqual(invalid, 1)
+
     def _hostile_fixture(self) -> Fixture:
         f = Fixture(self)
         f.write([rec("recovery")])
@@ -719,7 +731,10 @@ class TestInertness(unittest.TestCase):
                 mock.patch.object(socket, "socket") as p_sock, \
                 mock.patch.object(urllib.request, "urlopen") as p_url, \
                 mock.patch.object(rw, "make_live_actuators") as p_factory, \
-                mock.patch.object(rw, "LiveActuators") as p_cls:
+                mock.patch.object(rw, "LiveActuators") as p_cls, \
+                mock.patch.object(
+                    rw, "make_self_probe", return_value=FakeProbe(HEALTHY_LOCAL),
+                ) as p_probe:
             for name, (records, exp) in SCENARIOS.items():
                 with self.subTest(scenario=name):
                     f = Fixture(self)
@@ -737,6 +752,7 @@ class TestInertness(unittest.TestCase):
                                           "--state-file", str(f.state),
                                           "--watcher-health-dir", str(f.wdir)]), 0)
         self.assertEqual(seen, {i.value for i in rw.Incident}, "every incident class exercised")
+        p_probe.assert_called_once_with()
         for m in (p_run, p_popen, p_sock, p_url, p_factory, p_cls):
             self.assertEqual(m.call_count, 0, m)
 

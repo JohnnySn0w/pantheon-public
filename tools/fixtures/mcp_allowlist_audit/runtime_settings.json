@@ -1,0 +1,8 @@
+{
+  "argv": [
+    "/home/fixture/.npm-global/bin/claude",
+    "--settings",
+    "{\"enabledPlugins\":{\"telegram@claude-plugins-official\":true}}"
+  ],
+  "cwd": "/home/fixture/pantheon-config"
+}

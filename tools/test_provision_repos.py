@@ -566,5 +566,68 @@ class TestCmdClaimRepoProvisioning(unittest.TestCase):
         self.assertEqual(len(provision_calls), 1, "provision_repos should be called once")
 
 
+def test_provision_adapter_preserves_best_effort_availability_only_contract(tmp_path: Path) -> None:
+    _write_registry(tmp_path)
+    calls: list[tuple[str, Path]] = []
+    def adapter(repo: str, target: Path) -> pr.ProvisionReconcileResult:
+        calls.append((repo, target))
+        return pr.ProvisionReconcileResult(False, "authorization scope mismatch", "clone", "availability-only")
+    warnings = pr.provision_repos(
+        {"repos": ["echo-prismatic:rw"]}, repo_root=tmp_path,
+        clone_base=tmp_path / "clones", reconcile_adapter=adapter,
+    )
+    assert calls == [("echo-prismatic", tmp_path / "clones" / "echo-prismatic")]
+    assert warnings == ["echo-prismatic: reconcile refused: authorization scope mismatch"]
+    def exploding(_repo: str, _target: Path) -> pr.ProvisionReconcileResult:
+        raise RuntimeError("boom")
+    warnings = pr.provision_repos(
+        {"repos": ["echo-prismatic"]}, repo_root=tmp_path,
+        clone_base=tmp_path / "clones", reconcile_adapter=exploding,
+    )
+    assert "unexpected reconciler error" in warnings[0]
+
+
+def test_provision_adapter_validates_registry_and_action_policy_before_accepting(tmp_path: Path) -> None:
+    _write_registry(tmp_path)
+    calls: list[str] = []
+    def result(action: str, policy: str = "availability-only", ok: bool = True):
+        def adapter(repo: str, _target: Path) -> pr.ProvisionReconcileResult:
+            calls.append(repo); return pr.ProvisionReconcileResult(ok, "detail", action, policy)
+        return adapter
+
+    warnings = pr.provision_repos(
+        {"repos": ["totally-unknown-repo:rw"]}, repo_root=tmp_path,
+        clone_base=tmp_path / "clones", reconcile_adapter=result("clone"),
+    )
+    assert calls == []; assert "unknown repo" in warnings[0]
+
+    warnings = pr.provision_repos(
+        {"repos": ["echo-prismatic:rw"]}, repo_root=tmp_path,
+        clone_base=tmp_path / "clones", reconcile_adapter=result("ff-advance"),
+    )
+    assert "action ff-advance" in warnings[0]
+
+    warnings = pr.provision_repos(
+        {"repos": ["echo-prismatic:rw"]}, repo_root=tmp_path,
+        clone_base=tmp_path / "clones", reconcile_adapter=result("clone", "ff-only"),
+    )
+    assert "update_policy ff-only" in warnings[0]
+
+    assert pr.provision_repos(
+        {"repos": ["echo-prismatic:rw"]}, repo_root=tmp_path,
+        clone_base=tmp_path / "clones", reconcile_adapter=result("clone"),
+    ) == []
+
+    warnings = pr.provision_repos(
+        {"repos": ["pantheon-config:rw"]}, repo_root=tmp_path,
+        clone_base=tmp_path / "clones", reconcile_adapter=result("clone"),
+    )
+    assert "always_available" in warnings[0] and "clone" in warnings[0]
+    assert pr.provision_repos(
+        {"repos": ["pantheon-config:rw"]}, repo_root=tmp_path,
+        clone_base=tmp_path / "clones", reconcile_adapter=result("noop"),
+    ) == []
+
+
 if __name__ == "__main__":
     unittest.main()

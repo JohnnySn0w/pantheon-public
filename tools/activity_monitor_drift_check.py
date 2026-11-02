@@ -100,6 +100,7 @@ KNOWN_PREDICATES = (
     "p1a", "p1b", "p1c", "p1d",
     "cap-modal", "cap-modal-unsafe", "spend-cap", "cyber-refusal",
     "stuck-poke", "tui-wedge",
+    "interactive-await",  # T-5793: P1.b blocked on AskUserQuestion/EnterPlanMode -> Recovery
 )
 
 # Ticket-ratified defaults; every other KNOWN_PREDICATE stays unarmed (None)

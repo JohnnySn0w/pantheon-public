@@ -25,6 +25,7 @@ from unittest import mock
 
 import yaml
 
+from tools._host_control_plan_fixtures import framework_overlay, register_plan
 from tools.host_control.contracts import (
     OPERATION_TRANSITIONS,
     OPERATION_STATES,
@@ -185,6 +186,11 @@ class OperationCaseBase(unittest.TestCase):
             harness_override="codex",
             root=Path("/projection"),
         )
+        # T-5533: registered in registry_dict(). T-5608: the REAL codex plan (its
+        # residue quarantine is admitted) keeps a broker-admitted fire and the D6
+        # synthesized timer-enable intent this lifecycle fixture counts.
+        assert "seat-runtime-residue-quarantine" in {op.kind for op in prototype.operations}
+        self.prototype = prototype
         self.framework_sha256 = prototype.provenance["source_artifact_sha256"]
         self.template_ids = (
             "tools/systemd/pantheon-persona-consume@.service",
@@ -195,13 +201,15 @@ class OperationCaseBase(unittest.TestCase):
         self.registry_path = self.root / "registry.json"
         self.policy_path = self.root / "policy.json"
         self.journal_path = self.root / "broker.sqlite3"
+        # T-5533 review r1 B1: the broker plans against a framework-copy overlay.
+        self.framework = framework_overlay(self.root / "framework", REPO_ROOT, self.template_ids)
         self.write_json(self.registry_path, self.registry_dict())
         self.write_json(self.policy_path, self.policy_dict())
         self.files = RootOwnedFileLoader._open_for_test(
             (self.root,),
             expected_owner_uid=os.getuid(),
         )
-        self.registry = SeatRegistry.load(self.registry_path, files=self.files)
+        self.registry = SeatRegistry.load(self.registry_path, files=self.files, framework_root=self.framework)
         self.policy = HostPolicy.load(self.policy_path, files=self.files)
         self.journal = BrokerJournal.open(self.journal_path)
         self.handle_counter = itertools.count(1)
@@ -209,7 +217,6 @@ class OperationCaseBase(unittest.TestCase):
             registry=self.registry,
             policy=self.policy,
             journal=self.journal,
-            installer=self.installer,
             clock=lambda: FIXED_NOW,
             handle_factory=self.next_handle,
             plan_ttl=timedelta(hours=1),
@@ -268,7 +275,7 @@ class OperationCaseBase(unittest.TestCase):
         path.chmod(0o600)
 
     def registry_dict(self) -> dict:
-        return {
+        value = {
             "schema": "pantheon-host-seat-registry/v1",
             "seats": [
                 {
@@ -315,6 +322,8 @@ class OperationCaseBase(unittest.TestCase):
                 }
             ],
         }
+        register_plan(value, self.root, self.prototype, seat_id="recovery", manifest_revision="manifest-r1")
+        return value
 
     def policy_dict(self) -> dict:
         grants = []
@@ -1187,7 +1196,6 @@ class LockContentionTests(OperationCaseBase):
             registry=self.registry,
             policy=self.policy,
             journal=self.short,
-            installer=self.installer,
             clock=lambda: FIXED_NOW,
             handle_factory=self.next_handle,
             plan_ttl=timedelta(hours=1),

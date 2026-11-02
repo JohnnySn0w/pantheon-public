@@ -369,6 +369,63 @@ class ProjectCatalogueTests(unittest.TestCase):
     def test_live_project_catalogue_is_valid(self) -> None:
         self.assertEqual(pc.check_project_catalogue(REPO_ROOT, frozenset()), ())
 
+    # --- T-5679: the CLI defaults to the canonical goals.md goal keys -------
+
+    _GOAL_FIXTURE = REPO_ROOT / "tools" / "fixtures" / "goal_registry" / "goal_headings_ok.md"
+
+    def _goal_parented_repo(self, td: str, *, with_registry: bool) -> Path:
+        from tools import goal_registry as gr
+
+        repo = Path(td)
+        _write_record(
+            repo / "projects" / "records",
+            _record("goal-owned-project", parent_goal_ref="goal:alpha-goal"),
+        )
+        _write_generated(repo, frozenset({"alpha-goal"}))
+        if with_registry:
+            target = repo / gr.GOALS_RELPATH
+            target.parent.mkdir(parents=True)
+            target.write_bytes(self._GOAL_FIXTURE.read_bytes())
+        return repo
+
+    def _run_main(self, args: list[str]) -> tuple[int, str]:
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stderr(buf):
+            code = pc.main(args)
+        return code, buf.getvalue()
+
+    def test_cli_check_defaults_to_registry_goal_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._goal_parented_repo(td, with_registry=True)
+            code, stderr = self._run_main(["check", "--repo-root", str(repo)])
+            self.assertEqual((code, stderr), (0, ""))
+
+    def test_cli_explicit_goal_key_overrides_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._goal_parented_repo(td, with_registry=True)
+            code, stderr = self._run_main(
+                ["check", "--repo-root", str(repo), "--goal-key", "other-goal"]
+            )
+            self.assertEqual(code, 1)
+            self.assertIn("dangling-goal: goal-owned-project", stderr)
+
+    def test_cli_missing_registry_is_surfaced_not_silent(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._goal_parented_repo(td, with_registry=False)
+            code, stderr = self._run_main(["check", "--repo-root", str(repo)])
+            self.assertEqual(code, 1)
+            self.assertIn("goal-registry-unavailable: goal registry missing", stderr)
+            self.assertIn("dangling-goal: goal-owned-project", stderr)
+
+    def test_cli_generate_uses_registry_default(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            repo = self._goal_parented_repo(td, with_registry=True)
+            code, stderr = self._run_main(["generate", "--repo-root", str(repo)])
+            self.assertEqual((code, stderr), (0, ""))
+
     def test_ci_paths_cover_project_records_and_schema(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
         # T-5001: ci.yml has no push trigger (the nightly covers main); only the PR list.

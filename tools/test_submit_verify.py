@@ -988,6 +988,62 @@ class TestPreRetryRecheck(unittest.TestCase):
         self.assertTrue(r.ok)
         self.assertEqual(fake.enter_calls, 2)
 
+    def test_paste_rendering_after_the_post_enter_capture_is_not_confirmed(self):
+        # T-5610 (orchestrator 2026-10-26 18:28Z): on a heavy pane the collapsed paste had
+        # not rendered when the post-Enter capture ran, so the composer looked empty
+        # and the wake read "submit confirmed". The placeholder then appeared and sat
+        # unsubmitted. The confirm re-sample sees it and the retry Enter submits it.
+        fake = FakePane([_submitted_pane(["done"]), _PANE_5148_STUCK, _PANE_5148_STUCK,
+                         _submitted_pane(["done"])])
+        r = self._run(fake)
+        self.assertTrue(r.ok)
+        self.assertEqual(fake.enter_calls, 2)
+
+    def test_late_landing_after_the_last_retry_is_confirmed(self):
+        # T-5651 (specialist keep-going 2026-10-27 04:46Z): the seat was finishing a turn,
+        # every check in the ~3-4s retry window still saw the text, and the Enter landed
+        # after. specialist answered the nudge, but the unit failed and paged Recovery. A final
+        # late re-check sees the cleared composer: ok, with no extra Enter.
+        fake = FakePane([_PANE_5148_STUCK] * 5 + [_submitted_pane(["done"])])
+        r = self._run(fake)
+        self.assertTrue(r.ok, r)
+        self.assertEqual(fake.enter_calls, 3)
+        self.assertIn("late", r.detail)
+
+    def test_submit_landing_well_after_the_first_late_look_is_confirmed(self):
+        # T-5656 (recovery's own consume 2026-10-27 06:35Z, T-5651 live): the wake landed
+        # but later than retries + one 3s look, so the unit paged. The late look is a
+        # bounded poll: a cleared composer on the 4th late sample still confirms,
+        # with no extra Enter.
+        fake = FakePane([_PANE_5148_STUCK] * 8 + [_submitted_pane(["done"])])
+        r = self._run(fake)
+        self.assertTrue(r.ok, r)
+        self.assertEqual(fake.enter_calls, 3)
+        self.assertIn("late", r.detail)
+
+    def test_late_poll_is_bounded_and_sends_no_enter(self):
+        # All-pending: the late poll sleeps at most LATE_CONFIRM_TOTAL_S in
+        # LATE_CONFIRM_POLL_S steps, sends no Enter, and reports unconfirmed.
+        slept = []
+        fake = FakePane([_PANE_5221_STUCK])
+        r = sv.submit_verify(
+            self.profile, "p:0.0", _PROMPT_5221,
+            send_text=fake.send_text, send_enter=fake.send_enter,
+            capture=fake.capture, sleep=slept.append)
+        self.assertFalse(r.ok)
+        self.assertEqual(fake.enter_calls, 3)
+        late = [s for s in slept if s == sv.LATE_CONFIRM_POLL_S]
+        self.assertGreaterEqual(len(late), 2)
+        self.assertLessEqual(sum(late), sv.LATE_CONFIRM_TOTAL_S)
+        self.assertGreater(sum(late) + sv.LATE_CONFIRM_POLL_S, sv.LATE_CONFIRM_TOTAL_S)
+
+    def test_empty_late_sample_is_no_vote(self):
+        # An empty capture inside the late poll casts no vote; the poll keeps looking.
+        fake = FakePane([_PANE_5148_STUCK] * 5 + ["", _submitted_pane(["done"])])
+        r = self._run(fake)
+        self.assertTrue(r.ok, r)
+        self.assertEqual(fake.enter_calls, 3)
+
     def test_all_pending_still_exhausts_retries(self):
         fake = FakePane([_PANE_5221_STUCK])
         r = self._run(fake, _PROMPT_5221)

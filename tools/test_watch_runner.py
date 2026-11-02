@@ -19,6 +19,7 @@ worktree flows. The live surface is the four in-session modes above.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import io
 import json
 import os
@@ -123,6 +124,309 @@ def _write_landed_report(path: Path, headline: str = "Test headline.", body: str
     genuinely "landed" rather than merely present.
     """
     path.write_text(_landed_report_text(headline=headline, body=body), encoding="utf-8")
+
+
+class _SnapshotResponse:
+    """Small urllib response double that preserves an arbitrary byte body."""
+
+    def __init__(
+        self,
+        body: bytes,
+        *,
+        status: int = 200,
+        final_url: str = "https://code.claude.com/docs/en/legal-and-compliance.md",
+        headers: dict[str, str] | None = None,
+    ) -> None:
+        self.body = body
+        self.status = status
+        self.final_url = final_url
+        self.headers = headers or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def getcode(self) -> int:
+        return self.status
+
+    def geturl(self) -> str:
+        return self.final_url
+
+    def read(self, limit: int) -> bytes:
+        return self.body[:limit]
+
+
+def _snapshot_opener(response: _SnapshotResponse):
+    def open_response(_request, *, timeout):
+        if timeout <= 0:
+            raise AssertionError("timeout must be bounded")
+        return response
+    return open_response
+
+
+class TestLegalSnapshotRegistry(unittest.TestCase):
+    def test_only_policy_topic_has_exact_fixed_spec(self) -> None:
+        self.assertEqual(
+            set(watch_runner.TOPIC_SNAPSHOTS), {"anthropic-policy-and-billing"}
+        )
+        spec = watch_runner.TOPIC_SNAPSHOTS["anthropic-policy-and-billing"]
+        self.assertEqual(
+            spec.url, "https://code.claude.com/docs/en/legal-and-compliance.md"
+        )
+        self.assertEqual(spec.final_url, spec.url)
+        self.assertEqual(spec.slug, "legal-and-compliance")
+
+    def test_exact_dated_destination(self) -> None:
+        spec = watch_runner.TOPIC_SNAPSHOTS["anthropic-policy-and-billing"]
+        self.assertEqual(
+            watch_runner.snapshot_relpath(spec, "2026-11-01").as_posix(),
+            "knowledge/watch/snapshots/legal-and-compliance/2026-11-01.md",
+        )
+
+    def test_invalid_spec_variants_refused(self) -> None:
+        bad_specs = [
+            watch_runner.SnapshotSpec(
+                url="http://code.claude.com/docs/en/legal-and-compliance.md",
+                final_url="http://code.claude.com/docs/en/legal-and-compliance.md",
+                slug="legal-and-compliance",
+            ),
+            watch_runner.SnapshotSpec(
+                url="https://evil.example/docs/en/legal-and-compliance.md",
+                final_url="https://evil.example/docs/en/legal-and-compliance.md",
+                slug="legal-and-compliance",
+            ),
+            watch_runner.SnapshotSpec(
+                url="https://code.claude.com/docs/en/legal-and-compliance.md?x=1",
+                final_url="https://code.claude.com/docs/en/legal-and-compliance.md?x=1",
+                slug="legal-and-compliance",
+            ),
+            watch_runner.SnapshotSpec(
+                url="https://code.claude.com/docs/en/legal-and-compliance.md",
+                final_url="https://code.claude.com/docs/en/legal-and-compliance.md",
+                slug="../escape",
+            ),
+        ]
+        for spec in bad_specs:
+            with self.subTest(spec=spec), self.assertRaises(watch_runner.SnapshotCaptureError):
+                watch_runner._validate_snapshot_spec(spec)
+        spec = watch_runner.TOPIC_SNAPSHOTS["anthropic-policy-and-billing"]
+        for invalid_date in ("2026-1-1", "../2026-11-01", "not-a-date"):
+            with self.subTest(date=invalid_date), self.assertRaises(
+                watch_runner.SnapshotCaptureError
+            ):
+                watch_runner.snapshot_relpath(spec, invalid_date)
+
+
+class TestLegalSnapshotCapture(unittest.TestCase):
+    TOPIC = "anthropic-policy-and-billing"
+    TODAY = date(2026, 11, 1)
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.relpath = Path(
+            "knowledge/watch/snapshots/legal-and-compliance/2026-11-01.md"
+        )
+        self.log_patch = patch.object(watch_runner, "_append_runner_log")
+        self.log_patch.start()
+
+    def tearDown(self) -> None:
+        self.log_patch.stop()
+        self._tmp.cleanup()
+
+    def _capture(self, body: bytes, **response_kwargs) -> Path | None:
+        response = _SnapshotResponse(body, **response_kwargs)
+        return watch_runner.capture_topic_snapshot(
+            self.TOPIC,
+            self.TODAY,
+            repo_root=self.root,
+            opener=_snapshot_opener(response),
+        )
+
+    def test_non_utf8_and_newline_body_is_hash_identical(self) -> None:
+        body = b"# raw\r\nline\ninvalid:\xff\x00tail\r"
+        relpath = self._capture(body)
+        self.assertEqual(relpath, self.relpath)
+        landed = (self.root / self.relpath).read_bytes()
+        self.assertEqual(landed, body)
+        self.assertEqual(hashlib.sha256(landed).digest(), hashlib.sha256(body).digest())
+
+    def test_http_status_timeout_redirect_oversize_and_empty_refused(self) -> None:
+        spec = watch_runner.TOPIC_SNAPSHOTS[self.TOPIC]
+        cases = {
+            "status": lambda: watch_runner.fetch_snapshot_bytes(
+                spec, opener=_snapshot_opener(_SnapshotResponse(b"x", status=503))
+            ),
+            "redirect": lambda: watch_runner.fetch_snapshot_bytes(
+                spec,
+                opener=_snapshot_opener(
+                    _SnapshotResponse(b"x", final_url="https://example.com/page.md")
+                ),
+            ),
+            "oversize": lambda: watch_runner.fetch_snapshot_bytes(
+                spec,
+                opener=_snapshot_opener(_SnapshotResponse(b"x" * (spec.max_bytes + 1))),
+            ),
+            "declared-oversize": lambda: watch_runner.fetch_snapshot_bytes(
+                spec,
+                opener=_snapshot_opener(
+                    _SnapshotResponse(b"x", headers={"Content-Length": str(spec.max_bytes + 1)})
+                ),
+            ),
+            "declared-negative": lambda: watch_runner.fetch_snapshot_bytes(
+                spec,
+                opener=_snapshot_opener(
+                    _SnapshotResponse(b"x", headers={"Content-Length": "-1"})
+                ),
+            ),
+            "declared-malformed": lambda: watch_runner.fetch_snapshot_bytes(
+                spec,
+                opener=_snapshot_opener(
+                    _SnapshotResponse(b"x", headers={"Content-Length": "many"})
+                ),
+            ),
+            "empty": lambda: watch_runner.fetch_snapshot_bytes(
+                spec, opener=_snapshot_opener(_SnapshotResponse(b""))
+            ),
+            "timeout": lambda: watch_runner.fetch_snapshot_bytes(
+                spec,
+                opener=lambda _request, timeout: (_ for _ in ()).throw(TimeoutError(timeout)),
+            ),
+        }
+        for name, operation in cases.items():
+            with self.subTest(name=name), self.assertRaises(
+                watch_runner.SnapshotCaptureError
+            ):
+                operation()
+        self.assertFalse((self.root / self.relpath).exists())
+
+    def test_no_content_length_and_chunked_responses_preserve_exact_bytes(self) -> None:
+        spec = watch_runner.TOPIC_SNAPSHOTS[self.TOPIC]
+        body = b"raw\xff\r\nbody\n"
+        for headers in ({}, {"Transfer-Encoding": "chunked"}):
+            with self.subTest(headers=headers):
+                fetched = watch_runner.fetch_snapshot_bytes(
+                    spec,
+                    opener=_snapshot_opener(_SnapshotResponse(body, headers=headers)),
+                )
+                self.assertEqual(fetched, body)
+
+    def test_write_failure_cleans_temp_and_preserves_prior_destination(self) -> None:
+        destination = self.root / self.relpath
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"old-body")
+        with patch("tools.watch_runner.os.replace", side_effect=OSError("disk")), \
+             self.assertRaises(watch_runner.SnapshotCaptureError):
+            self._capture(b"new-body")
+        self.assertEqual(destination.read_bytes(), b"old-body")
+        self.assertEqual(list(destination.parent.glob(".*.tmp")), [])
+
+    def test_fetch_failure_preserves_prior_destination(self) -> None:
+        destination = self.root / self.relpath
+        destination.parent.mkdir(parents=True)
+        destination.write_bytes(b"old-body")
+        with self.assertRaises(watch_runner.SnapshotCaptureError):
+            watch_runner.capture_topic_snapshot(
+                self.TOPIC,
+                self.TODAY,
+                repo_root=self.root,
+                opener=lambda _request, timeout: (_ for _ in ()).throw(
+                    TimeoutError(timeout)
+                ),
+            )
+        self.assertEqual(destination.read_bytes(), b"old-body")
+        self.assertEqual(list(destination.parent.glob(".*.tmp")), [])
+
+    def test_symlink_destination_components_refused(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        snapshot_root = self.root / "knowledge" / "watch" / "snapshots"
+        snapshot_root.parent.mkdir(parents=True)
+        snapshot_root.symlink_to(outside, target_is_directory=True)
+        with self.assertRaises(watch_runner.SnapshotCaptureError):
+            self._capture(b"body")
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_same_bytes_idempotent_without_mtime_change(self) -> None:
+        self._capture(b"same")
+        destination = self.root / self.relpath
+        os.utime(destination, ns=(1_000_000_000, 1_000_000_000))
+        before = destination.stat().st_mtime_ns
+        self._capture(b"same")
+        self.assertEqual(destination.stat().st_mtime_ns, before)
+        self.assertEqual(destination.read_bytes(), b"same")
+
+    def test_changed_same_day_atomically_replaces_one_file(self) -> None:
+        self._capture(b"first")
+        self._capture(b"second")
+        destination = self.root / self.relpath
+        self.assertEqual(destination.read_bytes(), b"second")
+        self.assertEqual(list(destination.parent.glob("2026-11-01.md")), [destination])
+        self.assertEqual(list(destination.parent.glob(".*.tmp")), [])
+
+
+class TestNoRedirectHTTPIntegration(unittest.TestCase):
+    def test_redirect_is_refused_before_target_request(self) -> None:
+        import http.server
+        import threading
+        import urllib.error
+        import urllib.request
+
+        counts = {"source": 0, "target": 0}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self) -> None:
+                if self.path == "/source":
+                    counts["source"] += 1
+                    self.send_response(302)
+                    self.send_header("Location", "/target")
+                    self.end_headers()
+                    return
+                if self.path == "/target":
+                    counts["target"] += 1
+                    self.send_response(200)
+                    self.end_headers()
+                    self.wfile.write(b"must-not-be-fetched")
+                    return
+                self.send_response(404)
+                self.end_headers()
+
+            def log_message(self, _format, *_args) -> None:
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            host, port = server.server_address
+            request = urllib.request.Request(f"http://{host}:{port}/source")
+            error_code = None
+            try:
+                watch_runner._open_snapshot_request(request, timeout=2)
+            except urllib.error.HTTPError as exc:
+                error_code = exc.code
+            self.assertEqual(counts, {"source": 1, "target": 0})
+            self.assertEqual(error_code, 302)
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join(timeout=2)
+
+
+class TestLegalSnapshotBaseline(unittest.TestCase):
+    def test_baseline_size_and_hash_unchanged(self) -> None:
+        baseline = (
+            Path(__file__).resolve().parent.parent
+            / "knowledge/watch/snapshots/legal-and-compliance/2026-09-30.md"
+        )
+        body = baseline.read_bytes()
+        self.assertEqual(len(body), 6149)
+        self.assertEqual(
+            hashlib.sha256(body).hexdigest(),
+            "4a4cc1762fb1d992a66347dcf94c60a27d328391d8074c13e8ae9d5c4182413b",
+        )
 
 
 class TestHermesGuardScan(unittest.TestCase):
@@ -390,6 +694,93 @@ class TestCommitAndPushScopeFilter(unittest.TestCase):
         self.assertFalse(any(a[:2] == ["git", "push"] for a in argvs))
 
 
+class TestSnapshotCommitScope(unittest.TestCase):
+    DATE = "2026-11-01"
+    TOPIC = _topic("anthropic-policy-and-billing")
+    SNAPSHOT_REL = "knowledge/watch/snapshots/legal-and-compliance/2026-11-01.md"
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.report_dir = self.root / "knowledge" / "watch" / "reports" / self.DATE
+        self.report_dir.mkdir(parents=True)
+        _write_landed_report(self.report_dir / f"{self.TOPIC.slug}.md")
+        self.snapshot = self.root / self.SNAPSHOT_REL
+        self.snapshot.parent.mkdir(parents=True)
+        self.snapshot.write_bytes(b"snapshot-body")
+        os.environ[_GIT_MUTATION_LOCK_ENV] = str(self.root / "lock" / "ops.lock")
+        self.git_patch = patch("tools._git_utils.subprocess.run")
+        self.git_run = self.git_patch.start()
+        self.scan_patch = patch(
+            "tools.watch_runner._hermes_scan_dir", return_value=(True, None)
+        )
+        self.scan_patch.start()
+
+    def tearDown(self) -> None:
+        self.scan_patch.stop()
+        self.git_patch.stop()
+        os.environ.pop(_GIT_MUTATION_LOCK_ENV, None)
+        self._tmp.cleanup()
+
+    def _calls(self) -> list[list[str]]:
+        return [call.args[0] for call in self.git_run.call_args_list]
+
+    def _run_with_staged(self, paths: list[str]) -> tuple[bool, str]:
+        def fake_run(argv, **_kwargs):
+            if argv[:3] == ["git", "diff", "--cached"]:
+                return MagicMock(returncode=0, stdout="\n".join(paths) + "\n", stderr="")
+            return MagicMock(returncode=0, stdout="", stderr="")
+        self.git_run.side_effect = fake_run
+        return watch_runner.git_commit_and_push(
+            self.DATE, [self.TOPIC], {self.TOPIC.slug: "ok"}, cwd=self.root
+        )
+
+    def test_exact_report_and_snapshot_paths_accepted(self) -> None:
+        report_rel = f"knowledge/watch/reports/{self.DATE}/{self.TOPIC.slug}.md"
+        ok, msg = self._run_with_staged([report_rel, self.SNAPSHOT_REL])
+        self.assertTrue(ok, msg)
+        add_call = next(args for args in self._calls() if args[:2] == ["git", "add"])
+        self.assertIn(f"knowledge/watch/reports/{self.DATE}/", add_call)
+        self.assertIn(self.SNAPSHOT_REL, add_call)
+        self.assertNotIn("knowledge/watch/snapshots/", add_call)
+
+    def test_missing_expected_snapshot_refuses_and_resets(self) -> None:
+        self.snapshot.unlink()
+        report_rel = f"knowledge/watch/reports/{self.DATE}/{self.TOPIC.slug}.md"
+        ok, msg = self._run_with_staged([report_rel])
+        self.assertFalse(ok)
+        self.assertIn("snapshot guard refused", msg)
+        self.assertTrue(any(args[:3] == ["git", "reset", "HEAD"] for args in self._calls()))
+        self.assertFalse(any(args[:2] == ["git", "commit"] for args in self._calls()))
+
+    def test_sibling_date_slug_traversal_other_topic_and_prestaged_refuse(self) -> None:
+        refused_paths = [
+            "knowledge/watch/snapshots/legal-and-compliance/2026-10-31.md",
+            "knowledge/watch/snapshots/other-slug/2026-11-01.md",
+            "knowledge/watch/snapshots/legal-and-compliance/../escape.md",
+            "knowledge/watch/snapshots/other-topic/2026-11-01.md",
+        ]
+        report_rel = f"knowledge/watch/reports/{self.DATE}/{self.TOPIC.slug}.md"
+        for leaked in refused_paths:
+            with self.subTest(leaked=leaked):
+                self.git_run.reset_mock()
+                ok, msg = self._run_with_staged([report_rel, self.SNAPSHOT_REL, leaked])
+                self.assertFalse(ok)
+                self.assertIn("scope guard refused", msg)
+                self.assertTrue(
+                    any(args[:3] == ["git", "reset", "HEAD"] for args in self._calls())
+                )
+                self.assertFalse(any(args[:2] == ["git", "commit"] for args in self._calls()))
+
+    def test_snapshot_byte_guard_refuses_and_resets(self) -> None:
+        self.snapshot.write_text("bad " + "HERME" + "S.md bytes\n", encoding="utf-8")
+        report_rel = f"knowledge/watch/reports/{self.DATE}/{self.TOPIC.slug}.md"
+        ok, msg = self._run_with_staged([report_rel, self.SNAPSHOT_REL])
+        self.assertFalse(ok)
+        self.assertIn("guard refused", msg)
+        self.assertTrue(any(args[:3] == ["git", "reset", "HEAD"] for args in self._calls()))
+
+
 class TestCommitMessageConstruction(unittest.TestCase):
     """The commit message template renders deterministically from inputs."""
 
@@ -416,6 +807,24 @@ class TestCommitMessageConstruction(unittest.TestCase):
         )
         self.assertIn("1 topic(s): solo", msg)
         self.assertIn("Statuses: solo=ok", msg)
+
+    def test_configured_ok_topic_names_only_exact_snapshot_scope(self) -> None:
+        topic = _topic("anthropic-policy-and-billing")
+        msg = watch_runner._build_commit_message(
+            "2026-11-01", [topic], {topic.slug: "ok"}
+        )
+        self.assertIn(
+            "exact snapshot(s): knowledge/watch/snapshots/legal-and-compliance/2026-11-01.md",
+            msg,
+        )
+        self.assertNotIn("knowledge/watch/snapshots/ only", msg)
+
+    def test_configured_failed_topic_has_no_snapshot_scope(self) -> None:
+        topic = _topic("anthropic-policy-and-billing")
+        msg = watch_runner._build_commit_message(
+            "2026-11-01", [topic], {topic.slug: "fail"}
+        )
+        self.assertIn("Scope: knowledge/watch/reports/2026-11-01/ only.", msg)
 
 
 class TestEmptyFireShortCircuit(unittest.TestCase):
@@ -1775,6 +2184,129 @@ class TestLandReports(unittest.TestCase):
         self.assertEqual(self._saved_state["topics"]["alpha"]["last_outcome"], "fail")
 
 
+class TestLandReportsSnapshotGate(unittest.TestCase):
+    TODAY = date(2026, 11, 1)
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.reports_root = self.root / "knowledge" / "watch" / "reports"
+        self.date_dir = self.reports_root / self.TODAY.isoformat()
+        self.date_dir.mkdir(parents=True)
+        self.state = {"schema_version": 1, "topics": {}}
+        self.policy = Topic(
+            slug="anthropic-policy-and-billing",
+            cadence="weekly",
+            budget=300,
+            scope="s",
+            seed_sources=[],
+            notes="",
+        )
+        self.alpha = _topic("alpha")
+        self.patches = [
+            patch.object(watch_runner, "REPORTS_ROOT", self.reports_root),
+            patch.object(watch_runner, "load_state", return_value=self.state),
+            patch.object(watch_runner, "_append_runner_log"),
+        ]
+        for item in self.patches:
+            item.start()
+
+    def tearDown(self) -> None:
+        for item in self.patches:
+            item.stop()
+        self._tmp.cleanup()
+
+    def test_configured_capture_precedes_ok_state_index_commit_and_actuation(self) -> None:
+        _write_landed_report(self.date_dir / f"{self.policy.slug}.md")
+        events: list[str] = []
+        real_append = watch_runner.append_day_index_entry
+        real_update = watch_runner.update_state
+        with patch.object(watch_runner, "parse_topics", return_value=[self.policy]), \
+             patch.object(
+                 watch_runner,
+                 "capture_topic_snapshot",
+                 side_effect=lambda *_args, **_kwargs: events.append("snapshot"),
+             ) as capture, \
+             patch.object(
+                 watch_runner,
+                 "append_day_index_entry",
+                 side_effect=lambda *args: (events.append("index"), real_append(*args))[1],
+             ), \
+             patch.object(
+                 watch_runner,
+                 "update_state",
+                 side_effect=lambda *args: (events.append("state"), real_update(*args))[1],
+             ), \
+             patch.object(
+                 watch_runner,
+                 "save_state",
+                 side_effect=lambda *_args: events.append("save"),
+             ), \
+             patch.object(
+                 watch_runner,
+                 "git_commit_and_push",
+                 side_effect=lambda *_args, **_kwargs: (events.append("commit") or True, "ok"),
+             ), \
+             patch.object(
+                 watch_runner,
+                 "actuate_phase",
+                 side_effect=lambda *_args, **_kwargs: events.append("actuate"),
+             ):
+            rc = watch_runner.land_reports(self.TODAY, force=True)
+        self.assertEqual(rc, 0)
+        capture.assert_called_once_with(self.policy.slug, self.TODAY)
+        self.assertEqual(events, ["snapshot", "index", "state", "save", "commit", "actuate"])
+
+    def test_capture_failure_leaves_batch_without_bookkeeping_commit_or_actuation(self) -> None:
+        _write_landed_report(self.date_dir / "alpha.md")
+        _write_landed_report(self.date_dir / f"{self.policy.slug}.md")
+        with patch.object(watch_runner, "parse_topics", return_value=[self.alpha, self.policy]), \
+             patch.object(
+                 watch_runner,
+                 "capture_topic_snapshot",
+                 side_effect=watch_runner.SnapshotCaptureError("network down"),
+             ), \
+             patch.object(watch_runner, "save_state") as save, \
+             patch.object(watch_runner, "git_commit_and_push") as commit, \
+             patch.object(watch_runner, "actuate_phase") as actuate, \
+             patch("sys.stderr", new_callable=io.StringIO):
+            rc = watch_runner.land_reports(self.TODAY, force=True)
+        self.assertEqual(rc, 1)
+        self.assertFalse((self.date_dir / "README.md").exists())
+        self.assertEqual(self.state, {"schema_version": 1, "topics": {}})
+        save.assert_not_called()
+        commit.assert_not_called()
+        actuate.assert_not_called()
+
+    def test_failed_configured_report_does_not_capture_or_require_snapshot(self) -> None:
+        with patch.object(watch_runner, "parse_topics", return_value=[self.policy]), \
+             patch.object(watch_runner, "capture_topic_snapshot") as capture, \
+             patch.object(watch_runner, "save_state"), \
+             patch.object(
+                 watch_runner, "git_commit_and_push", return_value=(True, "ok")
+             ) as commit, \
+             patch.object(watch_runner, "actuate_phase"):
+            rc = watch_runner.land_reports(self.TODAY, force=True)
+        self.assertEqual(rc, 1)
+        capture.assert_not_called()
+        self.assertEqual(commit.call_args.args[2], {self.policy.slug: "fail"})
+        index = (self.date_dir / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"[{self.policy.slug}]({self.policy.slug}.md) | fail", index)
+
+    def test_unrelated_topic_never_fetches_or_requires_snapshot(self) -> None:
+        _write_landed_report(self.date_dir / "alpha.md")
+        with patch.object(watch_runner, "parse_topics", return_value=[self.alpha]), \
+             patch.object(watch_runner, "capture_topic_snapshot") as capture, \
+             patch.object(watch_runner, "save_state"), \
+             patch.object(
+                 watch_runner, "git_commit_and_push", return_value=(True, "ok")
+             ), \
+             patch.object(watch_runner, "actuate_phase"):
+            rc = watch_runner.land_reports(self.TODAY, force=True)
+        self.assertEqual(rc, 0)
+        capture.assert_not_called()
+
+
 class TestFileWatchTicket(unittest.TestCase):
     """ORG-025/T-0855 migrated timer entrypoint: file a target=specialist watch
     dispatch ticket when topics are due; no claude -p / no researcher.
@@ -2176,6 +2708,101 @@ class TestT0261Layer3Integration(unittest.TestCase):
         )
         self.assertEqual(rc, 64)
         self.assertIn("refusing to run without explicit mode", stderr)
+
+
+class TestSnapshotLayer3Integration(unittest.TestCase):
+    DATE = "2026-11-01"
+    TOPIC = _topic("anthropic-policy-and-billing")
+    SNAPSHOT_REL = "knowledge/watch/snapshots/legal-and-compliance/2026-11-01.md"
+    REPORT_REL = "knowledge/watch/reports/2026-11-01/anthropic-policy-and-billing.md"
+
+    def setUp(self) -> None:
+        from tools._test_fixtures import setup_integration_env, snapshot_real_repo
+        self.real_snapshot = snapshot_real_repo()
+        self.env = setup_integration_env()
+        os.environ[_GIT_MUTATION_LOCK_ENV] = str(self.env.base_dir / "watch.lock")
+
+    def tearDown(self) -> None:
+        from tools._test_fixtures import teardown_integration_env, assert_real_repo_untouched
+        os.environ.pop(_GIT_MUTATION_LOCK_ENV, None)
+        teardown_integration_env(self.env)
+        assert_real_repo_untouched(self.real_snapshot)
+
+    def _run_git(self, *args: str, cwd: Path | None = None) -> str:
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd or self.env.repo_path,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return result.stdout
+
+    def _write_report(self, headline: str) -> None:
+        path = self.env.repo_path / self.REPORT_REL
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _write_landed_report(path, headline=headline)
+
+    def _capture(self, body: bytes) -> None:
+        with patch.object(watch_runner, "_append_runner_log"):
+            watch_runner.capture_topic_snapshot(
+                self.TOPIC.slug,
+                date.fromisoformat(self.DATE),
+                repo_root=self.env.repo_path,
+                opener=_snapshot_opener(_SnapshotResponse(body)),
+            )
+
+    def _land(self) -> tuple[bool, str]:
+        return watch_runner.git_commit_and_push(
+            self.DATE,
+            [self.TOPIC],
+            {self.TOPIC.slug: "ok"},
+            cwd=self.env.repo_path,
+        )
+
+    def test_exact_paths_commit_to_tmp_origin_and_same_day_history_is_recoverable(self) -> None:
+        self._write_report("first")
+        self._capture(b"first-body")
+        ok, msg = self._land()
+        self.assertTrue(ok, msg)
+
+        self._write_report("second")
+        self._capture(b"second-body")
+        ok, msg = self._land()
+        self.assertTrue(ok, msg)
+
+        current = self._run_git(
+            f"--git-dir={self.env.bare_origin}", "show", f"main:{self.SNAPSHOT_REL}"
+        ).encode()
+        previous = self._run_git(
+            f"--git-dir={self.env.bare_origin}", "show", f"main^:{self.SNAPSHOT_REL}"
+        ).encode()
+        self.assertEqual(current, b"second-body")
+        self.assertEqual(previous, b"first-body")
+        paths = self._run_git(
+            f"--git-dir={self.env.bare_origin}",
+            "ls-tree", "-r", "--name-only", "main", "knowledge/watch/snapshots",
+        ).splitlines()
+        self.assertEqual(paths, [self.SNAPSHOT_REL])
+
+    def test_unexpected_prestaged_snapshot_refuses_with_clean_index_and_remote(self) -> None:
+        self._write_report("first")
+        self._capture(b"body")
+        rogue_rel = "knowledge/watch/snapshots/other/2026-11-01.md"
+        rogue = self.env.repo_path / rogue_rel
+        rogue.parent.mkdir(parents=True)
+        rogue.write_bytes(b"rogue")
+        self._run_git("add", "--", rogue_rel)
+
+        ok, msg = self._land()
+        self.assertFalse(ok)
+        self.assertIn("scope guard refused", msg)
+        self.assertEqual(self._run_git("diff", "--cached", "--name-only"), "")
+        remote_head = self._run_git(
+            f"--git-dir={self.env.bare_origin}", "rev-parse", "main"
+        ).strip()
+        self.assertEqual(remote_head, self.env.baseline_head)
 
 
 # ---------------------------------------------------------------------------
@@ -3258,6 +3885,31 @@ class TestIndexUnindexedReports(unittest.TestCase):
         added = wr.index_unindexed_reports(self.d)
         self.assertEqual(added, ["semantic-search-graph-db-stack"])
         self.assertTrue(wr.day_index_has_row(self.d, "semantic-search-graph-db-stack"))
+
+    def test_skips_underscore_runner_artifacts(self):
+        """_topic-warnings.md is written with deliberately no README row
+        (write_topic_warnings docstring); the sweep must not index it."""
+        self._report("_topic-warnings")
+        self._report("topic-a")
+        self.assertEqual(wr.index_unindexed_reports(self.d), ["topic-a"])
+        self.assertFalse(wr.day_index_has_row(self.d, "_topic-warnings"))
+
+    def test_indexes_adhoc_report_without_frontmatter_by_title(self):
+        """Hand-delivered one-off reports (e.g. 2026-10-12's ad-hoc evals) carry a
+        `# ` title and `## ` sections but no watch-template frontmatter; they are
+        real reports, so the sweep indexes them by title instead of leaving them
+        unindexed forever."""
+        (self.d / "adhoc-eval.md").write_text(
+            "# Hook Fail-Closed Mode Evaluation\n\n## Findings\n\n" + ("body. " * 200),
+            encoding="utf-8")
+        self.assertEqual(wr.index_unindexed_reports(self.d), ["adhoc-eval"])
+        row = [l for l in (self.d / "README.md").read_text().splitlines() if "[adhoc-eval]" in l][0]
+        self.assertIn("Hook Fail-Closed Mode Evaluation", row)
+
+    def test_still_skips_small_or_unsectioned_adhoc_files(self):
+        (self.d / "stub.md").write_text("# Title only\n", encoding="utf-8")
+        (self.d / "nosections.md").write_text("# Title\n\n" + ("text " * 300), encoding="utf-8")
+        self.assertEqual(wr.index_unindexed_reports(self.d), [])
 
     def test_is_idempotent(self):
         self._report("topic-a")

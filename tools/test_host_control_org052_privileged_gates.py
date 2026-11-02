@@ -37,6 +37,7 @@ from tools.host_control.self_amendment import (
     refuse_self_amendment,
 )
 from tools.host_mcp_adapter import contract as adapter
+from tools._host_control_plan_fixtures import registered_plan_transform
 from tools.test_host_control_core import HostControlCase, _plan_replace
 
 REPO = Path(__file__).resolve().parent.parent
@@ -61,22 +62,20 @@ CLOSED_HANDLE_PARAMS = frozenset(
 )
 
 
-class _InjectingInstaller:
-    """Wraps the REAL persona installer and appends crafted operations, so the
-    plan composer sees what a hostile or buggy installer revision would emit."""
+def _injecting(extra):
+    """Appends crafted operations to the REAL registered plan, so the plan
+    composer sees what a hostile or buggy installer revision would emit (T-5533:
+    the broker reads the root-registered plan; was a wrapped installer)."""
 
-    def __init__(self, real, extra):
-        self._real = real
-        self._extra = extra
-
-    def plan(self, *args, **kwargs):
-        plan = self._real.plan(*args, **kwargs)
+    def inject(plan):
         template = next(op for op in plan.operations if op.kind == "atomic-write")
         added = tuple(
             dataclasses.replace(template, operation_id=f"t2918-{index}", kind=kind, target=target)
-            for index, (kind, target) in enumerate(self._extra)
+            for index, (kind, target) in enumerate(extra)
         )
         return _plan_replace(plan, operations=plan.operations + added)
+
+    return inject
 
 
 class PlanComposerGateTests(HostControlCase):
@@ -89,7 +88,7 @@ class PlanComposerGateTests(HostControlCase):
         if not protected_roots:
             return super().build_service(**kwargs)
         return HostPlanService(
-            registry=self.registry, policy=self.policy, journal=self.journal, installer=self.installer,
+            registry=self.registry, policy=self.policy, journal=self.journal,
             clock=lambda: FIXED_NOW, handle_factory=lambda: next(self.handles), plan_ttl=timedelta(hours=1),
             contract_version="org.pantheon.HostBroker1/v1", broker_revision="unit-test",
             host_operation_families=frozenset(("persona.install", "persona.verify")),
@@ -97,9 +96,9 @@ class PlanComposerGateTests(HostControlCase):
         )
 
     def plan_with(self, extra, **service_kwargs):
-        self.installer = _InjectingInstaller(self.installer, extra)
         service = self.build_service(**service_kwargs)
-        return service.plan(1003, "recovery", "manifest-r1", "t2918-request")
+        with registered_plan_transform(_injecting(extra)):
+            return service.plan(1003, "recovery", "manifest-r1", "t2918-request")
 
     def test_baseline_plan_still_composes(self) -> None:
         self.assertTrue(self.plan().plan_handle)
@@ -115,7 +114,6 @@ class PlanComposerGateTests(HostControlCase):
                 self.assertEqual(wire.error_name_for(info.exception), wire.SUBSTRATE_FAMILY_NOT_EXPOSED_ERROR)
                 wire.validate_org082_error(wire.SUBSTRATE_FAMILY_NOT_EXPOSED_ERROR, wire.error_body_for(info.exception))
                 self.assertEqual(self.row_count(), before)  # nothing journaled
-                self.installer = self.installer._real
 
     def test_a_non_substrate_out_of_envelope_kind_is_still_seat_local_residue(self) -> None:
         result = self.plan_with([("seat-periodic-unit-install", "/projection/home/claude-fallback/.config/x")])
@@ -137,6 +135,13 @@ class PlanComposerGateTests(HostControlCase):
             "approval journal": "/var/lib/pantheon-host-approval/approval.sqlite3",
             "op enum (envelope)": str(REPO / "tools/host_control/envelope.py"),
             "op enum (registry)": str(REPO / "tools/germinate/op_registry.py"),
+            # T-2920 U2 (E36): the ingress state, the framework install prefix
+            # and the installer operation-enum files
+            "ingress state": "/var/lib/pantheon-host-approval-telegram/offset.json",
+            "framework copy": "/usr/local/lib/pantheon/framework/r1/tools/persona_installer.py",
+            "framework active link": "/usr/local/lib/pantheon/framework/active",
+            "op enum (installer contracts)": str(REPO / "tools/persona_installer_contracts.py"),
+            "op enum (installer)": str(REPO / "tools/persona_installer.py"),
             "dot-dot escape": "/projection/home/claude-fallback/../../../etc/pantheon/x",
             "double-slash spelling": "//etc/pantheon/x",
             # review N4: non-normalized spellings must normalize INTO the protected root
@@ -154,7 +159,6 @@ class PlanComposerGateTests(HostControlCase):
                         self.plan_with([(kind, target)])
                     self.assertEqual(wire.error_body_for(info.exception), "family_denied")  # no path leak
                     self.assertEqual(self.row_count(), before)
-                    self.installer = self.installer._real
 
     def test_configured_trusted_roots_are_protected_too(self) -> None:
         """The registry/policy this broker loaded live under its trusted root."""
@@ -181,7 +185,12 @@ def test_static_roots_cover_every_dist_unit_execstart_and_state_directory():
         if execstart:
             assert any(execstart == r or execstart.startswith(r + "/") for r in roots), (unit.name, execstart)
         state = service.get("StateDirectory")
-        if state and unit.name in ("pantheon-host-broker.service", "pantheon-host-approval.service"):
+        if state and unit.name in (
+            "pantheon-host-broker.service",
+            "pantheon-host-approval.service",
+            # T-2920 U2 (E36): the Telegram ingress state too
+            "pantheon-host-approval-telegram-ingress.service",
+        ):
             assert f"/var/lib/{state}" in STATIC_PROTECTED_ROOTS, (unit.name, state)
 
 

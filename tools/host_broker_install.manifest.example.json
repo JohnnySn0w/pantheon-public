@@ -1,0 +1,60 @@
+{
+  "schema": "pantheon-host-broker-install/v1",
+  "revision": "provisional-2026-10-27",
+  "status": "provisional-pending-ratification",
+  "accounts": {
+    "broker": {"name": "pantheon-hostbroker", "uid": 1901},
+    "approval": {"name": "pantheon-hostapproval", "uid": 1902},
+    "ingress": {"name": "pantheon-hostapproval-ingress", "uid": 1903},
+    "monitor": {"name": "pantheon-hostmonitor", "uid": 1904}
+  },
+  "account_defaults": {"shell": "/usr/sbin/nologin", "locked": true},
+  "groups": {
+    "entries": [],
+    "none_reason": "only user-private groups (gid == uid, families account.ensure); no service joins pantheon-mailbox or any shared group"
+  },
+  "paths": {
+    "etc_root": {"path": "/etc/pantheon", "owner": "root", "group": "root", "mode": "0755"},
+    "broker_etc": {"path": "/etc/pantheon/host-broker", "owner": "root", "group": "root", "mode": "0755"},
+    "broker_plans": {"path": "/etc/pantheon/host-broker/plans", "owner": "root", "group": "root", "mode": "0755"},
+    "broker_manifests": {"path": "/etc/pantheon/host-broker/manifests", "owner": "root", "group": "root", "mode": "0755"},
+    "approval_etc": {"path": "/etc/pantheon/host-approval", "owner": "root", "group": "root", "mode": "0755"},
+    "executor_etc": {"path": "/etc/pantheon/host-executor", "owner": "root", "group": "root", "mode": "0755"},
+    "ingress_etc": {"path": "/etc/pantheon/host-approval-telegram", "owner": "root", "group": "ingress", "mode": "0750"},
+    "ingress_credentials": {"path": "/etc/pantheon/host-approval-telegram/credentials", "owner": "ingress", "group": "ingress", "mode": "0700"},
+    "lib_root": {"path": "/usr/local/lib/pantheon", "owner": "root", "group": "root", "mode": "0755"},
+    "framework_base": {"path": "/usr/local/lib/pantheon/framework", "owner": "root", "group": "root", "mode": "0755"},
+    "var_lib_root": {"path": "/var/lib/pantheon", "owner": "root", "group": "root", "mode": "0755"},
+    "home_parent": {"path": "/var/lib/pantheon/home", "owner": "root", "group": "root", "mode": "0755"},
+    "producer_run_root": {"path": "/run/pantheon-host-install", "owner": "root", "group": "root", "mode": "0755"},
+    "producer_staging": {"path": "/run/pantheon-host-install/staging", "owner": "producer", "group": "producer", "mode": "0700"}
+  },
+  "files": {
+    "seat_registry": {"path": "/etc/pantheon/host-broker/seat-registry.json"},
+    "approver_policy": {"path": "/etc/pantheon/host-approval/approver-policy.json", "ref": "operator-batch:3"},
+    "broker_policy": {"path": "/etc/pantheon/host-broker/host-policy.json", "ref": "operator-batch:3"},
+    "executor_config": {"path": "/etc/pantheon/host-executor/config.json"},
+    "broker_config": {"path": "/etc/pantheon/host-broker/config.json", "placeholder": "U2 config schema"},
+    "approval_config": {"path": "/etc/pantheon/host-approval/config.json", "placeholder": "U2 config schema"},
+    "ingress_config": {"path": "/etc/pantheon/host-approval-telegram/ingress.json"}
+  },
+  "executables": {
+    "broker": "/usr/local/libexec/pantheon-host-broker",
+    "approval": "/usr/local/libexec/pantheon-host-approval",
+    "ingress": "/usr/local/libexec/pantheon-host-approval-telegram-ingress",
+    "executor": "/usr/local/libexec/pantheon-host-executor"
+  },
+  "framework": {"base_key": "framework_base", "active_link": "active", "keep_previous": 1},
+  "mailbox_hub": "/home/post-office/mailbox",
+  "approvers": {"seat_ids": [], "policy_ref": "operator-batch:3"},
+  "refs": {
+    "telegram_bot_token": {"credential_id": "telegram-approval-bot", "source_ref": "operator-batch:1"},
+    "telegram_human": {"source_ref": "operator-batch:2"}
+  },
+  "packages_verify": ["python3", "python3-dbus", "python3-gi", "python3-yaml"],
+  "runtimes": {
+    "host": {"prefix": "/usr/local/lib/pantheon/host-mcp-adapter", "launcher": "/usr/local/libexec/pantheon-host-mcp-adapter"},
+    "approval": {"prefix": "/usr/local/lib/pantheon/approval-mcp-adapter", "launcher": "/usr/local/libexec/pantheon-approval-mcp-adapter"}
+  },
+  "producer": {"user": "nobody", "group": "nogroup", "via": "setpriv"}
+}

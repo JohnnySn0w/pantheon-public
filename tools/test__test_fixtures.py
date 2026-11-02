@@ -207,14 +207,57 @@ class TestSnapshotAndAssert(unittest.TestCase):
         snap = snapshot_real_repo(repo_path=repo)
         # Simulate a script erroneously committing to the "real" repo.
         _commit(repo, "bad.txt", "erroneous commit")
-        # Guard must fire.
+        # Guard must fire (T-5817: after a short settle window it never leaves).
         with self.assertRaises(AssertionError) as ctx:
-            assert_real_repo_untouched(snap)
+            assert_real_repo_untouched(snap, settle_s=0.2)
         self.assertIn("new local-only commits", str(ctx.exception).lower())
         # T-4108: the message names the leaked commit's subject and paths, so a
         # leak caught by the wrong test under xdist still points at its source.
         self.assertIn("erroneous commit", str(ctx.exception))
         self.assertIn("bad.txt", str(ctx.exception))
+
+    # --- T-5817: a concurrent actor's commit, pushed moments later -----------
+
+    def test_concurrent_actor_commit_pushed_within_settle_passes(self) -> None:
+        """Repro of orchestrator's 2026-11-01 soak failure: the live seat's own ticket.py
+        committed to REPO_ROOT during the test and pushed it moments later. The
+        guard re-reads and sees it reach origin/*, so it is not a leak."""
+        import threading
+        repo = _init_repo(self._base)
+        _commit(repo, "a.txt", "init")
+        _push(repo)
+        snap = snapshot_real_repo(repo_path=repo)
+        _commit(repo, "tickets.txt", "tickets: clear stale auto_delivered (another actor)")
+        pusher = threading.Timer(0.5, _push, args=(repo,))
+        pusher.start()
+        self.addCleanup(pusher.join)
+        assert_real_repo_untouched(snap, settle_s=60)  # must not raise
+
+    def test_leaked_commit_still_fails_after_settle(self) -> None:
+        """A test's leaked commit is never pushed: the guard waits out the settle
+        window and then fails, naming it."""
+        import time
+        repo = _init_repo(self._base)
+        _commit(repo, "a.txt", "init")
+        _push(repo)
+        snap = snapshot_real_repo(repo_path=repo)
+        _commit(repo, "bad.txt", "erroneous commit")
+        start = time.monotonic()
+        with self.assertRaises(AssertionError) as ctx:
+            assert_real_repo_untouched(snap, settle_s=1.0)
+        self.assertGreaterEqual(time.monotonic() - start, 0.9)
+        self.assertIn("bad.txt", str(ctx.exception))
+
+    def test_clean_teardown_never_waits(self) -> None:
+        """No new local-only SHA: no settle wait, even with a long window."""
+        import time
+        repo = _init_repo(self._base)
+        _commit(repo, "a.txt", "init")
+        _push(repo)
+        snap = snapshot_real_repo(repo_path=repo)
+        start = time.monotonic()
+        assert_real_repo_untouched(snap, settle_s=600)
+        self.assertLess(time.monotonic() - start, 30)
 
     # --- T-4108: an unknown snapshot must not become an empty baseline -------
 

@@ -1,0 +1,132 @@
+{
+  "_doc": "T-5689 item 3: single-line BLOCK_SCALAR_FIELDS values rendered by the new writer (text), with what origin/main's readers parse from those bytes. Captured once from origin/main 5f373536677d; the test does not import old code.",
+  "main_sha": "5f373536677d8c6afd8aeb90387b481f17e88872",
+  "cases": [
+    {
+      "value": "a subagent steered by injected content runs sudo, reads a token file",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: a subagent steered by injected content runs sudo, reads a token file\n---\n\n# fixture\n",
+      "main_parse_front_matter": "a subagent steered by injected content runs sudo, reads a token file",
+      "main_ticket_purpose": "a subagent steered by injected content runs sudo, reads a token file"
+    },
+    {
+      "value": "has: colon-space inside",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: has: colon-space inside\n---\n\n# fixture\n",
+      "main_parse_front_matter": "has: colon-space inside",
+      "main_ticket_purpose": "has: colon-space inside"
+    },
+    {
+      "value": "ends with colon:",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: ends with colon:\n---\n\n# fixture\n",
+      "main_parse_front_matter": "ends with colon:",
+      "main_ticket_purpose": "ends with colon:"
+    },
+    {
+      "value": "has # a hash",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: has # a hash\n---\n\n# fixture\n",
+      "main_parse_front_matter": "has # a hash",
+      "main_ticket_purpose": "has # a hash"
+    },
+    {
+      "value": "a, b, c",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: a, b, c\n---\n\n# fixture\n",
+      "main_parse_front_matter": "a, b, c",
+      "main_ticket_purpose": "a, b, c"
+    },
+    {
+      "value": "'single quoted'",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: 'single quoted'\n---\n\n# fixture\n",
+      "main_parse_front_matter": "'single quoted'",
+      "main_ticket_purpose": "'single quoted'"
+    },
+    {
+      "value": "\"double quoted\"",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: \"double quoted\"\n---\n\n# fixture\n",
+      "main_parse_front_matter": "\"double quoted\"",
+      "main_ticket_purpose": "\"double quoted\""
+    },
+    {
+      "value": "*star first",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: *star first\n---\n\n# fixture\n",
+      "main_parse_front_matter": "*star first",
+      "main_ticket_purpose": "*star first"
+    },
+    {
+      "value": "&amp first",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: &amp first\n---\n\n# fixture\n",
+      "main_parse_front_matter": "&amp first",
+      "main_ticket_purpose": "&amp first"
+    },
+    {
+      "value": "!bang first",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: !bang first\n---\n\n# fixture\n",
+      "main_parse_front_matter": "!bang first",
+      "main_ticket_purpose": "!bang first"
+    },
+    {
+      "value": "{brace first}",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: {brace first}\n---\n\n# fixture\n",
+      "main_parse_front_matter": "{brace first}",
+      "main_ticket_purpose": "{brace first}"
+    },
+    {
+      "value": "- dash first",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: - dash first\n---\n\n# fixture\n",
+      "main_parse_front_matter": "- dash first",
+      "main_ticket_purpose": "- dash first"
+    },
+    {
+      "value": "? question first",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: ? question first\n---\n\n# fixture\n",
+      "main_parse_front_matter": "? question first",
+      "main_ticket_purpose": "? question first"
+    },
+    {
+      "value": "% percent first",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: % percent first\n---\n\n# fixture\n",
+      "main_parse_front_matter": "% percent first",
+      "main_ticket_purpose": "% percent first"
+    },
+    {
+      "value": "@ at first",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: @ at first\n---\n\n# fixture\n",
+      "main_parse_front_matter": "@ at first",
+      "main_ticket_purpose": "@ at first"
+    },
+    {
+      "value": "`tick` first",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: `tick` first\n---\n\n# fixture\n",
+      "main_parse_front_matter": "`tick` first",
+      "main_ticket_purpose": "`tick` first"
+    },
+    {
+      "value": "x | y",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: x | y\n---\n\n# fixture\n",
+      "main_parse_front_matter": "x | y",
+      "main_ticket_purpose": "x | y"
+    },
+    {
+      "value": "> not a header",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: > not a header\n---\n\n# fixture\n",
+      "main_parse_front_matter": "> not a header",
+      "main_ticket_purpose": "> not a header"
+    },
+    {
+      "value": "[only open bracket",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: [only open bracket\n---\n\n# fixture\n",
+      "main_parse_front_matter": "[only open bracket",
+      "main_ticket_purpose": "[only open bracket"
+    },
+    {
+      "value": "null-ish but not null",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: null-ish but not null\n---\n\n# fixture\n",
+      "main_parse_front_matter": "null-ish but not null",
+      "main_ticket_purpose": "null-ish but not null"
+    },
+    {
+      "value": "~",
+      "text": "---\nid: T-9905\ncreated: 2026-10-27T17:30:00Z\nrequester: artisan\ntarget: role:engineering_orchestrator\nstate: active\nlabels: [ticket-system]\nthreat_path: ~\n---\n\n# fixture\n",
+      "main_parse_front_matter": "~",
+      "main_ticket_purpose": "~"
+    }
+  ]
+}

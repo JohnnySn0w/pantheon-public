@@ -61,6 +61,17 @@ the live probe (ADR section 4: verify "may run active probes") and records
 none; the apply pre-pass refuses any mailbox target outside the hub before
 anything changes; the reconcile probe reports deterministic probe residue.
 Without a configured hub every mailbox operation fails closed.
+
+T-5608 (HO ruling 2026-10-27) implements the T-5473 residue quarantine as
+``files.seat_root`` plus the inspection reads DECLARED for it in
+``envelope.KIND_INSPECTION_READS``: its preflight and apply run the
+installer's own ``_residue_quarantine_check`` through a
+``DeclaredInspectionPort`` that exposes only those reads. The consume and
+controller units it reads are derived ONLY from the plan-named consume
+timer's instance (the B9 ``_paired_service`` precedent), and the persona must
+be that instance. The move is a receipt-owned rename within the seat root
+(``SeatFiles.rename_within``), never a delete; rollback renames back from the
+receipt; reconcile reports the residue and every quarantine directory.
 """
 
 from __future__ import annotations
@@ -77,6 +88,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from typing import Any, Callable, Final, Mapping
 
@@ -94,6 +106,7 @@ from tools.host_control.contracts import (
 )
 from tools.host_control.envelope import (
     EXECUTOR_KIND_CLASSES,
+    KIND_INSPECTION_READS,
     require_executor_envelope,
     require_revision_implemented,
 )
@@ -129,6 +142,16 @@ from tools.persona_installer_contracts import (
     _sha256_bytes,
 )
 from tools.persona_installer_activation import (
+    QUARANTINE_DIR_PREFIX,
+    _QUARANTINE_CLASSES,
+    _bootstrap_residue_entries,
+    _quarantine_can_rollback,
+    _quarantine_class_base,
+    _quarantine_desired,
+    _quarantine_dir_for,
+    _quarantine_pairs,
+    _quarantine_stamp,
+    _residue_quarantine_check,
     LEGACY_CONVERGENCE_SERVICE_SETTLE_POLL_INTERVAL_SECONDS,
     LEGACY_CONVERGENCE_SERVICE_SETTLE_WINDOW_SECONDS,
     RUNTIME_VIABILITY_TEARDOWN_MARGIN_SECONDS,
@@ -215,7 +238,11 @@ UNIT_SHAPES: Final = {
     "persona-service": re.compile(r"pantheon-persona-consume@[a-z0-9][a-z0-9_-]{0,63}\.service\Z"),
     "persona-timer": re.compile(r"pantheon-persona-consume@[a-z0-9][a-z0-9_-]{0,63}\.timer\Z"),
     "receiver": re.compile(r"codex-telegram-poller\.service\Z"),
+    # T-5608: read ONLY by the residue quarantine's declared inspection
+    # (envelope.KIND_INSPECTION_READS), derived from the plan-named timer
+    "controller-service": re.compile(r"pantheon-runtime-controller@[a-z0-9][a-z0-9_-]{0,63}\.service\Z"),
 }
+QUARANTINE_KIND: Final = "seat-runtime-residue-quarantine"
 UNIT_ROLES: Final = {
     ("stale-unit-failure-reset", "target"): frozenset({"persona-service"}),
     ("unit-fire", "target"): frozenset({"persona-service"}),
@@ -226,6 +253,9 @@ UNIT_ROLES: Final = {
     ("codex-telegram-disabled-first", "target"): frozenset({"receiver"}),
     ("daemon-reload", "unit"): frozenset({"receiver"}),
     ("timer-enablement-absence-check", "timer"): frozenset({"persona-timer"}),
+    # T-5608: the plan-named consume timer; the consume and controller
+    # services are derived from its instance only (Engine._quarantine_units)
+    ("seat-runtime-residue-quarantine", "timer"): frozenset({"persona-timer"}),
 }
 # Kinds whose named units are checked at PARSE time. The 5b
 # timer-enablement-absence-check keeps its 5b admission: its timer reaches
@@ -247,6 +277,40 @@ _DIRECT_FIRE_HARNESSES: Final = frozenset(("claude", "codex"))
 
 class UnitRefused(HostControlError):
     """A port call named a unit outside the plan-named allowlist."""
+
+
+class DeclaredInspectionPort:
+    """T-5608: the ONLY user-manager surface a kind with declared inspection
+    reads (``envelope.KIND_INSPECTION_READS``) is handed. It exposes just the
+    two read methods and refuses (``UnitRefused``, before the port is called)
+    any call whose ``(method, unit role, purpose)`` is not declared for the
+    kind; units are bound to their roles by the caller (timer, consume,
+    controller). No write method exists on it."""
+
+    def __init__(
+        self,
+        port: UserManagerPort,
+        reads: tuple[tuple[str, str, str], ...],
+        units: Mapping[str, str],
+        timeout: Callable[[], float],
+    ) -> None:
+        self._port = port
+        self._reads = frozenset(reads)
+        self._roles = {unit: role for role, unit in units.items()}
+        self._timeout = timeout
+
+    def _declared(self, method: str, unit: str, purpose: str) -> None:
+        role = self._roles.get(unit)
+        if role is None or (method, role, purpose) not in self._reads:
+            raise UnitRefused(f"undeclared inspection read: {method} {str(unit)[:80]} {purpose}".rstrip())
+
+    def unit_file_enablement(self, unit: str) -> Any:
+        self._declared("unit_file_enablement", unit, "")
+        return self._port.unit_file_enablement(unit, timeout=self._timeout())
+
+    def read_unit(self, unit: str, purpose: ReadPurpose) -> UnitSnapshot:
+        self._declared("read_unit", unit, purpose.value)
+        return self._port.read_unit(unit, purpose, timeout=self._timeout())
 
 
 def unit_shape_ok(unit: object, shapes: frozenset[str]) -> bool:
@@ -291,6 +355,12 @@ def consume_instance_problem(operations: "tuple[InstallOperation, ...]") -> str:
             return "unit-fire target is not the service its timer fires"
         if operation.kind == "timer-observe" and operation.desired.get("service", "") != _paired(operation.target):
             return "timer-observe service is not the service its timer fires"
+        if operation.kind == QUARANTINE_KIND:
+            # T-5608: the units it reads are derived from the timer's instance,
+            # so the persona it moves residue for must BE that instance
+            match = _CONSUME_INSTANCE.fullmatch(operation.desired.get("timer", ""))
+            if match is None or operation.desired.get("persona", "") != match.group("instance"):
+                return "residue quarantine persona is not its consume timer's instance"
     if len(instances) > 1:
         return "spec names more than one consume instance: " + ",".join(sorted(instances))
     return ""
@@ -756,6 +826,10 @@ class ExecutorEngine:
         verify: bool,
     ) -> tuple[MutationRecord | None, OperationEvidence]:
         capability = EXECUTOR_KIND_CLASSES.get(operation.kind)
+        if capability == "files.seat_root" and operation.kind == QUARANTINE_KIND:
+            if verify:
+                return None, self._verify_quarantine(operation)
+            return self._apply_quarantine(operation)
         if capability == "files.seat_root":
             if verify:
                 return None, self._verify_file(operation)
@@ -1252,6 +1326,286 @@ class ExecutorEngine:
         )
 
     # ------------------------------------------------------------------
+    # files.seat_root: the T-5473 residue quarantine (T-5608, HO ruling
+    # 2026-10-27). A receipt-owned MOVE of the closed phase-Q residue set into
+    # <persona root>/.installer-quarantine-<stamp>/<class>/<name>, never a
+    # delete. Preflight and apply run the installer's own predicate
+    # (``_residue_quarantine_check``) over the declared inspection reads.
+    # ------------------------------------------------------------------
+
+    def _quarantine_units(self, operation: InstallOperation) -> dict[str, str]:
+        """role -> unit: the plan-named timer (per-kind allowlist), and the
+        consume and controller services derived ONLY from its instance."""
+
+        timer = self._unit(operation, "timer")
+        match = _CONSUME_INSTANCE.fullmatch(timer)
+        if match is None or operation.desired.get("persona", "") != match.group("instance"):
+            raise UnitRefused("residue quarantine persona is not its consume timer's instance")
+        controller = f"pantheon-runtime-controller@{match.group('instance')}.service"
+        if not unit_shape_ok(controller, frozenset({"controller-service"})):
+            raise UnitRefused("derived controller service is outside the per-kind allowlist")
+        return {"timer": timer, "consume": self._paired_service(timer), "controller": controller}
+
+    def _quarantine_entries(self, root: str, persona: str) -> list[tuple[str, str]]:
+        """The installer's residue listing, after the executor's containment:
+        the persona root must be the operation target, and every class base
+        must lie inside the seat root as a real directory (or be absent), so
+        the listing never reads through a symlink."""
+
+        try:
+            for base in (root, f"{root}/{persona}", f"{root}/{persona}/runtime-controller"):
+                if self._files.kind(base) not in ("absent", "directory"):
+                    raise OperationFailed(f"residue quarantine: {base} is not a directory")
+        except SeatPathRefused as exc:
+            raise OperationFailed(f"residue quarantine: {exc}") from exc
+        return _bootstrap_residue_entries(Path(root), persona)
+
+    def _quarantine_check(self, operation: InstallOperation) -> Any:
+        """THE installer predicate with the executor's reads injected; every
+        port call goes through the kind's declared inspection reads."""
+
+        root_target = operation.target
+        units = self._quarantine_units(operation)
+        port = DeclaredInspectionPort(
+            self._user_manager, KIND_INSPECTION_READS[operation.kind], units, self._call_timeout
+        )
+
+        def bootstrap_fire_pending(timer: str) -> bool:
+            try:
+                return not port.unit_file_enablement(timer).enabled
+            except _us.UserManagerError as exc:
+                raise OperationFailed(f"cannot read the consume timer enablement: {exc}") from exc
+
+        def liveness(_persona: str) -> dict[str, str | None]:
+            states: dict[str, str | None] = {}
+            for unit in (units["controller"], units["consume"]):
+                try:
+                    states[unit] = port.read_unit(unit, ReadPurpose.SERVICE_OBSERVE).active_state
+                except (OperationFailed, _us.UserManagerError):
+                    states[unit] = None
+            return states
+
+        def entries(root: str, persona: str) -> list[tuple[str, str]]:
+            if root_target != f"{root}/{persona}":
+                raise OperationFailed("residue quarantine target is not its persona root")
+            return self._quarantine_entries(root, persona)
+
+        return _residue_quarantine_check(
+            operation,
+            bootstrap_fire_pending=bootstrap_fire_pending,
+            liveness=liveness,
+            entries=entries,
+        )
+
+    def _quarantine_record(self, operation: InstallOperation, changed: bool, before: dict[str, str]) -> MutationRecord:
+        return MutationRecord(
+            operation.operation_id, operation.kind, operation.target, operation.owner,
+            changed, before, "quarantined",
+        )
+
+    def _apply_quarantine(self, operation: InstallOperation) -> tuple[MutationRecord, OperationEvidence]:
+        """Installer parity (``LocalHostBackend._execute_residue_quarantine``):
+        the predicate first, then the move. A failure part-way restores every
+        moved entry and raises (nothing changed); if THAT restore cannot
+        finish, the entries still quarantined are returned as a changed
+        mutation so the receipt can drive rollback (never dropped)."""
+
+        check = self._quarantine_check(operation)
+        if not check.ok:
+            raise OperationFailed(f"{operation.operation_id}: {check.detail}")
+        if check.classification == "converged":
+            return self._quarantine_record(
+                operation, False, {"state": "skipped", "reason": check.detail}
+            ), self._evidence(operation, True, check.detail, {"residue": "left-in-place"})
+        root, persona, _ = _quarantine_desired(operation)
+        entries = self._quarantine_entries(root, persona)
+        if not entries:
+            return self._quarantine_record(operation, False, {"state": "absent"}), self._evidence(
+                operation, True, "no control-plane residue to quarantine", {"residue": "absent"}
+            )
+        stamp = _quarantine_stamp()
+        qdir = _quarantine_dir_for(root, persona, stamp)
+        if self._files.lexists(qdir):
+            raise OperationFailed(f"{operation.operation_id}: quarantine dir {qdir} already exists")
+
+        def receipt(moved: list[tuple[str, str]]) -> dict[str, str]:
+            listing = json.dumps([[cls, name] for cls, name in moved], separators=(",", ":"))
+            return {
+                "state": "present", "persona_state_root": root, "persona": persona,
+                "stamp": stamp, "moved": listing,
+            }
+
+        full = receipt(entries)
+        projected = record_size(
+            self._quarantine_record(operation, True, full),
+            self._evidence(operation, True, "quarantined", {"residue": "quarantined", "quarantine_dir": qdir, "moved": full["moved"]}),
+        )
+        if projected > self._remaining:
+            raise ResultBudgetExceeded(
+                f"record of {projected} bytes exceeds the remaining result budget "
+                f"({self._remaining} bytes); refused before any change"
+            )
+
+        def paths(cls: str, name: str) -> tuple[str, str]:
+            return f"{_quarantine_class_base(root, persona, cls)}/{name}", f"{qdir}/{cls}/{name}"
+
+        created: list[str] = []
+        moved: list[tuple[str, str]] = []
+        failure: BaseException | None = None
+        try:
+            for cls, name in entries:
+                for directory in (qdir, f"{qdir}/{cls}"):
+                    if directory not in created:
+                        self._files.mkdir(directory, 0o700)
+                        created.append(directory)
+                source, destination = paths(cls, name)
+                try:
+                    self._files.rename_within(source, destination)  # move, never delete
+                except SeatChangeIncomplete:
+                    moved.append((cls, name))  # the rename committed
+                    raise
+                moved.append((cls, name))
+        except Exception as exc:
+            failure = exc
+        if failure is None:
+            listing = full["moved"]
+            return self._quarantine_record(operation, True, full), self._evidence(
+                operation, True, check.detail.replace("would move", "moved", 1),
+                {"residue": "quarantined", "quarantine_dir": qdir, "moved": listing},
+            )
+        still: list[tuple[str, str]] = []
+        for cls, name in reversed(moved):
+            source, destination = paths(cls, name)
+            try:
+                self._files.rename_within(destination, source)
+            except SeatChangeIncomplete:
+                pass  # moved back; only the directory sync failed
+            except Exception:
+                still.append((cls, name))
+        if not still:
+            for directory in reversed(created):  # only emptied dirs; never recursive
+                try:
+                    self._files.rmdir_if_empty(directory)
+                except Exception:
+                    pass
+            raise OperationFailed(
+                f"{operation.operation_id}: quarantine move failed, restored: {_safe_detail(failure)}"
+            )
+        kept = [item for item in entries if item in still]
+        before = receipt(kept)
+        return self._quarantine_record(operation, True, before), self._evidence(
+            operation, False,
+            f"moved, then failed and could not restore {len(kept)} path(s): {_safe_detail(failure)}",
+            {"residue": "partially-quarantined", "quarantine_dir": qdir, "moved": before["moved"]},
+        )
+
+    def _verify_quarantine(self, operation: InstallOperation) -> OperationEvidence:
+        """Installer parity: structural only (a post-bootstrap seat legitimately
+        has a fresh runtime.json); the receipt's copies are checked at rollback."""
+
+        _quarantine_desired(operation)
+        self._quarantine_units(operation)
+        return self._evidence(
+            operation, True, "structural: residue quarantine is receipt-checked at rollback",
+            {"observation": "residue-quarantine"},
+        )
+
+    def _observe_quarantine(self, operation: InstallOperation) -> OperationEvidence:
+        """Reconcile (a lost apply): the residue still in place and every
+        quarantine directory with its class contents, read-only. The
+        deterministic layout <qdir>/<class>/<name> is what an operator or a
+        re-apply recovers from after a crash between moves."""
+
+        root, persona, _ = _quarantine_desired(operation)
+        self._quarantine_units(operation)
+        residue = self._quarantine_entries(root, persona)
+        qdirs = [
+            name for name in self._files.list_dir(f"{root}/{persona}") if name.startswith(QUARANTINE_DIR_PREFIX)
+        ]
+        quarantined = {
+            qdir: [[cls, name] for cls in _QUARANTINE_CLASSES for name in self._files.list_dir(f"{root}/{persona}/{qdir}/{cls}")]
+            for qdir in qdirs
+        }
+        return self._evidence(
+            operation,
+            True,
+            "live residue and quarantine directories observed",
+            {
+                "observation": "residue-quarantine",
+                "residue": json.dumps([[cls, name] for cls, name in residue], separators=(",", ":")),
+                "quarantine_dirs": json.dumps(sorted(quarantined), separators=(",", ":")),
+                "quarantined": json.dumps(quarantined, sort_keys=True, separators=(",", ":")),
+            },
+        )
+
+    def _classify_quarantine_restore(self, mutation: MutationRecord) -> tuple[str, str]:
+        """The installer's ``_quarantine_can_rollback`` over the executor's
+        confined existence read, after the executor's containment."""
+
+        root = mutation.before.get("persona_state_root", "")
+        if not self._files.contains(mutation.target) or not self._files.contains(root):
+            return "refused", "residue quarantine receipt names a path outside the seat root"
+        check = _quarantine_can_rollback(mutation.before, self._files.lexists, mutation.target)
+        if check.ok:
+            return check.classification, check.detail
+        return ("drifted" if check.classification == "drifted" else "refused"), check.detail
+
+    def _restore_quarantine(self, mutation: MutationRecord, operation: InstallOperation) -> tuple[MutationRecord, OperationEvidence]:
+        pairs = _quarantine_pairs(mutation.before, mutation.target)
+        record = MutationRecord(
+            mutation.operation_id, mutation.kind, mutation.target, mutation.owner,
+            True, dict(mutation.before), "restored",
+        )
+        projected = record_size(record, None) + EVIDENCE_RESERVE_BYTES
+        if projected > self._remaining:
+            raise ResultBudgetExceeded(
+                f"restore record of {projected} bytes exceeds the remaining result budget; refused before any change"
+            )
+        done: list[tuple[str, str]] = []
+        failure: BaseException | None = None
+        for quarantined, original in pairs:
+            try:
+                self._files.rename_within(quarantined, original)
+            except SeatChangeIncomplete:
+                done.append((quarantined, original))  # moved back; only the sync failed
+            except Exception as exc:
+                failure = exc
+                break
+            else:
+                done.append((quarantined, original))
+        if failure is not None:
+            undone = 0
+            for quarantined, original in reversed(done):
+                try:
+                    self._files.rename_within(original, quarantined)
+                    undone += 1
+                except SeatChangeIncomplete:
+                    undone += 1
+                except Exception:
+                    pass
+            if undone == len(done):
+                raise OperationFailed(
+                    f"quarantine restore failed, nothing left half-restored: {_safe_detail(failure)}"
+                )
+            return dataclass_replace(record, after_fingerprint="partially-restored"), self._evidence(
+                operation, False,
+                f"quarantine restore failed part-way and could not be undone: {_safe_detail(failure)}",
+                {"action": "rename-back", "restored_from": "receipt-before-snapshot"},
+            )
+        qdir = _quarantine_dir_for(
+            mutation.before["persona_state_root"], mutation.before["persona"], mutation.before["stamp"]
+        )
+        for directory in [f"{qdir}/{cls}" for cls in _QUARANTINE_CLASSES] + [qdir]:
+            try:  # only emptied dirs; rmdir_if_empty never removes a non-empty one
+                self._files.rmdir_if_empty(directory)
+            except Exception:
+                pass
+        return record, self._evidence(
+            operation, True, f"restored {len(done)} quarantined path(s)",
+            {"action": "rename-back", "restored_from": "receipt-before-snapshot", "moved_back": str(len(done))},
+        )
+
+    # ------------------------------------------------------------------
     # user_systemd.activate (T-2917 5c.2): shared helpers
     # ------------------------------------------------------------------
 
@@ -1435,6 +1789,9 @@ class ExecutorEngine:
             op for op in operations
             if op.kind in ACTIVATION_KINDS or op.kind == "codex-telegram-disabled-first"
         ]
+        # T-5608: a kind with declared inspection reads makes ONLY those calls
+        # (no reachability probe here); an unreachable manager fails its own
+        # reads closed (an unreadable state refuses)
         if needs_manager:
             try:
                 self._user_manager.manager_environment()
@@ -1467,6 +1824,10 @@ class ExecutorEngine:
         if kind == "codex-telegram-disabled-first":
             observed = self._disabled_first_check(operation)
             return "" if observed.ok else f"conflicting: {observed.detail}"
+        if kind == QUARANTINE_KIND:
+            # T-5608: the installer's own predicate, the same call apply makes first
+            check = self._quarantine_check(operation)
+            return "" if check.ok else f"conflicting: {check.detail}"
         if kind == "unit-fire":
             budget = _parse_unit_fire_timeout_budget(operation)
             self._viability(operation)
@@ -2271,6 +2632,8 @@ class ExecutorEngine:
 
     def _observe(self, operation: InstallOperation) -> OperationEvidence:
         capability = EXECUTOR_KIND_CLASSES.get(operation.kind)
+        if operation.kind == QUARANTINE_KIND:
+            return self._observe_quarantine(operation)
         if capability == "files.seat_root":
             snapshot = self._files.snapshot(operation.target)
             state = snapshot.get("state", "")
@@ -2393,6 +2756,8 @@ class ExecutorEngine:
 
         if mutation.kind == "timer-enable":
             return self._classify_timer_restore(mutation, operation)
+        if mutation.kind == QUARANTINE_KIND:
+            return self._classify_quarantine_restore(mutation)
         if EXECUTOR_KIND_CLASSES.get(mutation.kind) != "files.seat_root":
             return "refused", f"{mutation.kind} is not restorable by the executor"
         before_state = mutation.before.get("state")
@@ -2464,6 +2829,8 @@ class ExecutorEngine:
     def _restore(self, mutation: MutationRecord, operation: InstallOperation) -> tuple[MutationRecord, OperationEvidence]:
         if mutation.kind == "timer-enable":
             return self._restore_timer(mutation, operation)
+        if mutation.kind == QUARANTINE_KIND:
+            return self._restore_quarantine(mutation, operation)
         return self._restore_file(mutation, operation)
 
     def _restore_file(self, mutation: MutationRecord, operation: InstallOperation) -> tuple[MutationRecord, OperationEvidence]:

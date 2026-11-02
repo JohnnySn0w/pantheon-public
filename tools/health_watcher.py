@@ -148,12 +148,15 @@ class ProcessTap:
                                              stderr=subprocess.DEVNULL, start_new_session=True)
             except (OSError, ValueError):
                 self.proc = None
-        threading.Thread(target=self._pump, daemon=True).start()
+        self._pump_thread = threading.Thread(target=self._pump, daemon=True)
+        self._pump_thread.start()
 
     def _pump(self):
         try:
             if self.proc is not None and self.proc.stdout is not None:
                 self._read_tokens(self.proc.stdout)
+        except (OSError, ValueError):
+            pass                            # shutdown may close the pipe to unblock this reader
         finally:
             self.events.put((self.spec.label, "exit"))
 
@@ -193,6 +196,13 @@ class ProcessTap:
                 p.wait(timeout=3)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+        self._pump_thread.join(timeout=3)   # a reaped child closes the writer, so EOF is prompt
+        for stream in (p.stdin, p.stdout):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
 
 class Watcher:

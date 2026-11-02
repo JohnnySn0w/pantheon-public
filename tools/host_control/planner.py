@@ -1,20 +1,24 @@
-"""Server-owned plan construction for the host capability broker.
+"""Server-owned plan composition for the host capability broker.
 
-Import-closure exception (T-5516, ORG-052 §1/§3): this is the ONLY module in
-``tools/host_control`` allowed to import ``tools.persona_installer``. The broker
-plans in-process -- ``Manifest.from_bytes`` and ``PersonaInstaller.plan`` validate
-and render the seat's Codex Telegram bridge block, so the broker process loads the
-installer's agent-facing closure (Telegram bridge, mailbox client, harness
-adapter). Every other host_control module takes the pure contract types from
-``tools.persona_installer_contracts``. ``tools/test_host_control_import_closure.py``
-pins this exception by name. T-5533 removes it (split the pure bridge
-validate/render functions, or move planning into a sandboxed unprivileged
-process) before T-2920 enables the broker.
+T-5533 (ORG-052 section 1/3, split protocol from privilege): the broker does NOT
+compute installer plans. Registration (T-2920) runs the unprivileged
+``tools.host_plan_producer`` from the root-owned framework copy and registers the
+plan's bytes per (seat, manifest revision) in the seat registry (``plans``).
+``HostPlanService.plan`` reads that plan through the root-owned loader, checks its
+registered sha256, canonical form and digest, refuses it when the framework copy's
+artifact digest no longer matches the registered ``framework_sha256``, and then
+applies the broker's own checks: the op-registry dispatch table, the self-amendment
+refusal, the seat-local partition, the executor envelope, and the effect digest
+(target, framework revision and framework digest bindings). No module in
+``tools/host_control`` imports ``tools.persona_installer``; only the pure contract
+types in ``tools.persona_installer_contracts`` are used
+(``tools/test_host_control_import_closure.py`` pins this, and executes ``plan()``).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import json
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Callable, Final, Iterable, Literal
@@ -31,16 +35,20 @@ from tools.host_control.contracts import (
 )
 from tools.host_control.envelope import (
     EXECUTOR_KIND_CLASSES,
+    LAUNCH_DEPENDENT_KINDS,
+    LAUNCH_KINDS,
+    MUST_RUN_BEFORE_LAUNCH_KINDS,
+    LaunchBeforeContainment,
     OutOfEnvelopeKinds,
+    launch_order_violation,
     require_executor_envelope,
+    require_routed_launch_bound,
 )
 from tools.host_control.journal import BrokerJournal
 from tools.host_control.policy import HostPolicy
 from tools.host_control.registry import SeatRegistry
 from tools.host_control.runtime_table import DaemonRuntime, load_daemon_runtime
 from tools.host_control.self_amendment import default_protected_roots, refuse_self_amendment
-# Sanctioned exception, see the module docstring (T-5516 / T-5533).
-from tools.persona_installer import Manifest, PersonaInstaller
 from tools.persona_installer_contracts import (
     InstallOperation,
     InstallPlan,
@@ -57,11 +65,33 @@ SEAT_LOCAL_ACTION_PREFIX: Final = "seat-local."
 SEAT_LOCAL_CAPABILITY_PREFIX: Final = "seat-local:"
 
 
+def launch_routed_operation_ids(plan: InstallPlan) -> frozenset[str]:
+    """T-5470 partition routing (HO ruling 2026-10-26): when the plan carries a
+    must-run-before-launch op that is seat-local residue (never admitted), every
+    launch op, and every admitted op that needs a launch's effect in the same
+    run (``LAUNCH_DEPENDENT_KINDS``), is routed to the residue too, so the broker
+    never launches ahead of containment. Routing only ever moves admitted ops to
+    the residue, never the other way. Otherwise (e.g. a codex plan with no such
+    op) nothing is routed and the fires stay broker-executed."""
+
+    if not any(
+        op.kind in MUST_RUN_BEFORE_LAUNCH_KINDS and op.kind not in EXECUTOR_KIND_CLASSES
+        for op in plan.operations
+    ):
+        return frozenset()
+    return frozenset(
+        op.operation_id
+        for op in plan.operations
+        if op.kind in EXECUTOR_KIND_CLASSES and op.kind in (LAUNCH_KINDS | LAUNCH_DEPENDENT_KINDS)
+    )
+
+
 def partition_installer_plan(
     plan: InstallPlan,
 ) -> tuple[InstallPlan, tuple[InstallOperation, ...]]:
     """Split an installer plan into the BROKER plan (only kinds the
-    executor envelope admits) and an explicit seat-local residue.
+    executor envelope admits, less any T-5470 launch routing,
+    ``launch_routed_operation_ids``) and an explicit seat-local residue.
 
     Every excluded or unclassified kind is named in the residue, which is
     carried as ``OperatorAction`` entries on the broker plan so it is bound
@@ -73,12 +103,22 @@ def partition_installer_plan(
     operation id or a residue kind (nothing partially applies out of order).
     """
 
-    admitted = tuple(op for op in plan.operations if op.kind in EXECUTOR_KIND_CLASSES)
-    residue = tuple(op for op in plan.operations if op.kind not in EXECUTOR_KIND_CLASSES)
+    routed = launch_routed_operation_ids(plan)
+    admitted = tuple(
+        op for op in plan.operations if op.kind in EXECUTOR_KIND_CLASSES and op.operation_id not in routed
+    )
+    residue = tuple(
+        op for op in plan.operations if op.kind not in EXECUTOR_KIND_CLASSES or op.operation_id in routed
+    )
     if not residue:
         return plan, ()
-    if len(residue) > SEAT_LOCAL_RESIDUE_LIMIT:
+    # T-5470 partition routing (HO ruling 2026-10-26): routed launches have their
+    # own bound; B8 cap unchanged. SEAT_LOCAL_RESIDUE_LIMIT bounds only the
+    # out-of-envelope residue; the routed ops (fixed, enumerated, in-envelope
+    # kinds) are bounded at one op per LAUNCH_KINDS | LAUNCH_DEPENDENT_KINDS kind.
+    if len([op for op in residue if op.operation_id not in routed]) > SEAT_LOCAL_RESIDUE_LIMIT:
         raise PolicyDenied("family_denied")
+    require_routed_launch_bound(op.kind for op in residue if op.operation_id in routed)
     residue_by_id = {op.operation_id: op for op in residue}
     residue_kinds = {op.kind for op in residue}
     blocked: set[str] = set()
@@ -116,6 +156,60 @@ def partition_installer_plan(
     return InstallPlan.create(**values), residue
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise HostControlError("registered plan has a duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def parse_registered_plan(raw: bytes) -> InstallPlan:
+    """Parse root-registered plan bytes (T-5533): strict JSON with no duplicate
+    keys, exactly the canonical encoding of the plan it decodes to, and a valid
+    installer-plan digest."""
+
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_duplicate_keys)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HostControlError("registered plan is not valid JSON") from exc
+    if not isinstance(value, dict):
+        raise HostControlError("registered plan is malformed")
+    try:
+        plan = InstallPlan.from_dict(value)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HostControlError("registered plan is malformed") from exc
+    if canonical_json(plan.to_dict()).encode("utf-8") != raw:
+        raise HostControlError("registered plan is not canonical")
+    if not plan.validate_digest():
+        raise HostControlError("registered plan has an invalid digest")
+    return plan
+
+
+def effective_broker_order(plan: InstallPlan) -> tuple[InstallOperation, ...]:
+    """T-5470: the order the broker flow actually executes a plan in: the
+    admitted broker operations, then the seat-local residue (both from
+    ``partition_installer_plan`` itself, never a copy of its rule)."""
+
+    broker_plan, residue = partition_installer_plan(plan)
+    return broker_plan.operations + residue
+
+
+def refuse_launch_before_containment(plan: InstallPlan) -> None:
+    """T-5470 standing invariant, shared by the registration-time producer and
+    ``HostPlanService.plan``: over the effective broker order no launch op runs
+    before a must-run-before-launch op, and a claude plan that launches carries
+    its shell-box containment op (``envelope.launch_order_violation``)."""
+
+    reason = launch_order_violation(
+        ((operation.operation_id, operation.kind) for operation in effective_broker_order(plan)),
+        selected_harness=plan.selected_harness,
+    )
+    if reason is not None:
+        raise LaunchBeforeContainment(reason)
+
+
 def seat_local_residue(plan: InstallPlan) -> list[dict[str, str]]:
     """The bounded residue list as the approver-facing summary shows it."""
 
@@ -130,8 +224,13 @@ def seat_local_residue(plan: InstallPlan) -> list[dict[str, str]]:
                 "status": SEAT_LOCAL_STATUS,
             }
         )
-    if len(entries) > SEAT_LOCAL_RESIDUE_LIMIT:
+    # T-5470 partition routing (HO ruling 2026-10-26): routed launches have their
+    # own bound; B8 cap unchanged. A residue entry of an in-envelope kind can only
+    # be a routed launch (or dependent); the rest is the out-of-envelope residue.
+    routed = [entry for entry in entries if entry["kind"] in EXECUTOR_KIND_CLASSES]
+    if len(entries) - len(routed) > SEAT_LOCAL_RESIDUE_LIMIT:
         raise HostControlError("seat-local residue exceeds its bound")
+    require_routed_launch_bound(entry["kind"] for entry in routed)
     return entries
 
 
@@ -142,7 +241,6 @@ class HostPlanService:
         registry: SeatRegistry,
         policy: HostPolicy,
         journal: BrokerJournal,
-        installer: PersonaInstaller,
         clock: Callable[[], datetime],
         handle_factory: Callable[[], str],
         plan_ttl: timedelta,
@@ -171,7 +269,6 @@ class HostPlanService:
         self._registry = registry
         self._policy = policy
         self._journal = journal
-        self._installer = installer
         self._clock = clock
         self._handle_factory = handle_factory
         self._plan_ttl = plan_ttl
@@ -250,12 +347,13 @@ class HostPlanService:
         subject = self._registry.subject_for_uid(authenticated_uid)
         target = self._registry.seat(seat_id)
         manifest_record = self._registry.manifest(manifest_revision)
-        manifest_bytes = self._registry.read_manifest_bytes(manifest_record)
-        frozen_manifest = Manifest.from_bytes(
-            manifest_record.path,
-            manifest_bytes,
-        )
-        self._validate_frozen_manifest(frozen_manifest, manifest_record.template_ids)
+        # The registered manifest must not have drifted since registration, and
+        # (T-5533) the framework copy must still hash to the registered
+        # framework_sha256: a plan registered against an older copy is stale.
+        # (The frozen-manifest template binding moved to the producer:
+        # tools.host_plan_producer.validate_frozen_manifest.)
+        self._registry.read_manifest_bytes(manifest_record)
+        self._registry.check_framework_digest(manifest_record)
 
         decision = self._policy.authorize_plan(
             subject,
@@ -272,14 +370,12 @@ class HostPlanService:
         if not allowed_families:
             raise PolicyDenied("family_denied")
 
-        full_plan = self._installer.plan(
-            frozen_manifest,
-            target.persona,
-            harness_override=target.harness,
-            root=target.install_root,
-        )
-        if not full_plan.validate_digest():
-            raise HostControlError("installer returned an invalid plan digest")
+        # T-5533: the root-registered plan for exactly this (seat, manifest
+        # revision); computed at registration by tools.host_plan_producer.
+        plan_record = self._registry.plan_record(target.seat_id, manifest_record.revision)
+        full_plan = parse_registered_plan(self._registry.read_plan_bytes(plan_record))
+        if full_plan.provenance.get("manifest") != str(manifest_record.path):
+            raise HostControlError("registered plan is bound to another manifest")
         # ORG-082 §2 (T-2918, F1): a substrate family is absent from the
         # daemon's dispatch table, so the composer refuses it HERE, before
         # partition can turn it into seat-local residue and before any
@@ -307,6 +403,10 @@ class HostPlanService:
             manifest=manifest_record,
             installer_plan=installer_plan,
         )
+        # T-5470: no launch ahead of containment in the order the broker flow
+        # executes (admitted, then residue). After the target/framework bindings
+        # (compute_effect_digest), still before any handle or journal write.
+        refuse_launch_before_containment(full_plan)
 
         handle = self._handle_factory()
         if not isinstance(handle, str) or _HEX_256.fullmatch(handle) is None:
@@ -350,34 +450,6 @@ class HostPlanService:
             summary_json=summary,
             replayed=replayed,
         )
-
-    @staticmethod
-    def _validate_frozen_manifest(
-        manifest: Manifest,
-        template_ids: tuple[str, ...],
-    ) -> None:
-        systemd = manifest.installer.get("systemd")
-        if not isinstance(systemd, dict):
-            raise HostControlError("frozen manifest systemd section is invalid")
-        quota_check = manifest.installer.get("quota_check")
-        if quota_check is None:
-            quota_check = {}
-        if not isinstance(quota_check, dict):
-            raise HostControlError("frozen manifest quota_check section is invalid")
-        actual = (
-            systemd.get("service_template"),
-            systemd.get("timer_template"),
-            quota_check.get(
-                "service_template",
-                "tools/systemd/pantheon-persona-quota@.service",
-            ),
-            quota_check.get(
-                "timer_template",
-                "tools/systemd/pantheon-persona-quota@.timer",
-            ),
-        )
-        if actual != template_ids:
-            raise HostControlError("registered template binding mismatch")
 
     @staticmethod
     def plan_summary(plan: PlanEnvelope) -> str:

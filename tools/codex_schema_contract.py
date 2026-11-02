@@ -46,6 +46,7 @@ BINDINGS = REPO / "harness" / "codex" / "appserver_seats.json"
 SCHEMA_ROOT = REPO / "harness" / "codex" / "schema"
 BUNDLE = "codex_app_server_protocol.schemas.json"
 VERSION_RE = re.compile(r"codex-cli\s+(\d+\.\d+\.\d+\S*)")
+INSTANCE_ROOT_CWD = "@instance-root"
 
 if __package__ == "tools":
     from tools import codex_delivery as cd
@@ -57,6 +58,18 @@ else:
 # ------------------------------------------------------------------ bindings / versions
 def load_bindings(path: Path = BINDINGS) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))["seats"]
+
+
+def resolve_binding_cwd(binding: dict, *, instance_root: Path = REPO) -> str:
+    """Resolve the active-checkout sentinel while rejecting ambiguous relatives."""
+    raw = binding.get("cwd")
+    if raw == INSTANCE_ROOT_CWD:
+        return str(instance_root.resolve())
+    if not isinstance(raw, str) or not Path(raw).is_absolute():
+        raise ValueError(
+            f"binding cwd must be an absolute path or {INSTANCE_ROOT_CWD!r}, got {raw!r}"
+        )
+    return raw
 
 
 def seat_for_account(account: Optional[str] = None, path: Path = BINDINGS) -> Optional[tuple]:

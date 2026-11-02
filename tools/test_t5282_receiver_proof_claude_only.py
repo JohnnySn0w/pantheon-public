@@ -1,8 +1,8 @@
-"""T-5282: a Claude-only Telegram seat (archivist) has no bridge binding and no codex
-fallback, so no receiver handoff can ever happen for it: the consume path's read-only
-receiver proof is not-applicable, decided from the manifest-derived binding. A seat that
-CAN hand off (Telegram channel + cross-harness fallback) but lost its bridge entry must
-still fail closed."""
+"""T-5282: a Claude-only Telegram seat with no bridge binding or cross-harness
+fallback needs no receiver handoff, so the consume path's read-only proof is
+not-applicable. A seat that CAN hand off (Telegram channel + cross-harness fallback)
+but lost its bridge entry must still fail closed. Archivist joined the bridged set in
+T-5744."""
 
 from __future__ import annotations
 
@@ -91,8 +91,7 @@ def test_real_manifest_classification():
     def load(persona):
         return persona_bringup.load_binding(MANIFEST, persona)
 
-    assert rc._receiver_proof_not_applicable(load("archivist")) is True
     assert rc._receiver_proof_not_applicable(load("artisan")) is True
     assert rc._receiver_proof_not_applicable(load("mason")) is True
-    for bridged in ("orchestrator", "specialist", "recovery"):
+    for bridged in ("orchestrator", "specialist", "recovery", "archivist"):
         assert rc._receiver_proof_not_applicable(load(bridged)) is False, bridged

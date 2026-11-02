@@ -45,10 +45,23 @@ _HEX_LOWER = "0123456789abcdef"
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _EDGES = frozenset((t.frm, t.to) for t in TRANSITIONS)
 MAX_SEGMENT = 64
+# The ONE bound on a run's plan.json, used by encode_plan/write_plan AND read_plan
+# (T-5809): a full-seat install node is 86-123 KB, over the generic 64 KiB WAL
+# artifact cap, which stays in force for every other run-state artifact.
+MAX_PLAN_BYTES = 1 << 20
 
 
 class RunStateError(RuntimeError):
     """A run-state record or path is refused (malformed, tampered, or an illegal transition)."""
+
+
+def encode_plan(plan: Mapping[str, Any]) -> bytes:
+    """Canonical plan.json bytes under MAX_PLAN_BYTES, or CanonicalJsonError("json-too-large").
+
+    The executor calls this BEFORE claiming or admitting a run (T-5809), so an
+    oversized plan refuses with no claim held and no run record created."""
+
+    return canonical_json_bytes(plan, max_bytes=MAX_PLAN_BYTES)
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +214,15 @@ def validate_record(record: Mapping[str, Any], expected: RunTuple | None = None)
 # ---------------------------------------------------------------------------
 
 
+def _rmdir_quietly(path: Path) -> None:
+    """rmdir (never recursive) a run directory a failed create made; a non-empty one is left in place."""
+
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+
+
 def _ensure_private_dir(path: Path, uid: int) -> None:
     try:
         path.mkdir(mode=DIR_MODE)
@@ -243,7 +265,7 @@ class RunHandle:
     def read_record(self) -> dict[str, Any]:
         try:
             data = self.held.read_regular("record.json", expected_uid=self.store.uid, expected_mode=FILE_MODE, max_bytes=1 << 20)
-            record = load_canonical_json(data, max_bytes=1 << 20)
+            record = load_canonical_json(data)  # the generic artifact cap the record is written under (unchanged by T-5809)
         except Exception as exc:  # noqa: BLE001 -- every unreadable record refuses, typed
             raise RunStateError(f"record unreadable at {self.path}: {exc}") from None
         validate_record(record, self.tuple)
@@ -273,11 +295,13 @@ class RunHandle:
         return record
 
     def write_plan(self, data: bytes) -> None:
+        if len(data) > MAX_PLAN_BYTES:
+            raise RunStateError(f"plan is {len(data)} bytes, over MAX_PLAN_BYTES ({MAX_PLAN_BYTES})")
         self.held.write_immutable("plan.json", data, expected_uid=self.store.uid, mode=FILE_MODE)
 
     def read_plan(self) -> dict[str, Any]:
-        data = self.held.read_regular("plan.json", expected_uid=self.store.uid, expected_mode=FILE_MODE, max_bytes=1 << 20)
-        return load_canonical_json(data, max_bytes=1 << 20)
+        data = self.held.read_regular("plan.json", expected_uid=self.store.uid, expected_mode=FILE_MODE, max_bytes=MAX_PLAN_BYTES)
+        return load_canonical_json(data, max_bytes=MAX_PLAN_BYTES)
 
     def append_transcript(self, line: bytes) -> None:
         fd = os.open(
@@ -308,7 +332,20 @@ class RunStore:
         self.root = Path(scope_root)
         self.uid = os.getuid() if uid is None else uid
 
-    def create(self, tup: RunTuple, *, operations: list[dict[str, Any]]) -> RunHandle:
+    # What create writes, by name, in this order; a failed create unlinks exactly these (T-5810),
+    # in REVERSE order, so a cleanup that stops early never leaves a record without its plan.
+    _CREATE_FILES = ("plan.json", "manifest.json", "record.json")
+
+    def create(self, tup: RunTuple, *, operations: list[dict[str, Any]], plan: bytes) -> RunHandle:
+        """Admit a run: plan.json, then the WAL manifest, then record.json (state PENDING).
+
+        record.json is the admission (ORG-080 §4 admission step 2), so it is written
+        LAST: a record never exists without the plan rollback reads and the manifest
+        reconcile/rollback classify against (T-5810). A failure before the record
+        lands unlinks only the files named in ``_CREATE_FILES`` and rmdirs the run
+        directory, so no record-less run directory is left behind.
+        """
+
         _ensure_private_dir(self.root, self.uid)
         current = self.root
         for part in tup.relpath().parts[:-1]:
@@ -316,9 +353,33 @@ class RunStore:
             _ensure_private_dir(current, self.uid)
         path = current / tup.run_id
         path.mkdir(mode=DIR_MODE)
-        os.chmod(path, DIR_MODE)
-        handle = RunHandle(self, tup, path)
+        try:
+            os.chmod(path, DIR_MODE)
+            handle = RunHandle(self, tup, path)
+        except BaseException:
+            _rmdir_quietly(path)
+            raise
+        try:
+            self._admit(handle, tup, operations, plan)
+        except BaseException:
+            for name in reversed(self._CREATE_FILES):
+                try:
+                    os.unlink(name, dir_fd=handle.held.fileno())
+                except FileNotFoundError:
+                    pass
+                except OSError:
+                    break  # leave the directory for the operator rather than mask the original failure
+            handle.close()
+            _rmdir_quietly(path)
+            raise
+        return handle
+
+    @staticmethod
+    def _admit(handle: RunHandle, tup: RunTuple, operations: list[dict[str, Any]], plan: bytes) -> None:
         stamp = now_iso()
+        handle.write_plan(plan)
+        with handle.wal() as wal:
+            wal.initialize_manifest(created_at=stamp, updated_at=stamp)
         record = {
             "schema": SCHEMA,
             "tuple": tup.to_json_obj(),
@@ -332,7 +393,6 @@ class RunStore:
             "updated_at": stamp,
         }
         handle._write(record)
-        return handle
 
     def _tuple_from_path(self, record_dir: Path) -> RunTuple:
         rel = record_dir.relative_to(self.root)
@@ -352,7 +412,16 @@ class RunStore:
             raise RunStateError(f"run_id {run_id} appears under {len(hits)} tuples")
         return self._tuple_from_path(hits[0]) if hits else None
 
-    def all_tuples(self) -> list[RunTuple]:
+    def has_record(self, tup: RunTuple) -> bool:
+        """Whether the run directory holds record.json (the admission); lstat, never followed."""
+
+        try:
+            os.lstat(self.root / tup.relpath() / "record.json")
+        except FileNotFoundError:
+            return False
+        return True
+
+    def _dir_tuples(self) -> list[RunTuple]:
         base = self.root / "schema-v1"
         if not base.is_dir():
             return []
@@ -360,3 +429,13 @@ class RunStore:
             (self._tuple_from_path(p) for p in base.glob("*/*/*/*/*") if p.is_dir()),
             key=lambda t: t.run_id,
         )
+
+    def all_tuples(self) -> list[RunTuple]:
+        """Admitted runs only: a run directory without record.json is never admitted (see ``orphan_tuples``)."""
+
+        return [t for t in self._dir_tuples() if self.has_record(t)]
+
+    def orphan_tuples(self) -> list[RunTuple]:
+        """Run directories with no record.json: create died between mkdir and the record write (T-5810)."""
+
+        return [t for t in self._dir_tuples() if not self.has_record(t)]

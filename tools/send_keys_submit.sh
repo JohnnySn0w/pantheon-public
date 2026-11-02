@@ -86,6 +86,11 @@ HERMES_ENTER_DELAY="${HERMES_ENTER_DELAY:-1.2}"
 PENDING_PASTE_SENTINEL="${PENDING_PASTE_SENTINEL:-[Pasted text}"  # claude-code pending-paste marker
 SUBMIT_RETRIES="${SUBMIT_RETRIES:-2}"              # extra Enter attempts if submit unconfirmed
 EMPTY_RECAPTURE_S="${EMPTY_RECAPTURE_S:-0.4}"       # T-5412: wait before re-reading an empty capture
+# T-5680: the failure-path late-confirm poll, ported from submit_verify.py (T-5651/T-5656):
+# LATE_CONFIRM_POLLS looks every LATE_CONFIRM_POLL_S, no Enter. Equal to submit_verify's
+# LATE_CONFIRM_POLL_S / LATE_CONFIRM_TOTAL_S (test-pinned).
+LATE_CONFIRM_POLL_S="${LATE_CONFIRM_POLL_S:-1.5}"
+LATE_CONFIRM_POLLS="${LATE_CONFIRM_POLLS:-6}"
 
 # T-1106: the submit-verify predicate is per-harness (submit_verify.py PROFILES).
 # Default to claude-code so every existing caller (handoff_and_restart, self_restart,
@@ -404,6 +409,25 @@ send_keys_submit() {
     if [[ "$verdict" == "pending" ]]; then last_check="pending"; else last_check="unverified"; fi
     echo "[send_keys_submit] submit unconfirmed (still pending); retrying Enter ($((attempt+1))/$SUBMIT_RETRIES)" >&2
   done
+  # T-5680: a seat finishing its turn (or a heavy pane) can accept the Enter after the
+  # retry window (specialist keep-going 10-27 15:08Z false-failed though the nudge landed).
+  # Only when the verifier last saw the text PENDING: look again, bounded, NO Enter. A
+  # pane in a tmux mode or an empty capture casts no vote, as above.
+  if [[ "$last_check" == "pending" ]]; then
+    local late
+    for (( late=0; late<LATE_CONFIRM_POLLS; late++ )); do
+      sleep "$LATE_CONFIRM_POLL_S"
+      [[ "$(tmux "${tmux_socket_args[@]}" display-message -p -t "$pane" '#{pane_in_mode}' 2>/dev/null || echo 1)" == "0" ]] || continue
+      pane_text="$(tmux "${tmux_socket_args[@]}" capture-pane -t "$pane" -p 2>/dev/null || true)"
+      [[ "$pane_text" == *[![:space:]]* ]] || continue
+      verdict="$(printf '%s' "$pane_text" \
+        | python3 "$SUBMIT_VERIFY_PY" --harness "$harness" --pending-check --text "$text" 2>/dev/null)"
+      if [[ "$verdict" == "submitted" ]]; then
+        echo "[send_keys_submit] submit confirmed late (after the last retry; T-5680)" >&2
+        return 0
+      fi
+    done
+  fi
   echo "[send_keys_submit] ERROR: prompt submit unconfirmed after $SUBMIT_RETRIES Enter retries (pane $pane)" >&2
   # T-4117: 2 only when the verifier itself saw the text still pending (a busy
   # pane queues it); an untrusted final surface stays 1 (the Enter may be eaten).

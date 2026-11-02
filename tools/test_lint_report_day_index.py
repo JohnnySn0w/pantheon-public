@@ -69,6 +69,14 @@ class CheckDayDirTests(unittest.TestCase):
                             "[a](a.md)\n", ["a.md", "extra.md"])
             self.assertEqual(lrd.check_day_dir(d), ([], ["extra.md"]))
 
+    def test_underscore_runner_artifacts_are_not_unindexed(self):
+        # watch_runner writes _topic-warnings.md with deliberately NO README row
+        # (it reaches the digest directly); the lint must not count it as drift.
+        with tempfile.TemporaryDirectory() as t:
+            d = self._mkday(Path(t), "2026-01-06",
+                            "[a](a.md)\n", ["a.md", "_topic-warnings.md"])
+            self.assertEqual(lrd.check_day_dir(d), ([], []))
+
     def test_fail_row_plaintext_with_no_file_is_clean(self):
         # The real 05-25 shape: a fail row in plain text, no .md on disk → clean.
         with tempfile.TemporaryDirectory() as t:

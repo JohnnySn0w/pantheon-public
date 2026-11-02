@@ -4,8 +4,12 @@ Documentation=file:///home/%u/pantheon-config/tools/codex_modal_monitor.py
 
 [Timer]
 OnBootSec=3min
+OnActiveSec=1min
 OnUnitActiveSec=5min
-Persistent=true
+
+# Level-triggered: a missed modal check is not a missed job. Persistent=true can leave this
+# timer permanently elapsed after a user-manager restart: its saved wall-clock stamp suppresses
+# the past OnBootSec deadline while OnUnitActiveSec has no activation anchor in the new manager.
 Unit=pantheon-codex-modal-monitor.service
 
 [Install]

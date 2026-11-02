@@ -17,6 +17,7 @@ from pathlib import Path
 from tools import persona_bringup
 from tools.persona_installer import (
     HO_RESUMER_UNITS,
+    LEGACY_UNIT_SETS,
     Manifest,
     PersonaInstaller,
 )
@@ -97,7 +98,8 @@ class FleetCompletenessTests(unittest.TestCase):
                     self.assertIn(operation_id, ops)
 
     def test_keep_going_is_planned_exactly_for_the_personas_keep_going_maps(self) -> None:
-        # T-5482: archivist/codex/watchman are deliberately exempt (_NO_KEEP_GOING)
+        # T-5748: only Archivist remains deliberately exempt; both Codex seats
+        # receive the shared harness-aware cadence.
         from tools import keep_going
 
         for persona in self.personas:
@@ -115,9 +117,10 @@ class FleetCompletenessTests(unittest.TestCase):
         from tools import persona_installer as pim
 
         self.assertTrue(pim._keep_going_planned("recovery"))
-        for persona in ("archivist", "codex", "watchman"):
+        for persona in ("codex", "watchman"):
             with self.subTest(persona=persona):
-                self.assertFalse(pim._keep_going_planned(persona))
+                self.assertTrue(pim._keep_going_planned(persona))
+        self.assertFalse(pim._keep_going_planned("archivist"))
 
     def test_the_mailbox_wake_timer_is_enabled_exactly_for_the_wake_listed_personas(self) -> None:
         for persona in self.personas:
@@ -130,14 +133,24 @@ class FleetCompletenessTests(unittest.TestCase):
                 else:
                     self.assertNotIn("periodic.mailbox-wake.timer-enable", ops)
 
-    def test_every_seat_decommissions_the_ho_resumer_before_the_first_fire(self) -> None:
+    def test_the_ho_resumer_is_decommissioned_exactly_where_declared_before_the_first_fire(self) -> None:
+        declared = {
+            persona: self.manifest.binding(persona).legacy_units
+            for persona in self.personas
+            if self.manifest.binding(persona).legacy_units
+        }
+        self.assertEqual(declared, {"orchestrator": ("ho-resumer",), "codex": ("codex-keep-going",)})
         for persona in self.personas:
             with self.subTest(persona=persona):
                 plan = self.plans[persona]
                 ids = [op.operation_id for op in plan.operations]
-                op = self.ops(persona)["service.ho-resumer.decommission"]
+                if persona not in declared:
+                    self.assertNotIn("seat-service-decommission", {op.kind for op in plan.operations})
+                    continue
+                legacy_set = declared[persona][0]
+                op = self.ops(persona)[f"service.{legacy_set}.decommission"]
                 self.assertEqual(op.kind, "seat-service-decommission")
-                self.assertEqual(op.desired["units"], ",".join(HO_RESUMER_UNITS))
+                self.assertEqual(op.desired["units"], ",".join(LEGACY_UNIT_SETS[legacy_set]))
                 self.assertLess(ids.index(op.operation_id), ids.index("connective.unit-fire"))
 
     def test_every_periodic_and_the_controller_are_ordered_after_the_consume_timer(self) -> None:

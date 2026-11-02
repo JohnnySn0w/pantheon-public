@@ -1,0 +1,24 @@
+{
+  "mcpServers": {},
+  "projects": {
+    "/home/fixture": {
+      "mcpServers": {
+        "mailbox": {
+          "type": "stdio",
+          "command": "python3",
+          "args": ["/home/fixture/pantheon-config/tools/mailbox_mcp.py"],
+          "env": {}
+        }
+      }
+    },
+    "/home/fixture/work/explicit-project": {
+      "mcpServers": {
+        "sticker": {
+          "type": "stdio",
+          "command": "python3",
+          "args": ["/home/fixture/pantheon-config/tools/sticker_mcp.py"]
+        }
+      }
+    }
+  }
+}

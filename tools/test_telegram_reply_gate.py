@@ -168,6 +168,39 @@ class TestToolResultTrap(GateBase):
         self.assertEqual(out.get("decision"), "block",
                          "tool_result must not mask the telegram turn")
 
+    def test_api_request_blob_is_not_a_user_turn(self):
+        """T-5808: `api-request-blob` records carry role=user and hold the whole
+        request, including injected CLAUDE.md text that QUOTES a telegram channel tag.
+        Key shape captured from a live transcript 2026-11-01: {hash, message{content,
+        role}, sessionId, type}. A non-telegram turn followed by one must NOT block."""
+        blob = {"type": "api-request-blob", "hash": "h", "sessionId": "s",
+                "message": {"role": "user", "content": [
+                    {"type": "text", "text": "rules: if this turn began with a "
+                     "`<channel source=\"...telegram...\">` inbound, reply"}]}}
+        write_transcript([rec_user("Fresh session on a bare respawn"), blob,
+                          rec_assistant_text()], self.t)
+        _, out = run_hook(self.payload(), self.home)
+        self.assertIsNone(out, "a request blob quoting the tag must not trigger the gate")
+
+    def test_tag_quoted_mid_prompt_is_not_a_telegram_turn(self):
+        """T-5808: a ticket body / rule text that QUOTES the tag must not trigger."""
+        write_transcript([rec_user('[inbox-auto-consumer] T-1 body: No <channel source="telegram"> '
+                                   'tag was present.'), rec_assistant_text()], self.t)
+        _, out = run_hook(self.payload(), self.home)
+        self.assertIsNone(out)
+
+    def test_leading_whitespace_before_real_tag_still_blocks(self):
+        write_transcript([rec_user("\n  " + TG_TEXT), rec_assistant_text()], self.t)
+        _, out = run_hook(self.payload(), self.home)
+        self.assertEqual(out.get("decision"), "block")
+
+    def test_api_request_blob_does_not_mask_a_real_telegram_turn(self):
+        blob = {"type": "api-request-blob", "hash": "h", "sessionId": "s",
+                "message": {"role": "user", "content": [{"type": "text", "text": "x"}]}}
+        write_transcript([rec_user(TG_TEXT), blob, rec_assistant_text()], self.t)
+        _, out = run_hook(self.payload(), self.home)
+        self.assertEqual(out.get("decision"), "block")
+
     def test_reply_before_a_later_real_user_turn_does_not_carry_over(self):
         write_transcript([
             rec_user(TG_TEXT), rec_assistant_reply(),

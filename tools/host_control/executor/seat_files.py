@@ -22,6 +22,11 @@ EXACT object the caller classified: ``restore_file`` and ``remove_file``
 require the current file's sha256, ``remove_symlink`` the link's exact
 readlink text, and ``rmdir_if_empty`` never removes a non-empty directory
 (nothing here deletes recursively).
+
+T-5608 (the residue quarantine) adds ``rename_within``: a move of one entry
+to a new name, both ends inside the seat root and both parents walked the
+same way; it refuses an existing destination and never deletes. Plus two
+reads, ``lexists`` and ``list_dir``.
 """
 
 from __future__ import annotations
@@ -516,3 +521,86 @@ class SeatFiles:
             return True
         finally:
             os.close(parent)
+
+    # ------------------------------------------------------------------
+    # T-5608: the residue quarantine's move (and its two reads)
+    # ------------------------------------------------------------------
+
+    def lexists(self, target: str) -> bool:
+        """True when ANY object (a symlink included, never followed) is at
+        ``target``; False when it or its parent is absent. A symlinked or
+        foreign-owned path component is refused, never traversed."""
+
+        parts = self._relative(target)
+        try:
+            parent = self._open_parent(parts)
+        except _ParentMissing:
+            return False
+        try:
+            return self._final_stat(parent, parts[-1]) is not None
+        finally:
+            os.close(parent)
+
+    def list_dir(self, target: str) -> tuple[str, ...]:
+        """Sorted entry names of the owned directory at ``target``; empty
+        when it is absent. Read-only; the directory itself is opened with
+        ``O_NOFOLLOW``, so a symlink there is refused."""
+
+        parts = self._relative(target)
+        try:
+            parent = self._open_parent(parts)
+        except _ParentMissing:
+            return ()
+        try:
+            try:
+                directory = self._open_child(parent, parts[-1], owner_checked=True)
+            except _ParentMissing:
+                return ()
+        finally:
+            os.close(parent)
+        try:
+            return tuple(sorted(os.listdir(directory)))
+        finally:
+            os.close(directory)
+
+    def rename_within(self, source: str, destination: str) -> None:
+        """Move the executor-owned entry at ``source`` to ``destination``
+        (a new name; a symlink is moved as the link itself, never followed).
+        Refused, nothing changed: either end outside the seat root, a
+        missing or foreign-owned source, a missing destination parent, or
+        an EXISTING destination (never replaced). Once the rename has
+        committed, a failing directory sync raises ``SeatChangeIncomplete``.
+        The destination check and the rename share the destination parent's
+        descriptor; only the seat's own uid can write under its seat root."""
+
+        source_parts = self._relative(source)
+        destination_parts = self._relative(destination)
+        try:
+            source_parent = self._open_parent(source_parts)
+        except _ParentMissing as exc:
+            raise SeatPathRefused("move source parent is missing") from exc
+        try:
+            try:
+                destination_parent = self._open_parent(destination_parts)
+            except _ParentMissing as exc:
+                raise SeatPathRefused("move destination parent is missing") from exc
+            try:
+                existing = self._final_stat(source_parent, source_parts[-1])
+                if existing is None:
+                    raise SeatPathRefused("move source is absent")
+                self._check_owner(existing, "move source")
+                if self._final_stat(destination_parent, destination_parts[-1]) is not None:
+                    raise SeatPathRefused("move destination already exists; never replaced")
+                os.rename(
+                    source_parts[-1],
+                    destination_parts[-1],
+                    src_dir_fd=source_parent,
+                    dst_dir_fd=destination_parent,
+                )
+                # committed: the entry moved
+                self._sync_committed(destination_parent, "entry moved")
+                self._sync_committed(source_parent, "entry moved")
+            finally:
+                os.close(destination_parent)
+        finally:
+            os.close(source_parent)

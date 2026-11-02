@@ -90,6 +90,56 @@ _MAX_STATUSLINE_BYTES = 1024 * 1024
 _MAX_PROMPT_HISTORY_TAIL_BYTES = 256 * 1024
 _EMPTY_PASTED_CONTENTS_RE = re.compile(rb'"pastedContents":\s*\{\}')
 
+# T-5791 r1: line-anchored provider banners only, so prose that quotes a banner
+# ("the docs say 'Please run /login'", a test log's "Error 401 ...") never
+# matches. T-5803: the line must open with exactly one of Claude Code's own
+# message glyphs (●/⏺/⎿); bare, '>'- or '│'-prefixed lines (cat'd files,
+# quoted blocks, tool-output boxes) never count. Each pattern
+# is single-line (no re.S). Real banner: `● Please run /login · API Error: 401
+# Invalid authentication credentials`.
+_AUTH_BANNER_PREFIX = r"^\s*[●⏺⎿]\s+"
+_AUTHENTICATION_LOSS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("http-401", re.compile(
+        _AUTH_BANNER_PREFIX
+        + r"(?:Please run /login\s*·\s*)?API Error:\s*401\b[^\n]{0,200}?"
+        r"(?:Invalid authentication credentials|authentication_error)",
+    )),
+    ("account-disabled", re.compile(
+        _AUTH_BANNER_PREFIX
+        + r"(?:API Error:\s*40[0-3]\b[^\n]{0,200}?)?(?:Your |This )?(?:account|organization) "
+        r"(?:has been|was|is) (?:disabled|suspended|revoked)\b[^\n]{0,80}$",
+        re.I,
+    )),
+    ("login-required", re.compile(
+        _AUTH_BANNER_PREFIX
+        + r"(?:(?:Not logged in|Invalid API key|OAuth token (?:has been )?(?:revoked|expired))\s*[·-]\s*)?"
+        r"Please run /login\s*(?:·[^\n]{0,200})?$",
+    )),
+)
+#: Only the active prompt/error region is classified, never scrollback.
+AUTH_LOSS_ACTIVE_REGION_LINES = 12
+
+
+def classify_claude_authentication_loss(text: str) -> tuple[str, int] | None:
+    """Return (pattern_id, banner_line_count) for explicit provider auth loss, else None.
+
+    The banner must sit in the last AUTH_LOSS_ACTIVE_REGION_LINES non-empty lines.
+    banner_line_count counts every banner line in the capture, so a caller can
+    corroborate on a NEW failure (the count grew) instead of re-reading one
+    static pane."""
+    lines = [line for line in _normalize_provider_pane(text).split("\n") if line.strip()]
+
+    def match(line: str) -> str | None:
+        return next((pid for pid, pattern in _AUTHENTICATION_LOSS_PATTERNS if pattern.search(line)), None)
+
+    active = next(
+        (pid for line in reversed(lines[-AUTH_LOSS_ACTIVE_REGION_LINES:]) if (pid := match(line))),
+        None,
+    )
+    if active is None:
+        return None
+    return active, sum(1 for line in lines if match(line))
+
 
 def _normalize_provider_pane(text: str) -> str:
     return _ANSI_RE.sub("", text).replace("\r", "")
@@ -204,7 +254,8 @@ _MONTH_ABBR_TO_NUM = {
 # QUOTING the modal (sentinel + chrome + footer, byte-for-byte) still landed
 # inside that window whenever followed by 0-11 trailing lines of commentary.
 # Round 2 closes that gap two ways: (a) `_footer_is_final_line` below requires
-# the confirm/cancel footer to be the pane's absolute LAST non-blank line --
+# the confirm/cancel footer to be the pane's final modal line (allowing only
+# Claude's exact UI-owned background-task status row below it) --
 # structurally impossible for a quote followed by ANY further prose, and
 # always true for the Claude Code UI's own always-rendered input-box/status
 # tail once the modal actually closes; (b) this window shrinks from 20 to 16
@@ -227,6 +278,15 @@ _FOOTER_LINE_RE = re.compile(
     r"·[ \t ]*esc[ \t ]+to[ \t ]+cancel[ \t ]*$"
 )
 
+# Claude 5.5 may render this one UI-owned task-status row below an open modal
+# (observed live on Archivist, T-5744/T-5757). Keep the allowance exact and
+# single-line: arbitrary prose after the footer must still fail the structural
+# anchor that prevents transcript quotes from classifying.
+_BACKGROUND_TASK_MODAL_TAIL_RE = re.compile(
+    r"(?i)^[ \t ]*background[ \t ]+task[ \t ]+update[ \t ]+waiting[ \t ]+"
+    r"while[ \t ]+this[ \t ]+panel[ \t ]+is[ \t ]+open[ \t ]*$"
+)
+
 # T-4037 REBOUND round 2 Finding 2: the live modal marks its highlighted
 # option with "❯" immediately before the option text -- "❯ 1. Stop and wait
 # for limit to reset" (session/weekly/opus, real capture) / "❯ Adjust monthly
@@ -246,10 +306,21 @@ _SPEND_OPTION_GLYPH_RE = re.compile(
 )
 
 
+def _modal_anchored_lines(text: str) -> list[str]:
+    """Normalized pane lines with the one known modal-owned tail removed."""
+    normalized = _normalize_provider_pane(text).rstrip()
+    lines = normalized.splitlines()
+    if lines and _BACKGROUND_TASK_MODAL_TAIL_RE.fullmatch(lines[-1]):
+        lines.pop()
+        while lines and not lines[-1].strip():
+            lines.pop()
+    return lines
+
+
 def _footer_is_final_line(text: str) -> bool:
-    """True iff `text`'s absolute LAST non-empty line (after ANSI-strip and
-    trailing-blank-trim) is the modal's confirm/cancel footer (T-4037 REBOUND
-    round 2 Finding 1).
+    """True iff `text`'s final modal line (after ANSI-strip and removal of the
+    exact optional background-task UI row) is the confirm/cancel footer
+    (T-4037 REBOUND round 2 Finding 1; T-5744/T-5757).
 
     This is the structural anchor the round-2 reviewer's false positives all
     share: a pane sample that merely QUOTES the modal in conversation is, in
@@ -257,10 +328,9 @@ def _footer_is_final_line(text: str) -> bool:
     whenever the modal has genuinely closed -- by the Claude Code UI's own
     always-rendered input-box/prompt/status-line tail. Neither ever leaves
     the footer as the pane's final rendered content. A live, still-open modal
-    is the one case where nothing renders below it.
+    is the one case where only the exact optional task-status row may follow.
     """
-    normalized = _normalize_provider_pane(text).rstrip()
-    lines = normalized.splitlines()
+    lines = _modal_anchored_lines(text)
     if not lines:
         return False
     return _FOOTER_LINE_RE.fullmatch(lines[-1]) is not None
@@ -273,8 +343,7 @@ def _bottom_region(text: str) -> str:
     must gate on `_footer_is_final_line` first (T-4037 REBOUND round 2) --
     this function only tightens the SPAN of the window; it does not itself
     require the window to end at the footer."""
-    normalized = _normalize_provider_pane(text).rstrip()
-    lines = normalized.splitlines()
+    lines = _modal_anchored_lines(text)
     return "\n".join(lines[-_MID_SESSION_CAP_BOTTOM_REGION_LINES:])
 
 
@@ -544,9 +613,9 @@ def classify_claude_mid_session_cap(text: str, *, now: datetime) -> ClaudeMidSes
     ASCII prose that quoted the modal byte-for-byte and was followed by a
     SHORT amount of further text (0-11 trailing lines still fit inside that
     window). This function now additionally requires
-    `_footer_is_final_line`: the pane's absolute LAST non-blank line must be
-    the modal's own confirm/cancel footer. A live, still-open modal is always
-    the last thing rendered in a `capture-pane -p` sample; prose quoting it,
+    `_footer_is_final_line`: the modal's own confirm/cancel footer must be the
+    final modal line, with only the exact optional task-status row after it.
+    Prose quoting it,
     or the Claude Code UI's own always-rendered input-box/status tail once
     the modal has closed, is not. This is a single-sample, POSITION-anchored
     structural check -- strictly stronger than the round-1 substring window,
@@ -586,7 +655,7 @@ def classify_claude_mid_session_cap(text: str, *, now: datetime) -> ClaudeMidSes
     gates: (1) `_claude_cap_sentinel`'s exact "you've hit your
     (session|weekly|opus) limit · resets ..." phrase (CAP_SENTINELS); (2)
     `_footer_is_final_line` -- the modal's confirm/cancel footer must be the
-    pane's absolute LAST rendered line; (3) the "❯" selector glyph
+    final modal line (apart from the exact optional task-status row); (3) the "❯" selector glyph
     immediately adjacent to the modal's own highlighted option text, not
     merely present in the window (`_SESSION_OPTION_GLYPH_RE`/
     `_SPEND_OPTION_GLYPH_RE`); (4) TWO consecutive samples ~60s apart whose
@@ -1309,9 +1378,30 @@ class ClaudeHarnessAdapter(PantheonHarnessAdapter):
             if sample.sha256 != baseline.sha256
         )
         resolved_now = now if now is not None else datetime.now(timezone.utc)
+        # T-5791: the launch itself is the fresh event at post-start (the banner
+        # differs from the pre-launch baseline); two consecutive changed samples
+        # holding the same active-region banner corroborate it.
+        auth_candidate: str | None = None
+        auth_hits = 0
         for sample in sample_tuple:
             if sample.sha256 == baseline.sha256:
                 continue
+            auth = classify_claude_authentication_loss(sample.text)
+            if auth is not None:
+                if auth[0] == auth_candidate:
+                    auth_hits += 1
+                else:
+                    auth_candidate, auth_hits = auth[0], 1
+                if auth_hits >= 2:
+                    return PostStartAssessment(
+                        schema="pantheon-harness-post-start-assessment/v1",
+                        harness=harness, profile=profile, status="authentication-loss",
+                        cause="claude-authentication-loss", pattern_id=auth[0],
+                        baseline_sha256=baseline.sha256, capture_count=len(sample_tuple),
+                        changed_capture_indices=changed,
+                    )
+            else:
+                auth_candidate, auth_hits = None, 0
             pattern_id, cause = classify_claude_post_start_subscription_cap(
                 baseline_text=baseline.text,
                 sample_text=sample.text,

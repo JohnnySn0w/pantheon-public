@@ -55,10 +55,11 @@ RuntimeMode = Literal["interactive", "batch"]
 RuntimeMeter = Literal["subscription", "sdk-credit", "api", "enterprise"]
 QuotaSource = Literal["app-server", "statusline", "provider-api", "unavailable"]
 QuotaFreshness = Literal["fresh", "stale", "unavailable"]
-PostStartAssessmentStatus = Literal["ready", "subscription-cap", "unknown"]
+PostStartAssessmentStatus = Literal["ready", "subscription-cap", "authentication-loss", "unknown"]
 ProviderCompletionStatus = Literal[
     "provider-completed",
     "subscription-cap",
+    "authentication-loss",
     "operational-readiness",
     "not-applicable",
     "unknown",

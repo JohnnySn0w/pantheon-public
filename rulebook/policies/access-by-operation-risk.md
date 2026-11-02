@@ -1,6 +1,6 @@
 # Access by Operation Risk — which credential may live on which account
 
-**Status:** Proposed (drafted 2026-09-28 by Orchestrator for the operator's ratification; the carrier ticket names this file).
+**Status:** Withdrawn 2026-10-31. The operator rejected or redirected the surviving decision rows in TG 12648, and TG 12650 identified the missed T-4554 stale-record preflight. T-4133 and its implementation child were dropped. This file is retained as historical design evidence only; it is not authoritative and none of its reconciliation rows may be executed without fresh grounding and scope.
 **Author:** Orchestrator (Orchestrator), under T-2893.
 **Operationalizes:** ORG-075 decision D3: access is gated by the operation's blast radius and reversibility, not by the actor — least privilege, answered the same way for every actor including the HO.
 **Stays inside:** `trust-posture.md`'s reserved set. New credentials, wider scopes, access grants, anything that mints or reveals a secret, money, and outward-facing acts remain the operator's. This policy does not move any of them to the HO; where it proposes a carve-out, the row says **decide**.

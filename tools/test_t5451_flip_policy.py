@@ -22,7 +22,6 @@ from tools import persona_bringup
 from tools import persona_installer as pim
 from tools import runtime_controller as rc
 from tools.harness_adapter.diagnostics import (
-    flip_key_deprecations,
     flip_key_violations,
     resolve_controller_config,
 )
@@ -47,7 +46,7 @@ class QuotaAllowlistRetiredTests(unittest.TestCase):
         for persona, fallbacks, expect in (
             ("artisan", ("codex/x",), (True, "supported")),
             ("orchestrator", ("codex/x",), (True, "supported")),
-            ("archivist", (), (False, "no-manifest-fallback")),
+            ("archivist", ("codex/interactive-chatgpt",), (True, "supported")),
         ):
             binding = mock.Mock()
             binding.persona = persona
@@ -65,17 +64,8 @@ class QuotaAllowlistRetiredTests(unittest.TestCase):
                 pim.PersonaInstaller(REPO_ROOT).plan(manifest, "specialist", root=Path(tmp) / "r")
 
 
-EXPECTED_EXPLICIT_TRUE = {
-    ("head-engineering-orchestrator", "fallback_return"),
-    ("specialist", "fallback_return"),
-    ("head-system-orchestrator", "fallback_return"),
-    ("engineering-orchestrator-1", "mid_session_cap_swap"),
-    ("engineering-orchestrator-1", "fallback_return"),
-}
-
-
 class FlipKeysPhaseATests(unittest.TestCase):
-    """T-5446 Phase A: default ON; `true` tolerated (deprecated no-op); `false` forbidden."""
+    """T-5446 Phase B (T-5460): default ON; ANY presence of a retired key is a violation, ignored at runtime."""
 
     def test_defaults_are_on(self) -> None:
         self.assertTrue(RuntimeControllerConfig.__dataclass_fields__["mid_session_cap_swap_enabled"].default)
@@ -86,7 +76,7 @@ class FlipKeysPhaseATests(unittest.TestCase):
         self.assertTrue(controller.mid_session_cap_swap_enabled)
         self.assertTrue(controller.fallback_return_enabled)
 
-    def test_true_is_tolerated_silently_and_listed_as_deprecated(self) -> None:
+    def test_true_is_a_violation_but_silent_and_never_crashes_or_changes_the_flip(self) -> None:
         import warnings
 
         for key in ("mid_session_cap_swap", "fallback_return"):
@@ -97,8 +87,15 @@ class FlipKeysPhaseATests(unittest.TestCase):
                 controller = resolve_controller_config(manifest, persona="recovery", role="recovery")
             self.assertTrue(controller.mid_session_cap_swap_enabled)
             self.assertTrue(controller.fallback_return_enabled)
-            self.assertEqual(flip_key_violations(manifest), [])
-            self.assertEqual(flip_key_deprecations(manifest), [f"harness_runtime.roles.recovery.{key}"])
+            violations = flip_key_violations(manifest)
+            self.assertEqual(len(violations), 1)
+            self.assertIn(f"recovery.{key}=True", violations[0])
+            self.assertRegex(violations[0], r"remove the key.*T-5446/T-5460|T-5446/T-5460")
+
+    def test_flip_key_deprecations_is_retired(self) -> None:
+        import tools.harness_adapter.diagnostics as diag
+
+        self.assertFalse(hasattr(diag, "flip_key_deprecations"))
 
     def test_false_is_a_violation_but_never_crashes_or_disables_the_flip(self) -> None:
         for key in ("mid_session_cap_swap", "fallback_return"):
@@ -120,24 +117,21 @@ class FlipKeysPhaseATests(unittest.TestCase):
             self.assertTrue(controller.fallback_return_enabled)
             self.assertEqual(len(flip_key_violations(manifest)), 1)
 
-    def test_manifest_load_rejects_false(self) -> None:
-        raw = yaml.safe_load(INSTANCE.read_text(encoding="utf-8"))
-        raw["harness_runtime"]["roles"]["head-system-orchestrator"]["fallback_return"] = False
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "instance.yaml"
-            path.write_text(yaml.safe_dump(raw), encoding="utf-8")
-            with self.assertRaisesRegex(pim.ManifestError, r"T-5446.*TG 12274/12283"):
-                pim.Manifest.load(path)
+    def test_manifest_load_rejects_false_and_true(self) -> None:
+        for value in (False, True):
+            raw = yaml.safe_load(INSTANCE.read_text(encoding="utf-8"))
+            raw["harness_runtime"]["roles"]["head-system-orchestrator"]["fallback_return"] = value
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "instance.yaml"
+                path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+                with self.assertRaisesRegex(pim.ManifestError, r"T-5446"):
+                    pim.Manifest.load(path)
 
-    def test_instance_yaml_has_exactly_the_expected_explicit_true_keys_and_no_false(self) -> None:
+    def test_instance_yaml_has_no_retired_flip_keys(self) -> None:
         raw = yaml.safe_load(INSTANCE.read_text(encoding="utf-8"))
-        found = set()
         for role, body in raw["harness_runtime"]["roles"].items():
             for key in ("mid_session_cap_swap", "fallback_return"):
-                if key in body:
-                    self.assertIs(body[key], True, f"{role}.{key} must be an explicit true (never false)")
-                    found.add((role, key))
-        self.assertEqual(found, EXPECTED_EXPLICIT_TRUE)
+                self.assertNotIn(key, body, f"{role}.{key}: retired key must be absent (T-5460)")
         self.assertEqual(flip_key_violations(raw), [])
 
 
@@ -147,6 +141,13 @@ class RetiredFlipKeyControllerReportTests(unittest.TestCase):
     def _manifest_with_false(self, tmp: Path) -> Path:
         raw = yaml.safe_load(INSTANCE.read_text(encoding="utf-8"))
         raw["harness_runtime"]["roles"]["head-system-orchestrator"]["fallback_return"] = False
+        path = tmp / "instance.yaml"
+        path.write_text(yaml.safe_dump(raw), encoding="utf-8")
+        return path
+
+    def _manifest_with_true(self, tmp: Path) -> Path:
+        raw = yaml.safe_load(INSTANCE.read_text(encoding="utf-8"))
+        raw["harness_runtime"]["roles"]["head-system-orchestrator"]["fallback_return"] = True
         path = tmp / "instance.yaml"
         path.write_text(yaml.safe_dump(raw), encoding="utf-8")
         return path
@@ -162,20 +163,31 @@ class RetiredFlipKeyControllerReportTests(unittest.TestCase):
                 rc._report_retired_flip_keys("orchestrator", "head-engineering-orchestrator", path, state_root=root)
             self.assertEqual(alert.call_count, 1)
             events = [c[0][1] for c in ev.call_args_list]
-            self.assertEqual(events.count("retired_flip_key_ignored"), 1)
-            # orchestrator's role only carries a tolerated `true`: a deprecation note, never an alert
-            self.assertEqual(events.count("deprecated_flip_key_noop"), 1)
+            self.assertEqual(events, ["retired_flip_key_ignored"])
 
-    def test_true_key_records_one_deprecation_evidence_line_per_window_and_no_alert(self) -> None:
+    def test_re_added_true_key_is_reported_once_per_cooldown_as_a_violation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            path = self._manifest_with_true(root)
+            with mock.patch.object(rc, "_route_failure_alert") as alert, \
+                 mock.patch.object(rc, "_append_controller_evidence") as ev:
+                rc._report_retired_flip_keys("recovery", "head-system-orchestrator", path, state_root=root)
+                rc._report_retired_flip_keys("recovery", "head-system-orchestrator", path, state_root=root)
+                rc._report_retired_flip_keys("orchestrator", "head-engineering-orchestrator", path, state_root=root)
+            self.assertEqual(alert.call_count, 1)
+            events = [c[0][1] for c in ev.call_args_list]
+            self.assertEqual(events, ["retired_flip_key_ignored"])
+            self.assertNotIn("deprecated_flip_key_noop", events)
+
+    def test_clean_instance_yaml_reports_nothing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             with mock.patch.object(rc, "_route_failure_alert") as alert, \
                  mock.patch.object(rc, "_append_controller_evidence") as ev:
                 rc._report_retired_flip_keys("recovery", "head-system-orchestrator", INSTANCE, state_root=root)
-                rc._report_retired_flip_keys("recovery", "head-system-orchestrator", INSTANCE, state_root=root)
             alert.assert_not_called()
-            self.assertEqual(ev.call_count, 1)
-            self.assertEqual(ev.call_args[0][1], "deprecated_flip_key_noop")
+            ev.assert_not_called()
+            self.assertFalse(hasattr(rc, "_note_deprecated_flip_keys"))
 
     def test_never_raises_on_an_unreadable_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -423,8 +435,13 @@ class FalseFlipKeyCannotDisableTheSwapTests(unittest.TestCase):
             self.assertEqual(ev.call_args[0][1], "retired_flip_key_ignored")
 
     # T-5461: installer-tier tools load strictly by design; everything else is runtime-path.
+    # T-5533: the broker's strict frozen-manifest load moved from host_control/planner.py
+    # to the registration-time plan producer.
     STRICT_MANIFEST_LOADERS = frozenset({
-        "tools/host_control/planner.py",
+        # T-5091 U1: plan_install plans exactly what the installer would do, so it must refuse
+        # a bad flip key exactly where the installer does (strict = installer semantics).
+        "tools/germinate/components/harness-manager.py",
+        "tools/host_plan_producer.py",
         "tools/persona_installer.py",
         "tools/persona_installer_apply.py",
         "tools/persona_installer_verify_seat.py",
@@ -492,11 +509,11 @@ class FlipPolicyReportTests(unittest.TestCase):
 
         with mock.patch.object(fpr, "_comms_readiness", return_value="ready"):
             rows = {r["persona"]: r for r in fpr.build_report(INSTANCE, usage={"orchestrator": 96.0, "artisan": 80.0})}
-        self.assertIsNone(rows["archivist"]["fallback"])
+        self.assertEqual(rows["archivist"]["fallback"], ["codex/interactive-chatgpt"])
         self.assertTrue(rows["orchestrator"]["planned_transition_on_next_tick"])
         self.assertFalse(rows["artisan"]["planned_transition_on_next_tick"])
         self.assertIsNone(rows["recovery"]["planned_transition_on_next_tick"])  # usage not supplied
-        for persona in ("orchestrator", "artisan", "specialist", "recovery", "mason"):
+        for persona in ("orchestrator", "artisan", "specialist", "recovery", "mason", "archivist"):
             self.assertTrue(rows[persona]["quota_check_supported"])
             self.assertTrue(rows[persona]["mid_session_cap_swap"])
             self.assertTrue(rows[persona]["fallback_return"])

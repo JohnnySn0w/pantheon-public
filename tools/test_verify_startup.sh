@@ -273,6 +273,10 @@ preflight_codex_control_plane_idle() {
   printf '%s' "$CODEX_IDLE_PANE" > "$SBX/pane_text"
   fake_role_map control-plane
 }
+# Observed Watchman composer: this Codex build renders model + cwd but omits the
+# optional git-context suffix shown by the control-plane Codex build.
+WATCHMAN_CODEX_IDLE_PANE=$'› Improve documentation in @filename\n\n  gpt-5.6-sol high · ~/pantheon-config'
+preflight_watchman_codex_idle() { printf '%s' "$WATCHMAN_CODEX_IDLE_PANE" > "$SBX/pane_text"; }
 
 # Modal counterexample: an old composer may remain in scrollback while the live
 # bottom region is an approval dialog. The modal footer must veto the tempting
@@ -431,6 +435,7 @@ run_test auto_mode_nudge        7 --agent recovery   # T-4646
 run_test manual_mode_idle       0 --agent recovery
 run_test manual_mode_footer_only 0 --agent recovery
 run_test codex_control_plane_idle 0 --agent recovery
+run_test watchman_codex_idle     0 --agent watchman
 run_test codex_modal_stays_wedged 7 --agent recovery
 run_test capture_fails          0 --agent recovery
 run_test boot_dialog_dismissed  0 --agent recovery
@@ -507,13 +512,28 @@ postcheck_control_plane_no_telegram_is_poller_na() {
 run_test control_plane_no_telegram_is_poller_na 0 --agent artisan
 
 echo "=== T-2210: every seat is addressable ==="
-for a in recovery orchestrator specialist archivist mason artisan codex; do
+for a in recovery orchestrator specialist archivist mason artisan codex watchman; do
   if bash "$SUT" --agent "$a" --self --no-dewedge >/dev/null 2>&1 || [ $? -ne 64 ]; then
     echo "  PASS: $a is a known agent"; PASS=$((PASS+1))
   else
     echo "  FAIL: $a not in the agent table"; FAIL=$((FAIL+1)); FAILED_TESTS+=("agent_$a")
   fi
 done
+
+echo "=== T-5748: Watchman startup-contract topology ==="
+watchman_contract=0
+grep -q '\[watchman\]=codex-fallback' "$SUT" || { echo "  FAIL: Watchman account missing"; watchman_contract=1; }
+grep -q '\[watchman\]=codex-fallback-main:0' "$SUT" || { echo "  FAIL: Watchman pane missing"; watchman_contract=1; }
+grep -q '\[watchman\]=pantheon-runtime-controller@watchman.service' "$SUT" || { echo "  FAIL: Watchman controller unit missing"; watchman_contract=1; }
+grep -q '\[watchman\]=0' "$SUT" || { echo "  FAIL: Watchman must not require a Telegram poller"; watchman_contract=1; }
+grep -q '\[watchman\]=/home/codex-fallback' "$SUT" || { echo "  FAIL: Watchman home missing"; watchman_contract=1; }
+grep -q '\[watchman\]=codex' "$SUT" || { echo "  FAIL: Watchman Codex harness missing"; watchman_contract=1; }
+if [[ "$watchman_contract" == 0 ]]; then
+  echo "  PASS: Watchman account/pane/controller/no-poller/home/harness contract"
+  PASS=$((PASS+1))
+else
+  FAIL=$((FAIL+1)); FAILED_TESTS+=("watchman_contract")
+fi
 
 # --- constants must stay byte-equal with handoff_and_restart.sh (drift guard) ---
 echo "=== constant-drift guard ==="

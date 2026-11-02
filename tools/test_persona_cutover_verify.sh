@@ -371,6 +371,14 @@ run_cutover_case() { # <persona> <account> <uid> <supervise-basename>
   #    deterministically from this seat (PCX_APPLY_PATH is a hardcoded
   #    per-account absolute path we have no access to). This is the approved
   #    scope boundary: we do not chase further.
+  # T-5669: on the persona's OWN seat the install-done precondition legitimately
+  # passes (PCX_APPLY_PATH is reachable), so the script would continue into a dry
+  # run of a cutover of the live caller's seat. Never drive that from a test.
+  if [[ "$(id -u)" == "$uid" ]]; then
+    skip "cutover(${persona}): stubbed-uid case (running as ${account} itself: the precondition passes on its own seat — T-5669)"
+    rm -f "$unit_file"
+    return 0
+  fi
   out="$(FAKE_UID="$uid" PATH="$FAKEBIN2:$PATH" bash "$CUTOVER" --persona "$persona" --stamp t1 --manifest "$INSTANCE_YAML" --unit-file "$unit_file" 2>&1)"; rc=$?
   check "cutover(${persona}): stubbed uid passes guard, dies rc 1" "$rc" "1"
   if user_bus_present "$uid"; then

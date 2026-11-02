@@ -261,6 +261,31 @@ class TokenReaderTests(unittest.TestCase):
             self.assertTrue(_wait(lambda: "signal" in h.calls, 30), h.calls)    # valid token acted on
 
 
+class ProcessTapLifecycleTests(unittest.TestCase):
+    def test_stop_closes_owned_pipes_and_is_idempotent(self):
+        events = queue.Queue()
+        prog = ("import sys\n"
+                "sys.stdout.write('R\\n'); sys.stdout.flush()\n"
+                "sys.stdin.read()\n")
+        tap = hw.ProcessTap(
+            hw.TapSpec("lifecycle", "system", "i"), events, SudoReader(),
+            argv=[sys.executable, "-I", "-c", prog])
+        self.addCleanup(tap.stop)
+        self.assertEqual(events.get(timeout=5), ("lifecycle", "ready"))
+        proc = tap.proc
+        self.assertIsNotNone(proc)
+        self.assertFalse(proc.stdin.closed)
+        self.assertFalse(proc.stdout.closed)
+
+        tap.stop()
+
+        self.assertEqual(proc.poll(), 0)
+        self.assertTrue(proc.stdin.closed)
+        self.assertTrue(proc.stdout.closed)
+        self.assertFalse(tap._pump_thread.is_alive())
+        tap.stop()  # repeated watcher shutdown is deliberately harmless
+
+
 class TapArgvTests(unittest.TestCase):
     def _sudo(self):
         with mock.patch.object(hc.pwd, "getpwuid") as g:

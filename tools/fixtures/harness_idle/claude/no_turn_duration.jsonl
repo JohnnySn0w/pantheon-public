@@ -1,0 +1,8 @@
+{"type":"user","timestamp":"2026-10-13T12:28:05.650Z","turnOrigin":"human"}
+{"type":"attachment","timestamp":"2026-10-13T12:28:05.648Z"}
+{"type":"assistant","timestamp":"2026-10-13T12:28:08.136Z","message":{"stop_reason":"tool_use"}}
+{"type":"user","timestamp":"2026-10-13T12:28:08.453Z","message":{"content":[{"type":"tool_result"}]}}
+{"type":"attachment","timestamp":"2026-10-13T12:28:08.475Z"}
+{"type":"assistant","timestamp":"2026-10-13T12:28:10.164Z","message":{"stop_reason":"end_turn"}}
+{"type":"system","subtype":"stop_hook_summary","timestamp":"2026-10-13T12:28:10.439Z"}
+{"type":"file-history-snapshot"}

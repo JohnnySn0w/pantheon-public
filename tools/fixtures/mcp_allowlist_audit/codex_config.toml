@@ -1,0 +1,3 @@
+[mcp_servers.telegram]
+command = "python3"
+args = ["/home/fixture/pantheon-config/tools/codex_telegram_bridge.py", "exec", "--mode", "server"]

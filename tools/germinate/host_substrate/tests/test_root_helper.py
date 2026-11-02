@@ -29,7 +29,7 @@ BASE = {
     "accounts": {"alice": {"uid": 3101, "home": "/home/alice", "shell": "/bin/bash", "linger": True, "groups": ["pmail"]},
                  "bob": {"uid": 3102, "home": "/home/bob", "shell": "/bin/bash"}},
     "installer_roots": ["/srv/pantheon"],
-    "paths": {"/srv/pantheon/shared": {"owner": "alice", "group": "pmail", "mode": "0750", "acl": ["user::rwx", "group::r-x", "other::---", "group:pmail:r-x"]}},
+    "paths": {"/srv/pantheon/shared": {"owner": "alice", "group": "pmail", "mode": "0750", "acl": ["user::rwx", "group::r-x", "other::---", "group:pmail:r-x", "mask::r-x"]}},
     "mailbox_dirs": {"alice": {"path": "/srv/pantheon/mbox-alice", "owner": "alice", "group": "pmail", "mode": "2770"}},
     "units": {"x.service": {"path": "/etc/systemd/system/x.service", "source": "x.service", "sha256": "a" * 64, "enable": True}},
     "dbus_policies": {},
@@ -493,12 +493,12 @@ def test_argv_is_fixed_lists_of_absolute_binaries():
         ("group.member", (("account", "alice"), ("group", "pmail"), ("state", "present"))): [["/usr/bin/gpasswd", "--add", "alice", "pmail"]],
         ("linger.enable", (("account", "alice"),)): [["/usr/bin/loginctl", "enable-linger", "alice"]],
         ("unit.system.enable", (("state", "enabled"), ("unit", "x.service"))): [["/usr/bin/systemctl", "enable", "x.service"]],
-        ("acl.converge", (("path", "/srv/pantheon/shared"),)): [["/usr/bin/setfacl", "--set", "group::r-x,group:pmail:r-x,other::---,user::rwx", "/srv/pantheon/shared"]],
+        ("acl.converge", (("path", "/srv/pantheon/shared"),)): [["/usr/bin/setfacl", "--physical", "--set", "group::r-x,group:pmail:r-x,mask::r-x,other::---,user::rwx", "/srv/pantheon/shared"]],
         # T-5513: GNU chmod keeps a DIRECTORY's setuid/setgid bits for a 4-digit numeric mode
         # (2770 -> chmod 0000 -> 2000; 2770 -> chmod 0750 -> 2750). A fifth leading zero makes
         # the numeric mode exact, so chmod argv is always 5-digit.
         ("owner_mode.set", (("path", "/srv/pantheon/shared"),)): [
-            ["/usr/bin/chown", "alice:pmail", "/srv/pantheon/shared"], ["/usr/bin/chmod", "00750", "/srv/pantheon/shared"]],
+            ["/usr/bin/chown", "-h", "alice:pmail", "/srv/pantheon/shared"], ["/usr/bin/chmod", "00750", "/srv/pantheon/shared"]],
         ("mailbox_dir.retire", (("mailbox", "alice"),)): [["/usr/bin/chmod", "00000", "/srv/pantheon/mbox-alice"]],
     }
     for (family, params), want in golden.items():
@@ -578,11 +578,11 @@ def test_acl_without_base_entries_is_refused(acl, missing):
 
 
 def test_acl_with_access_and_default_base_entries_is_accepted():
-    acl = ["user::rwx", "group::r-x", "other::---", "group:pmail:r-x",
-           "default:user::rwx", "default:group::r-x", "default:other::---", "default:group:pmail:r-x"]
+    acl = ["user::rwx", "group::r-x", "other::---", "group:pmail:r-x", "mask::r-x",
+           "default:user::rwx", "default:group::r-x", "default:other::---", "default:group:pmail:r-x", "default:mask::r-x"]
     m = _acl_manifest(acl)
     (argv,) = P.apply_argv(F.resolve("acl.converge", {"path": "/srv/pantheon/shared"}, m))
-    assert argv[:2] == ["/usr/bin/setfacl", "--set"] and set(argv[2].split(",")) == set(acl)
+    assert argv[:3] == ["/usr/bin/setfacl", "--physical", "--set"] and set(argv[3].split(",")) == set(acl)
 
 
 def test_acl_converge_refuses_an_empty_entry_list():
@@ -614,3 +614,400 @@ def test_every_chmod_argv_is_an_exact_five_digit_mode():
                 F.resolve("mailbox_dir.retire", {"mailbox": "alice"}, m)]
     chmods = [argv for r in resolved for argv in P.apply_argv(r) if argv[0] == P.CHMOD]
     assert chmods and all(len(a[1]) == 5 and a[1][0] == "0" for a in chmods)
+
+
+# --- T-2920 U3c: the full approved-argv surface (captured from main e1ce3dd42) ----------
+
+_STAGED = "/run/pantheon/host-substrate/stage/abc"
+_A, _B = "a" * 64, "b" * 64
+_SUDO_SHA = "e61d5c8006f3dddffdd59ab6bfd626ca2c9a2a6981ed1281eb1f57f525551924"
+#: Every family's apply_argv. Captured by diffing main's ports.py against this branch over
+#: every family: ONLY acl.converge (+--physical) and owner_mode.set (chown +-h) differ
+#: (T-5653, Recovery D15). Every other row is byte-identical to main.
+FULL_SURFACE = [
+    ("account.ensure", {"account": "alice"}, None, [
+        ["/usr/sbin/groupadd", "--gid", "3101", "alice"],
+        ["/usr/sbin/useradd", "--uid", "3101", "--gid", "3101", "--home-dir", "/home/alice", "--create-home", "--shell", "/bin/bash", "alice"]]),
+    ("account.retire", {"account": "alice"}, None, [["/usr/sbin/usermod", "--lock", "--expiredate", "1", "alice"]]),
+    ("group.ensure", {"group": "pmail"}, None, [["/usr/sbin/groupadd", "--gid", "3001", "pmail"]]),
+    ("group.member", {"group": "pmail", "account": "alice", "state": "present"}, None, [["/usr/bin/gpasswd", "--add", "alice", "pmail"]]),
+    ("group.member", {"group": "pmail", "account": "alice", "state": "absent"}, None, [["/usr/bin/gpasswd", "--delete", "alice", "pmail"]]),
+    ("acl.converge", {"path": "/srv/pantheon/shared"}, None, [
+        ["/usr/bin/setfacl", "--physical", "--set", "group::r-x,group:pmail:r-x,mask::r-x,other::---,user::rwx", "/srv/pantheon/shared"]]),
+    ("owner_mode.set", {"path": "/srv/pantheon/shared"}, None, [
+        ["/usr/bin/chown", "-h", "alice:pmail", "/srv/pantheon/shared"], ["/usr/bin/chmod", "00750", "/srv/pantheon/shared"]]),
+    ("sudoers_fragment.ensure", {"template": "alice-probe", "sha256": _SUDO_SHA}, _STAGED, [
+        ["/usr/bin/install", "-o", "root", "-g", "root", "-m", "0440", _STAGED, "/etc/sudoers.d/pantheon-alice-probe.pantheon-tmp"],
+        ["/usr/sbin/visudo", "-cf", "/etc/sudoers.d/pantheon-alice-probe.pantheon-tmp"],
+        ["/usr/bin/mv", "-f", "--", "/etc/sudoers.d/pantheon-alice-probe.pantheon-tmp", "/etc/sudoers.d/pantheon-alice-probe"],
+        ["/usr/sbin/visudo", "-c"], ["/usr/bin/sudo", "-l", "-U", "alice"]]),
+    ("sudoers_fragment.retire", {"template": "alice-probe"}, None, [
+        ["/usr/bin/unlink", "/etc/sudoers.d/pantheon-alice-probe"], ["/usr/sbin/visudo", "-c"]]),
+    ("unit.system.install", {"unit": "x.service", "state": "present", "sha256": _A}, _STAGED, [
+        ["/usr/bin/install", "-o", "root", "-g", "root", "-m", "0644", _STAGED, "/etc/systemd/system/x.service"],
+        ["/usr/bin/systemctl", "daemon-reload"]]),
+    ("unit.system.install", {"unit": "x.service", "state": "absent", "sha256": _A}, None, [
+        ["/usr/bin/unlink", "/etc/systemd/system/x.service"], ["/usr/bin/systemctl", "daemon-reload"]]),
+    ("unit.system.enable", {"unit": "x.service", "state": "enabled"}, None, [["/usr/bin/systemctl", "enable", "x.service"]]),
+    ("unit.system.enable", {"unit": "x.service", "state": "disabled"}, None, [["/usr/bin/systemctl", "disable", "x.service"]]),
+    ("dbus_policy.install", {"policy": "p", "sha256": _B}, _STAGED, [
+        ["/usr/bin/install", "-o", "root", "-g", "root", "-m", "0644", _STAGED, "/etc/dbus-1/system.d/org.pantheon.X.conf"],
+        ["/usr/bin/systemctl", "reload", "dbus.service"]]),
+    ("dbus_policy.retire", {"policy": "p"}, None, [
+        ["/usr/bin/unlink", "/etc/dbus-1/system.d/org.pantheon.X.conf"], ["/usr/bin/systemctl", "reload", "dbus.service"]]),
+    ("mailbox_dir.ensure", {"mailbox": "alice"}, None, [
+        ["/usr/bin/install", "-d", "-o", "alice", "-g", "pmail", "-m", "2770", "/srv/pantheon/mbox-alice"]]),
+    ("mailbox_dir.retire", {"mailbox": "alice"}, None, [["/usr/bin/chmod", "00000", "/srv/pantheon/mbox-alice"]]),
+    ("linger.enable", {"account": "alice"}, None, [["/usr/bin/loginctl", "enable-linger", "alice"]]),
+    ("linger.disable", {"account": "alice"}, None, [["/usr/bin/loginctl", "disable-linger", "alice"]]),
+]
+
+
+def _surface_manifest():
+    doc = copy.deepcopy(BASE)
+    doc["dbus_policies"] = {"p": {"path": "/etc/dbus-1/system.d/org.pantheon.X.conf", "source": "p.conf", "sha256": _B}}
+    return F.load_manifest(doc)
+
+
+def test_the_full_apply_argv_surface_is_pinned_for_every_family():
+    m = _surface_manifest()
+    assert {row[0] for row in FULL_SURFACE} == F.FAMILIES
+    for family, params, staged, want in FULL_SURFACE:
+        assert P.apply_argv(F.resolve(family, params, m), staged_source=staged) == want, family
+    r = F.resolve("account.ensure", {"account": "alice"}, m)
+    rr = F.resolve("account.retire", {"account": "alice"}, m)
+    assert P.rollback_argv(r, None) == [["/usr/sbin/userdel", "alice"], ["/usr/sbin/groupdel", "alice"]]
+    assert P.rollback_argv(rr, dict(rr.after, locked=False)) == [["/usr/sbin/usermod", "--unlock", "--expiredate", "", "alice"]]
+    assert P.rollback_argv(rr, dict(rr.after)) == []
+
+
+def test_the_two_ruled_argv_carry_physical_and_no_dereference_exactly_once():
+    """T-5653 (Recovery, D15): setfacl --physical, chown -h; nothing else gains a flag."""
+    m = _surface_manifest()
+    (setfacl,) = P.apply_argv(F.resolve("acl.converge", {"path": "/srv/pantheon/shared"}, m))
+    chown, chmod = P.apply_argv(F.resolve("owner_mode.set", {"path": "/srv/pantheon/shared"}, m))
+    assert setfacl[:3] == [P.SETFACL, "--physical", "--set"] and setfacl.count("--physical") == 1
+    assert chown[:2] == [P.CHOWN, "-h"] and chown.count("-h") == 1 and "--no-dereference" not in chown
+    assert chmod == [P.CHMOD, "00750", "/srv/pantheon/shared"]
+    flagged = [a for _f, _p, _s, argvs in FULL_SURFACE for a in argvs if "--physical" in a or "-h" in a]
+    assert flagged == [setfacl, chown]
+
+
+def test_the_residual_toctou_is_recorded_beside_the_argv():
+    src = (PKG / "ports.py").read_text(encoding="utf-8")
+    assert "RESIDUAL TOCTOU (T-5653" in src and "INTERMEDIATE path component" in src
+    assert "installer roots (and every directory above a" in src
+
+
+# --- T-2920 U3c: the T-5653 mask rule (Recovery, D15) -----------------------------------------
+
+_B3 = ["user::rwx", "group::r-x", "other::---"]
+_D3 = ["default:user::rwx", "default:group::r-x", "default:other::---"]
+
+
+@pytest.mark.parametrize(
+    "mode, acl, match",
+    [
+        ("0750", [*_B3, "mask::r-x"], "a lone mask:: "),
+        ("0750", [*_B3, *_D3, "default:mask::r-x"], "a lone default:mask:: "),
+        # T-5665 subsumes T-5653's at-most-one-mask check (one entry per prefix, tag, qualifier)
+        ("0750", [*_B3, "group:pmail:r-x", "mask::r-x", "mask::r--"],
+         r"'mask::r-x' and 'mask::r--' both set mask:: .*T-5665"),
+        ("0750", [*_B3, "group:pmail:r-x", "mask::r-x", *_D3, "default:group:pmail:r-x", "default:mask::r-x",
+                  "default:mask::rwx"], r"'default:mask::r-x' and 'default:mask::rwx' both set default:mask:: .*T-5665"),
+        ("0750", [*_B3, "group:pmail:r-x", "mask::rwx"], r"mask::rwx must equal the mode's group bits r-x"),
+        ("2770", [*_B3, "group:pmail:r-x", "mask::r-x"], r"mask::r-x must equal the mode's group bits rwx"),
+    ],
+    ids=["lone-mask", "lone-default-mask", "duplicate-mask", "duplicate-default-mask", "mask-rwx-mode-0750",
+         "mask-vs-setgid-mode"],
+)
+def test_the_mask_rule_refuses(mode, acl, match):
+    with pytest.raises(F.ManifestError, match=match):
+        manifest(paths={"/srv/pantheon/shared": {"owner": "alice", "group": "pmail", "mode": mode, "acl": acl}})
+
+
+@pytest.mark.parametrize(
+    "mode, acl",
+    [
+        ("0750", [*_B3, "group:pmail:r-x", "mask::r-x"]),
+        ("0770", [*_B3, "user:bob:rwx", "mask::rwx"]),
+        ("2750", [*_B3, "group:pmail:r-x", "mask::r-x", *_D3, "default:user:bob:rwx", "default:mask::rwx"]),
+        ("0700", [*_B3, "group:pmail:---", "mask::---"]),
+    ],
+    ids=["mask-equals-group-bits", "rwx", "default-mask-has-no-mode-constraint", "empty-mask"],
+)
+def test_the_mask_rule_accepts_a_mask_matching_the_mode(mode, acl):
+    manifest(paths={"/srv/pantheon/shared": {"owner": "alice", "group": "pmail", "mode": mode, "acl": acl}})
+
+
+def test_the_live_component_manifest_satisfies_the_mask_rule():
+    import yaml
+
+    doc = yaml.safe_load((PKG.parent / "components" / "host-substrate.manifest.yaml").read_text(encoding="utf-8"))
+    F.load_manifest(doc)
+
+
+# --- T-2920 U3c: the symlink guard (Recovery, T-5653 D15), simulated tier ---------------------
+
+_GUARDED = [
+    ("acl.converge", {"path": "/srv/pantheon/shared"}, "/srv/pantheon/shared"),
+    ("owner_mode.set", {"path": "/srv/pantheon/shared"}, "/srv/pantheon/shared"),
+    ("mailbox_dir.ensure", {"mailbox": "alice"}, "/srv/pantheon/mbox-alice"),
+    ("mailbox_dir.retire", {"mailbox": "alice"}, "/srv/pantheon/mbox-alice"),
+]
+
+
+@pytest.mark.parametrize("family, params, path", _GUARDED, ids=[g[0] for g in _GUARDED])
+@pytest.mark.parametrize("phase", [Hp.ACTIVATE, Hp.STAGE])
+def test_a_symlink_subject_is_refused_in_preflight_loudly(family, params, path, phase):
+    port = SpyPort()
+    port.state["path_types"][path] = "symbolic link"
+    h = helper(port=port)
+    step = h.admit(family, params, phase)
+    ev = h.preflight(step)
+    assert not ev.ok and ev.data["code"] == "SYMLINK_SUBJECT_REFUSED"
+    assert ev.detail.startswith("SYMLINK_SUBJECT_REFUSED: " + path + " is a symbolic link")
+    with pytest.raises(Hp.SymlinkSubjectRefused, match="symbolic link") as exc:
+        h.apply(step)
+    assert exc.value.code == "SYMLINK_SUBJECT_REFUSED" and isinstance(exc.value, Hp.PreflightRefused)
+    assert port.dump()["subjects"] == {}  # nothing was written
+
+
+@pytest.mark.parametrize("family, params, path", _GUARDED, ids=[g[0] for g in _GUARDED])
+def test_a_non_symlink_subject_passes_the_guard(family, params, path):
+    port = SpyPort()
+    port.state["path_types"][path] = "directory"
+    h = helper(port=port)
+    step = h.admit(family, params, Hp.ACTIVATE)
+    h.apply(step)
+    assert h.verify(step).ok
+
+
+def test_unguarded_families_never_type_a_path():
+    class Strict(SpyPort):
+        def path_type(self, path):
+            raise AssertionError("path_type called for an unguarded family")
+
+    h = helper(port=Strict())
+    for family, params in (("account.ensure", {"account": "alice"}), ("group.ensure", {"group": "pmail"}),
+                           ("linger.enable", {"account": "alice"})):
+        h.apply(h.admit(family, params, Hp.ACTIVATE))
+
+
+def test_an_untypable_subject_fails_closed():
+    class Broken(SpyPort):
+        def path_type(self, path):
+            raise P.ObservationError("stat exited 5")
+
+    h = helper(port=Broken())
+    step = h.admit("owner_mode.set", {"path": "/srv/pantheon/shared"}, Hp.ACTIVATE)
+    ev = h.preflight(step)
+    assert not ev.ok and "could not type the subject path" in ev.detail
+    with pytest.raises(Hp.PreflightRefused, match="could not type"):
+        h.apply(step)
+
+
+@pytest.mark.parametrize("family, params, path", _GUARDED, ids=[g[0] for g in _GUARDED])
+def test_restore_and_guarded_put_refuse_a_symlink_subject(family, params, path):
+    """T-5653 'guard ALL path-taking actuation': a restore re-applies argv on the path."""
+    port = SpyPort()
+    h = helper(port=port)
+    step = h.admit(family, params, Hp.ACTIVATE)
+    before = h.apply(step)
+    port.state["path_types"][path] = "symbolic link"  # swapped after apply
+    after = port.dump()["subjects"]
+    with pytest.raises(Hp.SymlinkSubjectRefused):
+        h.restore(step, before)
+    with pytest.raises(Hp.SymlinkSubjectRefused):
+        h.guarded_put(step.subject, before)
+    assert port.dump()["subjects"] == after
+
+
+@pytest.mark.parametrize("ftype", ["symbolische Verknüpfung", "fifo", ""])
+def test_a_type_outside_the_allowlist_is_refused_not_read_as_safe(ftype):
+    """Review MED-1: the guard allowlists the C-locale %F texts; it never treats an
+    unknown type as 'not a symlink'."""
+    port = SpyPort()
+    port.state["path_types"]["/srv/pantheon/shared"] = ftype
+    h = helper(port=port)
+    step = h.admit("owner_mode.set", {"path": "/srv/pantheon/shared"}, Hp.ACTIVATE)
+    ev = h.preflight(step)
+    assert not ev.ok and "unrecognised file type" in ev.detail
+    with pytest.raises(Hp.PreflightRefused, match="unrecognised file type"):
+        h.apply(step)
+    assert port.dump()["subjects"] == {}
+
+
+def test_simulated_path_types_load_backward_compatibly():
+    port = P.SimulatedSubstratePort({"subjects": {"group:pmail": {"gid": 3001}}, "visudo": {}})
+    assert port.path_type("/srv/pantheon/shared") is None and port.dump()["path_types"] == {}
+    port.load({"subjects": {}, "visudo": {}, "path_types": {"/srv/x": "symbolic link"}})
+    assert port.path_type("/srv/x") == "symbolic link"
+
+
+# --- T-5657 (Recovery, D15): the ancestor walk on the simulated tier -----------------------
+
+
+def test_simulated_path_stats_model_a_correct_host_with_explicit_overrides():
+    port = P.SimulatedSubstratePort()
+    assert port.path_stat("/srv") == P.SIMULATED_TRUSTED_DIR == ("directory", "root", "root", "0755")
+    port.state["path_stats"]["/srv"] = ("directory", "bob", "bob", "0755")
+    port.state["path_stats"]["/gone"] = None
+    assert port.path_stat("/srv") == ("directory", "bob", "bob", "0755") and port.path_stat("/gone") is None
+    port.put("owner_mode:/srv/pantheon", {"owner": "alice", "group": "pmail", "mode": "0770"})
+    assert port.path_stat("/srv/pantheon") == ("directory", "alice", "pmail", "0770")  # a converged ancestor is seen
+
+
+def test_simulated_path_stats_load_backward_compatibly():
+    port = P.SimulatedSubstratePort({"subjects": {}, "visudo": {}, "path_types": {}})
+    assert port.dump()["path_stats"] == {}
+    port.load({"subjects": {}, "visudo": {}, "path_stats": {"/srv": ["directory", "root", "root", "0777"]}})
+    assert port.path_stat("/srv") == ("directory", "root", "root", "0777")
+
+
+def test_the_simulated_walk_sees_an_earlier_op_make_an_ancestor_untrusted():
+    """No cache, on the wired tier: a manifest that converges an ancestor to a g+w mode
+    makes every subject below it refuse in the SAME run."""
+    m = manifest(paths={"/srv/pantheon": {"owner": "root", "group": "pmail", "mode": "0770"},
+                        "/srv/pantheon/shared": {"owner": "alice", "group": "pmail", "mode": "0750"}})
+    h = Hp.RootHelper(P.SimulatedSubstratePort(), m, Hp.BOOTSTRAP)
+    h.apply(h.admit("owner_mode.set", {"path": "/srv/pantheon"}, Hp.ACTIVATE))
+    with pytest.raises(Hp.AncestorRefused, match="ancestor /srv/pantheon is group-writable"):
+        h.apply(h.admit("owner_mode.set", {"path": "/srv/pantheon/shared"}, Hp.ACTIVATE))
+
+
+def test_the_component_rollback_path_is_walked_too():
+    port = P.SimulatedSubstratePort()
+    h = Hp.RootHelper(port, manifest(), Hp.BOOTSTRAP)
+    port.state["path_stats"]["/srv"] = ("directory", "root", "root", "0757")
+    with pytest.raises(Hp.AncestorRefused, match="ancestor /srv is other-writable"):
+        h.guarded_put("acl:/srv/pantheon/shared", None)
+
+
+# --- T-5665 (Recovery, D15): at most one ACL entry per (prefix, tag, qualifier) --------------
+
+
+@pytest.mark.parametrize(
+    "acl, first, second, key",
+    [
+        (["user::rwx", "user::r-x", "group::r-x", "other::---"], "user::rwx", "user::r-x", "user::"),
+        (["user::rwx", "group::r-x", "other::---", "group:pmail:r-x", "group:pmail:r--", "mask::r-x"],
+         "group:pmail:r-x", "group:pmail:r--", "group:pmail:"),
+        (["user::rwx", "group::r-x", "other::---", "default:user::rwx", "default:user::r-x", "default:group::r-x",
+          "default:other::---"], "default:user::rwx", "default:user::r-x", "default:user::"),
+        (["user::rwx", "group::r-x", "group::rwx", "other::---", "group:pmail:r-x", "mask::r-x"],
+         "group::r-x", "group::rwx", "group::"),
+        (["user::rwx", "group::r-x", "other::---", "user:bob:rwx", "user:bob:rwx", "mask::rwx"],
+         "user:bob:rwx", "user:bob:rwx", "user:bob:"),
+    ],
+    ids=["duplicate-user-base", "duplicate-named-qualifier", "duplicate-default", "two-group-base-with-named",
+         "exact-duplicate"],
+)
+def test_two_acl_entries_with_one_key_are_refused_naming_both(acl, first, second, key):
+    """Fails first on main (captured in the U3d report): all of these LOADED there; real
+    setfacl --set keeps the last one, so verify would never converge."""
+    with pytest.raises(F.ManifestError, match=re.escape(f"{first!r} and {second!r} both set {key} ") + ".*T-5665"):
+        manifest(paths={"/srv/pantheon/shared": {"owner": "alice", "group": "pmail", "mode": "0750", "acl": acl}})
+
+
+def test_the_same_qualifier_under_different_prefixes_or_tags_is_not_a_duplicate():
+    manifest(paths={"/srv/pantheon/shared": {"owner": "alice", "group": "pmail", "mode": "0750", "acl": [
+        "user::rwx", "group::r-x", "other::---", "user:alice:rwx", "group:alice:r-x", "mask::r-x",
+        "default:user::rwx", "default:group::r-x", "default:other::---", "default:user:alice:rwx",
+        "default:mask::rwx"]}})
+
+
+@pytest.mark.parametrize(
+    "entry",
+    ["user:65534:r--", "group:3001:r-x", "default:user:65534:r--", "u:alice:rwx", "g::r-x", "o::---", "m::r-x",
+     "d:user:alice:rwx", "d:u:alice:rwx", "default:u:alice:rwx", "user:Alice:rwx"],
+)
+def test_the_acl_grammar_admits_only_long_form_tags_and_name_qualifiers(entry):
+    """T-5665 LOAD-BEARING PIN: the one-entry-per-key rule compares TEXTUAL keys, which is
+    canonical only because _ACL_RE refuses numeric qualifiers and u:/g:/o:/m:/d: short
+    forms. If the grammar ever widens, 'u:nobody' vs 'user:65534' would alias past it."""
+    assert not F._ACL_RE.match(entry)
+    with pytest.raises(F.ManifestError, match="is not an allowlisted shape"):
+        manifest(paths={"/srv/pantheon/shared": {"owner": "alice", "group": "pmail", "mode": "0750",
+                                                 "acl": ["user::rwx", "group::r-x", "other::---", entry]}})
+
+
+def test_duplicate_mailbox_dir_paths_are_refused():
+    """Review LOW-1: one mailbox_dirs entry per path, so a dir: subject has one owner."""
+    dirs = {"alice": {"path": "/srv/pantheon/mbox", "owner": "alice", "group": "pmail", "mode": "2770"},
+            "bob": {"path": "/srv/pantheon/mbox", "owner": "bob", "group": "pmail", "mode": "2770"}}
+    with pytest.raises(F.ManifestError, match=r"mailbox_dirs\.bob\.path: '/srv/pantheon/mbox' duplicates mailbox_dirs\.alice"):
+        manifest(mailbox_dirs=dirs)
+
+
+def test_the_designated_owner_of_a_step_comes_from_its_own_resolved_entry():
+    """Review LOW-1: with a step, D is ``step.resolved.entry``'s owner, never the first
+    path match. A raw manifest (past load_manifest) carries two entries on one path."""
+    doc = copy.deepcopy(BASE)
+    doc["mailbox_dirs"] = {
+        "alice": {"path": "/srv/pantheon/team/mbox", "owner": "alice", "group": "pmail", "mode": "2770"},
+        "bob": {"path": "/srv/pantheon/team/mbox", "owner": "bob", "group": "pmail", "mode": "2770"},
+    }
+    m = F.Manifest(doc, "raw")
+    port = P.SimulatedSubstratePort()
+    port.state["path_stats"]["/srv/pantheon/team"] = ("directory", "bob", "pmail", "0750")
+    h = Hp.RootHelper(port, m, Hp.BOOTSTRAP)
+    step = h.admit("mailbox_dir.ensure", {"mailbox": "bob"}, Hp.ACTIVATE)
+    assert h.designated_owner(step.resolved.subject, step.resolved.entry) == "bob"
+    assert h.designated_owner(step.resolved.subject) == "alice"  # the path lookup's first match
+    assert h.preflight(step).ok  # preflight passes the step's own entry
+    alice = h.admit("mailbox_dir.ensure", {"mailbox": "alice"}, Hp.ACTIVATE)
+    ev = h.preflight(alice)
+    assert not ev.ok and "ancestor /srv/pantheon/team is owned by 'bob', not 'root' or 'alice'" in ev.detail
+
+
+@pytest.mark.parametrize("ftype, why", [("symbolic link", "is a symbolic link"),
+                                        ("regular file", "is a 'regular file', not a directory")])
+def test_a_simulated_ancestor_typed_through_path_types_is_honoured(ftype, why):
+    """Review LOW-3: a non-directory ``path_types`` entry wins in path_stat, so an
+    ancestor modelled as a symlink never reads as a trusted directory."""
+    port = P.SimulatedSubstratePort()
+    port.state["path_types"]["/srv/pantheon"] = ftype
+    assert port.path_stat("/srv/pantheon")[0] == ftype
+    port.state["path_types"]["/srv"] = "directory"
+    assert port.path_stat("/srv") == P.SIMULATED_TRUSTED_DIR
+    h = Hp.RootHelper(port, manifest(), Hp.BOOTSTRAP)
+    ev = h.preflight(h.admit("owner_mode.set", {"path": "/srv/pantheon/shared"}, Hp.ACTIVATE))
+    assert not ev.ok and f"ancestor /srv/pantheon {why}" in ev.detail
+
+
+def test_the_designated_owner_never_owns_the_root_directory():
+    """A depth-1 subject's parent is "/": the D exception never extends to it."""
+    m = manifest(installer_roots=["/srv"], paths={"/srv": {"owner": "alice", "group": "pmail", "mode": "0750"}})
+    port = P.SimulatedSubstratePort()
+    port.state["path_stats"]["/"] = ("directory", "alice", "pmail", "0755")
+    h = Hp.RootHelper(port, m, Hp.BOOTSTRAP)
+    assert h.designated_owner("owner_mode:/srv") == "alice"
+    ev = h.ancestor_walk("owner_mode:/srv")
+    assert ev is not None and "ancestor / is owned by 'alice', not 'root'" in ev.detail
+
+
+def test_a_mailbox_hub_subject_with_a_post_office_owned_grandparent_is_refused_today():
+    """KNOWN, VISIBLE behaviour (mason + Recovery D15, 2026-10-27): the designated-owner
+    exception covers the leaf's PARENT only. The live hub is /home/post-office (post-office,
+    0710) / mailbox (post-office, 0710), so a /home/post-office/mailbox/<persona> subject is
+    refused at its GRANDPARENT. Recovery's later hub-layout ruling (tracked gap) changes this test."""
+    doc = copy.deepcopy(BASE)
+    doc["groups"] = {"pantheon-mailbox": {"gid": 3001}}
+    doc["accounts"] = {"post-office": {"uid": 3101, "home": "/home/post-office", "shell": "/usr/sbin/nologin"}}
+    doc["installer_roots"] = ["/home/post-office"]
+    doc["paths"] = {}
+    doc["mailbox_dirs"] = {"orchestrator": {"path": "/home/post-office/mailbox/orchestrator", "owner": "post-office",
+                                     "group": "pantheon-mailbox", "mode": "2770"}}
+    doc["sudoers_templates"] = {}
+    m = F.load_manifest(doc)
+    port = P.SimulatedSubstratePort()
+    port.state["path_stats"].update({
+        "/home/post-office": ("directory", "post-office", "pantheon-mailbox", "0710"),
+        "/home/post-office/mailbox": ("directory", "post-office", "pantheon-mailbox", "0710"),
+    })
+    h = Hp.RootHelper(port, m, Hp.BOOTSTRAP)
+    assert h.designated_owner("dir:/home/post-office/mailbox/orchestrator") == "post-office"
+    ev = h.preflight(h.admit("mailbox_dir.ensure", {"mailbox": "orchestrator"}, Hp.ACTIVATE))
+    assert not ev.ok and ev.data == {"code": Hp.AncestorRefused.code, "ancestor": "/home/post-office"}
+    assert "ancestor /home/post-office is owned by 'post-office', not 'root'" in ev.detail

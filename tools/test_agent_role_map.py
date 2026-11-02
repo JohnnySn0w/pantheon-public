@@ -133,6 +133,37 @@ class RestartTargetTest(unittest.TestCase):
             with self.assertRaises(KeyError):
                 m.restart_target("mason")
 
+    def test_bespoke_seat_without_restart_service_still_raises(self):
+        with mock.patch.object(m, "instance_binding",
+                               return_value={"account": "x", "restart_pane": "x-main:0"}):
+            with self.assertRaises(KeyError):
+                m.restart_target("x")
+
+    def test_control_plane_seat_needs_no_restart_service(self):
+        # T-5698: watchman's shape (restart_service deliberately absent) resolves.
+        with mock.patch.object(m, "instance_binding", return_value={
+                "account": "codex-fallback", "restart_mode": "user",
+                "restart_pane": "codex-fallback-main:0", "supervisor": "control-plane"}):
+            t = m.restart_target("watchman")
+        self.assertEqual(t, {"supervisor": "control-plane",
+                             "service": "pantheon-persona-consume@watchman.service",
+                             "mode": "user", "pane": "codex-fallback-main:0",
+                             "session_unit": "pantheon-runtime-controller@watchman.service"})
+
+    def test_every_runtime_controller_seat_resolves(self):
+        # T-5698: all seven seats run `runtime_controller controller-main` (ps, 2026-10-27);
+        # the recovery SOPs resolve units through restart-target, so none may raise.
+        for persona in ("orchestrator", "specialist", "recovery", "archivist", "artisan", "mason", "watchman"):
+            with self.subTest(persona=persona):
+                t = m.restart_target(persona)
+                self.assertEqual(t["supervisor"], "control-plane")
+                self.assertEqual(t["session_unit"], f"pantheon-runtime-controller@{persona}.service")
+                self.assertEqual(t["service"], f"pantheon-persona-consume@{persona}.service")
+
+    def test_live_mason_and_watchman_panes(self):
+        self.assertEqual(m.restart_target("mason")["pane"], "suborch1-main:0")
+        self.assertEqual(m.restart_target("watchman")["pane"], "codex-fallback-main:0")
+
     def test_live_artisan_is_control_plane(self):
         # T-5299: artisan completed its cutover; restart-target must resolve, not raise.
         t = m.restart_target("artisan")

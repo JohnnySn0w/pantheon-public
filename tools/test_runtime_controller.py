@@ -2350,6 +2350,202 @@ class InitialViabilityTests(unittest.TestCase):
                 self.assertEqual(picked[0]["trigger"], trigger)
                 self.assertNotIn("consume_selected_operator_destination", [r["event"] for r in rows])
 
+    @staticmethod
+    def _real_begin_transition_record(root: Path, persona: str, trigger: str, outgoing, incoming) -> None:
+        """T-5794: transition.json exactly as the REAL planned-swap flow leaves it:
+        _begin_transition, then the swap's awaiting-successor-read update, then the
+        successor ack's completion. No step writes `destination` (the fixture
+        _write_operator_transition hand-wrote it, which hid the live defect)."""
+        rc._begin_transition(
+            persona, trigger=trigger,
+            outgoing_profile=outgoing.launch.profile, incoming_profile=incoming.launch.profile,
+            outgoing_harness=outgoing.launch.harness, incoming_harness=incoming.launch.harness,
+            drain_id=None, state_root=root,
+        )
+        path = rc._transition_path(persona, root)
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state.update(
+            phase="completed", runtime_swapped=True, fallback_active=trigger == "planned-quota",
+            successor_read_ack=True, completed_at="2026-11-01T17:08:43Z",
+        )
+        rc._atomic_json(path, state)
+        assert "destination" not in json.loads(path.read_text(encoding="utf-8"))
+
+    def test_consume_accepts_real_begin_transition_record_without_destination(self) -> None:
+        """T-5794 live shape (recovery/archivist 2026-11-01): the completed quota record has
+        incoming_* but no destination; consume must follow it, not block."""
+        for trigger in ("planned-quota", "forced-cap", "quota-reset"):
+            with self.subTest(trigger=trigger), tempfile.TemporaryDirectory() as tmp, \
+                    mock.patch.dict(os.environ, {}, clear=False):
+                os.environ.pop("INVOCATION_ID", None)
+                root = Path(tmp)
+                events: list[str] = []
+                primary, fallback = self._bindings(root)
+                recorded = self._operator_swapped_to_codex(root, primary, fallback, trigger=trigger)
+                self._real_begin_transition_record(root, primary.persona, trigger, primary, fallback)
+                pane, pid, scope, start = self._reuse_patches(events)
+                with pane, pid, scope, start as start_runtime, _provenance_patch_with(
+                    source_hashes=recorded.source_hashes,
+                ), mock.patch.object(rc, "_pane_runs_binding", side_effect=_pane_runs("codex")):
+                    reused = rc.ensure_viable_runtime(
+                        (primary, fallback),
+                        adapter_factory=lambda binding: _Adapter(binding),
+                        state_root=root,
+                        backend=_ViabilityBackend(events),
+                    )
+                evidence = _evidence_events(root)
+                start_runtime.assert_not_called()
+                self.assertEqual(reused.binding.launch.harness, "codex")
+                self.assertIn("consume_selected_transition_destination", evidence)
+
+    def test_consume_follows_controller_fallback_return_receipt(self) -> None:
+        """T-5794 orchestrator shape: an older planned-quota record onto codex
+        (fallback_active=True) is left behind; the controller's fallback-return then
+        relaunches the primary. The receipt controller_main now writes must let
+        consume follow the live primary instead of blocking against codex."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("INVOCATION_ID", None)
+            root = Path(tmp)
+            events: list[str] = []
+            primary, fallback = self._bindings(root)
+            # runtime.json records codex in this scaffold; flip the roles so the
+            # recorded/live runtime is the RETURN destination.
+            recorded = self._operator_swapped_to_codex(root, primary, fallback, trigger="planned-quota")
+            self._real_begin_transition_record(root, primary.persona, "planned-quota", primary, fallback)
+            self.assertTrue(rc._record_fallback_return_transition(
+                primary.persona, primary, rc._runtime_ref(fallback), state_root=root,
+                now=datetime(2026, 11, 1, 17, 1, 26, tzinfo=timezone.utc),
+            ))
+            record = rc.transition_state(primary.persona, state_root=root)
+            self.assertEqual(
+                (record["trigger"], record["phase"], record["destination"], record["fallback_active"]),
+                ("fallback-return", "completed", rc._runtime_ref(fallback), False),
+            )
+            pane, pid, scope, start = self._reuse_patches(events)
+            with pane, pid, scope, start as start_runtime, _provenance_patch_with(
+                source_hashes=recorded.source_hashes,
+            ), mock.patch.object(rc, "_pane_runs_binding", side_effect=_pane_runs("codex")):
+                reused = rc.ensure_viable_runtime(
+                    (primary, fallback),
+                    adapter_factory=lambda binding: _Adapter(binding),
+                    state_root=root,
+                    backend=_ViabilityBackend(events),
+                )
+            start_runtime.assert_not_called()
+            self.assertEqual(reused.binding.launch.harness, "codex")
+            self.assertIn("consume_selected_transition_destination", _evidence_events(root))
+
+    def test_fallback_return_receipt_never_overwrites_an_in_flight_transition(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            primary, fallback = self._bindings(root)
+            for phase in ("preparing", "awaiting-successor-read", "compensation-failed"):
+                with self.subTest(phase=phase):
+                    _write_operator_transition(root, rc._runtime_ref(fallback), phase=phase, trigger="planned-quota")
+                    self.assertFalse(rc._record_fallback_return_transition(
+                        primary.persona, fallback, rc._runtime_ref(primary), state_root=root,
+                        now=datetime(2026, 11, 1, 17, 2, tzinfo=timezone.utc),
+                    ))
+                    state = rc.transition_state(primary.persona, state_root=root)
+                    self.assertEqual((state["phase"], state["trigger"]), (phase, "planned-quota"))
+
+    def test_consume_accepts_live_natural_cap_swap_without_transition_receipt(self) -> None:
+        """T-5744: a mid-session cap exits before a transition receipt exists.
+        The active cap record, exact runtime.json, and positive live-pane argv are
+        the fail-closed proof that mail may wake the controller-selected fallback."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("INVOCATION_ID", None)
+            root = Path(tmp)
+            events: list[str] = []
+            primary, fallback = self._bindings(root)
+            recorded = self._operator_swapped_to_codex(root, primary, fallback)
+            (root / "recovery" / "runtime-controller" / "transition.json").unlink()
+            now = datetime(2026, 10, 30, 16, 30, tzinfo=timezone.utc)
+            rc.record_last_attempt(
+                primary.persona,
+                primary,
+                outcome="failed",
+                failure_class="subscription_cap",
+                now=now,
+                cooldown_until_override=now + timedelta(days=2),
+                state_root=root,
+            )
+            pane, pid, scope, start = self._reuse_patches(events)
+            with pane, pid, scope, start as start_runtime, _provenance_patch_with(
+                source_hashes=recorded.source_hashes,
+            ), mock.patch.object(rc, "_pane_runs_binding", side_effect=_pane_runs("codex")):
+                reused = rc.ensure_viable_runtime(
+                    (primary, fallback),
+                    adapter_factory=lambda binding: _Adapter(binding),
+                    state_root=root,
+                    backend=_ViabilityBackend(events),
+                    now=now,
+                )
+            evidence = _evidence_events(root)
+        start_runtime.assert_not_called()
+        self.assertEqual(reused.receipt.status, "reused-recorded")
+        self.assertEqual(reused.binding.launch.harness, "codex")
+        self.assertIn("consume_selected_cap_fallback", evidence)
+
+    def test_consume_rejects_expired_natural_cap_swap_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("INVOCATION_ID", None)
+            root = Path(tmp)
+            events: list[str] = []
+            primary, fallback = self._bindings(root)
+            recorded = self._operator_swapped_to_codex(root, primary, fallback)
+            (root / "recovery" / "runtime-controller" / "transition.json").unlink()
+            now = datetime(2026, 10, 30, 16, 30, tzinfo=timezone.utc)
+            rc.record_last_attempt(
+                primary.persona, primary, outcome="failed", failure_class="subscription_cap",
+                now=now - timedelta(hours=2), cooldown_until_override=now - timedelta(hours=1),
+                state_root=root,
+            )
+            pane, pid, scope, start = self._reuse_patches(events)
+            with pane, pid, scope, start as start_runtime, _provenance_patch_with(
+                source_hashes=recorded.source_hashes,
+            ), mock.patch.object(rc, "_pane_runs_binding", side_effect=_pane_runs("codex")):
+                with self.assertRaises(rc.RuntimeViabilityBlocked) as caught:
+                    rc.ensure_viable_runtime(
+                        (primary, fallback), adapter_factory=lambda binding: _Adapter(binding),
+                        state_root=root, backend=_ViabilityBackend(events), now=now,
+                    )
+        start_runtime.assert_not_called()
+        self.assertEqual(caught.exception.reason, "runtime-state-missing-or-mismatched")
+
+    def test_consume_rejects_expired_cap_even_when_primary_is_held(self) -> None:
+        """A hold may make the fallback viable, but it cannot revive stale cap proof."""
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("INVOCATION_ID", None)
+            root = Path(tmp)
+            events: list[str] = []
+            primary, fallback = self._bindings(root)
+            recorded = self._operator_swapped_to_codex(root, primary, fallback)
+            (root / "recovery" / "runtime-controller" / "transition.json").unlink()
+            now = datetime(2026, 10, 30, 16, 30, tzinfo=timezone.utc)
+            rc.record_last_attempt(
+                primary.persona, primary, outcome="failed", failure_class="subscription_cap",
+                now=now - timedelta(hours=2), cooldown_until_override=now - timedelta(hours=1),
+                state_root=root,
+            )
+            holds_path = rc._holds_path(primary.persona, state_root=root)
+            holds_path.parent.mkdir(parents=True, exist_ok=True)
+            holds_path.write_text(json.dumps({
+                "schema": "pantheon-persona-runtime-holds/v1",
+                "holds": {rc._runtime_ref(primary): {"reason": "unrelated-operator-hold"}},
+            }), encoding="utf-8")
+            pane, pid, scope, start = self._reuse_patches(events)
+            with pane, pid, scope, start as start_runtime, _provenance_patch_with(
+                source_hashes=recorded.source_hashes,
+            ), mock.patch.object(rc, "_pane_runs_binding", side_effect=_pane_runs("codex")):
+                with self.assertRaises(rc.RuntimeViabilityBlocked) as caught:
+                    rc.ensure_viable_runtime(
+                        (primary, fallback), adapter_factory=lambda binding: _Adapter(binding),
+                        state_root=root, backend=_ViabilityBackend(events), now=now,
+                    )
+        start_runtime.assert_not_called()
+        self.assertEqual(caught.exception.reason, "runtime-state-missing-or-mismatched")
+
     def test_consume_still_blocks_an_in_flight_quota_swap(self) -> None:
         for phase in ("preparing", "awaiting-successor-read"):
             with self.subTest(phase=phase):
@@ -9362,9 +9558,9 @@ class RuntimeLifecycleTests(unittest.TestCase):
             self.assertEqual(planned.call_args.kwargs["trigger"], "planned-quota")
 
     def test_persona_bringup_quota_check_cli_unsupported_no_fallback_json(self) -> None:
-        # T-5446: orchestrator is now supported (no persona allowlist); a seat with no manifest
-        # fallback is the unsupported case. NEVER point this at a fallback seat: it would
-        # run a real claude quota probe.
+        # T-5446: support is derived from manifest fallbacks. Watchman has no
+        # fallback, so this path remains side-effect free. (Archivist gained a
+        # Codex fallback in T-5744 and is no longer an unsupported fixture.)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             result = subprocess.run(
@@ -9373,7 +9569,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
                     str(REPO_ROOT / "tools" / "persona_bringup.py"),
                     "quota-check",
                     "--persona",
-                    "archivist",
+                    "watchman",
                     "--state-dir",
                     str(root / "state"),
                     "--mailbox-hub",
@@ -9388,7 +9584,7 @@ class RuntimeLifecycleTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertFalse(payload["supported"])
             self.assertEqual(payload["decision"], "unsupported")
-            self.assertFalse((root / "state" / "archivist").exists())
+            self.assertFalse((root / "state" / "watchman").exists())
 
     def test_completed_swap_selects_manifest_allowed_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -12597,6 +12793,23 @@ class DurableStateHelperTests(unittest.TestCase):
 
 
 class SelectViableRuntimeTests(unittest.TestCase):
+    def test_authentication_loss_is_permanent_and_selects_codex_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude = _stateless_binding(root, harness="claude", profile="anthropic-code")
+            codex = _stateless_binding(root, harness="codex", profile="interactive-chatgpt")
+            now = rc._utc_now()
+            record = rc.record_last_attempt(
+                "orchestrator", claude, outcome="failed", failure_class="authentication_loss",
+                state_root=root, now=now,
+            )
+            selected, skipped = rc._select_viable_runtime(
+                "orchestrator", [claude, codex], {}, now + timedelta(days=365), state_root=root
+            )
+            self.assertIsNone(record["cooldown_until"])
+            self.assertIs(selected, codex)
+            self.assertEqual(skipped, [{"runtime": "claude/anthropic-code", "reason": "authentication-loss"}])
+
     def test_selects_first_candidate_with_no_cooldown(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -17242,6 +17455,31 @@ class ControllerMainCycleTests(unittest.TestCase):
             self.assertEqual(attempt["consecutive_failures"], 0)
             self.assertIsNone(attempt["cooldown_until"])
             self.assertIsNone(attempt["failure_class"])
+
+    def test_fallback_return_outcome_leaves_completed_transition_receipt(self) -> None:
+        """T-5794: controller_main's fallback-return branch replaces the stale
+        fallback_active record with a completed fallback-return receipt naming the
+        return destination."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex = _stateless_binding(root, harness="codex", profile="interactive-chatgpt")
+            rc._atomic_json(rc._transition_path("orchestrator", root), {
+                "schema": "pantheon-runtime-transition/v1", "persona": "orchestrator",
+                "trigger": "planned-quota", "phase": "completed", "fallback_active": True,
+                "incoming_harness": "codex", "incoming_profile": "interactive-chatgpt",
+            })
+            with mock.patch.object(rc, "_notify_runtime_swap"):
+                rc.controller_main(
+                    "orchestrator", candidates=[codex], state_root=root, sleep=lambda s: None,
+                    start_runtime_fn=self._fake_start,
+                    block_until_death_fn=lambda b: rc.FallbackReturnOutcome(target_ref="claude/anthropic-code"),
+                )
+            state = rc.transition_state("orchestrator", state_root=root)
+            self.assertEqual(
+                (state["trigger"], state["phase"], state["destination"], state["fallback_active"],
+                 state["source_runtime"]),
+                ("fallback-return", "completed", "claude/anthropic-code", False, "codex/interactive-chatgpt"),
+            )
 
     def test_mid_session_cap_state_cleared_on_both_ordinary_death_and_swap(self) -> None:
         # Two INDEPENDENT personas -- avoids the second call's candidate

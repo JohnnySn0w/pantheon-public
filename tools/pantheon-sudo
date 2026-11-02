@@ -10,6 +10,12 @@
 # hand-written `tr -d '\n' < <file> | sudo -S ...` form it replaces. Commands that need
 # their own stdin should read a file instead.
 #
+# T-5713: a caller's piped or redirected stdin is REFUSED (exit 66), not silently dropped
+# (`echo x | pantheon-sudo tee -a FILE` used to exit 0 and write nothing). It is never
+# passed through: a command sudo runs without asking (NOPASSWD, cached) would never read
+# the password line, so the PASSWORD itself would reach the command. Write the data with
+# the command itself instead: pantheon-sudo sh -c 'printf "%s\n" "line" >> FILE'.
+#
 # tools/hooks/root-env-guard.py refuses agent commands that name the password file or pass
 # `sudo -S`, which leaves this wrapper as the one working path. It is a text-level guard
 # against accidental leaks into transcripts (ORG-105 sec.4), not a sandbox.
@@ -20,6 +26,12 @@ PW_FILE="${PANTHEON_SUDO_PW_FILE:-$HOME/root.env}"
 if [ "$#" -eq 0 ]; then
   echo "usage: pantheon-sudo <command> [args...]" >&2
   exit 64
+fi
+if [ -p /dev/stdin ] || [ -f /dev/stdin ]; then
+  echo "pantheon-sudo: refusing: stdin is a pipe or file, and the command would never see it" \
+       "(its stdin is the password pipe). Put the data in the command, e.g." \
+       "pantheon-sudo sh -c 'printf \"%s\\n\" LINE >> FILE' [T-5713]" >&2
+  exit 66
 fi
 if [ ! -r "$PW_FILE" ]; then
   echo "pantheon-sudo: password file not readable for $(id -un)" >&2

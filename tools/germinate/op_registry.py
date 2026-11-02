@@ -27,6 +27,7 @@ from typing import Final, Literal, Mapping
 from tools.germinate.planner_sandbox.wal.artifacts import canonical_json_bytes, sha256_hex
 from tools.host_control.envelope import (
     EXECUTOR_KIND_CLASSES,
+    KIND_INSPECTION_READS,
     ORG082_SUBSTRATE_FAMILIES,
     OUT_OF_ENVELOPE_KINDS,
 )
@@ -90,15 +91,23 @@ class OpKind:
     substrate: bool
     read_only: bool
     broker_admitted: bool
+    #: T-5608: the kind's declared user-manager inspection reads
+    #: (envelope.KIND_INSPECTION_READS), part of the digested blob.
+    inspection_reads: tuple[tuple[str, str, str], ...] = ()
 
     def to_json_obj(self) -> dict[str, object]:
-        return {
+        obj: dict[str, object] = {
             "broker_admitted": self.broker_admitted,
             "capability_class": self.capability_class,
             "privilege": self.privilege,
             "read_only": self.read_only,
             "substrate": self.substrate,
         }
+        # Only kinds that declare reads carry the key, so every other entry's
+        # bytes are unchanged; a declared read changes the registry digest.
+        if self.inspection_reads:
+            obj["inspection_reads"] = [list(read) for read in self.inspection_reads]
+        return obj
 
 
 @dataclass(frozen=True)
@@ -127,9 +136,13 @@ def _add(entries: dict[str, OpKind], entry: OpKind) -> None:
 
 def build_entries(engine_kinds: Mapping[str, tuple[str, Privilege]] = ENGINE_KINDS) -> dict[str, OpKind]:
     entries: dict[str, OpKind] = {}
+    unknown = sorted(set(KIND_INSPECTION_READS) - set(EXECUTOR_KIND_CLASSES))
+    if unknown:
+        raise OpRegistryError(f"inspection reads declared for kinds outside the executor envelope: {unknown}")
     for kind, klass in EXECUTOR_KIND_CLASSES.items():
         read_only = klass in READ_ONLY_CLASSES
-        _add(entries, OpKind(kind, klass, "none" if read_only else "seat", False, read_only, True))
+        reads = tuple(tuple(read) for read in KIND_INSPECTION_READS.get(kind, ()))
+        _add(entries, OpKind(kind, klass, "none" if read_only else "seat", False, read_only, True, reads))
     for kind in OUT_OF_ENVELOPE_KINDS:
         _add(entries, OpKind(kind, SEAT_LOCAL_CLASS, "seat", False, False, False))
     for kind in ORG082_SUBSTRATE_FAMILIES:

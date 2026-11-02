@@ -250,6 +250,17 @@ FLEET_FIRING_RAW: tuple[RawFiringObservation, ...] = (
         agent="artisan", timer_active_state="inactive", timer_unit_file_state="disabled",
         timer_last_trigger=None, state_file_present=False, state_file=None,
     ),
+    # T-5748 compatibility expansion: these seats joined AGENT_PANE after the
+    # original 2026-08-05 capture. Their shared timer was not firing at the
+    # 2026-10-30 audit that triggered installer parity work.
+    RawFiringObservation(
+        agent="codex", timer_active_state="inactive", timer_unit_file_state="disabled",
+        timer_last_trigger=None, state_file_present=False, state_file=None,
+    ),
+    RawFiringObservation(
+        agent="watchman", timer_active_state="inactive", timer_unit_file_state="disabled",
+        timer_last_trigger=None, state_file_present=False, state_file=None,
+    ),
 )
 
 FLEET_FIRING_FRAMING: Mapping[str, str] = {
@@ -274,6 +285,14 @@ FLEET_FIRING_FRAMING: Mapping[str, str] = {
         "subagent seat, not among the four standing daemons (orchestrator/specialist/recovery/codex); "
         "an on-demand seat may not need a standing continuation timer. Not asserted "
         "broken, and not re-armed by this module."
+    ),
+    "codex": (
+        "not-firing-observed at the shared timer -- T-5748 migrates the older "
+        "codex-keep-going timer into the installer-owned cadence."
+    ),
+    "watchman": (
+        "not-firing-observed -- T-5748 adds this Codex-primary seat to the "
+        "installer-owned continuation cadence."
     ),
 }
 

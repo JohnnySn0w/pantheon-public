@@ -1509,6 +1509,27 @@ approval_mode = "approve"
         self.assertEqual(hashlib.sha256(worktree).hexdigest(), reference.source_sha256)
         self.assertIn(b"mcp__telegram__reply", worktree)
 
+    def test_archivist_codex_standing_instructions_pin_main_ancestor_and_sha(self) -> None:
+        """T-5744: a pre-squash branch SHA is not fetchable by a fresh seat clone."""
+        manifest = Manifest.load(REPO_ROOT / "instance.yaml")
+        reference = codex_standing_instructions_reference(manifest, "archivist")
+        self.assertIsNotNone(reference)
+        assert reference is not None
+        ancestor = subprocess.run(
+            ("git", "-C", str(REPO_ROOT), "merge-base", "--is-ancestor", reference.source_commit, "HEAD"),
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(ancestor.returncode, 0, ancestor.stderr)
+        source_at_commit = subprocess.run(
+            ("git", "-C", str(REPO_ROOT), "show", f"{reference.source_commit}:{reference.source}"),
+            check=True,
+            capture_output=True,
+        ).stdout
+        self.assertEqual(hashlib.sha256(source_at_commit).hexdigest(), reference.source_sha256)
+        self.assertEqual(hashlib.sha256((REPO_ROOT / reference.source).read_bytes()).hexdigest(), reference.source_sha256)
+
     def test_persona_brief_ref_rejects_absolute_traversal_and_out_of_account_paths(self) -> None:
         for value in (
             "/home/claude/CLAUDE.md",
@@ -6578,6 +6599,39 @@ class ClaudeMcpServerCase(unittest.TestCase):
         }
         with self.assertRaises(ManifestError):
             parse_claude_mcp_block(block)
+
+    def test_in_house_host_adapters_are_listed_but_admit_no_persona(self) -> None:
+        # T-2920 U5: the two ORG-052 §7 rows exist (U1's mcp-allowlist precondition
+        # is met) with EMPTY persona sets: which seats may load them is an MCP
+        # adoption decision set at enable (runbook P10), so every persona is refused.
+        from tools import persona_installer as PI
+        from tools.harness_adapter import host_mcp_registration as HMR
+
+        names = (HMR.HOST_SERVER_NAME, HMR.APPROVAL_SERVER_NAME)
+        for name in names:
+            self.assertIn(name, PI._CLAUDE_MCP_ALLOWLIST)
+            self.assertEqual(PI._CLAUDE_MCP_ALLOWLIST[name], frozenset())
+        # every persona any row admits, every persona instance.yaml provisions, plus recovery
+        instance = yaml.safe_load((REPO_ROOT / "instance.yaml").read_text(encoding="utf-8"))
+        provisioned = set(instance["persona_installer"]["claude_mcp_servers"]["personas"])
+        personas = set().union(*PI._CLAUDE_MCP_ALLOWLIST.values()) | provisioned | {"recovery"}
+        self.assertGreaterEqual(len(personas), 6)
+        for persona in sorted(personas):
+            for name in names:
+                block = {
+                    "schema": CLAUDE_MCP_SERVERS_SCHEMA,
+                    "personas": {
+                        persona: {
+                            "account": "fixture-account",
+                            "scope": "user",
+                            "servers": {name: _claude_mcp_server_cfg(command=HMR.REGISTRATIONS_BY_NAME[name].command,
+                                                                     args=[])},
+                        }
+                    },
+                }
+                with self.subTest(persona=persona, server=name), self.assertRaises(ManifestError) as ctx:
+                    parse_claude_mcp_block(block)
+                self.assertIn("not allowlisted for persona", str(ctx.exception))
 
     def test_parser_rejects_inline_secret_env_key(self) -> None:
         block = self._artisan_block(

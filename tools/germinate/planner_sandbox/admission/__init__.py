@@ -10,12 +10,13 @@ scope carve).
 from __future__ import annotations
 
 from .coordinator import bootstrap_component
-from .exceptions import AdmissionRefused, PrimitiveUnavailable
+from .exceptions import AdmissionRefused, ClaimHolderMismatch, PrimitiveUnavailable
 from .gate import acquire
 
 __all__ = [
     "acquire",
     "bootstrap_component",
     "AdmissionRefused",
+    "ClaimHolderMismatch",
     "PrimitiveUnavailable",
 ]

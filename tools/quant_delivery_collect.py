@@ -231,7 +231,8 @@ def parse_ticket_file(path: Path) -> TicketInfo | None:
         return None
     fields: dict[str, Any] = {}
     for line in text[3:end].splitlines():
-        if ":" not in line:
+        # T-5689: an indented line is block-scalar content (`key: |` / `>`), never a key.
+        if ":" not in line or line[:1] in (" ", "\t"):
             continue
         key, value = line.split(":", 1)
         fields[key.strip()] = _parse_scalar(value)

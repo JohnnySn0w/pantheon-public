@@ -40,6 +40,8 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import stat
 import sys
 import tempfile
 import tomllib
@@ -86,11 +88,19 @@ from tools.harness_permission_posture import (
     codex_permission_native_sandbox,
     validate_codex_permission_native,
 )
+from tools import codex_schema_contract as codex_appserver_contract
 from tools.harness_adapter.provider_quota import (
     CodexAppServerQuotaObserver,
     read_codex_app_server_hooks,
     read_codex_app_server_rate_limits,
 )
+
+
+_APP_SERVER_BINDINGS = Path(__file__).resolve().parents[2] / "harness/codex/appserver_seats.json"
+_APP_SERVER_RUNTIME = Path(__file__).resolve().parents[2] / "harness/codex/appserver_supervise.py"
+_APP_SERVER_ROUTE_REL = Path(".config/pantheon/codex-appserver-route.json")
+_APP_SERVER_READY_SCHEMA = "pantheon-codex-appserver-input-ready/v1"
+_APP_SERVER_READY_KEYS = frozenset({"schema", "persona", "thread_id", "launch_nonce"})
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +204,7 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
         super().__init__(role_domain, launch=launch)
         self._codex_home = codex_home if codex_home is not None else Path.home()
         self._mailbox_path = mailbox_path
+        self._appserver_readiness: tuple[Path, str, str, str] | None = None
 
     # -------------------------------------------------------------------------
     # Typed lifecycle contract
@@ -472,6 +483,12 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
         )
 
     def build_interactive_launch(self, target: TmuxTarget, *, cwd: Path) -> CommandSpec:
+        # Route selection is per launch. A prior app-server generation must never
+        # make a later bare launch on this adapter poll its stale receipt.
+        self._appserver_readiness = None
+        appserver = self._controller_appserver_launch(target, cwd=cwd)
+        if appserver is not None:
+            return appserver
         argv = [str(self.executable)]
         model = self.launch.model if self.launch else None
         if model:
@@ -499,6 +516,133 @@ class CodexHarnessAdapter(PantheonHarnessAdapter):
                 "PANTHEON_TMUX_WINDOW": target.window,
                 "PANTHEON_TMUX_PANE": target.pane,
             },
+        )
+
+    def _controller_appserver_launch(self, target: TmuxTarget, *, cwd: Path) -> CommandSpec | None:
+        """Select the controller-owned route only for a valid explicit switch."""
+        switch_path = self._codex_home / _APP_SERVER_ROUTE_REL
+        try:
+            switch = json.loads(switch_path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, ValueError):
+            return None
+        if type(switch) is not dict or switch.get("enabled") is not True:
+            return None
+        try:
+            bindings = json.loads(_APP_SERVER_BINDINGS.read_text(encoding="utf-8"))["seats"]
+            seat = switch["seat"]
+            binding = bindings[seat]
+            raw_state = str(switch["state_dir"])
+            state_dir = raw_state.replace("~/", str(self._codex_home) + "/", 1)
+            socket_path = Path(str(switch["socket"]))
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            raise ValueError(f"invalid enabled app-server route {switch_path}: {exc}") from exc
+        if binding.get("account") != self._codex_home.name:
+            raise ValueError(
+                f"app-server seat {seat!r} belongs to account {binding.get('account')!r}, "
+                f"not {self._codex_home.name!r}"
+            )
+        binding_cwd = codex_appserver_contract.resolve_binding_cwd(
+            binding, instance_root=_APP_SERVER_BINDINGS.parents[2]
+        )
+        expected = {
+            "codex_bin": str(self.executable),
+            "cwd": str(cwd),
+            "model": self.launch.model if self.launch else None,
+        }
+        if self.launch is not None:
+            sandbox = codex_permission_native_sandbox(self.launch.native)
+            if sandbox is None:
+                sandbox = self.launch.native.get("sandbox")
+            overrides = codex_permission_native_overrides(self.launch.native)
+            raw_overrides = self.launch.native.get("config_overrides")
+            if isinstance(raw_overrides, dict):
+                overrides = {**overrides, **raw_overrides}
+            expected["sandbox"] = sandbox
+            expected["approval_policy"] = overrides.get("approval_policy")
+        for key, value in expected.items():
+            bound = binding_cwd if key == "cwd" else binding.get(key)
+            if bound != value:
+                raise ValueError(
+                    f"app-server seat {seat!r} {key}={bound!r} does not match runtime {value!r}"
+                )
+        if socket_path.name != "as.sock" or not socket_path.is_absolute():
+            raise ValueError(f"app-server public socket must be an absolute as.sock path: {socket_path}")
+        argv = [
+            sys.executable, str(_APP_SERVER_RUNTIME),
+            "--controller-owned", "--manage-writer",
+            "--persona", seat,
+            "--account", str(binding["account"]),
+            "--codex-bin", str(binding["codex_bin"]),
+            "--codex-home", str(self._codex_home / ".codex"),
+            "--rundir", str(socket_path.parent),
+            "--state-dir", state_dir,
+            "--sandbox", str(binding["sandbox"]),
+            "--approval-policy", str(binding["approval_policy"]),
+            "--model", str(binding["model"]),
+            "--cwd", binding_cwd,
+            "--route-switch", str(switch_path),
+        ]
+        # Keep the random token safe as a separate argv value at both the
+        # controller->supervisor and supervisor->writer boundaries.  A raw
+        # token_urlsafe value may begin with "-", which argparse treats as an
+        # option and rejects before either process can publish readiness.
+        launch_nonce = "n_" + secrets.token_urlsafe(32)
+        receipt_path = Path(state_dir) / "input-ready.json"
+        try:
+            thread_doc = json.loads((Path(state_dir) / "thread.json").read_text(encoding="utf-8"))
+            expected_thread = thread_doc["thread_id"]
+            if type(expected_thread) is not str or not expected_thread:
+                raise ValueError("invalid recorded thread")
+            receipt_path.unlink(missing_ok=True)
+        except (OSError, KeyError, ValueError, TypeError) as exc:
+            raise ValueError(f"cannot prepare app-server readiness receipt: {exc}") from exc
+        self._appserver_readiness = (receipt_path, seat, expected_thread, launch_nonce)
+        argv += ["--readiness-receipt", str(receipt_path), "--launch-nonce", launch_nonce]
+        return CommandSpec(
+            argv=tuple(argv), stdin=None, cwd=cwd,
+            env={
+                "CODEX_HOME": str(self._codex_home / ".codex"),
+                "PANTHEON_TMUX_SESSION": target.session,
+                "PANTHEON_TMUX_WINDOW": target.window,
+                "PANTHEON_TMUX_PANE": target.pane,
+            },
+        )
+
+    def appserver_input_readiness_enabled(self) -> bool:
+        return self._appserver_readiness is not None
+
+    def appserver_input_ready(self) -> bool:
+        """Validate the exact current-generation writer receipt. Never trusts pixels."""
+        if self._appserver_readiness is None:
+            return False
+        path, persona, expected_thread, nonce = self._appserver_readiness
+        fd = -1
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or stat.S_IMODE(info.st_mode) != 0o600 or info.st_size > 4096):
+                return False
+            raw = os.read(fd, 4097)
+            if len(raw) > 4096 or len(raw) != info.st_size:
+                return False
+            doc = json.loads(raw)
+        except (OSError, ValueError, UnicodeError):
+            return False
+        finally:
+            if fd >= 0:
+                os.close(fd)
+        return (
+            type(doc) is dict
+            and frozenset(doc) == _APP_SERVER_READY_KEYS
+            and type(doc.get("schema")) is str
+            and doc["schema"] == _APP_SERVER_READY_SCHEMA
+            and type(doc.get("persona")) is str
+            and doc["persona"] == persona
+            and type(doc.get("thread_id")) is str
+            and doc["thread_id"] == expected_thread
+            and type(doc.get("launch_nonce")) is str
+            and doc["launch_nonce"] == nonce
         )
 
     def assess_post_start_readiness(

@@ -81,6 +81,14 @@ Modes (default-safe contract, mirrors ``tools/watch_runner.py``):
         Prod mode (T-1604). HO-run: kill the dedicated codex-audit session
         for SLOT/date. Idempotent if already gone.
 
+    python3 tools/s3star_audit_runner.py --await-audit --slot SLOT [--date YYYY-MM-DD] [--stable-seconds N] [--timeout-seconds T] [--poll-seconds P]
+        Safe, READ-ONLY mode (T-5666). The executable "safe to land" gate: polls
+        until the profiled codex process is gone, OR findings.md is sealed and
+        findings.md / verdicts.jsonl / the run dir have been unchanged for N
+        seconds (interactive codex idles at its prompt and never exits). rc 0
+        cleared, 1 timeout, 2 bad args / missing run dir. Never kills, lands, or
+        tears down.
+
 State file: ``~/.local/state/pantheon/s3star_audit/state.json``.
 """
 
@@ -95,6 +103,7 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -1461,16 +1470,18 @@ def build_dispatch_ticket_bodies(
         f"dedicated `{session}` tmux session (never the supervisor-managed "
         f"`{STANDING_WORKER_SESSION}`), writes a fresh brief into the run workspace, and "
         f"launches the profiled auditor (`codex --profile {AUDIT_PROFILE}`) reading it. "
-        f"Observe the run. Land findings and verdicts only after the Codex process has "
-        f"EXITED in the `{session}` pane, not when `{findings_path}` first appears: Codex "
-        f"can rewrite its output files after first writing them (T-4307: on 2026-09-28 "
-        f"verdicts.jsonl was rewritten ~40s after it first appeared, so retest verdicts "
-        f"landed twice). Gate on the Codex PROCESS, not the tmux session: when Codex exits "
-        f"the pane drops back to a shell prompt but the session stays alive until "
-        f"--teardown-audit, so it will never disappear on its own. Codex has exited when "
-        f"`pgrep -u {CODEX_AUDIT_USER} -af 'codex --profile {AUDIT_PROFILE}'` prints "
-        f"nothing. "
-        f"Once it has exited, file the per-finding tickets by running: "
+        f"Observe the run. Land findings and verdicts only after `python3 "
+        f"tools/s3star_audit_runner.py --await-audit --slot {slot.slug} "
+        f"--date {today.isoformat()}` returns 0, not when `{findings_path}` first appears: "
+        f"Codex can rewrite its output files after first writing them (T-4307: on "
+        f"2026-09-28 verdicts.jsonl was rewritten ~40s after it first appeared, so retest "
+        f"verdicts landed twice). It is read-only and polls until the Codex process has "
+        f"exited, or findings.md carries its closing sentinel and findings.md, "
+        f"verdicts.jsonl and the run dir have been unchanged for 10 minutes (interactive "
+        f"Codex idles at its prompt after finishing and may never exit). rc 1 is a "
+        f"timeout and rc 2 is bad args or a missing run dir: in both cases do NOT land. "
+        f"Do not gate on the tmux session either: it stays alive until --teardown-audit. "
+        f"Once it returns 0, file the per-finding tickets by running: "
         f"`python3 tools/s3star_audit_runner.py --land-findings --slot {slot.slug} "
         f"--findings-file {findings_path}` (a complete audit -- one ending in its closing "
         f"sentinel -- with zero findings lands clean, rc 0, filed 0). "
@@ -1534,6 +1545,7 @@ def file_dispatch_ticket(
         sys.executable,
         str(ticket_bin),
         "file",
+        "--automated-filer", "s3star_audit_runner",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "orchestrator",
         "--target", "role:engineering_orchestrator",
         "--title", f"S3* audit dispatch — {slot.slug} {today.isoformat()}",
@@ -1994,6 +2006,7 @@ def file_finding(
         sys.executable,
         str(ticket_bin),
         "file",
+        "--automated-filer", "s3star_audit_runner",  # T-5678: ORG-105 gate, non-interactive
         "--requester", "orchestrator",
         "--target", owner_target(owner),
         "--title", f"S3* audit finding {finding.finding_id}: {finding.title}"[:120],
@@ -2613,6 +2626,104 @@ def land_verdicts(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# T-5666: --await-audit -- the executable "safe to land" gate (read-only).
+# ---------------------------------------------------------------------------
+
+_AWAIT_STABLE_DEFAULT = 600.0
+_AWAIT_TIMEOUT_DEFAULT = 7200.0
+_AWAIT_POLL_DEFAULT = 30.0
+
+
+def _audit_process_running(run) -> bool | None:
+    """True/False if a `codex --profile <AUDIT_PROFILE>` process exists for the
+    audit user; None if the probe itself failed (callers fail closed)."""
+    try:
+        result = run(
+            ["pgrep", "-u", CODEX_AUDIT_USER, "-af", f"codex --profile {AUDIT_PROFILE}"],
+            capture_output=True, text=True, timeout=_SESSION_STEP_TIMEOUT_SECONDS, check=False,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None  # hung or missing pgrep: unknown, fail closed, keep polling
+    if result.returncode == 0:
+        return bool((result.stdout or "").strip())
+    if result.returncode == 1:
+        return False
+    return None
+
+
+def _findings_sealed(path: Path) -> bool:
+    """Sealed = `_split_closing_sentinel` reports no problems (one valid
+    sentinel, last, N matching the headings): the same check land_findings uses."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return False
+    return not _split_closing_sentinel(text)[1]
+
+
+def _mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return None
+
+
+def await_audit(
+    slot_slug: str,
+    today: date,
+    *,
+    run_dir: Path | None = None,
+    stable_seconds: float = _AWAIT_STABLE_DEFAULT,
+    timeout_seconds: float = _AWAIT_TIMEOUT_DEFAULT,
+    poll_seconds: float = _AWAIT_POLL_DEFAULT,
+    run=subprocess.run,
+    now=time.time,
+    sleep=time.sleep,
+    out=print,
+) -> int:
+    """Block until it is safe to land the audit's outputs. READ-ONLY: the only
+    subprocess is the pgrep probe; it never kills, lands, or tears down.
+
+    Clears (rc 0) when EITHER the profiled codex process is gone, OR findings.md
+    is sealed AND findings.md, verdicts.jsonl (if present) and the run dir have
+    all been unmodified for >= stable_seconds. rc 1 = timeout (a probe failure
+    persisting to timeout also lands here: fail closed); rc 2 = missing run dir.
+    """
+    run_dir = run_dir if run_dir is not None else run_workspace_dir(slot_slug, today)
+    if not run_dir.is_dir():
+        out(f"ERROR: run dir {run_dir} does not exist")
+        return 2
+    findings = run_dir / "findings.md"
+    verdicts = run_dir / "verdicts.jsonl"
+    start = now()
+    while True:
+        t = now()
+        mt = {n: _mtime(p) for n, p in (
+            ("findings.md", findings), ("verdicts.jsonl", verdicts), ("run_dir", run_dir))}
+        mtimes = ", ".join(
+            f"{n}={'absent' if v is None else datetime.fromtimestamp(v, timezone.utc).strftime('%H:%M:%SZ')}"
+            for n, v in mt.items()
+        )
+        running = _audit_process_running(run)
+        if running is False:
+            out(f"await-audit: CLEARED (process exited); {mtimes}")
+            return 0
+        if running is None:
+            out("await-audit: process probe failed; treating as still running")
+        known = [v for v in mt.values() if v is not None]
+        if known and _findings_sealed(findings):
+            age = t - max(known)
+            if age >= stable_seconds:
+                out(f"await-audit: CLEARED (findings sealed, unchanged {age:.0f}s >= "
+                    f"{stable_seconds:.0f}s); {mtimes}")
+                return 0
+        if t - start >= timeout_seconds:
+            out(f"await-audit: TIMEOUT after {t - start:.0f}s; do not land; {mtimes}")
+            return 1
+        sleep(poll_seconds)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(
         description="ORG-038 S3* audit pilot scheduler. Default-safe: pass exactly "
@@ -2652,6 +2763,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
              "so a session started on one date can be torn down correctly on another.",
     )
     p.add_argument(
+        "--await-audit", action="store_true",
+        help="T-5666 (read-only): poll until it is safe to land -- codex process gone, "
+             "or findings.md sealed and all outputs unchanged for --stable-seconds. "
+             "Requires --slot. rc 0 cleared, 1 timeout, 2 bad args/missing run dir.",
+    )
+    p.add_argument("--stable-seconds", type=float, default=_AWAIT_STABLE_DEFAULT,
+                   help="--await-audit: required unchanged window (default 600)")
+    p.add_argument("--timeout-seconds", type=float, default=_AWAIT_TIMEOUT_DEFAULT,
+                   help="--await-audit: give up after this long (default 7200)")
+    p.add_argument("--poll-seconds", type=float, default=_AWAIT_POLL_DEFAULT,
+                   help="--await-audit: poll interval (default 30)")
+    p.add_argument(
         "--record-retest-verdict", action="store_true",
         help="T-2613: record an independent re-test verdict on a finding ticket "
              "(structural close/reopen of retest_status). Requires --ticket and "
@@ -2688,6 +2811,7 @@ def _enforce_default_safe(args: argparse.Namespace) -> int | None:
             ("--land-verdicts", args.land_verdicts),
             ("--launch-audit", args.launch_audit),
             ("--teardown-audit", args.teardown_audit),
+            ("--await-audit", args.await_audit),
             ("--record-retest-verdict", args.record_retest_verdict),
         ) if on
     ]
@@ -2695,10 +2819,26 @@ def _enforce_default_safe(args: argparse.Namespace) -> int | None:
         print(
             "ERROR: pass exactly one of --emit-brief / --file-dispatch-ticket / "
             "--land-findings / --land-verdicts / --launch-audit / "
-            "--teardown-audit / --record-retest-verdict.",
+            "--teardown-audit / --await-audit / --record-retest-verdict.",
             file=sys.stderr,
         )
         return 64
+    if args.await_audit:
+        problem = None
+        if args.slot is None:
+            problem = "--await-audit requires --slot."
+        elif args.stable_seconds < 0:
+            problem = "--stable-seconds must be >= 0."
+        elif args.timeout_seconds <= 0 or args.poll_seconds <= 0:
+            problem = "--timeout-seconds and --poll-seconds must be > 0."
+        elif args.date is not None:
+            try:
+                date.fromisoformat(args.date)
+            except ValueError:
+                problem = f"--date must be YYYY-MM-DD, got {args.date!r}."
+        if problem:
+            print(f"ERROR: {problem}", file=sys.stderr)
+            return 2
     if args.land_findings and (args.slot is None or args.findings_file is None):
         print("ERROR: --land-findings requires --slot and --findings-file.", file=sys.stderr)
         return 64
@@ -2833,6 +2973,15 @@ def main(argv: list[str] | None = None) -> int:
             f"{codex_audit_session_name(args.slot, run_date)}"
         )
         return 0
+
+    if args.await_audit:
+        run_date = date.fromisoformat(args.date) if args.date else today
+        return await_audit(
+            args.slot, run_date,
+            stable_seconds=args.stable_seconds,
+            timeout_seconds=args.timeout_seconds,
+            poll_seconds=args.poll_seconds,
+        )
 
     if args.record_retest_verdict:
         new_status = record_retest_verdict(

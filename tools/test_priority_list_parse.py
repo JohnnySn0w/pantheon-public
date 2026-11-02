@@ -45,10 +45,13 @@ class ParseValid(unittest.TestCase):
         live_path = REPO_ROOT / "rulebook" / "priority-list.md"
         result = parse(live_path.read_text(encoding="utf-8"))
         self.assertTrue(result)
-        self.assertEqual(result.get("persona-orientation"), 1)
+        # T-5683 reorder (the operator TG 12384/12385)
+        self.assertEqual(result.get("org-052"), 1)
+        self.assertEqual(result.get("echo"), 2)
         self.assertEqual(result.get("harness-controller"), 2)
         self.assertEqual(result.get("ticket-flow"), 3)
-        self.assertEqual(result.get("concordance"), 4)
+        self.assertEqual(result.get("persona-orientation"), 4)
+        self.assertEqual(result.get("concordance"), 5)
 
     def test_duplicate_label_ceiling_lowest_rank_wins(self):
         text = _wrap(

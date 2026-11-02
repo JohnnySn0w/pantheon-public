@@ -100,6 +100,7 @@ NEVER_ALERT_SKIP_VOCABS: frozenset[str] = frozenset({
     "interactive_required",     # tickets labeled interactive; intentional
     "not_before_unmet",         # date-deferred tickets; intentional (T-0219b)
     "appetite_overrun_blocked", # T-3440/ORG-089: substate:appetite-overrun; intentional structural gate
+    "security_pending",         # T-5678/ORG-105: awaiting HO security-accept; intentional structural gate
     "pending_prompt_recovered", # T-5408: our stuck prompt was submitted with one Enter; healed
     "dispatch_locked",          # T-0717: auto_delivered mutex held — healthy, not stuck
     "concurrent_state_flip",    # T-3010: ticket state flipped between scan + deliver
@@ -358,6 +359,7 @@ _SEND_KEYS_HELPER = Path(__file__).resolve().parent / "send_keys_submit.sh"
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from tools import _security_gate  # noqa: E402  (T-5678)
 from tools.ticket import TICKETS_ROOT, parse_ticket, ticket_holder  # noqa: E402
 from tools.agent_role_map import (  # noqa: E402
     resolve_role,
@@ -828,6 +830,7 @@ def list_eligible_tickets(agent: str) -> list[TicketInfo]:
     interactive_locked: list[TicketInfo] = []
     not_before_unmet: list[TicketInfo] = []
     overrun_blocked: list[TicketInfo] = []  # T-3440 / ORG-089
+    security_pending: list[TicketInfo] = []  # T-5678 / ORG-105
 
     found_any = False
     # ORG-088 rev-2 (T-3789): hoist per-site addressing inputs above the loop —
@@ -904,6 +907,12 @@ def list_eligible_tickets(agent: str) -> list[TicketInfo]:
             overrun_blocked.append(info)
             continue
 
+        # T-5678 / ORG-105 s4: a security-shaped filing awaits HO's security-accept.
+        # Structurally not-deliverable until then; joins the same skip family.
+        if _security_gate.is_pending(fields):
+            security_pending.append(info)
+            continue
+
         # T-3440 / ORG-089 Scope B: a dep counts as satisfied only when SHIPPED
         # (in done/ and not `substate: dropped`). A dropped dep keeps the
         # dependant dep-blocked (falsifier 2), same as a still-open dep.
@@ -935,6 +944,8 @@ def list_eligible_tickets(agent: str) -> list[TicketInfo]:
         raise SkipCycle("dependency_blocked")
     if overrun_blocked:
         raise SkipCycle("appetite_overrun_blocked")
+    if security_pending:
+        raise SkipCycle("security_pending")
     if interactive_locked:
         raise SkipCycle("interactive_required")
     if not_before_unmet:
@@ -1042,6 +1053,9 @@ def _is_non_workable(fields: dict) -> bool:
     # currently be worked" predicate, on the auto-dispatch side rather than
     # the manual-claim side).
     if fields.get("substate") == "awaiting-merge":
+        return True
+    # T-5678: a security_gate: pending ticket cannot be worked (nor be in flight).
+    if _security_gate.is_pending(fields):
         return True
     return False
 

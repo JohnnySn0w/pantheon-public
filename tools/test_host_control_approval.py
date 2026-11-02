@@ -123,7 +123,9 @@ CONSUMER_UID = 2001
 APPROVAL_PACKAGE_DIR = REPO_ROOT / "tools" / "host_control" / "approval"
 BROKER_MODULE_FILES = (
     REPO_ROOT / "tools" / "host_control" / "__init__.py",
+    REPO_ROOT / "tools" / "host_control" / "broker_config.py",  # T-2920 U2
     REPO_ROOT / "tools" / "host_control" / "contracts.py",
+    REPO_ROOT / "tools" / "host_control" / "daemon_config.py",  # T-2920 U2 (shared)
     REPO_ROOT / "tools" / "host_control" / "health.py",
     REPO_ROOT / "tools" / "host_control" / "health_dbus.py",
     REPO_ROOT / "tools" / "host_control" / "journal.py",
@@ -139,7 +141,9 @@ BROKER_MODULE_FILES = (
 # approver-policy file trust instead of drifting a ~300-line duplicate.
 BROKER_ONLY_MODULES = frozenset(
     (
+        "tools.host_control.__main__",  # T-2920 U2 broker entrypoint
         "tools.host_control.approval_client",
+        "tools.host_control.broker_config",  # T-2920 U2
         "tools.host_control.driver",
         "tools.host_control.envelope",
         "tools.host_control.execution_source",
@@ -168,7 +172,7 @@ BROKER_ONLY_MODULES = frozenset(
 # else via `from tools.host_control import X` (or `import tools.host_control`)
 # is flagged: the parent __init__ re-exports broker symbols, so the
 # module-set check alone has a re-export bypass (AB-2 review gap 1).
-SHARED_SUBSTRATE_NAMES = frozenset(("contracts", "trusted_files"))
+SHARED_SUBSTRATE_NAMES = frozenset(("contracts", "trusted_files", "daemon_config"))
 
 APPROVAL_TABLES = [
     ("grant_events", 1),
@@ -590,7 +594,9 @@ class SeparationTests(ApprovalCaseBase):
             [path.name for path in module_files],
             [
                 "__init__.py",
+                "__main__.py",  # T-2920 U2 daemon entrypoint
                 "broker_client.py",
+                "config.py",  # T-2920 U2 root config schema
                 "contracts.py",
                 "dbus_service.py",
                 "human.py",
@@ -2358,6 +2364,8 @@ class Gate28SurfaceTests(ApprovalCaseBase):
         # T-5518 async card delivery: a flag and a count, never a record
         "deliver_human_request": (bool,),
         "resume_human_deliveries": (int,),
+        # T-2920 U2: the keyset walk over every pending request; a count
+        "resume_all_human_deliveries": (int,),
     }
 
     def test_no_service_method_returns_authority_without_durable_bound_commit(self) -> None:
@@ -2935,6 +2943,10 @@ class ConsumerContractTests(unittest.TestCase):
                 }
             ],
         }
+        # T-5533: the broker reads the root-registered plan, not an installer.
+        from tools._host_control_plan_fixtures import framework_overlay, register_plan
+
+        register_plan(registry, self.root, prototype, seat_id="recovery", manifest_revision="manifest-r1")
         policy = {
             "schema": "pantheon-host-policy/v1",
             "revision": "policy-r1",
@@ -2969,10 +2981,16 @@ class ConsumerContractTests(unittest.TestCase):
         )
         self.handle_counter = itertools.count(0x1000)
         planner = HostPlanService(
-            registry=SeatRegistry.load(registry_path, files=self.files),
+            registry=SeatRegistry.load(
+                registry_path,
+                files=self.files,
+                # T-5533 review r1 B1: the broker plans against a framework overlay.
+                framework_root=framework_overlay(
+                    self.root / "framework", REPO_ROOT, tuple(registry["manifests"][0]["template_ids"])
+                ),
+            ),
             policy=HostPolicy.load(policy_path, files=self.files),
             journal=self.broker_journal,
-            installer=installer,
             clock=lambda: FIXED_NOW,
             handle_factory=self.next_handle,
             plan_ttl=timedelta(hours=1),

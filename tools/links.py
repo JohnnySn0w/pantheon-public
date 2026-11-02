@@ -138,6 +138,9 @@ def read_doc(path: Path) -> _Doc:
             body_start = i + 1
             break
         line = lines[i].rstrip("\n").rstrip("\r")
+        # T-5689: an indented line is block-scalar content (`key: |` / `>`), never a key.
+        if line[:1] in (" ", "\t"):
+            continue
         if ":" in line and not line.lstrip().startswith("#"):
             key, _, val = line.partition(":")
             key = key.strip()

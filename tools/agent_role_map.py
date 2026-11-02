@@ -425,7 +425,13 @@ _FALLBACK_PERSONA_TO_BINDING: dict[str, dict] = {
                   "supervisor": "control-plane"},
     # T-5311: mason's expected_policy_skip marker removed (its cited cause was stale;
     # in-window maintenance renders OK via T-5285).
-    "mason": {"account": "suborch1"},
+    # T-5698: mason runs under its runtime controller (pantheon-runtime-controller@mason,
+    # session suborch1-main) like artisan, so it carries the control-plane markers.
+    # restart_service stays ABSENT (watchman's shape): it would make restart_drain build a
+    # drain entry and flip context_fill_monitor's has_restart; the restart identity is
+    # derived by restart_target instead.
+    "mason": {"account": "suborch1", "restart_mode": "user",
+              "restart_pane": "suborch1-main:0", "supervisor": "control-plane"},
     # T-3574 (orchestrator ruling (b), 2026-09-08) + T-5299 (2026-10-20): artisan mirrors
     # instance.yaml roles.engineering-orchestrator-2. T-5299 completed the control-plane
     # cutover: supervisor + restart binding added (archivist's shape). The earlier premature
@@ -684,9 +690,13 @@ def restart_target(persona: str) -> dict:
     it. Raises KeyError when the persona has no restart binding: a caller that
     would fall back to a hardcoded bespoke unit is the exact hazard this replaces."""
     binding = instance_binding(persona)
-    if "restart_service" not in binding or "restart_pane" not in binding:
+    control_plane = binding.get("supervisor") == "control-plane"
+    # T-5698: a control-plane seat's service is DERIVED (persona-consume@), so it
+    # needs only restart_pane. watchman deliberately omits restart_service (it would
+    # arm Claude-coupled restart-drain/context-fill), and mason carries none either.
+    if "restart_pane" not in binding or (not control_plane and "restart_service" not in binding):
         raise KeyError(f"no restart binding for persona {persona!r}")
-    if binding.get("supervisor") == "control-plane":
+    if control_plane:
         return {"supervisor": "control-plane",
                 "service": control_plane_consume_service(persona),
                 "mode": binding.get("restart_mode", "user"),

@@ -3925,13 +3925,29 @@ class TestSeatMaintenanceT2984(unittest.TestCase):
     """T-2984: an active seat-maintenance window (notify_policy) vetoes the wedge
     restart via _wedge_restart_suppressed — checked BEFORE the flag and the modal
     capture, so a cutover-in-progress seat is never restarted out from under the swap.
-    The maintenance registry resolves under PANTHEON_STATE_DIR (same tmp as T-2965)."""
+    The maintenance registry resolves under PANTHEON_STATE_DIR (same tmp as T-2965).
+
+    T-5817: hermetic. PANTHEON_MAINTENANCE_REGISTRY outranks PANTHEON_STATE_DIR, and a
+    caller's environment can carry it (test_mailbox_wake used to set it process-wide at
+    import, so in a one-process full run this class armed specialist in THAT shared file and
+    test_no_maintenance then read it back). It is removed for each test and the whole
+    environment restored after. The seat-state readers are pinned to "no record": on the
+    HO seat `safe_effective_for("specialist")` otherwise runs a real cross-account
+    `sudo -n -u <specialist account> cat` and reads the host's OOM holds."""
 
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
-        os.environ["PANTHEON_STATE_DIR"] = self._tmp.name
         self.addCleanup(self._tmp.cleanup)
-        self.addCleanup(lambda: os.environ.pop("PANTHEON_STATE_DIR", None))
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("PANTHEON_MAINTENANCE_REGISTRY", None)
+        os.environ["PANTHEON_STATE_DIR"] = self._tmp.name
+        import tools.seat_state as ss
+        for name in ("_read_seat_state", "_read_seat_state_cross", "_read_oom"):
+            p = patch.object(ss, name, return_value=ss.Contribution())
+            p.start()
+            self.addCleanup(p.stop)
 
     def test_no_maintenance_is_not_suppressed(self) -> None:
         self.assertFalse(cfm._seat_in_maintenance("specialist"))
@@ -3965,10 +3981,35 @@ class TestSeatMaintenanceT2984(unittest.TestCase):
 
     def test_seat_in_maintenance_failopen_on_registry_fault(self) -> None:
         # A broken registry must never suppress (fail-open) — else it would silently
-        # mask real wedges. Point the resolver at an unreadable path.
+        # mask real wedges. Point the resolver at an unreadable path (setUp's
+        # patch.dict restores the caller's environment afterwards).
         os.environ["PANTHEON_MAINTENANCE_REGISTRY"] = "/proc/nonexistent/x.json"
-        self.addCleanup(lambda: os.environ.pop("PANTHEON_MAINTENANCE_REGISTRY", None))
         self.assertFalse(cfm._seat_in_maintenance("specialist"))
+
+    def test_t5817_inherited_registry_env_cannot_leak_in(self) -> None:
+        # Regression (orchestrator soak 2026-11-01): an armed registry named by an INHERITED
+        # PANTHEON_MAINTENANCE_REGISTRY must not decide these tests. Re-run setUp under
+        # such an environment: the arm stays invisible and the env comes back after.
+        import tools.notify_policy as np
+        leaked = Path(self._tmp.name) / "leaked.json"
+        np.enter_maintenance("specialist", minutes=30, registry=leaked)
+        with patch.dict(os.environ, {"PANTHEON_MAINTENANCE_REGISTRY": str(leaked)}):
+            inner = TestSeatMaintenanceT2984("test_no_maintenance_is_not_suppressed")
+            inner.setUp()
+            try:
+                self.assertFalse(cfm._seat_in_maintenance("specialist"))
+            finally:
+                inner.doCleanups()
+            self.assertEqual(os.environ.get("PANTHEON_MAINTENANCE_REGISTRY"), str(leaked))
+
+    def test_t5817_seat_state_is_not_read_from_the_host(self) -> None:
+        # No real seat-state read (and so no cross-account sudo) from these tests.
+        with patch("subprocess.run", side_effect=AssertionError("host read")) as run, \
+                patch("subprocess.Popen", side_effect=AssertionError("host read")) as popen, \
+                patch.object(cfm, "_capture_pane_text", return_value=None):
+            self.assertIsNone(cfm._wedge_restart_suppressed("specialist", {}))
+        run.assert_not_called()
+        popen.assert_not_called()
 
 
 class TestSeatStateT5527(unittest.TestCase):

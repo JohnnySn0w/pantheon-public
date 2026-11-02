@@ -112,6 +112,15 @@ fields:
   - {field: dropped_reason, kind: scalar, required: "when substate == dropped", authority: "ORG-021; T-3440", status: active}
   - {field: dropped_from_state, kind: enum, values: [inbox, active], required: "when substate == dropped", authority: "T-3440", status: active}
   - {field: awaiting_merge_ref, kind: scalar, required: "when substate == awaiting-merge", authority: "T-4119", status: active}
+  - {field: security_gate, kind: enum, values: [pending, accepted, rejected], required: never, authority: "T-5678", status: active}
+  - {field: security_rank, kind: enum, values: [primary, secondary], required: "when security_gate == accepted", authority: "T-5678", status: active}
+  - {field: threat_foothold, kind: scalar, required: "when security_gate is set and threat_unclassified is not true", authority: "T-5678", status: active}
+  - {field: threat_impact, kind: scalar, required: "when security_gate is set and threat_unclassified is not true", authority: "T-5678", status: active}
+  - {field: threat_path, kind: scalar, required: "when security_gate is set and threat_unclassified is not true", authority: "T-5678", status: active}
+  - {field: threat_justification, kind: scalar, required: never, authority: "T-5678", status: active}
+  - {field: not_security_reason, kind: scalar, required: never, authority: "T-5678", status: active}
+  - {field: threat_unclassified, kind: enum, values: ["true"], required: never, authority: "T-5678", status: active}
+  - {field: security_filer, kind: scalar, required: "when threat_unclassified == true", authority: "T-5678", status: active}
   # consumer stamps (authority = implementing tickets, orchestrator ruling T-4751)
   - {field: auto_delivered, kind: bool, values: [true], required: never, authority: "T-0717; T-0971", status: active}
   - {field: auto_delivered_at, kind: timestamp, required: "when auto_delivered is set", authority: "T-0717; T-0971", status: active}

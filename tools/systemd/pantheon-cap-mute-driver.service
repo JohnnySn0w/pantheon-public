@@ -32,6 +32,7 @@ OnFailure=pantheon-unit-failure-alert@%n.service
 Type=oneshot
 WorkingDirectory=%h/pantheon-config
 Environment=PATH=/usr/local/bin:/usr/bin:/bin
+Environment=CAP_MUTE_ARM=1
 # ORG-076 §7 per-persona notify-mute registry (T-2978/T-2987 go-live) — the SAME
 # source of truth is_muted() reads. This driver is a WRITER of it; the monitors are
 # readers. Fail-open if absent (notify_policy defaults to the never-created /opt path).

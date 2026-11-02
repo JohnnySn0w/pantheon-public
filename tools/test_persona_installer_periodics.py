@@ -89,6 +89,55 @@ class PeriodicCase(unittest.TestCase):
 
 
 class PlanShapeTests(PeriodicCase):
+    def test_live_reconcile_workflow_contains_only_keep_going_and_legacy_migration(self) -> None:
+        from tools import persona_installer_apply as apply_cli
+
+        data = _manifest_dict(second_persona=True)
+        data["roles"]["peer-daemon-consultant"]["legacy_units"] = ["codex-keep-going"]
+        self.set_manifest(data)
+        _installer, plan, _manifest = apply_cli.build_plan(
+            self.manifest_path,
+            "consultant",
+            repo_root=REPO_ROOT,
+            root=self.root / "projection",
+            workflow="reconcile-keep-going",
+        )
+        self.assertEqual(
+            [operation.operation_id for operation in plan.operations],
+            [
+                "connective.config-dir",
+                "connective.systemd-dir",
+                "connective.unit-dir",
+                "connective.local-dir",
+                "connective.local-state-dir",
+                "connective.pantheon-state-dir",
+                "connective.installer-state-dir",
+                "connective.state-dir",
+                "connective.receipt-dir",
+                "periodic.keep-going.service-unit",
+                "periodic.keep-going.timer-unit",
+                "service.codex-keep-going.decommission",
+                "periodic.daemon-reload",
+                "periodic.keep-going.timer-enable",
+                "periodic.keep-going.timer-observe",
+            ],
+        )
+        self.assertNotIn("harness.direct-fire", {op.operation_id for op in plan.operations})
+        enable = next(op for op in plan.operations if op.operation_id == "periodic.keep-going.timer-enable")
+        self.assertEqual(enable.desired["after"], "periodic.daemon-reload")
+
+        backend = SimulatedHostBackend()
+        decommission = next(op for op in plan.operations if op.kind == "seat-service-decommission")
+        unit_dir = decommission.desired["unit_dir"].rstrip("/")
+        for name in ("codex-keep-going.timer", "codex-keep-going.service"):
+            backend.seed_file(f"{unit_dir}/{name}", "legacy\n")
+        backend.enabled_timers.add("codex-keep-going.timer")
+        report = _installer.apply(plan, plan.digest, backend, self.actor(plan), manifest=_manifest)
+        self.assertEqual(report.status, "applied", report.errors)
+        self.assertIn("pantheon-keep-going@consultant.timer", backend.enabled_timers)
+        self.assertNotIn("codex-keep-going.timer", backend.enabled_timers)
+        self.assertIsNotNone(report.receipt)
+
     def test_seat_core_unit_installs_are_banner_plus_verbatim_template(self) -> None:
         plan = self.plan()
         expected = {
@@ -137,6 +186,40 @@ class PlanShapeTests(PeriodicCase):
         plan = self.plan("recovery")
         self.op(plan, "periodic.quota.timer-enable")  # StopIteration if gated away
 
+    def test_codex_personas_receive_keep_going_from_the_same_installer_bundle(self) -> None:
+        # The installer must not silently omit the anti-idle leg merely because the
+        # selected/default harness is Codex. keep_going owns the harness-specific
+        # submit profile at delivery time.
+        for persona in ("codex", "watchman"):
+            with self.subTest(persona=persona):
+                self.assertTrue(_pim._keep_going_planned(persona))
+                binding = dataclasses.replace(self.manifest.binding("recovery"), persona=persona)
+                periodics = _pim._seat_core_periodics(
+                    REPO_ROOT, self.manifest, binding, "# managed\n", "test-revision")
+                names = {name for name, _timer, _service in periodics.timers}
+                self.assertIn("keep-going", names)
+
+    def test_codex_legacy_cadence_is_retired_before_shared_timer_can_start(self) -> None:
+        data = _manifest_dict(second_persona=True)
+        data["roles"]["peer-daemon-consultant"]["legacy_units"] = ["codex-keep-going"]
+        self.set_manifest(data)
+        plan = self.plan("consultant")
+        operation = self.op(plan, "service.codex-keep-going.decommission")
+        self.assertEqual(
+            operation.desired["units"],
+            "codex-keep-going.timer,codex-keep-going.service",
+        )
+        ids = self.ids(plan)
+        self.assertLess(ids.index(operation.operation_id), ids.index("harness.direct-fire"))
+        self.assertLess(
+            ids.index(operation.operation_id),
+            ids.index("periodic.keep-going.timer-enable"),
+        )
+
+    def test_live_codex_binding_declares_legacy_cadence_migration(self) -> None:
+        live = Manifest.load(REPO_ROOT / "instance.yaml")
+        self.assertIn("codex-keep-going", live.binding("codex").legacy_units)
+
     def test_restart_drain_dropin_matches_live_content(self) -> None:
         plan = self.plan()
         operation = self.op(plan, "periodic.restart-drain.dropin")
@@ -166,6 +249,13 @@ class PlanShapeTests(PeriodicCase):
         data["persona_installer"]["mailbox"]["wake_timer_secondary_personas"] = []
         self.set_manifest(data)
         self.assertNotIn("periodic.mailbox-wake.timer-enable", self.ids(self.plan("consultant")))
+
+    def test_live_manifest_declares_every_controller_codex_seat_wakeable(self) -> None:
+        live = Manifest.load(REPO_ROOT / "instance.yaml")
+        mailbox = live.installer["mailbox"]
+        covered = set(mailbox["wake_timer_personas"]) | set(
+            mailbox["wake_timer_secondary_personas"])
+        self.assertTrue({"orchestrator", "specialist", "recovery", "codex", "watchman"} <= covered)
 
     def test_mailbox_onboard_is_imported_lazily(self) -> None:
         source = (REPO_ROOT / "tools" / "persona_installer.py").read_text(encoding="utf-8")
@@ -283,6 +373,31 @@ class SimulatedApplyTests(PeriodicCase):
             "pantheon-persona-consume@recovery.timer", absence.target, absence.desired["canonical_template_path"]
         )
         self.assertFalse(backend.preflight(absence).ok)
+
+    def test_codex_legacy_timer_is_disabled_and_quarantined_reversibly(self) -> None:
+        data = _manifest_dict(second_persona=True)
+        data["roles"]["peer-daemon-consultant"]["legacy_units"] = ["codex-keep-going"]
+        self.set_manifest(data)
+        plan = self.plan("consultant")
+        operation = self.op(plan, "service.codex-keep-going.decommission")
+        backend = SimulatedHostBackend()
+        unit_dir = operation.desired["unit_dir"].rstrip("/")
+        for name in ("codex-keep-going.timer", "codex-keep-going.service"):
+            backend.seed_file(f"{unit_dir}/{name}", "legacy\n")
+        backend.enabled_timers.add("codex-keep-going.timer")
+        mutation, evidence = backend.execute(operation, EXECUTION_CONTEXT_ALL_IN_ONE)
+        self.assertTrue(evidence.ok)
+        self.assertNotIn("codex-keep-going.timer", backend.enabled_timers)
+        self.assertEqual(mutation.before["timer_was_enabled"], "true")
+        self.assertEqual(
+            backend.entries[
+                f"{operation.desired['quarantine_dir']}/codex-keep-going.timer"
+            ]["state"],
+            "file",
+        )
+        backend.rollback_mutation(mutation)
+        self.assertIn("codex-keep-going.timer", backend.enabled_timers)
+        self.assertIn(f"{unit_dir}/codex-keep-going.timer", backend.entries)
 
 
 class AdoptionTests(PeriodicCase):
@@ -447,7 +562,10 @@ class BrokerPartitionTests(PeriodicCase):
                 periodic_ids = {o.operation_id for o in plan.operations if o.operation_id.startswith("periodic.")}
                 self.assertTrue(periodic_ids)
                 self.assertTrue(periodic_ids <= residue_ids)
-                self.assertLessEqual(len(residue), SEAT_LOCAL_RESIDUE_LIMIT)
+                # T-5470 (HO ruling 2026-10-26): routed launches have their own bound; B8 counts the rest
+                from tools.host_control.envelope import EXECUTOR_KIND_CLASSES
+
+                self.assertLessEqual(len([o for o in residue if o.kind not in EXECUTOR_KIND_CLASSES]), SEAT_LOCAL_RESIDUE_LIMIT)
                 self.assertFalse(
                     {o.kind for o in broker_plan.operations if o.operation_id.startswith("periodic.")}
                 )
@@ -469,7 +587,14 @@ class BrokerPartitionTests(PeriodicCase):
             # persona in the real instance.yaml plans today; one that stops
             # planning must fail this test loudly, not drop out of the count.
             plan = installer.plan(manifest, persona, root=self.root / f"real-{persona}")
-            counts[persona] = len(partition_installer_plan(plan)[1])
+            # T-5470 partition routing (HO ruling 2026-10-26): routed launches have their own
+            # bound; B8 cap unchanged. Count only the out-of-envelope residue (a residue op of
+            # an in-envelope kind is a routed launch or dependent).
+            from tools.host_control.envelope import EXECUTOR_KIND_CLASSES
+
+            counts[persona] = len(
+                [op for op in partition_installer_plan(plan)[1] if op.kind not in EXECUTOR_KIND_CLASSES]
+            )
         self.assertTrue(counts)
         self.assertLessEqual(max(counts.values()), SEAT_LOCAL_RESIDUE_LIMIT, counts)
 
@@ -480,8 +605,11 @@ class BrokerPartitionTests(PeriodicCase):
 
         plan = self.plan()
         residue_id = "periodic.daemon-reload"
-        victim = self.op(plan, "connective.timer-enable")
+        # T-5470: on a claude seat the consume timer-enable is routed to the residue
+        # now, so the victim is an op that stays ADMITTED (the mailbox probe).
+        victim = self.op(plan, "connective.mailbox-probe")
         self.assertIn(victim.kind, EXECUTOR_KIND_CLASSES)
+        self.assertIn(victim.operation_id, {o.operation_id for o in partition_installer_plan(plan)[0].operations})
         for dependency, field in (
             (residue_id, "desired"),
             ("seat-periodic-daemon-reload", "desired"),  # by residue KIND

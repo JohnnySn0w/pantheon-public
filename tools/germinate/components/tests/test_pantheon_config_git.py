@@ -31,6 +31,7 @@ from tools.germinate.registry.contract_digest import compute_contract_digest
 from tools.git_fixture import BubbleGit
 from tools.git_fixture import git as fgit
 from tools.persona_installer import InstallOperation, OperationFailed
+from tools import repo_reconciler as RR
 
 REPO_ROOT = Path(__file__).resolve().parents[4]
 COMPONENTS = REPO_ROOT / "tools" / "germinate" / "components"
@@ -137,14 +138,29 @@ def test_clone_of_a_pin_behind_the_tip_is_refused_and_leaves_nothing(world):
     assert not Path(world.target).exists() and CK not in world.handler.installs
 
 
-def test_clone_landing_on_the_wrong_commit_reclaims_itself(world):
+def test_clone_landing_on_the_wrong_commit_is_preserved_for_supervised_cleanup(world):
     world.advance("v2")
     S = _side_branch(world)  # a tip, but not of the default branch: clone lands on main's tip
     op = _op("repo.clone", pre={"exists": "false"}, desired={"head": S})
     assert not world.handler.preflight(op).ok
-    with pytest.raises(OperationFailed, match="clone landed on .*reclaimed"):
+    with pytest.raises(OperationFailed, match="clone landed on .*left in place"):
         world.handler.execute(op)
-    assert not Path(world.target).exists() and CK not in world.handler.installs
+    assert Path(world.target).exists() and CK not in world.handler.installs
+
+
+def test_failed_clone_race_preserves_foreign_content_and_receipt_refusal(world, monkeypatch):
+    world.advance("v2")
+    side = _side_branch(world)
+    original = RR._run_git
+    def raced(args, **kwargs):
+        result = original(args, **kwargs)
+        if args and args[0] == "clone" and result.returncode == 0:
+            Path(world.target, "foreign.txt").write_text("do not delete", encoding="utf-8")
+        return result
+    monkeypatch.setattr(RR, "_run_git", raced)
+    with pytest.raises(OperationFailed, match="left in place"):
+        world.handler.execute(_op("repo.clone", pre={"exists": "false"}, desired={"head": side}))
+    assert Path(world.target, "foreign.txt").read_text(encoding="utf-8") == "do not delete"
 
 
 # --- ff-advance -------------------------------------------------------------------

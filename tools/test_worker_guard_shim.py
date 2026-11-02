@@ -139,6 +139,57 @@ class TestShimMatchesImplAsScript(unittest.TestCase):
         self.assertGreater(cmp.denies, 2)
 
 
+class TestCompareScriptsTimeoutRerun(unittest.TestCase):
+    """T-5817: a pair that differs only because one side hit the guard's own T-4389 deadline on a
+    loaded host is re-run serially and judged on the re-run; any other difference is final."""
+
+    _ALLOW = smoke.Outcome(0, b"", b"")
+    _DENY = smoke.Outcome(0, b'{"hookSpecificOutput": {"permissionDecision": "deny"}}', b"")
+    _TIMEOUT = smoke.Outcome(0, b'{"x": "' + smoke.TIMED_OUT_MARKER + b' this command"}', b"")
+
+    def _compare(self, script_outcomes, reruns=smoke.TIMEOUT_RERUNS):
+        """`script_outcomes`: {script: [outcome per successive run of the one case]}."""
+        calls = {"ref": 0, "new": 0}
+
+        def fake_run(script, stdin, timeout=120.0):
+            seq = script_outcomes[str(script)]
+            out = seq[min(calls[str(script)], len(seq) - 1)]
+            calls[str(script)] += 1
+            return out
+
+        with unittest.mock.patch.object(smoke, "run_script", side_effect=fake_run):
+            cmp = smoke.compare_scripts(Path("ref"), Path("new"), [("c", b"{}")], workers=1,
+                                        timeout_reruns=reruns)
+        return cmp, calls
+
+    def test_marker_is_the_impls_deadline_text(self):
+        impl = _load_impl()
+        self.assertIn(smoke.TIMED_OUT_MARKER, json.dumps(impl._TIMED_OUT).encode())
+
+    def test_load_timeout_on_one_side_is_rerun_and_passes(self):
+        cmp, calls = self._compare({"ref": [self._TIMEOUT, self._ALLOW], "new": [self._ALLOW]})
+        self.assertEqual(cmp.mismatches, [])
+        self.assertEqual(calls, {"ref": 2, "new": 2})
+
+    def test_persistent_timeout_stays_a_mismatch(self):
+        cmp, calls = self._compare({"ref": [self._TIMEOUT], "new": [self._ALLOW]})
+        self.assertEqual(len(cmp.mismatches), 1)
+        self.assertEqual(calls["ref"], 1 + smoke.TIMEOUT_RERUNS)
+
+    def test_rerun_must_still_be_byte_identical(self):
+        cmp, _ = self._compare({"ref": [self._TIMEOUT, self._DENY], "new": [self._ALLOW]})
+        self.assertEqual(len(cmp.mismatches), 1)
+
+    def test_a_real_difference_is_never_rerun(self):
+        cmp, calls = self._compare({"ref": [self._DENY], "new": [self._ALLOW]})
+        self.assertEqual(len(cmp.mismatches), 1)
+        self.assertEqual(calls, {"ref": 1, "new": 1})
+
+    def test_reruns_off_keeps_the_old_strictness(self):
+        cmp, _ = self._compare({"ref": [self._TIMEOUT, self._ALLOW], "new": [self._ALLOW]}, reruns=0)
+        self.assertEqual(len(cmp.mismatches), 1)
+
+
 class TestShimAlone(unittest.TestCase):
     def test_fast_path_never_imports_the_impl_and_missing_impl_fails_loud(self):
         # run_isolation copies ONLY the shim to a temp dir: a main-thread payload must still be a

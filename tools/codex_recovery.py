@@ -150,6 +150,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Protocol
 
@@ -165,6 +166,21 @@ SYSTEMCTL = "/usr/bin/systemctl"
 ENV_BIN = "/usr/bin/env"
 # logind's own persistent linger state: one empty file per lingering account.
 LINGER_STATE_DIR = Path("/var/lib/systemd/linger")
+CAP_STATE_ROOT = Path(".local/state/pantheon/personas")
+CAP_STATE_FILENAME = "mid-session-cap.json"
+CAP_STATE_SCHEMA = "pantheon-persona-mid-session-cap/v1"
+MAX_CAP_STATE_BYTES = 64 * 1024
+CAP_STATE_MAX_AGE_SECS = 600
+_ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+_MODAL_FOOTER_RE = re.compile(
+    r"(?i)^[ \t ]*enter[ \t ]+to[ \t ]+confirm[ \t ]*"
+    r"·[ \t ]*esc[ \t ]+to[ \t ]+cancel[ \t ]*$"
+)
+_SPEND_OPTION_GLYPH_RE = re.compile(
+    r"❯[ \t ]*adjust[ \t ]+monthly[ \t ]+spend[ \t ]+limit:",
+    re.IGNORECASE,
+)
+_MODAL_SPAN_LINES = 16
 
 # ---------------------------------------------------------------------------
 # Defaults (all overridable — the real, root-owned paths at increment-2
@@ -1173,6 +1189,28 @@ class PaneForegroundProbe:
         return tuple(p.decode("utf-8", "replace") for p in raw.split(b"\x00") if p)
 
 
+class PaneCaptureProbe:
+    """Capture the target pane through the same hardened account transition."""
+
+    def __init__(self, *, runner: Callable[..., object] | None = None,
+                 pwnam: Callable[[str], object] = pwd.getpwnam):
+        self._runner = runner or _real_runner
+        self._pwnam = pwnam
+
+    def capture(self, target: TargetSpec) -> str:
+        uid, gid = _revalidated_uid_gid(target, pwnam=self._pwnam)
+        argv = _setpriv_prefix(uid, gid) + [
+            TMUX, "capture-pane", "-p", "-t", target.tmux_session,
+        ]
+        out = self._runner(
+            argv, env=_build_env(target, pwnam=self._pwnam),
+            timeout=SUBPROCESS_TIMEOUT_SECS,
+        )
+        if out.returncode != 0:
+            raise subprocess.CalledProcessError(out.returncode, argv, out.stdout, out.stderr)
+        return out.stdout
+
+
 # ---------------------------------------------------------------------------
 # Root -> target transition + argv construction (contract item 1).
 # ---------------------------------------------------------------------------
@@ -2020,6 +2058,102 @@ def _real_runner(argv: list[str], *, env: dict[str, str], timeout: float):
     )
 
 
+def read_spend_reset_state(target: TargetSpec) -> Mapping[str, object]:
+    """Read the target account's single published cap-detector state.
+
+    Account-to-persona identity is deliberately not guessed here.  A target
+    account with zero or multiple detector records is ambiguous and therefore
+    cannot authorize a live keystroke.
+    """
+    root = Path(f"/home/{target.account}") / CAP_STATE_ROOT
+    candidates = sorted(root.glob(f"*/{CAP_STATE_FILENAME}"))
+    if len(candidates) != 1:
+        raise ValueError(f"expected one cap reset record, found {len(candidates)}")
+    path = candidates[0]
+    if path.is_symlink() or not path.is_file():
+        raise ValueError("cap reset record is not a regular non-symlink file")
+    raw = path.read_bytes()
+    if len(raw) > MAX_CAP_STATE_BYTES:
+        raise ValueError("cap reset record exceeds size limit")
+    try:
+        state = json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError("cap reset record is malformed") from exc
+    if not isinstance(state, dict):
+        raise ValueError("cap reset record is not an object")
+    return state
+
+
+def _parse_explicit_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        return None
+    return parsed.astimezone(timezone.utc)
+
+
+def pane_shows_monthly_spend_modal_at_bottom(pane_text: str | None) -> bool:
+    """Strict live-chrome check equivalent to Claude's cap classifier."""
+    if not pane_text:
+        return False
+    normalized = _ANSI_RE.sub("", pane_text).replace("\r", "").rstrip()
+    lines = normalized.splitlines()
+    if not lines or _MODAL_FOOTER_RE.fullmatch(lines[-1]) is None:
+        return False
+    region = "\n".join(lines[-_MODAL_SPAN_LINES:]).lower()
+    required = (
+        "monthly spend limit",
+        "what do you want to do?",
+        "usage credit balance: $",
+        "wait for limit to reset",
+    )
+    return all(item in region for item in required) and bool(
+        _SPEND_OPTION_GLYPH_RE.search(region)
+    )
+
+
+def _reset_state_identity(state: Mapping[str, object]) -> tuple[object, ...]:
+    """Action-relevant episode identity; observed_at may advance on a safe reread."""
+    return tuple(state.get(key) for key in (
+        "schema", "runtime", "modal_present", "modal_kind", "detected_at",
+        "reset_at", "reset_source",
+    ))
+
+
+def _spend_reset_comparison(state: Mapping[str, object], now: float) -> tuple[dict, str | None]:
+    checked_at = _iso_utc(int(now))
+    reset_at_raw = state.get("reset_at")
+    receipt = {
+        "reset_checked_at": checked_at,
+        "reset_at": reset_at_raw if isinstance(reset_at_raw, str) else None,
+        "reset_comparison": "ambiguous",
+    }
+    if state.get("schema") != CAP_STATE_SCHEMA:
+        return receipt, "spend modal reset evidence has unknown schema"
+    if state.get("modal_present") is not True:
+        return receipt, "spend modal reset evidence does not confirm a live modal"
+    if state.get("modal_kind") != "monthly-spend-limit":
+        return receipt, "reset evidence is not for a monthly spend-limit modal"
+    observed_at = _parse_explicit_timestamp(state.get("observed_at"))
+    now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    if observed_at is None or not (0 <= (now_dt - observed_at).total_seconds() <= CAP_STATE_MAX_AGE_SECS):
+        return receipt, "spend modal reset evidence is missing, stale, or future-dated"
+    if state.get("reset_source") != "parsed":
+        return receipt, "spend modal reset evidence is not parsed"
+    reset_at = _parse_explicit_timestamp(reset_at_raw)
+    if reset_at is None:
+        return receipt, "spend modal reset evidence has no unambiguous reset time"
+    if now_dt < reset_at:
+        receipt["reset_comparison"] = "pre-reset"
+        return receipt, "spend modal dismissal refused before parsed reset"
+    receipt["reset_comparison"] = "post-reset"
+    return receipt, None
+
+
 def dispatch(
     *,
     verb: str,
@@ -2032,6 +2166,9 @@ def dispatch(
     rate_limiter: RateLimiter,
     runner: SubprocessRunner = _real_runner,
     foreground_probe: Callable[[TargetSpec], ForegroundSnapshot] | None = None,
+    spend_reset_probe: Callable[[TargetSpec], Mapping[str, object]] | None = None,
+    pane_capture: Callable[[TargetSpec], str | None] | None = None,
+    clock: Callable[[], float] = time.time,
     deploy_owner_uids: frozenset[int] = DEFAULT_DEPLOY_OWNER_UIDS,
     dry_run: bool = False,
     manifest_loader: Callable[..., BrokerManifest] = load_broker_manifest,
@@ -2046,9 +2183,11 @@ def dispatch(
     manifest_kwargs.setdefault("pwnam", pwnam)
     who = {"verb": verb, "target": target_key, "action": action,
            "invoker_uid": invoker.uid, "invoker_user": invoker.user}
+    reset_receipt: dict = {}
+    initial_reset_state: Mapping[str, object] | None = None
 
     def _refuse(reason: str) -> DispatchResult:
-        _best_effort_audit(audit, event="refuse", reason=reason, **who)
+        _best_effort_audit(audit, event="refuse", reason=reason, **reset_receipt, **who)
         return DispatchResult(outcome="refused", detail=reason)
 
     if verb not in DESTRUCTIVE_VERBS:
@@ -2097,6 +2236,21 @@ def dispatch(
             # action would run), but this keeps it a clean, audited refusal
             # instead of an uncaught traceback out of dispatch()/main().
             return _refuse(f"foreground probe failed: {exc}")
+        if action == "spend-modal-dismiss":
+            if spend_reset_probe is None:
+                spend_reset_probe = read_spend_reset_state
+            try:
+                initial_reset_state = spend_reset_probe(target)
+                reset_receipt, reset_refusal = _spend_reset_comparison(initial_reset_state, clock())
+            except (OSError, ValueError, TypeError) as exc:
+                reset_receipt = {
+                    "reset_checked_at": _iso_utc(int(clock())),
+                    "reset_at": None,
+                    "reset_comparison": "ambiguous",
+                }
+                return _refuse(f"spend modal reset evidence unavailable: {exc}")
+            if reset_refusal is not None:
+                return _refuse(reset_refusal)
         try:
             argv = build_unstick_argv(target, action, pwnam=pwnam)
         except DispatchRefusedError as exc:
@@ -2147,27 +2301,63 @@ def dispatch(
         if not allowed:
             return _refuse("precedence precondition not met: " + " ".join(states))
 
+        env = _build_env(target, pwnam=pwnam)
+
+        # The detector record is necessary but not sufficient: immediately
+        # before Escape, prove the exact modal still occupies the pane bottom,
+        # then reread the detector so a state transition during capture closes
+        # the gate instead of landing a key in whatever replaced the modal.
+        if verb == "unstick" and action == "spend-modal-dismiss":
+            assert initial_reset_state is not None  # established by the first gate above
+            capture = pane_capture or PaneCaptureProbe(pwnam=pwnam).capture
+            try:
+                live_pane = capture(target)
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                return _refuse(f"live pane capture failed: {exc}")
+            if not pane_shows_monthly_spend_modal_at_bottom(live_pane):
+                return _refuse("live pane does not show the monthly spend-limit modal at bottom")
+            try:
+                assert spend_reset_probe is not None
+                final_reset_state = spend_reset_probe(target)
+                reset_receipt, reset_refusal = _spend_reset_comparison(final_reset_state, clock())
+            except (OSError, ValueError, TypeError) as exc:
+                return _refuse(f"spend modal reset reread unavailable: {exc}")
+            if reset_refusal is not None:
+                return _refuse(reset_refusal)
+            if _reset_state_identity(final_reset_state) != _reset_state_identity(initial_reset_state):
+                return _refuse("spend modal reset evidence changed during live verification")
+
         rate_key = f"{verb}__{target_key}"
         if not rate_limiter.check_and_record(rate_key):
             return _refuse("rate limit exceeded")
 
-        env = _build_env(target, pwnam=pwnam)
-
         if dry_run:
-            _best_effort_audit(audit, event="dry_run", argv=argv, **who)
+            _best_effort_audit(audit, event="dry_run", argv=argv, **reset_receipt, **who)
             return DispatchResult(outcome="dry_run", detail="validated; not executed")
 
         # Fail-closed (contract item 5): the pre-action audit write MUST succeed
         # before we act. If it can't, refuse — never execute unaudited.
         try:
-            audit.write(event="pre_action", argv=argv, **who)
+            audit.write(event="pre_action", argv=argv, **reset_receipt, **who)
         except AuditWriteError as exc:
             return DispatchResult(outcome="refused", detail=f"audit sink unwritable: {exc}")
 
         result = runner(argv, env=env, timeout=SUBPROCESS_TIMEOUT_SECS)
 
+        modal_confirmation = None
+        if verb == "unstick" and action == "spend-modal-dismiss":
+            try:
+                after_pane = (pane_capture or PaneCaptureProbe(pwnam=pwnam).capture)(target)
+                modal_confirmation = (
+                    "still-present" if pane_shows_monthly_spend_modal_at_bottom(after_pane)
+                    else "cleared"
+                )
+            except (OSError, ValueError, subprocess.SubprocessError):
+                modal_confirmation = "unreadable"
+
         try:
-            audit.write(event="post_action", exit_code=result.returncode, **who)
+            audit.write(event="post_action", exit_code=result.returncode,
+                        modal_confirmation=modal_confirmation, **reset_receipt, **who)
         except AuditWriteError as exc:
             # Best-effort: the action already ran and can't be un-done. Loud on
             # stderr so this is never a silently-swallowed gap.
@@ -2348,6 +2538,8 @@ class BrokerContext:
     manifest_kwargs: dict = field(default_factory=dict)
     runner: SubprocessRunner = _real_runner
     foreground_probe: Callable[[TargetSpec], ForegroundSnapshot] | None = None
+    spend_reset_probe: Callable[[TargetSpec], Mapping[str, object]] | None = None
+    pane_capture: Callable[[TargetSpec], str | None] | None = None
     linger_probe: Callable[[str], bool] = real_linger_probe
     clock: Callable[[], float] = time.time
 
@@ -2436,6 +2628,9 @@ def main(argv: list[str] | None = None, *, ctx: BrokerContext | None = None) -> 
         rate_limiter=RateLimiter(state_dir, clock=ctx.clock),
         runner=ctx.runner,
         foreground_probe=probe,
+        spend_reset_probe=ctx.spend_reset_probe,
+        pane_capture=ctx.pane_capture,
+        clock=ctx.clock,
         dry_run=args.dry_run,
         manifest_kwargs=ctx.manifest_kwargs,
         pwnam=ctx.pwnam,

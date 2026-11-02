@@ -1004,7 +1004,10 @@ class SecondaryWakeTimerTests(MailboxOnboardTestCase):
 
     def test_live_instance_yaml_lists_consume_plane_secondaries(self) -> None:
         ctx = mo.load_mailbox_context(REPO_ROOT / "instance.yaml", REPO_ROOT)
-        self.assertEqual(ctx.wake_timer_secondary_personas, frozenset({"artisan", "specialist", "recovery", "mason"}))
+        self.assertEqual(
+            ctx.wake_timer_secondary_personas,
+            frozenset({"artisan", "specialist", "recovery", "mason", "watchman"}),
+        )
         self.assertFalse(ctx.wake_timer_personas & ctx.wake_timer_secondary_personas)
 
 

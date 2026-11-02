@@ -741,7 +741,21 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
-    goal_keys = frozenset(args.goal_key)
+    if args.goal_key:
+        # Explicit flags override the registry (tests, ad-hoc checks).
+        goal_keys = frozenset(args.goal_key)
+    else:
+        # T-5679: default to the canonical goals.md markers. A failing
+        # registry is surfaced, then validation proceeds with no keys, so
+        # only a record that actually names goal:<key> is affected.
+        try:
+            from tools.goal_registry import registry_status
+        except ImportError:  # run as `python3 tools/project_catalogue.py`
+            from goal_registry import registry_status
+
+        goal_keys, registry_error = registry_status(args.repo_root)
+        if registry_error is not None:
+            print(f"goal-registry-unavailable: {registry_error}", file=sys.stderr)
     if any(PROJECT_ID_RE.fullmatch(key) is None for key in goal_keys):
         print("goal keys must use stable lowercase kebab form", file=sys.stderr)
         return 2

@@ -15,6 +15,18 @@ harmless; a nudge fired into active work is the disruption we avoid). The idle-g
 also the natural throttle: once a nudge wakes the agent it goes busy, so the next tick
 skips — no extra debounce needed.
 
+HARNESS-NEUTRAL IDLE (T-5793). The pane gate above read only Claude Code's sentinels, so
+every codex pane classified None and a codex seat (specialist on fallback, codex, watchman) was
+skipped forever. Idle now comes from the live harness's own session log
+(tools/harness_idle.py: codex rollout task_started/task_complete/turn_aborted, Claude
+transcript turn boundaries + background work); only an IDLE reading proceeds, and the pane
+capture is demoted to the pre-inject safety gate (harness_idle.pane_inject_safe). The
+reading also supplies the session id for the T-1500 backoff reset and the harness for the
+submit profile. KEEP_GOING_IDLE_SOURCE=pane restores the pre-T-5793 pane gate and Claude
+session probe. It is not byte-identical: active_harness (the pane-mode submit profile and
+the codex cap-gate exemption) now prefers the controller's runtime.json over the
+active-runtime.json cache in both modes.
+
 Known limitation: an agent idle because it is legitimately WAITING on a human answer
 looks the same as a parked agent, so it will be nudged. That nudge is low-harm (the
 agent can just restate it is blocked on the operator), but noted.
@@ -117,6 +129,13 @@ try:
 except ImportError:  # bare run with cwd=tools/
     import fleet_usage_gate as _fug  # type: ignore
 
+# T-5793: harness-neutral idle from the harness's own session log. Stdlib-only module
+# that never raises; same dual-import shape as the imports above.
+try:
+    from tools import harness_idle as _hi
+except ImportError:  # bare run with cwd=tools/
+    import harness_idle as _hi  # type: ignore
+
 AGENT_PANE = {
     "orchestrator": {
         "pane_target": "claude-telegram-bot:0", "unix_user": "claude",
@@ -128,18 +147,21 @@ AGENT_PANE = {
         # recovery/specialist control-plane seats, whose plain `-home-<account>` slug read
         # a stale/other project dir than their live session writes.
         "projects_dir": agent_role_map.live_session_projects_dir("claude"),
+        "harness": "claude-code",
     },
     "specialist": {
         "pane_target": "claude-research-bot:0", "unix_user": "claude-research",
         "pantheon_config_path": "/home/claude-research/pantheon-config",
         "ledger_agent_id": "specialist",
         "projects_dir": agent_role_map.live_session_projects_dir("claude-research"),
+        "harness": "claude-code",
     },
     "recovery": {
         "pane_target": "claude-telegram-bot-fallback:0", "unix_user": "claude-fallback",
         "pantheon_config_path": "/home/claude-fallback/pantheon-config",
         "ledger_agent_id": "recovery",
         "projects_dir": agent_role_map.live_session_projects_dir("claude-fallback"),
+        "harness": "claude-code",
     },
     # Mason + Artisan (ORG-043 sub-orchestrator seats), added 2026-07-21: their
     # bringup armed pantheon-keep-going@{mason,artisan}.timer (T-1896) but this map
@@ -167,6 +189,24 @@ AGENT_PANE = {
         "projects_dir": agent_role_map.live_session_projects_dir("suborch2"),
         "queue_aware_backoff": True,
         "ticket_targets": frozenset({"artisan"}),
+    },
+    "codex": {
+        "pane_target": "codex-session:0", "unix_user": "codex",
+        "pantheon_config_path": "/home/codex/pantheon-config",
+        "ledger_agent_id": "codex",
+        "projects_dir": agent_role_map.live_session_projects_dir("codex"),
+        "harness": "codex",
+        "queue_aware_backoff": True,
+        "ticket_targets": frozenset({"codex", "role:head_auditor"}),
+    },
+    "watchman": {
+        "pane_target": "codex-fallback-main:0", "unix_user": "codex-fallback",
+        "pantheon_config_path": "/home/codex-fallback/pantheon-config",
+        "ledger_agent_id": "watchman",
+        "projects_dir": agent_role_map.live_session_projects_dir("codex-fallback"),
+        "harness": "codex",
+        "queue_aware_backoff": True,
+        "ticket_targets": frozenset({"watchman", "role:system_orchestrator"}),
     },
 }
 
@@ -202,24 +242,6 @@ _NO_KEEP_GOING: dict[str, str] = {
         "T-3811). REVISIT (move her here -> AGENT_PANE) ONLY under a real "
         "wakeability-topology change, which is operator-ratify per orchestrator; the "
         "mailbox-wake timer is her heartbeat."
-    ),
-    "codex": (
-        "EXEMPT — different harness, not a different opinion. codex is an OpenAI "
-        "codex-CLI agent, not Claude Code (T-1041/T-1106). Its TUI needs the "
-        "`harness: codex` submit profile because the claude-code '[Pasted text' "
-        "sentinel is always-absent there and the default profile FALSE-PASSES — it "
-        "reports a nudge submitted without confirming it. This module's AGENT_PANE "
-        "carries no harness key and its delivery path assumes the default profile, "
-        "so a codex entry here would silently report success while nudging nothing. "
-        "Supporting it means teaching this module the harness profile first."
-    ),
-    "watchman": (
-        "EXEMPT — same harness reason as codex (T-4884 B6): watchman is a codex-CLI "
-        "seat (codex-fallback), and this module's delivery path assumes the Claude "
-        "Code submit profile, so a nudge would false-pass. Also by design: it takes "
-        "only recovery tickets and is woken by its deterministic watcher and its "
-        "mailbox, not an anti-idle timer (design note §3/§4: Claude-coupled monitors "
-        "are not armed on this seat)."
     ),
 }
 
@@ -348,11 +370,11 @@ def capture_pane(pane_target: str, unix_user: str) -> str | None:
     return r.stdout if r.returncode == 0 else None
 
 
-def inject(pane_target: str, prompt: str) -> bool:
+def inject(pane_target: str, prompt: str, *, harness: str = "claude-code") -> bool:
     """Inject + submit-verify via send_keys_submit.sh (same path as the mailbox waker)."""
     try:
         r = subprocess.run(
-            [str(_SEND_KEYS_HELPER), pane_target, prompt],
+            [str(_SEND_KEYS_HELPER), "--harness", harness, pane_target, prompt],
             capture_output=True, text=True, timeout=60,
         )
     except (subprocess.TimeoutExpired, OSError) as exc:
@@ -361,6 +383,47 @@ def inject(pane_target: str, prompt: str) -> bool:
     if r.returncode != 0:
         print(f"[keep_going] inject failed rc={r.returncode}: {r.stderr.strip()}", file=sys.stderr)
     return r.returncode == 0
+
+
+def active_harness(agent: str, cfg: dict, *, state_path: Path | None = None) -> str:
+    """Return the submit-profile harness for the persona's live runtime.
+
+    Controller-managed seats can change harness without changing their tmux target.
+    T-5793: a thin wrapper over the shared resolver harness_idle.resolve_harness —
+    the controller's runtime.json first (what mailbox_wake reads), then the
+    active-runtime.json cache, then the manifest/default harness carried by the seat
+    configuration. Malformed/missing state fails safely to that default.
+    `state_path` (tests) names an active-runtime.json; runtime.json is looked up beside
+    it under runtime-controller/, the real per-persona layout.
+    """
+    fallback = str(cfg.get("harness") or "claude-code")
+    home = Path(f"/home/{cfg['unix_user']}")
+    pdir = state_path.parent if state_path is not None else None
+    profile, _started, _source = _hi.resolve_harness(
+        agent, home=home, default=fallback, account=cfg["unix_user"], persona_dir=pdir)
+    return profile
+
+
+# T-5793 rollback lever: "log" (default) gates the nudge on the harness session log;
+# "pane" restores the pre-T-5793 pane classifier, Claude session id and active_harness
+# delivery. Not byte-identical: active_harness now prefers runtime.json over the
+# active-runtime.json cache. Read per run so a unit drop-in flips it without a deploy.
+IDLE_SOURCE_ENV = "KEEP_GOING_IDLE_SOURCE"
+
+
+def idle_source() -> str:
+    return "pane" if os.environ.get(IDLE_SOURCE_ENV, "log").strip().lower() == "pane" else "log"
+
+
+def idle_reading(agent: str, cfg: dict) -> "_hi.IdleReading":
+    """The seat's idle reading from its live harness's session log (never raises).
+    keep_going@<seat> runs AS the seat, so the default local reader suffices."""
+    user = cfg["unix_user"]
+    return _hi.read_idle(
+        agent, account=user, home=f"/home/{user}", cwd=cfg.get("pantheon_config_path"),
+        default_harness=str(cfg.get("harness") or "claude-code"),
+        claude_projects_dir=cfg.get("projects_dir"),
+    )
 
 
 def mailbox_inbox_for(agent: str) -> Path:
@@ -683,6 +746,7 @@ def _ticket_is_actionable(path: Path, targets: frozenset, root: Path) -> bool:
     not_before_val: str | None = None
     depends_raw: str | None = None
     labels_raw: str | None = None
+    security_gate_val: str | None = None
     for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
         if line.startswith("target:"):
             target_val = line.split(":", 1)[1].strip()
@@ -692,6 +756,8 @@ def _ticket_is_actionable(path: Path, targets: frozenset, root: Path) -> bool:
             depends_raw = line.split(":", 1)[1].strip()
         elif line.startswith("labels:"):
             labels_raw = line.split(":", 1)[1].strip()
+        elif line.startswith("security_gate:"):
+            security_gate_val = line.split(":", 1)[1].strip()
         elif line.startswith("# "):
             break  # past the frontmatter block
 
@@ -705,6 +771,10 @@ def _ticket_is_actionable(path: Path, targets: frozenset, root: Path) -> bool:
         labels = {p.strip().strip("'\"") for p in labels_raw.strip("[]").split(",")}
         if "interactive-required" in labels:
             return False  # interactive_required
+
+    # T-5678 / ORG-105 s4: awaiting HO's security-accept; the consumer will not dispatch it.
+    if (security_gate_val or "").lower() == "pending":
+        return False  # security_pending
 
     if depends_raw and depends_raw not in ("[]", ""):
         deps = [p.strip() for p in depends_raw.strip("[]").split(",") if p.strip()]
@@ -833,6 +903,15 @@ def cap_or_usage_gate(cfg: dict, agent: str, now_ts: int,
     2. Then T-2024's HIT-cap check, `is_usage_capped`, unchanged: returns True/False.
 
     do_fleet_gate is an injection seam for testing (called with now_ts)."""
+    # The fleet gate measures the shared Claude subscription. A controller-swapped
+    # Codex runtime must keep progressing; charging Claude's scarcity to another
+    # provider is the live T-5748 failure mode.
+    if active_harness(agent, cfg) == "codex":
+        # Both cap detectors consume Claude transcript/status records. Once the
+        # selected runtime is Codex those records describe the unavailable primary,
+        # not the live provider, and must not park the fallback.
+        return False
+
     gate = do_fleet_gate or _fug.evaluate
     try:
         decision = gate(now_ts)
@@ -870,7 +949,8 @@ def run(agent: str, *, prompt: str = DEFAULT_PROMPT,
         do_sleep=time.sleep,
         now_ts: int | None = None,
         adaptive: bool | None = None,
-        do_seat_hold=None) -> int:
+        do_seat_hold=None,
+        do_idle_reading=None) -> int:
     cfg = AGENT_PANE.get(agent)
     if cfg is None:
         print(f"[keep_going] unknown agent {agent!r} (known: {list(AGENT_PANE)})", file=sys.stderr)
@@ -885,12 +965,24 @@ def run(agent: str, *, prompt: str = DEFAULT_PROMPT,
               f"(ORG-106 L2)")
         return 0
 
+    source = idle_source()
+    reading = None  # T-5793: the log reading (log mode only)
+
     def deliver() -> bool:
         """Delivery-mode dispatch (T-1827 R1): the decision logic above is identical
         for every agent; only this final step is per-agent switchable. Fail-open to
         send-keys for any agent missing from DELIVERY_MODE."""
         if DELIVERY_MODE.get(agent, "send-keys") == "mailbox":
             return do_mailbox_send(agent, prompt, inbox=mailbox_inbox)
+        if reading is not None:
+            # T-5793: inject with the harness the log reading resolved (codex ->
+            # the codex submit profile), the same one the pane gate was checked for.
+            return do_inject(cfg["pane_target"], prompt, harness=reading.harness)
+        if do_inject is inject:
+            return do_inject(
+                cfg["pane_target"], prompt,
+                harness=active_harness(agent, cfg),
+            )
         return do_inject(cfg["pane_target"], prompt)
 
     def landed_after_all() -> bool:
@@ -915,17 +1007,36 @@ def run(agent: str, *, prompt: str = DEFAULT_PROMPT,
                 return True
         return False
 
-    pane = do_capture(cfg["pane_target"], cfg["unix_user"])
-    if pane is None:
-        print(f"[keep_going] {agent}: pane uncapturable — skip (fail safe)", file=sys.stderr)
-        return 0  # not an error: a missed nudge is harmless
-    idle = is_idle_at_prompt(pane)
-    if idle is None:
-        print(f"[keep_going] {agent}: idle state inconclusive — skip (fail safe)")
-        return 0
-    if idle is False:
-        print(f"[keep_going] {agent}: busy or modal — skip (no nudge into active work)")
-        return 0
+    if source == "log":
+        # T-5793: idle comes from the harness's own session log; only IDLE nudges
+        # (WORKING / BG_WAIT / UNKNOWN skip — UNKNOWN keeps the old None->skip fail-safe).
+        reading = (do_idle_reading or idle_reading)(agent, cfg)
+        if reading.verdict is not _hi.Verdict.IDLE:
+            print(f"[keep_going] {agent}: log says {reading.verdict.value} — skip "
+                  f"({reading.reason}; harness={reading.harness} log={reading.log_path})")
+            return 0
+        # The screen is only the pre-inject safety gate (modal/dialog/busy check).
+        pane = do_capture(cfg["pane_target"], cfg["unix_user"])
+        if pane is None:
+            print(f"[keep_going] {agent}: log says idle, pane uncapturable — skip (fail safe)",
+                  file=sys.stderr)
+            return 0
+        if not _hi.pane_inject_safe(pane, reading.harness):
+            print(f"[keep_going] {agent}: log says idle, pane not injectable — skip "
+                  f"(harness={reading.harness}; {reading.reason})")
+            return 0
+    else:
+        pane = do_capture(cfg["pane_target"], cfg["unix_user"])
+        if pane is None:
+            print(f"[keep_going] {agent}: pane uncapturable — skip (fail safe)", file=sys.stderr)
+            return 0  # not an error: a missed nudge is harmless
+        idle = is_idle_at_prompt(pane)
+        if idle is None:
+            print(f"[keep_going] {agent}: idle state inconclusive — skip (fail safe)")
+            return 0
+        if idle is False:
+            print(f"[keep_going] {agent}: busy or modal — skip (no nudge into active work)")
+            return 0
 
     # T-2024: parked-at-idle is necessary but not sufficient — a usage/capability
     # cap can leave the pane LOOKING idle while every turn would just re-hit the
@@ -965,7 +1076,10 @@ def run(agent: str, *, prompt: str = DEFAULT_PROMPT,
             state = read_state(sp)
             # T-1500 (B): a restarted session voids the escalation measured against the
             # OLD session — reset to base cadence so a fresh parked agent is nudged fast.
-            state, sess_reset = maybe_reset_for_new_session(state, do_session_id(cfg))
+            # T-5793: in log mode the reading names the live harness's session (a codex
+            # rollout id on codex), so the reset fires on a codex restart too.
+            cur_sid = reading.session_id if reading is not None else do_session_id(cfg)
+            state, sess_reset = maybe_reset_for_new_session(state, cur_sid)
             cur_work = do_work_ts(cfg)
             now = now_ts if now_ts is not None else int(time.time())
             # T-1926: opt-in only. Agents without `queue_aware_backoff` pass floor_exp=None

@@ -25,7 +25,7 @@
 #                  denylisted modal persists (fail-closed; did NOT press keys)
 #             64 = usage error (unknown --agent / bad flag)
 #
-# Usage: verify_startup.sh [--agent recovery|orchestrator|specialist] [--self] [--no-dewedge]
+# Usage: verify_startup.sh [--agent recovery|orchestrator|specialist|archivist|mason|artisan|codex|watchman] [--self] [--no-dewedge]
 #                          [--at-boot] [--pane <target>] [--timeout <sec>] [--json] [-h]
 #   --at-boot: SessionStart-hook mode (T-1099) — self-call that skips the pane
 #              check (pane unsettled mid-boot) + de-wedge (no-self-inject), runs
@@ -79,7 +79,10 @@ BOTTOM_REGION_LINES=6
 # These are deliberately separate from the Claude constants above, whose byte
 # equality with handoff_and_restart.sh is guarded by the smoke suite.
 CODEX_IDLE_PROMPT='^[[:space:]]*›([[:space:]]|$)'
-CODEX_IDLE_FOOTER='^[[:space:]]*[[:alnum:]._-]+[[:space:]]+[[:alnum:]._-]+[[:space:]]+·[[:space:]]+[^[:space:]]+[[:space:]]+·[[:space:]]+.+[[:space:]]+\[[^]]+\][[:space:]]*$'
+# Codex always renders model + effort + cwd. Some builds also append the git
+# context (`· Main [default]`); Watchman's observed composer omits that suffix.
+# The prompt conjunction and modal veto below remain mandatory in both shapes.
+CODEX_IDLE_FOOTER='^[[:space:]]*[[:alnum:]._-]+[[:space:]]+[[:alnum:]._-]+[[:space:]]+·[[:space:]]+[^[:space:]]+([[:space:]]+·[[:space:]]+.+[[:space:]]+\[[^]]+\])?[[:space:]]*$'
 CODEX_DIALOG_EXCLUDE='Press enter to confirm|esc to cancel|Would you like to run'
 
 # --- per-agent facts (single explicit source; mirrors _AGENT_HEALTH_CONFIG +
@@ -90,9 +93,10 @@ CODEX_DIALOG_EXCLUDE='Press enter to confirm|esc to cancel|Would you like to run
 # mailbox_wake.AGENT_PANE (the fullest existing source) rather than re-derived,
 # and the services MEASURED per account rather than assumed.
 declare -A AGENT_USER=( [recovery]=claude-fallback [orchestrator]=claude [specialist]=claude-research \
-                        [archivist]=exocortex [mason]=suborch1 [artisan]=suborch2 [codex]=codex )
+                        [archivist]=exocortex [mason]=suborch1 [artisan]=suborch2 [codex]=codex [watchman]=codex-fallback )
 declare -A AGENT_PANE=( [recovery]=claude-telegram-bot-fallback:0 [orchestrator]=claude-telegram-bot:0 [specialist]=claude-research-bot:0 \
-                        [archivist]=claude-telegram-bot-exocortex:0 [mason]=suborch1-main:0 [artisan]=suborch2-main:0 [codex]=codex-session )
+                        [archivist]=claude-telegram-bot-exocortex:0 [mason]=suborch1-main:0 [artisan]=suborch2-main:0 [codex]=codex-session \
+                        [watchman]=codex-fallback-main:0 )
 # ⚠️ mason and artisan have NO session-owning unit — measured: their tmux sessions
 # are created directly, and `systemctl --user list-units` shows only per-task
 # units (inbox-consumer@, keep-going@), nothing that owns the session. The entry
@@ -100,22 +104,24 @@ declare -A AGENT_PANE=( [recovery]=claude-telegram-bot-fallback:0 [orchestrator]
 # plausible name here would produce a permanent "not active (got 'unknown')"
 # warning about a unit that was never supposed to exist.
 declare -A AGENT_SERVICE=( [recovery]=claude-telegram-fallback.service [orchestrator]=claude-telegram.service [specialist]=claude-telegram-research.service \
-                           [archivist]=claude-telegram-exocortex.service [mason]= [artisan]= [codex]=codex-daemon.service )
+                           [archivist]=claude-telegram-exocortex.service [mason]= [artisan]= [codex]=codex-daemon.service \
+                           [watchman]=pantheon-runtime-controller@watchman.service )
 # T-5299: which seats run the Telegram plugin (and so have a poller child to find).
 # This is NOT derivable from AGENT_SERVICE: a control-plane seat gets a session unit from
 # restart-target whether or not it has a bot, and artisan (mailbox-first, no bot) has one
 # since its cutover. Keying the poller probe on the unit made artisan read "comms-dark" and
 # poller_escalate kill its healthy session. Unknown seat -> 0 -> NOT_APPLICABLE -> never
 # escalates (an unlisted seat must be added here deliberately to be poller-checked).
-declare -A AGENT_TELEGRAM=( [recovery]=1 [orchestrator]=1 [specialist]=1 [archivist]=1 [mason]=0 [artisan]=0 [codex]=0 )
+declare -A AGENT_TELEGRAM=( [recovery]=1 [orchestrator]=1 [specialist]=1 [archivist]=1 [mason]=0 [artisan]=0 [codex]=0 [watchman]=0 )
 declare -A AGENT_HOME=( [recovery]=/home/claude-fallback [orchestrator]=/home/claude [specialist]=/home/claude-research \
-                        [archivist]=/home/exocortex [mason]=/home/suborch1 [artisan]=/home/suborch2 [codex]=/home/codex )
+                        [archivist]=/home/exocortex [mason]=/home/suborch1 [artisan]=/home/suborch2 [codex]=/home/codex \
+                        [watchman]=/home/codex-fallback )
 # ⚠️ HARNESS. Every pane sentinel in this file — the idle '❯', the boot dialogs,
 # the liveness tokens — describes CLAUDE CODE's TUI. codex runs a different
 # harness with a different screen, so matching those patterns against its pane is
 # meaningless and DISMISSING against it would be pressing unknown keys into a live
 # session. It is listed so it can be named and identified; the de-wedge refuses.
-declare -A AGENT_HARNESS=( [codex]=codex )
+declare -A AGENT_HARNESS=( [codex]=codex [watchman]=codex )
 
 AGENT=""
 SELF_MODE="auto"     # auto: decide from whether --agent's user == current user
@@ -157,7 +163,7 @@ if [[ -z "$AGENT" ]]; then
   done
 fi
 if [[ -z "$AGENT" || -z "${AGENT_USER[$AGENT]:-}" ]]; then
-  echo "verify_startup: unknown/undetermined agent (got '${AGENT:-}'; user '$CURRENT_USER'). Pass --agent recovery|orchestrator|specialist." >&2
+  echo "verify_startup: unknown/undetermined agent (got '${AGENT:-}'; user '$CURRENT_USER'). Pass a known --agent (recovery, orchestrator, specialist, archivist, mason, artisan, codex, or watchman)." >&2
   exit 64
 fi
 

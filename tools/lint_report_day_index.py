@@ -61,8 +61,13 @@ def linked_md_targets(readme_text: str) -> set[str]:
 
 
 def disk_md_files(day_dir: Path) -> set[str]:
-    """`*.md` report files in a day directory, excluding README.md."""
-    return {p.name for p in day_dir.glob("*.md") if p.name != "README.md"}
+    """`*.md` report files in a day directory, excluding README.md and
+    `_`-prefixed runner artifacts (e.g. `_topic-warnings.md`, which
+    watch_runner writes with deliberately no README row)."""
+    return {
+        p.name for p in day_dir.glob("*.md")
+        if p.name != "README.md" and not p.name.startswith("_")
+    }
 
 
 def check_day_dir(day_dir: Path) -> tuple[list[str], list[str]]:

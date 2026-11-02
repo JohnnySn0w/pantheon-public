@@ -1,0 +1,4 @@
+{"type":"user","timestamp":"2026-10-23T15:36:30.287Z","turnOrigin":"task_notification","message":{"content":"<task-notification><task-id>a6405612ccd08b31a</task-id><status>completed</status></task-notification>"}}
+{"type":"assistant","timestamp":"2026-10-23T15:36:34.206Z","message":{"stop_reason":"end_turn"}}
+{"type":"system","subtype":"stop_hook_summary","timestamp":"2026-10-23T15:36:34.458Z"}
+{"type":"system","subtype":"turn_duration","timestamp":"2026-10-23T15:36:34.512Z","pendingBackgroundAgentCount":1}

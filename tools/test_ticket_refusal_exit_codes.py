@@ -18,6 +18,7 @@ import ast
 import contextlib
 import io
 import os
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -579,6 +580,33 @@ class TestAppetiteHelpMatchesTheGate(_FileFlow):
         # It suggests operator-ad-hoc, so it must also say that needs --appetite.
         self.assertIn("'operator-ad-hoc'", msg)
         self.assertIn("needs --appetite", msg)
+
+    def test_ad_hoc_via_operational_root_is_still_a_bet(self) -> None:
+        """T-3332 r1 MED-1: the help says file ad-hoc the operator asks with
+        --nearest-intent-ref ticket:T-5677 PLUS a descriptive --serves, which
+        the ORG-089 appetite gate refuses without --appetite and accepts with
+        it, with no ORG-054 purpose warning (T-5677 is an operational root).
+        T-5677 is the captured real root from tools/fixtures/ticket_lineage."""
+        shutil.copy(
+            Path(__file__).resolve().parent / "fixtures" / "ticket_lineage"
+            / "tickets" / "inbox" / "T-5677.md",
+            self.tickets / "inbox" / "T-5677.md",
+        )
+        for dest in ("serves", "nearest_intent_ref"):
+            with self.subTest(help=dest):
+                text = _file_option_help(dest)
+                self.assertIn("--nearest-intent-ref ticket:T-5677", text)
+                self.assertIn("descriptive --serves (which requires --appetite", text)
+        ad_hoc = (*self.BASE, "--nearest-intent-ref=ticket:T-5677",
+                  "--serves=the operator ad-hoc ask: compare two model backends")
+        rc, _out, err = _run_main(*ad_hoc)
+        self.assertEqual(rc, ticket.EXIT_REFUSAL, err)
+        self.assertIn("appetite required", _error_line(err))
+        self.assertEqual(self._inbox_files(), ["T-5677.md"])
+        rc, _out, err = _run_main(*ad_hoc, "--appetite=4")
+        self.assertEqual(rc, 0, err)
+        self.assertNotIn("[ticket-purpose] WARN", err)
+        self.assertEqual(self._inbox_files(), ["T-0099.md", "T-5677.md"])
 
     def test_following_the_help_succeeds(self) -> None:
         # operator-ad-hoc + --appetite files...

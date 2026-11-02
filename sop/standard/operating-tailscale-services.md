@@ -3,7 +3,7 @@
 ## When to use this
 
 Operating, observing, or restoring Pantheon's Tailscale Serve mappings:
-- PWA reachability check (`https://swarm.tail26cadd.ts.net/` from the operator's phone or any tailnet device).
+- PWA reachability check (`https://swarm.example.ts.net/` from the operator's phone or any tailnet device).
 - Recovery when serve config has disappeared (per T-0336 first production occurrence 2026-05-14).
 - Initial setup or re-setup after a host migration.
 - Auditing what the tailnet exposes from this node.
@@ -59,7 +59,7 @@ The inbox-consumer dispatches it; Orchestrator runs the sudo commands; the resol
 
 ```bash
 tailscale serve status --json | jq '.Services'   # Should show svc:kino + svc:dashboard with TCP entries
-curl -k https://swarm.tail26cadd.ts.net/         # From a tailnet device — should return PWA HTML
+curl -k https://swarm.example.ts.net/         # From a tailnet device — should return PWA HTML
 ```
 
 End-to-end smoke: the operator loads PWA from his iPhone (Tailscale must be active on iPhone — check `tailscale status` shows iPhone's `last seen` is recent / online).
@@ -96,7 +96,7 @@ The Tailscale-User-Login header model assumes the backend ONLY accepts requests 
 
 ### Tag-owned client device → no Tailscale-User-Login → kino 401 (T-0638)
 
-**Symptom:** PWA fetch fails with `fetchTickets: 401`; server-side `tailscale status` shows the user's user-tagged devices all offline/idle and the active client appears as `tagged-devices`. The kino daemon is healthy, Tailscale serve config is intact, but `curl https://kino.tail26cadd.ts.net/api/tickets` returns `{"error":"unauthorized","reason":"no_tailscale_identity"}`.
+**Symptom:** PWA fetch fails with `fetchTickets: 401`; server-side `tailscale status` shows the user's user-tagged devices all offline/idle and the active client appears as `tagged-devices`. The kino daemon is healthy, Tailscale serve config is intact, but `curl https://kino.example.ts.net/api/tickets` returns `{"error":"unauthorized","reason":"no_tailscale_identity"}`.
 
 **Cause:** Tailscale serve injects `Tailscale-User-Login` from the *source peer's user identity*. When a device is owned by a TAG (e.g. `tagged-devices`) instead of a user account, it has no user identity to propagate — the header is OMITTED from forwarded requests (not "tagged-devices" as a literal value), and kino's `extractTailscaleIdentity` returns `null`. The distinction matters: `no_tailscale_identity` is "no header at all," not `user_mismatch` ("header present but rejected").
 

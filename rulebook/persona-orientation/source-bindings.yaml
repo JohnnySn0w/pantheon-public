@@ -3,10 +3,10 @@
 # the most recent non-dry-run render. Read by
 # tools/persona_orientation/check_stale.py to detect drift.
 rulebook/directives.md:
-  byte_length: 63621
-  git_blob: 40244656492cde2dccbc82108f14b70f5f655790
-  git_sha: bd907297b984b4d3c6ecc857d61abd883ae15350
-  sha256: 3b5724173f4ecfe006496a6619bd136ad3ac8bc8a4944eb17075d1478666f5d6
+  byte_length: 64997
+  git_blob: 1dbcb37e00e444b3321274738d519b1f2142bb97
+  git_sha: fef18ac0885ece02cae91605ea147dca79a857db
+  sha256: a1a27493cd10e05844685eff9c1b32706d925ef9310b701c81f38c672725e618
 rulebook/policies/autonomy.md:
   byte_length: 28390
   git_blob: fa13ae11c8b83cfb53cbb404876468752cc171e5
@@ -28,10 +28,10 @@ rulebook/policies/goal-mapping.md:
   git_sha: da3668ad7eea7fc985eaf8306672e7d480424c0e
   sha256: 5c744e5e7503720bce17c578ee3113e1960acbbfeabaac80cec9fa43a37869f8
 rulebook/policies/mcp-adoption.md:
-  byte_length: 13481
-  git_blob: 01818c6013ce834de50848ccc7ceb06164615215
-  git_sha: 54da3534a94bce3e84a666678ac9805dcd16fa38
-  sha256: 805e553d0a952cf72d54e7a5be85634aeac862d2c6a38f37b270ad860622b82a
+  byte_length: 15459
+  git_blob: 22e8126bff04c12a161b02b4a0af29f3bc7801e7
+  git_sha: d37c293ff229fe8b57192487711f5550e5a3e859
+  sha256: 10a1a9ea37c3b9aa65df2c8763907534724e05e71e3ed138ef4de43b7e9644d7
 rulebook/policies/trust-posture.md:
   byte_length: 26575
   git_blob: 7ea7de923d44f69f1a6f2469a9aea86ef19ff512
@@ -48,10 +48,10 @@ sop/standard/a2a-research-request-handling.md:
   git_sha: 650829da832a61d1d7f212d5fabfbb4e2c654baa
   sha256: 0b2a59e1c3e50badccda48bb0a9ec6b4eddec39aa82104cb3dcb34324ba8d39e
 sop/standard/applying-the-threat-model.md:
-  byte_length: 3245
-  git_blob: 01cc990122b120918dd9b61a9aedfa57c3d0c9f0
-  git_sha: 19e2eff7472bf09e2d074db7bd663267a69defbe
-  sha256: 7632b356d8d28af3b656274b81f2a204c0c4d31f940e3fc4ef95eb04d60b31bd
+  byte_length: 6634
+  git_blob: 404c906e97acf1317126b6d145aae4d37f348436
+  git_sha: 034f275f6fd931c2f062149e8e713a68a63bcbfd
+  sha256: 85ece0701a1d476c131073aef5dd8fbb32a5a7dc6b76d284dab38635a095741f
 sop/standard/auto-resume-operator-runbook.md:
   byte_length: 21200
   git_blob: a5d515b1f4d7cacb294d63b98c1d683dfe1518a3
@@ -143,10 +143,10 @@ sop/standard/testing-depth-and-scope.md:
   git_sha: 585bc0af43d46de5832dddcc170a31c204ba2009
   sha256: 1790f2790af046c1c6b865ef07bffffc0ccc9924b33bae64c7ef67c07dd11a48
 sop/standard/ticket-flow.md:
-  byte_length: 15886
-  git_blob: 8297d080ead23c63eaf01ef94770fc40c05b7745
-  git_sha: a3dc970ee6d2db3bcc6c7a40f1d608555f3a0ee0
-  sha256: 3f36fff9d7481f512990682f1a26d69bc8363d9922e5e37318727e16b1d0a4e8
+  byte_length: 16917
+  git_blob: bdba2d230b0c53ddf17f1c10ce0202be17a0a0da
+  git_sha: f7b6b58569e5e6f7966ab05baff40e40d029c0bf
+  sha256: cd1320b67a7ba28168a234d3149969fa6466b983a281e11199a14acdd50c5aa0
 sop/standard/web-research-isolation.md:
   byte_length: 8834
   git_blob: 991c28a85fdcf966dc881fa362e1e71852301920

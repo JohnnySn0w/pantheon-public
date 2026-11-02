@@ -2,7 +2,7 @@
 
 ## When to use this
 
-You want a new backend (bound to `127.0.0.1:<port>`) reachable from the tailnet at a clean subdomain like `https://<name>.tail26cadd.ts.net` — separate FQDN, separate certs, coexists with the existing services (kino, dashboard, echo-recorder).
+You want a new backend (bound to `127.0.0.1:<port>`) reachable from the tailnet at a clean subdomain like `https://<name>.example.ts.net` — separate FQDN, separate certs, coexists with the existing services (kino, dashboard, echo-recorder).
 
 Pantheon's pattern is **service-scope serves** (`tailscale serve --service=svc:<name>`), NOT default-scope. Service-scope gives each service its own subdomain via Tailscale Services + `tag:swarm` node tagging. Default-scope would clobber root path on the swarm node (kino owns it).
 
@@ -23,7 +23,9 @@ Tailscale admin console → Services → "Create service":
 - **Backend host:** the VPS, tagged `tag:swarm`
 - **Port:** `443` (Tailscale Services proxy terminate TLS at 443)
 
-ACL must permit the tag. Already configured for `tag:swarm` per kino's setup.
+### 2b. Approve the host for the new service (one-time, the operator)
+
+After the node-side serve (step 3) is set, Tailscale admin console → Services → `<name>`: approve the pending host. Until it is approved, `tailscaled` installs no route for the service VIP, so the URL **times out** (not 502) even though the serve is set and the backend is up. Misleading signal: the node's CapMap can already list `services/<name>` with its addrs and `tcp:443` before approval, so a host-side CapMap check does not prove approval; the console's Services page is the authority (T-5704, svc:vote: diagnosed as a missing policy grant, fixed by the approval click alone).
 
 ### 3. Add the node-side service-scope serve
 
@@ -55,14 +57,14 @@ tailscale serve get-config --all
 tailscale serve status --json | jq '.Services'
 
 # Smoke from the VPS itself (kino + dashboard work direct; new services may take ~1–2 min for MagicDNS propagation):
-curl -sk -o /dev/null -w "HTTP %{http_code}\n" https://<name>.tail26cadd.ts.net/
+curl -sk -o /dev/null -w "HTTP %{http_code}\n" https://<name>.example.ts.net/
 
 # End-to-end smoke from the operator's phone:
 # - Tailscale active on iPhone
-# - Open https://<name>.tail26cadd.ts.net/ in Safari (NOT http:// — see gotcha below)
+# - Open https://<name>.example.ts.net/ in Safari (NOT http:// — see gotcha below)
 ```
 
-**Operator gotcha — HTTPS only, no HTTP redirect.** Tailscale Serve at `--https=443` listens on HTTPS only; there is no automatic `http://` → `https://` redirect. A phone hitting `http://<name>.tail26cadd.ts.net/` will hang on a connection timeout (looks like a server problem; it's actually wrong-scheme). Always include the explicit `https://` scheme in any URL you share or bookmark. Surfaced 2026-05-16 during T-0363 echo-recorder first-fire.
+**Operator gotcha — HTTPS only, no HTTP redirect.** Tailscale Serve at `--https=443` listens on HTTPS only; there is no automatic `http://` → `https://` redirect. A phone hitting `http://<name>.example.ts.net/` will hang on a connection timeout (looks like a server problem; it's actually wrong-scheme). Always include the explicit `https://` scheme in any URL you share or bookmark. Surfaced 2026-05-16 during T-0363 echo-recorder first-fire.
 
 ### 6. Test the boot-restore path (recommended for new services)
 

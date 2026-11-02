@@ -94,8 +94,13 @@ def _is_real_user_turn(rec):
     tool_result records ALSO carry role="user" (verified on a live transcript
     2026-07-28). Treating one as the latest user turn would compare against the
     wrong point in the conversation and let a genuinely-dropped reply through.
+
+    The record TYPE must be "user" (T-5808): `api-request-blob` records also carry
+    role="user" but hold the whole API request, including injected CLAUDE.md text
+    that quotes a telegram channel tag, so keying on role alone made every
+    session-opening turn on a seat with such a CLAUDE.md look Telegram-inbound.
     """
-    if rec.get("type") == "user" or (rec.get("message") or {}).get("role") == "user":
+    if rec.get("type") == "user":
         parts = _content_parts(rec)
         if parts and all(p.get("type") == "tool_result" for p in parts if isinstance(p, dict)):
             return False
@@ -194,7 +199,10 @@ def main():
     if last_user is None:
         allow()                     # tail window held no user turn -> not our case
 
-    if not CHANNEL_RE.search(_text_of(records[last_user])):
+    # Anchored at the turn's START (T-5808): a real delivery opens with the channel
+    # tag (129/129 live inbounds, 2026-11-01). A prompt that merely QUOTES the tag
+    # mid-text (a ticket body, a rule, a pasted log) is not a telegram turn.
+    if not CHANNEL_RE.match(_text_of(records[last_user]).lstrip()):
         allow()                     # not a telegram-inbound turn
 
     if _replied_after(records, last_user):

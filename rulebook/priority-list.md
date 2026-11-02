@@ -17,34 +17,30 @@ Sort algorithm (per ORG-078 §3):
 <!-- PRIORITY-LIST-START -->
 ```yaml
 priority-1:
-  # the operator TG 1676 (2026-08-29): T-3338 and T-3339 jointly occupy the
-  # top slot while the fleet persona-orientation substrate is built.
-  - persona-orientation
+  # the operator TG 12363 (2026-10-27): ORG-052 installer + ORG-106 lead the stack.
+  - org-052
+  - org-106
 
 priority-2:
-  # the operator's current top-of-stack per TG 8027 (2026-08-20)
+  # the operator TG 12385 (2026-10-27): Echo moves up to priority 2.
+  - echo
+  # the operator's top-of-stack per TG 8027 (2026-08-20)
   - harness-controller
   - t-2953-arc
-  # the operator TG 8228 (2026-08-22): promote the activity_monitor Signal-1
-  # structural rewrite — replace language-regex await-detection with
-  # tool_use-absence structural detector. Fixes the model-level tendency
-  # class surfaced when T-3070 (regex extension) exposed the underlying
-  # brittleness of language-detection against stochastic model output.
-  - t-3071-arc
 
 priority-3:
   # Ticket-system flow — the layer that enforces cascade, priority, dependency
   - ticket-flow
   - org-065
-  - org-013
 
 priority-4:
+  # Persona-orientation phases 3-5 (T-5674/75/76, the operator TG 12358)
+  - persona-orientation
+
+priority-5:
   # Concordance / retrieval — decision-corpus recall + injection layer
   - concordance
   - org-073
-  # the operator TG 1902 (2026-09-06): return Echo to the active stack. Lowest
-  # current active rank preserves the persona/harness/ticket-flow prerequisites.
-  - echo
 ```
 <!-- PRIORITY-LIST-END -->
 

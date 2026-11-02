@@ -1,0 +1,557 @@
+{
+ "cases": {
+  "absent-acl:/srv/pantheon/missing": [
+   {
+    "argv": [
+     "/usr/bin/getfacl",
+     "--omit-header",
+     "--absolute-names",
+     "--no-effective",
+     "--physical",
+     "--",
+     "/srv/pantheon/missing"
+    ],
+    "returncode": 1,
+    "stderr": "getfacl: /srv/pantheon/missing: No such file or directory\n",
+    "stdout": ""
+   }
+  ],
+  "converged:acl:/srv/pantheon/shared": [
+   {
+    "argv": [
+     "/usr/bin/getfacl",
+     "--omit-header",
+     "--absolute-names",
+     "--no-effective",
+     "--physical",
+     "--",
+     "/srv/pantheon/shared"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "user::rwx\ngroup::r-x\ngroup:pmail:r-x\nmask::r-x\nother::---\n\n"
+   }
+  ],
+  "converged:dir:/srv/pantheon/mbox-alice": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/srv/pantheon/mbox-alice"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "directory:alice:pmail:2770\n"
+   }
+  ],
+  "converged:file:/etc/dbus-1/system.d/org.pantheon.T2918Fixture.conf": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/etc/dbus-1/system.d/org.pantheon.T2918Fixture.conf"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "regular file:root:root:644\n"
+   },
+   {
+    "argv": [
+     "/usr/bin/sha256sum",
+     "--",
+     "/etc/dbus-1/system.d/org.pantheon.T2918Fixture.conf"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "edc14effd2a66fd71ad92ef1e925566a588f427fb2ae22dc16c68ee27321b649  /etc/dbus-1/system.d/org.pantheon.T2918Fixture.conf\n"
+   }
+  ],
+  "converged:file:/etc/sudoers.d/pantheon-alice-probe": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/etc/sudoers.d/pantheon-alice-probe"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "regular file:root:root:440\n"
+   },
+   {
+    "argv": [
+     "/usr/bin/sha256sum",
+     "--",
+     "/etc/sudoers.d/pantheon-alice-probe"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "d4ee1bdd95bef58477a07e804e16197caa89a065dd62d105918bb5d6b355bee0  /etc/sudoers.d/pantheon-alice-probe\n"
+   }
+  ],
+  "converged:file:/etc/systemd/system/t2918.service": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/etc/systemd/system/t2918.service"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "regular file:root:root:644\n"
+   },
+   {
+    "argv": [
+     "/usr/bin/sha256sum",
+     "--",
+     "/etc/systemd/system/t2918.service"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "6794f46b9e3b96cc320bc5a305737ff8e906de46365a5a340b0c677a6957f7e8  /etc/systemd/system/t2918.service\n"
+   }
+  ],
+  "converged:group:pmail": [
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "group",
+     "pmail"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "pmail:x:3001:alice\n"
+   }
+  ],
+  "converged:linger:alice": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/var/lib/systemd/linger/alice"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "regular empty file:root:root:644\n"
+   }
+  ],
+  "converged:member:pmail:alice": [
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "group",
+     "pmail"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "pmail:x:3001:alice\n"
+   }
+  ],
+  "converged:owner_mode:/srv/pantheon/shared": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/srv/pantheon/shared"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "directory:alice:pmail:750\n"
+   }
+  ],
+  "converged:passwd:alice": [
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "passwd",
+     "alice"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "alice:x:3101:3101::/home/alice:/bin/bash\n"
+   },
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "shadow",
+     "alice"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "alice:x:20753:0:99999:7:::\n"
+   }
+  ],
+  "dir-as-file:/etc/systemd/system": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/etc/systemd/system"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "directory:root:root:755\n"
+   },
+   {
+    "argv": [
+     "/usr/bin/sha256sum",
+     "--",
+     "/etc/systemd/system"
+    ],
+    "returncode": 1,
+    "stderr": "/usr/bin/sha256sum: /etc/systemd/system: Is a directory\n",
+    "stdout": ""
+   }
+  ],
+  "fresh:acl:/srv/pantheon/shared": [
+   {
+    "argv": [
+     "/usr/bin/getfacl",
+     "--omit-header",
+     "--absolute-names",
+     "--no-effective",
+     "--physical",
+     "--",
+     "/srv/pantheon/shared"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "user::rwx\ngroup::r-x\nother::r-x\n\n"
+   }
+  ],
+  "fresh:dir:/srv/pantheon/mbox-alice": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/srv/pantheon/mbox-alice"
+    ],
+    "returncode": 1,
+    "stderr": "/usr/bin/stat: cannot statx '/srv/pantheon/mbox-alice': No such file or directory\n",
+    "stdout": ""
+   }
+  ],
+  "fresh:file:/etc/dbus-1/system.d/org.pantheon.T2918Fixture.conf": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/etc/dbus-1/system.d/org.pantheon.T2918Fixture.conf"
+    ],
+    "returncode": 1,
+    "stderr": "/usr/bin/stat: cannot statx '/etc/dbus-1/system.d/org.pantheon.T2918Fixture.conf': No such file or directory\n",
+    "stdout": ""
+   },
+   {
+    "argv": [
+     "/usr/bin/sha256sum",
+     "--",
+     "/etc/dbus-1/system.d/org.pantheon.T2918Fixture.conf"
+    ],
+    "returncode": 1,
+    "stderr": "/usr/bin/sha256sum: /etc/dbus-1/system.d/org.pantheon.T2918Fixture.conf: No such file or directory\n",
+    "stdout": ""
+   }
+  ],
+  "fresh:file:/etc/sudoers.d/pantheon-alice-probe": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/etc/sudoers.d/pantheon-alice-probe"
+    ],
+    "returncode": 1,
+    "stderr": "/usr/bin/stat: cannot statx '/etc/sudoers.d/pantheon-alice-probe': No such file or directory\n",
+    "stdout": ""
+   },
+   {
+    "argv": [
+     "/usr/bin/sha256sum",
+     "--",
+     "/etc/sudoers.d/pantheon-alice-probe"
+    ],
+    "returncode": 1,
+    "stderr": "/usr/bin/sha256sum: /etc/sudoers.d/pantheon-alice-probe: No such file or directory\n",
+    "stdout": ""
+   }
+  ],
+  "fresh:file:/etc/systemd/system/t2918.service": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/etc/systemd/system/t2918.service"
+    ],
+    "returncode": 1,
+    "stderr": "/usr/bin/stat: cannot statx '/etc/systemd/system/t2918.service': No such file or directory\n",
+    "stdout": ""
+   },
+   {
+    "argv": [
+     "/usr/bin/sha256sum",
+     "--",
+     "/etc/systemd/system/t2918.service"
+    ],
+    "returncode": 1,
+    "stderr": "/usr/bin/sha256sum: /etc/systemd/system/t2918.service: No such file or directory\n",
+    "stdout": ""
+   }
+  ],
+  "fresh:group:pmail": [
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "group",
+     "pmail"
+    ],
+    "returncode": 2,
+    "stderr": "",
+    "stdout": ""
+   }
+  ],
+  "fresh:linger:alice": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/var/lib/systemd/linger/alice"
+    ],
+    "returncode": 1,
+    "stderr": "/usr/bin/stat: cannot statx '/var/lib/systemd/linger/alice': No such file or directory\n",
+    "stdout": ""
+   }
+  ],
+  "fresh:member:pmail:alice": [
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "group",
+     "pmail"
+    ],
+    "returncode": 2,
+    "stderr": "",
+    "stdout": ""
+   }
+  ],
+  "fresh:owner_mode:/srv/pantheon/shared": [
+   {
+    "argv": [
+     "/usr/bin/stat",
+     "--format=%F:%U:%G:%a",
+     "--",
+     "/srv/pantheon/shared"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "directory:root:root:755\n"
+   }
+  ],
+  "fresh:passwd:alice": [
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "passwd",
+     "alice"
+    ],
+    "returncode": 2,
+    "stderr": "",
+    "stdout": ""
+   },
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "shadow",
+     "alice"
+    ],
+    "returncode": 2,
+    "stderr": "",
+    "stdout": ""
+   }
+  ],
+  "retired:passwd:alice": [
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "passwd",
+     "alice"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "alice:x:3101:3101::/home/alice:/bin/bash\n"
+   },
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "shadow",
+     "alice"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "alice:x:20753:0:99999:7::1:\n"
+   }
+  ],
+  "setgid-dir-acl:/srv/pantheon/mbox-alice": [
+   {
+    "argv": [
+     "/usr/bin/getfacl",
+     "--omit-header",
+     "--absolute-names",
+     "--no-effective",
+     "--physical",
+     "--",
+     "/srv/pantheon/mbox-alice"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "user::rwx\ngroup::rwx\nother::---\n\n"
+   }
+  ],
+  "snapshot": [
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "passwd"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "root:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nalice:x:3101:3101::/home/alice:/bin/bash\n"
+   },
+   {
+    "argv": [
+     "/usr/bin/getent",
+     "group"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "root:x:0:\ndaemon:x:1:\npmail:x:3001:alice\nalice:x:3101:\n"
+   }
+  ],
+  "symlink-acl:/srv/pantheon/link": [
+   {
+    "argv": [
+     "/usr/bin/getfacl",
+     "--omit-header",
+     "--absolute-names",
+     "--no-effective",
+     "--physical",
+     "--",
+     "/srv/pantheon/link"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": ""
+   }
+  ],
+  "visudo:error": [
+   {
+    "argv": [
+     "/usr/sbin/visudo",
+     "-cf",
+     "/mnt/staging/67747af7b6ab0eb0b4bc8d9c234e8fa0879577a38b6c0556969755c784931786"
+    ],
+    "returncode": 1,
+    "stderr": "/mnt/staging/67747af7b6ab0eb0b4bc8d9c234e8fa0879577a38b6c0556969755c784931786:1:36: syntax error\nalice ALL=(root) NOPASSWD /bin/true\n                                   ^\n",
+    "stdout": ""
+   }
+  ],
+  "visudo:ok": [
+   {
+    "argv": [
+     "/usr/sbin/visudo",
+     "-cf",
+     "/mnt/staging/d4ee1bdd95bef58477a07e804e16197caa89a065dd62d105918bb5d6b355bee0"
+    ],
+    "returncode": 0,
+    "stderr": "",
+    "stdout": "/mnt/staging/d4ee1bdd95bef58477a07e804e16197caa89a065dd62d105918bb5d6b355bee0: parsed OK\n"
+   }
+  ]
+ },
+ "provenance": "T-2920 U3b. Recorded 2026-10-27 from REAL binaries (getent, stat, sha256sum, getfacl, visudo) inside the T-2918 userns sandbox (private /etc, LC_ALL=C), after converging the test_gate_acceptance_sandbox manifest with SandboxSubstratePort. The snapshot enumerations are trimmed to root, daemon, alice and pmail (the sandbox /etc copies the seat host's account names). systemctl is FAKED in that sandbox, so the systemctl_show cases are HAND-RECORDED from systemctl(1) --value output and are not real-surface evidence; the real-surface check is carried to U4 (nspawn rehearsal). Shadow field 2 is a fixed DUMMY \"x\" in every line (recorded \"!\" lock markers replaced: Recovery D15 row-2 condition and review HIGH); the snapshot shadow enumeration record was removed with row 10. getfacl argv gained --physical after recording (review MED); --physical changes output ONLY for a symlink argument (verified on this host's getfacl: dir and missing-path output identical with and without it), and the sandbox real-binary test re-runs it live. symlink-acl was recorded on the seat host against a symlink in a scratch dir (path rewritten to /srv/pantheon/link): rc 0, empty stdout; without --physical getfacl followed the link.",
+ "sandbox_get": {
+  "acl:/srv/pantheon/shared": {
+   "entries": [
+    "group::r-x",
+    "group:pmail:r-x",
+    "mask::r-x",
+    "other::---",
+    "user::rwx"
+   ]
+  },
+  "dir:/srv/pantheon/mbox-alice": {
+   "group": "pmail",
+   "mode": "2770",
+   "owner": "alice"
+  },
+  "file:/etc/dbus-1/system.d/org.pantheon.T2918Fixture.conf": {
+   "mode": "0644",
+   "owner": "root",
+   "sha256": "edc14effd2a66fd71ad92ef1e925566a588f427fb2ae22dc16c68ee27321b649"
+  },
+  "file:/etc/sudoers.d/pantheon-alice-probe": {
+   "mode": "0440",
+   "owner": "root",
+   "sha256": "d4ee1bdd95bef58477a07e804e16197caa89a065dd62d105918bb5d6b355bee0"
+  },
+  "file:/etc/systemd/system/t2918.service": {
+   "mode": "0644",
+   "owner": "root",
+   "sha256": "6794f46b9e3b96cc320bc5a305737ff8e906de46365a5a340b0c677a6957f7e8"
+  },
+  "group:pmail": {
+   "gid": 3001
+  },
+  "linger:alice": true,
+  "member:pmail:alice": true,
+  "owner_mode:/srv/pantheon/shared": {
+   "group": "pmail",
+   "mode": "0750",
+   "owner": "alice"
+  },
+  "passwd:alice": {
+   "gid": 3101,
+   "home": "/home/alice",
+   "locked": false,
+   "shell": "/bin/bash",
+   "uid": 3101
+  }
+ },
+ "systemctl_show_hand_recorded": {
+  "disabled": {
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "disabled\n"
+  },
+  "enabled": {
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "enabled\n"
+  },
+  "masked": {
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "masked\n"
+  },
+  "not-installed": {
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "\n"
+  },
+  "static": {
+   "returncode": 0,
+   "stderr": "",
+   "stdout": "static\n"
+  }
+ }
+}

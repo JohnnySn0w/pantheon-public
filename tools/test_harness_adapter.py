@@ -479,6 +479,27 @@ class TestClaudeTranslations(unittest.TestCase):
                 self.assertNotEqual(assessment.status, "subscription-cap")
                 self.assertIsNone(assessment.pattern_id)
 
+    def test_claude_authentication_loss_requires_two_identical_captures(self) -> None:
+        adapter = ClaudeHarnessAdapter(
+            "orchestrator", claude_home=Path("/tmp/fake-claude-home"),
+            launch=_claude_launch_config({}),
+        )
+        baseline = _post_start_sample("❯ \n", 0)
+        one = adapter.assess_post_start_readiness(
+            harness="claude", profile="interactive-subscription", baseline=baseline,
+            samples=(_post_start_sample("● Please run /login", 1),),
+        )
+        two = adapter.assess_post_start_readiness(
+            harness="claude", profile="interactive-subscription", baseline=baseline,
+            samples=(
+                _post_start_sample("● Please run /login", 1),
+                _post_start_sample("● Please run /login", 2),
+            ),
+        )
+        self.assertEqual(one.status, "unknown")
+        self.assertEqual(two.status, "authentication-loss")
+        self.assertEqual(two.pattern_id, "login-required")
+
     def test_claude_interactive_completion_observer_uses_fresh_statusline_boundary_without_raw_text(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -940,6 +961,20 @@ class TestClaudeMidSessionCap(unittest.TestCase):
             modal.reset_at,
             datetime(2026, 9, 27, 17, 0, 0, tzinfo=timezone.utc),
         )
+
+    def test_spend_limit_modal_with_background_task_status_tail_is_classified(self) -> None:
+        """T-5744/T-5757: Claude may render one task-status line below an
+        open modal. It is UI chrome, not conversational prose."""
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        text = self.spend_limit_text + "\nBackground task update waiting while this panel is open\n"
+        modal = classify_claude_mid_session_cap(text, now=now)
+        self.assertIsNotNone(modal)
+        self.assertEqual(modal.modal_kind, "monthly-spend-limit")
+
+    def test_spend_limit_modal_with_arbitrary_trailing_prose_is_not_classified(self) -> None:
+        now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        text = self.spend_limit_text + "\nThis prose quotes the modal above.\n"
+        self.assertIsNone(classify_claude_mid_session_cap(text, now=now))
 
     def test_prompt_echoed_cap_text_is_not_classified(self) -> None:
         now = datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
